@@ -1,4 +1,4 @@
-# fluent
+# Fluent: a self improving software factory
 
 Fluent is an autonomous, self-improving software factory delivered as an Agent Skill.
 
