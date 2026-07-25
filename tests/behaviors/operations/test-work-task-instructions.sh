@@ -96,7 +96,10 @@ json_value() {
 }
 
 assert_contains() {
-  if ! printf '%s' "$1" | grep -Fq -- "$2"; then
+  # Match in-process so no producer-consumer pipeline exists to fail under
+  # pipefail; quote the needle so it stays a literal while the surrounding
+  # * remain Bash wildcards.
+  if [[ "$1" != *"$2"* ]]; then
     printf '    FAIL: output does not contain "%s"\n' "$2"
     printf '    Output:\n%s\n' "$1"
     return 1
@@ -104,7 +107,7 @@ assert_contains() {
 }
 
 assert_not_contains() {
-  if printf '%s' "$1" | grep -Fq -- "$2"; then
+  if [[ "$1" == *"$2"* ]]; then
     printf '    FAIL: output unexpectedly contains "%s"\n' "$2"
     printf '    Output:\n%s\n' "$1"
     return 1
@@ -220,6 +223,56 @@ test_minimal_work_item_keeps_minimal_prompt() {
   return $RESULT
 }
 
+test_literal_containment_helpers_handle_large_multiline_output() {
+  needle="EARLY_LINE_LITERAL_SENTINEL"
+  # First complete line carries the unique literal; the trailing content is
+  # deterministic and exceeds 1 MiB. With the old grep pipeline the matcher
+  # exits on the early line and printf then dies with SIGPIPE (PIPESTATUS
+  # 141 0) under pipefail, so containment must not depend on that pipeline.
+  filler=$'trailing deterministic content line\n'
+  while [ "${#filler}" -lt 1048576 ]; do
+    filler="${filler}${filler}"
+  done
+  haystack="prefix ${needle} suffix"$'\n'"${filler}"
+
+  RESULT=0
+
+  # The literal is present on an early line, so containment must succeed.
+  assert_contains "$haystack" "$needle" || RESULT=1
+
+  # The same present literal must make the inverse helper fail. Suppress the
+  # expected diagnostic so it does not dump the multi-megabyte haystack.
+  if assert_not_contains "$haystack" "$needle" > /dev/null 2>&1; then
+    printf '    FAIL: assert_not_contains missed a present literal in long output\n'
+    RESULT=1
+  fi
+
+  # A literal that never appears must let the inverse helper succeed.
+  assert_not_contains "$haystack" "ABSENT_LITERAL_NEVER_PRESENT" || RESULT=1
+
+  return $RESULT
+}
+
+test_literal_containment_helpers_treat_pattern_metacharacters_literally() {
+  # a*b is a Bash pattern only if the needle expansion is unquoted; quoted, it
+  # is the literal three-character string, which never occurs in the haystack.
+  haystack="prefix aZZb suffix"
+
+  RESULT=0
+
+  # The literal a*b is absent, so containment must fail. Suppress the expected
+  # diagnostic from the positive helper.
+  if assert_contains "$haystack" "a*b" > /dev/null 2>&1; then
+    printf '    FAIL: assert_contains treated "a*b" as a wildcard pattern\n'
+    RESULT=1
+  fi
+
+  # The inverse helper must succeed for the same absent literal.
+  assert_not_contains "$haystack" "a*b" || RESULT=1
+
+  return $RESULT
+}
+
 printf 'test-work-task-instructions\n\n'
 
 run_test "work create persists and shows instructions" \
@@ -232,5 +285,9 @@ run_test "attempt run keeps extra args out of prompt" \
   test_attempt_run_keeps_extra_args_out_of_prompt
 run_test "minimal Work Item keeps minimal prompt" \
   test_minimal_work_item_keeps_minimal_prompt
+run_test "literal containment helpers handle large multiline output" \
+  test_literal_containment_helpers_handle_large_multiline_output
+run_test "literal containment helpers treat pattern metacharacters literally" \
+  test_literal_containment_helpers_treat_pattern_metacharacters_literally
 
 summarize_and_exit

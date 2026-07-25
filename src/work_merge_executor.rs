@@ -830,11 +830,8 @@ fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-fn autofix_commit_message() -> (&'static str, &'static str) {
-    (
-        "Conform code to project standards",
-        "- Apply the fix-pre-merge hook's changes so check-pre-merge passes.",
-    )
+fn autofix_commit_message() -> &'static str {
+    "Conform code to project standards"
 }
 
 fn commit_autofix(worktree_dir: &Path) -> Result<()> {
@@ -843,10 +840,10 @@ fn commit_autofix(worktree_dir: &Path) -> Result<()> {
         &["add", "--", ".", ":(exclude).fluent"],
         "stage fix-pre-merge changes",
     )?;
-    let (subject, body) = autofix_commit_message();
+    let subject = autofix_commit_message();
     git::run(
         worktree_dir,
-        &["commit", "-m", subject, "-m", body],
+        &["commit", "-m", subject],
         "commit fix-pre-merge changes",
     )
 }
@@ -3578,15 +3575,45 @@ mod tests {
     }
 
     #[test]
-    fn autofix_commit_subject_names_no_hook_or_process() {
-        let (subject, _body) = autofix_commit_message();
-        assert!(!subject.is_empty(), "subject must not be empty");
-        let lower = subject.to_lowercase();
-        for banned in ["fix-pre-merge", "hook", "before landing"] {
-            assert!(
-                !lower.contains(banned),
-                "subject must not contain \"{banned}\": {subject}"
-            );
-        }
+    fn commit_autofix_writes_approved_message() {
+        // Drive the real commit_autofix path in an isolated repository and
+        // inspect the complete persisted message, not just the helper's
+        // in-memory result. Equality with the production source proves the Git
+        // boundary persisted the message with full fidelity; equality with the
+        // declared approved wording proves the source still emits the approved
+        // maintenance subject.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_test_repo(&repo);
+
+        // A fix-pre-merge change leaves the candidate worktree dirty.
+        fs::write(repo.join("file.txt"), "reformatted").unwrap();
+        commit_autofix(&repo).expect("commit_autofix persists the staged change");
+
+        let persisted = git::run_stdout(&repo, &["log", "-1", "--format=%B"], "read message")
+            .expect("read the persisted commit message");
+
+        // Fidelity: the Git boundary holds exactly the production source, so
+        // any persisted divergence fails.
+        assert_eq!(
+            persisted,
+            autofix_commit_message(),
+            "persisted message must equal the production message source"
+        );
+
+        // Policy (B2): the complete persisted message equals the approved
+        // maintenance wording.
+        assert_eq!(
+            persisted, "Conform code to project standards",
+            "persisted message must equal the approved wording"
+        );
+
+        // Shape (B1): nonempty, exactly one subject and no body.
+        assert!(!persisted.is_empty(), "message must not be empty");
+        assert!(
+            !persisted.contains('\n'),
+            "message must be a single subject line with no body: {persisted:?}"
+        );
     }
 }

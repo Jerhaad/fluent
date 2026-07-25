@@ -5540,3 +5540,21 @@ existing one),
 THE SYSTEM SHALL print a notice that fluent keeps its learned project notes and
 test config in `.fluent/` and commits them alongside the user's changes.
 Test: tests/binary.rs (init_output_notes_fluent_tracks_its_state)
+
+## Generated commit wording
+
+### B1
+
+WHEN `fix-pre-merge` changes candidate files and Fluent creates the
+corresponding commit,
+THE SYSTEM SHALL persist a nonempty commit message containing exactly one
+subject and no body.
+Test: src/work_merge_executor.rs (commit_autofix_writes_approved_message)
+
+### B2
+
+WHEN `fix-pre-merge` changes candidate files and Fluent creates the
+corresponding commit,
+THE SYSTEM SHALL persist `Conform code to project standards` as the complete
+commit message.
+Test: src/work_merge_executor.rs (commit_autofix_writes_approved_message)

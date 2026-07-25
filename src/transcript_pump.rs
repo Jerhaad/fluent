@@ -13,7 +13,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -866,30 +866,198 @@ impl FirstFault {
     }
 }
 
-/// A required status command awaiting acknowledgement. The submitter blocks on the
-/// one-shot `ack` until the worker has attempted its persistence, so a terminal
-/// acknowledgement can never be followed by a later Running write.
-struct RequiredCommand {
-    status: PumpStatus,
-    ack: SyncSender<Result<(), String>>,
+/// A monotonic identity for one required status command, assigned when it is
+/// submitted. It follows the command from the required FIFO into its active record or
+/// into shared resolving ownership, so cleanup and reconciliation act on one exact
+/// identity and never clear unrelated work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RequiredCommandId(u64);
+
+/// The shared cell behind an idempotent one-shot acknowledgement. The submitter holds
+/// a [`RequiredAckWaiter`] and blocks on it; the resolver authority — held by the
+/// queued command and then the active record — fixes exactly one immutable
+/// `Result<(), String>` and wakes the waiter. Repeated resolution leaves the first
+/// stored result unchanged, with no second delivery, replacement, or block;
+/// `RequiredAckResolver::resolve_once` returns `()`, and only `RequiredAckWaiter::wait`
+/// returns the stored result. Its lock is never held together with the coordinator
+/// mutex.
+struct AckCell {
+    result: Mutex<Option<Result<(), String>>>,
+    ready: Condvar,
 }
 
-/// What the worker does next, decided atomically under one lock so required
-/// statuses drain FIFO, the newest periodic drains before the terminal, and the
-/// terminal write is always last.
+/// The resolver authority for a required acknowledgement. Cloning it shares the one
+/// underlying cell, so the queued command, the active record, and any reconciler hold
+/// the same idempotent one-shot.
+#[derive(Clone)]
+struct RequiredAckResolver {
+    cell: Arc<AckCell>,
+}
+
+/// The submitter side of a required acknowledgement. It blocks until the one-shot
+/// result becomes observable.
+struct RequiredAckWaiter {
+    cell: Arc<AckCell>,
+}
+
+impl RequiredAckResolver {
+    /// Fix the one-shot result if it is not already fixed, waking the waiter. A second
+    /// call observes the stored result and neither replaces nor re-delivers it, so
+    /// normal and reconciliation paths converge on one immutable result.
+    fn resolve_once(&self, result: Result<(), String>) {
+        let mut slot = self.cell.result.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(result);
+            self.cell.ready.notify_all();
+        }
+    }
+
+    /// Whether the one-shot result is already observable. Read with the coordinator
+    /// mutex released, so the two locks are never held together.
+    fn is_observable(&self) -> bool {
+        self.cell.result.lock().unwrap().is_some()
+    }
+}
+
+impl RequiredAckWaiter {
+    /// Whether the one-shot result is already observable, read without consuming the
+    /// waiter. A test reads its own shared acknowledgement cell here to prove the result
+    /// was fixed by a specific settlement path before it blocks on `wait`.
+    #[cfg(test)]
+    fn test_is_observable(&self) -> bool {
+        self.cell.result.lock().unwrap().is_some()
+    }
+
+    /// Block until the one-shot result is observable and return it.
+    fn wait(self) -> Result<(), String> {
+        let mut slot = self.cell.result.lock().unwrap();
+        while slot.is_none() {
+            slot = self.cell.ready.wait(slot).unwrap();
+        }
+        slot.clone().unwrap()
+    }
+}
+
+/// Create a fresh idempotent one-shot acknowledgement: the resolver authority and the
+/// submitter's waiter, sharing one cell.
+fn new_ack() -> (RequiredAckResolver, RequiredAckWaiter) {
+    let cell = Arc::new(AckCell {
+        result: Mutex::new(None),
+        ready: Condvar::new(),
+    });
+    (
+        RequiredAckResolver {
+            cell: Arc::clone(&cell),
+        },
+        RequiredAckWaiter { cell },
+    )
+}
+
+/// The lifecycle of a never-accepted required command. It stays `Queued` in the single
+/// shared required deque until authorized worker termination changes it — in place,
+/// under the coordinator mutex — to `Resolving`. There is no second container: a
+/// retired command keeps its position, identity, and original resolver in the same
+/// deque, and only matching cleanup removes it once its one-shot is observable.
+enum QueuedLifecycle {
+    Queued,
+    /// Authorized termination retired this never-accepted command in place. It keeps its
+    /// original resolver in the shared deque; its immutable disconnected result is the
+    /// static `immutable_error`, and its disconnected accounting was applied once during
+    /// the lock-held retirement commit. `RetiringBeforeCleanup` — the resolver is
+    /// observable but the entry is not yet removed — is derived from the resolver's
+    /// observable state, not stored here as a second lifecycle truth.
+    Resolving {
+        immutable_error: &'static str,
+    },
+}
+
+/// A required status command with its acknowledgement resolver and lifecycle. It lives
+/// in the single shared required deque from enqueue through acknowledgement
+/// observability: while `Queued` it awaits selection; once authorized termination
+/// retires it in place to `Resolving` it stays in the same deque, keeping its identity
+/// and original resolver until its one-shot result is observable and matching cleanup
+/// removes it.
+struct RequiredCommand {
+    id: RequiredCommandId,
+    status: PumpStatus,
+    resolver: RequiredAckResolver,
+    lifecycle: QueuedLifecycle,
+}
+
+/// A required status accepted for the worker: its id and the status to persist. Its
+/// acknowledgement resolver already lives in the shared active record, installed as
+/// one lock-held mutation with the queue removal.
+struct AcceptedRequired {
+    id: RequiredCommandId,
+    status: PumpStatus,
+}
+
+/// The active phase of an accepted required write. Acceptance versus resolved/retiring
+/// is derived from the one-shot's observable state, not stored here: while the
+/// resolver is unresolved the record is `Accepted`; once resolved it is
+/// `Resolved/Retiring` until matching cleanup.
+enum ActivePhase {
+    /// Accepted but the store has not returned. Only a caller holding
+    /// [`AbandonmentAuthority`] may turn this into a bounded worker-unwind result.
+    Pending,
+    /// The store returned this exact result; the first transition after return.
+    Observed(Result<(), String>),
+    /// The immutable caller result is fixed and accounting is applied; the one-shot
+    /// resolves from `result` outside the coordinator lock.
+    Prepared { result: Result<(), String> },
+}
+
+/// The shared record for one accepted required write, owning its acknowledgement
+/// resolver from the acceptance linearization point through matching cleanup.
+struct ActiveWrite {
+    id: RequiredCommandId,
+    resolver: RequiredAckResolver,
+    phase: ActivePhase,
+    /// Whether this write's success/failure has been applied to the diagnostics
+    /// exactly once, so repeated reconciliation observes rather than re-applies it.
+    accounting_applied: bool,
+}
+
+/// An owned proof that no live store frame can still return and no possible real
+/// result remains unpublished. Only boundaries that establish that fact construct it:
+/// the worker's own panic catch after the stack unwound, the worker observing a
+/// disconnected wake outside any store call and committed to exit, or `finish`/`drop`
+/// after the worker join completes. Holding the proof does not mean the worker has
+/// already exited — the wake-disconnected worker constructs it while still running its
+/// final reconciliation. An exact result already shared in `Observed` or `Prepared` is
+/// preserved, not erased: reconciliation only fixes the bounded worker-unwind outcome
+/// for a `Pending` frame that can never return. A direct or concurrent reconciler
+/// without this proof cannot synthesize a pending outcome — it leaves `Pending` owned
+/// and unresolved.
+struct AbandonmentAuthority {
+    _private: (),
+}
+
+impl AbandonmentAuthority {
+    /// Construct the proof at a boundary that has established the worker can no longer
+    /// publish a store result. Private to this module and never handed to an arbitrary
+    /// reconciler, so `Pending` synthesis cannot occur without it.
+    fn assume_worker_abandoned() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// What the worker does next, decided atomically under one lock so required statuses
+/// drain FIFO, the newest periodic drains before the terminal, and the terminal write
+/// is always last.
 enum Work {
-    Required(RequiredCommand),
+    Required(AcceptedRequired),
     Periodic(PumpStatus),
     Terminal(TerminalStatusSpec),
     Idle,
 }
 
-/// Which submission a write persisted, so periodic and Complete-to-Failed fallback
-/// failures stay distinct from required and terminal failures in the diagnostics.
+/// Which non-required submission a write persisted, so periodic and Complete-to-Failed
+/// fallback failures stay distinct from terminal failures in the diagnostics. Required
+/// writes track their in-flight state in the shared active record instead.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WriteKind {
     Periodic,
-    Required,
     Terminal,
     /// The Failed fallback written after a Complete status could not be persisted.
     /// Tracked distinctly so a fallback failure — including a panic mid-fallback —
@@ -898,6 +1066,16 @@ enum WriteKind {
     Fallback,
 }
 
+/// The bounded diagnostic fixed as an accepted required write's one-shot result when
+/// the worker provably unwound before the store returned. "panicked" keeps it
+/// attributable to a worker unwind in the transport `last_error`.
+const ACCEPTED_WRITE_WORKER_UNWIND: &str =
+    "persist pump status: status worker panicked before acknowledging an accepted required write";
+
+/// The bounded disconnected result fixed on a never-accepted queued required write
+/// when authorized termination retires it.
+const QUEUED_REQUIRED_DISCONNECT: &str = "persist pump status: status worker disconnected";
+
 /// Shared coordinator state. Every submission mutates it under one lock and every
 /// category the submitter can decide (coalesced, dropped, disconnected) is recorded
 /// there immediately, so the balance invariant holds even for submissions the
@@ -905,18 +1083,32 @@ enum WriteKind {
 struct CoordinatorInner {
     /// The newest pending periodic snapshot; a replaced one is counted coalesced.
     periodic: Option<PumpStatus>,
-    /// Required statuses awaiting the worker, processed front-first.
+    /// The single shared required deque. It owns every never-accepted command and its
+    /// original acknowledgement resolver from enqueue through acknowledgement
+    /// observability. A `Queued` entry awaits the worker (processed front-first); an
+    /// entry authorized termination retired in place is `Resolving` and stays in this
+    /// same deque — there is no second resolving container — until its one-shot is
+    /// observable and matching cleanup removes it.
     required: VecDeque<RequiredCommand>,
+    /// The accepted required write the worker is currently persisting, owning its
+    /// acknowledgement resolver from the acceptance linearization point through
+    /// matching cleanup. `Pending`, `Observed`, and `Prepared` phases and the derived
+    /// `Resolved/Retiring` state all live here.
+    active_required: Option<ActiveWrite>,
+    /// The next required command identity to assign.
+    next_command_id: u64,
     /// The terminal status, set once by `finish`; the worker writes it last.
     terminal: Option<TerminalStatusSpec>,
     /// Exact accounting of every submission.
     diagnostics: StatusTransportDiagnostics,
-    /// The category of the write the worker is currently attempting, set before
-    /// each `store.write` and cleared once its result is recorded. If the worker
-    /// unwinds *inside* `store.write`, this remains set, so reconciliation accounts
-    /// the attempted write truthfully as a write failure rather than sweeping it
-    /// into the disconnected bucket (which would hide that the store was reached).
-    active_write: Option<WriteKind>,
+    /// The category of a *non-required* write (periodic, terminal, or fallback) the
+    /// worker is currently attempting, set before each `store.write` and cleared once
+    /// its result is recorded. A still-set marker means the worker unwound *inside*
+    /// `store.write`, so reconciliation accounts the attempted write truthfully as a
+    /// write failure rather than sweeping it into the disconnected bucket (which would
+    /// hide that the store was reached). Required writes track their in-flight state in
+    /// `active_required` instead.
+    in_flight: Option<WriteKind>,
     /// The last best-effort *periodic* write failure, kept distinct from required
     /// and terminal failures so a required failure never masquerades as periodic.
     periodic_error: Option<String>,
@@ -933,16 +1125,251 @@ struct CoordinatorInner {
     shutdown: bool,
 }
 
+impl CoordinatorInner {
+    /// The initial coordinator state: nothing pending, nothing accounted, not yet
+    /// sealed or shut down. Shared by production spawn and the deterministic test
+    /// harness so both start from one canonical state.
+    fn new() -> Self {
+        Self {
+            periodic: None,
+            required: VecDeque::new(),
+            active_required: None,
+            next_command_id: 0,
+            terminal: None,
+            diagnostics: StatusTransportDiagnostics::default(),
+            in_flight: None,
+            periodic_error: None,
+            settlement_error: None,
+            fallback_error: None,
+            sealed: false,
+            shutdown: false,
+        }
+    }
+}
+
 struct SharedStatusState {
     inner: Mutex<CoordinatorInner>,
+    /// Test-only settlement probes. Each is invoked outside both the coordinator and
+    /// acknowledgement-cell mutexes at one exact boundary so a test can inject an unwind
+    /// or force concurrent settlers there. Production compiles without this field, so no
+    /// probe exists off the test path.
+    #[cfg(test)]
+    hooks: TestHooks,
+}
+
+/// A test-only settlement probe with no argument, shared as an `Arc` so it can be
+/// cloned out and invoked with every coordinator lock released.
+#[cfg(test)]
+type ProbeHook = Arc<dyn Fn() + Send + Sync>;
+
+/// A test-only settlement probe carrying the required identity at the boundary.
+#[cfg(test)]
+type IdProbeHook = Arc<dyn Fn(RequiredCommandId) + Send + Sync>;
+
+/// The installable test-only settlement probes. Each slot defaults to empty, so an
+/// un-instrumented coordinator invokes nothing. A test installs a probe to observe or
+/// perturb one exact boundary; the probe runs with both mutexes released.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks {
+    /// Runs before the lock-held queued-retirement commit is taken.
+    before_queued_retirement_commit: Mutex<Option<ProbeHook>>,
+    /// Runs after a resolving queued one-shot is observable and before its matching
+    /// cleanup.
+    queued_retiring_before_cleanup: Mutex<Option<IdProbeHook>>,
+    /// Runs after an active record is installed as `Prepared` and before its one-shot
+    /// resolves.
+    active_prepared: Mutex<Option<IdProbeHook>>,
+    /// Runs after an active one-shot result is observable and before its matching
+    /// cleanup.
+    active_retiring_before_cleanup: Mutex<Option<IdProbeHook>>,
+    /// Runs each time the worker is about to block on the wake channel, so a test knows
+    /// the worker is idle before it withholds a wake.
+    worker_before_wake_receive: Mutex<Option<ProbeHook>>,
+    /// Runs inside `finish` after the terminal is queued and before the worker join.
+    finish_before_join: Mutex<Option<ProbeHook>>,
+    /// Runs inside `drop` after the wake sender is removed and before the worker join.
+    drop_wake_disconnected_before_join: Mutex<Option<ProbeHook>>,
 }
 
 impl SharedStatusState {
-    fn next_work(&self) -> Work {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(cmd) = inner.required.pop_front() {
-            return Work::Required(cmd);
+    /// Invoke the `BeforeQueuedRetirementCommit` probe, if installed, with both mutexes
+    /// released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_before_queued_retirement_commit(&self) {
+        let hook = self
+            .hooks
+            .before_queued_retirement_commit
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
         }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_before_queued_retirement_commit(&self) {}
+
+    /// Invoke the `QueuedRetiringBeforeCleanup` probe for `id`, if installed, with both
+    /// mutexes released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_queued_retiring_before_cleanup(&self, id: RequiredCommandId) {
+        let hook = self
+            .hooks
+            .queued_retiring_before_cleanup
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            hook(id);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_queued_retiring_before_cleanup(&self, _id: RequiredCommandId) {}
+
+    /// Invoke the `ActivePrepared` probe for `id`, if installed, with both mutexes
+    /// released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_active_prepared(&self, id: RequiredCommandId) {
+        let hook = self.hooks.active_prepared.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(id);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_active_prepared(&self, _id: RequiredCommandId) {}
+
+    /// Invoke the `ActiveRetiringBeforeCleanup` probe for `id`, if installed, with both
+    /// mutexes released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_active_retiring_before_cleanup(&self, id: RequiredCommandId) {
+        let hook = self
+            .hooks
+            .active_retiring_before_cleanup
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            hook(id);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_active_retiring_before_cleanup(&self, _id: RequiredCommandId) {}
+
+    /// Invoke the `WorkerBeforeWakeReceive` probe, if installed, with both mutexes
+    /// released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_worker_before_wake_receive(&self) {
+        let hook = self
+            .hooks
+            .worker_before_wake_receive
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_worker_before_wake_receive(&self) {}
+
+    /// Invoke the `FinishBeforeJoin` probe, if installed, with both mutexes released.
+    /// Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_finish_before_join(&self) {
+        let hook = self.hooks.finish_before_join.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_finish_before_join(&self) {}
+
+    /// Invoke the `DropWakeDisconnectedBeforeJoin` probe, if installed, with both mutexes
+    /// released. Production compiles this to nothing.
+    #[cfg(test)]
+    fn emit_drop_wake_disconnected_before_join(&self) {
+        let hook = self
+            .hooks
+            .drop_wake_disconnected_before_join
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn emit_drop_wake_disconnected_before_join(&self) {}
+
+    /// Atomically remove the next queued required command and install its
+    /// acknowledgement resolver as an active record in `Accepted/Pending`, returning
+    /// the status to persist. Queue removal and active installation are one lock-held
+    /// mutation with no intervening hook, probe, callback, or fallible work; the
+    /// projected transport is stamped under the same lock. Returns `None` when no
+    /// required command is queued or a write is already active (the single worker
+    /// never selects a second).
+    fn accept_next_required(&self) -> Option<AcceptedRequired> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.active_required.is_some() {
+            return None;
+        }
+        // Refuse acceptance once the coordinator has shut down, before examining or
+        // removing any front entry. A shut-down coordinator's queued ownership belongs to
+        // authorized reconciliation, which disconnects it; the worker must never move a
+        // queued entry into an active write after shutdown.
+        if inner.shutdown {
+            return None;
+        }
+        // Accept only a `Queued` front entry. A `Resolving` entry is retired shared
+        // state — the single deque now holds both — and is never acceptable work.
+        match inner.required.front() {
+            Some(front) if matches!(front.lifecycle, QueuedLifecycle::Queued) => {}
+            _ => return None,
+        }
+        let RequiredCommand {
+            id,
+            mut status,
+            resolver,
+            ..
+        } = inner.required.pop_front()?;
+        // Install shared active ownership before releasing the lock: from here the
+        // command is neither queued nor lost — it is the active record owning its
+        // acknowledgement resolver.
+        inner.active_required = Some(ActiveWrite {
+            id,
+            resolver,
+            phase: ActivePhase::Pending,
+            accounting_applied: false,
+        });
+        // Stamp a self-consistent projected accounting under the same lock so the
+        // persisted Running document carries a balanced view, not zeros.
+        let mut projected = inner.diagnostics.clone();
+        projected.written += 1;
+        status.transport = projected;
+        Some(AcceptedRequired { id, status })
+    }
+
+    fn next_work(&self) -> Work {
+        // Accept the next required command (atomic queue-removal + active install).
+        if let Some(accepted) = self.accept_next_required() {
+            return Work::Required(accepted);
+        }
+        let mut inner = self.inner.lock().unwrap();
         // Drain the newest periodic before the terminal so no Running write can
         // follow the terminal state.
         if let Some(status) = inner.periodic.take() {
@@ -954,16 +1381,205 @@ impl SharedStatusState {
         Work::Idle
     }
 
-    /// Mark that the worker is about to attempt a write of `kind`. Paired with
-    /// `record_write`, which clears it. A still-set marker means the worker
+    /// Publish the store's returned result into the matching active record as
+    /// `Observed`. This is the first state transition after `store.write` returns,
+    /// before any classification, accounting, probe, or acknowledgement work, so a
+    /// later unwind reproduces the exact caller and ledger result.
+    fn publish_observed(&self, id: RequiredCommandId, result: Result<(), String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(active) = inner.active_required.as_mut() {
+            if active.id == id {
+                active.phase = ActivePhase::Observed(result);
+            }
+        }
+    }
+
+    /// Prepare the active record for resolution under the coordinator lock: derive the
+    /// caller result from its own stored truth, apply success/failure accounting
+    /// exactly once, move it to `Prepared`, and return its id, a resolver handle, and
+    /// the result to resolve outside the lock. Returns `None` when there is no active
+    /// record, or when the record is `Pending` and no `authority` proves the worker
+    /// abandoned it — leaving `Pending` owned and unresolved.
+    fn prepare_active(
+        &self,
+        authority: Option<&AbandonmentAuthority>,
+    ) -> Option<(RequiredCommandId, RequiredAckResolver, Result<(), String>)> {
+        let mut inner = self.inner.lock().unwrap();
+        let (id, resolver, result, needs_accounting) = {
+            let active = inner.active_required.as_ref()?;
+            let result: Result<(), String> = match &active.phase {
+                ActivePhase::Pending => {
+                    // Synthesizing an unwind requires explicit abandonment authority; a
+                    // reconciler without it must leave the live worker's Pending owned.
+                    authority?;
+                    Err(bound_error(ACCEPTED_WRITE_WORKER_UNWIND))
+                }
+                ActivePhase::Observed(Ok(())) => Ok(()),
+                ActivePhase::Observed(Err(err)) => Err(bound_error(err)),
+                ActivePhase::Prepared { result } => result.clone(),
+            };
+            (
+                active.id,
+                active.resolver.clone(),
+                result,
+                !active.accounting_applied,
+            )
+        };
+        if needs_accounting {
+            match &result {
+                Ok(()) => inner.diagnostics.written += 1,
+                Err(err) => {
+                    inner.diagnostics.write_failures += 1;
+                    inner.diagnostics.last_error = Some(err.clone());
+                }
+            }
+        }
+        let active = inner
+            .active_required
+            .as_mut()
+            .expect("active record present under the same lock");
+        active.accounting_applied = true;
+        active.phase = ActivePhase::Prepared {
+            result: result.clone(),
+        };
+        Some((id, resolver, result))
+    }
+
+    /// Remove the active record for `id` once its one-shot result is observable,
+    /// transitioning it from `Resolved/Retiring` to cleaned. `observable` is read with
+    /// the coordinator lock released, so the two locks are never held together.
+    fn cleanup_active_if_observable(&self, id: RequiredCommandId, observable: bool) {
+        if !observable {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.active_required.as_ref().is_some_and(|a| a.id == id) {
+            inner.active_required = None;
+        }
+    }
+
+    /// Settle the active required write end to end: prepare it under the lock, resolve
+    /// its one-shot outside the lock (idempotent), then clean up the record once the
+    /// result is observable. Returns without effect when there is no active record or
+    /// when a `Pending` record has no abandonment authority. Safe to call repeatedly
+    /// and concurrently: accounting and resolution each happen once.
+    fn settle_active(&self, authority: Option<&AbandonmentAuthority>) {
+        let Some((id, resolver, result)) = self.prepare_active(authority) else {
+            return;
+        };
+        // Probe the shared `Prepared` boundary — the record is installed with its exact
+        // result and accounting fixed — before the one-shot resolves. Outside both locks.
+        self.emit_active_prepared(id);
+        // Resolve outside the coordinator lock; the two locks are never held together.
+        resolver.resolve_once(result);
+        let observable = resolver.is_observable();
+        // Probe the `RetiringBeforeCleanup` boundary — the exact result is observable —
+        // before matching cleanup removes the record. Outside both locks.
+        self.emit_active_retiring_before_cleanup(id);
+        self.cleanup_active_if_observable(id, observable);
+    }
+
+    /// Retire every never-accepted queued required command in place, under one
+    /// coordinator-lock section, changing each `Queued` entry to `Resolving` without
+    /// leaving the shared deque. A test-only `BeforeQueuedRetirementCommit` probe runs
+    /// first, outside the lock, so a test can force an unwind before the commit; if it
+    /// unwinds, the lock is never taken and every entry stays `Queued`, unresolved, and
+    /// unaccounted for a later authorized reconciliation to resume.
+    ///
+    /// The lock-held commit performs no allocation, callback, hook, acknowledgement-cell
+    /// operation, queue move, append, reserve, collect, local command container, or
+    /// resolver clone: it counts the `Queued` entries, computes the final disconnected
+    /// count, changes each `Queued` entry's lifecycle to `Resolving` with the static
+    /// immutable error, and assigns the disconnected count. Requires abandonment
+    /// authority. Idempotent: an already-`Resolving` entry is left as it is, and a later
+    /// call resumes any newly queued command.
+    fn retire_queued(&self, _authority: &AbandonmentAuthority) {
+        // The retirement probe runs before the lock so an injected unwind leaves the
+        // commit untaken and every entry still queued and unaccounted.
+        self.emit_before_queued_retirement_commit();
+        let mut inner = self.inner.lock().unwrap();
+        inner.shutdown = true;
+        // Count the never-accepted entries and compute the final disconnected count
+        // before mutating any lifecycle — no allocation or clone in the commit itself.
+        let mut queued_count = 0u64;
+        for entry in &inner.required {
+            if matches!(entry.lifecycle, QueuedLifecycle::Queued) {
+                queued_count += 1;
+            }
+        }
+        let final_disconnected = inner.diagnostics.disconnected + queued_count;
+        // Change every `Queued` entry to `Resolving` in place with the static immutable
+        // error. The entry keeps its position, identity, and original resolver.
+        for entry in inner.required.iter_mut() {
+            if matches!(entry.lifecycle, QueuedLifecycle::Queued) {
+                entry.lifecycle = QueuedLifecycle::Resolving {
+                    immutable_error: QUEUED_REQUIRED_DISCONNECT,
+                };
+            }
+        }
+        inner.diagnostics.disconnected = final_disconnected;
+    }
+
+    /// Resolve the shared resolving queued commands one identity at a time. Each
+    /// iteration selects one `Resolving` entry under the lock and clones only its
+    /// `(id, resolver, immutable_error)`; the original resolver stays in the shared
+    /// deque. The lock is released before the bounded `Err` is constructed, before the
+    /// idempotent one-shot resolves, before its observability is read, and before the
+    /// `QueuedRetiringBeforeCleanup` probe — every step outside both mutexes. Only then,
+    /// under the lock, is the matching id removed, and only when it is still `Resolving`
+    /// and its one-shot became observable. An unwind or a concurrent reconciler that
+    /// selected the same identity loses nothing: the one-shot is idempotent and the
+    /// matching-id cleanup is a no-op on an already-removed entry.
+    fn resolve_queued(&self) {
+        loop {
+            // Select one shared resolving identity and clone only its handle and static
+            // error under the lock — never the resolver's observability, which would
+            // require the acknowledgement-cell lock while the coordinator lock is held.
+            let selected = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .required
+                    .iter()
+                    .find_map(|entry| match &entry.lifecycle {
+                        QueuedLifecycle::Resolving { immutable_error } => {
+                            Some((entry.id, entry.resolver.clone(), *immutable_error))
+                        }
+                        QueuedLifecycle::Queued => None,
+                    })
+            };
+            let Some((id, resolver, immutable_error)) = selected else {
+                break;
+            };
+            // Construct the bounded error and resolve the idempotent one-shot outside all
+            // locks; a repeat or concurrent resolution observes the same immutable result.
+            let result: Result<(), String> = Err(bound_error(immutable_error));
+            resolver.resolve_once(result);
+            let observable = resolver.is_observable();
+            // Probe the post-observability, pre-cleanup boundary outside both mutexes.
+            self.emit_queued_retiring_before_cleanup(id);
+            // Remove only this matching identity, and only when it is still `Resolving`
+            // and its one-shot became observable.
+            if observable {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(pos) = inner.required.iter().position(|e| {
+                    e.id == id && matches!(e.lifecycle, QueuedLifecycle::Resolving { .. })
+                }) {
+                    inner.required.remove(pos);
+                }
+            }
+        }
+    }
+
+    /// Mark that the worker is about to attempt a non-required write of `kind`. Paired
+    /// with `record_write`, which clears it. A still-set marker means the worker
     /// unwound inside `store.write`.
     fn begin_write(&self, kind: WriteKind) {
-        self.inner.lock().unwrap().active_write = Some(kind);
+        self.inner.lock().unwrap().in_flight = Some(kind);
     }
 
     fn record_write(&self, result: &Result<(), String>, kind: WriteKind) {
         let mut inner = self.inner.lock().unwrap();
-        inner.active_write = None;
+        inner.in_flight = None;
         match result {
             Ok(()) => inner.diagnostics.written += 1,
             Err(err) => {
@@ -973,7 +1589,7 @@ impl SharedStatusState {
                 match kind {
                     WriteKind::Periodic => inner.periodic_error = Some(bounded),
                     WriteKind::Fallback => inner.fallback_error = Some(bounded),
-                    _ => {}
+                    WriteKind::Terminal => {}
                 }
             }
         }
@@ -1008,48 +1624,62 @@ impl SharedStatusState {
     }
 
     /// Test-only proof that settlement left nothing pending: no coalescing slot, no
-    /// queued required status, no unwritten terminal, and no in-flight write.
+    /// queued or resolving required status in the single shared deque, no active
+    /// required write, no unwritten terminal, and no in-flight write.
     #[cfg(test)]
     fn is_quiescent(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.periodic.is_none()
             && inner.required.is_empty()
+            && inner.active_required.is_none()
             && inner.terminal.is_none()
-            && inner.active_write.is_none()
+            && inner.in_flight.is_none()
     }
 
-    /// Reconcile work the worker abandoned when it disconnected or panicked before
-    /// acknowledgement: acknowledge any pending required submission with an error so
-    /// its submitter never hangs, clear the pending periodic, and account every
-    /// still-uncategorized submission as disconnected so the balance invariant holds.
-    fn reconcile_abandoned(&self) {
+    /// Account a non-required write that was in flight when the worker unwound as a
+    /// write failure carrying the panic as its error — never swept into the
+    /// disconnected bucket, which would falsely report the store was never attempted.
+    /// A periodic or fallback write also latches into its distinct field.
+    fn account_in_flight_unwind(&self) {
         let mut inner = self.inner.lock().unwrap();
-        // A write that was in flight when the worker unwound is accounted truthfully
-        // as a write failure carrying the panic as its error — never swept into the
-        // disconnected bucket, which would falsely report the store was never
-        // attempted. A periodic write also latches into `periodic_error`.
-        if let Some(kind) = inner.active_write.take() {
+        if let Some(kind) = inner.in_flight.take() {
             let bounded = bound_error(STATUS_WORKER_PANIC);
             inner.diagnostics.write_failures += 1;
             inner.diagnostics.last_error = Some(bounded.clone());
             match kind {
                 WriteKind::Periodic => inner.periodic_error = Some(bounded),
                 WriteKind::Fallback => inner.fallback_error = Some(bounded),
-                _ => {}
+                WriteKind::Terminal => {}
             }
         }
-        while let Some(cmd) = inner.required.pop_front() {
-            let _ = cmd.ack.send(Err(
-                "persist pump status: status worker disconnected".to_string()
-            ));
+    }
+
+    /// Account and clear a pending periodic snapshot the dead worker never wrote as
+    /// one disconnected submission, so the balance invariant holds.
+    fn retire_pending_periodic(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.periodic.take().is_some() {
+            inner.diagnostics.disconnected += 1;
         }
-        inner.periodic = None;
-        inner.shutdown = true;
-        let d = &inner.diagnostics;
-        let accounted = d.written + d.coalesced + d.dropped + d.disconnected + d.write_failures;
-        if d.submitted > accounted {
-            inner.diagnostics.disconnected += d.submitted - accounted;
-        }
+    }
+
+    /// Reconcile all work the worker abandoned when it disconnected or panicked, with
+    /// abandonment authority proving it can no longer publish a real result. Marks
+    /// shutdown first so no new command can enter the FIFO, then settles the active
+    /// required write from its own stored truth (synthesizing a bounded unwind for a
+    /// `Pending` record), retires every never-accepted queued command in place to
+    /// `Resolving` and resolves it, and clears any pending periodic. Idempotent
+    /// under repeated and concurrent calls: every acknowledgement resolves exactly once
+    /// and every category is accounted exactly once.
+    fn reconcile_abandoned(&self, authority: &AbandonmentAuthority) {
+        // Shut the FIFO first: any submission after this point is disconnected at
+        // submit, and every command already queued is drained below.
+        self.inner.lock().unwrap().shutdown = true;
+        self.account_in_flight_unwind();
+        self.settle_active(Some(authority));
+        self.retire_queued(authority);
+        self.resolve_queued();
+        self.retire_pending_periodic();
     }
 }
 
@@ -1069,24 +1699,46 @@ struct StatusCoordinator {
 const STATUS_WORKER_PANIC: &str = "status coordinator worker panicked while persisting a status";
 
 impl StatusCoordinator {
+    /// Spawn a coordinator with its single worker. Production construction supplies no
+    /// test hooks, so no probe exists off the test path.
     fn spawn(
-        mut store: Box<dyn StatusStore>,
+        store: Box<dyn StatusStore>,
         first_fault: Option<Arc<FirstFault>>,
     ) -> Result<Self, TranscriptPumpError> {
         let shared = Arc::new(SharedStatusState {
-            inner: Mutex::new(CoordinatorInner {
-                periodic: None,
-                required: VecDeque::new(),
-                terminal: None,
-                diagnostics: StatusTransportDiagnostics::default(),
-                active_write: None,
-                periodic_error: None,
-                settlement_error: None,
-                fallback_error: None,
-                sealed: false,
-                shutdown: false,
-            }),
+            inner: Mutex::new(CoordinatorInner::new()),
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         });
+        Self::spawn_worker(shared, store, first_fault)
+    }
+
+    /// Spawn a coordinator whose test hooks are already installed BEFORE the worker
+    /// thread starts, so the worker can never emit `WorkerBeforeWakeReceive` (or any
+    /// probe) before the test's hook exists. Only tests use it; production goes through
+    /// [`StatusCoordinator::spawn`], which installs no hooks.
+    #[cfg(test)]
+    fn spawn_with_hooks(
+        store: Box<dyn StatusStore>,
+        first_fault: Option<Arc<FirstFault>>,
+        hooks: TestHooks,
+    ) -> Result<Self, TranscriptPumpError> {
+        let shared = Arc::new(SharedStatusState {
+            inner: Mutex::new(CoordinatorInner::new()),
+            hooks,
+        });
+        Self::spawn_worker(shared, store, first_fault)
+    }
+
+    /// Start the worker thread over an already-constructed shared state and wire up the
+    /// wake channel and join handle. Because the caller has fully built `shared` — hooks
+    /// included — before this runs, the worker observes every installed probe from its
+    /// first idle boundary onward.
+    fn spawn_worker(
+        shared: Arc<SharedStatusState>,
+        mut store: Box<dyn StatusStore>,
+        first_fault: Option<Arc<FirstFault>>,
+    ) -> Result<Self, TranscriptPumpError> {
         let (wake_tx, wake_rx) = sync_channel::<()>(1);
         let worker_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
@@ -1103,10 +1755,13 @@ impl StatusCoordinator {
                     if let Some(latch) = &first_fault {
                         latch.publish(&TranscriptPumpError::new(STATUS_WORKER_PANIC));
                     }
-                    // Acknowledge and account any work the panic abandoned so no
-                    // submitter hangs and the balance holds, then surface the panic
-                    // while preserving any Complete and periodic errors already seen.
-                    worker_shared.reconcile_abandoned();
+                    // The worker stack — and any store call — has unwound, so the catch
+                    // owns abandonment authority: it can no longer publish a real store
+                    // result. Acknowledge and account any abandoned work so no submitter
+                    // hangs and the balance holds, then surface the panic while
+                    // preserving any Complete and periodic errors already seen.
+                    let authority = AbandonmentAuthority::assume_worker_abandoned();
+                    worker_shared.reconcile_abandoned(&authority);
                     let inner = worker_shared.inner.lock().unwrap();
                     StatusSettlement {
                         diagnostics: inner.diagnostics.clone(),
@@ -1133,33 +1788,48 @@ impl StatusCoordinator {
         }
     }
 
+    /// Enqueue a required status into the shared deque and return the submitter's
+    /// blocking waiter, or a typed shutdown error accounted as disconnected. This does
+    /// NOT wake the worker: `submit_required` wakes immediately afterwards, while a test
+    /// may withhold the wake to drive wake disconnection around a blocked submitter.
+    fn enqueue_required(
+        &self,
+        status: PumpStatus,
+    ) -> Result<RequiredAckWaiter, TranscriptPumpError> {
+        let (resolver, waiter) = new_ack();
+        let mut inner = self.shared.inner.lock().unwrap();
+        inner.diagnostics.submitted += 1;
+        if inner.shutdown {
+            inner.diagnostics.disconnected += 1;
+            return Err(TranscriptPumpError::new(
+                "persist pump status: status coordinator already shut down",
+            ));
+        }
+        let id = RequiredCommandId(inner.next_command_id);
+        inner.next_command_id += 1;
+        inner.required.push_back(RequiredCommand {
+            id,
+            status,
+            resolver,
+            lifecycle: QueuedLifecycle::Queued,
+        });
+        Ok(waiter)
+    }
+
     /// Submit a required status and block until the worker acknowledges its
     /// persistence. A write failure or a worker that already shut down is a typed
     /// terminal infrastructure failure, because the durable diagnostic must be
     /// independently observable.
     fn submit_required(&self, status: PumpStatus) -> Result<(), TranscriptPumpError> {
-        let (ack_tx, ack_rx) = sync_channel::<Result<(), String>>(1);
-        {
-            let mut inner = self.shared.inner.lock().unwrap();
-            inner.diagnostics.submitted += 1;
-            if inner.shutdown {
-                inner.diagnostics.disconnected += 1;
-                return Err(TranscriptPumpError::new(
-                    "persist pump status: status coordinator already shut down",
-                ));
-            }
-            inner.required.push_back(RequiredCommand {
-                status,
-                ack: ack_tx,
-            });
-        }
+        let waiter = self.enqueue_required(status)?;
         self.wake();
-        match ack_rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(TranscriptPumpError::new(err)),
-            Err(_) => Err(TranscriptPumpError::new(
-                "persist pump status: status worker disconnected",
-            )),
+        // Block on the idempotent one-shot until the worker or an authorized
+        // reconciler fixes this command's exact result. A published store
+        // result or an authorized termination boundary resolves the waiter; a
+        // live `Pending` store frame that never returns can still block it.
+        match waiter.wait() {
+            Ok(()) => Ok(()),
+            Err(err) => Err(TranscriptPumpError::new(err)),
         }
     }
 
@@ -1207,6 +1877,10 @@ impl StatusCoordinator {
             inner.terminal = Some(spec);
         }
         self.wake();
+        // Probe the pre-join boundary outside both locks: the terminal is queued and the
+        // worker may still be inside a live store call. A blocked or unauthorized
+        // reconciler here must not synthesize a result before the join.
+        self.shared.emit_finish_before_join();
         let mut settlement = match self.join.take() {
             Some(join) => join.join().unwrap_or_else(|_| {
                 // The worker panicked while persisting a status. Its terminal write
@@ -1222,6 +1896,9 @@ impl StatusCoordinator {
                 ..StatusSettlement::default()
             },
         };
+        // The worker join has completed, so `finish` owns abandonment authority: the
+        // worker can no longer publish a real store result.
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
         // If the worker exited (panicked or disconnected) before processing the
         // terminal, its spec lingers unprocessed. Account it as a disconnected
         // submission and reconcile any other abandoned work, so the returned
@@ -1234,7 +1911,7 @@ impl StatusCoordinator {
                 inner.diagnostics.disconnected += 1;
             }
         }
-        self.shared.reconcile_abandoned();
+        self.shared.reconcile_abandoned(&authority);
         // Drop the wake sender and mark shutdown so any later submission is accounted
         // as disconnected rather than silently ignored.
         self.wake = None;
@@ -1250,12 +1927,23 @@ impl StatusCoordinator {
 
 impl Drop for StatusCoordinator {
     fn drop(&mut self) {
-        // On an unwind that skipped `finish`, end the worker so no periodic write
-        // lands after the caller stops using the coordinator: dropping the wake
-        // sender disconnects the worker's receive, and joining it settles the thread.
+        // On an unwind that skipped `finish`, end the worker so no periodic write lands
+        // after the caller stops using the coordinator. `drop` mirrors the authoritative
+        // part of `finish`: remove the wake sender so the worker's receive disconnects,
+        // join the worker, and only THEN — with the store frame provably gone — create
+        // abandonment authority and reconcile any residual work idempotently. Neither
+        // path may synthesize a `Pending` result before the join proves it is safe.
         if let Some(join) = self.join.take() {
             self.wake = None;
+            // Probe the post-disconnect, pre-join boundary outside both locks: the worker
+            // may still be inside a live store call, and an unauthorized reconciler here
+            // must not preempt its real result.
+            self.shared.emit_drop_wake_disconnected_before_join();
             let _ = join.join();
+            // The join completed, so `drop` now owns abandonment authority. Reconcile any
+            // residual abandoned work once more (idempotent) and mark shutdown.
+            let authority = AbandonmentAuthority::assume_worker_abandoned();
+            self.shared.reconcile_abandoned(&authority);
             if let Ok(mut inner) = self.shared.inner.lock() {
                 inner.shutdown = true;
             }
@@ -1275,15 +1963,20 @@ fn run_status_worker(
     loop {
         loop {
             match shared.next_work() {
-                Work::Required(cmd) => {
-                    let RequiredCommand { mut status, ack } = cmd;
-                    // Stamp live projected transport diagnostics so the persisted
-                    // Running document carries a self-consistent view, not zeros.
-                    status.transport = shared.projected_write_diagnostics();
-                    shared.begin_write(WriteKind::Required);
+                Work::Required(accepted) => {
+                    // The acknowledgement resolver already lives in the shared active
+                    // record (installed atomically with the queue removal) and the
+                    // status already carries its projected transport.
+                    let AcceptedRequired { id, status } = accepted;
                     let result = store.write(&status);
-                    shared.record_write(&result, WriteKind::Required);
-                    let _ = ack.send(result);
+                    // The first transition after the store returns publishes the exact
+                    // raw result as `Observed`, before any classification, accounting,
+                    // probe, or acknowledgement work.
+                    shared.publish_observed(id, result);
+                    // Settle from that observed truth: no abandonment authority is
+                    // needed because the store already returned. This applies accounting
+                    // once, resolves the one-shot outside the lock, and cleans up.
+                    shared.settle_active(None);
                 }
                 Work::Periodic(mut status) => {
                     status.transport = shared.projected_write_diagnostics();
@@ -1297,11 +1990,18 @@ fn run_status_worker(
                 Work::Idle => break,
             }
         }
+        // Probe the idle boundary outside both locks: the worker has drained all work and
+        // is about to block on the wake channel, so a test can withhold a wake to drive
+        // wake disconnection around a queued submitter.
+        shared.emit_worker_before_wake_receive();
         if wake_rx.recv().is_err() {
             // The coordinator was dropped without a terminal (an unwind that skipped
-            // finish). Reconcile any abandoned work so no submitter hangs and the
+            // finish). The worker is outside any store call and commits to loop exit,
+            // so it owns abandonment authority: no store frame or owned real result
+            // remains. Reconcile any abandoned work so no submitter hangs and the
             // balance holds.
-            shared.reconcile_abandoned();
+            let authority = AbandonmentAuthority::assume_worker_abandoned();
+            shared.reconcile_abandoned(&authority);
             return StatusSettlement {
                 diagnostics: shared.diagnostics(),
                 periodic_error: shared.periodic_error(),
@@ -1385,7 +2085,7 @@ fn write_accounted_terminal(
     let (projected, periodic_error) = {
         let mut inner = shared.inner.lock().unwrap();
         inner.diagnostics.submitted += 1;
-        inner.active_write = Some(kind);
+        inner.in_flight = Some(kind);
         let mut projected = inner.diagnostics.clone();
         projected.written += 1;
         (projected, inner.periodic_error.clone())
@@ -1712,6 +2412,1862 @@ mod tests {
             None,
             StatusTransportDiagnostics::default(),
         )
+    }
+
+    /// Build a bare shared coordinator state with no worker thread, so each active and
+    /// queued transition can be driven and probed deterministically. Tests reach the
+    /// coordinator's private state directly (a child module sees its parent's private
+    /// items), which is exactly the deterministic-probe surface the packet asks for.
+    fn test_shared() -> Arc<SharedStatusState> {
+        Arc::new(SharedStatusState {
+            inner: Mutex::new(CoordinatorInner::new()),
+            hooks: TestHooks::default(),
+        })
+    }
+
+    /// Enqueue a required command directly (as `submit_required` would, minus the
+    /// blocking wait), returning its id and the submitter's waiter.
+    fn test_enqueue_required(
+        shared: &SharedStatusState,
+        status: PumpStatus,
+    ) -> (RequiredCommandId, RequiredAckWaiter) {
+        let (resolver, waiter) = new_ack();
+        let mut inner = shared.inner.lock().unwrap();
+        inner.diagnostics.submitted += 1;
+        let id = RequiredCommandId(inner.next_command_id);
+        inner.next_command_id += 1;
+        inner.required.push_back(RequiredCommand {
+            id,
+            status,
+            resolver,
+            lifecycle: QueuedLifecycle::Queued,
+        });
+        (id, waiter)
+    }
+
+    /// Clone every shared `Resolving` entry's id and resolver from the single required
+    /// deque, so a test can probe one-shot observability without holding the coordinator
+    /// lock.
+    fn test_resolving_resolvers(
+        shared: &SharedStatusState,
+    ) -> Vec<(RequiredCommandId, RequiredAckResolver)> {
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .required
+            .iter()
+            .filter(|e| matches!(e.lifecycle, QueuedLifecycle::Resolving { .. }))
+            .map(|e| (e.id, e.resolver.clone()))
+            .collect()
+    }
+
+    /// Enqueue a required command already retired to `Resolving` with a chosen static
+    /// immutable error, applying its disconnected accounting once — the state authorized
+    /// retirement produces — so a test can prepare distinct shared resolving identities
+    /// and detect any result swap between them. Returns its id and the submitter's
+    /// waiter.
+    fn test_enqueue_resolving(
+        shared: &SharedStatusState,
+        status: PumpStatus,
+        immutable_error: &'static str,
+    ) -> (RequiredCommandId, RequiredAckWaiter) {
+        let (resolver, waiter) = new_ack();
+        let mut inner = shared.inner.lock().unwrap();
+        inner.diagnostics.submitted += 1;
+        inner.diagnostics.disconnected += 1;
+        let id = RequiredCommandId(inner.next_command_id);
+        inner.next_command_id += 1;
+        inner.required.push_back(RequiredCommand {
+            id,
+            status,
+            resolver,
+            lifecycle: QueuedLifecycle::Resolving { immutable_error },
+        });
+        (id, waiter)
+    }
+
+    /// Install a `BeforeQueuedRetirementCommit` probe.
+    fn set_before_queued_retirement_commit(
+        shared: &SharedStatusState,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *shared.hooks.before_queued_retirement_commit.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Install a `QueuedRetiringBeforeCleanup` probe.
+    fn set_queued_retiring_before_cleanup(
+        shared: &SharedStatusState,
+        hook: impl Fn(RequiredCommandId) + Send + Sync + 'static,
+    ) {
+        *shared.hooks.queued_retiring_before_cleanup.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Install an `ActivePrepared` probe.
+    fn set_active_prepared(
+        shared: &SharedStatusState,
+        hook: impl Fn(RequiredCommandId) + Send + Sync + 'static,
+    ) {
+        *shared.hooks.active_prepared.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Install an `ActiveRetiringBeforeCleanup` probe.
+    fn set_active_retiring_before_cleanup(
+        shared: &SharedStatusState,
+        hook: impl Fn(RequiredCommandId) + Send + Sync + 'static,
+    ) {
+        *shared.hooks.active_retiring_before_cleanup.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Install a `FinishBeforeJoin` probe.
+    fn set_finish_before_join(shared: &SharedStatusState, hook: impl Fn() + Send + Sync + 'static) {
+        *shared.hooks.finish_before_join.lock().unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Install a `DropWakeDisconnectedBeforeJoin` probe.
+    fn set_drop_wake_disconnected_before_join(
+        shared: &SharedStatusState,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) {
+        *shared
+            .hooks
+            .drop_wake_disconnected_before_join
+            .lock()
+            .unwrap() = Some(Arc::new(hook));
+    }
+
+    /// Clone the current active record's resolver, if any, with both locks released.
+    fn test_active_resolver(shared: &SharedStatusState) -> Option<RequiredAckResolver> {
+        shared
+            .inner
+            .lock()
+            .unwrap()
+            .active_required
+            .as_ref()
+            .map(|a| a.resolver.clone())
+    }
+
+    #[test]
+    fn required_acceptance_atomically_moves_ack_from_queue_to_active() {
+        // Atomic acceptance B1: selecting the next required write removes the exact
+        // command from the FIFO and installs its acknowledgement resolver as an active
+        // record in Accepted/Pending as one lock-held transition — never an interval
+        // where the command is neither queued nor active.
+        let shared = test_shared();
+        let (id, waiter) = test_enqueue_required(&shared, running_status());
+
+        // Before acceptance: queued, not active.
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert_eq!(inner.required.len(), 1, "the command is queued");
+            assert!(inner.active_required.is_none(), "nothing is active yet");
+        }
+
+        let accepted = shared
+            .accept_next_required()
+            .expect("the queued required command is accepted");
+        assert_eq!(accepted.id, id, "the exact queued command is accepted");
+
+        // After acceptance: removed from the FIFO and owned by the active record in
+        // Accepted/Pending, with the SAME identity — the two mutations are one step.
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert!(inner.required.is_empty(), "the command left the FIFO");
+            let active = inner
+                .active_required
+                .as_ref()
+                .expect("its resolver is now the active record");
+            assert_eq!(active.id, id, "the exact command is active");
+            assert!(
+                matches!(active.phase, ActivePhase::Pending),
+                "the accepted write is Accepted/Pending"
+            );
+            // The projected transport was stamped under the same lock.
+            assert_eq!(
+                accepted.status.transport.written, 1,
+                "the accepted status carries a self-consistent projected accounting"
+            );
+        }
+
+        // The resolver moved (not recreated): resolving the active record's resolver
+        // delivers to the original submitter's exact waiter.
+        let resolver = test_active_resolver(&shared).expect("an active resolver");
+        resolver.resolve_once(Ok(()));
+        assert_eq!(
+            waiter.wait(),
+            Ok(()),
+            "the moved resolver wakes the exact submitter"
+        );
+
+        // A second selection while a write is already active is refused: the single
+        // worker never selects a second required write.
+        assert!(
+            shared.accept_next_required().is_none(),
+            "no second required is selected while one is active"
+        );
+    }
+
+    #[test]
+    fn pending_accepted_write_unwind_resolves_once_as_write_failure() {
+        // Atomic acceptance B2: a Pending accepted write settled with abandonment
+        // authority fixes the caller's one-shot to the bounded accepted-write
+        // worker-unwind diagnostic, counts it once as a write failure (never
+        // disconnected or written), and invents no store result. Repeating the settle
+        // neither re-accounts nor re-resolves it.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        shared.accept_next_required().expect("accepted");
+
+        // The worker provably unwound (abandonment began right after acceptance).
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.settle_active(Some(&authority));
+
+        let result = waiter.wait();
+        let err = result.expect_err("a Pending unwind resolves as a failure");
+        assert!(
+            err.contains("panicked"),
+            "the caller's one-shot carries the accepted-write worker-unwind diagnostic: {err}"
+        );
+
+        let d = shared.diagnostics();
+        assert_eq!(
+            d.write_failures, 1,
+            "counted once as a write failure: {d:?}"
+        );
+        assert_eq!(d.written, 0, "no store result was invented: {d:?}");
+        assert_eq!(d.disconnected, 0, "not disconnected: {d:?}");
+        assert!(
+            d.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("panicked")),
+            "the unwind is the transport last_error: {d:?}"
+        );
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "the record is cleaned after its one-shot is observable"
+        );
+
+        // Idempotent: a repeated authorized settle neither re-accounts nor re-resolves.
+        shared.settle_active(Some(&authority));
+        let d = shared.diagnostics();
+        assert_eq!(
+            d.write_failures, 1,
+            "still exactly one write failure: {d:?}"
+        );
+    }
+
+    #[test]
+    fn live_worker_pending_result_cannot_be_synthesized_by_direct_reconcile() {
+        // Atomic acceptance B2: while a live gated worker is inside the store call
+        // (Accepted/Pending), a direct reconciler WITHOUT abandonment authority leaves
+        // the record owned and unresolved and changes no accounting. The worker's
+        // eventual actual store result then wins — invented unwind never preempts it.
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let store = GatedStore {
+            writes: Arc::clone(&writes),
+            entered: entered_tx,
+            gate: gate_rx,
+        };
+        let mut coordinator = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+        let shared = Arc::clone(&coordinator.shared);
+
+        // Submit a required status on another thread (so it wakes the worker); it
+        // blocks on its one-shot until the store returns.
+        std::thread::scope(|s| {
+            let submitter = s.spawn(|| coordinator.submit_required(running_status()));
+
+            // The worker accepted it and is now blocked inside the store call: Pending.
+            assert_eq!(entered_rx.recv().unwrap(), PumpState::Running);
+            assert!(
+                matches!(
+                    shared
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .active_required
+                        .as_ref()
+                        .map(|a| &a.phase),
+                    Some(ActivePhase::Pending)
+                ),
+                "the accepted write is Pending while the store call is in flight"
+            );
+
+            // Repeated direct reconcilers without authority — through both the whole
+            // settle path and the raw prepare step — leave Pending owned and unresolved
+            // and change no accounting. No authority means no synthesis at any layer.
+            shared.settle_active(None);
+            shared.settle_active(None);
+            assert!(
+                shared.prepare_active(None).is_none(),
+                "prepare without authority never synthesizes a Pending result"
+            );
+            let resolver = test_active_resolver(&shared).expect("still active and owned");
+            assert!(
+                !resolver.is_observable(),
+                "the live worker's one-shot is not resolved by an unauthorized reconcile"
+            );
+            {
+                let inner = shared.inner.lock().unwrap();
+                assert!(
+                    matches!(
+                        inner.active_required.as_ref().map(|a| &a.phase),
+                        Some(ActivePhase::Pending)
+                    ),
+                    "the record stays Pending, never advanced by an unauthorized reconcile"
+                );
+            }
+            let d = shared.diagnostics();
+            assert_eq!(
+                (d.written, d.write_failures, d.disconnected),
+                (0, 0, 0),
+                "an unauthorized reconcile changes no accounting: {d:?}"
+            );
+            assert!(
+                writes.lock().unwrap().is_empty(),
+                "the gated store has not yet recorded anything"
+            );
+
+            // Release the store: the worker's actual success is the one exact result.
+            for _ in 0..4 {
+                let _ = gate_tx.send(());
+            }
+            submitter
+                .join()
+                .unwrap()
+                .expect("the exact real store success wins, not an invented unwind");
+        });
+
+        // The store actually recorded the exact required status; the real write is what
+        // reached durability.
+        assert_eq!(
+            writes.lock().unwrap().first().map(|s| s.state),
+            Some(PumpState::Running),
+            "the real required status was persisted by the worker"
+        );
+
+        let settlement =
+            coordinator.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+        // Exactly the required write and the terminal write are written; nothing was
+        // synthesized as a failure or a disconnect.
+        assert_eq!(
+            settlement.diagnostics.written, 2,
+            "exactly the real required and terminal writes landed: {:?}",
+            settlement.diagnostics
+        );
+        assert_eq!(
+            (
+                settlement.diagnostics.write_failures,
+                settlement.diagnostics.disconnected
+            ),
+            (0, 0),
+            "no failure or disconnect was synthesized: {:?}",
+            settlement.diagnostics
+        );
+        assert!(
+            settlement.diagnostics.is_balanced(),
+            "diagnostics balance independently: {:?}",
+            settlement.diagnostics
+        );
+        assert!(coordinator.is_quiescent(), "settlement is quiescent");
+    }
+
+    #[test]
+    fn live_pending_write_overlapping_finish_keeps_real_result() {
+        // Active boundary recovery B2: `finish` overlapping a live pending required store
+        // call leaves the pending result owned until the real store result returns. At
+        // the FinishBeforeJoin boundary an unauthorized reconciler cannot preempt it;
+        // only the worker's real result wins, and post-join authority reconciles the rest.
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let store = GatedStore {
+            writes: Arc::clone(&writes),
+            entered: entered_tx,
+            gate: gate_rx,
+        };
+        let mut coordinator = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+        let shared = Arc::clone(&coordinator.shared);
+
+        // Enqueue and wake; the worker accepts and blocks inside the gated store: Pending.
+        let waiter = coordinator
+            .enqueue_required(running_status())
+            .expect("enqueued");
+        coordinator.wake();
+        assert_eq!(entered_rx.recv().unwrap(), PumpState::Running);
+
+        // The submitter blocks on its standalone waiter; it does not borrow the
+        // coordinator, so `finish` can still take &mut self.
+        let submitter = std::thread::spawn(move || waiter.wait());
+
+        // FinishBeforeJoin: assert the live write is still Pending, prove an unauthorized
+        // reconciler has no effect, then release the store so the real result wins.
+        {
+            let hook_shared = Arc::clone(&shared);
+            let gate_tx = gate_tx.clone();
+            set_finish_before_join(&shared, move || {
+                assert!(
+                    matches!(
+                        hook_shared
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .active_required
+                            .as_ref()
+                            .map(|a| &a.phase),
+                        Some(ActivePhase::Pending)
+                    ),
+                    "the accepted write is still Pending at FinishBeforeJoin"
+                );
+                hook_shared.settle_active(None);
+                assert!(
+                    test_active_resolver(&hook_shared).is_some_and(|r| !r.is_observable()),
+                    "an unauthorized reconciler cannot resolve the live pending write"
+                );
+                for _ in 0..8 {
+                    let _ = gate_tx.send(());
+                }
+            });
+        }
+
+        let settlement =
+            coordinator.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+        assert_eq!(
+            submitter.join().unwrap(),
+            Ok(()),
+            "the real store result wins"
+        );
+        assert_eq!(
+            writes.lock().unwrap().first().map(|s| s.state),
+            Some(PumpState::Running),
+            "the real required status was persisted"
+        );
+        assert_eq!(
+            settlement.diagnostics.written, 2,
+            "the real required and terminal writes landed: {:?}",
+            settlement.diagnostics
+        );
+        assert_eq!(
+            (
+                settlement.diagnostics.write_failures,
+                settlement.diagnostics.disconnected
+            ),
+            (0, 0),
+            "no synthesized failure or disconnect: {:?}",
+            settlement.diagnostics
+        );
+        assert!(
+            settlement.diagnostics.is_balanced(),
+            "diagnostics balance independently: {:?}",
+            settlement.diagnostics
+        );
+        assert!(coordinator.is_quiescent(), "quiescent after finish");
+    }
+
+    #[test]
+    fn live_pending_write_overlapping_drop_keeps_real_result() {
+        // Active boundary recovery B2 (the active wake-disconnect case): dropping the
+        // coordinator removes the wake sender while a real required store call is still
+        // gated. At DropWakeDisconnectedBeforeJoin an unauthorized reconciler has no
+        // effect; only the worker's real result wins, and post-join authority reconciles
+        // residual state.
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let store = GatedStore {
+            writes: Arc::clone(&writes),
+            entered: entered_tx,
+            gate: gate_rx,
+        };
+        let mut coordinator = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+        let shared = Arc::clone(&coordinator.shared);
+
+        let waiter = coordinator
+            .enqueue_required(running_status())
+            .expect("enqueued");
+        coordinator.wake();
+        assert_eq!(entered_rx.recv().unwrap(), PumpState::Running);
+
+        let submitter = std::thread::spawn(move || waiter.wait());
+
+        // DropWakeDisconnectedBeforeJoin: the wake sender is already removed, but the
+        // worker is still inside the gated required store call (Pending). Prove an
+        // unauthorized reconciler has no effect, then release the store.
+        {
+            let hook_shared = Arc::clone(&shared);
+            let gate_tx = gate_tx.clone();
+            set_drop_wake_disconnected_before_join(&shared, move || {
+                assert!(
+                    matches!(
+                        hook_shared
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .active_required
+                            .as_ref()
+                            .map(|a| &a.phase),
+                        Some(ActivePhase::Pending)
+                    ),
+                    "the accepted write is still Pending at DropWakeDisconnectedBeforeJoin"
+                );
+                hook_shared.settle_active(None);
+                assert!(
+                    test_active_resolver(&hook_shared).is_some_and(|r| !r.is_observable()),
+                    "an unauthorized reconciler cannot resolve the live pending write"
+                );
+                for _ in 0..4 {
+                    let _ = gate_tx.send(());
+                }
+            });
+        }
+
+        drop(coordinator);
+        assert_eq!(
+            submitter.join().unwrap(),
+            Ok(()),
+            "the real store result wins before post-join authority"
+        );
+        assert_eq!(
+            writes.lock().unwrap().first().map(|s| s.state),
+            Some(PumpState::Running),
+            "the real required status was persisted, not synthesized"
+        );
+        // After the drop join, residual state is reconciled and balanced. There is no
+        // terminal in the drop path, so only the real required write landed.
+        let d = shared.diagnostics();
+        assert_eq!(
+            d.written, 1,
+            "exactly the real required write landed: {d:?}"
+        );
+        assert_eq!(
+            (d.write_failures, d.disconnected),
+            (0, 0),
+            "nothing was synthesized: {d:?}"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(shared.is_quiescent(), "quiescent after drop");
+    }
+
+    #[test]
+    fn wake_disconnect_resolves_a_blocked_queued_submitter() {
+        // Wake-disconnect proof B1: a never-woken queued submitter is resolved by the
+        // worker's OWN ordinary wake-disconnect reconciliation, proven by joining the raw
+        // worker handle directly — before coordinator Drop or any post-join reconciliation
+        // could run. The idle probe is installed BEFORE the worker starts, and the worker
+        // is held at that probe (a barrier) while the test enqueues without a wake, so the
+        // proof uses synchronization rather than scheduling probability.
+        let (store, writes) = RecordingStore::new();
+
+        // Build the idle barrier and install it into the hooks BEFORE the worker thread
+        // starts: the worker signals it is idle and then blocks until the test releases
+        // it. Pre-installing the probe is what makes the worker unable to reach `recv`
+        // before the hook exists.
+        let (idle_tx, idle_rx) = mpsc::channel();
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let hooks = TestHooks::default();
+        {
+            let release = Arc::clone(&release);
+            *hooks.worker_before_wake_receive.lock().unwrap() = Some(Arc::new(move || {
+                let _ = idle_tx.send(());
+                release.wait();
+            }));
+        }
+        let mut coordinator =
+            StatusCoordinator::spawn_with_hooks(Box::new(store), None, hooks).unwrap();
+        let shared = Arc::clone(&coordinator.shared);
+
+        // Wait until the worker has drained all work and is held inside the idle probe,
+        // before `recv`. Anything enqueued next can never be seen as work.
+        idle_rx.recv().unwrap();
+
+        // Enqueue a required command WITHOUT waking the idle worker.
+        let waiter = coordinator
+            .enqueue_required(running_status())
+            .expect("enqueued");
+
+        // Take and drop the wake sender while the coordinator remains alive, so the
+        // worker's next `recv` observes disconnection.
+        coordinator.wake = None;
+        // Take the raw worker join handle out of the coordinator WITHOUT dropping the
+        // coordinator, so the join below invokes neither coordinator Drop nor its
+        // post-join reconciliation.
+        let worker = coordinator
+            .join
+            .take()
+            .expect("the raw worker handle is present");
+
+        // Release the idle barrier: the worker enters `recv`, observes disconnection,
+        // reconciles the never-woken queued submitter, and exits.
+        release.wait();
+
+        // Join the raw handle directly — only the worker path has run so far. Capture the
+        // raw worker settlement so the ordinary wake-disconnect path is proven directly:
+        // if the ordinary disconnected-receive branch panicked, the worker wrapper's catch
+        // would perform fallback reconciliation and return `worker_error=Some(...)`, so the
+        // per-field checks below would fail even though the caller was still resolved.
+        let settlement = worker.join().expect("the worker joins cleanly");
+
+        // Before consuming the waiter, prove the acknowledgement is ALREADY observable:
+        // the worker's own wake-disconnect reconciliation resolved it, not Drop. Removing
+        // that reconciliation makes this assertion fail here, without hanging.
+        assert!(
+            waiter.test_is_observable(),
+            "the worker's wake-disconnect reconciliation resolved the caller before Drop"
+        );
+
+        // All four error fields are absent: the settlement came from the ordinary worker
+        // path, not from a periodic write failure, a terminal settlement failure, a
+        // Complete-to-Failed fallback, or the panic-catch worker fallback.
+        assert!(
+            settlement.periodic_error.is_none(),
+            "no periodic write failed on the wake-disconnect path: {:?}",
+            settlement.periodic_error
+        );
+        assert!(
+            settlement.settlement_error.is_none(),
+            "no terminal settlement failed on the wake-disconnect path: {:?}",
+            settlement.settlement_error
+        );
+        assert!(
+            settlement.fallback_error.is_none(),
+            "no Complete-to-Failed fallback ran on the wake-disconnect path: {:?}",
+            settlement.fallback_error
+        );
+        assert!(
+            settlement.worker_error.is_none(),
+            "the worker exited the ordinary disconnect path without a panic-catch fallback: {:?}",
+            settlement.worker_error
+        );
+
+        // The raw worker settlement's own diagnostics equal the exact ordinary-disconnect
+        // tuple, independently of the shared-diagnostics check below.
+        let s = &settlement.diagnostics;
+        assert_eq!(
+            (
+                s.submitted,
+                s.written,
+                s.coalesced,
+                s.dropped,
+                s.disconnected,
+                s.write_failures,
+            ),
+            (1, 0, 0, 0, 1, 0),
+            "the raw worker settlement carries the exact queued-disconnect tuple: {s:?}"
+        );
+
+        assert_eq!(
+            waiter
+                .wait()
+                .expect_err("the queued submitter is resolved disconnected"),
+            QUEUED_REQUIRED_DISCONNECT,
+            "the exact immutable disconnected result reaches the blocked caller"
+        );
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "the never-woken command never reached the store"
+        );
+
+        // Exact diagnostics before Drop, balanced independently, and quiescent.
+        let d = shared.diagnostics();
+        assert_eq!(
+            (
+                d.submitted,
+                d.written,
+                d.coalesced,
+                d.dropped,
+                d.disconnected,
+                d.write_failures,
+            ),
+            (1, 0, 0, 0, 1, 0),
+            "the exact queued-disconnect diagnostic tuple: {d:?}"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after wake disconnection"
+        );
+
+        // Drop the still-alive coordinator last. Its join handle is already gone, so Drop
+        // performs no reconciliation.
+        drop(coordinator);
+    }
+
+    #[test]
+    fn shutdown_refuses_required_acceptance() {
+        // Shutdown acceptance B1: once the coordinator is shut down, acceptance refuses a
+        // still-queued entry under the coordinator lock and leaves its identity and
+        // resolver owned by the shared queue. Authorized reconciliation later delivers the
+        // exact disconnected result, and the final diagnostics are the exact balanced
+        // tuple with a quiescent shared state.
+        let shared = test_shared();
+        let (id, waiter) = test_enqueue_required(&shared, running_status());
+
+        // Shut the coordinator down while the entry is still queued and shared.
+        shared.inner.lock().unwrap().shutdown = true;
+
+        // Acceptance refuses under the lock and moves nothing.
+        assert!(
+            shared.accept_next_required().is_none(),
+            "acceptance refuses a queued entry after shutdown"
+        );
+
+        // The same identity, resolver, and unresolved waiter remain owned by the shared
+        // queue; nothing became active.
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert_eq!(
+                inner.required.len(),
+                1,
+                "the entry stays in the shared deque"
+            );
+            let front = inner.required.front().expect("the entry is still owned");
+            assert_eq!(front.id, id, "the same identity is owned by the queue");
+            assert!(
+                matches!(front.lifecycle, QueuedLifecycle::Queued),
+                "shutdown does not itself retire the entry"
+            );
+            assert!(
+                inner.active_required.is_none(),
+                "nothing was moved to an active write"
+            );
+        }
+        assert!(
+            !waiter.test_is_observable(),
+            "the queued waiter stays unresolved while it remains shared"
+        );
+
+        // Authorized reconciliation delivers the exact disconnected result to the caller.
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.reconcile_abandoned(&authority);
+        assert_eq!(
+            waiter
+                .wait()
+                .expect_err("the queued submitter is resolved disconnected"),
+            QUEUED_REQUIRED_DISCONNECT,
+            "authorized reconciliation delivers exactly the disconnected result"
+        );
+
+        let d = shared.diagnostics();
+        assert_eq!(
+            (
+                d.submitted,
+                d.written,
+                d.coalesced,
+                d.dropped,
+                d.disconnected,
+                d.write_failures,
+            ),
+            (1, 0, 0, 0, 1, 0),
+            "the exact shutdown-disconnect diagnostic tuple: {d:?}"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after reconciliation"
+        );
+    }
+
+    #[test]
+    fn active_and_queued_required_writes_reconcile_distinctly() {
+        // Atomic acceptance B2: with one Pending active write and a distinct queued
+        // write, an unauthorized reconcile leaves both owned; an authorized reconcile
+        // settles the active write from its own truth and disconnects the queued one,
+        // each caller observing its exact own result with no diagnostic crossing.
+        let shared = test_shared();
+        let (_active_id, active_waiter) = test_enqueue_required(&shared, running_status());
+        shared.accept_next_required().expect("active accepted");
+        let (_queued_id, queued_waiter) = test_enqueue_required(&shared, running_status());
+
+        // Unauthorized: active Pending stays owned, the queued command stays queued.
+        shared.settle_active(None);
+        shared.resolve_queued();
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert!(
+                matches!(
+                    inner.active_required.as_ref().map(|a| &a.phase),
+                    Some(ActivePhase::Pending)
+                ),
+                "the active write is still Pending"
+            );
+            assert_eq!(
+                inner.required.len(),
+                1,
+                "the queued command is still queued"
+            );
+            assert!(
+                inner
+                    .required
+                    .iter()
+                    .all(|e| matches!(e.lifecycle, QueuedLifecycle::Queued)),
+                "an unauthorized reconcile never retires a queued command"
+            );
+        }
+
+        // Authorized: the active write settles as an unwind failure; the queued write
+        // is disconnected. The two callers observe distinct results.
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.reconcile_abandoned(&authority);
+
+        let active_result = active_waiter
+            .wait()
+            .expect_err("active resolves to a failure");
+        let queued_result = queued_waiter
+            .wait()
+            .expect_err("queued resolves disconnected");
+        assert!(
+            active_result.contains("before acknowledging an accepted required write"),
+            "the active caller gets the accepted-write unwind diagnostic: {active_result}"
+        );
+        assert!(
+            queued_result.contains("disconnected"),
+            "the queued caller gets the disconnected diagnostic: {queued_result}"
+        );
+        assert_ne!(
+            active_result, queued_result,
+            "no diagnostic crosses between the active and queued callers"
+        );
+
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "one active write failure: {d:?}");
+        assert_eq!(d.disconnected, 1, "one queued disconnect: {d:?}");
+        assert!(shared.is_quiescent(), "settlement is quiescent: {d:?}");
+    }
+
+    #[test]
+    fn observed_required_store_error_survives_unwind_before_ack() {
+        // Observed store outcomes B1: once the store's exact error is published as
+        // Observed (the first transition after return), a later worker unwind before
+        // acknowledgement preserves that exact bounded error in the caller, the
+        // transport last_error, and the write-failure accounting — a generic
+        // worker-unwind diagnostic never replaces it.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+
+        // The store returned this exact error; publish it as the first transition.
+        shared.publish_observed(accepted.id, Err("exact store boom".to_string()));
+
+        // The worker then unwinds before acknowledgement: reconcile with authority.
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.reconcile_abandoned(&authority);
+
+        let err = waiter.wait().expect_err("the caller keeps the store error");
+        assert_eq!(err, "exact store boom", "the exact observed error survives");
+        assert!(
+            !err.contains("panicked"),
+            "a generic worker-unwind diagnostic never replaces the observed error: {err}"
+        );
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "one write failure: {d:?}");
+        assert_eq!(
+            d.last_error.as_deref(),
+            Some("exact store boom"),
+            "the transport last_error keeps the exact error: {d:?}"
+        );
+    }
+
+    #[test]
+    fn observed_required_success_survives_unwind_before_ack() {
+        // Observed store outcomes B2: an observed success survives a later worker
+        // unwind as success, counted as one written submission, not a write failure.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        shared.publish_observed(accepted.id, Ok(()));
+
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.reconcile_abandoned(&authority);
+
+        assert_eq!(waiter.wait(), Ok(()), "observed success stays success");
+        let d = shared.diagnostics();
+        assert_eq!(d.written, 1, "counted once as written: {d:?}");
+        assert_eq!(d.write_failures, 0, "no write failure: {d:?}");
+    }
+
+    #[test]
+    fn observed_required_results_resolve_exactly_once() {
+        // Observed store outcomes B2: the caller resolves from the observed result
+        // exactly once and accounting is applied once, whether success or failure, even
+        // under repeated settlement.
+        for (observed, expect_written, expect_failures) in
+            [(Ok(()), 1u64, 0u64), (Err("boom".to_string()), 0u64, 1u64)]
+        {
+            let shared = test_shared();
+            let (_id, waiter) = test_enqueue_required(&shared, running_status());
+            let accepted = shared.accept_next_required().expect("accepted");
+            shared.publish_observed(accepted.id, observed.clone());
+
+            // Normal worker settlement needs no authority: the store already returned.
+            shared.settle_active(None);
+            // Repeated settlement neither re-resolves nor re-accounts.
+            shared.settle_active(None);
+            let authority = AbandonmentAuthority::assume_worker_abandoned();
+            shared.settle_active(Some(&authority));
+
+            match &observed {
+                Ok(()) => assert_eq!(waiter.wait(), Ok(()), "success resolves once"),
+                Err(e) => assert_eq!(
+                    waiter.wait().expect_err("failure resolves once"),
+                    *e,
+                    "the exact error resolves once"
+                ),
+            }
+            let d = shared.diagnostics();
+            assert_eq!(d.written, expect_written, "written once: {d:?}");
+            assert_eq!(d.write_failures, expect_failures, "failure once: {d:?}");
+            assert!(
+                shared.inner.lock().unwrap().active_required.is_none(),
+                "the record is cleaned after its result is observable"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_active_record_remains_recoverable_until_matching_cleanup() {
+        // Observed store outcomes B2: after accounting/resolution preparation the
+        // active record stays recoverable until its one-shot is observable; resolving
+        // it makes it Resolved/Retiring (still present); only matching cleanup removes
+        // it, and a non-matching identity never clears it.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        let id = accepted.id;
+        shared.publish_observed(id, Ok(()));
+
+        // Prepare (Accepted/Prepared): accounting applied, record recoverable, one-shot
+        // not yet observable.
+        let (prepared_id, resolver, result) = shared.prepare_active(None).expect("prepared");
+        assert_eq!(prepared_id, id);
+        {
+            let inner = shared.inner.lock().unwrap();
+            let active = inner.active_required.as_ref().expect("still recoverable");
+            assert!(matches!(active.phase, ActivePhase::Prepared { .. }));
+        }
+        assert!(
+            !resolver.is_observable(),
+            "Accepted/Prepared: the one-shot is not yet observable"
+        );
+
+        // Resolve the one-shot: the still-present record is now Resolved/Retiring.
+        resolver.resolve_once(result);
+        assert!(resolver.is_observable(), "the one-shot is now observable");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_some(),
+            "Resolved/Retiring: the record is recoverable until matching cleanup"
+        );
+
+        // A non-matching cleanup identity never clears this record.
+        shared.cleanup_active_if_observable(RequiredCommandId(9999), true);
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_some(),
+            "cleanup targets one exact identity"
+        );
+
+        // Matching cleanup removes it.
+        shared.cleanup_active_if_observable(id, true);
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "matching cleanup transitions Resolved/Retiring to cleaned"
+        );
+        assert_eq!(waiter.wait(), Ok(()), "the submitter observed its result");
+    }
+
+    #[test]
+    fn active_prepared_unwind_resumes_exact_result_once() {
+        // Active boundary recovery B1: an unwind at the ActivePrepared probe — the shared
+        // record is installed as Prepared with its exact result and accounting fixed, but
+        // its one-shot has not resolved — leaves the record recoverable. A resumed settler
+        // delivers the same exact result once, re-accounts nothing, and cleans one id.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        shared.publish_observed(accepted.id, Err("exact active boom".to_string()));
+
+        set_active_prepared(&shared, |_id| panic!("injected prepared unwind"));
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| shared.settle_active(None)));
+        assert!(
+            unwound.is_err(),
+            "the probe forced an unwind at the Prepared boundary"
+        );
+
+        // The record is Prepared and recoverable; accounting was applied once; the
+        // one-shot has not resolved.
+        {
+            let inner = shared.inner.lock().unwrap();
+            let active = inner.active_required.as_ref().expect("still recoverable");
+            assert_eq!(active.id, accepted.id, "the same identity is recoverable");
+            assert!(
+                matches!(active.phase, ActivePhase::Prepared { .. }),
+                "Prepared boundary"
+            );
+        }
+        let resolver = test_active_resolver(&shared).expect("still owned");
+        assert!(
+            !resolver.is_observable(),
+            "the one-shot did not resolve before the unwind"
+        );
+        assert_eq!(
+            shared.diagnostics().write_failures,
+            1,
+            "accounting applied once"
+        );
+
+        // Resume: the same exact result is delivered once and the record is cleaned.
+        set_active_prepared(&shared, |_id| {});
+        shared.settle_active(None);
+        assert_eq!(
+            waiter.wait().expect_err("resumes to the exact result"),
+            "exact active boom",
+            "the resumed settler delivers the exact result, never a replacement"
+        );
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "no re-accounting on resume: {d:?}");
+        assert_eq!(d.written, 0, "no success invented: {d:?}");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "matching cleanup removed exactly the resumed identity"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after resume"
+        );
+    }
+
+    #[test]
+    fn active_prepared_concurrent_settler_converges() {
+        // Active boundary recovery B1: several settlers held together at the ActivePrepared
+        // boundary converge on one exact result, one accounting transition, and one
+        // cleanup — never a duplicate, replacement, or crossed identity.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        shared.publish_observed(accepted.id, Err("converge boom".to_string()));
+
+        let settlers = 6;
+        let barrier = Arc::new(std::sync::Barrier::new(settlers));
+        {
+            let barrier = Arc::clone(&barrier);
+            set_active_prepared(&shared, move |_id| {
+                // Hold every settler at the Prepared boundary before any resolves.
+                barrier.wait();
+            });
+        }
+        std::thread::scope(|s| {
+            for _ in 0..settlers {
+                let shared = &shared;
+                s.spawn(move || shared.settle_active(None));
+            }
+        });
+
+        assert_eq!(
+            waiter.wait().expect_err("resolves once"),
+            "converge boom",
+            "every settler converges on the one exact result"
+        );
+        let d = shared.diagnostics();
+        assert_eq!(
+            d.write_failures, 1,
+            "accounting applied exactly once: {d:?}"
+        );
+        assert_eq!(d.written, 0, "no success invented: {d:?}");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "the active identity is cleaned exactly once"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after convergence"
+        );
+    }
+
+    #[test]
+    fn active_retiring_unwind_resumes_without_replacement() {
+        // Active boundary recovery B1: an unwind at the ActiveRetiringBeforeCleanup probe
+        // — the exact result is already observable but the record is not yet cleaned —
+        // leaves the record recoverable. A resumed settler cleans the matching id without
+        // replacing the delivered result or re-accounting it.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        shared.publish_observed(accepted.id, Err("retiring boom".to_string()));
+
+        set_active_retiring_before_cleanup(&shared, |_id| panic!("injected retiring unwind"));
+        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| shared.settle_active(None)));
+        assert!(
+            unwound.is_err(),
+            "the probe forced an unwind at the retiring boundary"
+        );
+
+        // The one-shot is observable but the record is not yet cleaned.
+        let resolver = test_active_resolver(&shared).expect("still recoverable");
+        assert!(
+            resolver.is_observable(),
+            "the exact result is already observable"
+        );
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_some(),
+            "RetiringBeforeCleanup: the record is recoverable until matching cleanup"
+        );
+
+        // Resume: the delivered result is unchanged and the matching id is cleaned once.
+        set_active_retiring_before_cleanup(&shared, |_id| {});
+        shared.settle_active(None);
+        assert_eq!(
+            waiter.wait().expect_err("keeps the delivered result"),
+            "retiring boom",
+            "the resumed settler never replaces the delivered result"
+        );
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "no re-accounting on resume: {d:?}");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "matching cleanup removed exactly the retiring identity"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after resume"
+        );
+    }
+
+    #[test]
+    fn active_retiring_concurrent_cleanup_targets_one_id() {
+        // Active boundary recovery B1: several settlers held together at the retiring
+        // boundary — each with the one-shot already observable — converge so that cleanup
+        // targets exactly one matching id, delivering the result once with one accounting
+        // transition.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        let accepted = shared.accept_next_required().expect("accepted");
+        shared.publish_observed(accepted.id, Ok(()));
+
+        let settlers = 6;
+        let barrier = Arc::new(std::sync::Barrier::new(settlers));
+        {
+            let barrier = Arc::clone(&barrier);
+            set_active_retiring_before_cleanup(&shared, move |_id| {
+                // Hold every settler at the retiring boundary before any cleans up.
+                barrier.wait();
+            });
+        }
+        std::thread::scope(|s| {
+            for _ in 0..settlers {
+                let shared = &shared;
+                s.spawn(move || shared.settle_active(None));
+            }
+        });
+
+        assert_eq!(
+            waiter.wait(),
+            Ok(()),
+            "the one exact result is delivered once"
+        );
+        let d = shared.diagnostics();
+        assert_eq!(d.written, 1, "accounting applied exactly once: {d:?}");
+        assert_eq!(d.write_failures, 0, "no failure invented: {d:?}");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "cleanup targeted exactly one matching id"
+        );
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(
+            shared.is_quiescent(),
+            "shared state is quiescent after convergence"
+        );
+    }
+
+    #[test]
+    fn pending_reconciliation_requires_worker_abandonment_authority() {
+        // Reconciliation convergence B1: at the Pending boundary a reconciler without
+        // abandonment authority leaves the record owned, unresolved, and unaccounted;
+        // only after the explicit worker-exit token may pending reconciliation proceed.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        shared.accept_next_required().expect("accepted");
+
+        // Released before any worker-exit event: no state, accounting, or result moves.
+        shared.settle_active(None);
+        let resolver = test_active_resolver(&shared).expect("still owned");
+        assert!(!resolver.is_observable(), "Pending stays unresolved");
+        let d = shared.diagnostics();
+        assert_eq!(
+            (d.written, d.write_failures),
+            (0, 0),
+            "no accounting: {d:?}"
+        );
+
+        // After the worker-exit/join token, pending reconciliation proceeds once.
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.settle_active(Some(&authority));
+        assert!(
+            waiter.wait().is_err(),
+            "authorized reconciliation resolves the pending write"
+        );
+        assert_eq!(shared.diagnostics().write_failures, 1);
+    }
+
+    #[test]
+    fn concurrent_reconciliation_resolves_active_ack_once() {
+        // Reconciliation convergence B1: several authorized reconcilers racing one
+        // Pending active write converge on one immutable caller result, one accounting
+        // transition, and one cleanup — never a duplicate or replacement.
+        let shared = test_shared();
+        let (_id, waiter) = test_enqueue_required(&shared, running_status());
+        shared.accept_next_required().expect("accepted");
+
+        let racers = 8;
+        let barrier = std::sync::Barrier::new(racers);
+        std::thread::scope(|s| {
+            for _ in 0..racers {
+                let shared = &shared;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    let authority = AbandonmentAuthority::assume_worker_abandoned();
+                    shared.settle_active(Some(&authority));
+                });
+            }
+        });
+
+        assert!(waiter.wait().is_err(), "the one-shot resolves exactly once");
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "accounting applied once: {d:?}");
+        assert_eq!(d.written, 0, "no success invented: {d:?}");
+        assert!(
+            shared.inner.lock().unwrap().active_required.is_none(),
+            "the active identity is cleaned exactly once"
+        );
+    }
+
+    #[test]
+    fn coordinator_worker_finish_drop_reconcile_interleavings_converge() {
+        // Reconciliation convergence B1: normal completion, worker-panic recovery, wake
+        // disconnection via drop, and repeated authorized reconciliation each converge
+        // on one balanced, quiescent settlement without blocking, losing, replacing, or
+        // duplicating a diagnostic.
+
+        // Normal finish: the caller sees success; settlement is balanced and quiescent.
+        {
+            let (store, _w) = RecordingStore::new();
+            let mut c = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+            assert!(c.submit_required(running_status()).is_ok());
+            let s = c.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+            assert!(s.diagnostics.is_balanced(), "balanced: {:?}", s.diagnostics);
+            assert!(c.is_quiescent(), "quiescent after normal finish");
+            assert_eq!(s.diagnostics.write_failures, 0);
+        }
+
+        // Worker panic + finish, then a repeated authorized reconcile: the crashed
+        // write is one write failure, the terminal is disconnected, balance holds, and
+        // repeated reconciliation neither duplicates nor replaces the diagnostic.
+        {
+            let mut c = StatusCoordinator::spawn(Box::new(PanicStore), None).unwrap();
+            assert!(c.submit_required(running_status()).is_err());
+            let s = c.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+            assert!(s.diagnostics.is_balanced(), "balanced: {:?}", s.diagnostics);
+            assert!(c.is_quiescent(), "quiescent after panic finish");
+            assert_eq!(s.diagnostics.write_failures, 1);
+            assert_eq!(s.diagnostics.disconnected, 1);
+
+            let before = c.shared.diagnostics();
+            let authority = AbandonmentAuthority::assume_worker_abandoned();
+            c.shared.reconcile_abandoned(&authority);
+            let after = c.shared.diagnostics();
+            assert_eq!(
+                (before.written, before.write_failures, before.disconnected),
+                (after.written, after.write_failures, after.disconnected),
+                "repeated reconciliation is idempotent: {before:?} vs {after:?}"
+            );
+            assert!(c.is_quiescent());
+        }
+
+        // Wake disconnection: dropping an idle coordinator ends the worker through its
+        // wake-disconnect reconcile path without hanging.
+        {
+            let (store, _w) = RecordingStore::new();
+            let c = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+            drop(c); // returns only if the worker converged and joined
+        }
+    }
+
+    #[test]
+    fn worker_termination_preserves_each_required_ack_identity_and_accounting() {
+        // Reconciliation convergence B2: authorized termination finds one active write
+        // and three distinct queued writes. It settles the active caller from its own
+        // truth and, under the lock, retires every queued command in place to Resolving
+        // in the single shared deque — keeping its resolver, stable identity, immutable
+        // disconnected result, and exactly-once accounting BEFORE any outside-lock
+        // delivery. Each caller then observes its exact own result once; no diagnostic
+        // crosses identities.
+        let shared = test_shared();
+
+        // Active write with its own distinct observed error.
+        let (_a, active_waiter) = test_enqueue_required(&shared, running_status());
+        let active = shared.accept_next_required().expect("active accepted");
+        shared.publish_observed(active.id, Err("active boom".to_string()));
+
+        // Three distinct queued writes.
+        let (b_id, b_wait) = test_enqueue_required(&shared, running_status());
+        let (c_id, c_wait) = test_enqueue_required(&shared, running_status());
+        let (d_id, d_wait) = test_enqueue_required(&shared, running_status());
+
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        // Settle the active caller from its own truth first.
+        shared.settle_active(Some(&authority));
+        assert_eq!(
+            active_waiter
+                .wait()
+                .expect_err("active keeps its own error"),
+            "active boom",
+            "the active caller keeps its own observed error, not a disconnect"
+        );
+
+        // Retire every queued command in place to Resolving under the lock.
+        shared.retire_queued(&authority);
+        // Before any delivery: all three are shared, accounted, and unresolved.
+        let resolvers = test_resolving_resolvers(&shared);
+        assert_eq!(
+            resolvers.len(),
+            3,
+            "all queued retired in place to Resolving"
+        );
+        let ids: Vec<_> = resolvers.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&b_id) && ids.contains(&c_id) && ids.contains(&d_id),
+            "each stable command identity is preserved in shared ownership"
+        );
+        for (_, r) in &resolvers {
+            assert!(!r.is_observable(), "no one-shot resolves before delivery");
+        }
+        let d = shared.diagnostics();
+        assert_eq!(
+            d.disconnected, 3,
+            "disconnected accounting applied once: {d:?}"
+        );
+
+        // Now deliver outside the lock; each caller observes its own result once.
+        shared.resolve_queued();
+        assert!(b_wait.wait().is_err(), "queued b resolves");
+        assert!(c_wait.wait().is_err(), "queued c resolves");
+        assert!(d_wait.wait().is_err(), "queued d resolves");
+
+        let d = shared.diagnostics();
+        assert_eq!(d.write_failures, 1, "one active write failure: {d:?}");
+        assert_eq!(d.disconnected, 3, "three queued disconnects: {d:?}");
+        assert!(d.is_balanced(), "balanced: {d:?}");
+        assert!(shared.is_quiescent(), "settlement is quiescent");
+    }
+
+    #[test]
+    fn queued_resolvers_remain_shared_across_pre_delivery_unwind() {
+        // Reconciliation convergence B2: an unwind after every queued command is retired
+        // in place to Resolving but before any one-shot resolution leaves every resolver
+        // authority in the shared deque; a resumed/concurrent reconciler completes them.
+        // A local vector is never the last owner.
+        let shared = test_shared();
+        let (_b, b_wait) = test_enqueue_required(&shared, running_status());
+        let (_c, c_wait) = test_enqueue_required(&shared, running_status());
+
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.retire_queued(&authority);
+
+        // The reconciler unwinds here — before calling resolve_queued. Every resolver
+        // remains owned by shared state and unresolved.
+        let resolvers = test_resolving_resolvers(&shared);
+        assert_eq!(
+            resolvers.len(),
+            2,
+            "both resolvers stay in shared ownership"
+        );
+        for (_, r) in &resolvers {
+            assert!(
+                !r.is_observable(),
+                "no resolver was lost to (or resolved by) a local vector"
+            );
+        }
+
+        // A resumed reconciler completes delivery; no waiter was lost.
+        shared.resolve_queued();
+        assert!(b_wait.wait().is_err(), "b resumes to disconnect");
+        assert!(c_wait.wait().is_err(), "c resumes to disconnect");
+        assert!(shared.is_quiescent(), "quiescent after resume");
+    }
+
+    #[test]
+    fn queued_resolution_resumes_after_one_delivery_without_loss_or_swap() {
+        // Reconciliation convergence B2: an unwind after one queued result becomes
+        // observable and before the rest resolve is resumed by a later reconciler; every
+        // caller observes its own result once, and the delivered entry's original
+        // resolver stays shared until matching cleanup.
+        let shared = test_shared();
+        let (b_id, b_wait) = test_enqueue_required(&shared, running_status());
+        let (_c, c_wait) = test_enqueue_required(&shared, running_status());
+
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        shared.retire_queued(&authority);
+
+        // Deliver exactly one one-shot (the FIFO-first entry), then "unwind" before the
+        // rest resolve — the shared entry is not yet cleaned.
+        let resolvers = test_resolving_resolvers(&shared);
+        assert_eq!(
+            resolvers[0].0, b_id,
+            "the first shared entry is FIFO-first (b)"
+        );
+        resolvers[0].1.resolve_once(Err("x".to_string()));
+        assert!(resolvers[0].1.is_observable(), "b's one-shot is observable");
+        assert!(!resolvers[1].1.is_observable(), "c is not yet resolved");
+        // The delivered entry's original resolver is still shared (not the last owner).
+        assert_eq!(
+            test_resolving_resolvers(&shared).len(),
+            2,
+            "both entries remain shared until matching cleanup"
+        );
+
+        // Resume: a later reconciler completes the rest and cleans up; no loss.
+        shared.resolve_queued();
+        assert!(b_wait.wait().is_err(), "b keeps its own delivered result");
+        assert!(c_wait.wait().is_err(), "c resumes without loss");
+        assert!(shared.is_quiescent(), "quiescent after resume");
+    }
+
+    #[test]
+    fn queued_precommit_unwind_keeps_every_resolver_shared() {
+        // Shared queued ownership B1: an unwind at the BeforeQueuedRetirementCommit probe
+        // — before the lock-held Queued->Resolving commit — leaves every never-accepted
+        // command shared, queued, unresolved, and unaccounted, so a later authorized
+        // reconciliation resumes it. The single required deque is the only owner
+        // throughout: no ownership transfer container exists to lose a resolver.
+        let shared = test_shared();
+        let (_b, b_wait) = test_enqueue_required(&shared, running_status());
+        let (_c, c_wait) = test_enqueue_required(&shared, running_status());
+        let (_d, d_wait) = test_enqueue_required(&shared, running_status());
+
+        // Clone each queued resolver up front so observability can be probed without the
+        // coordinator lock.
+        let queued_resolvers: Vec<RequiredAckResolver> = shared
+            .inner
+            .lock()
+            .unwrap()
+            .required
+            .iter()
+            .map(|e| e.resolver.clone())
+            .collect();
+
+        // Inject an unwind at the pre-commit probe.
+        set_before_queued_retirement_commit(&shared, || panic!("injected pre-commit unwind"));
+        let authority = AbandonmentAuthority::assume_worker_abandoned();
+        let unwound =
+            std::panic::catch_unwind(AssertUnwindSafe(|| shared.retire_queued(&authority)));
+        assert!(
+            unwound.is_err(),
+            "the probe forced an unwind before the commit"
+        );
+
+        // Every entry stays shared, queued, and unresolved; nothing was accounted, and
+        // the FIFO was never shut, because the lock-held commit was never taken.
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert_eq!(
+                inner.required.len(),
+                3,
+                "every command stays in the shared deque"
+            );
+            assert!(
+                inner
+                    .required
+                    .iter()
+                    .all(|e| matches!(e.lifecycle, QueuedLifecycle::Queued)),
+                "no entry was retired before the commit"
+            );
+            assert!(!inner.shutdown, "the untaken commit left shutdown unset");
+            assert_eq!(inner.diagnostics.disconnected, 0, "nothing was accounted");
+        }
+        for r in &queued_resolvers {
+            assert!(!r.is_observable(), "no one-shot resolved before the commit");
+        }
+
+        // Resume: clear the probe and retire again. Every entry retires in place and
+        // resolves once; every waiter observes its own disconnect and settlement is
+        // quiescent.
+        set_before_queued_retirement_commit(&shared, || {});
+        shared.retire_queued(&authority);
+        {
+            let inner = shared.inner.lock().unwrap();
+            assert!(inner.shutdown, "the resumed commit shut the FIFO");
+            assert_eq!(
+                inner.diagnostics.disconnected, 3,
+                "each entry accounted disconnected exactly once on resume"
+            );
+            assert!(
+                inner.required.iter().all(|e| matches!(
+                    e.lifecycle,
+                    QueuedLifecycle::Resolving { immutable_error }
+                        if immutable_error == QUEUED_REQUIRED_DISCONNECT
+                )),
+                "every entry retired in place to Resolving with the static disconnect error"
+            );
+        }
+        shared.resolve_queued();
+        assert_eq!(
+            b_wait.wait().expect_err("b resolves"),
+            QUEUED_REQUIRED_DISCONNECT,
+            "b resumes to exactly its own disconnect result"
+        );
+        assert_eq!(
+            c_wait.wait().expect_err("c resolves"),
+            QUEUED_REQUIRED_DISCONNECT,
+            "c resumes to exactly its own disconnect result"
+        );
+        assert_eq!(
+            d_wait.wait().expect_err("d resolves"),
+            QUEUED_REQUIRED_DISCONNECT,
+            "d resumes to exactly its own disconnect result"
+        );
+        let d = shared.diagnostics();
+        assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+        assert!(shared.is_quiescent(), "quiescent after resume");
+    }
+
+    #[test]
+    fn queued_resolution_resumes_after_one_without_result_swap() {
+        // Shared queued ownership B2: shared Resolving entries with DISTINCT static
+        // immutable errors resolve without swapping results, whether two concurrent
+        // reconcilers select the same identity or one delivery unwinds after a result is
+        // observable. Each original waiter receives its own exact string, accounting
+        // applies once, and settlement reaches quiescence. A final block proves ordinary
+        // production retirement fixes exactly QUEUED_REQUIRED_DISCONNECT for every entry.
+        static ERR_A: &str = "persist pump status: queued disconnect A";
+        static ERR_B: &str = "persist pump status: queued disconnect B";
+
+        // --- Concurrent same-identity delivery preserves each exact result ---
+        // Two reconcilers race one deque of two shared Resolving entries. Selection
+        // always returns the front Resolving entry, so both reconcilers select the same
+        // identity; a barrier holds both at the post-observability, pre-cleanup boundary
+        // for that identity before either cleans it. The idempotent one-shot and
+        // matching-id cleanup keep each caller's exact own result and account once.
+        {
+            let shared = test_shared();
+            let (a_id, a_wait) = test_enqueue_resolving(&shared, running_status(), ERR_A);
+            let (b_id, b_wait) = test_enqueue_resolving(&shared, running_status(), ERR_B);
+
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            {
+                let seen = Arc::clone(&seen);
+                let barrier = Arc::clone(&barrier);
+                set_queued_retiring_before_cleanup(&shared, move |id| {
+                    seen.lock().unwrap().push(id);
+                    // Hold both reconcilers at the same identity's boundary before either
+                    // removes it, so the same stable id is provably selected concurrently.
+                    barrier.wait();
+                });
+            }
+
+            std::thread::scope(|s| {
+                let shared = &shared;
+                s.spawn(move || shared.resolve_queued());
+                s.spawn(move || shared.resolve_queued());
+            });
+
+            // Each ORIGINAL waiter receives its OWN exact string — never the other's.
+            assert_eq!(
+                a_wait.wait().expect_err("a resolves"),
+                ERR_A,
+                "a keeps its own result"
+            );
+            assert_eq!(
+                b_wait.wait().expect_err("b resolves"),
+                ERR_B,
+                "b keeps its own result"
+            );
+
+            // Both reconcilers selected each stable identity — proof of concurrent same-id
+            // selection — and accounting applied once per entry.
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen.iter().filter(|id| **id == a_id).count(),
+                2,
+                "both reconcilers selected a's stable id: {seen:?}"
+            );
+            assert_eq!(
+                seen.iter().filter(|id| **id == b_id).count(),
+                2,
+                "both reconcilers selected b's stable id: {seen:?}"
+            );
+            let d = shared.diagnostics();
+            assert_eq!(
+                d.disconnected, 2,
+                "disconnected accounting applied once per entry: {d:?}"
+            );
+            assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+            assert!(
+                shared.is_quiescent(),
+                "quiescent after concurrent resolution"
+            );
+        }
+
+        // --- Post-observability unwind resumes without loss or swap ---
+        // An unwind fires after one result becomes observable but before cleanup. The
+        // delivered entry's ORIGINAL resolver stays shared; a resumed reconciler
+        // completes every delivery, and each caller keeps its own exact string.
+        {
+            let shared = test_shared();
+            let (_a, a_wait) = test_enqueue_resolving(&shared, running_status(), ERR_A);
+            let (_b, b_wait) = test_enqueue_resolving(&shared, running_status(), ERR_B);
+
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let fired = Arc::clone(&fired);
+                set_queued_retiring_before_cleanup(&shared, move |_id| {
+                    if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        panic!("injected post-observability unwind");
+                    }
+                });
+            }
+            let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| shared.resolve_queued()));
+            assert!(
+                unwound.is_err(),
+                "the probe forced an unwind after one result was observable"
+            );
+            assert_eq!(
+                test_resolving_resolvers(&shared).len(),
+                2,
+                "both entries — including the delivered one — remain shared until cleanup"
+            );
+
+            // Resume completes delivery; each caller keeps its own exact result.
+            shared.resolve_queued();
+            assert_eq!(
+                a_wait.wait().expect_err("a resumes"),
+                ERR_A,
+                "a keeps its own result"
+            );
+            assert_eq!(
+                b_wait.wait().expect_err("b resumes"),
+                ERR_B,
+                "b keeps its own result"
+            );
+            let d = shared.diagnostics();
+            assert_eq!(
+                d.disconnected, 2,
+                "accounting applied once per entry across resume: {d:?}"
+            );
+            assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+            assert!(shared.is_quiescent(), "quiescent after resume");
+        }
+
+        // --- Production retirement fixes exactly QUEUED_REQUIRED_DISCONNECT ---
+        {
+            let shared = test_shared();
+            let (_p, p_wait) = test_enqueue_required(&shared, running_status());
+            let (_q, q_wait) = test_enqueue_required(&shared, running_status());
+            let authority = AbandonmentAuthority::assume_worker_abandoned();
+            shared.retire_queued(&authority);
+            {
+                let inner = shared.inner.lock().unwrap();
+                assert!(
+                    inner.required.iter().all(|e| matches!(
+                        e.lifecycle,
+                        QueuedLifecycle::Resolving { immutable_error }
+                            if immutable_error == QUEUED_REQUIRED_DISCONNECT
+                    )),
+                    "ordinary retirement fixes exactly QUEUED_REQUIRED_DISCONNECT for every entry"
+                );
+                assert_eq!(
+                    inner.diagnostics.disconnected, 2,
+                    "every entry accounted once"
+                );
+            }
+            shared.resolve_queued();
+            assert_eq!(
+                p_wait.wait().expect_err("p resolves"),
+                QUEUED_REQUIRED_DISCONNECT,
+                "the production caller gets exactly the disconnect diagnostic"
+            );
+            assert_eq!(
+                q_wait.wait().expect_err("q resolves"),
+                QUEUED_REQUIRED_DISCONNECT,
+                "every production caller gets exactly the disconnect diagnostic"
+            );
+            let d = shared.diagnostics();
+            assert!(d.is_balanced(), "diagnostics balance independently: {d:?}");
+            assert!(
+                shared.is_quiescent(),
+                "quiescent after production retirement"
+            );
+        }
+    }
+
+    /// A store that fails every Running write, fails the Complete write with a
+    /// distinct error, and panics on the Failed fallback, so periodic, terminal
+    /// settlement, fallback, and worker termination can all fail in one capture.
+    struct CompositeFailureStore;
+
+    impl StatusStore for CompositeFailureStore {
+        fn write(&mut self, status: &PumpStatus) -> Result<(), String> {
+            match status.state {
+                PumpState::Running => Err("running write failure".to_string()),
+                PumpState::Complete => Err("Complete write failure".to_string()),
+                PumpState::Failed => panic!("simulated Failed fallback panic"),
+            }
+        }
+    }
+
+    #[test]
+    fn settlement_result_retains_all_distinct_failures() {
+        // Composite settlement and quiescence B1: when periodic persistence, terminal
+        // settlement, the Failed fallback, and worker termination each fail during one
+        // capture, the typed result retains every diagnostic in its distinct field
+        // without replacing the immutable primary or the exact observed required-write
+        // result delivered to its caller.
+        let latch = Arc::new(FirstFault::default());
+        let mut coordinator =
+            StatusCoordinator::spawn(Box::new(CompositeFailureStore), Some(Arc::clone(&latch)))
+                .unwrap();
+
+        // The required caller observes its own exact store error, resolved once.
+        let required = coordinator
+            .submit_required(running_status())
+            .expect_err("the required write fails");
+        assert!(
+            required.message().contains("running write failure"),
+            "the observed required-write result reaches its caller unchanged: {required}"
+        );
+
+        // A best-effort periodic write also fails (drained before the terminal).
+        coordinator.submit_periodic(running_status());
+        let settlement =
+            coordinator.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+
+        let err = settlement
+            .terminal_failure()
+            .expect("a composite terminal failure, never silent success");
+        assert!(
+            err.periodic_error()
+                .is_some_and(|e| e.contains("running write failure")),
+            "the periodic failure is retained distinctly: {err:?}"
+        );
+        assert!(
+            err.settlement_error()
+                .is_some_and(|e| e.contains("Complete write failure")),
+            "the terminal-settlement failure is retained distinctly: {err:?}"
+        );
+        assert!(
+            err.fallback_error()
+                .is_some_and(|e| e.contains(STATUS_WORKER_PANIC)),
+            "the fallback failure is retained distinctly: {err:?}"
+        );
+        assert_eq!(
+            err.worker_error(),
+            Some(STATUS_WORKER_PANIC),
+            "the worker termination is retained distinctly: {err:?}"
+        );
+        assert!(
+            err.message().contains("Complete write failure"),
+            "the immutable primary is not replaced by a later diagnostic: {err}"
+        );
+        assert!(
+            err.transport().is_some_and(|t| t.is_balanced()),
+            "the balanced transport is retained: {err:?}"
+        );
+    }
+
+    #[test]
+    fn failure_settlement_is_exact_and_quiescent() {
+        // Composite settlement and quiescence B2: an ordinary terminal store failure
+        // settles with exact terminal-inclusive counts satisfying the balance equation
+        // and leaves no active, accepted, prepared, resolved/retiring, queued, or
+        // shared-resolving state.
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let store = FailStateStore {
+            attempts: Arc::clone(&attempts),
+            fail: vec![PumpState::Complete],
+        };
+        let mut coordinator = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+
+        coordinator
+            .submit_required(running_status())
+            .expect("the required write succeeds");
+        let settlement =
+            coordinator.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+
+        let d = &settlement.diagnostics;
+        // Required (written) + Complete terminal (write failure) + Failed fallback
+        // (written): three submissions, two written, one write failure.
+        assert_eq!(d.submitted, 3, "exact submissions: {d:?}");
+        assert_eq!(d.written, 2, "exact written: {d:?}");
+        assert_eq!(d.write_failures, 1, "exact write failures: {d:?}");
+        assert_eq!(d.coalesced, 0, "exact coalesced: {d:?}");
+        assert_eq!(d.dropped, 0, "exact dropped: {d:?}");
+        assert_eq!(d.disconnected, 0, "exact disconnected: {d:?}");
+        assert!(d.is_balanced(), "terminal-inclusive balance holds: {d:?}");
+        assert!(
+            coordinator.is_quiescent(),
+            "no residual state after failure"
+        );
+        {
+            let inner = coordinator.shared.inner.lock().unwrap();
+            assert!(
+                inner.active_required.is_none(),
+                "no active/accepted/prepared record"
+            );
+            assert!(
+                inner
+                    .required
+                    .iter()
+                    .all(|e| !matches!(e.lifecycle, QueuedLifecycle::Resolving { .. })),
+                "no shared-resolving state"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_settlement_is_exact_and_quiescent() {
+        // Composite settlement and quiescence B2: a successful terminal settlement
+        // exposes exact terminal-inclusive counts and leaves no active, queued, or
+        // shared-resolving acknowledgement state behind.
+        let (store, _writes) = RecordingStore::new();
+        let mut coordinator = StatusCoordinator::spawn(Box::new(store), None).unwrap();
+
+        coordinator
+            .submit_required(running_status())
+            .expect("the required write succeeds");
+        let settlement =
+            coordinator.finish(TerminalStatusSpec::complete(0, PumpSummary::default()));
+
+        let d = &settlement.diagnostics;
+        // Required (written) + Complete terminal (written): two submissions, both written.
+        assert_eq!(d.submitted, 2, "exact submissions: {d:?}");
+        assert_eq!(d.written, 2, "exact written: {d:?}");
+        assert_eq!(
+            (d.coalesced, d.dropped, d.disconnected, d.write_failures),
+            (0, 0, 0, 0),
+            "no loss on success: {d:?}"
+        );
+        assert!(d.is_balanced(), "terminal-inclusive balance holds: {d:?}");
+        assert!(settlement.terminal_failure().is_none(), "clean success");
+        assert!(
+            coordinator.is_quiescent(),
+            "no residual state after success"
+        );
+        {
+            let inner = coordinator.shared.inner.lock().unwrap();
+            assert!(
+                inner.active_required.is_none(),
+                "no active/accepted/prepared record"
+            );
+            assert!(
+                inner
+                    .required
+                    .iter()
+                    .all(|e| !matches!(e.lifecycle, QueuedLifecycle::Resolving { .. })),
+                "no shared-resolving state"
+            );
+        }
     }
 
     #[test]

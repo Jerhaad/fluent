@@ -1,0 +1,30 @@
+---
+name: shell-test-pipelines-fail-under-pipefail
+description: Shell behavior tests run under set -euo pipefail, so a short-circuiting consumer like grep -q gives the producer SIGPIPE (exit 141) and fails the pipeline; match in-process instead
+metadata:
+  type: gotcha
+---
+
+The shell scripts under `tests/behaviors/` run with `set -euo pipefail`. Inside
+that mode any pipeline whose consumer exits early can fail even when the logic
+is correct: `printf '%s' "$1" | grep -Fq -- "$2"` short-circuits `grep` on the
+first match, `printf` then dies with `SIGPIPE` (exit 141), and `pipefail`
+propagates that non-zero `PIPESTATUS` as the pipeline's status. Against large
+multi-line output the matcher exits on an early line and the producer is still
+writing, so a *present* literal yields a false negative (`PIPESTATUS 141 0`).
+
+Prefer in-process Bash matching over a producer-consumer pipeline for
+containment checks: `[[ "$1" == *"$2"* ]]` (and `!=` for the inverse). Quote the
+needle (`"$2"`) so pattern metacharacters like `*` and `[` stay literal, and
+leave the surrounding `*` unquoted so they remain the wildcards that span the
+haystack. No pipeline means nothing to receive `SIGPIPE`.
+
+When regression-testing this class of fix, make it mutation-sensitive: build a
+deterministic haystack larger than a pipe buffer (>1 MiB via a doubling loop)
+with the literal on an early line to reproduce the SIGPIPE timing, and add a
+metacharacter case (needle `a*b` against `aZZb`) so unquoting the needle
+visibly reverses the outcome. Suppress the helper's own `FAIL:`/`Output:`
+diagnostic (`> /dev/null 2>&1`) on the sub-checks you expect to fail so the
+multi-megabyte value is not dumped.
+
+Related: [[shell-tests-invisible-to-compiler]]
