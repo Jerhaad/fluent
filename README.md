@@ -1,6 +1,6 @@
 # Fluent – a self improving software factory
 
-Fluent is an autonomous, self-improving software factory delivered as an Agent Skill.
+Fluent autonomously turns your ideas, bug reports, user feedback, production logs, and agent traces into working software.
 
 You use Fluent by chatting with Claude Code, Codex, or another coding agent that can load Agent Skills. Your agent conversation is the primary interface; you do not need to switch to a separate Fluent app to shape or run Work.
 
