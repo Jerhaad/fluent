@@ -2,6 +2,14 @@
 
 Fluent is a factory that autonomously turns your ideas, bug reports, user feedback, production logs, and agent traces into working software.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/fluent-at-a-glance-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/fluent-at-a-glance-light.png">
+    <img alt="Ideas, bugs, feedback, logs, and agent traces can become Observations, which you shape into Work Items for coding agents. Fluent's agents build, test, review, and learn; after you approve the result, Fluent produces merged code. The project's delivery system can deploy it. New findings can return as Observations, while Expertise guides future agents." src=".github/assets/fluent-at-a-glance-light.png" width="100%">
+  </picture>
+</p>
+
 You use the factory through the Fluent Agent Skill in Claude Code, Codex, or another coding agent. The skill turns your existing conversation into Fluent's interface and drives its command-line machinery for you.
 
 You can capture any of those inputs as an Observation, then shape it into one or more Work Items through conversation. Approved Work can run immediately or enter a queue; when you start the scheduler, it runs queued Work as execution capacity becomes available. Each Attempt loops through Writer → Tester → Reviewers until it passes; the Learner then captures any reusable project knowledge, and Fluent returns a ready Merge Candidate for you to inspect and land. After you approve it, the land gate updates, checks, reviews, and merges the candidate into your target branch; your delivery system can deploy it from there. Findings from shaping, building, landing, and running the software can feed the next cycle as new Observations or project Expertise.
