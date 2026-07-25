@@ -8,7 +8,7 @@ You use Fluent by chatting with Claude Code, Codex, or another coding agent that
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/fluent-overall-flow-dark.png">
     <source media="(prefers-color-scheme: light)" srcset=".github/assets/fluent-overall-flow-light.png">
-    <img alt="Fluent separates human attention from execution capacity. You shape Work by chatting with an agent that has the Fluent skill. Execution-ready Work Items wait to run, then Fluent writes, tests, reviews, and learns. Durable questions and ready candidates wait for a person without occupying an execution slot. Accepted candidates pass the land gate, while Observations and Expertise feed future Work." src=".github/assets/fluent-overall-flow-light.png" width="100%">
+    <img alt="Fluent separates human attention from execution capacity. In a conversation with an agent carrying the Fluent skill, you iteratively shape a Work Item. An Attempt runs Writer, Tester, Reviewers, and Learner; reviewer findings return to the Writer, and questions pause for human help without occupying an execution slot. You inspect and approve the ready Merge Candidate before a separate land gate updates, checks, reviews, and lands it. After land, Observations shape future Work and Expertise guides future Writers and Reviewers." src=".github/assets/fluent-overall-flow-light.png" width="100%">
   </picture>
 </p>
 
