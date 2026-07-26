@@ -7821,10 +7821,10 @@ mod tests {
 
     #[test]
     fn writer_prompts_preserve_required_progress_schema() {
-        // Required-progress production B1: when an Attempt carries a progress
-        // contract, the Writer prompt names the authoritative `## Required completion`
-        // section and instructs preserving the stable ids and requirements and
-        // attaching concrete evidence. An Attempt without a contract omits it.
+        // Review follow-up placement B1/B2: when a follow-up Writer receives a
+        // required-progress contract, the prompt keeps review work in a separate
+        // section and tells the Writer to migrate legacy rows with their nested
+        // notes. An Attempt without a contract omits the authoritative schema.
         let mut item = WorkItem {
             id: "work-1".to_string(),
             title: "Required progress".to_string(),
@@ -7846,11 +7846,25 @@ mod tests {
         );
 
         let tmp = tempfile::TempDir::new().unwrap();
+        let progress_path = tmp
+            .path()
+            .join(".fluent/work/progress/work-1/attempt-1/progress.md");
+        std::fs::create_dir_all(progress_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &progress_path,
+            "## Required completion\n\n\
+             - [x] Address review finding: Legacy\n\
+               - commit abc123\n\
+             - [ ] step-1 — Do the thing\n",
+        )
+        .unwrap();
+        let review_path = tmp.path().join("review.md");
+        std::fs::write(&review_path, "- [ ] Current finding").unwrap();
         let prompt = build_write_task_prompt_with_workspace(
             &item,
             "attempt-1",
             "attempt-1-write-1",
-            &[],
+            std::slice::from_ref(&review_path),
             None,
             Some(tmp.path()),
         );
@@ -7865,6 +7879,22 @@ mod tests {
         assert!(
             prompt.contains("Evidence:"),
             "the prompt instructs attaching concrete evidence; got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("## Review follow-ups"),
+            "the prompt names a separate review follow-up section; got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("outside `## Required completion`"),
+            "the prompt keeps follow-ups outside the authoritative section; got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("nested evidence and commit notes"),
+            "the prompt migrates legacy rows and their nested notes as a unit; got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("without re-creating or rewording"),
+            "the prompt preserves the required manifest while migrating legacy rows; got:\n{prompt}"
         );
 
         // An unmarked (legacy) Attempt omits the required-progress schema entirely.

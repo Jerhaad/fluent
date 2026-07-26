@@ -89,7 +89,7 @@ progress.md is a `- [ ]` to-do list that persists across rounds. Each item can h
     - [ ] Write integration test
 
 {{#if has_required_progress}}
-progress.md contains an authoritative `## Required completion` section the Fluent materialized from the Plan's required rows. Each top-level entry is exactly `- [ ] <stable-id> — <requirement>` or, once satisfied, `- [x] <stable-id> — <requirement>; Evidence: <source/test>`. You MUST preserve every stable id and its requirement text exactly — never add, remove, reorder, or reword an entry. Mark an entry `- [x]` only by appending `; Evidence: <the source file or test that proves it>` once it is genuinely complete. This section is the advancement gate's authority: a candidate cannot advance while any required entry is unchecked, and a review disagreement is resolved by a follow-up Writer checking the current item with concrete evidence, never by editing the schema.
+progress.md contains an authoritative `## Required completion` section the Fluent materialized from the Plan's required rows. Each top-level entry is exactly `- [ ] <stable-id> — <requirement>` or, once satisfied, `- [x] <stable-id> — <requirement>; Evidence: <source/test>`. You MUST preserve every stable id and its requirement text exactly — never add, remove, reorder, or reword an entry. Mark an entry `- [x]` only by appending `; Evidence: <the source file or test that proves it>` once it is genuinely complete. Keep this section limited to the materialized stable manifest; record review work under a separate `## Review follow-ups` section outside `## Required completion`. The required section is the advancement gate's authority: a candidate cannot advance while any required entry is unchecked, and a review disagreement is resolved by a follow-up Writer checking the current item with concrete evidence, never by editing the schema.
 
 {{/if}}
 {{#if has_progress_md}}
@@ -98,8 +98,10 @@ progress.md contains an authoritative `## Required completion` section the Fluen
 1. Create progress.md at {{progress_md_path}}: identify the steps in plan.md and turn them into a `- [ ]` to-do checklist.
 {{/if}}
 {{#if has_prior_reviews}}
-2. Remove any existing `- [ ] Address review finding:` lines from progress.md (leave `- [x] Address review finding:` lines as historical record). Then collect every `- [ ]` finding from the prior review files and add each before the first `- [ ]` item in progress.md as `- [ ] Address review finding: <title> (from <review-md-path>)`. Address these before remaining plan steps.
-3. Find the first `- [ ]` item — that is your next step.
+2. Ensure progress.md has a separate `## Review follow-ups` section outside `## Required completion`.
+3. If `## Required completion` contains legacy top-level `Address review finding:` rows, move each row and all of its nested evidence and commit notes as a unit to `## Review follow-ups`, without re-creating or rewording any required manifest row. Preserve checked findings as historical records and keep unchecked findings unresolved.
+4. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
+5. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
 {{else}}
 2. Find the first `- [ ]` item — that is your next step.
 {{/if}}
