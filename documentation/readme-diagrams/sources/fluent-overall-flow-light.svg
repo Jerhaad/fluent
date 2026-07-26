@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 390" width="680" height="390" font-family="Menlo">
+  <defs>
+    <style>
+      .lane { stroke: #ddd; stroke-width: 1; fill: #ffffff; }
+      .box { stroke: #ddd; stroke-width: 1; fill: #f6f6f6; }
+      .principal { stroke: #999; stroke-width: 1.25; fill: #f6f6f6; }
+      .title { fill: #292929; font-size: 9.5px; font-weight: 600; text-anchor: middle; }
+      .actor { fill: #292929; font-size: 8.5px; font-weight: 600; text-anchor: middle; }
+      .gate-text { fill: #292929; font-size: 7.5px; font-weight: 600; text-anchor: middle; }
+      .text { fill: #777; font-size: 8px; text-anchor: middle; }
+      .subtext { fill: #777; font-size: 7.5px; text-anchor: middle; }
+      .tiny-title { fill: #777; font-size: 6.5px; text-anchor: middle; letter-spacing: 0.4px; }
+      .lane-title { fill: #777; font-size: 8px; text-anchor: start; letter-spacing: 0.5px; }
+      .lane-note { fill: #888; font-size: 8px; text-anchor: end; }
+      .arrow { stroke: #292929; stroke-width: 1; fill: none; marker-end: url(#arrowhead); }
+      .return { stroke: #999; stroke-width: 1; fill: none; marker-end: url(#muted-arrowhead); }
+      .exchange { stroke: #999; stroke-width: 1; stroke-dasharray: 3 3; fill: none; marker-start: url(#muted-arrowhead); marker-end: url(#muted-arrowhead); }
+      .feedback { stroke: #999; stroke-width: 1; fill: none; }
+    </style>
+    <marker id="arrowhead" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#292929"/>
+    </marker>
+    <marker id="muted-arrowhead" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto-start-reverse">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#999"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="680" height="390" fill="#ffffff"/>
+
+  <!-- Human attention -->
+  <rect x="8" y="12" width="664" height="112" rx="4" class="lane"/>
+  <text x="22" y="34" class="lane-title">HUMAN ATTENTION</text>
+  <text x="658" y="34" class="lane-note">through the Fluent skill in your agent conversation</text>
+
+  <rect x="24" y="50" width="150" height="58" rx="4" class="principal"/>
+  <text x="99" y="75" class="title">shape what to build</text>
+  <text x="99" y="94" class="subtext">↻ refine until confirmed</text>
+
+  <rect x="238" y="50" width="140" height="58" rx="4" class="box"/>
+  <text x="308" y="76" class="title">unblock agents when</text>
+  <text x="308" y="91" class="title">they are stuck</text>
+
+  <rect x="430" y="50" width="185" height="58" rx="4" class="principal"/>
+  <text x="522.5" y="76" class="title">inspect and approve</text>
+  <text x="522.5" y="91" class="title">the result</text>
+
+  <!-- Execution capacity -->
+  <rect x="8" y="146" width="664" height="112" rx="4" class="lane"/>
+  <text x="22" y="168" class="lane-title">EXECUTION CAPACITY</text>
+  <text x="658" y="168" class="lane-note">compute + tools + hardware</text>
+
+  <rect x="49" y="184" width="100" height="56" rx="4" class="principal"/>
+  <text x="99" y="216" class="title">Work Item</text>
+
+  <rect x="165" y="174" width="250" height="76" rx="4" class="box"/>
+  <text x="179" y="191" class="lane-title">ATTEMPT</text>
+  <text x="290" y="213" class="actor">Writer → Tester → Reviewers → Learner</text>
+  <path d="M318 218 V241 H200 V219" class="return"/>
+  <text x="259" y="237" class="subtext">fail → revise</text>
+
+  <rect x="425" y="184" width="80" height="56" rx="4" class="principal"/>
+  <text x="465" y="207" class="actor">ready Merge</text>
+  <text x="465" y="222" class="actor">Candidate</text>
+
+  <rect x="535" y="178" width="82" height="68" rx="4" class="box"/>
+  <text x="576" y="194" class="tiny-title">LAND GATE</text>
+  <text x="576" y="214" class="gate-text">update → checks</text>
+  <text x="576" y="230" class="gate-text">reviews</text>
+
+  <rect x="632" y="185" width="40" height="54" rx="4" class="principal"/>
+  <text x="652" y="207" class="actor">target</text>
+  <text x="652" y="222" class="actor">branch</text>
+
+  <!-- Main flow and human gates -->
+  <line x1="99" y1="108" x2="99" y2="181" class="arrow"/>
+  <line x1="149" y1="212" x2="162" y2="212" class="arrow"/>
+  <line x1="415" y1="212" x2="422" y2="212" class="arrow"/>
+  <line x1="465" y1="184" x2="465" y2="111" class="arrow"/>
+  <line x1="576" y1="108" x2="576" y2="175" class="arrow"/>
+  <text x="604" y="142" class="text">approved</text>
+  <line x1="617" y1="212" x2="629" y2="212" class="arrow"/>
+  <text x="623" y="203" class="subtext">pass</text>
+
+  <!-- A durable human pause releases its execution slot -->
+  <line x1="308" y1="111" x2="308" y2="171" class="exchange"/>
+  <text x="383" y="139" class="subtext">slot released while waiting</text>
+
+  <!-- Self-improvement after land -->
+  <rect x="8" y="276" width="664" height="102" rx="4" class="lane"/>
+  <text x="22" y="298" class="lane-title">SELF-IMPROVEMENT</text>
+  <text x="658" y="298" class="lane-note">after land, learning feeds the next cycle</text>
+
+  <rect x="28" y="316" width="150" height="44" rx="4" class="box"/>
+  <text x="103" y="335" class="actor">Observations</text>
+  <text x="103" y="351" class="subtext">shape future Work</text>
+
+  <rect x="245" y="316" width="200" height="44" rx="4" class="box"/>
+  <text x="345" y="335" class="actor">Expertise</text>
+  <text x="345" y="351" class="subtext">guides future Writers + Reviewers</text>
+
+  <path d="M652 239 V370 H103" class="feedback"/>
+  <circle cx="652" cy="370" r="1.75" fill="#999"/>
+  <path d="M103 370 V363" class="return"/>
+  <path d="M345 370 V363" class="return"/>
+  <path d="M28 338 H16 V79 H21" class="return"/>
+  <path d="M345 316 V253" class="return"/>
+</svg>

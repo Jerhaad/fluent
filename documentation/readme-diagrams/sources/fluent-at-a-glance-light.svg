@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 562" width="760" height="562" font-family="Menlo">
+  <defs>
+    <style>
+      .card { fill: none; stroke: #D0D7DE; stroke-width: 1; }
+      .execution-boundary { fill: #F6F8FA; stroke: none; }
+      .learn-card { fill: #B45309; fill-opacity: 0.04; stroke: #B45309; stroke-width: 1; }
+      .signal-box, .authority-box { fill: #FFFFFF; stroke: #B45309; stroke-width: 0.9; }
+      .brand { fill: #1F2328; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
+      .tagline { fill: #59636E; font-size: 9.5px; font-weight: 400; letter-spacing: 0.1px; }
+      .interface-line { fill: #59636E; font-size: 9.5px; font-weight: 400; letter-spacing: 0.1px; text-anchor: end; }
+      .card-title { fill: #1F2328; font-size: 12px; font-weight: 600; letter-spacing: 0.45px; text-anchor: middle; }
+      .learn-title { fill: #B45309; font-size: 12px; font-weight: 600; letter-spacing: 0.45px; text-anchor: middle; }
+      .body { fill: #59636E; font-size: 8.5px; text-anchor: middle; }
+      .compact-body { fill: #59636E; font-size: 7.4px; text-anchor: middle; }
+      .approval-body { fill: #59636E; font-size: 7.2px; text-anchor: middle; }
+      .learn-body { fill: #B45309; font-size: 7.4px; text-anchor: middle; }
+      .role { fill: #1F2328; font-size: 7.2px; font-weight: 600; letter-spacing: 0.2px; text-anchor: middle; }
+      .signal-label { fill: #B45309; font-size: 6.5px; font-weight: 600; letter-spacing: 0.9px; text-anchor: middle; }
+      .signal-text { fill: #B45309; font-size: 6.2px; font-weight: 600; letter-spacing: 0.1px; text-anchor: middle; }
+      .authority-text { fill: #B45309; font-size: 6px; font-weight: 600; letter-spacing: 0.1px; text-anchor: middle; }
+      .or-text { fill: #59636E; font-size: 6px; font-weight: 600; letter-spacing: 0.4px; text-anchor: middle; }
+      .icon { fill: none; stroke: #1F2328; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
+      .learn-icon { fill: none; stroke: #B45309; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
+      .connector { fill: none; stroke: #B45309; stroke-width: 1; marker-end: url(#arrowhead); }
+      .return { fill: none; stroke: #B45309; stroke-width: 1; stroke-dasharray: 4 4; marker-end: url(#accent-arrowhead); }
+      .learning-return { fill: none; stroke: #B45309; stroke-width: 1; stroke-dasharray: 4 4; marker-end: url(#accent-arrowhead); }
+      .revision { fill: none; stroke: #B45309; stroke-width: 1; stroke-dasharray: 3 3; marker-end: url(#accent-arrowhead); }
+      .ingress { fill: none; stroke: #B45309; stroke-width: 1; marker-end: url(#accent-arrowhead); }
+      .dialogue { fill: none; stroke: #B45309; stroke-width: 1; marker-end: url(#dialogue-arrowhead); }
+      .dialogue-label { fill: #59636E; font-size: 5.2px; font-weight: 600; letter-spacing: 0.45px; text-anchor: middle; }
+      .execution-caption { fill: #59636E; font-size: 6.2px; font-weight: 500; letter-spacing: 0.05px; text-anchor: middle; }
+      .collector { fill: none; stroke: #B45309; stroke-width: 0.9; }
+      .connector-label { fill: #59636E; font-size: 6.2px; letter-spacing: 0.7px; text-anchor: middle; }
+      .side-label { fill: #59636E; font-size: 6px; font-weight: 600; letter-spacing: 0.65px; text-anchor: middle; }
+      .return-label { fill: #B45309; font-size: 6px; font-weight: 600; letter-spacing: 0.65px; text-anchor: middle; }
+    </style>
+    <marker id="arrowhead" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto">
+      <path d="M0 0 L7 3 L0 6 Z" fill="#B45309"/>
+    </marker>
+    <marker id="accent-arrowhead" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto">
+      <path d="M0 0 L7 3 L0 6 Z" fill="#B45309"/>
+    </marker>
+    <marker id="dialogue-arrowhead" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto-start-reverse">
+      <path d="M0 0 L5 2 L0 4 Z" fill="#B45309"/>
+    </marker>
+    <pattern id="dot-grid" width="14" height="14" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.65" fill="#8C959F" opacity="0.2"/>
+    </pattern>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="562" fill="#FFFFFF"/>
+  <rect x="18" y="18" width="724" height="526" fill="url(#dot-grid)"/>
+
+  <text x="34" y="38" class="brand">Fluent</text>
+  <text x="34" y="56" class="tagline">a self improving software factory</text>
+  <text x="726" y="38" class="interface-line">Use the Fluent skill to drive the factory by chatting</text>
+  <text x="726" y="56" class="interface-line">with Codex, Claude Code, or another coding agent</text>
+
+  <!-- Delegated execution may be local or remote -->
+  <rect x="506" y="126" width="240" height="418" rx="3" class="execution-boundary"/>
+  <text x="626" y="535" class="execution-caption">Delegated work runs in local sandboxes or on remote machines.</text>
+
+  <!-- Signals entering the factory -->
+  <text x="163" y="89" class="signal-label">INPUT SIGNALS</text>
+  <rect x="18" y="96" width="56" height="20" rx="2" class="signal-box"/>
+  <rect x="79" y="96" width="68" height="20" rx="2" class="signal-box"/>
+  <rect x="152" y="96" width="61" height="20" rx="2" class="signal-box"/>
+  <rect x="218" y="96" width="90" height="20" rx="2" class="signal-box"/>
+  <text x="46" y="109" class="signal-text">AGENT TRACES</text>
+  <text x="113" y="109" class="signal-text">PRODUCTION LOGS</text>
+  <text x="182.5" y="109" class="signal-text">USER FEEDBACK</text>
+  <text x="263" y="109" class="signal-text">TEAM VISION AND IDEAS</text>
+  <line x1="46" y1="116" x2="46" y2="126" class="collector"/>
+  <line x1="113" y1="116" x2="113" y2="126" class="collector"/>
+  <line x1="182.5" y1="116" x2="182.5" y2="126" class="collector"/>
+  <line x1="263" y1="116" x2="263" y2="126" class="collector"/>
+  <line x1="46" y1="126" x2="263" y2="126" class="collector"/>
+  <line x1="142" y1="126" x2="142" y2="135" class="ingress"/>
+
+  <rect x="545" y="82" width="146" height="22" rx="2" class="signal-box"/>
+  <text x="618" y="96" class="signal-text">Human context and decisions</text>
+  <line x1="610" y1="135" x2="610" y2="108" class="dialogue"/>
+  <text x="570" y="119" class="dialogue-label">Pull in a human</text>
+  <line x1="626" y1="108" x2="626" y2="135" class="dialogue"/>
+  <text x="671" y="119" class="dialogue-label">Additional human input</text>
+
+  <!-- Observations -->
+  <rect x="42" y="138" width="200" height="166" rx="3" class="card"/>
+  <g class="icon">
+    <path d="M123 177 Q142 160 161 177 Q142 194 123 177 Z"/>
+    <circle cx="142" cy="177" r="4"/>
+  </g>
+  <text x="142" y="215" class="card-title">OBSERVATIONS</text>
+  <text x="142" y="244" class="body">Record things to explore, build,</text>
+  <text x="142" y="257" class="body">fix, or improve.</text>
+
+  <!-- Work Items -->
+  <rect x="280" y="138" width="200" height="166" rx="3" class="card"/>
+  <g class="icon">
+    <path d="M368 158 H389 L396 165 V190 H368 Z"/>
+    <path d="M389 158 V165 H396"/>
+    <line x1="374" y1="170" x2="388" y2="170"/>
+    <line x1="374" y1="177" x2="390" y2="177"/>
+    <line x1="374" y1="184" x2="384" y2="184"/>
+  </g>
+  <text x="380" y="215" class="card-title">WORK ITEMS</text>
+  <text x="380" y="238" class="compact-body">Discuss and turn an Observation into</text>
+  <text x="380" y="251" class="compact-body">a Brief, Behavior Specifications,</text>
+  <text x="380" y="264" class="compact-body">a Technical Approach, and an</text>
+  <text x="380" y="277" class="compact-body">Implementation Plan.</text>
+
+  <!-- Build and review -->
+  <rect x="518" y="138" width="200" height="166" rx="3" class="card"/>
+  <text x="555" y="174" class="role">WRITER</text>
+  <text x="618" y="174" class="role">TESTER</text>
+  <text x="681" y="174" class="role">REVIEWERS</text>
+  <line x1="578" y1="171" x2="591" y2="171" class="connector"/>
+  <line x1="643" y1="171" x2="651" y2="171" class="connector"/>
+  <path d="M690 181 V198 H548 V181" class="revision"/>
+  <text x="618" y="215" class="card-title">BUILD + REVIEW</text>
+  <text x="618" y="238" class="compact-body">Several specialist Reviewers assess</text>
+  <text x="618" y="251" class="compact-body">every change from different perspectives.</text>
+  <text x="618" y="264" class="compact-body">Their findings return to the Writer until</text>
+  <text x="618" y="277" class="compact-body">every Reviewer is satisfied.</text>
+
+  <!-- Learn -->
+  <rect x="518" y="340" width="200" height="174" rx="3" class="learn-card"/>
+  <g class="learn-icon">
+    <path d="M596 367 Q607 363 618 370 V390 Q607 384 596 386 Z"/>
+    <path d="M640 367 Q629 363 618 370 V390 Q629 384 640 386 Z"/>
+    <path d="M603 360 Q618 350 633 360"/>
+    <path d="M630 355 L634 360 L628 361"/>
+  </g>
+  <text x="618" y="417" class="learn-title">LEARN</text>
+  <text x="618" y="440" class="learn-body">Learn from the change, tests, and every</text>
+  <text x="618" y="453" class="learn-body">review. Reusable conventions, constraints,</text>
+  <text x="618" y="466" class="learn-body">and gotchas become Expertise; findings</text>
+  <text x="618" y="479" class="learn-body">that call for another change become</text>
+  <text x="618" y="492" class="learn-body">follow-up Observations.</text>
+
+  <!-- Approve and land -->
+  <rect x="280" y="340" width="200" height="174" rx="3" class="card"/>
+  <rect x="314" y="365" width="54" height="19" rx="2" class="authority-box"/>
+  <rect x="392" y="365" width="54" height="19" rx="2" class="authority-box"/>
+  <text x="341" y="377.5" class="authority-text">YOU</text>
+  <text x="419" y="377.5" class="authority-text">POLICY</text>
+  <text x="380" y="377.5" class="or-text">OR</text>
+  <text x="380" y="417" class="card-title">APPROVE + LAND</text>
+  <text x="380" y="440" class="approval-body">Evaluate the Merge Candidate and its</text>
+  <text x="380" y="453" class="approval-body">evidence. You can authorize landing, or</text>
+  <text x="380" y="466" class="approval-body">a policy can do so when confidence clears</text>
+  <text x="380" y="479" class="approval-body">a configured threshold. Fluent lands it</text>
+  <text x="380" y="492" class="approval-body">only after target-branch checks pass.</text>
+
+  <!-- Deploy -->
+  <rect x="42" y="340" width="200" height="174" rx="3" class="card"/>
+  <g class="icon">
+    <circle cx="142" cy="378" r="14"/>
+    <path d="M142 364 C134 372 134 384 142 392"/>
+    <path d="M142 364 C150 372 150 384 142 392"/>
+    <line x1="128" y1="378" x2="156" y2="378"/>
+    <path d="M131 371 Q142 375 153 371"/>
+    <path d="M131 385 Q142 381 153 385"/>
+  </g>
+  <text x="142" y="417" class="card-title">DEPLOY</text>
+  <text x="142" y="447" class="compact-body">Put merged code into production through</text>
+  <text x="142" y="460" class="compact-body">the project’s deployment tools. Production</text>
+  <text x="142" y="473" class="compact-body">traces, logs, and user feedback become</text>
+  <text x="142" y="486" class="compact-body">new Observations.</text>
+
+  <!-- Main production flow -->
+  <line x1="242" y1="221" x2="277" y2="221" class="connector"/>
+  <text x="250" y="184" class="connector-label" transform="rotate(-90 250 184)">CONVERSATION</text>
+  <line x1="480" y1="221" x2="515" y2="221" class="connector"/>
+  <text x="488" y="184" class="connector-label" transform="rotate(-90 488 184)">SCHEDULER</text>
+  <path d="M718 221 H738 V427 H721" class="connector"/>
+  <text x="728" y="324" class="side-label" transform="rotate(90 728 324)">REVIEWED CHANGE</text>
+  <line x1="518" y1="427" x2="483" y2="427" class="connector"/>
+  <text x="490" y="387" class="connector-label" transform="rotate(90 490 387)">MERGE CANDIDATE</text>
+  <line x1="280" y1="427" x2="245" y2="427" class="connector"/>
+  <text x="252" y="387" class="connector-label" transform="rotate(90 252 387)">MERGED CODE</text>
+
+  <!-- Information returning to future work -->
+  <line x1="618" y1="340" x2="618" y2="307" class="return"/>
+  <text x="650" y="325" class="return-label">EXPERTISE</text>
+  <path d="M548 340 V322 H142 V307" class="learning-return"/>
+  <text x="345" y="318" class="return-label">NEW OBSERVATIONS</text>
+  <path d="M42 427 H22 V126 H43" class="return"/>
+  <text x="32" y="277" class="side-label" transform="rotate(-90 32 277)">NEW SIGNALS</text>
+</svg>

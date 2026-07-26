@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 230" width="680" height="230" font-family="Menlo">
+  <defs>
+    <style>
+      .container { stroke: #ddd; stroke-width: 1; fill: #ffffff; }
+      .box { stroke: #ddd; stroke-width: 1; fill: #f6f6f6; }
+      .principal { stroke: #999; stroke-width: 1.25; fill: #f6f6f6; }
+      .gate { stroke: #999; stroke-width: 1.25; fill: none; }
+      .title { fill: #292929; font-size: 9.5px; font-weight: 600; text-anchor: middle; }
+      .text { fill: #999; font-size: 8px; text-anchor: middle; }
+      .label { fill: #bbb; font-size: 8px; text-anchor: middle; letter-spacing: 0.5px; }
+      .caption { fill: #999; font-size: 9.5px; text-anchor: middle; }
+      .arrow { stroke: #292929; stroke-width: 1; fill: none; marker-end: url(#arrowhead); }
+      .return { stroke: #999; stroke-width: 1; fill: none; marker-end: url(#muted-arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#292929"/>
+    </marker>
+    <marker id="muted-arrowhead" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#999"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="680" height="230" fill="#ffffff"/>
+
+  <!-- Work Item -->
+  <text x="40" y="108" class="title">Work Item</text>
+  <text x="40" y="125" class="text">approved</text>
+  <line x1="75" y1="112" x2="97" y2="112" class="arrow"/>
+
+  <!-- Attempt -->
+  <rect x="100" y="30" width="302" height="162" rx="4" class="container"/>
+  <text x="251" y="50" class="label">ATTEMPT · LOCAL FOREGROUND</text>
+
+  <rect x="110" y="68" width="60" height="66" rx="4" class="box"/>
+  <text x="140" y="97" class="title">Writer</text>
+  <text x="140" y="115" class="text">commits</text>
+
+  <line x1="170" y1="101" x2="179" y2="101" class="arrow"/>
+
+  <rect x="182" y="68" width="60" height="66" rx="4" class="box"/>
+  <text x="212" y="97" class="title">Tester</text>
+  <text x="212" y="115" class="text">runs tests</text>
+
+  <line x1="242" y1="101" x2="251" y2="101" class="arrow"/>
+
+  <rect x="254" y="68" width="66" height="66" rx="4" class="box"/>
+  <text x="287" y="94" class="title">5 reviews</text>
+  <text x="287" y="109" class="text">separate</text>
+  <text x="287" y="122" class="text">lenses</text>
+
+  <line x1="320" y1="101" x2="329" y2="101" class="arrow"/>
+
+  <rect x="332" y="68" width="58" height="66" rx="4" class="box"/>
+  <text x="361" y="97" class="title">Learner</text>
+  <text x="361" y="115" class="text">records</text>
+
+  <path d="M287 134 V155 H140 V139" class="return"/>
+  <text x="214" y="169" class="text">blocking failure → rewrite</text>
+  <text x="287" y="185" class="text">uncertain → needs you</text>
+
+  <!-- Ready candidate -->
+  <line x1="402" y1="112" x2="411" y2="112" class="arrow"/>
+  <rect x="414" y="68" width="88" height="86" rx="4" class="principal"/>
+  <text x="458" y="91" class="title">ready</text>
+  <text x="458" y="106" class="title">Merge Candidate</text>
+  <text x="458" y="132" class="text">not merged</text>
+
+  <!-- Human acceptance -->
+  <line x1="502" y1="112" x2="516" y2="112" class="arrow"/>
+  <line x1="520" y1="72" x2="520" y2="150" class="gate"/>
+  <text x="520" y="59" class="label">YOU</text>
+  <text x="520" y="169" class="text">accept</text>
+
+  <!-- Land gate and target branch -->
+  <line x1="524" y1="112" x2="538" y2="112" class="arrow"/>
+  <rect x="541" y="68" width="91" height="86" rx="4" class="box"/>
+  <text x="586.5" y="91" class="title">land gate</text>
+  <text x="586.5" y="112" class="text">update</text>
+  <text x="586.5" y="128" class="text">check + review</text>
+  <line x1="632" y1="112" x2="642" y2="112" class="arrow"/>
+  <text x="650" y="104" class="title">target</text>
+  <text x="650" y="127" class="title">branch</text>
+
+  <text x="340" y="219" class="caption">Blocking failures loop back. Consequential decisions pause at needs-user.</text>
+</svg>

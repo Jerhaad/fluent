@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 230" width="680" height="230" font-family="Menlo">
+  <defs>
+    <style>
+      .container { stroke: #ddd; stroke-width: 1; fill: #ffffff; }
+      .box { stroke: #ddd; stroke-width: 1; fill: #f6f6f6; }
+      .principal { stroke: #999; stroke-width: 1.25; fill: #f6f6f6; }
+      .title { fill: #292929; font-size: 10.5px; font-weight: 600; text-anchor: middle; }
+      .text { fill: #999; font-size: 8.5px; text-anchor: middle; }
+      .label { fill: #bbb; font-size: 8.5px; text-anchor: middle; letter-spacing: 0.5px; }
+      .caption { fill: #999; font-size: 9.5px; text-anchor: middle; }
+      .arrow { stroke: #292929; stroke-width: 1; fill: none; marker-end: url(#arrowhead); }
+    </style>
+    <marker id="arrowhead" markerWidth="6" markerHeight="5" refX="5" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#292929"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="680" height="230" fill="#ffffff"/>
+
+  <!-- Input -->
+  <text x="68" y="104" class="title">request or selected</text>
+  <text x="68" y="119" class="title">Observation</text>
+  <text x="68" y="137" class="text">what you noticed</text>
+  <line x1="128" y1="112" x2="153" y2="112" class="arrow"/>
+
+  <!-- Conversation -->
+  <rect x="157" y="30" width="386" height="152" rx="4" class="container"/>
+  <text x="350" y="51" class="label">CHAT WITH YOUR AGENT</text>
+
+  <rect x="171" y="72" width="78" height="66" rx="4" class="box"/>
+  <text x="210" y="97" class="title">Brief</text>
+  <text x="210" y="116" class="text">outcome + why</text>
+
+  <line x1="249" y1="105" x2="257" y2="105" class="arrow"/>
+
+  <rect x="260" y="72" width="82" height="66" rx="4" class="box"/>
+  <text x="301" y="97" class="title">Behaviors</text>
+  <text x="301" y="113" class="text">observable</text>
+  <text x="301" y="125" class="text">truth</text>
+
+  <line x1="342" y1="105" x2="350" y2="105" class="arrow"/>
+
+  <rect x="353" y="72" width="82" height="66" rx="4" class="box"/>
+  <text x="394" y="97" class="title">Approach</text>
+  <text x="394" y="113" class="text">technical</text>
+  <text x="394" y="125" class="text">direction</text>
+
+  <line x1="435" y1="105" x2="443" y2="105" class="arrow"/>
+
+  <rect x="446" y="72" width="82" height="66" rx="4" class="box"/>
+  <text x="487" y="97" class="title">Plan</text>
+  <text x="487" y="113" class="text">verifiable</text>
+  <text x="487" y="125" class="text">slices</text>
+
+  <text x="350" y="164" class="caption">you confirm each stage</text>
+
+  <!-- Durable handoff -->
+  <line x1="543" y1="112" x2="570" y2="112" class="arrow"/>
+  <rect x="573" y="74" width="98" height="76" rx="4" class="principal"/>
+  <text x="622" y="99" class="title">Work Item</text>
+  <text x="622" y="118" class="text">approved handoff</text>
+  <text x="622" y="132" class="text">not running yet</text>
+
+  <!-- Caption -->
+  <text x="340" y="216" class="caption">Independent pieces become peer Work Items; implementation stays sequential inside one.</text>
+</svg>
