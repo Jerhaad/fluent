@@ -5040,6 +5040,14 @@ accepted Write result; a review-only Attempt is not code-producing. The
 independently identifiable follow-ups; it is not itself an Observation or
 Work Item.
 
+The expertise-capture, canonical `Update expertise` commit, candidate-pointer,
+and expertise-write-grant behaviors in this section describe the default
+`capture` Learner mode. The **Selectable pre-land Learner policy** section below
+defines the `no-expertise` mode, whose isolated audit denies expertise and
+candidate Git writes and keeps the reviewed Writer commit exact. A merged
+candidate always runs the post-land handoff-only path regardless of the stored
+mode.
+
 A **relaunchable** Learning failure permits a later
 `fluent attempt run` to invoke the Learner again. Fluent derives
 relaunchability from the stored `LearningFailureKind`. An **ordinary
@@ -5070,6 +5078,7 @@ Test: src/work_task_executor.rs (learner_prompt_includes_attempt_diff_and_all_re
 
 ### B4
 
+WHERE a Work Item's Learner mode is `capture`,
 WHEN the Learner runs before land and identifies durable project
 knowledge,
 THE SYSTEM SHALL merge that knowledge into `.fluent/expertise/`, refining
@@ -5151,6 +5160,7 @@ Test: src/work_attempt_loop.rs (learner_sidecar_failure_recovery_calls_coder_onc
 
 ### B12
 
+WHERE a Work Item's Learner mode is `capture`,
 WHEN a pre-land Learner run leaves accepted expertise changes — committed,
 staged, unstaged, or untracked — all confined to `.fluent/expertise/`,
 THE SYSTEM SHALL host-author exactly one `Update expertise` commit whose
@@ -5178,7 +5188,7 @@ Test: src/work_attempt_loop.rs (learner_reverted_out_of_bounds_commit_is_still_r
 
 ### B14
 
-WHERE the Learner runs sandboxed before land,
+WHERE a `capture` Learner runs sandboxed before land,
 THE SYSTEM SHALL grant it write access only to `.fluent/expertise/`, the
 designated managed handoff surface, and Git metadata needed for an
 expertise commit; it SHALL NOT grant write access to the Observation
@@ -5367,6 +5377,245 @@ Merge Candidate candidate commit and record relaunchable `Generic`
 failed Learning with no handoff reference and a
 canonical-handoff-publication diagnostic.
 Test: src/work_attempt_loop.rs (learner_handoff_failure_retains_clean_typed_failed_result)
+
+## Selectable pre-land Learner policy
+
+A Work Item's **Learner mode** is a durable policy chosen before execution that
+controls whether its pre-land Learner may capture expertise. **capture** is the
+default and preserves the behavior above. **no-expertise** still audits the
+accepted change and produces a handoff, but denies expertise and candidate Git
+mutations and keeps the **reviewed Writer SHA** — the commit named by the latest
+completed Write output, the pending Merge Candidate, and every Tester and
+built-in reviewer context in the final passing review round — exact through
+Learner. Earlier corrective-round contexts are historical evidence, not competing
+current pointers.
+
+### B1
+
+WHEN `fluent work-item create` omits `--learner-mode`, receives
+`--learner-mode capture`, or reads a legacy record with no `learner_mode` field,
+THE SYSTEM SHALL resolve the Work Item's Learner mode as `capture` and omit the
+default field from the minimal split record.
+Test: tests/binary.rs (work_item_create_defaults_learner_mode_to_capture)
+Test: tests/binary.rs (work_item_create_accepts_explicit_capture_learner_mode)
+Test: src/work_model.rs (learner_mode_defaults_to_capture_for_legacy_work_items)
+Test: tests/work_model_external.rs (capture_mode_preserves_minimal_work_item_json)
+
+### B2
+
+WHEN `fluent work-item create` receives `--learner-mode no-expertise`,
+THE SYSTEM SHALL persist the exact split-record field
+`"learner_mode": "no-expertise"` and materialize the resolved mode through
+`fluent work-item show`; an unsupported value is rejected before the Work Item is
+created.
+Test: src/work_model.rs (no_expertise_learner_mode_round_trips_through_split_storage)
+Test: tests/binary.rs (work_item_show_materializes_resolved_learner_mode)
+Test: tests/binary.rs (work_item_create_rejects_unknown_learner_mode)
+
+### B3
+
+WHILE a code-producing Work Item's Learner mode is `no-expertise`,
+WHEN its final review round passes,
+THE SYSTEM SHALL run Learner and require successful Learning before reporting the
+Merge Candidate ready, persist a valid handoff whose expertise reference list is
+empty, describe missing durable knowledge only as non-corrective follow-up
+material that may later become an Observation, and create no expertise commit or
+tracked candidate-worktree change.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_runs_learner_before_readiness)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_handoff_has_no_expertise_references)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_succeeds_without_expertise_commit)
+Test: src/work_task_executor.rs (pre_land_no_expertise_missing_knowledge_is_observation_only)
+
+### B4
+
+WHILE a pre-land Learner runs in `no-expertise` mode,
+WHEN Fluent is about to launch its coder and again on a freshly re-read persisted
+state immediately before Learning advances to `HandoffPending`,
+THE SYSTEM SHALL require candidate `HEAD`, the Merge Candidate `candidate_commit`,
+the latest Write-output commit, and every Tester and built-in reviewer context in
+the final passing round to equal the reviewed Writer SHA with no staged,
+unstaged, or untracked candidate change, reading only the final passing round.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_requires_clean_common_sha_before_launch)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_rejects_mismatched_final_review_context)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_preserves_every_candidate_pointer)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_ignores_historical_review_contexts)
+
+### B4a
+
+IF the pre-launch or fresh-read post-run no-expertise identity or cleanliness
+check fails,
+THEN THE SYSTEM SHALL launch no Learner coder (preflight) or advance no pointer
+(postflight), persist relaunchable `Generic` failed Learning with no canonical
+handoff, leave every live and persisted candidate pointer unchanged without
+overwriting the live candidate, report the exact identity or cleanliness
+contradiction, and withhold Merge Candidate readiness. A contradictory pointer
+may already be off the reviewed Writer SHA; the fail-closed contract preserves
+that evidence rather than repairing it back onto the reviewed SHA.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_preflight_failure_launches_no_coder)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_postcheck_fails_closed)
+
+### B4b
+
+WHILE a pre-land Learner runs in `no-expertise` mode,
+WHEN it settles any terminal Learning transition,
+THE SYSTEM SHALL apply each transition through a fresh, lock-held mutation that
+re-reads the current aggregate, accepts only this runner's exact Learning
+frontier, and changes only the Learning record, so a concurrent Work-model change
+during the coder run whose identity fields stay valid survives through
+`HandoffPending` and `Succeeded`, a persisted identity contradiction becomes
+durable relaunchable `Generic` failed Learning rather than a stale-write error, a
+concurrent harder Learning transition is never overwritten, and no post-Learner
+whole-aggregate write reintroduces the stale-write race.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_concurrent_unrelated_field_survives_to_success)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_concurrent_pointer_contradiction_fails_closed)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_never_overwrites_a_harder_learning_frontier)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_publication_preserves_a_field_observed_after_handoff_pending)
+
+### B5
+
+WHERE a pre-land Learner runs in `no-expertise` mode,
+THE SYSTEM SHALL run it from an isolated accepted-change snapshot, grant write
+access only to its managed handoff staging surface and per-launch private
+temporary directory, and deny writes to project expertise, the candidate
+workspace, the live checkout, shared Git metadata, and shared temporary roots
+even when the caller requested `--no-sandbox`.
+Test: src/work_task_executor.rs (pre_land_no_expertise_denies_expertise_candidate_and_live_git_writes)
+Test: tests/binary.rs (pre_land_no_expertise_ignores_no_sandbox_and_preserves_candidate_git)
+
+### B5a
+
+WHEN `fluent attempt run --runtime fargate` targets a `no-expertise` Work Item,
+THE SYSTEM SHALL reject the launch before any credential lookup or injection,
+Fargate bootstrap, `.fluent/Dockerfile` creation, Docker/AWS/external command,
+workspace archive or upload, ECS task creation, runtime-state write, or
+launch-induced Work-model mutation, and direct the operator to run the Attempt
+locally on a trusted macOS host. A local host that cannot enforce the trusted
+write boundary fails closed without downgrading the mode.
+Test: src/fargate.rs (no_expertise_work_item_is_rejected_before_every_launch_side_effect)
+Test: tests/binary.rs (fargate_no_expertise_rejection_names_local_trusted_runtime)
+Test: src/work_task_executor.rs (no_expertise_requires_trusted_write_confinement)
+Test: src/work_attempt_loop.rs (unsupported_no_expertise_host_preserves_candidate_and_retry)
+
+### B6
+
+IF the no-expertise invocation ledger contains any candidate Git mutation —
+including an expertise-only change or one a later invocation reverted — or
+canonical handoff publication fails after a clean result with no typed failure
+classification,
+THEN THE SYSTEM SHALL dispose of the isolated workspace, persist relaunchable
+`Generic` failed Learning with no handoff reference, leave every pointer at the
+reviewed Writer SHA, and withhold Merge Candidate readiness.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_accounts_every_invocation_return)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_rejects_every_git_mutation)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_handoff_failure_preserves_reviewed_sha)
+
+### B6a
+
+WHILE a pre-land Learner runs in `no-expertise` mode,
+WHEN it settles canonical publication and failure across its two lock-held phases,
+THE SYSTEM SHALL settle through `prepare_no_expertise_handoff`, which rechecks the
+reviewed identity and advances Learning `InProgress` to `HandoffPending` or a typed
+`Failed`, and then `publish_no_expertise_handoff`, which reacquires the lock,
+re-runs the final identity check, publishes the canonical handoff, and settles
+`HandoffPending` to `Succeeded` or a typed `Failed`; SHALL hold a reviewed-identity
+transition guard over `HandoffPending` and `Succeeded` while keeping a change made
+during `InProgress` postflight-detectable and a relaunchable `Failed` record
+repairable; SHALL recover both transaction-journal outcomes — rerunning only the
+Learner when no terminal journal became durable and finishing the exact durable
+journal to `Succeeded` without rerunning otherwise; and SHALL settle integrity,
+cleanliness, and candidate-mutation contradictions as `Generic` while a publisher
+failure preserves the `LearningFailureKind` derived from its concrete cause
+(`EvidencePending` for a coder-already-ran supervision fault, then `TranscriptPump`
+for a transcript-pump publication fault), so not every handoff-publication failure
+is `Generic`.
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_real_final_publication_pointer_contradictions_fail_closed)
+Test: src/work_attempt_loop.rs (pre_land_no_expertise_settlement_errors_preserve_exact_primary_diagnostics)
+Test: src/work_model.rs (no_expertise_frozen_identity_guard_covers_every_supported_write_and_pointer)
+Test: src/work_model.rs (no_expertise_unexposed_identity_repair_uses_both_write_apis)
+
+### B7
+
+WHILE a pre-land no-expertise Learning record is relaunchable,
+WHEN `fluent attempt run` is invoked again,
+THE SYSTEM SHALL retry only Learner in `no-expertise` mode without rerunning
+Writer, Tester, or reviewers, preserving the stored mode.
+Test: tests/binary.rs (pre_land_no_expertise_retry_runs_only_learner_and_preserves_mode)
+
+### B8
+
+WHEN an already-merged candidate's Learner is retried,
+THE SYSTEM SHALL use post-land handoff-only execution regardless of the Work
+Item's stored Learner mode.
+Test: src/work_attempt_loop.rs (post_land_retry_is_handoff_only_for_every_stored_mode)
+
+### B9
+
+WHEN the confirmed Work Item contract requires one reviewed Writer SHA to survive
+Learner unchanged, the bundled Fluent `plan-execution` skill SHALL create that
+Work Item with `--learner-mode no-expertise`; otherwise it SHALL omit
+`--learner-mode` so the Work Item uses the default `capture` policy.
+Test: src/content.rs (bundled_plan_execution_selects_no_expertise_for_common_sha_work)
+Test: src/content.rs (bundled_plan_execution_preserves_capture_by_default)
+
+### B10
+
+WHEN an existing external caller invokes public `run_learner` through
+`LearnerRunInputs`,
+THE SYSTEM SHALL preserve the current `handoff_only: false` capture behavior and
+`handoff_only: true` post-land behavior without exposing a contradictory public
+no-expertise switch.
+Test: tests/public_api.rs (learner_run_inputs_handoff_only_surface_remains_source_compatible)
+Test: src/work_task_executor.rs (public_handoff_only_boolean_maps_to_existing_modes)
+
+### B11
+
+WHEN the Learner builds the coder's system and user prompts in any mode,
+THE SYSTEM SHALL construct them through one shared production builder that both the
+launch route and the tests use, covering the initial audit and the bounded
+schema-repair invocation in capture, no-expertise, and post-land handoff-only modes,
+so a tested prompt can never drift from what the coder actually receives.
+Test: src/work_task_executor.rs (learner_production_launch_prompts_cover_every_mode_and_invocation)
+
+### B12
+
+IF the Learner's production system prompt or user prompt cannot be resolved,
+rendered, or fully substituted,
+THEN THE SYSTEM SHALL return the prompt error before constructing or launching the
+coder, so no coder is ever built or launched from a mis-rendered prompt.
+Test: src/work_task_executor.rs (learner_production_prompt_failures_prevent_coder_construction)
+
+### B13
+
+WHEN an operator prepares a Work Item whose Learner mode matters, the bundled
+plan-execution guidance SHALL select the Learner mode before any create command and
+present the capture and no-expertise create forms as mutually exclusive branches,
+because `fluent work-item create` fixes the mode irreversibly.
+Test: src/content.rs (bundled_plan_execution_selects_mode_before_creating)
+Test: src/content.rs (living_behaviors_cover_no_expertise_prompt_and_create_order_contracts)
+
+### B14
+
+WHEN a fresh, unmerged `no-expertise` `Succeeded` candidate lands,
+THE SYSTEM SHALL land it through an identity-preserving exact-SHA route that skips
+rebase and provenance regeneration, runs `check-pre-merge` — never `fix-pre-merge`
+— only in a disposable exact-SHA worktree, and fast-forwards the target to exactly
+the reviewed Writer SHA. Successful removal of that disposable worktree is a land
+precondition: a passing check whose worktree cannot be removed fails the land
+before the second precondition check or any target Git mutation and retains at
+most the isolated worktree. The route enforces the same target-worktree
+cleanliness policy capture landing uses, both before any side effect and again
+immediately before the fast-forward. Both routes schedule the optional post-merge
+review through one shared follow-up-processing coordinator only after the landed
+follow-up result is durably recorded, and schedule nothing while returning the
+successful landed outcome when that persistence is unknown. An already-merged
+`no-expertise` record derives its reviewed Writer SHA independently of Learning
+status and fails closed when the persisted `merged_commit` is absent or differs
+from it.
+Test: src/work_merge_executor.rs (no_expertise_passing_check_cleanup_failure_blocks_land)
+Test: src/work_merge_executor.rs (no_expertise_land_records_follow_up_outcome_before_post_merge_review)
+Test: src/work_merge_executor.rs (no_expertise_merged_resume_requires_reviewed_sha_for_every_learning_state)
+Test: src/work_merge_executor.rs (no_expertise_dirty_target_fails_before_side_effects)
+Test: src/work_merge_executor.rs (no_expertise_land_rechecks_target_cleanliness_after_isolated_check)
 
 ## Corrective classification and Work authorization
 

@@ -38,6 +38,46 @@ impl Coder for ExternalCoder {
 }
 
 #[test]
+fn learner_run_inputs_handoff_only_surface_remains_source_compatible() {
+    // An external caller still constructs `LearnerRunInputs` with the Boolean
+    // `handoff_only` surface: `false` is capture, `true` is post-land handoff-only.
+    // No public no-expertise switch is exposed, so a caller cannot request the
+    // crate-private pre-land no-expertise mode.
+    use fluent::coder::CoderKind;
+    use fluent::content::ContentResolver;
+    use fluent::work_task_executor::LearnerRunInputs;
+    use std::path::PathBuf;
+
+    let resolver = ContentResolver::new(None);
+    let workspace = PathBuf::from("/tmp/ws");
+    let handoff = PathBuf::from("/tmp/handoff");
+    let make = |handoff_only: bool| LearnerRunInputs {
+        workspace_path: &workspace,
+        resolver: &resolver,
+        extra_args: &[],
+        coder_kind: CoderKind::Claude,
+        no_sandbox: false,
+        model: None,
+        effort: None,
+        review_artifact_paths: &[],
+        tester_artifact_paths: &[],
+        diff_command: "git diff",
+        handoff_dir: &handoff,
+        denied_write_roots: &[],
+        handoff_only,
+        repair: None,
+    };
+    assert!(!make(false).handoff_only, "false is the capture surface");
+    assert!(
+        make(true).handoff_only,
+        "true is the post-land handoff-only surface"
+    );
+
+    // The public Boolean-only entry point still resolves.
+    let _run = fluent::work_task_executor::run_learner;
+}
+
+#[test]
 fn external_coder_can_construct_transcript_capture() {
     // The public constructor accepts a transcript path and a project root and
     // resolves this project's pump thresholds internally — the caller never names

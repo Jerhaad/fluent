@@ -1157,4 +1157,491 @@ Check item {{ITEM_ID}}.
             render_template("{{#if review_only}}A{{/if}}", &[("review_only", "yes")]).unwrap();
         assert_eq!(out, "A");
     }
+
+    #[test]
+    fn bundled_plan_execution_selects_no_expertise_for_common_sha_work() {
+        // The bundled plan-execution skill teaches operators to select
+        // `--learner-mode no-expertise` when the contract requires one reviewed
+        // Writer SHA to remain unchanged through Learner.
+        let skill = bundled_skill_content("fluent/references/plan-execution.md")
+            .expect("bundled plan-execution skill must be present");
+        assert!(
+            skill.contains("--learner-mode no-expertise"),
+            "the skill must show the no-expertise create flag"
+        );
+        assert!(
+            skill.contains("remain unchanged through") && skill.contains("reviewed Writer SHA"),
+            "the skill must name the one-reviewed-SHA condition"
+        );
+        assert!(
+            skill.contains("trusted macOS host"),
+            "the skill must note that no-expertise Work is local-only"
+        );
+    }
+
+    #[test]
+    fn bundled_plan_execution_preserves_capture_by_default() {
+        // Ordinary Work omits `--learner-mode` and uses the default capture policy.
+        let skill = bundled_skill_content("fluent/references/plan-execution.md")
+            .expect("bundled plan-execution skill must be present");
+        assert!(
+            skill.contains("omit `--learner-mode`") && skill.contains("default to `capture`"),
+            "the skill must default ordinary Work to capture"
+        );
+        assert!(
+            skill.contains("Add `--learner-mode no-expertise` only when"),
+            "no-expertise must be the exception, not the default"
+        );
+    }
+
+    #[test]
+    fn bundled_plan_execution_selects_mode_before_creating() {
+        // The mode decision is an irreversible input to `fluent work-item create`,
+        // so the skill must teach selecting the mode before it gives any instruction
+        // to create. A later conditional cannot undo a default create already run.
+        let skill = bundled_skill_content("fluent/references/plan-execution.md")
+            .expect("bundled plan-execution skill must be present");
+        let select_at = skill
+            .find("Select the Learner mode")
+            .expect("the skill must have a Learner-mode selection step");
+        let first_create_at = skill
+            .find("fluent work-item create")
+            .expect("the skill must show a create command");
+        assert!(
+            select_at < first_create_at,
+            "the Learner-mode decision must precede the first create command"
+        );
+        // Both create branches are present and each retains its correct flag: the
+        // capture branch is introduced before the no-expertise branch, and the
+        // no-expertise command carries the flag.
+        assert_ordered(
+            skill,
+            &[
+                "Select the Learner mode",
+                "If you selected capture",
+                "If you selected no-expertise",
+                "--learner-mode no-expertise",
+            ],
+        );
+        assert!(
+            skill.contains("mutually exclusive"),
+            "the two create commands must be presented as mutually exclusive branches"
+        );
+    }
+
+    #[test]
+    fn living_behaviors_cover_no_expertise_prompt_and_create_order_contracts() {
+        // B11d: the living behavior documentation carries the shared production prompt
+        // construction contract, the failure-before-coder-construction contract, and
+        // the per-Work-Item mode-selection-before-creation contract with its mutually
+        // exclusive capture and no-expertise create forms.
+        let behaviors = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/documentation/behaviors.md"
+        ))
+        .expect("documentation/behaviors.md must be present");
+
+        assert!(
+            behaviors.contains("one shared production builder that both the")
+                && behaviors.contains("initial audit and the bounded")
+                && behaviors
+                    .contains("schema-repair invocation in capture, no-expertise, and post-land"),
+            "living behaviors must describe shared production prompt construction for every mode and invocation"
+        );
+        assert!(
+            behaviors.contains("before constructing or launching the")
+                && behaviors
+                    .contains("no coder is ever built or launched from a mis-rendered prompt"),
+            "living behaviors must describe returning the prompt error before coder construction"
+        );
+        assert!(
+            behaviors.contains("select the Learner mode before any create command")
+                && behaviors.contains("mutually exclusive branches")
+                && behaviors.contains("fixes the mode irreversibly"),
+            "living behaviors must describe selecting the mode before creation with mutually exclusive create forms"
+        );
+    }
+
+    #[test]
+    fn no_expertise_docs_state_residual_out_of_band_git_race() {
+        // B4m: architecture states the model-lock transaction makes supported
+        // persisted-state transitions atomic but cannot serialize an arbitrary process
+        // that edits candidate Git after the last Git read; closing that residual race
+        // would need a universal candidate-workspace lock, out of scope here.
+        let architecture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/documentation/architecture.md"
+        ))
+        .expect("documentation/architecture.md must be present");
+
+        assert!(
+            architecture.contains("supported persisted-state") && architecture.contains("atomic"),
+            "architecture must distinguish atomic supported persisted-state transitions"
+        );
+        assert!(
+            architecture.contains("edits candidate Git")
+                && architecture.contains("after")
+                && architecture.contains("residual race"),
+            "architecture must name the residual out-of-band candidate-Git race after the last read"
+        );
+        assert!(
+            architecture
+                .contains("universal lock shared by every candidate-workspace Git writer")
+                && architecture.contains("outside this release correction"),
+            "architecture must state the universal candidate-workspace Git lock is out of scope"
+        );
+    }
+
+    /// The first ```` ```sh ```` fenced block that appears after `marker` in `text`.
+    fn sh_block_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+        let start = text.find(marker)?;
+        let after = &text[start..];
+        let fence = after.find("```sh")?;
+        let body = &after[fence + "```sh".len()..];
+        let end = body.find("```")?;
+        Some(&body[..end])
+    }
+
+    /// Tokenize a fenced shell command, treating line-continuation backslashes as
+    /// separators rather than tokens, so a flag and its value are adjacent tokens.
+    fn shell_tokens(block: &str) -> Vec<String> {
+        block
+            .replace('\\', " ")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every value token immediately following a `--learner-mode` flag token.
+    fn learner_mode_values(tokens: &[String]) -> Vec<String> {
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| token.as_str() == "--learner-mode")
+            .map(|(index, _)| tokens.get(index + 1).cloned().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn bundled_plan_execution_create_blocks_require_exact_learner_mode_tokens() {
+        // B11f: parse the fenced create commands into tokens so the value following the
+        // single `--learner-mode` flag is EXACTLY `no-expertise`. A prefix or suffix
+        // such as `no-expertise-invalid` fails. The capture command carries no
+        // `--learner-mode` token.
+        let skill = bundled_skill_content("fluent/references/plan-execution.md")
+            .expect("bundled plan-execution skill must be present");
+
+        let capture = sh_block_after(&skill, "If you selected capture")
+            .expect("the skill must show a capture create block");
+        let no_expertise = sh_block_after(&skill, "If you selected no-expertise")
+            .expect("the skill must show a no-expertise create block");
+
+        assert_eq!(
+            capture.matches("fluent work-item create").count(),
+            1,
+            "the capture block must hold exactly one create command"
+        );
+        assert_eq!(
+            no_expertise.matches("fluent work-item create").count(),
+            1,
+            "the no-expertise block must hold exactly one create command"
+        );
+
+        let capture_tokens = shell_tokens(capture);
+        assert!(
+            capture_tokens.iter().all(|token| token != "--learner-mode"),
+            "the capture create command must carry no --learner-mode token"
+        );
+
+        let no_expertise_tokens = shell_tokens(no_expertise);
+        let values = learner_mode_values(&no_expertise_tokens);
+        assert_eq!(
+            values,
+            vec!["no-expertise".to_string()],
+            "the no-expertise command must carry exactly one --learner-mode flag whose value is \
+             exactly `no-expertise`"
+        );
+
+        // Exact token comparison rejects a near-match value that a substring check
+        // (`contains(\"--learner-mode no-expertise\")`) would wrongly accept.
+        let near_miss = shell_tokens("fluent work-item create x --learner-mode no-expertise-invalid");
+        assert_ne!(
+            learner_mode_values(&near_miss),
+            vec!["no-expertise".to_string()],
+            "a prefix or suffix such as `no-expertise-invalid` must fail the exact-token check"
+        );
+    }
+
+    #[test]
+    fn no_expertise_docs_describe_lock_held_publication_transaction() {
+        // B4t: architecture distinguishes the first lock-held InProgress -> HandoffPending
+        // preparation from the second lock-held final identity check, handoff
+        // publication, and terminal settlement; describes the reviewed-identity
+        // transition guard and both transaction-journal recovery outcomes; and retains
+        // only out-of-band candidate Git mutation after the final Git read as the
+        // residual race.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/documentation/architecture.md"
+        ))
+        .expect("documentation/architecture.md must be present");
+        // Collapse hard-wrap whitespace so phrase checks are insensitive to line breaks.
+        let architecture = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(
+            architecture.contains("first lock-held phase")
+                && architecture.contains("advances Learning `InProgress` to `HandoffPending`"),
+            "architecture must describe the first lock-held InProgress -> HandoffPending preparation"
+        );
+        assert!(
+            architecture.contains("second lock-held phase")
+                && architecture
+                    .contains("publishes the canonical handoff while the model lock is still held")
+                && architecture.contains("settles the same aggregate to `Succeeded`"),
+            "architecture must describe the second lock-held final check, publication, and settlement"
+        );
+        assert!(
+            architecture.contains("share one model-mutation boundary")
+                && architecture
+                    .contains("no supported concurrent Work-model transition can interleave"),
+            "architecture must state the final transaction is one uninterruptible boundary"
+        );
+        assert!(
+            architecture.contains("reviewed-identity transition guard"),
+            "architecture must describe the reviewed-identity transition guard"
+        );
+        assert!(
+            architecture.contains("two transaction-journal outcomes")
+                && architecture.contains("reruns only the Learner")
+                && architecture.contains("finishes that exact journal to `Succeeded`"),
+            "architecture must describe both safe transaction-journal recovery outcomes"
+        );
+        assert!(
+            architecture.contains("edits candidate Git") && architecture.contains("residual race"),
+            "architecture must retain only out-of-band candidate Git mutation as the residual race"
+        );
+    }
+
+    /// Read a repo-relative living document and collapse hard-wrap whitespace so
+    /// phrase checks are insensitive to line breaks.
+    fn read_living_doc(relative: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{relative} must be present: {e}"));
+        raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Extract the text of a living document between two stable section anchors so a
+    /// contract check binds to one bounded section: unrelated text elsewhere cannot
+    /// satisfy a positive claim and a contradictory sentence elsewhere cannot coexist.
+    /// Fails if either anchor is absent, ambiguously duplicated, or out of order.
+    fn bounded_section<'a>(doc: &'a str, start_anchor: &str, end_anchor: &str) -> &'a str {
+        let starts: Vec<usize> = doc.match_indices(start_anchor).map(|(idx, _)| idx).collect();
+        assert_eq!(
+            starts.len(),
+            1,
+            "start anchor {start_anchor:?} must appear exactly once (found {})",
+            starts.len()
+        );
+        let ends: Vec<usize> = doc.match_indices(end_anchor).map(|(idx, _)| idx).collect();
+        assert_eq!(
+            ends.len(),
+            1,
+            "end anchor {end_anchor:?} must appear exactly once (found {})",
+            ends.len()
+        );
+        let start = starts[0];
+        let end = ends[0];
+        assert!(
+            start < end,
+            "start anchor {start_anchor:?} must precede end anchor {end_anchor:?}"
+        );
+        &doc[start..end]
+    }
+
+    #[test]
+    fn living_no_expertise_contract_names_two_phase_publication_and_recovery() {
+        // B4ar: the living no-expertise contract is enforced per bounded document
+        // section, so unrelated text elsewhere cannot satisfy a positive claim and a
+        // contradictory sentence elsewhere cannot coexist. The bounded no-expertise
+        // section of BOTH documentation/behaviors.md and documentation/architecture.md
+        // independently names the two lock-held publication phases, the frozen
+        // reviewed-identity guard and its InProgress/relaunchable rules, both
+        // transaction-journal recovery outcomes, and the Generic-vs-typed publisher
+        // classification — and each slice rejects the stale blanket claim that every
+        // publication failure is Generic.
+        let architecture = read_living_doc("documentation/architecture.md");
+        let behaviors = read_living_doc("documentation/behaviors.md");
+        let decisions = read_living_doc(".fluent/expertise/decisions.md");
+        let reserved = read_living_doc(".fluent/expertise/learnings/reserved-phase-terminal-finalizer.md");
+        let field_finalizer =
+            read_living_doc(".fluent/expertise/learnings/fresh-field-level-finalizer-preserves-concurrent-state.md");
+        let route_tests =
+            read_living_doc(".fluent/expertise/learnings/route-tests-drive-real-launch-wiring.md");
+        let mode_prompts =
+            read_living_doc(".fluent/expertise/learnings/mode-specific-prompts-replace-conflicting-base-instructions.md");
+
+        // Bound each living document to its no-expertise section. Extraction fails if
+        // either anchor is missing, ambiguously duplicated, or out of order — no
+        // whole-document fallback remains.
+        let behaviors_slice = bounded_section(
+            &behaviors,
+            "## Selectable pre-land Learner policy",
+            "## Corrective classification and Work authorization",
+        );
+        let architecture_slice = bounded_section(
+            &architecture,
+            "A `no-expertise` pre-land Learner instead",
+            "A relaunchable Learner run that failed before its candidate landed recovers",
+        );
+
+        // The two-phase publication, recovery, and classification contract is required
+        // INSIDE each bounded slice independently.
+        for (name, slice) in [
+            ("behaviors", behaviors_slice),
+            ("architecture", architecture_slice),
+        ] {
+            // 1. First lock-held phase: fresh identity/cleanliness recheck and the
+            //    InProgress -> HandoffPending (or typed Failed) transition.
+            assert!(
+                slice.contains("`prepare_no_expertise_handoff`"),
+                "{name} slice must name the first lock-held publication phase"
+            );
+            assert!(
+                slice.contains("`InProgress` to `HandoffPending`"),
+                "{name} slice must describe the prepared InProgress -> HandoffPending transition"
+            );
+            // 2. Separately lock-held second phase: final identity check, canonical
+            //    publication, and the HandoffPending -> Succeeded (or typed Failed) result.
+            assert!(
+                slice.contains("`publish_no_expertise_handoff`"),
+                "{name} slice must name the second lock-held publication phase"
+            );
+            assert!(
+                slice.contains("`Succeeded`"),
+                "{name} slice must describe settling the published handoff to Succeeded"
+            );
+            // 3. Frozen reviewed identity only in HandoffPending/Succeeded, InProgress
+            //    changes detectable, relaunchable Failed repairable.
+            assert!(
+                slice.contains("reviewed-identity transition guard"),
+                "{name} slice must name the frozen reviewed-identity transition guard"
+            );
+            assert!(
+                slice.contains("`InProgress`") && slice.contains("repairable"),
+                "{name} slice must keep InProgress changes detectable and relaunchable Failed \
+                 repairable"
+            );
+            // 4 & 5. Both transaction-journal recovery outcomes: rerun only the Learner
+            //    when no terminal journal is durable, and finish the exact durable journal
+            //    to Succeeded without rerunning.
+            assert!(
+                slice.contains("transaction-journal outcomes"),
+                "{name} slice must describe both transaction-journal recovery outcomes"
+            );
+            assert!(
+                slice.contains("without rerunning"),
+                "{name} slice must recover the durable terminal journal without rerunning the Learner"
+            );
+            // 6. Integrity/cleanliness/candidate-mutation classify Generic, while
+            //    publisher failures preserve their cause-derived classification.
+            assert!(
+                slice.contains("`EvidencePending`") && slice.contains("`TranscriptPump`"),
+                "{name} slice must name the typed publisher-failure classifications"
+            );
+            assert!(
+                slice.contains("not every handoff-publication failure is `Generic`"),
+                "{name} slice must state not every handoff-publication failure is Generic"
+            );
+            // Negative: reject any stale blanket claim that a publication failure is
+            // Generic; the only allowed form is the corrected "not every ... is Generic".
+            for (idx, _) in slice.match_indices("handoff-publication failure is `Generic`") {
+                assert!(
+                    slice[..idx].ends_with("not every "),
+                    "{name} slice carries a stale blanket 'every handoff-publication failure is \
+                     `Generic`' claim; only the corrected 'not every ...' form is allowed"
+                );
+            }
+        }
+
+        // Architecture slice: the exact-SHA land preconditions, shared scheduling
+        // coordinator, capture-only rebase/fix qualification, and HostPreparation seam.
+        assert!(
+            architecture_slice.contains("identity-preserving exact-SHA route")
+                && architecture_slice.contains("skips rebase and provenance regeneration")
+                && architecture_slice.contains("never `fix-pre-merge`"),
+            "architecture slice must describe the exact-SHA route that skips rebase and never \
+             runs fix-pre-merge"
+        );
+        assert!(
+            architecture_slice.contains("Removing that disposable worktree is a land precondition"),
+            "architecture slice must state disposable-worktree removal is a land precondition"
+        );
+        assert!(
+            architecture_slice
+                .contains("the same target-worktree cleanliness policy capture landing uses")
+                && architecture_slice.contains(
+                    "before any side effect and again immediately before the fast-forward"
+                ),
+            "architecture slice must state the target cleanliness policy before side effects and \
+             before the fast-forward"
+        );
+        assert!(
+            architecture_slice.contains("shared follow-up-processing and scheduling coordinator")
+                && architecture_slice.contains(
+                    "schedules the optional post-merge review only after the landed follow-up \
+                     result is durably recorded",
+                ),
+            "architecture slice must describe the shared scheduling coordinator's durability gate"
+        );
+        assert!(
+            architecture_slice.contains("`HostPreparation`")
+                && architecture_slice.contains("`HostPreparation::Production`"),
+            "architecture slice must name the HostPreparation launch seam"
+        );
+
+        // Behaviors slice: the exact-SHA land route without fix-pre-merge, and B14's
+        // total already-Merged rule — an absent OR divergent merged_commit fails closed.
+        assert!(
+            behaviors_slice.contains("identity-preserving exact-SHA route")
+                && behaviors_slice.contains("never `fix-pre-merge`"),
+            "behaviors slice must describe the exact-SHA land route without fix-pre-merge"
+        );
+        assert!(
+            behaviors_slice.contains("`merged_commit` is absent or differs"),
+            "behaviors slice B14 must fail closed when an already-Merged no-expertise \
+             merged_commit is absent or divergent"
+        );
+
+        // Decisions and single-topic learnings still name the implemented publication
+        // function and carry no superseded identifiers or claims.
+        assert!(
+            decisions.contains("`publish_no_expertise_handoff`"),
+            "decisions must name publish_no_expertise_handoff"
+        );
+        for (name, doc) in [
+            ("architecture slice", architecture_slice),
+            ("decisions", decisions.as_str()),
+            ("reserved-phase learning", reserved.as_str()),
+            ("fresh-field-level learning", field_finalizer.as_str()),
+        ] {
+            assert!(
+                !doc.contains("settle_no_expertise_publication"),
+                "{name} must not carry the superseded settle_no_expertise_publication identifier"
+            );
+        }
+        assert!(
+            route_tests.contains("`HostPreparation`"),
+            "the launch-route learning must name the HostPreparation seam"
+        );
+        assert!(
+            !mode_prompts.contains("satisfied with fake executables"),
+            "the mode-prompts learning must not claim the host prereq is satisfied with fake \
+             executables"
+        );
+        assert!(
+            mode_prompts.contains("injected `HostPreparation` seam"),
+            "the mode-prompts learning must describe the injected HostPreparation seam"
+        );
+    }
 }

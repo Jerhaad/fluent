@@ -242,6 +242,7 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
             behaviors_file,
             approach_file,
             plan_file,
+            learner_mode,
         } => {
             let instructions = match (instructions, instructions_file) {
                 (Some(instructions), None) => Some(instructions),
@@ -260,6 +261,7 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
             let item = WorkItem {
                 planning_context,
                 instructions,
+                learner_mode: learner_mode.unwrap_or_default(),
                 ..WorkItem::planned(id, title)
             };
             store.create_work_item(&item)?;

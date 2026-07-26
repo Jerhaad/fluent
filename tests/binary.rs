@@ -1767,6 +1767,152 @@ fn planned_work_is_execution_ready_lineage_root() {
 }
 
 #[test]
+fn work_item_create_defaults_learner_mode_to_capture() {
+    let tmp = TempDir::new().unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["work-item", "create", "work-1", "--title", "Planned work"])
+        .assert()
+        .success();
+
+    let shown = work_item_value(tmp.path(), "work-1");
+    assert_eq!(shown["learner_mode"], "capture");
+    // The default is omitted from split storage so legacy records stay byte-stable.
+    let stored = fs::read_to_string(tmp.path().join(".fluent/work/items/work-1.json")).unwrap();
+    assert!(!stored.contains("learner_mode"));
+}
+
+#[test]
+fn work_item_create_accepts_explicit_capture_learner_mode() {
+    let tmp = TempDir::new().unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Planned work",
+            "--learner-mode",
+            "capture",
+        ])
+        .assert()
+        .success();
+
+    let shown = work_item_value(tmp.path(), "work-1");
+    assert_eq!(shown["learner_mode"], "capture");
+    let stored = fs::read_to_string(tmp.path().join(".fluent/work/items/work-1.json")).unwrap();
+    assert!(!stored.contains("learner_mode"));
+}
+
+#[test]
+fn work_item_show_materializes_resolved_learner_mode() {
+    let tmp = TempDir::new().unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "work-no",
+            "--title",
+            "Release gate",
+            "--learner-mode",
+            "no-expertise",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "work-cap",
+            "--title",
+            "Ordinary work",
+        ])
+        .assert()
+        .success();
+
+    // A no-expertise Work Item persists and materializes the exact field.
+    let no_expertise = work_item_value(tmp.path(), "work-no");
+    assert_eq!(no_expertise["learner_mode"], "no-expertise");
+    let stored = fs::read_to_string(tmp.path().join(".fluent/work/items/work-no.json")).unwrap();
+    assert!(stored.contains("\"learner_mode\": \"no-expertise\""));
+
+    // A default Work Item still materializes `capture` even though split storage
+    // omits it.
+    let capture = work_item_value(tmp.path(), "work-cap");
+    assert_eq!(capture["learner_mode"], "capture");
+}
+
+#[test]
+fn work_item_create_rejects_unknown_learner_mode() {
+    let tmp = TempDir::new().unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Planned work",
+            "--learner-mode",
+            "bogus",
+        ])
+        .assert()
+        .failure();
+
+    // The command is rejected before any Work Item is created.
+    assert!(!tmp.path().join(".fluent/work/items/work-1.json").exists());
+}
+
+#[test]
+fn fargate_no_expertise_rejection_names_local_trusted_runtime() {
+    let tmp = TempDir::new().unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Release gate",
+            "--learner-mode",
+            "no-expertise",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    // A no-expertise Fargate launch is refused and directs the operator to run the
+    // Attempt locally on a trusted macOS host.
+    let output = fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "attempt",
+            "run",
+            "work-1",
+            "attempt-1",
+            "--runtime",
+            "fargate",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the no-expertise launch is rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("locally"), "stderr: {stderr}");
+    assert!(stderr.contains("trusted"), "stderr: {stderr}");
+    assert!(stderr.contains("macOS"), "stderr: {stderr}");
+}
+
+#[test]
 fn attempt_create_accepts_execution_ready_work() {
     let tmp = TempDir::new().unwrap();
     fluent_cmd()
@@ -3005,6 +3151,231 @@ fn attempt_run_retries_only_failed_learner() {
         "retry does not rerun the Writer"
     );
     assert_eq!(after["attempts"][0]["learning"]["status"], "succeeded");
+}
+
+/// Create a no-expertise Work Item and its initial Attempt so the Learner is
+/// forced to confine even when the caller passes `--no-sandbox`.
+fn create_no_expertise_attempt(main_dir: &Path) {
+    fluent_cmd()
+        .current_dir(main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Release gate",
+            "--learner-mode",
+            "no-expertise",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+}
+
+/// A no-expertise Learner mock that drives write and review rounds, then, in its
+/// (successful) Learner run, probes whether it can write to the candidate
+/// workspace (its confined cwd) and announces the result on stdout before writing
+/// a valid draft. Under confinement the probe write is denied; if `--no-sandbox`
+/// were wrongly honored, the write would be allowed.
+fn no_expertise_probe_learner_mock_script(draft_json: &str) -> String {
+    format!(
+        r##"#!/bin/bash
+PROMPT=""
+NEXT_IS_PROMPT=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  echo "LEARNER_RUN"
+  printf 'LEARNER_HEAD %s\n' "$(git rev-parse HEAD)"
+  if (echo probe > confinement-probe.txt) 2>/dev/null; then
+    echo "CANDIDATE_WRITE_ALLOWED"
+  else
+    echo "CANDIDATE_WRITE_DENIED"
+  fi
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  if [ -n "$DRAFT" ]; then
+    mkdir -p "$(dirname "$DRAFT")"
+    printf '%s\n' '{draft_json}' > "$DRAFT"
+  fi
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    printf 'loop output\n' > loop-output.txt
+    git add loop-output.txt
+    git commit -m "Add loop output" >/dev/null 2>&1
+    ;;
+  *)
+    printf 'Verdict: pass\n\nLoop review.\n' > review.md
+    ;;
+esac
+exit 0
+"##
+    )
+}
+
+#[test]
+fn pre_land_no_expertise_ignores_no_sandbox_and_preserves_candidate_git() {
+    // B5: a `--no-sandbox` request is ignored for a no-expertise Learner — it still
+    // runs confined — and the reviewed candidate Git state is preserved. The
+    // candidate invariants hold whether or not the host can enforce the trusted
+    // boundary; the confinement observation is asserted only where a real sandbox is
+    // usable, and an unsupported host must fail closed rather than downgrade.
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-no-expertise-confine");
+    write_mock_claude(
+        &bin_dir,
+        &no_expertise_probe_learner_mock_script(r#"{"learning_summary":"noted","follow_ups":[]}"#),
+    );
+    create_no_expertise_attempt(&main_dir);
+
+    let output = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "attempt run exits 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value = read_work_show_json(&main_dir, "work-1");
+    assert_eq!(
+        value["learner_mode"], "no-expertise",
+        "the stored policy is preserved"
+    );
+    let candidate = value["merge_candidates"][0]["candidate_commit"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let write_commit = value["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .filter_map(|task| task["output"]["commit"].as_str())
+        .last()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        candidate, write_commit,
+        "the candidate commit stays at the reviewed Writer SHA"
+    );
+
+    // The live candidate worktree is untouched: HEAD is the reviewed Writer SHA and
+    // no expertise commit was authored, regardless of the Learner outcome.
+    let candidate_ws = main_dir.join("../work-6-work-1-attempt-1");
+    let head = git::run_stdout(&candidate_ws, &["rev-parse", "HEAD"], "candidate head").unwrap();
+    assert_eq!(head, candidate, "the candidate HEAD is preserved");
+    let log = git::run_stdout(&candidate_ws, &["log", "--oneline"], "candidate log").unwrap();
+    assert!(!log.contains("Update expertise"), "no expertise commit: {log}");
+
+    if real_sandbox_exec_is_usable() {
+        assert_eq!(
+            value["attempts"][0]["learning"]["status"], "succeeded",
+            "a confined no-expertise Learner still produces a handoff"
+        );
+        let transcripts = learner_transcripts(&main_dir);
+        assert!(
+            transcripts.contains("CANDIDATE_WRITE_DENIED"),
+            "the candidate workspace write was denied under confinement: {transcripts}"
+        );
+        assert!(
+            !transcripts.contains("CANDIDATE_WRITE_ALLOWED"),
+            "--no-sandbox did not weaken the confinement boundary: {transcripts}"
+        );
+    } else {
+        assert_eq!(
+            value["attempts"][0]["learning"]["status"], "failed",
+            "an unsupported host fails closed rather than downgrading to an unconfined run"
+        );
+        assert_eq!(value["attempts"][0]["learning"]["failure_kind"], "generic");
+    }
+}
+
+#[test]
+fn pre_land_no_expertise_retry_runs_only_learner_and_preserves_mode() {
+    // B6: a relaunchable no-expertise Learning retries only the Learner in the same
+    // mode — no Writer, Tester, or reviewer reruns — and the stored policy is
+    // preserved. The retry-scope invariants hold whether or not the host can enforce
+    // the trusted boundary; a successful retry additionally requires a usable
+    // sandbox.
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let counter = tmp.path().join("no-expertise-retry-counter");
+    let bin_dir = tmp.path().join("bin-no-expertise-retry");
+    write_mock_claude(
+        &bin_dir,
+        &post_land_learner_mock_script(
+            &counter,
+            r#"{"learning_summary":"noted","follow_ups":[]}"#,
+            false,
+        ),
+    );
+    create_no_expertise_attempt(&main_dir);
+
+    // First run: write and reviews complete; the Learner fails relaunchably — its
+    // mock fails the first invocation, or an unsupported host fails it closed.
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+
+    let before = read_work_show_json(&main_dir, "work-1");
+    let tasks_before = before["attempts"][0]["tasks"].as_array().unwrap().len();
+    let commit_before = before["merge_candidates"][0]["candidate_commit"].clone();
+    assert_eq!(
+        before["attempts"][0]["learning"]["status"], "failed",
+        "the first Learner run fails relaunchably, leaving something to retry"
+    );
+    assert_eq!(before["learner_mode"], "no-expertise");
+
+    // Retry: only the Learner runs again.
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+
+    let after = read_work_show_json(&main_dir, "work-1");
+    assert_eq!(
+        after["attempts"][0]["tasks"].as_array().unwrap().len(),
+        tasks_before,
+        "retry adds no Writer, Tester, or reviewer Tasks"
+    );
+    assert_eq!(
+        after["merge_candidates"][0]["candidate_commit"], commit_before,
+        "retry does not rerun the Writer"
+    );
+    assert_eq!(
+        after["learner_mode"], "no-expertise",
+        "the retry preserves the stored no-expertise policy"
+    );
+
+    if real_sandbox_exec_is_usable() {
+        assert_eq!(
+            after["attempts"][0]["learning"]["status"], "succeeded",
+            "a trusted retry completes the Learner in no-expertise mode"
+        );
+    } else {
+        assert_eq!(
+            after["attempts"][0]["learning"]["status"], "failed",
+            "an unsupported host keeps the Learner relaunchable without downgrading"
+        );
+    }
 }
 
 /// A mock coder that drives write and review rounds like `loop_mock_script`, and

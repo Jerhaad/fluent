@@ -81,8 +81,10 @@ stops at a Learner failure, or pauses at `needs-user`. Each round:
 1. The writer produces a candidate commit.
 2. The Tester Task runs the project's tests.
 3. Domain reviewers evaluate in parallel.
-4. After the reviewers pass, the Learner captures durable project expertise
-   and records possible follow-ups for materialization after land.
+4. After the reviewers pass, the Learner runs in the Work Item's Learner mode:
+   in the default `capture` mode it captures durable project expertise, while in
+   `no-expertise` mode it audits the change without writing expertise. Either
+   way it records possible follow-ups for materialization after land.
 
 The round outcome determines what happens next:
 

@@ -1,8 +1,8 @@
 use fluent::work_model::{
-    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, MergeCandidate,
-    MergeCandidateMergeState, MergeReviewState, ReviewContext, Task, TaskArtifactArea, TaskKind,
-    TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError, WorkModelStore,
-    WorkspaceAccess, WorkspaceRef, from_json,
+    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, LearnerMode,
+    MergeCandidate, MergeCandidateMergeState, MergeReviewState, ReviewContext, Task,
+    TaskArtifactArea, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError,
+    WorkModelStorageError, WorkModelStore, WorkspaceAccess, WorkspaceRef, from_json,
 };
 use std::fs;
 
@@ -657,6 +657,34 @@ fn work_model_store_writes_deterministic_pretty_json() {
     assert!(task.contains(r#""id": "write-code""#));
     assert!(task.contains(r#""kind": "write""#));
     assert!(task.contains(r#""output": {"#));
+}
+
+#[test]
+fn capture_mode_preserves_minimal_work_item_json() {
+    // The default `capture` Learner mode is omitted from the split record so a
+    // minimal Work Item stays byte-identical to legacy `{id, title}` storage.
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+
+    let item = WorkItem {
+        id: "work-1".to_string(),
+        title: "Add durable model storage".to_string(),
+        learner_mode: LearnerMode::Capture,
+        ..Default::default()
+    };
+    store.write_work_item(&item).unwrap();
+
+    let path = temp.path().join(".fluent/work/items/work-1.json");
+    let content = fs::read_to_string(path).unwrap();
+    assert_eq!(
+        content,
+        r#"{
+  "id": "work-1",
+  "title": "Add durable model storage"
+}
+"#
+    );
+    assert!(!content.contains("learner_mode"));
 }
 
 #[test]

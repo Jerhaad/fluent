@@ -239,6 +239,10 @@ pub enum WorkItemCommands {
         /// Read the approved plan from a file
         #[arg(long, value_name = "PATH")]
         plan_file: Option<String>,
+
+        /// Pre-land Learner policy: `capture` (default) or `no-expertise`
+        #[arg(long, value_name = "MODE")]
+        learner_mode: Option<crate::work_model::LearnerMode>,
     },
 
     /// List stored Work Items

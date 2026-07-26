@@ -74,11 +74,52 @@ pub fn queue_path(project_root: &Path) -> PathBuf {
     project_root.join(".fluent/work/post-merge-review-queue.json")
 }
 
+// A wholly `#[cfg(test)]` observer invoked at entry to the real queue-persistence
+// leaf, immediately before the queue file is read or written. It receives the
+// complete `QueueEntry` and may inspect state a test captured (for example the
+// Work-model store), but it cannot replace, skip, or synthesize the real queue
+// write (B4ak). Production carries no observer.
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static QUEUE_APPEND_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(&QueueEntry)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A `#[cfg(test)]` RAII guard that observes each real queue append for the
+/// duration of its lifetime. Dropping it removes the observer.
+#[cfg(test)]
+pub(crate) struct QueueAppendObserverGuard;
+
+#[cfg(test)]
+pub(crate) fn observe_queue_append(
+    observer: impl FnMut(&QueueEntry) + 'static,
+) -> QueueAppendObserverGuard {
+    QUEUE_APPEND_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+    QueueAppendObserverGuard
+}
+
+#[cfg(test)]
+impl Drop for QueueAppendObserverGuard {
+    fn drop(&mut self) {
+        QUEUE_APPEND_OBSERVER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 pub fn append_entry(project_root: &Path, entry: QueueEntry) -> Result<()> {
     let path = queue_path(project_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("create post-merge-review queue directory")?;
     }
+    // Observe the complete entry at entry to the real queue-persistence leaf,
+    // before the queue file is read or written. The observer only inspects; the
+    // real read/append/write below always runs.
+    #[cfg(test)]
+    QUEUE_APPEND_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow_mut().as_mut() {
+            observer(&entry);
+        }
+    });
     let mut queue = load_queue(project_root)?;
     queue.entries.push(entry);
     save_queue(project_root, &queue)

@@ -36,6 +36,22 @@ The doctrine the reviewers call "make durable state authoritative":
   A terminal-state-write failure is attached as secondary context, never allowed
   to mask the primary.
 
+- **Settle a no-overwrite phase through fresh field-level mutations, not a
+  pre-run snapshot write.** `finalize_learning` writes the whole `item` snapshot it
+  reserved from — correct for capture, which intentionally moves the Write output
+  and Merge Candidate to its canonical `Update expertise` commit. A pre-land
+  `no-expertise` Learner must instead leave every pointer at the reviewed SHA, so it
+  settles through `settle_no_expertise_learner`: each terminal transition
+  (`prepare_no_expertise_handoff` for `InProgress → HandoffPending`/`Failed`,
+  `publish_no_expertise_handoff` for `HandoffPending → Succeeded`/`Failed`,
+  `settle_no_expertise_failure` for a preflight or coder failure) is a fresh,
+  lock-held `mutate_work_item` that re-reads the aggregate, accepts only this
+  runner's exact Learning frontier, and changes only the Learning record. Writing a
+  stale pre-run snapshot back would either strand Learning `InProgress` on a
+  `StaleWorkItem` error or clobber a concurrent field, so the Attempt call sites also
+  skip their post-Learner whole-aggregate write for this mode. See
+  [[fresh-field-level-finalizer-preserves-concurrent-state]].
+
 When you add or change a reserved-phase path, keep this shape: reserve, then run
 the whole body inside one finalizer whose result persists the authoritative state
 before any artifact. See [[compose-typed-failure-precedence]] for how the

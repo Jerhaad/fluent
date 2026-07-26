@@ -106,7 +106,26 @@ Once the user confirms, move to Work Item creation.
 
 ## Create the Work Item(s)
 
-For a single Work Item, `<work-item-id>` equals `<draft-id>`. Run:
+Creating a Work Item is irreversible: it fixes the Work Item's Learner mode. So decide each Work Item's mode *before* you run any create command — never run a default create first and reconsider the mode afterward. Select the mode, then run only the one create command that matches it.
+
+### Select the Learner mode
+
+Decide the Learner mode per Work Item, before creating it. There are two modes:
+
+- **capture** (default) — after reviews pass, the Learner may refine project expertise and add one `Update expertise` commit, which can retarget the Merge Candidate. This is right for ordinary Work, so omit `--learner-mode` and let it default to `capture`.
+- **no-expertise** — the Learner still runs and produces its handoff after reviews, but it is denied expertise and candidate Git writes, so it never adds a commit or moves the reviewed SHA. Missing durable knowledge is proposed as non-corrective follow-up material for a human to fold into expertise later. A no-expertise Work Item is local-only: run its Attempt on a trusted macOS host, not on Fargate.
+
+Add `--learner-mode no-expertise` only when the confirmed Work Item contract requires one exact reviewed Writer SHA to remain unchanged through Tester, every review, and the Learner — for example a release prerequisite that must land a single commit unchanged. Otherwise choose capture.
+
+For a split plan, decide each Work Item's mode against its own contract — the mode is per Work Item, not per plan.
+
+### Run the matching create command
+
+For a single Work Item, `<work-item-id>` equals `<draft-id>`. For multiple Work Items, run `fluent work-item create` once per Work Item. Each Work Item's `<work-item-id>` is `<draft-id>-<slug>`. Use its plan file at `.fluent/drafts/<draft-id>/items/<slug>/plan.md`. For brief, behaviors, and approach, use the Work-Item-specific file under `items/<slug>/` if it exists, otherwise the shared file at the draft root.
+
+Run exactly one of these per Work Item, matching the mode you selected — the two are mutually exclusive:
+
+**If you selected capture:** omit `--learner-mode` so the Work Item uses the default `capture` policy.
 
 ```sh
 fluent work-item create <work-item-id> \
@@ -117,7 +136,17 @@ fluent work-item create <work-item-id> \
   --plan-file .fluent/drafts/<draft-id>/plan.md
 ```
 
-For multiple Work Items, run `fluent work-item create` once per Work Item. Each Work Item's `<work-item-id>` is `<draft-id>-<slug>`. Use its plan file at `.fluent/drafts/<draft-id>/items/<slug>/plan.md`. For brief, behaviors, and approach, use the Work-Item-specific file under `items/<slug>/` if it exists, otherwise the shared file at the draft root.
+**If you selected no-expertise:** include `--learner-mode no-expertise`.
+
+```sh
+fluent work-item create <work-item-id> \
+  --title "<short title>" \
+  --learner-mode no-expertise \
+  --brief-file .fluent/drafts/<draft-id>/brief.md \
+  --behaviors-file .fluent/drafts/<draft-id>/behaviors.diff.md \
+  --approach-file .fluent/drafts/<draft-id>/approach.md \
+  --plan-file .fluent/drafts/<draft-id>/plan.md
+```
 
 Do not create the Attempt or run it. That belongs to the autonomous stage in `fluent`. Stop here.
 

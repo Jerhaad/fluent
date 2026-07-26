@@ -2725,6 +2725,140 @@ pub fn learner_is_handoff_only(candidate_merged: bool) -> bool {
     candidate_merged
 }
 
+/// The internal Learner execution mode, resolved from the Work Item's stored
+/// `LearnerMode` and the candidate's merge state.
+///
+/// It is crate-private and never appears on the public `LearnerRunInputs`, so an
+/// external caller can only reach `Capture` (`handoff_only: false`) or
+/// `PostLandHandoffOnly` (`handoff_only: true`) and can never construct a state
+/// that contradicts the Boolean. The pre-land no-expertise mode is selected only
+/// through the crate-private production adapter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LearnerExecutionMode {
+    /// Ordinary pre-land Learner that may refine and commit expertise in the live
+    /// candidate workspace.
+    Capture,
+    /// Pre-land Learner that audits the reviewed change from an isolated snapshot,
+    /// denies expertise and candidate Git mutations, and produces only a handoff.
+    PreLandNoExpertise,
+    /// Post-land recovery Learner that runs handoff-only against the merged commit.
+    PostLandHandoffOnly,
+}
+
+impl LearnerExecutionMode {
+    /// Whether the Learner may write `.fluent/expertise/` and commit in the live
+    /// candidate workspace. Only ordinary capture may.
+    pub(crate) fn expertise_writable(self) -> bool {
+        matches!(self, Self::Capture)
+    }
+
+    /// Whether the run must stay confined even when `--no-sandbox` is requested.
+    /// Both no-expertise and post-land handoff-only enforce a trusted boundary.
+    pub(crate) fn forces_sandbox(self) -> bool {
+        !matches!(self, Self::Capture)
+    }
+
+    /// The host's sandbox-gating decision for this run: whether the coder stays
+    /// confined given the requested `--no-sandbox`. Only ordinary capture may run
+    /// unconfined; a forcing mode stays sandboxed even when `--no-sandbox` is set.
+    pub(crate) fn effectively_sandboxed(self, requested_no_sandbox: bool) -> bool {
+        !(requested_no_sandbox && !self.forces_sandbox())
+    }
+
+    /// Whether the run is the pre-land no-expertise mode.
+    pub(crate) fn is_pre_land_no_expertise(self) -> bool {
+        matches!(self, Self::PreLandNoExpertise)
+    }
+
+    /// Whether the run is the post-land handoff-only recovery mode.
+    pub(crate) fn is_post_land(self) -> bool {
+        matches!(self, Self::PostLandHandoffOnly)
+    }
+}
+
+/// Map the public `handoff_only` Boolean to the internal execution mode. The
+/// public API only distinguishes capture (`false`) from post-land handoff-only
+/// (`true`); the pre-land no-expertise mode is never reachable through it.
+pub(crate) fn learner_execution_mode_from_handoff_only(handoff_only: bool) -> LearnerExecutionMode {
+    if handoff_only {
+        LearnerExecutionMode::PostLandHandoffOnly
+    } else {
+        LearnerExecutionMode::Capture
+    }
+}
+
+/// Resolve the internal execution mode from the Work Item's stored Learner policy
+/// and the candidate's merge state. A merged candidate always runs post-land
+/// handoff-only regardless of the stored policy; otherwise the stored policy
+/// selects capture or pre-land no-expertise.
+pub(crate) fn resolve_learner_execution_mode(
+    learner_mode: crate::work_model::LearnerMode,
+    candidate_merged: bool,
+) -> LearnerExecutionMode {
+    if candidate_merged {
+        LearnerExecutionMode::PostLandHandoffOnly
+    } else {
+        match learner_mode {
+            crate::work_model::LearnerMode::Capture => LearnerExecutionMode::Capture,
+            crate::work_model::LearnerMode::NoExpertise => LearnerExecutionMode::PreLandNoExpertise,
+        }
+    }
+}
+
+/// The after-writing directive rendered into `prompts/learner-user.md` as one
+/// execution-mode token, so each mode reads accurately. A no-expertise run never
+/// borrows post-land discard wording and never directs the coder to create an
+/// Observation or Work Item directly.
+pub(crate) fn learner_user_mode_directive(mode: LearnerExecutionMode) -> &'static str {
+    match mode {
+        LearnerExecutionMode::Capture => {
+            "If you refined the project's learned model, commit the expertise changes with the\n\
+message \"Update expertise\". Commit nothing else — never project source, docs, or\n\
+the follow-up draft. If you found no durable learnings, do not commit and do not\n\
+create empty or placeholder learning files."
+        }
+        LearnerExecutionMode::PreLandNoExpertise => {
+            "This is a no-expertise run: the reviewed change has not merged and must keep its\n\
+exact reviewed commit. Do not commit anything and do not modify `.fluent/expertise/`\n\
+— expertise and candidate workspace writes are denied. If you identify durable\n\
+project knowledge that is not yet captured in expertise, describe it as a\n\
+non-corrective follow-up in the draft so it may later become an Observation. Do not\n\
+create an Observation or a Work Item yourself."
+        }
+        LearnerExecutionMode::PostLandHandoffOnly => {
+            "This is a post-land handoff-only run: the change has already merged. Do not\n\
+commit anything and do not modify `.fluent/expertise/` — expertise writes are\n\
+denied and will be discarded. If you identify durable project knowledge that is\n\
+not yet captured in expertise, describe it as a non-corrective follow-up in the\n\
+draft so it is recorded as an Observation for a human to fold into expertise\n\
+later."
+        }
+    }
+}
+
+/// The one-line execution-mode directive rendered into `prompts/learner-system.md`
+/// and reused verbatim for the schema-repair system prompt, so a schema repair
+/// keeps the same mode-accurate prohibition as the initial audit.
+pub(crate) fn learner_system_mode_directive(mode: LearnerExecutionMode) -> &'static str {
+    match mode {
+        LearnerExecutionMode::Capture => {
+            "You are running in capture mode: you may refine the project's learned model and \
+commit it with the message \"Update expertise\"."
+        }
+        LearnerExecutionMode::PreLandNoExpertise => {
+            "You are running in no-expertise mode: the reviewed change must keep its exact \
+commit, so expertise and candidate workspace writes are denied. Produce only the \
+handoff draft and propose any missing durable knowledge as non-corrective follow-up \
+material that may later become an Observation — never a direct Observation or Work \
+Item."
+        }
+        LearnerExecutionMode::PostLandHandoffOnly => {
+            "You are running in post-land handoff-only mode: the change already merged, so \
+expertise writes are denied and discarded. Produce only the handoff draft."
+        }
+    }
+}
+
 /// Whether the Learner may write `.fluent/expertise/` on this run. A handoff-only
 /// post-land retry may not, so expertise stays read-only and only the managed
 /// handoff surface is writable.
@@ -2768,12 +2902,80 @@ pub(crate) fn run_learner_captured(
     inputs: LearnerRunInputs<'_>,
     capture: Option<crate::coder::TranscriptCapture<'_>>,
 ) -> Result<()> {
+    let mode = learner_execution_mode_from_handoff_only(inputs.handoff_only);
+    run_learner_captured_in_mode(inputs, mode, capture)
+}
+
+/// Crate-private mode-explicit captured entry. Production orchestration selects
+/// the pre-land no-expertise mode here, which the public `handoff_only` Boolean
+/// cannot express. The mode drives sandbox confinement and prompt wording; the
+/// public inputs never carry it.
+pub(crate) fn run_learner_captured_in_mode(
+    inputs: LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
+    capture: Option<crate::coder::TranscriptCapture<'_>>,
+) -> Result<()> {
     let coder_kind = inputs.coder_kind;
     let model = inputs.model.map(|s| s.to_string());
     let effort = inputs.effort.map(|s| s.to_string());
-    run_learner_with_coder(inputs, capture, move |sandbox| {
-        coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref())
-    })
+    run_learner_with_coder(
+        inputs,
+        mode,
+        capture,
+        HostPreparation::Production,
+        move |sandbox| {
+            coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref())
+        },
+    )
+}
+
+/// Prepare the sandboxed host before an effectively sandboxed Learner launch:
+/// verify the coder's prerequisites, inject its supported credentials on the host
+/// (where the sandbox denies the credential store), and set up Git signing. This is
+/// the last trusted host boundary before environment filtering and Seatbelt.
+///
+/// Production always uses [`HostPreparation::Production`], which runs the fixed
+/// prerequisite → credential-injection → Git-signing sequence. A `#[cfg(test)]`-only
+/// [`HostPreparation::Injected`] variant lets a hermetic launch-route test replace
+/// exactly this operation with a recording no-op (or a sentinel failure), leaving the
+/// prompt builder, confinement profile construction, coder factory, and launch route
+/// production-identical without mutating process-global `PATH` or touching live
+/// credential or Git-signing state. A non-test build has no injectable variant.
+enum HostPreparation<'a> {
+    /// The production sequence: `os::check_prerequisites_for`, then
+    /// `credential::inject_credentials`, then `credential::setup_git_signing`.
+    Production,
+    /// A test-injected preparation. The launch route calls this instead of the
+    /// production sequence, so the test never mutates `PATH` or reads live
+    /// credentials. The closure may record the invocation and return a sentinel
+    /// failure to prove the route stops before the coder is constructed.
+    #[cfg(test)]
+    Injected(&'a mut dyn FnMut(CoderKind) -> Result<()>),
+    /// Keeps the `'a` lifetime live in non-test builds, where `Injected` is compiled
+    /// out. Never constructed.
+    #[cfg(not(test))]
+    #[allow(dead_code)]
+    _Unused(std::marker::PhantomData<&'a ()>),
+}
+
+impl HostPreparation<'_> {
+    /// Run the sandboxed-host preparation for a launch. Production runs the fixed
+    /// prerequisite, credential-injection, and Git-signing sequence; an injected
+    /// preparation defers entirely to the recording test closure.
+    fn prepare(&mut self, coder_kind: CoderKind) -> Result<()> {
+        match self {
+            HostPreparation::Production => {
+                os::check_prerequisites_for(coder_kind)?;
+                credential::inject_credentials()?;
+                credential::setup_git_signing();
+                Ok(())
+            }
+            #[cfg(test)]
+            HostPreparation::Injected(prepare) => prepare(coder_kind),
+            #[cfg(not(test))]
+            HostPreparation::_Unused(_) => unreachable!("_Unused is never constructed"),
+        }
+    }
 }
 
 /// Run the Learner with a caller-supplied coder factory. Production builds the real
@@ -2782,19 +2984,22 @@ pub(crate) fn run_learner_captured(
 /// capture is threaded as a separate immutable argument — resolved once in the
 /// crate-private Attempt adapter — so no transient capture state rides on the public
 /// `LearnerRunInputs`.
+///
+/// `host_preparation` performs the sandboxed-host preparation for an effectively
+/// sandboxed launch. Production passes [`HostPreparation::Production`]; a hermetic
+/// launch-route test passes a recording [`HostPreparation::Injected`] so the route
+/// runs unchanged without mutating `PATH` or touching live host state.
 fn run_learner_with_coder(
     inputs: LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
     capture: Option<crate::coder::TranscriptCapture<'_>>,
+    mut host_preparation: HostPreparation<'_>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     eprintln!("  Running the Learner after passing reviews…");
 
     let workspace_path = inputs.workspace_path;
     let workspace_resolver = ContentResolver::new(Some(workspace_path));
-    let system_prompt = workspace_resolver
-        .resolve_content("prompts/learner-system.md")
-        .unwrap_or_default();
-
     let learnings_dir = workspace_path.join(".fluent/expertise/learnings");
     let learnings_index_path = learnings_dir.join("INDEX.md");
     let expertise_index_path = workspace_path.join(".fluent/expertise/INDEX.md");
@@ -2802,45 +3007,32 @@ fn run_learner_with_coder(
     let review_paths_rendered = render_path_list(inputs.review_artifact_paths);
     let tester_paths_rendered = render_path_list(inputs.tester_artifact_paths);
 
-    let has_learnings_index = if learnings_index_path.is_file() {
-        "yes"
-    } else {
-        ""
-    };
-
     let draft_path = inputs.handoff_dir.join(crate::learner::DRAFT_FILE_NAME);
 
-    // A schema repair is not a fresh audit: the coder receives the rejected
-    // draft and exact error and re-emits only a schema-corrected draft.
-    let prompt = if let Some(repair) = inputs.repair.as_ref() {
-        schema_repair_prompt(&draft_path, repair)
-    } else {
-        let template = inputs
-            .resolver
-            .resolve_content("prompts/learner-user.md")
-            .ok_or_else(|| anyhow::anyhow!("bundled learner-user.md must resolve"))?;
-        crate::content::render_template(
-            &template,
-            &[
-                ("review_artifact_paths", &review_paths_rendered),
-                ("tester_artifact_paths", &tester_paths_rendered),
-                ("diff_command", inputs.diff_command),
-                ("learnings_dir", &learnings_dir.display().to_string()),
-                (
-                    "learnings_index_path",
-                    &learnings_index_path.display().to_string(),
-                ),
-                (
-                    "expertise_index_path",
-                    &expertise_index_path.display().to_string(),
-                ),
-                ("has_learnings_index", has_learnings_index),
-                ("draft_path", &draft_path.display().to_string()),
-                ("handoff_only", if inputs.handoff_only { "yes" } else { "" }),
-            ],
-        )
-        .map_err(|e| anyhow::anyhow!("learner-user.md template error: {e}"))?
-    };
+    // Build the mode-accurate system and user prompts through the one production
+    // helper the tests also exercise, so the launched prompts and the tested prompts
+    // can never drift. It renders the system prompt's execution-mode directive (a
+    // schema repair reuses that same system prompt), renders the initial user prompt
+    // or builds the bounded schema-repair user prompt, and fails closed on any
+    // resolution, rendering, or surviving-placeholder fault — so no coder is
+    // constructed from a mis-rendered prompt.
+    let LearnerPrompts {
+        system_prompt,
+        user_prompt: prompt,
+    } = build_learner_prompts(&LearnerPromptInputs {
+        user_resolver: inputs.resolver,
+        system_resolver: &workspace_resolver,
+        mode,
+        review_artifact_paths: &review_paths_rendered,
+        tester_artifact_paths: &tester_paths_rendered,
+        diff_command: inputs.diff_command,
+        learnings_dir: &learnings_dir.display().to_string(),
+        learnings_index_path: &learnings_index_path.display().to_string(),
+        expertise_index_path: &expertise_index_path.display().to_string(),
+        has_learnings_index: learnings_index_path.is_file(),
+        draft_path: &draft_path.display().to_string(),
+        repair: inputs.repair.as_ref(),
+    })?;
 
     let mut readable_roots: Vec<PathBuf> = inputs
         .review_artifact_paths
@@ -2855,7 +3047,10 @@ fn run_learner_with_coder(
     fs::create_dir_all(&expertise_dir)?;
     fs::create_dir_all(inputs.handoff_dir)?;
 
-    let effectively_sandboxed = !(inputs.no_sandbox && !inputs.handoff_only);
+    // Only ordinary capture may honor `--no-sandbox`. A no-expertise or post-land
+    // run forces the trusted boundary so a candidate cannot be retargeted or the
+    // merged branch mutated even when the caller requested no sandbox.
+    let effectively_sandboxed = mode.effectively_sandboxed(inputs.no_sandbox);
 
     // The managed Learner surface is the last trusted host boundary before
     // environment filtering and Seatbelt. When the coder launches effectively
@@ -2871,9 +3066,9 @@ fn run_learner_with_coder(
     // while the launch is still using it.
     let mut _private_temp_guard: Option<tempfile::TempDir> = None;
     if effectively_sandboxed {
-        os::check_prerequisites_for(inputs.coder_kind)?;
-        credential::inject_credentials()?;
-        credential::setup_git_signing();
+        // Prepare the trusted host boundary before any confinement profile is built
+        // or coder constructed, so a preparation failure stops the launch here.
+        host_preparation.prepare(inputs.coder_kind)?;
 
         let private_temp = create_private_launch_temp(inputs.handoff_dir)?;
         let scratch_str = private_temp.path().to_string_lossy().to_string();
@@ -2894,7 +3089,7 @@ fn run_learner_with_coder(
         let common_git_dir = worktree::git_common_dir(workspace_path)?;
         readable_roots.push(workspace_path.to_path_buf());
         let home = std::env::var("HOME").unwrap_or_default();
-        if learner_expertise_writable(inputs.handoff_only) {
+        if mode.expertise_writable() {
             let mut writable = vec![
                 expertise_dir.clone(),
                 inputs.handoff_dir.to_path_buf(),
@@ -2916,12 +3111,13 @@ fn run_learner_with_coder(
             let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
             (sandbox, Some(profile))
         } else {
-            // Handoff-only: deny expertise writes. Expertise stays readable, but
-            // only the isolated staging surface is writable. Git metadata is
-            // readable for the accepted-change diff but never writable. A post-
-            // land retry handles persisted merged state, so `--no-sandbox`
-            // cannot weaken its boundary: it uses the trusted system Seatbelt
-            // launcher and fails closed when the host cannot apply that profile.
+            // No-expertise and post-land handoff-only: deny expertise writes.
+            // Expertise stays readable, but only the isolated staging surface is
+            // writable. Git metadata is readable for the accepted-change diff but
+            // never writable. Both modes run against an isolated snapshot, so
+            // `--no-sandbox` cannot weaken the boundary: they use the trusted
+            // system Seatbelt launcher and fail closed when the host cannot apply
+            // that profile.
             readable_roots.push(expertise_dir.clone());
             readable_roots.push(common_git_dir.clone());
             let mut denied = vec![workspace_path.to_path_buf(), common_git_dir];
@@ -2969,6 +3165,117 @@ fn run_learner_with_coder(
         bail!("Learner coder exited with code {exit_code}");
     }
 
+    Ok(())
+}
+
+/// The rendered Learner system and user prompts for one invocation. Built by the
+/// single production helper both the launch path and the tests use, so a tested
+/// prompt can never drift from what the coder actually receives.
+#[derive(Debug)]
+pub(crate) struct LearnerPrompts {
+    pub system_prompt: String,
+    pub user_prompt: String,
+}
+
+/// The inputs the Learner prompt helper renders. Borrowed so the production launch
+/// path and the tests build the same prompts from the same fields.
+pub(crate) struct LearnerPromptInputs<'a> {
+    /// Resolves the user-prompt template (`prompts/learner-user.md`), honoring a
+    /// project-local or user override.
+    pub user_resolver: &'a ContentResolver,
+    /// Resolves the system-prompt template (`prompts/learner-system.md`).
+    pub system_resolver: &'a ContentResolver,
+    pub mode: LearnerExecutionMode,
+    pub review_artifact_paths: &'a str,
+    pub tester_artifact_paths: &'a str,
+    pub diff_command: &'a str,
+    pub learnings_dir: &'a str,
+    pub learnings_index_path: &'a str,
+    pub expertise_index_path: &'a str,
+    pub has_learnings_index: bool,
+    pub draft_path: &'a str,
+    /// When present, the user prompt is the bounded schema-repair prompt rather than
+    /// a fresh audit; the system prompt still carries the mode directive so the
+    /// repair keeps its mode-accurate prohibition.
+    pub repair: Option<&'a SchemaRepairInput<'a>>,
+}
+
+/// Build the Learner's system and user prompts for one invocation — the single
+/// production path shared with the tests.
+///
+/// The system prompt always renders the execution-mode directive; a schema repair
+/// reuses that same system prompt so its prohibition stays mode-accurate. The user
+/// prompt is either the rendered initial audit template or the bounded
+/// schema-repair prompt. Every content resolution and template render propagates as
+/// an error — there is no raw-template or empty-system fallback — and each
+/// template-rendered prompt is scanned for a surviving `{{`/`}}` token, so a
+/// mis-resolved or mis-rendered prompt fails before any coder is constructed. The
+/// schema-repair user prompt embeds the rejected draft JSON verbatim, which may
+/// legitimately contain braces, so only the template-rendered prompts are scanned.
+pub(crate) fn build_learner_prompts(inputs: &LearnerPromptInputs<'_>) -> Result<LearnerPrompts> {
+    let system_template = inputs
+        .system_resolver
+        .resolve_content("prompts/learner-system.md")
+        .ok_or_else(|| anyhow::anyhow!("learner-system.md could not be resolved"))?;
+    let system_prompt = crate::content::render_template(
+        &system_template,
+        &[("mode_directive", learner_system_mode_directive(inputs.mode))],
+    )
+    .map_err(|e| anyhow::anyhow!("learner-system.md template error: {e}"))?;
+    ensure_no_unresolved_placeholders("learner system prompt", &system_prompt)?;
+
+    let user_prompt = if let Some(repair) = inputs.repair {
+        schema_repair_prompt(Path::new(inputs.draft_path), repair)
+    } else {
+        let template = inputs
+            .user_resolver
+            .resolve_content("prompts/learner-user.md")
+            .ok_or_else(|| anyhow::anyhow!("learner-user.md could not be resolved"))?;
+        let rendered = crate::content::render_template(
+            &template,
+            &[
+                ("review_artifact_paths", inputs.review_artifact_paths),
+                ("tester_artifact_paths", inputs.tester_artifact_paths),
+                ("diff_command", inputs.diff_command),
+                ("learnings_dir", inputs.learnings_dir),
+                ("learnings_index_path", inputs.learnings_index_path),
+                ("expertise_index_path", inputs.expertise_index_path),
+                (
+                    "has_learnings_index",
+                    if inputs.has_learnings_index { "yes" } else { "" },
+                ),
+                ("draft_path", inputs.draft_path),
+                (
+                    "expertise_writable",
+                    if inputs.mode.expertise_writable() {
+                        "yes"
+                    } else {
+                        ""
+                    },
+                ),
+                ("mode_directive", learner_user_mode_directive(inputs.mode)),
+            ],
+        )
+        .map_err(|e| anyhow::anyhow!("learner-user.md template error: {e}"))?;
+        ensure_no_unresolved_placeholders("learner user prompt", &rendered)?;
+        rendered
+    };
+
+    Ok(LearnerPrompts {
+        system_prompt,
+        user_prompt,
+    })
+}
+
+/// Fail closed if a rendered prompt still carries `{{` or `}}` — an unresolved
+/// template variable or a doubled-brace escape that survived rendering. The check
+/// runs before any coder is constructed, so a mis-rendered prompt never reaches a
+/// launch. Only template-rendered prompts are scanned; the schema-repair prompt
+/// embeds verbatim JSON whose braces are legitimate.
+fn ensure_no_unresolved_placeholders(label: &str, rendered: &str) -> Result<()> {
+    if rendered.contains("{{") || rendered.contains("}}") {
+        bail!("{label} still contains unresolved template placeholders (`{{{{` or `}}}}`)");
+    }
     Ok(())
 }
 
@@ -4487,7 +4794,9 @@ mod tests {
                 handoff_only: false,
                 repair: None,
             },
+            LearnerExecutionMode::Capture,
             Some(capture),
+            HostPreparation::Production,
             move |_sandbox| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
@@ -4542,7 +4851,9 @@ mod tests {
                 handoff_only: false,
                 repair: None,
             },
+            LearnerExecutionMode::Capture,
             Some(capture),
+            HostPreparation::Production,
             move |_sandbox| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
@@ -8094,48 +8405,43 @@ mod tests {
         );
     }
 
+    /// Build the production Learner prompts for a mode straight from the bundled
+    /// resolver, so a test exercises the exact launch-path construction rather than a
+    /// duplicated inline render that could drift from it. A `repair` input switches
+    /// the user prompt to the bounded schema-repair prompt; the system prompt keeps
+    /// its mode directive either way.
+    fn bundled_learner_prompts(
+        mode: LearnerExecutionMode,
+        repair: Option<&SchemaRepairInput<'_>>,
+    ) -> LearnerPrompts {
+        let resolver = ContentResolver::new(None);
+        build_learner_prompts(&LearnerPromptInputs {
+            user_resolver: &resolver,
+            system_resolver: &resolver,
+            mode,
+            review_artifact_paths: "- /tmp/review-1/review.md\n- /tmp/review-2/review.md",
+            tester_artifact_paths:
+                "- /tmp/tester-1/tester-results.json\n- /tmp/tester-2/tester-results.json",
+            diff_command: "git -C '/tmp/workspace' diff 'main...HEAD'",
+            learnings_dir: "/tmp/learnings",
+            learnings_index_path: "/tmp/learnings/INDEX.md",
+            expertise_index_path: "/tmp/expertise/INDEX.md",
+            has_learnings_index: false,
+            draft_path: "/tmp/learner/follow-up-draft.json",
+            repair,
+        })
+        .expect("bundled learner prompts must render")
+    }
+
     #[test]
     fn learner_prompt_includes_attempt_diff_and_all_review_artifacts() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let resolver = ContentResolver::new(None);
-        let template = resolver
-            .resolve_content("prompts/learner-user.md")
-            .expect("learner-user.md must resolve");
-
-        let learnings_dir = workspace.join(".fluent/expertise/learnings");
-        let learnings_index_path = learnings_dir.join("INDEX.md");
-        let expertise_index_path = workspace.join(".fluent/expertise/INDEX.md");
-
-        let review_paths = "- /tmp/review-1/review.md\n- /tmp/review-2/review.md";
-        let tester_paths =
-            "- /tmp/tester-1/tester-results.json\n- /tmp/tester-2/tester-results.json";
-        let diff_command = "git -C '/tmp/workspace' diff 'main...HEAD'";
-        let draft_path = "/tmp/learner/follow-up-draft.json";
-
-        let rendered = crate::content::render_template(
-            &template,
-            &[
-                ("review_artifact_paths", review_paths),
-                ("tester_artifact_paths", tester_paths),
-                ("diff_command", diff_command),
-                ("learnings_dir", &learnings_dir.display().to_string()),
-                (
-                    "learnings_index_path",
-                    &learnings_index_path.display().to_string(),
-                ),
-                (
-                    "expertise_index_path",
-                    &expertise_index_path.display().to_string(),
-                ),
-                ("has_learnings_index", ""),
-                ("draft_path", draft_path),
-            ],
-        )
-        .expect("learner template must render");
+        // The initial capture user prompt — built through the production helper —
+        // carries the complete-change diff command and every review round's reviewer
+        // and tester artifacts, plus the draft path.
+        let rendered = bundled_learner_prompts(LearnerExecutionMode::Capture, None).user_prompt;
 
         assert!(
-            rendered.contains(diff_command),
+            rendered.contains("git -C '/tmp/workspace' diff 'main...HEAD'"),
             "the learner prompt must include the complete-change diff command"
         );
         assert!(
@@ -8149,23 +8455,9 @@ mod tests {
             "the learner prompt must include every review round's tester artifacts"
         );
         assert!(
-            rendered.contains(draft_path),
+            rendered.contains("/tmp/learner/follow-up-draft.json"),
             "the learner prompt must name the draft path"
         );
-    }
-
-    fn learner_ctx(handoff_only: &'static str) -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("review_artifact_paths", "- (none)"),
-            ("tester_artifact_paths", "- (none)"),
-            ("diff_command", "git diff"),
-            ("learnings_dir", "/tmp/learnings"),
-            ("learnings_index_path", "/tmp/learnings/INDEX.md"),
-            ("expertise_index_path", "/tmp/expertise/INDEX.md"),
-            ("has_learnings_index", ""),
-            ("draft_path", "/tmp/draft.json"),
-            ("handoff_only", handoff_only),
-        ]
     }
 
     #[test]
@@ -8182,17 +8474,588 @@ mod tests {
             learner_expertise_writable(false),
             "a pre-land run may refine expertise"
         );
+    }
 
-        // The handoff-only branch of the learner prompt forbids commits and
-        // expertise changes; the normal branch keeps the expertise instructions.
+    #[test]
+    fn learner_prompts_render_capture_no_expertise_and_post_land_modes() {
+        // The production helper renders three distinct, mode-accurate prompt pairs
+        // from one execution-mode token. Capture keeps the expertise-commit actions;
+        // no-expertise and post-land both forbid commits, but no-expertise never
+        // borrows the post-land discard wording. No rendered prompt keeps a template
+        // placeholder.
+        let capture = bundled_learner_prompts(LearnerExecutionMode::Capture, None);
+        let capture_user = &capture.user_prompt;
+        assert!(capture_user.contains("Update expertise"));
+        // Only the initial capture user prompt renders the concrete expertise-writing
+        // actions: write one file per learning, maintain the index, and point the
+        // expertise index at the learnings folder.
+        assert!(capture_user.contains("Write one file per learning"));
+        assert!(capture_user.contains("Maintain `/tmp/learnings/INDEX.md`"));
+        assert!(capture_user.contains("add a row for it"));
+        assert!(!capture_user.contains("expertise writes are denied"));
+        assert!(!capture_user.contains("no-expertise run"));
+        assert!(!capture_user.contains("post-land handoff-only run"));
+
+        let no_expertise = bundled_learner_prompts(LearnerExecutionMode::PreLandNoExpertise, None);
+        let no_expertise_user = &no_expertise.user_prompt;
+        assert!(no_expertise_user.contains("no-expertise run"));
+        assert!(no_expertise_user.contains("non-corrective follow-up"));
+        assert!(!no_expertise_user.contains("Update expertise"));
+        // The concrete capture-write actions are absent, not merely the phrase
+        // "Update expertise". A denied run is told to leave expertise unchanged.
+        assert!(!no_expertise_user.contains("Write one file per learning"));
+        assert!(!no_expertise_user.contains("Maintain `/tmp/learnings/INDEX.md`"));
+        assert!(no_expertise_user.contains("expertise writes are denied on this run"));
+        // No post-land discard wording leaks into a pre-land no-expertise prompt; its
+        // exact-reviewed-SHA and Observation-eligible wording is retained.
+        assert!(!no_expertise_user.contains("already merged"));
+        assert!(!no_expertise_user.contains("will be discarded"));
+        assert!(no_expertise_user.contains("exact reviewed commit"));
+        assert!(no_expertise_user.contains("later become an Observation"));
+
+        let post_land = bundled_learner_prompts(LearnerExecutionMode::PostLandHandoffOnly, None);
+        let post_land_user = &post_land.user_prompt;
+        assert!(post_land_user.contains("post-land handoff-only run"));
+        assert!(post_land_user.contains("already merged"));
+        assert!(post_land_user.contains("will be discarded"));
+        assert!(!post_land_user.contains("Update expertise"));
+        // Post-land is a denied-write mode too: no capture-write actions render.
+        assert!(!post_land_user.contains("Write one file per learning"));
+        assert!(!post_land_user.contains("Maintain `/tmp/learnings/INDEX.md`"));
+        assert!(post_land_user.contains("expertise writes are denied on this run"));
+
+        // Every rendered prompt — system and user, in every mode — is free of any
+        // surviving template placeholder.
+        for prompts in [&capture, &no_expertise, &post_land] {
+            assert!(
+                !prompts.user_prompt.contains("{{") && !prompts.user_prompt.contains("}}"),
+                "no rendered user prompt keeps a template placeholder"
+            );
+            assert!(
+                !prompts.system_prompt.contains("{{") && !prompts.system_prompt.contains("}}"),
+                "no rendered system prompt keeps a template placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn no_expertise_schema_repair_retains_mode_accurate_system_prompt() {
+        // A schema repair reuses the same mode-accurate system prompt as the initial
+        // audit, and its user prompt stays bounded to schema correction — it does not
+        // re-render the audit template or borrow another mode's capture wording.
+        let repair = SchemaRepairInput {
+            rejected_draft: r#"{"learning_summary":"x","follow_ups":[{"id":""}]}"#,
+            validation_error: "follow_up id must be non-empty",
+        };
+        let no_expertise =
+            bundled_learner_prompts(LearnerExecutionMode::PreLandNoExpertise, Some(&repair));
+
+        // The repair's system prompt carries the no-expertise directive, not capture
+        // or post-land wording.
+        let system = &no_expertise.system_prompt;
+        assert!(system.contains("no-expertise mode"));
+        assert!(system.contains("denied"));
+        assert!(!system.contains("Update expertise"));
+        assert!(!system.contains("already merged"));
+        // The shared system prose is capability-neutral: it does not order every mode
+        // to write the learned model.
+        assert!(!system.contains("Write only within the learned model"));
+
+        // The repair user prompt is bounded to schema correction: it re-emits a
+        // corrected draft with the exact error and does not repeat the audit or carry
+        // capture wording.
+        let user = &no_expertise.user_prompt;
+        assert!(user.contains("failed schema validation"));
+        assert!(user.contains("Do not repeat the review audit"));
+        assert!(user.contains(r#""follow_ups":[{"id":""}]"#));
+        assert!(user.contains("follow_up id must be non-empty"));
+        assert!(!user.contains("Update expertise"));
+        assert!(!user.contains("Write one file per learning"));
+
+        // Capture keeps its positive write capability through the same system
+        // template, even on a repair.
+        let capture = bundled_learner_prompts(LearnerExecutionMode::Capture, Some(&repair));
+        assert!(
+            capture
+                .system_prompt
+                .contains("you may refine the project's learned model")
+        );
+    }
+
+    #[test]
+    fn learner_prompts_fail_closed_on_unrenderable_or_placeholder_leaking_template() {
+        // The production helper fails before any coder is constructed when a template
+        // cannot render or renders with a surviving `{{`/`}}` token.
+        fn inputs<'a>(
+            user_resolver: &'a ContentResolver,
+            system_resolver: &'a ContentResolver,
+        ) -> LearnerPromptInputs<'a> {
+            LearnerPromptInputs {
+                user_resolver,
+                system_resolver,
+                mode: LearnerExecutionMode::Capture,
+                review_artifact_paths: "- (none)",
+                tester_artifact_paths: "- (none)",
+                diff_command: "git diff",
+                learnings_dir: "/tmp/learnings",
+                learnings_index_path: "/tmp/learnings/INDEX.md",
+                expertise_index_path: "/tmp/expertise/INDEX.md",
+                has_learnings_index: false,
+                draft_path: "/tmp/draft.json",
+                repair: None,
+            }
+        }
+        let bundled = ContentResolver::new(None);
+
+        // Case 1: an unknown-variable template cannot render.
+        let unrenderable = tempfile::TempDir::new().unwrap();
+        let dir = unrenderable.path().join(".fluent/prompts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("learner-user.md"), "Audit {{unknown_token}}.").unwrap();
+        let project = ContentResolver::new(Some(unrenderable.path()));
+        let err = build_learner_prompts(&inputs(&project, &bundled)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("learner-user.md template error"),
+            "an unrenderable template must fail the build: {err:#}"
+        );
+
+        // Case 2: a doubled-brace escape renders but leaves a literal `{{`/`}}`.
+        let leaking = tempfile::TempDir::new().unwrap();
+        let dir = leaking.path().join(".fluent/prompts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("learner-user.md"),
+            "Audit {{{{still_a_placeholder}}.",
+        )
+        .unwrap();
+        let project = ContentResolver::new(Some(leaking.path()));
+        let err = build_learner_prompts(&inputs(&project, &bundled)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unresolved template placeholders"),
+            "a surviving placeholder must fail the build: {err:#}"
+        );
+    }
+
+    /// A Learner coder that records every launch's `(system_prompt, user_prompt)`
+    /// pair through the real `run_captured` route and reports a clean success, so a
+    /// launch-route test observes exactly what the production route hands the coder.
+    struct PromptRecordingCoder {
+        launches: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl crate::coder::Coder for PromptRecordingCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the learner route launches through run_captured_reported")
+        }
+
+        fn run_captured(
+            &self,
+            prompt: &str,
+            system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            self.launches
+                .lock()
+                .unwrap()
+                .push((system_prompt.to_string(), prompt.to_string()));
+            Ok(0)
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the learner route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn learner_production_launch_prompts_cover_every_mode_and_invocation() {
+        // B3h: every mode × {initial, schema-repair} is driven through the SAME
+        // production launch route (`run_learner_with_coder`), which builds prompts via
+        // the one production `build_learner_prompts`, constructs the real confinement
+        // profile for a forcing mode, and hands the prompts to the constructed coder.
+        // The route is exercised hermetically: only the private sandboxed-host
+        // preparation is replaced with a recording no-op (`HostPreparation::Injected`),
+        // so the test never mutates process-global PATH, writes fake executables, nor
+        // reads or injects live credentials or Git-signing state. Preparation runs ZERO
+        // times for unsandboxed capture and ONCE for each forcing mode (no-expertise
+        // and post-land, which force the sandbox). The recording coder then captures
+        // the exact prompts the route delivers — launch-route coverage a helper-only
+        // render test cannot provide.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let repair = SchemaRepairInput {
+            rejected_draft: r#"{"learning_summary":"x","follow_ups":[{"id":""}]}"#,
+            validation_error: "follow_up id must be non-empty",
+        };
+        // Capture stays unsandboxed under `--no-sandbox`, so it prepares the host zero
+        // times; the two forcing modes ignore `--no-sandbox` and prepare exactly once.
+        let modes = [
+            ("capture", LearnerExecutionMode::Capture, 0usize),
+            ("no-expertise", LearnerExecutionMode::PreLandNoExpertise, 1),
+            ("post-land", LearnerExecutionMode::PostLandHandoffOnly, 1),
+        ];
+
+        for (mode_name, mode, expected_preparations) in modes {
+            for repair_opt in [None, Some(repair)] {
+                let invocation = if repair_opt.is_some() {
+                    "schema-repair"
+                } else {
+                    "initial"
+                };
+                let tmp = tempfile::tempdir().unwrap();
+                let workspace = tmp.path().join("workspace");
+                std::fs::create_dir_all(&workspace).unwrap();
+                // A forcing mode reads the workspace's Git common dir when it renders
+                // the trusted profile, so the snapshot must be a real repository.
+                crate::git::run(&workspace, &["init", "-q"], "init learner workspace").unwrap();
+                let handoff_dir = tmp.path().join("handoff");
+                std::fs::create_dir_all(&handoff_dir).unwrap();
+                let resolver = ContentResolver::new(None);
+
+                let factory_calls = Arc::new(AtomicUsize::new(0));
+                let factory_for_run = Arc::clone(&factory_calls);
+                let launches = Arc::new(Mutex::new(Vec::new()));
+                let launches_for_run = Arc::clone(&launches);
+
+                // Record every sandboxed-host preparation without running the real
+                // prerequisite, credential-injection, or Git-signing sequence. The
+                // recording Vec lives behind a shared handle so it survives the closure
+                // borrow and can be read after the launch returns.
+                let preparations = Arc::new(Mutex::new(Vec::<CoderKind>::new()));
+                let preparations_for_run = Arc::clone(&preparations);
+                let mut recording_prepare = move |coder_kind: CoderKind| -> Result<()> {
+                    preparations_for_run.lock().unwrap().push(coder_kind);
+                    Ok(())
+                };
+
+                run_learner_with_coder(
+                    LearnerRunInputs {
+                        workspace_path: &workspace,
+                        resolver: &resolver,
+                        extra_args: &[],
+                        coder_kind: CoderKind::Codex,
+                        no_sandbox: true,
+                        model: None,
+                        effort: None,
+                        review_artifact_paths: &[],
+                        tester_artifact_paths: &[],
+                        diff_command: "git -C '/tmp/workspace' diff 'main...HEAD'",
+                        handoff_dir: &handoff_dir,
+                        denied_write_roots: &[],
+                        handoff_only: mode.is_post_land(),
+                        repair: repair_opt,
+                    },
+                    mode,
+                    None,
+                    HostPreparation::Injected(&mut recording_prepare),
+                    move |_sandbox| {
+                        factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
+                        Box::new(PromptRecordingCoder {
+                            launches: launches_for_run,
+                        })
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("{mode_name}/{invocation}: the launch route must run the injected coder: {e:#}")
+                });
+
+                let preparations = preparations.lock().unwrap();
+                assert_eq!(
+                    preparations.len(),
+                    expected_preparations,
+                    "{mode_name}/{invocation}: sandboxed-host preparation runs zero times for unsandboxed capture and once per forcing mode"
+                );
+                assert!(
+                    preparations.iter().all(|kind| *kind == CoderKind::Codex),
+                    "{mode_name}/{invocation}: preparation receives the resolved coder kind"
+                );
+                drop(preparations);
+                assert_eq!(
+                    factory_calls.load(AtomicOrdering::SeqCst),
+                    1,
+                    "{mode_name}/{invocation}: the coder factory is constructed exactly once"
+                );
+                let launches = launches.lock().unwrap();
+                assert_eq!(
+                    launches.len(),
+                    1,
+                    "{mode_name}/{invocation}: the coder launches exactly once"
+                );
+                let (system, user) = &launches[0];
+                assert!(
+                    !system.is_empty() && !user.is_empty(),
+                    "{mode_name}/{invocation}: both prompts are non-empty"
+                );
+                assert!(
+                    !system.contains("{{")
+                        && !system.contains("}}")
+                        && !user.contains("{{"),
+                    "{mode_name}/{invocation}: no template placeholder leaks to the coder"
+                );
+
+                // The system prompt carries the mode-accurate directive for every
+                // invocation, including a schema repair (which reuses it).
+                match mode {
+                    LearnerExecutionMode::Capture => assert!(
+                        system.contains("capture mode")
+                            && system.contains("you may refine the project's learned model"),
+                        "{mode_name}/{invocation}: capture grants the expertise capability"
+                    ),
+                    LearnerExecutionMode::PreLandNoExpertise => assert!(
+                        system.contains("no-expertise mode")
+                            && !system.contains("already merged"),
+                        "{mode_name}/{invocation}: no-expertise directive, no post-land wording"
+                    ),
+                    LearnerExecutionMode::PostLandHandoffOnly => assert!(
+                        system.contains("post-land handoff-only mode"),
+                        "{mode_name}/{invocation}: post-land directive is present"
+                    ),
+                }
+
+                // The user prompt differs by invocation: the initial audit renders the
+                // accepted-change diff; a schema repair is bounded to correction.
+                match repair_opt {
+                    Some(_) => assert!(
+                        user.contains("failed schema validation")
+                            && user.contains("Do not repeat the review audit")
+                            && user.contains("follow_up id must be non-empty"),
+                        "{mode_name}/{invocation}: the schema-repair user prompt is bounded and carries the exact error"
+                    ),
+                    None => assert!(
+                        user.contains("git -C '/tmp/workspace' diff 'main...HEAD'"),
+                        "{mode_name}/{invocation}: the initial user prompt carries the accepted-change diff command"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn learner_production_prompt_failures_prevent_coder_construction() {
+        // B3g: if either the system or the user Learner prompt cannot be resolved,
+        // rendered, or fully substituted, the production launch route returns the
+        // prompt error BEFORE constructing or launching the coder. Both the
+        // coder-factory and the coder-launch counters stay at zero.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Drive the real launch route with a fault injected into exactly one prompt
+        // resolver, and report the surfaced error plus the factory/launch counts.
+        fn run_faulted(
+            workspace: &Path,
+            user_resolver: &ContentResolver,
+            handoff_dir: &Path,
+        ) -> (String, usize, usize) {
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_for_run = Arc::clone(&factory_calls);
+            let launches = Arc::new(Mutex::new(Vec::new()));
+            let launches_for_run = Arc::clone(&launches);
+
+            let result = run_learner_with_coder(
+                LearnerRunInputs {
+                    workspace_path: workspace,
+                    resolver: user_resolver,
+                    extra_args: &[],
+                    coder_kind: CoderKind::Codex,
+                    // Capture + no_sandbox keeps the route effectively unsandboxed, so a
+                    // reachable-but-uncalled coder factory is the only reason the coder
+                    // would ever be built — proving the prompt error short-circuits it.
+                    no_sandbox: true,
+                    model: None,
+                    effort: None,
+                    review_artifact_paths: &[],
+                    tester_artifact_paths: &[],
+                    diff_command: "git diff",
+                    handoff_dir,
+                    denied_write_roots: &[],
+                    handoff_only: false,
+                    repair: None,
+                },
+                LearnerExecutionMode::Capture,
+                None,
+                HostPreparation::Production,
+                move |_sandbox| {
+                    factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
+                    Box::new(PromptRecordingCoder {
+                        launches: launches_for_run,
+                    })
+                },
+            );
+            let err = result.expect_err("a prompt fault must fail the launch route");
+            (
+                format!("{err:#}"),
+                factory_calls.load(AtomicOrdering::SeqCst),
+                launches.lock().unwrap().len(),
+            )
+        }
+
+        // Case 1: the SYSTEM prompt cannot render. The route resolves the system
+        // template from the workspace, so a workspace override with an unknown token
+        // fails to render before the coder is constructed.
+        let system_fault = tempfile::tempdir().unwrap();
+        let workspace = system_fault.path().join("workspace");
+        let prompts = workspace.join(".fluent/prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("learner-system.md"), "System {{unknown_token}}.").unwrap();
+        let handoff_dir = system_fault.path().join("handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        let bundled_user = ContentResolver::new(None);
+        let (message, factory, launches) = run_faulted(&workspace, &bundled_user, &handoff_dir);
+        assert!(
+            message.contains("learner-system.md template error"),
+            "the system-prompt fault must surface: {message}"
+        );
+        assert_eq!(
+            (factory, launches),
+            (0, 0),
+            "a system-prompt fault constructs and launches no coder"
+        );
+
+        // Case 2: the USER prompt cannot render. A clean workspace resolves the system
+        // template from the bundled fallback, while the user resolver's override
+        // carries an unknown token.
+        let user_fault = tempfile::tempdir().unwrap();
+        let clean_workspace = user_fault.path().join("workspace");
+        std::fs::create_dir_all(&clean_workspace).unwrap();
+        let user_override = user_fault.path().join("project");
+        let user_prompts = user_override.join(".fluent/prompts");
+        std::fs::create_dir_all(&user_prompts).unwrap();
+        std::fs::write(user_prompts.join("learner-user.md"), "Audit {{unknown_token}}.").unwrap();
+        let handoff_dir = user_fault.path().join("handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        let faulty_user = ContentResolver::new(Some(&user_override));
+        let (message, factory, launches) = run_faulted(&clean_workspace, &faulty_user, &handoff_dir);
+        assert!(
+            message.contains("learner-user.md template error"),
+            "the user-prompt fault must surface: {message}"
+        );
+        assert_eq!(
+            (factory, launches),
+            (0, 0),
+            "a user-prompt fault constructs and launches no coder"
+        );
+    }
+
+    #[test]
+    fn learner_host_preparation_failure_prevents_coder_construction() {
+        // B3i: if sandboxed-host preparation fails for a forcing Learner mode, the
+        // production launch route returns that failure BEFORE constructing or launching
+        // the coder. A forcing mode (pre-land no-expertise) ignores `--no-sandbox` and
+        // forces the sandbox, so preparation runs; a sentinel failure from the injected
+        // preparation must short-circuit the route with both the coder-factory and the
+        // coder-launch counters still at zero. The test stays hermetic: it never mutates
+        // PATH nor touches live credentials or Git-signing state.
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // A forcing mode reads the workspace Git common dir when it renders the trusted
+        // profile, so the snapshot is a real repository. Preparation precedes that
+        // render, so the sentinel failure stops the route before it is reached.
+        crate::git::run(&workspace, &["init", "-q"], "init learner workspace").unwrap();
+        let handoff_dir = tmp.path().join("handoff");
+        std::fs::create_dir_all(&handoff_dir).unwrap();
         let resolver = ContentResolver::new(None);
-        let template = resolver.resolve_content("prompts/learner-user.md").unwrap();
-        let handoff_only = crate::content::render_template(&template, &learner_ctx("yes")).unwrap();
-        assert!(handoff_only.contains("post-land handoff-only run"));
-        assert!(handoff_only.contains("will be discarded"));
-        let normal = crate::content::render_template(&template, &learner_ctx("")).unwrap();
-        assert!(normal.contains("Update expertise"));
-        assert!(!normal.contains("post-land handoff-only run"));
+
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let factory_for_run = Arc::clone(&factory_calls);
+        let launches = Arc::new(Mutex::new(Vec::new()));
+        let launches_for_run = Arc::clone(&launches);
+
+        // A sentinel preparation failure. The route must surface it before it builds a
+        // coder, so the recording coder below is never constructed or launched.
+        let mut failing_prepare = |_coder_kind: CoderKind| -> Result<()> {
+            anyhow::bail!("sentinel host preparation failure")
+        };
+
+        let result = run_learner_with_coder(
+            LearnerRunInputs {
+                workspace_path: &workspace,
+                resolver: &resolver,
+                extra_args: &[],
+                coder_kind: CoderKind::Codex,
+                // A forcing mode forces the sandbox even under `--no-sandbox`, so host
+                // preparation runs and its failure is reached.
+                no_sandbox: true,
+                model: None,
+                effort: None,
+                review_artifact_paths: &[],
+                tester_artifact_paths: &[],
+                diff_command: "git diff",
+                handoff_dir: &handoff_dir,
+                denied_write_roots: &[],
+                handoff_only: false,
+                repair: None,
+            },
+            LearnerExecutionMode::PreLandNoExpertise,
+            None,
+            HostPreparation::Injected(&mut failing_prepare),
+            move |_sandbox| {
+                factory_for_run.fetch_add(1, AtomicOrdering::SeqCst);
+                Box::new(PromptRecordingCoder {
+                    launches: launches_for_run,
+                })
+            },
+        );
+
+        let err = result.expect_err("a host-preparation failure must fail the launch route");
+        assert!(
+            format!("{err:#}").contains("sentinel host preparation failure"),
+            "the host-preparation failure must surface: {err:#}"
+        );
+        assert_eq!(
+            factory_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a host-preparation failure constructs no coder"
+        );
+        assert_eq!(
+            launches.lock().unwrap().len(),
+            0,
+            "a host-preparation failure launches no coder"
+        );
+    }
+
+    #[test]
+    fn pre_land_no_expertise_missing_knowledge_is_observation_only() {
+        // Missing durable knowledge is proposed as non-corrective follow-up
+        // material that may later become an Observation, without post-land wording
+        // or a direct Observation/Work Item.
+        let user = learner_user_mode_directive(LearnerExecutionMode::PreLandNoExpertise);
+        assert!(user.contains("non-corrective follow-up"));
+        assert!(user.contains("later become an Observation"));
+        assert!(user.contains("Do not\ncreate an Observation or a Work Item yourself."));
+        assert!(!user.contains("will be discarded"));
+
+        let system = learner_system_mode_directive(LearnerExecutionMode::PreLandNoExpertise);
+        assert!(system.contains("non-corrective follow-up"));
+        assert!(!system.contains("post-land"));
+
+        // The public Boolean can only reach capture or post-land, never the
+        // pre-land no-expertise mode.
+        assert_eq!(
+            learner_execution_mode_from_handoff_only(false),
+            LearnerExecutionMode::Capture
+        );
+        assert_eq!(
+            learner_execution_mode_from_handoff_only(true),
+            LearnerExecutionMode::PostLandHandoffOnly
+        );
     }
 
     #[test]
@@ -8836,6 +9699,138 @@ mod tests {
         )));
         assert!(
             !handoff_content.contains("(allow file-write* (subpath \"/private/var/folders\"))")
+        );
+    }
+
+    #[test]
+    fn pre_land_no_expertise_denies_expertise_candidate_and_live_git_writes() {
+        // A pre-land no-expertise run reuses the confined denied-writes profile:
+        // only the managed handoff staging surface is writable, while expertise,
+        // the candidate workspace, and shared Git metadata stay readable but denied
+        // for writes.
+        assert!(
+            !LearnerExecutionMode::PreLandNoExpertise.expertise_writable(),
+            "no-expertise denies expertise writes"
+        );
+        assert!(
+            LearnerExecutionMode::PreLandNoExpertise.forces_sandbox(),
+            "no-expertise forces the trusted boundary"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let expertise_dir = workspace.join(".fluent/expertise");
+        fs::create_dir_all(&expertise_dir).unwrap();
+        let common_git_dir = workspace.join(".git");
+        fs::create_dir_all(&common_git_dir).unwrap();
+        let staging = tmp.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let resolver = ContentResolver::new(None);
+
+        // The denied set mirrors run_learner_with_coder's non-capture branch: the
+        // candidate workspace and shared Git metadata are denied; the staging
+        // surface is the only writable root.
+        let readable = vec![
+            workspace.clone(),
+            expertise_dir.clone(),
+            common_git_dir.clone(),
+        ];
+        let denied = vec![workspace.clone(), common_git_dir.clone()];
+        let profile = os::render_profile_for_access_for_coder_with_denied_writes(
+            &resolver,
+            "/Users/test",
+            &[staging.clone()],
+            &readable,
+            &denied,
+            CoderKind::Claude,
+        )
+        .unwrap();
+        let content = fs::read_to_string(profile.path).unwrap();
+        let write_grant =
+            |p: &Path| format!("(allow file-write* (subpath \"{}\"))", p.to_string_lossy());
+        let deny_write =
+            |p: &Path| format!("(deny file-write* (subpath \"{}\"))", p.to_string_lossy());
+
+        assert!(
+            content.contains(&write_grant(&staging)),
+            "only the staging surface is writable; profile:\n{content}"
+        );
+        assert!(
+            !content.contains(&write_grant(&expertise_dir)),
+            "expertise is never writable; profile:\n{content}"
+        );
+        assert!(
+            !content.contains(&write_grant(&workspace)),
+            "the candidate workspace is never writable; profile:\n{content}"
+        );
+        assert!(
+            content.contains(&deny_write(&workspace)),
+            "the candidate workspace is denied; profile:\n{content}"
+        );
+        assert!(
+            content.contains(&deny_write(&common_git_dir)),
+            "shared Git metadata is denied; profile:\n{content}"
+        );
+    }
+
+    #[test]
+    fn public_handoff_only_boolean_maps_to_existing_modes() {
+        // The public `handoff_only` Boolean maps only to the two long-standing
+        // modes; it can never express the crate-private pre-land no-expertise mode.
+        assert_eq!(
+            learner_execution_mode_from_handoff_only(false),
+            LearnerExecutionMode::Capture
+        );
+        assert_eq!(
+            learner_execution_mode_from_handoff_only(true),
+            LearnerExecutionMode::PostLandHandoffOnly
+        );
+
+        // A merged candidate always resolves to post-land handoff-only regardless
+        // of the stored Learner policy.
+        for stored in [
+            crate::work_model::LearnerMode::Capture,
+            crate::work_model::LearnerMode::NoExpertise,
+        ] {
+            assert_eq!(
+                resolve_learner_execution_mode(stored, true),
+                LearnerExecutionMode::PostLandHandoffOnly
+            );
+        }
+        // An unmerged candidate follows the stored policy.
+        assert_eq!(
+            resolve_learner_execution_mode(crate::work_model::LearnerMode::Capture, false),
+            LearnerExecutionMode::Capture
+        );
+        assert_eq!(
+            resolve_learner_execution_mode(crate::work_model::LearnerMode::NoExpertise, false),
+            LearnerExecutionMode::PreLandNoExpertise
+        );
+    }
+
+    #[test]
+    fn no_expertise_requires_trusted_write_confinement() {
+        // A no-expertise run forces the trusted boundary; a requested --no-sandbox
+        // cannot downgrade it to unconfined execution, unlike capture.
+        let no_expertise = LearnerExecutionMode::PreLandNoExpertise;
+        assert!(no_expertise.forces_sandbox());
+        assert!(!no_expertise.expertise_writable());
+
+        // Assert through the exact production sandbox-gating decision
+        // (`LearnerExecutionMode::effectively_sandboxed`, which run_learner_with_coder
+        // consults) rather than reconstructing the predicate here: a forcing mode
+        // stays sandboxed even when --no-sandbox is requested.
+        let requested_no_sandbox = true;
+        assert!(
+            no_expertise.effectively_sandboxed(requested_no_sandbox),
+            "no-expertise stays confined under --no-sandbox"
+        );
+
+        // Capture, by contrast, honors --no-sandbox through the same decision.
+        let capture = LearnerExecutionMode::Capture;
+        assert!(
+            !capture.effectively_sandboxed(requested_no_sandbox),
+            "capture honors --no-sandbox and runs unconfined"
         );
     }
 }

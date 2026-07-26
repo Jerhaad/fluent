@@ -32,6 +32,7 @@ pub struct WorkMergeConfig<'a> {
     pub run_post_merge_review: bool,
 }
 
+#[derive(Debug)]
 pub struct WorkMergeOutcome {
     pub merge_candidate_id: String,
     pub merged_commit: String,
@@ -96,20 +97,100 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         bail!("{error}");
     }
 
-    if candidate.merge_state.status == MergeCandidateMergeStatus::Merged
-        && let Some(merged_commit) = candidate.merge_state.merged_commit.clone()
-    {
+    // Resolve the frozen reviewed identity once from the durable model. A value
+    // here means this Attempt is no-expertise and its Learner has SUCCEEDED, so the
+    // reviewed Writer SHA is frozen and the land route may only ever produce that
+    // exact commit. Capture-mode Work resolves `None` and keeps its existing path.
+    let frozen_reviewed_sha = frozen_no_expertise_reviewed_sha(&item, &candidate);
+    // The already-Merged recovery check derives the reviewed Writer SHA independently
+    // of Learning status: an already-Merged no-expertise record must compare its
+    // merged commit with the reviewed commit even when Learning is absent, pending,
+    // or failed (B4ac). Capture-mode Work still resolves `None` and resumes normally.
+    let reviewed_sha_for_merged_check = no_expertise_reviewed_sha(&item, &candidate);
+
+    if candidate.merge_state.status == MergeCandidateMergeStatus::Merged {
         // The candidate already landed. Do not resolve workspaces, rebase, run
         // checks, or repeat the merge; resume any incomplete learner handoff
         // processing so a re-invocation converges idempotently.
-        let outcome = WorkMergeOutcome {
-            merge_candidate_id: candidate.id,
-            merged_commit,
-        };
-        if let Err(error) = process_landed_follow_ups(&config, &outcome) {
-            eprintln!("  Warning: failed to update follow-up-processing recovery state: {error}");
+        //
+        // For a no-expertise Attempt, already-Merged recovery is total and
+        // mode-aware. Branch on `Merged` here, before any workspace resolution, and
+        // derive the reviewed Writer SHA from the model independently of Learning.
+        // The persisted merged_commit must be present AND exactly equal to it: a
+        // merged_commit that is absent or divergent is a fresh-Attempt contradiction
+        // that fails closed before any workspace, artifact, Git, model, or follow-up
+        // effect (B4aj). Capture-mode Work keeps its legacy recovery — a present
+        // merged_commit resumes, and a missing one falls through unchanged rather
+        // than globally changing how a missing commit is recovered.
+        if let Some(reviewed_sha) = reviewed_sha_for_merged_check.as_deref() {
+            let merged_commit =
+                candidate
+                    .merge_state
+                    .merged_commit
+                    .as_deref()
+                    .ok_or_else(|| {
+                        fresh_attempt_required(format!(
+                            "no-expertise Merge Candidate {:?} is marked merged but records no \
+                             merged commit; the frozen reviewed SHA is {reviewed_sha}",
+                            candidate.id
+                        ))
+                    })?;
+            if merged_commit != reviewed_sha {
+                bail!(
+                    "no-expertise Merge Candidate {:?} is marked merged at {} but the frozen \
+                     reviewed SHA is {}; refusing to treat this land as successful. A fresh \
+                     Attempt with new tests, reviews, and Learning is required.",
+                    candidate.id,
+                    merged_commit,
+                    reviewed_sha
+                );
+            }
+            let outcome = WorkMergeOutcome {
+                merge_candidate_id: candidate.id,
+                merged_commit: merged_commit.to_string(),
+            };
+            if let Err(error) = process_landed_follow_ups(&config, &outcome) {
+                eprintln!(
+                    "  Warning: failed to update follow-up-processing recovery state: {error}"
+                );
+            }
+            return Ok(outcome);
         }
-        return Ok(outcome);
+        if let Some(merged_commit) = candidate.merge_state.merged_commit.clone() {
+            let outcome = WorkMergeOutcome {
+                merge_candidate_id: candidate.id,
+                merged_commit,
+            };
+            if let Err(error) = process_landed_follow_ups(&config, &outcome) {
+                eprintln!(
+                    "  Warning: failed to update follow-up-processing recovery state: {error}"
+                );
+            }
+            return Ok(outcome);
+        }
+    }
+
+    // A fresh, unmerged no-expertise candidate whose Learning succeeded lands its
+    // frozen reviewed SHA exactly: an identity-preserving preflight runs BEFORE any
+    // executing mark, Rebase Task, rebase coder, merge artifact, or Git mutation,
+    // and the exact-SHA path skips the rebase and provenance-regeneration steps
+    // entirely (B4u–B4x). Capture mode never enters here (B4z).
+    if let Some(reviewed_sha) = frozen_reviewed_sha {
+        let source_workspace = resolve_managed_candidate_workspace_path(
+            config.project_root,
+            &candidate.source_workspace.path,
+            config.work_item_id,
+            &candidate.attempt_id,
+        )?;
+        let target_workspace =
+            resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+        return land_frozen_no_expertise(
+            &config,
+            &candidate,
+            &source_workspace,
+            &target_workspace,
+            &reviewed_sha,
+        );
     }
 
     let source_workspace = resolve_managed_candidate_workspace_path(
@@ -156,6 +237,37 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     )
 }
 
+// A `#[cfg(test)]`-only observer of the follow-up-processing persistence error the
+// shared land coordinator surfaces as a warning. It never alters control flow;
+// it only lets a test confirm the failure originated inside the real Work-model
+// write path and retained its typed storage cause (B4ak). Production carries no
+// observer.
+#[cfg(test)]
+#[derive(Clone)]
+struct FollowUpPersistObservation {
+    rendered: String,
+    has_typed_storage_cause: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAST_FOLLOW_UP_PERSIST_ERROR: std::cell::RefCell<Option<FollowUpPersistObservation>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_follow_up_persist_error(error: &anyhow::Error) {
+    let has_typed_storage_cause = error
+        .chain()
+        .any(|cause| cause.is::<crate::work_model::WorkModelStorageError>());
+    LAST_FOLLOW_UP_PERSIST_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(FollowUpPersistObservation {
+            rendered: format!("{error:#}"),
+            has_typed_storage_cause,
+        });
+    });
+}
+
 /// Complete the ordered fresh-land coordinator with injectable boundaries so
 /// its persistence gate and recovered-land data flow can be tested directly.
 fn finish_fresh_land_with(
@@ -172,6 +284,8 @@ fn finish_fresh_land_with(
     // get ahead of the recovery boundary.
     let follow_up_result = process_follow_ups(&outcome);
     if let Err(error) = &follow_up_result {
+        #[cfg(test)]
+        observe_follow_up_persist_error(error);
         eprintln!("  Warning: failed to update follow-up-processing recovery state: {error}");
     }
 
@@ -459,6 +573,586 @@ fn recover_landed_candidate_result(
     }
 }
 
+/// Resolve a no-expertise Attempt's reviewed Writer SHA from its latest completed
+/// Write Task output, independently of the current Learning status. The reviewed SHA
+/// is a durable property of the reviewed Attempt, not a value that disappears when a
+/// legacy or recovery record's Learning is absent, `InProgress`, `HandoffPending`, or
+/// `Failed`. It is derived from the model alone, so it is workspace-independent and
+/// survives a cleaned-up candidate workspace. Capture-mode Work resolves `None`.
+fn no_expertise_reviewed_sha(
+    item: &WorkItem,
+    candidate: &crate::work_model::MergeCandidate,
+) -> Option<String> {
+    if item.learner_mode != crate::work_model::LearnerMode::NoExpertise {
+        return None;
+    }
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)?;
+    attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+}
+
+/// Resolve the frozen reviewed Writer SHA for selecting the fresh, unmerged exact-SHA
+/// land route: the Work is no-expertise AND that Attempt's Learner has SUCCEEDED. The
+/// reviewed SHA itself is derived by [`no_expertise_reviewed_sha`], matching the
+/// model-level frozen-identity tuple. `Learning == Succeeded` gates only route
+/// SELECTION; it never gates identity derivation, so the already-Merged recovery
+/// check still verifies a reviewed SHA for a non-succeeded record. Capture-mode Work
+/// and not-yet-succeeded Learners resolve `None`, so the exact-SHA land branch never
+/// runs for them.
+fn frozen_no_expertise_reviewed_sha(
+    item: &WorkItem,
+    candidate: &crate::work_model::MergeCandidate,
+) -> Option<String> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)?;
+    if !attempt
+        .learning
+        .as_ref()
+        .is_some_and(|learning| learning.is_succeeded())
+    {
+        return None;
+    }
+    no_expertise_reviewed_sha(item, candidate)
+}
+
+/// The retryable diagnostic returned whenever an exact-SHA no-expertise land cannot
+/// proceed. It never rewrites the approved commit; a fresh Attempt with new tests,
+/// reviews, and Learning is the only forward path.
+fn fresh_attempt_required(reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{reason}. A fresh Attempt with new tests, reviews, and Learning is required; the \
+         approved commit is not rewritten."
+    )
+}
+
+/// Read the current head of `target_branch` in the target workspace.
+fn resolve_target_head(target_workspace: &Path, target_branch: &str) -> Result<String> {
+    git::run_stdout(
+        target_workspace,
+        &["rev-parse", target_branch],
+        "resolve target branch",
+    )
+}
+
+/// Whether the candidate workspace is clean (no tracked or untracked change, none
+/// of the `.fluent` exclusion that the merge-time dirtiness check allows). A frozen
+/// land requires a fully clean tree so the reviewed SHA lands byte-for-byte.
+fn candidate_fully_clean(workspace: &Path) -> Result<bool> {
+    let status = git::run_stdout(
+        workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "check candidate cleanliness",
+    )?;
+    Ok(status.trim().is_empty())
+}
+
+/// Assert the frozen no-expertise preconditions against live Git: the candidate
+/// workspace is clean with HEAD at the reviewed SHA, and `target_head` is an
+/// ancestor of the reviewed SHA. Any failure returns the fresh-Attempt diagnostic
+/// without mutating Git.
+fn assert_frozen_preconditions(
+    source_workspace: &Path,
+    target_workspace: &Path,
+    target_branch: &str,
+    reviewed_sha: &str,
+    expected_target_head: &str,
+) -> Result<()> {
+    if !candidate_fully_clean(source_workspace)? {
+        return Err(fresh_attempt_required(format!(
+            "no-expertise land found the candidate workspace {} dirty; the frozen reviewed SHA \
+             {reviewed_sha} cannot be landed",
+            source_workspace.display()
+        )));
+    }
+    let head = head_commit(source_workspace)?;
+    if head != reviewed_sha {
+        return Err(fresh_attempt_required(format!(
+            "no-expertise land found candidate HEAD {head} but the frozen reviewed SHA is \
+             {reviewed_sha}"
+        )));
+    }
+    let target_head = resolve_target_head(target_workspace, target_branch)?;
+    if target_head != expected_target_head {
+        return Err(fresh_attempt_required(format!(
+            "no-expertise land found target {target_branch} at {target_head}, expected \
+             {expected_target_head}"
+        )));
+    }
+    let ancestry = git::run_raw(
+        target_workspace,
+        &["merge-base", "--is-ancestor", &target_head, reviewed_sha],
+    )?;
+    if !ancestry.status.success() {
+        return Err(fresh_attempt_required(format!(
+            "no-expertise land found target head {target_head} is not an ancestor of the frozen \
+             reviewed SHA {reviewed_sha}"
+        )));
+    }
+    Ok(())
+}
+
+/// Land a frozen no-expertise Merge Candidate at its exact reviewed SHA.
+///
+/// Order (B4u–B4x): read the live identity BEFORE any side effect; run
+/// check-pre-merge in a disposable detached worktree created at the reviewed SHA
+/// (never fix-pre-merge); require the disposable worktree to stay clean at the
+/// reviewed SHA and remove it; reacquire the live preconditions; fast-forward the
+/// target to exactly the reviewed SHA; and persist that exact SHA. Any preflight or
+/// check failure leaves the candidate unstarted-or-failed with the live source and
+/// target Git unchanged and reports that a fresh Attempt is required. The rebase
+/// coder is never constructed and provenance is never regenerated on this path.
+fn land_frozen_no_expertise(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    source_workspace: &Path,
+    target_workspace: &Path,
+    reviewed_sha: &str,
+) -> Result<WorkMergeOutcome> {
+    ensure_same_git_repository(config.project_root, source_workspace)?;
+    ensure_same_git_repository(config.project_root, target_workspace)?;
+    ensure_registered_worktree(config.project_root, source_workspace)?;
+
+    // Preflight: read the frozen identity from live Git before touching any durable
+    // state or Git. On any mismatch, bail before marking executing, creating a
+    // Rebase Task, launching a coder, or creating merge artifacts (B4u/B4v).
+    let target_head_before = resolve_target_head(target_workspace, &candidate.target_branch)?;
+    assert_frozen_preconditions(
+        source_workspace,
+        target_workspace,
+        &candidate.target_branch,
+        reviewed_sha,
+        &target_head_before,
+    )?;
+    // The target must satisfy the same cleanliness policy capture landing enforces,
+    // checked here before the candidate is marked executing or either live repository
+    // is changed (B4ai). An initially dirty target fails with no side effect.
+    ensure_clean_worktree(target_workspace)?;
+
+    // Preflight passed. Mark the candidate executing and create the artifact area,
+    // then run the exact-SHA check and fast-forward under the recovery finalizer.
+    let artifact_dir = merge_artifact_dir(
+        config.project_root,
+        config.work_item_id,
+        &candidate.attempt_id,
+        &candidate.id,
+    );
+    fs::create_dir_all(&artifact_dir)?;
+    set_candidate_executing(config.store, config.work_item_id, &candidate.id)?;
+
+    // Feed the exact-SHA execution and its pre-land base through the same durable
+    // follow-up/scheduling coordinator capture landing uses (B4ab): recover the
+    // durable merge, durably record complete/incomplete follow-up processing, and
+    // schedule the optional post-merge review only when that recovery result is
+    // durable. A follow-up-persistence error returns the successful landed outcome
+    // unchanged and schedules nothing.
+    let result = execute_frozen_no_expertise_land(
+        config,
+        candidate,
+        source_workspace,
+        target_workspace,
+        &artifact_dir,
+        reviewed_sha,
+        &target_head_before,
+    );
+    let execution = MergeExecution {
+        result,
+        base_commit: Some(target_head_before.clone()),
+    };
+    finish_fresh_land_with(
+        execution,
+        |result| {
+            recover_landed_candidate_result(config.store, config.work_item_id, &candidate.id, result)
+        },
+        |outcome| process_landed_follow_ups(config, outcome),
+        |outcome, base_commit| schedule_post_merge_review(config, candidate, outcome, base_commit),
+        config.run_post_merge_review,
+    )
+}
+
+/// Run check-pre-merge in a disposable exact-SHA worktree, then fast-forward the
+/// target to the frozen reviewed SHA. Never invokes fix-pre-merge and never rebases
+/// or regenerates provenance.
+fn execute_frozen_no_expertise_land(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    source_workspace: &Path,
+    target_workspace: &Path,
+    artifact_dir: &Path,
+    reviewed_sha: &str,
+    target_head_before: &str,
+) -> Result<WorkMergeOutcome> {
+    let check_artifacts = match run_frozen_pre_merge_check(
+        config,
+        candidate,
+        source_workspace,
+        artifact_dir,
+        reviewed_sha,
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            let artifacts = check_artifacts_for_failure(config.project_root, artifact_dir);
+            record_candidate_failure(
+                config.store,
+                config.work_item_id,
+                &candidate.id,
+                error.to_string(),
+                artifacts,
+                Vec::new(),
+            )?;
+            return Err(error);
+        }
+    };
+
+    // Reacquire the live preconditions before mutating the target: the check ran in
+    // an isolated worktree, but the live candidate and target must still hold before
+    // the fast-forward. Any drift fails closed with the live Git unchanged.
+    assert_frozen_preconditions(
+        source_workspace,
+        target_workspace,
+        &candidate.target_branch,
+        reviewed_sha,
+        target_head_before,
+    )
+    .map_err(|error| {
+        // Record the failure so the candidate does not remain Executing.
+        let _ = record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            error.to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+        error
+    })?;
+
+    // Recheck the target cleanliness immediately before the fast-forward (B4ai): the
+    // isolated check ran without touching the live target, but a target dirtied while
+    // it ran must fail closed with the dirty target preserved and the live candidate
+    // unchanged, never fast-forwarded over.
+    if let Err(error) = ensure_clean_worktree(target_workspace) {
+        let _ = record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            error.to_string(),
+            Vec::new(),
+            Vec::new(),
+        );
+        return Err(error);
+    }
+
+    // Fast-forward the target to exactly the reviewed SHA. No rebase, no provenance
+    // regeneration, no autofix commit — the approved commit lands verbatim.
+    git::run(
+        target_workspace,
+        &["checkout", &candidate.target_branch],
+        "checkout target branch",
+    )?;
+    git::run(
+        target_workspace,
+        &["merge", "--ff-only", reviewed_sha],
+        "fast-forward target branch to frozen reviewed SHA",
+    )?;
+
+    record_candidate_merged(
+        config.store,
+        config.work_item_id,
+        &candidate.id,
+        reviewed_sha,
+        check_artifacts,
+        Vec::new(),
+    )?;
+    // A succeeded no-expertise Learner is never retryable, so the candidate
+    // workspace is cleaned up like any other landed candidate.
+    if candidate_learning_is_retryable(config.store, config.work_item_id, &candidate.attempt_id)? {
+        eprintln!(
+            "  Merge Candidate {} landed; retaining its workspace for a retryable Learner run",
+            candidate.id
+        );
+    } else if let Err(error) = cleanup_managed_workspace(config.project_root, source_workspace) {
+        eprintln!(
+            "  Warning: Merge Candidate {} landed, but managed workspace cleanup failed: {error}",
+            candidate.id
+        );
+    }
+
+    Ok(WorkMergeOutcome {
+        merge_candidate_id: candidate.id.clone(),
+        merged_commit: reviewed_sha.to_string(),
+    })
+}
+
+/// Run only `check-pre-merge` against a disposable detached worktree created at the
+/// frozen reviewed SHA. fix-pre-merge is never invoked. The disposable worktree must
+/// remain clean at the reviewed SHA after the check; otherwise the land fails with a
+/// fresh-Attempt diagnostic and the worktree is removed (retained only if removal
+/// itself fails, never promoted to the live candidate). Durable logs are directed
+/// into the Merge Candidate artifact area (B4w/B4x).
+fn run_frozen_pre_merge_check(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    source_workspace: &Path,
+    artifact_dir: &Path,
+    reviewed_sha: &str,
+) -> Result<Vec<ArtifactRef>> {
+    // No check hook: nothing to run, no disposable worktree needed.
+    if hooks::find_hook(config.project_root, "check-pre-merge").is_none() {
+        return Ok(Vec::new());
+    }
+
+    let disposable = artifact_dir.join("exact-sha-check");
+    // A stale disposable worktree from a prior interrupted land is cleaned first.
+    if disposable.exists() {
+        let _ = git::run_raw(
+            source_workspace,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &disposable.to_string_lossy(),
+            ],
+        );
+        let _ = fs::remove_dir_all(&disposable);
+    }
+    git::run(
+        source_workspace,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &disposable.to_string_lossy(),
+            reviewed_sha,
+        ],
+        "create disposable exact-SHA worktree",
+    )?;
+
+    let outcome =
+        run_frozen_check_in_worktree(config, candidate, &disposable, artifact_dir, reviewed_sha);
+
+    // Always attempt to remove the disposable worktree through the real
+    // registered-worktree remover. Successful removal is a land precondition, not a
+    // warning-only best effort: a passing check whose disposable worktree cannot be
+    // removed fails the land before the second live precondition check or any target
+    // Git mutation, retaining at most that isolated worktree for cleanup (B4aa).
+    let removed = remove_disposable_worktree_checked(source_workspace, &disposable);
+
+    match outcome {
+        Ok(artifacts) => match removed {
+            Ok(()) => Ok(artifacts),
+            Err(cleanup) => Err(fresh_attempt_required(format!(
+                "check-pre-merge passed for the frozen reviewed SHA {reviewed_sha}, but removing \
+                 its disposable exact-SHA worktree {} failed: {cleanup:#}. The disposable worktree \
+                 is retained for cleanup and the land is aborted before any target mutation",
+                disposable.display()
+            ))),
+        },
+        Err(error) => match removed {
+            Ok(()) => Err(error),
+            // Both the hook and cleanup failed: preserve the hook failure as the
+            // primary and attach the cleanup failure so retaining the isolated
+            // worktree is only accepted with both failures visible.
+            Err(cleanup) => Err(error.context(format!(
+                "additionally, the disposable exact-SHA worktree {} could not be removed and is \
+                 retained for cleanup: {cleanup:#}",
+                disposable.display()
+            ))),
+        },
+    }
+}
+
+/// Run the `check-pre-merge` hook inside the disposable exact-SHA worktree and
+/// require it to pass and to leave the worktree clean at the reviewed SHA. Never
+/// runs fix-pre-merge. Returns the check artifact on success.
+fn run_frozen_check_in_worktree(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    disposable: &Path,
+    artifact_dir: &Path,
+    reviewed_sha: &str,
+) -> Result<Vec<ArtifactRef>> {
+    let hooks_dir = artifact_dir.join("hooks");
+    let context = HookContext {
+        work_item_id: Some(config.work_item_id.to_string()),
+        attempt_id: Some(candidate.attempt_id.clone()),
+        merge_candidate_id: Some(candidate.id.clone()),
+        candidate_commit: Some(reviewed_sha.to_string()),
+        artifact_dir: Some(artifact_dir.to_path_buf()),
+        log_dir: hooks_dir,
+        ..Default::default()
+    };
+
+    let check_outcome =
+        hooks::run_hook(config.project_root, "check-pre-merge", disposable, &context)?
+            .expect("check-pre-merge presence checked by caller");
+    let artifacts = vec![hook_artifact(config.project_root, &check_outcome)];
+    if !check_outcome.passed {
+        return Err(fresh_attempt_required(format!(
+            "check-pre-merge failed (exit {}) for the frozen reviewed SHA {reviewed_sha}. Log: {}",
+            check_outcome.exit_code,
+            check_outcome.log_path.display()
+        )));
+    }
+
+    // The check must not have dirtied, staged, or committed in the disposable
+    // worktree; fix-pre-merge is never invoked to repair it.
+    if !candidate_fully_clean(disposable)? {
+        return Err(fresh_attempt_required(
+            "check-pre-merge dirtied its disposable exact-SHA worktree",
+        ));
+    }
+    let head = head_commit(disposable)?;
+    if head != reviewed_sha {
+        return Err(fresh_attempt_required(format!(
+            "check-pre-merge moved the disposable exact-SHA worktree HEAD from {reviewed_sha} to \
+             {head}"
+        )));
+    }
+    Ok(artifacts)
+}
+
+/// Remove a disposable exact-SHA worktree and its directory through the real
+/// registered-worktree remover. A failure propagates so the caller can treat
+/// successful removal as a land precondition (B4aa).
+fn remove_disposable_worktree(source_workspace: &Path, disposable: &Path) -> Result<()> {
+    git::run(
+        source_workspace,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &disposable.to_string_lossy(),
+        ],
+        "remove disposable exact-SHA worktree",
+    )?;
+    if disposable.exists() {
+        fs::remove_dir_all(disposable).with_context(|| {
+            format!(
+                "remove disposable exact-SHA worktree directory {}",
+                disposable.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+// A `#[cfg(test)]`-only fault boundary that makes disposable-worktree removal fail
+// deterministically. Production has NO injectable removal path: the non-test build
+// below always calls the real registered-worktree remover directly (B4aa).
+#[cfg(test)]
+thread_local! {
+    static DISPOSABLE_REMOVAL_FAULT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// A `#[cfg(test)]` guard that forces the next disposable-worktree removals to fail
+/// for the duration of its lifetime, so the passing-check cleanup-failure land path
+/// can be driven through the public boundary without a real filesystem fault.
+#[cfg(test)]
+struct DisposableRemovalFaultGuard;
+
+#[cfg(test)]
+impl DisposableRemovalFaultGuard {
+    fn engage() -> Self {
+        DISPOSABLE_REMOVAL_FAULT.with(|fault| fault.set(true));
+        DisposableRemovalFaultGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for DisposableRemovalFaultGuard {
+    fn drop(&mut self) {
+        DISPOSABLE_REMOVAL_FAULT.with(|fault| fault.set(false));
+    }
+}
+
+/// Remove the disposable exact-SHA worktree. Production always calls the real
+/// registered-worktree remover; only a `#[cfg(test)]` build carries the injectable
+/// fault used to prove cleanup failure blocks the land.
+#[cfg(test)]
+fn remove_disposable_worktree_checked(source_workspace: &Path, disposable: &Path) -> Result<()> {
+    if DISPOSABLE_REMOVAL_FAULT.with(|fault| fault.get()) {
+        // Leave the isolated worktree in place, mirroring a real removal failure that
+        // retains at most that disposable worktree for cleanup.
+        return Err(anyhow::anyhow!(
+            "injected disposable exact-SHA worktree removal fault for {}",
+            disposable.display()
+        ));
+    }
+    remove_disposable_worktree(source_workspace, disposable)
+}
+
+#[cfg(not(test))]
+fn remove_disposable_worktree_checked(source_workspace: &Path, disposable: &Path) -> Result<()> {
+    remove_disposable_worktree(source_workspace, disposable)
+}
+
+// A `#[cfg(test)]`-only override for constructing the rebase coder. Production has NO
+// injectable coder: the non-test `build_rebase_coder` below always builds the real
+// coder for the resolved kind. Only a test build can substitute an in-process rebase
+// coder so the capture land route can be driven through public `merge_candidate`
+// while route selection, validation, artifact creation, provenance regeneration, and
+// final coordination all stay real (B4al).
+#[cfg(test)]
+thread_local! {
+    static REBASE_CODER_OVERRIDE: std::cell::RefCell<
+        Option<Box<dyn Fn() -> Box<dyn crate::coder::Coder>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// A `#[cfg(test)]` guard that substitutes the rebase coder for the duration of its
+/// lifetime. The override is consulted only by `build_rebase_coder`; it never replaces
+/// the merge route, the coordinator, or production coder construction.
+#[cfg(test)]
+struct RebaseCoderOverrideGuard;
+
+#[cfg(test)]
+impl RebaseCoderOverrideGuard {
+    fn engage(factory: impl Fn() -> Box<dyn crate::coder::Coder> + 'static) -> Self {
+        REBASE_CODER_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Box::new(factory)));
+        RebaseCoderOverrideGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for RebaseCoderOverrideGuard {
+    fn drop(&mut self) {
+        REBASE_CODER_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Build the rebase coder for a capture-mode merge. Production always builds the real
+/// coder for the resolved kind; only a `#[cfg(test)]` build carries the injectable
+/// override used to drive the capture land route through the public boundary (B4al).
+#[cfg(test)]
+fn build_rebase_coder(
+    config: &WorkMergeConfig<'_>,
+    sandbox: CoderSandbox,
+) -> Box<dyn crate::coder::Coder> {
+    if let Some(coder) = REBASE_CODER_OVERRIDE.with(|slot| slot.borrow().as_ref().map(|f| f())) {
+        return coder;
+    }
+    config.coder_kind.boxed(sandbox)
+}
+
+#[cfg(not(test))]
+fn build_rebase_coder(
+    config: &WorkMergeConfig<'_>,
+    sandbox: CoderSandbox,
+) -> Box<dyn crate::coder::Coder> {
+    config.coder_kind.boxed(sandbox)
+}
+
 fn execute_merge(
     config: &WorkMergeConfig<'_>,
     item: &WorkItem,
@@ -476,7 +1170,7 @@ fn execute_merge(
         target_workspace,
         artifact_dir,
         &mut base_commit,
-        |sandbox| config.coder_kind.boxed(sandbox),
+        |sandbox| build_rebase_coder(config, sandbox),
     );
     MergeExecution {
         result,
@@ -673,6 +1367,22 @@ fn finalize_merge(
         target_workspace,
         &["merge", "--ff-only", &merged_commit],
         "fast-forward target branch",
+    )?;
+
+    // The landed commit is the final tip, which includes any fix-pre-merge autofix
+    // commit made after the rebase. The first provenance regeneration ran against
+    // the pre-autofix rebase tip, so settle the Write provenance and candidate
+    // pointer onto the actually-landed commit here: every land pointer — the latest
+    // completed Write output, candidate_commit, merged_commit, the returned outcome,
+    // and target HEAD — then names one regenerated SHA (B4al). When no autofix ran
+    // the merged tip equals the rebase tip and this is a no-op.
+    regenerate_provenance(
+        config.store,
+        config.work_item_id,
+        &candidate.id,
+        &candidate.attempt_id,
+        target_head_before,
+        &merged_commit,
     )?;
 
     record_candidate_merged(
@@ -1660,6 +2370,22 @@ fn regenerate_provenance(
     new_tip: &str,
 ) -> Result<()> {
     let mut item = read_work_item_or_not_found(store, work_item_id)?;
+
+    // A frozen no-expertise identity must never be retargeted. Regenerating
+    // provenance rewrites the reviewed Writer SHA across the attempt, which is
+    // exactly the pointer move the freeze forbids, so this refuses to run rather
+    // than staging a change the model guard would reject.
+    if let Some(candidate) = item
+        .merge_candidates
+        .iter()
+        .find(|candidate| candidate.id == candidate_id)
+        && frozen_no_expertise_reviewed_sha(&item, candidate).is_some()
+    {
+        return Err(fresh_attempt_required(format!(
+            "refusing to regenerate provenance for the frozen no-expertise identity of Merge \
+             Candidate {candidate_id:?}"
+        )));
+    }
 
     let attempt = item
         .attempts
@@ -3614,6 +4340,1583 @@ mod tests {
         assert!(
             !persisted.contains('\n'),
             "message must be a single subject line with no body: {persisted:?}"
+        );
+    }
+
+    // --- Exact-SHA no-expertise land (B4u–B4z) ---
+
+    fn write_hook(project_root: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let hooks_dir = project_root.join(".fluent/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true).mode(0o755);
+        use std::io::Write;
+        let mut file = opts.open(hooks_dir.join(name)).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+    }
+
+    struct FrozenLandFixture {
+        _tmp: tempfile::TempDir,
+        /// The outer temporary root, a parent of both `project_root` and
+        /// `source_workspace` and outside every artifact area and disposable
+        /// worktree. Absolute test sentinels and event logs placed here survive
+        /// disposable-worktree cleanup, so an erroneous hook invocation stays
+        /// observable (B4an).
+        outer_root: PathBuf,
+        project_root: PathBuf,
+        source_workspace: PathBuf,
+        store: WorkModelStore,
+        reviewed_sha: String,
+    }
+
+    /// Build a real git repository with a `main` target and a registered candidate
+    /// worktree checked out at a frozen reviewed Writer SHA, then persist a
+    /// no-expertise Work Item whose Attempt's Learner has SUCCEEDED at that SHA.
+    fn frozen_land_fixture(learner_succeeded: bool) -> FrozenLandFixture {
+        build_frozen_fixture(|item, _reviewed_sha| {
+            if learner_succeeded {
+                item.attempts[0].learning = Some(crate::work_model::AttemptLearning::succeeded(
+                    1,
+                    crate::follow_up::ArtifactRef {
+                        path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json"
+                            .to_string(),
+                        digest: "sha256:frozen".to_string(),
+                    },
+                ));
+            }
+        })
+    }
+
+    /// Build the frozen-land repository, registered candidate worktree, and
+    /// no-expertise Work Item, then apply `configure` to the item (with the reviewed
+    /// SHA) immediately before it is created fresh. Creating the item fresh bypasses
+    /// the frozen-identity write guard, so a cell may persist an already-Merged state
+    /// with an absent or divergent merged_commit that the guard would otherwise
+    /// reject on a write to an existing aggregate.
+    fn build_frozen_fixture(
+        configure: impl FnOnce(&mut WorkItem, &str),
+    ) -> FrozenLandFixture {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            git::run(cwd, args, "frozen land fixture setup").unwrap();
+        };
+        git(&project_root, &["init", "-q", "-b", "main"]);
+        git(&project_root, &["config", "user.email", "t@t.co"]);
+        git(&project_root, &["config", "user.name", "t"]);
+        fs::write(project_root.join("file.txt"), "base").unwrap();
+        git(&project_root, &["add", "."]);
+        git(&project_root, &["commit", "-q", "-m", "baseline"]);
+
+        // The candidate advances one reviewed commit past main on a branch. main
+        // stays an ancestor of the reviewed SHA.
+        git(&project_root, &["checkout", "-q", "-b", "work/attempt-1"]);
+        fs::write(project_root.join("file.txt"), "reviewed change").unwrap();
+        git(&project_root, &["add", "."]);
+        git(&project_root, &["commit", "-q", "-m", "reviewed"]);
+        let reviewed_sha =
+            git::run_stdout(&project_root, &["rev-parse", "HEAD"], "reviewed sha").unwrap();
+        git(&project_root, &["checkout", "-q", "main"]);
+
+        // The candidate source workspace is a registered sibling worktree checked out
+        // at the reviewed SHA, at the model-required managed path.
+        let ws_path = crate::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+        let source_workspace = project_root
+            .parent()
+            .unwrap()
+            .join(Path::new(&ws_path).file_name().map(Path::new).unwrap());
+        git(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                source_workspace.to_str().unwrap(),
+                &reviewed_sha,
+            ],
+        );
+
+        let store = WorkModelStore::new(project_root.as_path());
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Frozen no-expertise land".to_string(),
+            learner_mode: crate::work_model::LearnerMode::NoExpertise,
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = item.attempts.first_mut().unwrap();
+        attempt.status = AttemptStatus::Complete;
+        attempt.review_state = Some(AttemptReviewState::Passed);
+        let task = attempt.tasks.first_mut().unwrap();
+        let workspace_id = task.workspace_access.writes.first().unwrap().id.clone();
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id,
+            workspace_path: ws_path,
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: reviewed_sha.clone(),
+        });
+        item.create_or_get_merge_candidate("attempt-1").unwrap();
+        configure(&mut item, &reviewed_sha);
+        store.create_work_item(&item).unwrap();
+
+        let outer_root = tmp.path().to_path_buf();
+        FrozenLandFixture {
+            _tmp: tmp,
+            outer_root,
+            project_root,
+            source_workspace,
+            store,
+            reviewed_sha,
+        }
+    }
+
+    fn frozen_config<'a>(
+        fx: &'a FrozenLandFixture,
+        resolver: &'a ContentResolver,
+        run_post_merge_review: bool,
+    ) -> WorkMergeConfig<'a> {
+        WorkMergeConfig {
+            project_root: fx.project_root.as_path(),
+            store: &fx.store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            no_sandbox: true,
+            run_post_merge_review,
+        }
+    }
+
+    fn target_head(fx: &FrozenLandFixture) -> String {
+        git::run_stdout(&fx.project_root, &["rev-parse", "main"], "target head").unwrap()
+    }
+
+    /// A complete snapshot of a workspace's Git state, used to prove a rejected land
+    /// mutates nothing. Retains HEAD, the raw staged index, porcelain status, the
+    /// staged blob of every tracked path, and the working-tree bytes of every tracked
+    /// path plus every untracked payload. `.git` and `.fluent` are excluded from the
+    /// status and untracked bytes: the durable Work model and merge-artifact area are
+    /// asserted separately, and the land lock, hooks, and store all live under
+    /// `.fluent`, so including them would compare orchestration noise, not the checkout.
+    #[derive(Debug, PartialEq, Eq)]
+    struct GitSnapshot {
+        head: String,
+        index: String,
+        status: String,
+        staged_blobs: Vec<(String, Vec<u8>)>,
+        worktree_bytes: Vec<(String, Vec<u8>)>,
+    }
+
+    fn is_orchestration_path(path: &str) -> bool {
+        matches!(path.split('/').next(), Some(".git") | Some(".fluent"))
+    }
+
+    fn snapshot_git(workspace: &Path) -> GitSnapshot {
+        let head = head_commit(workspace).unwrap();
+        let index =
+            git::run_stdout(workspace, &["ls-files", "--stage", "-z"], "snapshot index").unwrap();
+        let raw_status = git::run_stdout(
+            workspace,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "snapshot status",
+        )
+        .unwrap();
+        let status: String = raw_status
+            .lines()
+            .filter(|line| !is_orchestration_path(line.get(3..).unwrap_or("")))
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        let tracked =
+            git::run_stdout(workspace, &["ls-files", "-z"], "snapshot tracked paths").unwrap();
+        let mut staged_blobs = Vec::new();
+        let mut worktree_bytes = Vec::new();
+        for path in tracked.split('\0').filter(|entry| !entry.is_empty()) {
+            let blob = git::run_raw(workspace, &["show", &format!(":{path}")])
+                .unwrap()
+                .stdout;
+            staged_blobs.push((path.to_string(), blob));
+            if let Ok(bytes) = fs::read(workspace.join(path)) {
+                worktree_bytes.push((path.to_string(), bytes));
+            }
+        }
+        for line in raw_status.lines() {
+            if let Some(path) = line.strip_prefix("?? ") {
+                let path = path.trim();
+                if is_orchestration_path(path) {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(workspace.join(path)) {
+                    worktree_bytes.push((path.to_string(), bytes));
+                }
+            }
+        }
+        staged_blobs.sort();
+        worktree_bytes.sort();
+        GitSnapshot {
+            head,
+            index,
+            status,
+            staged_blobs,
+            worktree_bytes,
+        }
+    }
+
+    /// The set of worktrees git currently has registered for a repository, one
+    /// absolute path per registered worktree. Used to prove a rejected land leaks no
+    /// disposable worktree beyond the one it is documented to retain (B4as).
+    fn registered_worktrees(project_root: &Path) -> std::collections::BTreeSet<PathBuf> {
+        git::run_stdout(project_root, &["worktree", "list", "--porcelain"], "worktree list")
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(|path| PathBuf::from(path.trim()))
+            .collect()
+    }
+
+    #[test]
+    fn no_expertise_land_preflight_reads_identity_before_side_effects() {
+        // B4u: the preflight reads the live frozen identity and, when the candidate
+        // is clean at the reviewed SHA with main an ancestor, lands the exact SHA
+        // without ever marking executing before the read passes.
+        let fx = frozen_land_fixture(true);
+        let resolver = ContentResolver::new(None);
+        let outcome = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(outcome.merged_commit, fx.reviewed_sha);
+        assert_eq!(
+            target_head(&fx),
+            fx.reviewed_sha,
+            "the target fast-forwards to exactly the reviewed SHA"
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_blocks_rebase_before_git_or_model_mutation() {
+        // B4v: a mismatched live candidate (HEAD moved off the reviewed SHA) leaves
+        // the candidate unstarted, both Git heads unchanged, reports that a fresh
+        // Attempt is required, and never constructs a rebase coder.
+        let fx = frozen_land_fixture(true);
+        let target_before = target_head(&fx);
+
+        // Advance the candidate HEAD off the reviewed SHA.
+        git::run(
+            &fx.source_workspace,
+            &["commit", "-q", "--allow-empty", "-m", "drift"],
+            "drift candidate",
+        )
+        .unwrap();
+        let candidate_head_before = head_commit(&fx.source_workspace).unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt"),
+            "the diagnostic requires a fresh Attempt: {error}"
+        );
+
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        let candidate = &stored.merge_candidates[0];
+        assert_eq!(
+            candidate.merge_state.status,
+            MergeCandidateMergeStatus::Pending,
+            "a preflight failure leaves the candidate unstarted"
+        );
+        assert!(candidate.merge_state.merged_commit.is_none());
+        assert_eq!(target_head(&fx), target_before, "target Git is unchanged");
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            candidate_head_before,
+            "source Git is unchanged"
+        );
+        // A rebase coder produces exactly one artifact: a reserved Rebase Task. Its
+        // absence proves the frozen route bailed before any rebase-coder construction.
+        assert!(
+            !stored.attempts[0]
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Rebase),
+            "no Rebase Task was created, so no rebase coder was constructed"
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_blocks_when_target_not_ancestor() {
+        // B4v: a target head that is not an ancestor of the reviewed SHA blocks the
+        // land with the fresh-Attempt diagnostic and no Git mutation.
+        let fx = frozen_land_fixture(true);
+        // Advance main to a commit unrelated to the reviewed SHA so main is no longer
+        // an ancestor of it.
+        git::run(
+            &fx.project_root,
+            &["commit", "-q", "--allow-empty", "-m", "advance main"],
+            "advance main",
+        )
+        .unwrap();
+        let target_before = target_head(&fx);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(error.to_string().contains("fresh Attempt"));
+        assert_eq!(target_head(&fx), target_before, "target Git is unchanged");
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Pending
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_fast_forwards_exact_reviewed_sha_without_rebase() {
+        // B4w: with a passing check-pre-merge run in a disposable exact-SHA worktree,
+        // the target fast-forwards to the exact reviewed SHA and that SHA is persisted
+        // as merged_commit — no rebase, no provenance regeneration, no autofix.
+        let fx = frozen_land_fixture(true);
+        write_hook(&fx.project_root, "check-pre-merge", "#!/bin/sh\nexit 0\n");
+
+        let resolver = ContentResolver::new(None);
+        let outcome = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(outcome.merged_commit, fx.reviewed_sha);
+        assert_eq!(target_head(&fx), fx.reviewed_sha);
+
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        let candidate = &stored.merge_candidates[0];
+        assert_eq!(
+            candidate.merge_state.status,
+            MergeCandidateMergeStatus::Merged
+        );
+        assert_eq!(
+            candidate.merge_state.merged_commit.as_deref(),
+            Some(fx.reviewed_sha.as_str())
+        );
+        // No rebase task was ever created.
+        assert!(
+            !stored.attempts[0]
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Rebase),
+            "the frozen route never creates a Rebase Task"
+        );
+        // The disposable worktree was removed.
+        assert!(
+            !fx.project_root
+                .join(WORK_ARTIFACTS_DIR)
+                .join("work-1/attempt-1/attempt-1-merge-candidate/merge/exact-sha-check")
+                .exists(),
+            "the disposable exact-SHA worktree is removed after a passing check"
+        );
+    }
+
+    #[test]
+    fn regenerate_provenance_rejects_frozen_no_expertise_identity() {
+        // B4w: regenerate_provenance refuses to run for a frozen no-expertise
+        // identity, since retargeting the reviewed SHA is exactly the pointer move
+        // the freeze forbids.
+        let fx = frozen_land_fixture(true);
+        let error = regenerate_provenance(
+            &fx.store,
+            "work-1",
+            "attempt-1-merge-candidate",
+            "attempt-1",
+            "new-base",
+            "new-tip",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt")
+                || error.to_string().contains("regenerate provenance"),
+            "regenerate_provenance rejects the frozen identity: {error}"
+        );
+        // The reviewed SHA is untouched.
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .rev()
+                .find(|t| t.kind == TaskKind::Write)
+                .unwrap()
+                .output
+                .as_ref()
+                .unwrap()
+                .commit,
+            fx.reviewed_sha
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_never_runs_fix_pre_merge_or_changes_reviewed_sha() {
+        // B4x: a failing check-pre-merge never invokes fix-pre-merge, fails the
+        // candidate with a fresh-Attempt diagnostic, and leaves the live candidate and
+        // target unchanged with no autofix commit.
+        let fx = frozen_land_fixture(true);
+        write_hook(&fx.project_root, "check-pre-merge", "#!/bin/sh\nexit 1\n");
+        // A fix-pre-merge sentinel at an absolute path in the outer temporary root,
+        // outside the project, source workspace, artifact area, and every disposable
+        // worktree. If the hook ever runs, the marker survives disposable-worktree
+        // cleanup, so an erroneous invocation stays observable and fails the test.
+        let sentinel = fx.outer_root.join("fix-ran-marker");
+        write_hook(
+            &fx.project_root,
+            "fix-pre-merge",
+            &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+        );
+        let target_before = target_head(&fx);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(error.to_string().contains("fresh Attempt"), "{error}");
+
+        assert_eq!(target_head(&fx), target_before, "target unchanged");
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            fx.reviewed_sha,
+            "live candidate HEAD unchanged"
+        );
+        assert!(
+            !sentinel.exists(),
+            "fix-pre-merge is never invoked on the frozen route, even after cleanup"
+        );
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Failed,
+            "a failed exact-SHA check fails the candidate"
+        );
+        assert!(
+            stored.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn no_expertise_mutating_pre_merge_check_cannot_change_live_candidate_or_target() {
+        // B4x: a check-pre-merge that dirties/stages/commits in its cwd runs only in
+        // the disposable worktree; the live candidate and target stay unchanged and
+        // the candidate fails with a fresh-Attempt diagnostic.
+        let fx = frozen_land_fixture(true);
+        write_hook(
+            &fx.project_root,
+            "check-pre-merge",
+            "#!/bin/sh\necho mutated > file.txt\ngit add -A\ngit commit -q -m sneaky\nexit 0\n",
+        );
+        let target_before = target_head(&fx);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(error.to_string().contains("fresh Attempt"), "{error}");
+
+        assert_eq!(target_head(&fx), target_before, "target unchanged");
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            fx.reviewed_sha,
+            "live candidate HEAD unchanged despite a committing check"
+        );
+        assert!(
+            candidate_fully_clean(&fx.source_workspace).unwrap(),
+            "live candidate stays clean"
+        );
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Failed
+        );
+    }
+
+    #[test]
+    fn no_expertise_merged_resume_requires_frozen_reviewed_sha() {
+        // B4y: an already-Merged no-expertise candidate resumes as an idempotent
+        // success only when its persisted merged_commit equals the frozen reviewed
+        // SHA; a divergent merged_commit fails closed. The cleaned-up candidate
+        // workspace is not required.
+        let fx = frozen_land_fixture(true);
+        // Mark merged at the exact reviewed SHA and remove the candidate workspace.
+        record_candidate_merged(
+            &fx.store,
+            "work-1",
+            "attempt-1-merge-candidate",
+            &fx.reviewed_sha,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        git::run(
+            &fx.project_root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                fx.source_workspace.to_str().unwrap(),
+            ],
+            "remove candidate workspace",
+        )
+        .unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let outcome = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(
+            outcome.merged_commit, fx.reviewed_sha,
+            "a matching merged_commit resumes as an idempotent success without the workspace"
+        );
+    }
+
+    #[test]
+    fn no_expertise_merged_resume_fails_closed_on_divergent_merged_commit() {
+        // B4y: an already-Merged no-expertise candidate whose persisted merged_commit
+        // is NOT the frozen reviewed SHA must fail closed rather than report success.
+        // A fresh Work Item can persist such a divergent value (the frozen-identity
+        // model guard fires only on writes to an existing item), so the land route
+        // itself must catch it.
+        let fx = frozen_land_fixture(true);
+        let mut item = fx.store.read_work_item("work-1").unwrap();
+        item.merge_candidates[0].merge_state.status = MergeCandidateMergeStatus::Merged;
+        item.merge_candidates[0].merge_state.merged_commit =
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+        // Persist through a fresh store so no prior aggregate triggers the guard.
+        let fresh_dir = tempfile::TempDir::new().unwrap();
+        let fresh_store = WorkModelStore::new(fresh_dir.path());
+        fresh_store.create_work_item(&item).unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let config = WorkMergeConfig {
+            project_root: fresh_dir.path(),
+            store: &fresh_store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            no_sandbox: true,
+            run_post_merge_review: false,
+        };
+        let error = merge_candidate(config).unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt")
+                && error.to_string().contains("frozen reviewed SHA"),
+            "a divergent merged_commit fails closed with the fresh-Attempt diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn capture_land_still_allows_fix_pre_merge() {
+        // B4z: a capture-mode land keeps the existing check→fix→recheck path. A
+        // capture Work Item is never gated into the frozen branch, so run_merge_checks
+        // still runs fix-pre-merge after a failing check.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        init_test_repo(&project_root);
+        // A check that fails until the fix marker exists, then passes.
+        write_hook(
+            &project_root,
+            "check-pre-merge",
+            "#!/bin/sh\ntest -f conformed.txt\n",
+        );
+        write_hook(
+            &project_root,
+            "fix-pre-merge",
+            "#!/bin/sh\necho ok > conformed.txt\nexit 0\n",
+        );
+
+        let store = WorkModelStore::new(project_root.as_path());
+        let (item, candidate) = executing_candidate_item("work-1", &project_root);
+        // Capture mode: the frozen branch must not engage.
+        assert!(
+            frozen_no_expertise_reviewed_sha(&item, &candidate).is_none(),
+            "capture-mode Work never resolves a frozen reviewed SHA"
+        );
+
+        let artifact_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let resolver = ContentResolver::new(None);
+        let config = WorkMergeConfig {
+            project_root: project_root.as_path(),
+            store: &store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            no_sandbox: true,
+            run_post_merge_review: false,
+        };
+        let artifacts =
+            run_merge_checks(&config, &candidate, &project_root, &artifact_dir).unwrap();
+        assert!(
+            project_root.join("conformed.txt").exists(),
+            "capture-mode land still runs fix-pre-merge to conform the tree"
+        );
+        assert!(
+            artifacts.len() >= 3,
+            "check, fix, and recheck artifacts are all recorded: {}",
+            artifacts.len()
+        );
+    }
+
+    #[test]
+    fn no_expertise_passing_check_cleanup_failure_blocks_land() {
+        // B4as: a passing check-pre-merge whose disposable exact-SHA worktree cannot be
+        // removed fails the land before the second live precondition check or any target
+        // Git mutation. It persists EXACTLY the returned diagnostic as the failure
+        // reason, leaves the candidate exactly Failed with no merged commit or follow-up
+        // result, writes no real post-merge-review queue entry, preserves the complete
+        // source and target Git/index/status/byte state, and leaves the registered
+        // worktree set equal to the pre-call set plus exactly the one retained disposable
+        // worktree — no unspecified subset and no extra leak.
+        let fx = frozen_land_fixture(true);
+        write_hook(&fx.project_root, "check-pre-merge", "#!/bin/sh\nexit 0\n");
+        let src = fx.source_workspace.as_path();
+        let target = fx.project_root.as_path();
+
+        // Snapshot both complete checkouts and the exact registered-worktree set before.
+        let source_before = snapshot_git(src);
+        let target_before = snapshot_git(target);
+        let registered_before = registered_worktrees(target);
+
+        let resolver = ContentResolver::new(None);
+        let error = {
+            let _fault = DisposableRemovalFaultGuard::engage();
+            merge_candidate(frozen_config(&fx, &resolver, true)).unwrap_err()
+        };
+        let returned = error.to_string();
+        assert!(
+            returned.contains("disposable exact-SHA worktree") && returned.contains("failed"),
+            "the diagnostic reports the cleanup failure: {returned}"
+        );
+        assert!(
+            returned.contains("fresh Attempt"),
+            "the diagnostic requires a fresh Attempt: {returned}"
+        );
+
+        // Both complete checkouts survive byte-for-byte: no target fast-forward, no live
+        // candidate mutation, no index/status/byte drift on either side.
+        assert_eq!(
+            snapshot_git(src),
+            source_before,
+            "the complete source checkout is unchanged"
+        );
+        assert_eq!(
+            snapshot_git(target),
+            target_before,
+            "the complete target checkout is unchanged"
+        );
+
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        let candidate = &stored.merge_candidates[0];
+        assert_eq!(
+            candidate.merge_state.status,
+            MergeCandidateMergeStatus::Failed,
+            "a passing-check cleanup failure fails the candidate exactly"
+        );
+        // The persisted failure reason equals the returned diagnostic EXACTLY.
+        let reason = candidate
+            .merge_state
+            .failure_reason
+            .as_deref()
+            .expect("a failed candidate retains its failure reason");
+        assert_eq!(
+            reason, returned,
+            "the persisted failure reason equals the returned diagnostic exactly"
+        );
+        assert!(
+            candidate.merge_state.merged_commit.is_none(),
+            "a blocked land records no merged commit"
+        );
+        assert!(
+            candidate.merge_state.follow_up_failure.is_none(),
+            "a land blocked before recovery records no follow-up result"
+        );
+        // No post-merge review is scheduled: the land failed before recovery, so the
+        // real queue-persistence boundary is never reached.
+        let queue = crate::post_merge_review::load_queue(&fx.project_root).unwrap();
+        assert!(
+            queue.entries.is_empty(),
+            "a blocked land writes no post-merge-review queue entry"
+        );
+
+        // The registered-worktree delta is exactly the one retained disposable worktree:
+        // no pre-existing worktree is removed and no additional worktree leaks.
+        let registered_after = registered_worktrees(target);
+        assert!(
+            registered_before.difference(&registered_after).next().is_none(),
+            "no pre-existing worktree is removed"
+        );
+        let added: Vec<PathBuf> = registered_after
+            .difference(&registered_before)
+            .cloned()
+            .collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "exactly one disposable worktree is retained; none other leaks: {added:?}"
+        );
+        let expected_disposable = fx
+            .project_root
+            .join(WORK_ARTIFACTS_DIR)
+            .join("work-1/attempt-1/attempt-1-merge-candidate/merge/exact-sha-check");
+        assert!(
+            expected_disposable.exists(),
+            "the isolated disposable worktree is retained for cleanup"
+        );
+        assert_eq!(
+            added[0].canonicalize().unwrap(),
+            expected_disposable.canonicalize().unwrap(),
+            "the one retained worktree is exactly the isolated exact-SHA disposable worktree"
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_records_follow_up_outcome_before_post_merge_review() {
+        // B4ak: the public exact-SHA land route completes the real Work-model write of
+        // the incomplete follow-up result BEFORE it enters the real queue-persistence
+        // leaf. A scoped observer at that leaf confirms the durable follow-up failure is
+        // already stored at entry, then the real queue write runs and persists the
+        // complete entry. The succeeded Learner's handoff artifact is deliberately
+        // absent, so the real follow-up materialization boundary fails and records a
+        // durable incomplete result — leaving the queue empty would mean the exact-SHA
+        // route bypassed the shared coordinator.
+        let fx = frozen_land_fixture(true);
+        write_hook(&fx.project_root, "check-pre-merge", "#!/bin/sh\nexit 0\n");
+        // Pin the corrective fix depth at the cap so the detached-runner spawn is
+        // suppressed while the real queue persistence still runs.
+        let cap = crate::post_merge_review::max_post_merge_review_fix_depth();
+        fx.store
+            .mutate_work_item("work-1", |item| {
+                item.post_merge_review_fix_depth = Some(cap);
+                Ok(())
+            })
+            .unwrap();
+        let base_before = target_head(&fx);
+
+        // Capture, at entry to the real queue-persistence leaf, both the complete
+        // queue entry and the candidate as durably stored at that instant.
+        let observed_candidate: std::rc::Rc<
+            std::cell::RefCell<Option<crate::work_model::MergeCandidate>>,
+        > = std::rc::Rc::default();
+        let observed_entry: std::rc::Rc<
+            std::cell::RefCell<Option<crate::post_merge_review::QueueEntry>>,
+        > = std::rc::Rc::default();
+        let store_at_queue = fx.store.clone();
+        let observed_candidate_w = observed_candidate.clone();
+        let observed_entry_w = observed_entry.clone();
+
+        let resolver = ContentResolver::new(None);
+        let outcome = {
+            let _observer = crate::post_merge_review::observe_queue_append(move |entry| {
+                let item = store_at_queue.read_work_item("work-1").unwrap();
+                *observed_candidate_w.borrow_mut() = Some(item.merge_candidates[0].clone());
+                *observed_entry_w.borrow_mut() = Some(entry.clone());
+            });
+            merge_candidate(frozen_config(&fx, &resolver, true)).unwrap()
+        };
+        assert_eq!(outcome.merged_commit, fx.reviewed_sha);
+
+        // At entry to the real queue write, the durable candidate already carried the
+        // exact incomplete follow-up failure, proving the Work-model write preceded the
+        // queue-persistence leaf.
+        let at_queue = observed_candidate
+            .borrow()
+            .clone()
+            .expect("the observer saw the real queue-persistence leaf");
+        assert_eq!(
+            at_queue.merge_state.status,
+            MergeCandidateMergeStatus::Merged,
+            "the candidate is durably merged before the queue write"
+        );
+        let durable_failure = at_queue
+            .merge_state
+            .follow_up_failure
+            .clone()
+            .expect("the durable follow-up failure is stored before the queue write");
+
+        // The stored aggregate matches what the observer saw.
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0]
+                .merge_state
+                .follow_up_failure
+                .as_ref(),
+            Some(&durable_failure),
+            "the durable follow-up failure observed at the queue leaf is the persisted one"
+        );
+
+        // The real queue leaf then wrote exactly one complete entry.
+        let queue = crate::post_merge_review::load_queue(&fx.project_root).unwrap();
+        assert_eq!(
+            queue.entries.len(),
+            1,
+            "a real post-merge-review queue entry is persisted through the shared coordinator"
+        );
+        let entry = &queue.entries[0];
+        let expected = crate::post_merge_review::QueueEntry {
+            target_branch: stored.merge_candidates[0].target_branch.clone(),
+            merged_commit: fx.reviewed_sha.clone(),
+            // Only the runtime timestamp is captured from the entry and compared
+            // consistently; every other field is independently reconstructed.
+            merged_at_unix: entry.merged_at_unix,
+            source_work_item_id: "work-1".to_string(),
+            source_merge_candidate_id: "attempt-1-merge-candidate".to_string(),
+            base_commit: base_before.clone(),
+            fix_depth: cap,
+        };
+        assert_eq!(
+            *entry, expected,
+            "the persisted queue entry carries the complete land provenance"
+        );
+        // The entry the observer saw at the leaf equals the entry that was persisted.
+        assert_eq!(
+            observed_entry.borrow().clone(),
+            Some(entry.clone()),
+            "the observed entry equals the persisted entry"
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_skips_post_merge_review_when_follow_up_persistence_is_unknown() {
+        // B4ak: when the real Work-model storage write for the follow-up result fails
+        // so the result is unknown, the public exact-SHA land returns its already-durable
+        // landed outcome unchanged, keeps the candidate Merged, persists no follow-up
+        // result, and schedules no post-merge review (no queue entry). The failure
+        // originates inside the real Work-model write path — validation and storage are
+        // entered and only the atomic write fails — and retains its typed storage cause.
+        let fx = frozen_land_fixture(true);
+        write_hook(&fx.project_root, "check-pre-merge", "#!/bin/sh\nexit 0\n");
+
+        LAST_FOLLOW_UP_PERSIST_ERROR.with(|slot| *slot.borrow_mut() = None);
+        let resolver = ContentResolver::new(None);
+        let outcome = {
+            // Fault only the one follow-up-result write for this Work Item, at the real
+            // WorkModelStore persistence leaf. Every other write in the land commits.
+            let _fault = crate::work_model::persist_fault::arm_follow_up_write("work-1");
+            merge_candidate(frozen_config(&fx, &resolver, true)).unwrap()
+        };
+        // The land already became durable: the exact landed outcome is returned.
+        assert_eq!(outcome.merged_commit, fx.reviewed_sha);
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Merged,
+            "the land stays successful even when follow-up persistence is unknown"
+        );
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.merged_commit.as_deref(),
+            Some(fx.reviewed_sha.as_str()),
+            "the durable merged commit is exactly the reviewed SHA"
+        );
+        // No speculative follow-up result became durable: the faulted write never
+        // persisted, so the candidate carries no follow-up failure.
+        assert!(
+            stored.merge_candidates[0]
+                .merge_state
+                .follow_up_failure
+                .is_none(),
+            "an unknown follow-up persistence records no durable follow-up result"
+        );
+
+        // The failure came from inside the real Work-model write path and kept its
+        // typed WorkModelStorageError cause — not an ad-hoc pre-write short circuit.
+        let observed = LAST_FOLLOW_UP_PERSIST_ERROR
+            .with(|slot| slot.borrow().clone())
+            .expect("the coordinator surfaced the follow-up persistence failure");
+        assert!(
+            observed.has_typed_storage_cause,
+            "the surfaced failure retains its typed WorkModelStorageError cause: {}",
+            observed.rendered
+        );
+        assert!(
+            observed.rendered.contains("injected atomic Work-model storage fault"),
+            "the failure originated at the real atomic storage write: {}",
+            observed.rendered
+        );
+
+        // Persistence unknown suppresses the optional post-merge review: no queue entry.
+        let queue = crate::post_merge_review::load_queue(&fx.project_root).unwrap();
+        assert!(
+            queue.entries.is_empty(),
+            "unknown follow-up persistence writes no post-merge-review queue entry"
+        );
+    }
+
+    #[test]
+    fn no_expertise_merged_resume_requires_reviewed_sha_for_every_learning_state() {
+        // B4aj: an already-Merged no-expertise candidate derives its reviewed Writer
+        // SHA from the latest completed Write output independently of Learning, before
+        // resolving any workspace. The full five-by-three matrix
+        // ({None, InProgress, HandoffPending, Failed, Succeeded} ×
+        // {missing, divergent, matching}) is driven through public `merge_candidate`
+        // with the source workspace removed before every cell. A missing or divergent
+        // merged_commit fails closed with the complete aggregate and external target
+        // Git unchanged and no merge artifact area created; a matching one resumes
+        // idempotently without the workspace.
+        let handoff = crate::follow_up::ArtifactRef {
+            path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+            digest: "sha256:frozen".to_string(),
+        };
+        let learning_states: Vec<Option<crate::work_model::AttemptLearning>> = vec![
+            None,
+            Some(crate::work_model::AttemptLearning::in_progress(1)),
+            Some(crate::work_model::AttemptLearning::handoff_pending(1)),
+            Some(crate::work_model::AttemptLearning::failed(1, "retry me")),
+            Some(crate::work_model::AttemptLearning::succeeded(1, handoff.clone())),
+        ];
+
+        #[derive(Clone, Copy)]
+        enum MergedColumn {
+            Missing,
+            Divergent,
+            Matching,
+        }
+
+        for learning in &learning_states {
+            for column in [
+                MergedColumn::Missing,
+                MergedColumn::Divergent,
+                MergedColumn::Matching,
+            ] {
+                let learning = learning.clone();
+                let fx = build_frozen_fixture(|item, reviewed_sha| {
+                    item.attempts[0].learning = learning.clone();
+                    item.merge_candidates[0].merge_state.status =
+                        MergeCandidateMergeStatus::Merged;
+                    item.merge_candidates[0].merge_state.merged_commit = match column {
+                        MergedColumn::Missing => None,
+                        MergedColumn::Divergent => {
+                            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string())
+                        }
+                        MergedColumn::Matching => Some(reviewed_sha.to_string()),
+                    };
+                });
+
+                // Remove the source workspace before every cell: a successful matching
+                // resume then proves workspace-independence, and a rejected cell proves
+                // the reject decision precedes any workspace resolution.
+                git::run(
+                    &fx.project_root,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        fx.source_workspace.to_str().unwrap(),
+                    ],
+                    "remove candidate workspace",
+                )
+                .unwrap();
+                assert!(
+                    !fx.source_workspace.exists(),
+                    "the candidate workspace is absent before every cell"
+                );
+
+                let before = fx.store.read_work_item("work-1").unwrap();
+                let target_before = target_head(&fx);
+                let merge_artifact_area = fx
+                    .project_root
+                    .join(WORK_ARTIFACTS_DIR)
+                    .join("work-1/attempt-1/attempt-1-merge-candidate/merge");
+                let resolver = ContentResolver::new(None);
+
+                match column {
+                    MergedColumn::Missing | MergedColumn::Divergent => {
+                        let error =
+                            merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+                        assert!(
+                            error.to_string().contains("fresh Attempt")
+                                && error.to_string().contains("frozen reviewed SHA"),
+                            "a missing or divergent merged_commit fails closed for every \
+                             Learning state: {error}"
+                        );
+                        // Fail-closed before any effect: the whole persisted aggregate and
+                        // the external target Git are preserved exactly, and no merge
+                        // artifact area was created.
+                        let after = fx.store.read_work_item("work-1").unwrap();
+                        assert_eq!(
+                            after, before,
+                            "a rejected already-Merged cell changes no persisted state"
+                        );
+                        assert_eq!(
+                            target_head(&fx),
+                            target_before,
+                            "a rejected already-Merged cell leaves the target Git unchanged"
+                        );
+                        assert!(
+                            !merge_artifact_area.exists(),
+                            "a rejected already-Merged cell creates no merge artifact area"
+                        );
+                    }
+                    MergedColumn::Matching => {
+                        let outcome =
+                            merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+                        assert_eq!(
+                            outcome.merged_commit, fx.reviewed_sha,
+                            "a matching merged_commit resumes idempotently for every \
+                             Learning state"
+                        );
+                        let recovered = fx.store.read_work_item("work-1").unwrap();
+                        assert_eq!(
+                            recovered.merge_candidates[0].merge_state.status,
+                            MergeCandidateMergeStatus::Merged,
+                            "a matching recovery stays merged"
+                        );
+                        assert_eq!(
+                            recovered.merge_candidates[0]
+                                .merge_state
+                                .merged_commit
+                                .as_deref(),
+                            Some(fx.reviewed_sha.as_str()),
+                            "a matching recovery keeps the reviewed SHA as the merged commit"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_expertise_dirty_candidate_fails_before_model_or_artifact_mutation() {
+        // B4am: a dirty live no-expertise candidate fails at preflight, before any
+        // Work-model, artifact, source Git, target Git, index, worktree, or byte
+        // mutation. The complete Work Item aggregate and BOTH complete source/target
+        // checkouts — HEAD, raw index, porcelain status, staged and unstaged
+        // representations, and tracked/untracked payload bytes — are preserved
+        // byte-for-byte, and no merge-artifact area is created.
+        let fx = frozen_land_fixture(true);
+        let src = fx.source_workspace.as_path();
+        let target = fx.project_root.as_path();
+        // Stage one version of a tracked file, overwrite it with different unstaged
+        // bytes, and add an untracked binary payload.
+        fs::write(src.join("file.txt"), "staged version\n").unwrap();
+        git::run(src, &["add", "file.txt"], "stage tracked file").unwrap();
+        fs::write(src.join("file.txt"), "unstaged version\n").unwrap();
+        let payload: &[u8] = &[0u8, 1, 2, 3, 255, 254, 0, 42];
+        fs::write(src.join("payload.bin"), payload).unwrap();
+
+        // Snapshot the complete Work Item and both complete checkouts before the land.
+        let item_before = fx.store.read_work_item("work-1").unwrap();
+        let source_before = snapshot_git(src);
+        let target_before = snapshot_git(target);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt"),
+            "a dirty candidate requires a fresh Attempt: {error}"
+        );
+
+        // The whole Work Item aggregate is unchanged: no field, candidate state, or
+        // executing mark moved.
+        let item_after = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            item_after, item_before,
+            "a dirty-source rejection changes no persisted Work Item state"
+        );
+        // Both complete checkouts survive the rejected preflight byte-for-byte.
+        assert_eq!(
+            snapshot_git(src),
+            source_before,
+            "the complete source checkout is unchanged"
+        );
+        assert_eq!(
+            snapshot_git(target),
+            target_before,
+            "the complete target checkout is unchanged"
+        );
+        // No merge-artifact area was created.
+        assert!(
+            !target
+                .join(WORK_ARTIFACTS_DIR)
+                .join("work-1/attempt-1/attempt-1-merge-candidate/merge")
+                .exists(),
+            "a preflight failure creates no merge artifacts"
+        );
+    }
+
+    #[test]
+    fn no_expertise_pre_merge_check_mutation_matrix_preserves_live_git() {
+        // B4ad: dirty-only, staged-only, and committed changes made by
+        // check-pre-merge in the disposable worktree each fail the land without
+        // invoking fix-pre-merge, and each preserves the live candidate and target.
+        let cases: [(&str, &str); 3] = [
+            ("dirty-only", "#!/bin/sh\necho mutated > extra.txt\nexit 0\n"),
+            (
+                "staged-only",
+                "#!/bin/sh\necho mutated > extra.txt\ngit add -A\nexit 0\n",
+            ),
+            (
+                "committed",
+                "#!/bin/sh\necho mutated > file.txt\ngit add -A\ngit commit -q -m sneaky\nexit 0\n",
+            ),
+        ];
+        for (label, check) in cases {
+            let fx = frozen_land_fixture(true);
+            write_hook(&fx.project_root, "check-pre-merge", check);
+            // A fix-pre-merge sentinel at an absolute path in the outer temporary root,
+            // embedded shell-safe directly in the hook rather than through an
+            // environment variable the hook runner never defines. It lives outside the
+            // project, source workspace, artifact area, and every disposable worktree,
+            // so an erroneous invocation survives cleanup and remains observable.
+            let sentinel = fx.outer_root.join("fix-ran-marker");
+            write_hook(
+                &fx.project_root,
+                "fix-pre-merge",
+                &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+            );
+            let target_before = target_head(&fx);
+
+            let resolver = ContentResolver::new(None);
+            let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+            assert!(
+                error.to_string().contains("fresh Attempt"),
+                "[{label}] a mutating check requires a fresh Attempt: {error}"
+            );
+            assert!(
+                !sentinel.exists(),
+                "[{label}] fix-pre-merge is never invoked on the frozen route, even after cleanup"
+            );
+            assert_eq!(
+                target_head(&fx),
+                target_before,
+                "[{label}] target Git is unchanged"
+            );
+            assert_eq!(
+                head_commit(&fx.source_workspace).unwrap(),
+                fx.reviewed_sha,
+                "[{label}] the live candidate HEAD is unchanged"
+            );
+            assert!(
+                candidate_fully_clean(&fx.source_workspace).unwrap(),
+                "[{label}] the live candidate stays clean"
+            );
+            let stored = fx.store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                stored.merge_candidates[0].merge_state.status,
+                MergeCandidateMergeStatus::Failed,
+                "[{label}] a mutating check fails the candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn no_expertise_land_rechecks_live_source_and_target_after_isolated_check() {
+        // B4ad: live source drift and live target drift during the isolated check are
+        // each rejected by the second precondition check before the fast-forward.
+
+        // Source drift: the check advances the live candidate HEAD off the reviewed
+        // SHA while running in its disposable worktree.
+        let fx = frozen_land_fixture(true);
+        write_hook(
+            &fx.project_root,
+            "check-pre-merge",
+            &format!(
+                "#!/bin/sh\ngit -C '{}' commit -q --allow-empty -m drift\nexit 0\n",
+                fx.source_workspace.display()
+            ),
+        );
+        let target_before = target_head(&fx);
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt"),
+            "live source drift requires a fresh Attempt: {error}"
+        );
+        assert_eq!(
+            target_head(&fx),
+            target_before,
+            "the target never fast-forwards after live source drift"
+        );
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Failed
+        );
+
+        // Target drift: the check advances the live target branch while running in its
+        // disposable worktree.
+        let fx = frozen_land_fixture(true);
+        write_hook(
+            &fx.project_root,
+            "check-pre-merge",
+            &format!(
+                "#!/bin/sh\ngit -C '{}' commit -q --allow-empty -m target-drift\nexit 0\n",
+                fx.project_root.display()
+            ),
+        );
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("fresh Attempt"),
+            "live target drift requires a fresh Attempt: {error}"
+        );
+        assert_ne!(
+            target_head(&fx),
+            fx.reviewed_sha,
+            "the target never fast-forwards to the reviewed SHA after target drift"
+        );
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            fx.reviewed_sha,
+            "the live candidate is unchanged after target drift"
+        );
+    }
+
+    #[test]
+    fn no_expertise_dirty_target_fails_before_side_effects() {
+        // B4ai: an initially dirty target fails preflight before the candidate is
+        // marked executing or either live repository is changed, preserving the dirty
+        // target as found and leaving the live candidate unchanged.
+        let fx = frozen_land_fixture(true);
+        fs::write(fx.project_root.join("file.txt"), "dirty target").unwrap();
+        let target_before = target_head(&fx);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted changes"),
+            "a dirty target fails the existing cleanliness policy: {error}"
+        );
+
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Pending,
+            "a dirty target never marks the candidate executing"
+        );
+        assert_eq!(target_head(&fx), target_before, "target head is unchanged");
+        assert_eq!(
+            fs::read_to_string(fx.project_root.join("file.txt")).unwrap(),
+            "dirty target",
+            "the dirty target is preserved as found"
+        );
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            fx.reviewed_sha,
+            "the live candidate is unchanged"
+        );
+        assert!(
+            !fx.project_root
+                .join(WORK_ARTIFACTS_DIR)
+                .join("work-1/attempt-1/attempt-1-merge-candidate/merge")
+                .exists(),
+            "a preflight failure creates no merge artifacts"
+        );
+    }
+
+    #[test]
+    fn no_expertise_land_rechecks_target_cleanliness_after_isolated_check() {
+        // B4ai: a target dirtied during the isolated check fails before the
+        // fast-forward, preserving the dirty target and leaving the live candidate
+        // unchanged.
+        let fx = frozen_land_fixture(true);
+        write_hook(
+            &fx.project_root,
+            "check-pre-merge",
+            &format!(
+                "#!/bin/sh\necho 'dirtied during check' > '{}/file.txt'\nexit 0\n",
+                fx.project_root.display()
+            ),
+        );
+        let target_before = target_head(&fx);
+
+        let resolver = ContentResolver::new(None);
+        let error = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted changes"),
+            "a target dirtied during the check fails the cleanliness recheck: {error}"
+        );
+
+        assert_eq!(
+            target_head(&fx),
+            target_before,
+            "the target never fast-forwards after being dirtied during the check"
+        );
+        assert_eq!(
+            fs::read_to_string(fx.project_root.join("file.txt")).unwrap(),
+            "dirtied during check\n",
+            "the dirty target is preserved as found"
+        );
+        assert_eq!(
+            head_commit(&fx.source_workspace).unwrap(),
+            fx.reviewed_sha,
+            "the live candidate is unchanged"
+        );
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Failed,
+            "the already-started candidate fails when the target is dirtied mid-check"
+        );
+    }
+
+    /// A rebase coder that performs the real `git rebase main` in the working tree and
+    /// returns a clean supervision report, so the full capture rebase → provenance →
+    /// check/fix/recheck route can be driven through the shared execution path.
+    struct RealRebaseCoder;
+
+    impl crate::coder::Coder for RealRebaseCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the rebase route launches through run_captured_reported")
+        }
+
+        fn run_captured_reported(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> crate::coder::CoderRunCompletion {
+            let terminal = match git::run(working_dir, &["rebase", "main"], "capture rebase onto main")
+            {
+                Ok(()) => Ok(0),
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            crate::coder::CoderRunCompletion {
+                terminal,
+                report: crate::coder::CoderSupervisionReport::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the rebase route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn capture_land_public_route_retains_rebase_provenance_and_autofix() {
+        // B4al: a capture-mode land driven through public `merge_candidate` still
+        // reaches the rebase and provenance regeneration steps and still runs
+        // check → fix → recheck. The capture route is never gated into the frozen
+        // exact-SHA branch, and the ordered hook invocations are observable in an
+        // absolute external event record. The in-process rebase coder is injected only
+        // through a `#[cfg(test)]` seam; route selection, validation, artifact
+        // creation, provenance regeneration, and final coordination all stay real.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            git::run(cwd, args, "capture land fixture setup").unwrap();
+        };
+        git(&project_root, &["init", "-q", "-b", "main"]);
+        git(&project_root, &["config", "user.email", "t@t.co"]);
+        git(&project_root, &["config", "user.name", "t"]);
+        fs::write(project_root.join("file.txt"), "base").unwrap();
+        git(&project_root, &["add", "."]);
+        git(&project_root, &["commit", "-q", "-m", "baseline"]);
+
+        // The candidate branches from the baseline and adds one commit.
+        git(&project_root, &["checkout", "-q", "-b", "work/attempt-1"]);
+        fs::write(project_root.join("candidate.txt"), "candidate work").unwrap();
+        git(&project_root, &["add", "."]);
+        git(&project_root, &["commit", "-q", "-m", "candidate work"]);
+        let candidate_commit =
+            git::run_stdout(&project_root, &["rev-parse", "HEAD"], "candidate sha").unwrap();
+        git(&project_root, &["checkout", "-q", "main"]);
+        // main advances beyond the candidate's base, so a rebase is required.
+        fs::write(project_root.join("main-advance.txt"), "main moved").unwrap();
+        git(&project_root, &["add", "."]);
+        git(&project_root, &["commit", "-q", "-m", "advance main"]);
+
+        // The candidate source workspace is a registered worktree on its branch.
+        let ws_path = crate::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+        let source_workspace = project_root
+            .parent()
+            .unwrap()
+            .join(Path::new(&ws_path).file_name().map(Path::new).unwrap());
+        git(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                source_workspace.to_str().unwrap(),
+                "work/attempt-1",
+            ],
+        );
+
+        // Each hook appends its name to an absolute external event log in the outer
+        // temporary root, outside the project, source workspace, and artifact area, so
+        // the ordered check → fix → recheck sequence is observable after the land.
+        let event_log = tmp.path().join("hook-events.log");
+        let event_log_arg = event_log.display().to_string();
+        // A check that fails until fix-pre-merge conforms the tree.
+        write_hook(
+            &project_root,
+            "check-pre-merge",
+            &format!("#!/bin/sh\necho check >> '{event_log_arg}'\ntest -f conformed.txt\n"),
+        );
+        write_hook(
+            &project_root,
+            "fix-pre-merge",
+            &format!(
+                "#!/bin/sh\necho fix >> '{event_log_arg}'\necho ok > conformed.txt\n\
+                 git add -A\ngit commit -q -m conform\nexit 0\n"
+            ),
+        );
+
+        let store = WorkModelStore::new(project_root.as_path());
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Capture land".to_string(),
+            // Capture is the default learner mode.
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = item.attempts.first_mut().unwrap();
+        attempt.status = AttemptStatus::Complete;
+        attempt.review_state = Some(AttemptReviewState::Passed);
+        // A succeeded Learner lets the candidate advance; capture mode keeps it on the
+        // rebase route because it never resolves a frozen no-expertise reviewed SHA.
+        attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+                digest: "sha256:capture".to_string(),
+            },
+        ));
+        let task = attempt.tasks.first_mut().unwrap();
+        let workspace_id = task.workspace_access.writes.first().unwrap().id.clone();
+        task.status = TaskStatus::Complete;
+        task.output = Some(TaskOutput {
+            workspace_id,
+            workspace_path: ws_path,
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: candidate_commit.clone(),
+        });
+        item.create_or_get_merge_candidate("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        let candidate = item.merge_candidates[0].clone();
+
+        // The capture route is never gated into the frozen exact-SHA branch.
+        assert!(
+            frozen_no_expertise_reviewed_sha(&item, &candidate).is_none(),
+            "capture-mode Work never resolves a frozen reviewed SHA"
+        );
+
+        // The pre-land target head is the base the rebase regenerates provenance off.
+        let target_head_before =
+            git::run_stdout(&project_root, &["rev-parse", "main"], "target before").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let config = WorkMergeConfig {
+            project_root: project_root.as_path(),
+            store: &store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            no_sandbox: true,
+            run_post_merge_review: false,
+        };
+        // Drive the real public route; only the rebase coder is injected.
+        let outcome = {
+            let _coder = RebaseCoderOverrideGuard::engage(|| Box::new(RealRebaseCoder));
+            merge_candidate(config).unwrap()
+        };
+
+        // The rebase ran: a Rebase Task was created and completed.
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Complete),
+            "the capture route creates and completes a Rebase Task"
+        );
+
+        // The regenerated Write provenance names the old base and the regenerated SHA:
+        // the latest completed Write output records base_commit at the pre-land target
+        // head and commit off the pre-rebase candidate commit. That regenerated SHA is
+        // the single commit every land pointer must name.
+        let write_output = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .expect("a completed Write task carries regenerated provenance")
+            .output
+            .clone()
+            .expect("the completed Write task has output");
+        assert_eq!(
+            write_output.base_commit.as_deref(),
+            Some(target_head_before.as_str()),
+            "regenerated Write provenance records the pre-land target head as the base"
+        );
+        let regenerated_sha = write_output.commit.clone();
+        assert_ne!(
+            regenerated_sha, candidate_commit,
+            "provenance regeneration retargets the write output off the pre-rebase commit"
+        );
+
+        // Every persisted and returned land pointer names that one regenerated SHA.
+        let merge_candidate = &stored.merge_candidates[0];
+        assert_eq!(
+            merge_candidate.merge_state.status,
+            MergeCandidateMergeStatus::Merged,
+            "the capture candidate lands"
+        );
+        assert_eq!(
+            merge_candidate.candidate_commit, regenerated_sha,
+            "the persisted Merge Candidate candidate_commit names the regenerated SHA"
+        );
+        assert_eq!(
+            merge_candidate.merge_state.merged_commit.as_deref(),
+            Some(regenerated_sha.as_str()),
+            "the persisted merged_commit names the regenerated SHA"
+        );
+        assert_eq!(
+            outcome.merged_commit, regenerated_sha,
+            "the returned outcome names the regenerated SHA"
+        );
+        let target_head_after =
+            git::run_stdout(&project_root, &["rev-parse", "main"], "target after").unwrap();
+        assert_eq!(
+            target_head_after, regenerated_sha,
+            "the target HEAD fast-forwarded to exactly the regenerated SHA"
+        );
+
+        // check → fix → recheck ran: the conform commit is part of the regenerated tip,
+        // even after the managed workspace cleanup a succeeded Learner triggers.
+        let conformed_spec = format!("{regenerated_sha}:conformed.txt");
+        assert!(
+            git::run_raw(&project_root, &["cat-file", "-e", &conformed_spec])
+                .unwrap()
+                .status
+                .success(),
+            "fix-pre-merge conformed the tree and the conform commit is part of the landed tip"
+        );
+        // The absolute external event record is byte-exact `check\nfix\ncheck\n`, proving
+        // fix-pre-merge ran between two checks on the public route.
+        let events = fs::read_to_string(&event_log).unwrap();
+        assert_eq!(
+            events, "check\nfix\ncheck\n",
+            "the capture route runs check, then fix, then a recheck"
         );
     }
 }

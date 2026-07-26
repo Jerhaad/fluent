@@ -44,12 +44,18 @@ Brief → Behaviors → Approach → Plan → Execute → Review → Learner →
 Interactive stages happen in the agent's session with the user present.
 The agent follows skills directly.
 
-After a code-producing Attempt's reviews pass, the Learner captures durable
-project expertise and records possible follow-ups for materialization after
-land. Only a successful Learner run makes the pending Merge Candidate ready. A
-relaunchable Learner failure leaves the candidate non-ready and unlandable;
-`fluent attempt run` retries only the Learner. A failure after the coder ran but
-before its host evidence became durable is non-relaunchable: status reports
+After a code-producing Attempt's reviews pass, the Learner runs and records
+possible follow-ups for materialization after land. Whether it may capture
+expertise is governed by a durable Work Item policy, its Learner mode, chosen
+before execution and defaulted to `capture`: a `capture` Learner may refine and
+commit durable project expertise, while a `no-expertise` Learner audits the
+reviewed change from an isolated snapshot and produces only a handoff, keeping
+the reviewed Writer commit exact through Learner for a release gate that requires
+one unchanged SHA. Only a successful Learner run makes the pending Merge
+Candidate ready. A relaunchable Learner failure leaves the candidate non-ready
+and unlandable; `fluent attempt run` retries only the Learner in the same mode.
+A failure after the coder ran but before its host evidence became durable is
+non-relaunchable: status reports
 `learner-blocked`, and human evidence recovery is required before advancement.
 
 Delegated execution can run without the user until it produces a ready Merge
@@ -252,7 +258,12 @@ executes a Merge Candidate that still needs to land: it invokes an agent
 to rebase the candidate workspace against the target branch, regenerates
 post-rebase provenance, runs configured pre-merge checks in the candidate
 workspace, runs the required reviewer set with merge-time context, then
-fast-forwards the target branch to the updated candidate head.
+fast-forwards the target branch to the updated candidate head. This
+rebase-and-check path is the capture route; not every candidate rebases and not
+every failed check runs `fix-pre-merge`. A fresh `no-expertise` `Succeeded`
+candidate instead lands through the identity-preserving exact-SHA route described
+in the no-expertise section below, which never rebases, never regenerates
+provenance, and never runs `fix-pre-merge`.
 
 The rebase step is recorded as a `TaskKind::Rebase` Task on the Attempt,
 with its own artifact directory and prompt log. The agent runs
@@ -506,8 +517,21 @@ creations. This prevents mixed-generation reads and makes a failed or crashed
 write retryable without allowing a stale snapshot to overwrite its successor.
 Storage-revision exhaustion fails closed.
 
-A pre-land Learner runs inside one host-owned Git transaction over the managed
-candidate workspace, so a successful run leaves exactly one committed,
+A Work Item's Learner mode selects how its pre-land Learner runs. The mode is a
+serde-defaulted `LearnerMode` on the Work Item — `capture` or `no-expertise`,
+defaulting to `capture` and omitted from the minimal split record so legacy JSON
+stays byte-stable — set once through `fluent work-item create --learner-mode` and
+read by every Attempt, retry, and the host-side Fargate preflight. The
+orchestration resolves a crate-private execution mode from the stored policy and
+the candidate's merge state: an unmerged `capture` policy runs the capture path
+below, an unmerged `no-expertise` policy runs the isolated no-expertise path, and
+any merged candidate always runs post-land handoff-only regardless of the stored
+policy. The public `LearnerRunInputs { handoff_only: bool }` surface stays
+source-compatible and never expresses no-expertise, which is reachable only
+through the production adapter.
+
+A `capture` pre-land Learner runs inside one host-owned Git transaction over the
+managed candidate workspace, so a successful run leaves exactly one committed,
 expertise-only result and a clean workspace, and any rejection restores the
 baseline. The transaction first verifies the workspace `HEAD` equals the Learner
 baseline with a clean index and worktree; a dirty entry launches no coder, moves
@@ -541,6 +565,124 @@ withholds Merge Candidate readiness. If canonical-handoff publication fails
 after a clean successor is verified, that successor is retained as both
 pointers while Learning stays relaunchable `Generic` failed with no handoff
 reference.
+
+A `no-expertise` pre-land Learner instead runs from an isolated snapshot of the
+reviewed accepted change, baselined on the reviewed Writer commit rather than the
+live workspace, and reuses the same host-enforced confinement as post-land
+recovery: it forces the trusted Seatbelt boundary even when the caller passed
+`--no-sandbox`, grants writes only to its managed handoff staging surface and a
+per-launch private temporary directory, and denies writes to project expertise,
+the candidate workspace, the live checkout, shared Git metadata, and shared
+temporary roots.
+
+Because it must keep the reviewed commit exact, the host owns a
+pointer-identity gate around the run. Before launching the coder it requires
+candidate `HEAD`, the Merge Candidate commit, the latest Write-output commit, and
+every Tester and built-in reviewer context in the final passing review round to
+name the reviewed Writer SHA with a clean worktree, reading only that final round
+and treating earlier corrective rounds as historical evidence; a failure launches
+no coder. It pins every coder invocation's return into a ledger that rejects any
+candidate Git mutation — a source or expertise-only commit, a staged, unstaged,
+or untracked change, or one a later invocation reverted — rather than
+normalizing it.
+
+Unlike capture, which moves its canonical pointers through the host-owned Git
+transaction and one whole-aggregate finalizer, a `no-expertise` Learner settles
+every terminal transition through a fresh, lock-held field-level mutation that
+re-reads the current aggregate, accepts only this runner's exact Learning
+frontier, and changes only the Learning record. It settles across two lock-held
+phases. The first lock-held phase runs after the coder returns: it repeats the
+identity and cleanliness check against the freshly re-read pointers and
+final-round contexts and, in the same atomic step, advances Learning `InProgress`
+to `HandoffPending` — a durable, crash-observable preparation — or settles it
+`Failed`. The second lock-held phase is one transaction that re-finds the Attempt,
+requires its exact `HandoffPending` frontier and landing eligibility, re-runs the
+full final identity check against the current aggregate and candidate Git, and
+only then publishes the canonical handoff while the model lock is still held and
+settles the same aggregate to `Succeeded` (with the digest-bearing handoff
+reference) or a typed `Failed`. Because the final check, publication, and
+settlement share one model-mutation boundary, no supported concurrent Work-model
+transition can interleave between them. Because each transition reads and writes
+the same current aggregate, a concurrent Work-model change during the coder run
+neither strands Learning `InProgress` on a stale write nor is overwritten by a
+pre-run snapshot, and the Attempt call sites skip their post-Learner
+whole-aggregate write for this mode. The first phase is
+`prepare_no_expertise_handoff` and the second is `publish_no_expertise_handoff`;
+capture-mode landing keeps its whole-aggregate finalizer.
+
+Serialization alone is insufficient, so while a `no-expertise` Attempt's Learning
+is `HandoffPending` or `Succeeded` a central reviewed-identity transition guard
+rejects any supported write that would move its frozen reviewed tuple — the latest
+completed Write task or commit, the selected Merge Candidate id or commit, a
+final-round Tester or reviewer context, or the no-expertise policy — or persist a
+`merged_commit` other than that frozen reviewed Writer SHA, so a pointer update
+queued behind the publication lock cannot stale the settled handoff after the lock
+is released. A change while Learning is `InProgress` stays detectable by the
+postflight, and a relaunchable `Failed` record stays repairable.
+
+If the canonical handoff is written but the final Work-model transaction fails,
+recovery honestly reads one of two transaction-journal outcomes. When no terminal
+journal became durable, the previously durable `HandoffPending` frontier stands,
+recovery treats any unreferenced canonical file as untrusted, reruns only the
+Learner, revalidates the current reviewed identity, and atomically replaces that
+file with a newly validated handoff only after the new final check passes. When
+the terminal journal became durable before model application or journal removal
+finished, the next supported recovery read finishes that exact journal to
+`Succeeded` with its exact digest-bearing handoff reference, without rerunning the
+Learner. The failing call itself reports no readiness in either case.
+
+The model-lock transaction makes every *supported persisted-state* transition
+atomic: the pass/fail decision and the Learning write read and write the same
+lock-held aggregate, so no supported concurrent Work-model change can interleave
+between them. That guarantee covers persisted state, not candidate Git. The
+postflight's final read of candidate `HEAD` and the worktree is a point-in-time
+observation, so an arbitrary out-of-band process that edits candidate Git *after*
+that last read is a residual race the model lock cannot serialize. Eliminating it
+would require a universal lock shared by every candidate-workspace Git writer, which
+is outside this release correction and remains separate work.
+
+A fresh, unmerged `no-expertise` `Succeeded` candidate lands through an
+identity-preserving exact-SHA route rather than the capture rebase. It skips
+rebase and provenance regeneration, requires the live candidate clean at the
+frozen reviewed Writer SHA and the target head an ancestor of it, and runs
+`check-pre-merge` — never `fix-pre-merge` — only in a disposable exact-SHA
+worktree before fast-forwarding the target to exactly that SHA. Removing that
+disposable worktree is a land precondition: a passing check whose worktree cannot
+be removed fails the land before the second precondition check or any target Git
+mutation, retaining at most the isolated worktree for cleanup. The route enforces
+the same target-worktree cleanliness policy capture landing uses, both at the
+initial preflight before any side effect and again immediately before the
+fast-forward. Both the capture and exact-SHA routes feed their landed outcome
+through one shared follow-up-processing and scheduling coordinator
+(`finish_fresh_land_with`), which schedules the optional post-merge review only
+after the landed follow-up result is durably recorded and schedules nothing when
+that persistence is unknown, always returning the successful landed outcome
+unchanged.
+
+A `no-expertise` launch prepares its sandboxed host through the injected
+`HostPreparation` seam. Production always runs the fixed
+`HostPreparation::Production` prerequisite, credential, and signing steps; a
+hermetic launch-route test replaces them with the `#[cfg(test)]`-only
+`HostPreparation::Injected` variant to assert the same launch invariant in both
+host branches without real host side effects.
+
+An identity or cleanliness contradiction, a candidate Git mutation, or an untyped
+handoff-publication failure fails closed with relaunchable `Generic` Learning,
+while a typed publisher failure instead preserves the `LearningFailureKind`
+derived from its concrete cause — `EvidencePending` when the Learner coder already
+ran (a supervision-sidecar fault that is non-relaunchable and takes precedence) and
+`TranscriptPump` for a transcript-pump publication fault — so not every
+handoff-publication failure is `Generic`. Every such settlement leaves every live
+and persisted candidate pointer unchanged and withholds readiness; it never
+overwrites the live candidate, so a pointer an identity check found already off
+the reviewed Writer SHA is preserved as evidence rather than repaired back onto
+it. The handoff carries no expertise references, and missing durable knowledge is
+proposed only as non-corrective, Observation-eligible follow-up material. A `no-expertise` Attempt is local-only:
+`fluent attempt run --runtime fargate` refuses it on the host before any launch
+side effect — credential access, bootstrap, image or Docker/AWS commands,
+upload, ECS submission, or runtime-state writes — and directs the operator to a
+trusted macOS host, and a local host that cannot enforce the boundary fails
+closed without downgrading the policy.
 
 A relaunchable Learner run that failed before its candidate landed recovers
 through `fluent attempt run`, which retries only the Learner. An

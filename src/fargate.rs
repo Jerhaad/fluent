@@ -668,6 +668,27 @@ pub fn launch_work_attempt(
     attempt_id: &str,
     coder: CoderKind,
 ) -> Result<()> {
+    // Guard the no-expertise policy first, before any launch-induced side effect:
+    // credential lookup or injection, `ensure_setup` or other bootstrap,
+    // `.fluent/Dockerfile` creation, any Docker/AWS/external command, workspace
+    // archive or upload, ECS task creation, runtime-state write, or launch-induced
+    // Work-model mutation. The current Fargate entrypoint always requests
+    // `--no-sandbox`, Linux has no trusted Fluent write boundary, and a
+    // version-only image reuse can run a binary that ignores the stored mode, so
+    // the task is refused on this host before any remote state can exist. Reading
+    // the authoritative Work Item may finish a pending durable transaction; that is
+    // read behavior, not a launch side effect.
+    let item = crate::work_model::WorkModelStore::new(project_root)
+        .read_work_item(work_item_id)
+        .map_err(|e| anyhow::anyhow!("Failed to read Work Item {work_item_id}: {e}"))?;
+    if item.learner_mode == crate::work_model::LearnerMode::NoExpertise {
+        anyhow::bail!(
+            "Work Item {work_item_id:?} uses the no-expertise Learner mode, which Fargate cannot \
+             enforce. Run this Attempt locally on a trusted macOS host: \
+             `fluent attempt run {work_item_id} {attempt_id}`."
+        );
+    }
+
     let coder_env = coder_task_overrides(coder)?;
 
     let config = bootstrap_and_load_config(project_root)?;
@@ -796,6 +817,37 @@ pub fn pull_work_merge(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn no_expertise_work_item_is_rejected_before_every_launch_side_effect() {
+        // A no-expertise Fargate launch is refused on this host before any
+        // launch-induced side effect. Only the authoritative Work Item read
+        // precedes the guard, so no bootstrap, Dockerfile, upload, ECS task, or
+        // runtime-state write can occur.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path();
+        let store = crate::work_model::WorkModelStore::new(project_root);
+        let item = crate::work_model::WorkItem {
+            learner_mode: crate::work_model::LearnerMode::NoExpertise,
+            ..crate::work_model::WorkItem::planned("work-1", "Release gate")
+        };
+        store.create_work_item(&item).unwrap();
+
+        let result = launch_work_attempt(project_root, "work-1", "attempt-1", CoderKind::Claude);
+        let err = result.expect_err("a no-expertise Fargate launch is rejected");
+        let message = err.to_string();
+        assert!(message.contains("no-expertise"), "{message}");
+
+        // No launch-induced side effect occurred.
+        assert!(
+            !project_root.join(".fluent/Dockerfile").exists(),
+            "no Dockerfile is created"
+        );
+        assert!(
+            !work_attempt_runtime_dir(project_root, "work-1", "attempt-1").exists(),
+            "no runtime-state directory is written"
+        );
+    }
 
     #[test]
     fn work_merge_overrides_omit_post_merge_review_by_default() {

@@ -220,6 +220,53 @@ impl PartialEq for StorageRevision {
 
 impl Eq for StorageRevision {}
 
+/// Policy stored on a Work Item that controls whether its pre-land Learner may
+/// capture project expertise.
+///
+/// `Capture` is the default and preserves the ordinary pre-land Learner, which
+/// may produce one canonical `Update expertise` commit. `NoExpertise` still runs
+/// Learner and produces a handoff after reviews, but denies expertise writes and
+/// candidate Git mutations so the reviewed Writer SHA is never retargeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LearnerMode {
+    /// Ordinary pre-land Learner that may capture project expertise.
+    #[default]
+    Capture,
+    /// Pre-land Learner that audits the accepted change and produces a handoff
+    /// while denying expertise and candidate Git mutations.
+    NoExpertise,
+}
+
+impl LearnerMode {
+    /// Whether this is the default `capture` policy. Used to omit the field from
+    /// minimal split-record JSON so legacy Work stays byte-stable.
+    pub fn is_capture(&self) -> bool {
+        matches!(self, Self::Capture)
+    }
+}
+
+impl fmt::Display for LearnerMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Capture => "capture",
+            Self::NoExpertise => "no-expertise",
+        })
+    }
+}
+
+impl FromStr for LearnerMode {
+    type Err = ParseLearnerModeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "capture" => Ok(Self::Capture),
+            "no-expertise" => Ok(Self::NoExpertise),
+            other => Err(ParseLearnerModeError(other.to_string())),
+        }
+    }
+}
+
 /// Durable unit of planned Fluent work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
@@ -233,6 +280,12 @@ pub struct WorkItem {
     pub abandonment: Option<WorkItemAbandonment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_merge_review_fix_depth: Option<u64>,
+    /// The pre-land Learner policy for this Work Item. A missing value resolves to
+    /// the default `capture`. The aggregate always materializes the resolved mode
+    /// (so `work-item show` reports it), while split storage omits the default so
+    /// legacy and minimal records stay byte-stable.
+    #[serde(default)]
+    pub learner_mode: LearnerMode,
     /// How this Work Item came to exist. Legacy and ordinary planned Work are
     /// lineage roots; derived Work carries its originating provenance.
     #[serde(default, skip_serializing_if = "WorkOrigin::is_planned")]
@@ -279,6 +332,7 @@ impl PartialEq for WorkItem {
             && self.instructions == other.instructions
             && self.abandonment == other.abandonment
             && self.post_merge_review_fix_depth == other.post_merge_review_fix_depth
+            && self.learner_mode == other.learner_mode
             && self.origin == other.origin
             && self.authorization == other.authorization
             && self.lineage == other.lineage
@@ -301,6 +355,7 @@ impl Default for WorkItem {
             instructions: None,
             abandonment: None,
             post_merge_review_fix_depth: None,
+            learner_mode: LearnerMode::default(),
             origin: WorkOrigin::default(),
             authorization: ExecutionAuthorization::default(),
             lineage: WorkLineage::default(),
@@ -3331,6 +3386,10 @@ pub enum WorkModelError {
         attempt_id: String,
         state: &'static str,
     },
+    FrozenReviewedIdentity {
+        attempt_id: String,
+        field: &'static str,
+    },
 }
 
 impl fmt::Display for WorkModelError {
@@ -3527,6 +3586,13 @@ impl fmt::Display for WorkModelError {
                     "Attempt {attempt_id:?} cannot advance: its Learner run is {state}, not succeeded"
                 )
             }
+            Self::FrozenReviewedIdentity { attempt_id, field } => {
+                write!(
+                    f,
+                    "Attempt {attempt_id:?} has an exposed no-expertise handoff: its frozen reviewed \
+                     {field} cannot change while Learning is HandoffPending or Succeeded"
+                )
+            }
         }
     }
 }
@@ -3679,6 +3745,59 @@ impl Error for WorkModelStorageError {
     }
 }
 
+/// A wholly `#[cfg(test)]` fault at the real Work-model atomic persistence leaf.
+///
+/// Production carries no injectable path: the non-test build authors and applies
+/// the transaction directly. Only a test build can arm this so a public land is
+/// observed leaving its speculative follow-up result unknown — the durable land
+/// itself already committed — while the failure originates inside the real
+/// `WorkModelStore` write and retains its typed [`WorkModelStorageError`] cause
+/// (B4ak). It is thread-local, RAII-restored, and keyed to one Work Item's
+/// follow-up-result write, so concurrent tests are unaffected and every other
+/// write in the same land still commits for real.
+#[cfg(test)]
+pub(crate) mod persist_fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static FOLLOW_UP_WRITE_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// RAII guard: arm the persistence leaf to fail the next write that persists a
+    /// follow-up-processing failure for `work_item_id`. Dropping it disarms.
+    pub(crate) struct FollowUpWriteFaultGuard;
+
+    /// Arm the fault for exactly one follow-up-result write of `work_item_id`.
+    pub(crate) fn arm_follow_up_write(work_item_id: &str) -> FollowUpWriteFaultGuard {
+        FOLLOW_UP_WRITE_FAULT.with(|fault| *fault.borrow_mut() = Some(work_item_id.to_string()));
+        FollowUpWriteFaultGuard
+    }
+
+    impl Drop for FollowUpWriteFaultGuard {
+        fn drop(&mut self) {
+            FOLLOW_UP_WRITE_FAULT.with(|fault| *fault.borrow_mut() = None);
+        }
+    }
+
+    /// Whether this write must fail: the armed Work Item id matches and the item
+    /// being written carries the speculative follow-up-processing failure the
+    /// land is trying to persist. Consumes the arming so only that one write fails.
+    pub(crate) fn should_fault_follow_up_write(work_item: &super::WorkItem) -> bool {
+        FOLLOW_UP_WRITE_FAULT.with(|fault| {
+            let armed = fault.borrow().clone();
+            let matches = armed.as_deref() == Some(work_item.id.as_str())
+                && work_item
+                    .merge_candidates
+                    .iter()
+                    .any(|candidate| candidate.merge_state.follow_up_failure.is_some());
+            if matches {
+                *fault.borrow_mut() = None;
+            }
+            matches
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkModelStore {
     project_root: PathBuf,
@@ -3698,6 +3817,8 @@ struct WorkItemRecord {
     abandonment: Option<WorkItemAbandonment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_merge_review_fix_depth: Option<u64>,
+    #[serde(default, skip_serializing_if = "LearnerMode::is_capture")]
+    learner_mode: LearnerMode,
     #[serde(default, skip_serializing_if = "WorkOrigin::is_planned")]
     origin: WorkOrigin,
     #[serde(
@@ -3777,6 +3898,7 @@ impl From<&WorkItem> for WorkItemRecord {
             instructions: work_item.instructions.clone(),
             abandonment: work_item.abandonment.clone(),
             post_merge_review_fix_depth: work_item.post_merge_review_fix_depth,
+            learner_mode: work_item.learner_mode,
             origin: work_item.origin.clone(),
             authorization: work_item.authorization,
             lineage: work_item.lineage.clone(),
@@ -3797,6 +3919,7 @@ impl From<WorkItemRecord> for WorkItem {
             instructions: record.instructions,
             abandonment: record.abandonment,
             post_merge_review_fix_depth: record.post_merge_review_fix_depth,
+            learner_mode: record.learner_mode,
             origin: record.origin,
             authorization: record.authorization,
             lineage: record.lineage,
@@ -4148,6 +4271,15 @@ impl WorkModelStore {
                     work_item.storage_revision.set(current.storage_revision);
                     return Ok(());
                 }
+                // B4s: freeze a no-expertise Attempt's reviewed identity while its
+                // Learning is exposed. Reject before the transaction journal is
+                // authored so no stale-handoff pointer move ever becomes durable.
+                reject_frozen_no_expertise_identity_change(&current_item, work_item).map_err(
+                    |source| WorkModelStorageError::InvalidModel {
+                        path: path.clone(),
+                        source,
+                    },
+                )?;
             }
             Some(current.storage_revision)
         } else {
@@ -4169,7 +4301,20 @@ impl WorkModelStore {
             target_revision,
             work_item: work_item.clone(),
         };
-        write_json_file(&self.work_transaction_path(&work_item.id)?, &transaction)?;
+        let transaction_path = self.work_transaction_path(&work_item.id)?;
+        // A `#[cfg(test)]`-only fault at the real atomic persistence write. All
+        // validation, locking, revision, and transaction authoring above ran; only
+        // this final write of the durable transaction journal fails, mirroring a
+        // real atomic storage failure and surfacing the typed storage boundary
+        // (B4ak). Production never reaches this branch.
+        #[cfg(test)]
+        if persist_fault::should_fault_follow_up_write(work_item) {
+            return Err(WorkModelStorageError::WriteFile {
+                path: transaction_path,
+                source: io::Error::other("injected atomic Work-model storage fault"),
+            });
+        }
+        write_json_file(&transaction_path, &transaction)?;
         self.apply_work_item_transaction(&transaction)?;
         work_item.storage_revision.set(target_revision);
         Ok(())
@@ -4890,6 +5035,180 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), WorkModel
     })
 }
 
+/// The review round an Attempt's Task belongs to, parsed from its id. Mirrors the
+/// no-expertise pointer-identity gate so the frozen-identity guard reads the same
+/// final round. A pure-model derivation with no Git access. (B4s)
+fn attempt_task_review_round(attempt_id: &str, task: &Task) -> Option<usize> {
+    match task.kind {
+        TaskKind::Review => {
+            let suffix = task.id.strip_prefix(&format!("{attempt_id}-review-"))?;
+            suffix
+                .split_once('-')
+                .and_then(|(round, _)| round.parse::<usize>().ok())
+                .or(Some(1))
+        }
+        TaskKind::Tester => {
+            let suffix = task.id.strip_prefix(&format!("{attempt_id}-tester"))?;
+            if suffix.is_empty() {
+                Some(1)
+            } else {
+                suffix.strip_prefix('-').and_then(|n| n.parse::<usize>().ok())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The final (highest-numbered) review round among an Attempt's completed Tester and
+/// built-in reviewer Tasks. (B4s)
+fn attempt_final_review_round(attempt: &Attempt) -> usize {
+    attempt
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Complete)
+        .filter_map(|task| attempt_task_review_round(&attempt.id, task))
+        .max()
+        .unwrap_or(1)
+}
+
+/// The reviewed-identity tuple a no-expertise Attempt freezes once its Learning is
+/// exposed as `HandoffPending` or `Succeeded`: the reviewed Writer SHA and its Write
+/// Task, every Merge Candidate bound to the Attempt with its `candidate_commit`, and
+/// every final-round Tester and built-in reviewer commit context. Comparing this
+/// tuple before and after a proposed write detects any supported mutation that would
+/// move the audited pointers out from under a published or settled handoff. (B4s)
+#[derive(Debug, PartialEq, Eq)]
+struct FrozenReviewedIdentityTuple {
+    reviewed_sha: Option<String>,
+    write_task_id: Option<String>,
+    candidates: HashMap<String, String>,
+    final_round_contexts: HashMap<String, String>,
+}
+
+fn frozen_reviewed_identity_tuple(
+    item: &WorkItem,
+    attempt: &Attempt,
+) -> FrozenReviewedIdentityTuple {
+    let write = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete);
+    let reviewed_sha = write
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone());
+    let write_task_id = write.map(|task| task.id.clone());
+
+    let candidates = item
+        .merge_candidates
+        .iter()
+        .filter(|candidate| candidate.attempt_id == attempt.id)
+        .map(|candidate| (candidate.id.clone(), candidate.candidate_commit.clone()))
+        .collect();
+
+    let final_round = attempt_final_review_round(attempt);
+    let final_round_contexts = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Complete)
+        .filter(|task| {
+            (task.kind == TaskKind::Tester
+                || (task.kind == TaskKind::Review
+                    && crate::review::REVIEWERS.contains(&task.role.as_str())))
+                && attempt_task_review_round(&attempt.id, task) == Some(final_round)
+        })
+        .filter_map(|task| {
+            task.review_context
+                .as_ref()
+                .map(|context| (task.id.clone(), context.candidate_commit.clone()))
+        })
+        .collect();
+
+    FrozenReviewedIdentityTuple {
+        reviewed_sha,
+        write_task_id,
+        candidates,
+        final_round_contexts,
+    }
+}
+
+/// Reject a supported write that moves a no-expertise Attempt's frozen reviewed
+/// identity while its Learning record is exposed as `HandoffPending` or `Succeeded`,
+/// so a handoff audited against the reviewed Writer SHA can never be made stale by a
+/// later pointer move and a landed `merged_commit` can only ever be that exact SHA.
+///
+/// The check runs before the transaction journal is authored, covering both
+/// field-level and whole-aggregate writes without changing the public schema, and
+/// compares against the prior durable aggregate so a Learning-only transition, an
+/// exact-SHA landing metadata update, or any unrelated field change still commits. A
+/// change while Learning is `InProgress` (postflight detects it) or a repair after
+/// relaunchable `Failed` stays allowed because neither status exposes a handoff.
+/// Capture-mode Work is never frozen. (B4s)
+fn reject_frozen_no_expertise_identity_change(
+    prior: &WorkItem,
+    proposed: &WorkItem,
+) -> Result<(), WorkModelError> {
+    if prior.learner_mode != LearnerMode::NoExpertise {
+        return Ok(());
+    }
+    for attempt in &prior.attempts {
+        let exposed = matches!(
+            attempt.learning.as_ref(),
+            Some(learning)
+                if matches!(
+                    learning.status,
+                    LearningStatus::HandoffPending | LearningStatus::Succeeded
+                )
+        );
+        if !exposed {
+            continue;
+        }
+        let reject = |field: &'static str| WorkModelError::FrozenReviewedIdentity {
+            attempt_id: attempt.id.clone(),
+            field,
+        };
+        // The no-expertise policy that protects the frozen pointers may not change.
+        if proposed.learner_mode != prior.learner_mode {
+            return Err(reject("no-expertise policy"));
+        }
+        let Some(proposed_attempt) = proposed
+            .attempts
+            .iter()
+            .find(|candidate| candidate.id == attempt.id)
+        else {
+            return Err(reject("reviewed Attempt"));
+        };
+        let prior_identity = frozen_reviewed_identity_tuple(prior, attempt);
+        let proposed_identity = frozen_reviewed_identity_tuple(proposed, proposed_attempt);
+        if proposed_identity.reviewed_sha != prior_identity.reviewed_sha
+            || proposed_identity.write_task_id != prior_identity.write_task_id
+        {
+            return Err(reject("latest completed Write task or commit"));
+        }
+        if proposed_identity.candidates != prior_identity.candidates {
+            return Err(reject("selected Merge Candidate id or commit"));
+        }
+        if proposed_identity.final_round_contexts != prior_identity.final_round_contexts {
+            return Err(reject("final-round Tester or reviewer context"));
+        }
+        // A persisted `merged_commit` may only ever be the frozen reviewed SHA.
+        if let Some(reviewed_sha) = prior_identity.reviewed_sha.as_deref() {
+            for candidate in proposed
+                .merge_candidates
+                .iter()
+                .filter(|candidate| candidate.attempt_id == attempt.id)
+            {
+                if let Some(merged) = candidate.merge_state.merged_commit.as_deref()
+                    && merged != reviewed_sha
+                {
+                    return Err(reject("merged commit"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn aggregate_snapshot_matches(
     left: &WorkItem,
     right: &WorkItem,
@@ -4963,6 +5282,21 @@ impl fmt::Display for ParseTaskKindError {
 }
 
 impl Error for ParseTaskKindError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseLearnerModeError(String);
+
+impl fmt::Display for ParseLearnerModeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown learner mode: {} (expected capture or no-expertise)",
+            self.0
+        )
+    }
+}
+
+impl Error for ParseLearnerModeError {}
 
 pub fn to_json_pretty<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(value).map(|json| format!("{json}\n"))
@@ -8829,6 +9163,39 @@ random banner prose that must be ignored
     }
 
     #[test]
+    fn learner_mode_defaults_to_capture_for_legacy_work_items() {
+        // Work persisted before the Learner-mode policy carries no `learner_mode`
+        // field. It must resolve to the default `capture` so existing Work keeps
+        // its ordinary pre-land Learner behavior.
+        let legacy = r#"{ "id": "work-1", "title": "Legacy work" }"#;
+        let record: WorkItemRecord = from_json(legacy).unwrap();
+        let item = WorkItem::from(record);
+
+        assert_eq!(item.learner_mode, LearnerMode::Capture);
+        assert!(item.learner_mode.is_capture());
+    }
+
+    #[test]
+    fn no_expertise_learner_mode_round_trips_through_split_storage() {
+        // A no-expertise policy persists the exact split-record field and reads
+        // back unchanged through the typed aggregate.
+        let item = WorkItem {
+            learner_mode: LearnerMode::NoExpertise,
+            ..WorkItem::planned("work-1", "Release gate")
+        };
+
+        let json = to_json_pretty(&WorkItemRecord::from(&item)).unwrap();
+        assert!(
+            json.contains("\"learner_mode\": \"no-expertise\""),
+            "expected the exact split-record field, got: {json}"
+        );
+
+        let record: WorkItemRecord = from_json(&json).unwrap();
+        let restored = WorkItem::from(record);
+        assert_eq!(restored.learner_mode, LearnerMode::NoExpertise);
+    }
+
+    #[test]
     fn corrective_context_is_valid_execution_input_without_fake_planning() {
         let provenance = DerivedProvenance {
             observation_id: Some("obs-1".to_string()),
@@ -9168,5 +9535,635 @@ random banner prose that must be ignored
             "the recorded winners are stable on retry"
         );
         assert!(contenders[2].authorization.is_proposed());
+    }
+
+    /// A durable no-expertise aggregate whose Attempt carries a completed reviewed
+    /// Write, one final-round built-in reviewer context, a Merge Candidate, and the
+    /// given Learning record. Its reviewed Writer SHA is `commit-initial`.
+    fn no_expertise_frozen_item(learning: AttemptLearning) -> WorkItem {
+        let source = WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "../work-6-work-1-attempt-1-initial".to_string(),
+        };
+        let review_task = Task {
+            id: "attempt-1-review-1-tests".to_string(),
+            kind: TaskKind::Review,
+            status: TaskStatus::Complete,
+            role: "tests".to_string(),
+            instructions: None,
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess::read_only(vec![source.clone()]),
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path("work-1", "attempt-1", "attempt-1-review-1-tests"),
+            }),
+            review_context: Some(ReviewContext {
+                candidate_workspace_id: source.id.clone(),
+                candidate_workspace_path: source.path.clone(),
+                source_branch: "main".to_string(),
+                candidate_commit: "commit-initial".to_string(),
+                base_commit: None,
+            }),
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+        };
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Frozen no-expertise".to_string(),
+            learner_mode: LearnerMode::NoExpertise,
+            attempts: vec![Attempt {
+                id: "attempt-1".to_string(),
+                work_item_id: "work-1".to_string(),
+                kind: AttemptKind::Write,
+                status: AttemptStatus::Complete,
+                coder_mapping: CoderMapping::default(),
+                tasks: vec![
+                    Task {
+                        work_item_id: "work-1".to_string(),
+                        ..completed_write_task("attempt-1-write-1", "initial")
+                    },
+                    review_task,
+                ],
+                review_state: Some(AttemptReviewState::Passed),
+                pause_kind: None,
+                artifacts: Vec::new(),
+                created_at: None,
+                completed_at: None,
+                learning: Some(learning),
+                ..Default::default()
+            }],
+            merge_candidates: Vec::new(),
+            ..Default::default()
+        };
+        item.create_or_get_merge_candidate("attempt-1").unwrap();
+        item
+    }
+
+    fn frozen_store(learning: AttemptLearning) -> (tempfile::TempDir, WorkModelStore) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        store.create_work_item(&no_expertise_frozen_item(learning)).unwrap();
+        (tmp, store)
+    }
+
+    fn is_frozen_identity_error(err: &WorkModelStorageError) -> bool {
+        matches!(
+            err,
+            WorkModelStorageError::InvalidModel {
+                source: WorkModelError::FrozenReviewedIdentity { .. },
+                ..
+            }
+        )
+    }
+
+    #[test]
+    fn no_expertise_exposed_handoff_freezes_reviewed_identity_across_supported_writes() {
+        // B4s: while a no-expertise Attempt's Learning is HandoffPending or Succeeded,
+        // a supported write that moves the reviewed Writer SHA, a final-round reviewer
+        // context, or the no-expertise policy is rejected and the whole aggregate is
+        // preserved. Learning-only transitions, unrelated fields, and any change while
+        // Learning is InProgress or Failed stay allowed.
+        let handoff = crate::follow_up::ArtifactRef {
+            path: ".fluent/handoff.json".to_string(),
+            digest: "sha256:frozen".to_string(),
+        };
+
+        for learning in [
+            AttemptLearning::handoff_pending(1),
+            AttemptLearning::succeeded(1, handoff.clone()),
+        ] {
+            // Reviewed Writer SHA moves (write output and Merge Candidate together, so
+            // MergeCandidate provenance still validates): the freeze rejects it.
+            let (_tmp, store) = frozen_store(learning.clone());
+            let err = store
+                .mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks[0].output.as_mut().unwrap().commit =
+                        "commit-moved".to_string();
+                    item.merge_candidates[0].candidate_commit = "commit-moved".to_string();
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(is_frozen_identity_error(&err), "reviewed SHA move: {err:?}");
+            let reread = store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                reread.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+                "commit-initial",
+                "a rejected reviewed-SHA move leaves the aggregate unchanged"
+            );
+            assert_eq!(reread.merge_candidates[0].candidate_commit, "commit-initial");
+
+            // Final-round reviewer context moves: rejected (validation permits it).
+            let err = store
+                .mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks[1]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_commit = "commit-other".to_string();
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(is_frozen_identity_error(&err), "reviewer context move: {err:?}");
+
+            // The no-expertise policy that protects the pointers may not change.
+            let err = store
+                .mutate_work_item("work-1", |item| {
+                    item.learner_mode = LearnerMode::Capture;
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(is_frozen_identity_error(&err), "policy change: {err:?}");
+        }
+
+        // Learning-only transition HandoffPending -> Succeeded is allowed.
+        let (_tmp, store) = frozen_store(AttemptLearning::handoff_pending(1));
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].learning = Some(AttemptLearning::succeeded(1, handoff.clone()));
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.read_work_item("work-1").unwrap().attempts[0]
+            .learning
+            .as_ref()
+            .unwrap()
+            .is_succeeded());
+
+        // An unrelated field update is allowed under an exposed handoff.
+        store
+            .mutate_work_item("work-1", |item| {
+                item.title = "Retitled".to_string();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.read_work_item("work-1").unwrap().title, "Retitled");
+
+        // A pointer move while Learning is InProgress or Failed remains possible.
+        for learning in [
+            AttemptLearning::in_progress(1),
+            AttemptLearning::failed(1, "retry me"),
+        ] {
+            let (_tmp, store) = frozen_store(learning);
+            store
+                .mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks[0].output.as_mut().unwrap().commit =
+                        "commit-moved".to_string();
+                    item.merge_candidates[0].candidate_commit = "commit-moved".to_string();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .commit,
+                "commit-moved",
+                "an unexposed Learning record does not freeze the reviewed identity"
+            );
+        }
+    }
+
+    #[test]
+    fn no_expertise_exposed_handoff_rejects_mismatched_merged_commit() {
+        // B4s: a landing metadata write may persist merged_commit only as the frozen
+        // reviewed Writer SHA; any other value is rejected with the aggregate intact.
+        let handoff = crate::follow_up::ArtifactRef {
+            path: ".fluent/handoff.json".to_string(),
+            digest: "sha256:frozen".to_string(),
+        };
+        let (_tmp, store) = frozen_store(AttemptLearning::succeeded(1, handoff));
+
+        let err = store
+            .mutate_work_item("work-1", |item| {
+                item.merge_candidates[0].merge_state.merged_commit = Some("commit-other".to_string());
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(is_frozen_identity_error(&err), "mismatched merged_commit: {err:?}");
+        assert!(
+            store.read_work_item("work-1").unwrap().merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .is_none(),
+            "a rejected merged_commit leaves the merge state unchanged"
+        );
+
+        // Persisting the exact frozen reviewed SHA as the merged commit is allowed.
+        store
+            .mutate_work_item("work-1", |item| {
+                item.merge_candidates[0].merge_state.merged_commit =
+                    Some("commit-initial".to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .as_deref(),
+            Some("commit-initial")
+        );
+    }
+
+    /// A completed review-context Task (Tester or built-in reviewer) naming the
+    /// reviewed Writer SHA `commit-initial`, for the frozen-identity guard matrix.
+    fn frozen_context_task(id: &str, kind: TaskKind, role: &str) -> Task {
+        let source = WorkspaceRef {
+            id: "candidate".to_string(),
+            path: "../work-6-work-1-attempt-1-initial".to_string(),
+        };
+        Task {
+            id: id.to_string(),
+            kind,
+            status: TaskStatus::Complete,
+            role: role.to_string(),
+            instructions: None,
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess::read_only(vec![source.clone()]),
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path("work-1", "attempt-1", id),
+            }),
+            review_context: Some(ReviewContext {
+                candidate_workspace_id: source.id.clone(),
+                candidate_workspace_path: source.path.clone(),
+                source_branch: "main".to_string(),
+                candidate_commit: "commit-initial".to_string(),
+                base_commit: None,
+            }),
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    /// A durable no-expertise aggregate whose Attempt carries a completed reviewed
+    /// Write, a final-round Tester context, one final-round context for EVERY built-in
+    /// reviewer, and a Merge Candidate — the full frozen reviewed identity tuple. Its
+    /// reviewed Writer SHA is `commit-initial`.
+    fn no_expertise_full_frozen_item(learning: AttemptLearning) -> WorkItem {
+        let mut tasks = vec![Task {
+            work_item_id: "work-1".to_string(),
+            ..completed_write_task("attempt-1-write-1", "initial")
+        }];
+        tasks.push(frozen_context_task(
+            "attempt-1-tester",
+            TaskKind::Tester,
+            "tester",
+        ));
+        for role in crate::review::REVIEWERS {
+            tasks.push(frozen_context_task(
+                &format!("attempt-1-review-1-{role}"),
+                TaskKind::Review,
+                role,
+            ));
+        }
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Frozen no-expertise".to_string(),
+            learner_mode: LearnerMode::NoExpertise,
+            attempts: vec![Attempt {
+                id: "attempt-1".to_string(),
+                work_item_id: "work-1".to_string(),
+                kind: AttemptKind::Write,
+                status: AttemptStatus::Complete,
+                coder_mapping: CoderMapping::default(),
+                tasks,
+                review_state: Some(AttemptReviewState::Passed),
+                pause_kind: None,
+                artifacts: Vec::new(),
+                created_at: None,
+                completed_at: None,
+                learning: Some(learning),
+                ..Default::default()
+            }],
+            merge_candidates: Vec::new(),
+            ..Default::default()
+        };
+        item.create_or_get_merge_candidate("attempt-1").unwrap();
+        item
+    }
+
+    /// A byte-exact snapshot of every file under a directory, for proving a rejected
+    /// write left the split records, storage revision, and transaction journal
+    /// completely unchanged.
+    fn snapshot_dir(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        fn walk(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(path, bytes);
+                }
+            }
+        }
+        walk(root, &mut out);
+        out
+    }
+
+    #[test]
+    fn no_expertise_frozen_identity_guard_covers_every_supported_write_and_pointer() {
+        // B4af: while a no-expertise Learning record is HandoffPending or Succeeded,
+        // the SAME complete frozen-identity mutation is rejected through BOTH
+        // mutate_work_item and the public whole-aggregate write_work_item, preserving
+        // the entire aggregate, storage revision, split-record bytes, and the absence
+        // of a transaction journal. The matrix covers the no-expertise policy; the
+        // latest completed Write task id and commit; the selected Merge Candidate id
+        // and commit; the final Tester task id and commit context; each built-in
+        // reviewer task id and commit context; and a mismatched merged_commit — in
+        // both exposed states. InProgress and relaunchable Failed stay writable.
+        let handoff = crate::follow_up::ArtifactRef {
+            path: ".fluent/handoff.json".to_string(),
+            digest: "sha256:frozen".to_string(),
+        };
+
+        // Each mutation moves exactly one element of the frozen reviewed identity.
+        type Mutation = Box<dyn Fn(&mut WorkItem)>;
+        let mut mutations: Vec<(String, Mutation)> = vec![
+            (
+                "no-expertise policy".to_string(),
+                Box::new(|item: &mut WorkItem| item.learner_mode = LearnerMode::Capture),
+            ),
+            (
+                "latest Write commit (with coupled candidate commit)".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    item.attempts[0].tasks[0].output.as_mut().unwrap().commit =
+                        "commit-moved".to_string();
+                    item.merge_candidates[0].candidate_commit = "commit-moved".to_string();
+                }),
+            ),
+            (
+                "latest Write task id".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    item.attempts[0].tasks[0].id = "attempt-1-write-1-moved".to_string();
+                }),
+            ),
+            (
+                "selected Merge Candidate id".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    item.merge_candidates[0].id = "attempt-1-merge-candidate-moved".to_string();
+                }),
+            ),
+            (
+                "mismatched merged_commit".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    item.merge_candidates[0].merge_state.merged_commit =
+                        Some("commit-other".to_string());
+                }),
+            ),
+            (
+                "final Tester context commit".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    let task = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Tester)
+                        .unwrap();
+                    task.review_context.as_mut().unwrap().candidate_commit =
+                        "commit-other".to_string();
+                }),
+            ),
+            (
+                "final Tester task id".to_string(),
+                Box::new(|item: &mut WorkItem| {
+                    let task = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Tester)
+                        .unwrap();
+                    task.id = "attempt-1-tester-renamed".to_string();
+                }),
+            ),
+        ];
+        for role in crate::review::REVIEWERS {
+            let role_ctx = (*role).to_string();
+            mutations.push((
+                format!("reviewer {role} context commit"),
+                Box::new(move |item: &mut WorkItem| {
+                    let task = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.role == role_ctx && task.kind == TaskKind::Review)
+                        .unwrap();
+                    task.review_context.as_mut().unwrap().candidate_commit =
+                        "commit-other".to_string();
+                }),
+            ));
+            let role_id = (*role).to_string();
+            mutations.push((
+                format!("reviewer {role} task id"),
+                Box::new(move |item: &mut WorkItem| {
+                    let task = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.role == role_id && task.kind == TaskKind::Review)
+                        .unwrap();
+                    task.id = format!("attempt-1-review-1-{role_id}-renamed");
+                }),
+            ));
+        }
+
+        for learning in [
+            AttemptLearning::handoff_pending(1),
+            AttemptLearning::succeeded(1, handoff.clone()),
+        ] {
+            for (label, mutate) in &mutations {
+                // Path 1: mutate_work_item (reducer-based).
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = WorkModelStore::new(tmp.path());
+                store
+                    .create_work_item(&no_expertise_full_frozen_item(learning.clone()))
+                    .unwrap();
+                let before = snapshot_dir(tmp.path());
+                let err = store
+                    .mutate_work_item("work-1", |item| {
+                        mutate(item);
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert!(
+                    is_frozen_identity_error(&err),
+                    "[mutate_work_item] {label}: {err:?}"
+                );
+                assert_eq!(
+                    snapshot_dir(tmp.path()),
+                    before,
+                    "[mutate_work_item] {label}: a rejected write leaves every split record, the \
+                     storage revision, and the transaction journal byte-for-byte unchanged"
+                );
+                assert!(
+                    !store.work_transaction_path("work-1").unwrap().exists(),
+                    "[mutate_work_item] {label}: a rejected write authors no transaction journal"
+                );
+
+                // Path 2: public whole-aggregate write_work_item (imperative).
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = WorkModelStore::new(tmp.path());
+                store
+                    .create_work_item(&no_expertise_full_frozen_item(learning.clone()))
+                    .unwrap();
+                let before = snapshot_dir(tmp.path());
+                let mut proposed = store.read_work_item("work-1").unwrap();
+                mutate(&mut proposed);
+                let err = store.write_work_item(&proposed).unwrap_err();
+                assert!(
+                    is_frozen_identity_error(&err),
+                    "[write_work_item] {label}: {err:?}"
+                );
+                assert_eq!(
+                    snapshot_dir(tmp.path()),
+                    before,
+                    "[write_work_item] {label}: a rejected whole-aggregate write leaves every split \
+                     record, the storage revision, and the transaction journal unchanged"
+                );
+                assert!(
+                    !store.work_transaction_path("work-1").unwrap().exists(),
+                    "[write_work_item] {label}: a rejected write authors no transaction journal"
+                );
+            }
+        }
+
+        // The exposed states still allow a Learning-only transition and unrelated
+        // fields (proved for HandoffPending -> Succeeded and a retitle).
+        let (_tmp, store) = frozen_store(AttemptLearning::handoff_pending(1));
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].learning = Some(AttemptLearning::succeeded(1, handoff.clone()));
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.title = "Retitled".to_string();
+                Ok(())
+            })
+            .unwrap();
+
+        // InProgress and relaunchable Failed keep the reviewed identity writable
+        // through both write paths.
+        for learning in [
+            AttemptLearning::in_progress(1),
+            AttemptLearning::failed(1, "retry me"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = WorkModelStore::new(tmp.path());
+            store
+                .create_work_item(&no_expertise_full_frozen_item(learning.clone()))
+                .unwrap();
+            store
+                .mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks[0].output.as_mut().unwrap().commit =
+                        "commit-moved".to_string();
+                    item.merge_candidates[0].candidate_commit = "commit-moved".to_string();
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .commit,
+                "commit-moved",
+                "an unexposed Learning record does not freeze the reviewed identity"
+            );
+
+            let mut proposed = store.read_work_item("work-1").unwrap();
+            proposed.title = "Writable while unexposed".to_string();
+            store.write_work_item(&proposed).unwrap();
+            assert_eq!(
+                store.read_work_item("work-1").unwrap().title,
+                "Writable while unexposed"
+            );
+        }
+    }
+
+    #[test]
+    fn no_expertise_unexposed_identity_repair_uses_both_write_apis() {
+        // B4ap: while a no-expertise Learning record is InProgress or relaunchable
+        // Failed, a valid coupled repair of the reviewed-identity tuple persists through
+        // BOTH mutate_work_item and the public whole-aggregate write_work_item, while
+        // Learning and every unrelated field survive exactly. Every cell of
+        // {InProgress, Failed} × {mutate_work_item, write_work_item} uses an independent
+        // fresh store, so no reducer-mutated state leaks into the whole-aggregate API.
+        fn repair(item: &mut WorkItem) {
+            // Move the reviewed Write commit and every coupled pointer together to one
+            // new, internally consistent reviewed SHA.
+            item.attempts[0].tasks[0].output.as_mut().unwrap().commit =
+                "commit-repaired".to_string();
+            item.merge_candidates[0].candidate_commit = "commit-repaired".to_string();
+            for task in item.attempts[0].tasks.iter_mut() {
+                if let Some(ctx) = task.review_context.as_mut() {
+                    ctx.candidate_commit = "commit-repaired".to_string();
+                }
+            }
+        }
+
+        for learning in [
+            AttemptLearning::in_progress(1),
+            AttemptLearning::failed(1, "retry me"),
+        ] {
+            // Cell 1: mutate_work_item (reducer-based) on a fresh store. The expected
+            // aggregate is the created baseline with only the identity repair applied.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = WorkModelStore::new(tmp.path());
+            store
+                .create_work_item(&no_expertise_full_frozen_item(learning.clone()))
+                .unwrap();
+            let mut expected = store.read_work_item("work-1").unwrap();
+            repair(&mut expected);
+            store
+                .mutate_work_item("work-1", |item| {
+                    repair(item);
+                    Ok(())
+                })
+                .unwrap();
+            let after = store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                after.attempts[0].learning,
+                Some(learning.clone()),
+                "[mutate_work_item] the repair preserves the unexposed Learning record"
+            );
+            assert_eq!(
+                after, expected,
+                "[mutate_work_item] a valid identity repair persists with only the identity \
+                 fields changed and every unrelated field preserved"
+            );
+
+            // Cell 2: public whole-aggregate write_work_item on an INDEPENDENT fresh
+            // store — never the reducer-mutated store above.
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = WorkModelStore::new(tmp.path());
+            store
+                .create_work_item(&no_expertise_full_frozen_item(learning.clone()))
+                .unwrap();
+            let mut expected = store.read_work_item("work-1").unwrap();
+            repair(&mut expected);
+            store.write_work_item(&expected).unwrap();
+            let after = store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                after.attempts[0].learning,
+                Some(learning.clone()),
+                "[write_work_item] the repair preserves the unexposed Learning record"
+            );
+            assert_eq!(
+                after, expected,
+                "[write_work_item] a valid identity repair persists with only the identity \
+                 fields changed and every unrelated field preserved"
+            );
+        }
     }
 }
