@@ -101,12 +101,14 @@ fn review_only_hint(review_artifact: Option<&str>, passed: bool) -> String {
 
 pub fn after_attempt_run(
     outcome: &WorkAttemptRunOutcome,
+    work_item_id: &str,
     ctx: &AttemptRunContext,
 ) -> Option<String> {
     match outcome {
-        WorkAttemptRunOutcome::MergeCandidateReady { .. } => Some(
-            "\n→ Next: fluent merge-candidate show <work-item-id>, then fluent merge-candidate land <work-item-id>".to_string(),
-        ),
+        WorkAttemptRunOutcome::MergeCandidateReady { candidate_id } => Some(format!(
+            "\n→ Next: fluent merge-candidate show {work_item_id} {candidate_id}, then fluent \
+             merge-candidate land {work_item_id} {candidate_id}"
+        )),
         WorkAttemptRunOutcome::FollowUpRecoveryPending { next_action, .. } => {
             Some(format!("\n→ Next: {next_action}"))
         }
@@ -156,7 +158,7 @@ pub fn after_merge_candidate_show() -> &'static str {
 }
 
 pub fn after_merge_candidate_land() -> &'static str {
-    "\n→ Next: fluent cleanup <work-item-id>"
+    "\n→ Next: fluent cleanup"
 }
 
 pub fn after_work_item_list() -> &'static str {
@@ -176,15 +178,17 @@ pub fn empty_status_primer() -> &'static str {
 }
 
 /// Map a board-state `action` (from `work_status`) to the single most-actionable
-/// next command for the Work Item `id`. Returns `None` when the state has no
+/// next command for the Work Item `id`. Merge-ready rows also provide their
+/// authoritative Merge Candidate id. Returns `None` when the state has no
 /// operator command to name (transient or terminal states).
-pub fn next_action_for_action(action: &str, id: &str) -> Option<String> {
+pub fn next_action_for_action(action: &str, id: &str, merge_candidate_id: &str) -> Option<String> {
     match action {
         "needs-user" => Some(format!(
             "\n→ Next: {id} is paused for you; read its handoff, then fluent attempt run {id}"
         )),
         "merge-ready" => Some(format!(
-            "\n→ Next: fluent merge-candidate show {id}, then fluent merge-candidate land {id}"
+            "\n→ Next: fluent merge-candidate show {id} {merge_candidate_id}, then fluent \
+             merge-candidate land {id} {merge_candidate_id}"
         )),
         "learner-not-ready" => Some(format!(
             "\n→ Next: fluent attempt run {id} to run or retry the Learner before landing"
@@ -208,7 +212,7 @@ pub fn status_next_action(status: &WorkStatus) -> Option<String> {
     ];
     for action in PRIORITY {
         if let Some(row) = status.rows.iter().find(|row| row.action == action) {
-            return next_action_for_action(&row.action, &row.id);
+            return next_action_for_action(&row.action, &row.id, &row.merge_candidate);
         }
     }
     None
@@ -241,7 +245,7 @@ mod tests {
         let outcome = WorkAttemptRunOutcome::MergeCandidateReady {
             candidate_id: "mc-1".to_string(),
         };
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("merge-candidate"));
     }
 
@@ -252,7 +256,7 @@ mod tests {
             stage: "observation".to_string(),
             next_action: "Re-run `fluent merge-candidate land work-1 mc-1`.".to_string(),
         };
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("merge-candidate land work-1 mc-1"));
     }
 
@@ -263,7 +267,7 @@ mod tests {
             reason: "failed".to_string(),
             relaunchable: true,
         };
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("fluent attempt run"));
         assert!(!hint.contains("work-item show"));
         assert!(!hint.contains("merge-candidate land"));
@@ -276,7 +280,7 @@ mod tests {
             reason: "failed and non-relaunchable (evidence pending)".to_string(),
             relaunchable: false,
         };
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("fluent work-item show"));
         assert!(hint.contains("non-relaunchable"));
         assert!(!hint.contains("fluent attempt run"));
@@ -288,7 +292,7 @@ mod tests {
         let outcome = WorkAttemptRunOutcome::PlannedWriteRound {
             task_id: "t-1".to_string(),
         };
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("attempt run"));
         assert!(
             hint.contains("follow-up") || hint.contains("iterat"),
@@ -306,7 +310,7 @@ mod tests {
             coder: Some("codex"),
             review_artifact: None,
         };
-        let hint = after_attempt_run(&outcome, &ctx).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(hint.contains("re-authenticate"));
         assert!(hint.contains("codex login"));
         assert!(hint.contains("attempt run"));
@@ -321,7 +325,7 @@ mod tests {
             pause_kind: Some(&PauseKind::Uncertain),
             ..AttemptRunContext::default()
         };
-        let hint = after_attempt_run(&outcome, &ctx).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(hint.contains("handoff"));
         assert!(hint.contains("needs-user.md"));
         assert!(hint.contains("attempt run"));
@@ -334,7 +338,7 @@ mod tests {
             review_artifact: Some(".fluent/work/.../review.md"),
             ..AttemptRunContext::default()
         };
-        let hint = after_attempt_run(&outcome, &ctx).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(
             hint.contains("review.md"),
             "should name the artifact; got: {hint}"
@@ -358,7 +362,7 @@ mod tests {
     #[test]
     fn after_attempt_run_review_only_complete_names_verdicts() {
         let outcome = WorkAttemptRunOutcome::ReviewOnlyComplete;
-        let hint = after_attempt_run(&outcome, &AttemptRunContext::default()).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).unwrap();
         assert!(hint.contains("verdict"));
         // Pin the passing semantics — the counterpart to the failed hint.
         assert!(
@@ -381,7 +385,7 @@ mod tests {
             review_artifact: Some(".fluent/work/.../review.md"),
             ..AttemptRunContext::default()
         };
-        let hint = after_attempt_run(&outcome, &ctx).unwrap();
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(
             hint.contains("passed"),
             "passed-with-artifact hint must state the reviews passed; got: {hint}"
@@ -410,7 +414,7 @@ mod tests {
             task_id: "t-1".to_string(),
             output: "out".to_string(),
         };
-        assert!(after_attempt_run(&outcome, &AttemptRunContext::default()).is_none());
+        assert!(after_attempt_run(&outcome, "work-1", &AttemptRunContext::default()).is_none());
     }
 
     #[test]
@@ -432,6 +436,11 @@ mod tests {
         assert!(hint.contains("cleanup"));
     }
 
+    #[test]
+    fn after_merge_candidate_land_names_global_cleanup() {
+        assert_eq!(after_merge_candidate_land(), "\n→ Next: fluent cleanup");
+    }
+
     fn status_row(id: &str, action: &str) -> crate::work_status::WorkItemStatus {
         crate::work_status::WorkItemStatus {
             id: id.to_string(),
@@ -447,19 +456,20 @@ mod tests {
 
     #[test]
     fn next_action_for_task_ready_names_attempt_run() {
-        let hint = next_action_for_action("task-ready", "work-7").unwrap();
+        let hint = next_action_for_action("task-ready", "work-7", "-").unwrap();
         assert!(hint.contains("fluent attempt run work-7"));
     }
 
     #[test]
     fn next_action_for_merge_ready_names_land() {
-        let hint = next_action_for_action("merge-ready", "work-7").unwrap();
-        assert!(hint.contains("fluent merge-candidate land work-7"));
+        let hint =
+            next_action_for_action("merge-ready", "work-7", "attempt-1-merge-candidate").unwrap();
+        assert!(hint.contains("fluent merge-candidate land work-7 attempt-1-merge-candidate"));
     }
 
     #[test]
     fn next_action_for_learner_not_ready_names_attempt_run_without_land() {
-        let hint = next_action_for_action("learner-not-ready", "work-7").unwrap();
+        let hint = next_action_for_action("learner-not-ready", "work-7", "-").unwrap();
         assert!(hint.contains("fluent attempt run work-7"));
         assert!(hint.contains("Learner"));
         assert!(!hint.contains("merge-candidate land"));
@@ -467,21 +477,21 @@ mod tests {
 
     #[test]
     fn next_action_for_learner_blocked_is_none_to_avoid_inspection_loop() {
-        assert!(next_action_for_action("learner-blocked", "work-7").is_none());
+        assert!(next_action_for_action("learner-blocked", "work-7", "-").is_none());
     }
 
     #[test]
     fn next_action_for_needs_user_names_handoff_and_attempt_run() {
-        let hint = next_action_for_action("needs-user", "work-7").unwrap();
+        let hint = next_action_for_action("needs-user", "work-7", "-").unwrap();
         assert!(hint.contains("handoff"));
         assert!(hint.contains("fluent attempt run work-7"));
     }
 
     #[test]
     fn next_action_for_transient_or_terminal_action_is_none() {
-        assert!(next_action_for_action("executing", "work-7").is_none());
-        assert!(next_action_for_action("merged", "work-7").is_none());
-        assert!(next_action_for_action("abandoned", "work-7").is_none());
+        assert!(next_action_for_action("executing", "work-7", "-").is_none());
+        assert!(next_action_for_action("merged", "work-7", "-").is_none());
+        assert!(next_action_for_action("abandoned", "work-7", "-").is_none());
     }
 
     #[test]
@@ -516,6 +526,21 @@ mod tests {
             hint.contains("fluent merge-candidate land work-b"),
             "got: {hint}"
         );
+    }
+
+    #[test]
+    fn status_next_action_names_concrete_merge_candidate() {
+        let mut row = status_row("work-b", "merge-ready");
+        row.merge_candidate = "attempt-3-merge-candidate".to_string();
+        let hint = status_next_action(&WorkStatus {
+            rows: vec![row],
+            errors: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(hint.contains("fluent merge-candidate show work-b attempt-3-merge-candidate"));
+        assert!(!hint.contains("<work-item-id>"));
+        assert!(!hint.contains("<merge-candidate-id>"));
     }
 
     #[test]

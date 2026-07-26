@@ -292,7 +292,9 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
                 print!("{}", to_json_pretty(&item)?);
                 if guidance::guidance_enabled() {
                     let row = work_status::summarize_work_item(&item, Some(project_root));
-                    if let Some(hint) = guidance::next_action_for_action(&row.action, &row.id) {
+                    if let Some(hint) =
+                        guidance::next_action_for_action(&row.action, &row.id, &row.merge_candidate)
+                    {
                         eprintln!("{hint}");
                     }
                 }
@@ -648,7 +650,9 @@ fn cmd_attempt(
                     }
                 }
                 if guidance::guidance_enabled() {
-                    if let Some(hint) = guidance::after_attempt_run(outcome, &hint_ctx) {
+                    if let Some(hint) =
+                        guidance::after_attempt_run(outcome, &work_item_id, &hint_ctx)
+                    {
                         eprintln!("{hint}");
                     }
                 }

@@ -19158,7 +19158,7 @@ fn attempt_create_output_names_attempt_run_next() {
 
 #[test]
 #[serial]
-fn attempt_run_output_names_next_action_for_merge_candidate_ready() {
+fn attempt_run_output_names_executable_merge_candidate_commands() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     fluent_cmd()
@@ -19173,7 +19173,10 @@ fn attempt_run_output_names_next_action_for_merge_candidate_ready() {
         .success();
 
     let bin_dir = tmp.path().join("bin-guidance-pass");
-    write_mock_claude(&bin_dir, &loop_mock_script("pass"));
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"guidance","follow_ups":[]}"#),
+    );
 
     let output = fluent_cmd()
         .current_dir(&main_dir)
@@ -19185,9 +19188,39 @@ fn attempt_run_output_names_next_action_for_merge_candidate_ready() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("merge-candidate"),
-        "next-action for MergeCandidateReady should name merge-candidate on stderr; got:\n{stderr}"
+        stderr.contains("fluent merge-candidate show work-1 attempt-1-merge-candidate"),
+        "ready guidance should name the executable show command; got:\n{stderr}"
     );
+    assert!(
+        stderr.contains("fluent merge-candidate land work-1 attempt-1-merge-candidate"),
+        "ready guidance should name the executable land command; got:\n{stderr}"
+    );
+    assert!(!stderr.contains("<work-item-id>"));
+    assert!(!stderr.contains("<merge-candidate-id>"));
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "show",
+            "work-1",
+            "attempt-1-merge-candidate",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
 }
 
 #[test]
@@ -19355,6 +19388,91 @@ fn status_names_next_action_for_actionable_state() {
         show_stderr.contains("fluent attempt run work-1"),
         "work-item show should name the runnable attempt on stderr; got:\n{show_stderr}"
     );
+}
+
+#[test]
+#[serial]
+fn status_names_executable_merge_candidate_show() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-status-candidate");
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"status","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(&main_dir, &bin_dir);
+
+    for args in [vec!["status"], vec!["work-item", "show", "work-1"]] {
+        let output = fluent_cmd()
+            .current_dir(&main_dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("fluent merge-candidate show work-1 attempt-1-merge-candidate"),
+            "{args:?} should name the executable show command; got:\n{stderr}"
+        );
+        assert!(!stderr.contains("<work-item-id>"));
+        assert!(!stderr.contains("<merge-candidate-id>"));
+    }
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "show",
+            "work-1",
+            "attempt-1-merge-candidate",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+#[serial]
+fn successful_land_names_executable_cleanup() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-cleanup");
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"cleanup guidance","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(&main_dir, &bin_dir);
+
+    let land = fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(land.status.success());
+    let stderr = String::from_utf8_lossy(&land.stderr);
+    assert!(
+        stderr.lines().any(|line| line == "→ Next: fluent cleanup"),
+        "successful land should name global cleanup: {stderr}"
+    );
+    assert!(
+        !stderr.contains("fluent cleanup work-1")
+            && !stderr.contains("fluent cleanup attempt-1-merge-candidate")
+            && !stderr.contains("fluent cleanup <"),
+        "cleanup guidance must not contain a positional identifier: {stderr}"
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .arg("cleanup")
+        .assert()
+        .success();
 }
 
 #[test]

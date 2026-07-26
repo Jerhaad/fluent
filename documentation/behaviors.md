@@ -5661,7 +5661,7 @@ names `merge-candidate show`/`land`; a planned follow-up round names `attempt ru
 a relaunchable Learner failure names `attempt run`; a non-relaunchable Learner evidence
 failure names Work Item inspection and forbids rerun and land; a failed Attempt names the
 recovery/inspection step; a review-only completion names its next step.
-Test: tests/binary.rs (attempt_run_output_names_next_action_for_merge_candidate_ready)
+Test: tests/binary.rs (attempt_run_output_names_executable_merge_candidate_commands)
 Test: tests/binary.rs (attempt_run_output_names_next_action_for_failed)
 Test: src/guidance.rs (after_attempt_run_relaunchable_learner_failure_names_retry)
 Test: src/guidance.rs (after_attempt_run_non_relaunchable_learner_failure_names_human_inspection)
