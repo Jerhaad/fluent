@@ -12,17 +12,16 @@ Fluent is a factory that autonomously turns your team's vision, ideas, bug repor
 
 You use the factory through the Fluent [skill](https://agentskills.io/) in Codex, Claude Code, Pi, or another coding agent that supports skills. The skill turns your conversation into Fluent's interface and drives its command-line machinery for you.
 
-## Install
+### Install
 
-Fluent currently runs on macOS. From your repository, install the Fluent skill:
-
-```sh
+```bash
+# Fluent currently runs only on macOS
 npx skills add mrinalwadhwa/fluent --skill fluent
 ```
 
-Then open the repository in Codex, Claude Code, or Pi. Ask it to use Fluent, and describe what you want to explore, build, fix, or improve.
+Use the command above to install the Fluent skill, then start your coding agent in the project folder you want Fluent to work on. Ask it to use Fluent and describe what you want to explore, build, fix, or improve.
 
-The skill sets up Fluent in the repository, then starts shaping the work with you.
+The first invocation sets up Fluent for that project and starts shaping the work with you.
 
 ## How Fluent works
 
