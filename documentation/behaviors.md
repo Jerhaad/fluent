@@ -449,6 +449,35 @@ workspace path and launch the selected coder in that workspace.
 Test: tests/binary.rs (work_task_run_completes_write_task_with_committed_output)
 Test: tests/behaviors/operations/test-work-task-run.sh (run reuses worktree and launches coder there)
 
+### B32a
+
+IF the first Writer binding starts while its source checkout contains a
+staged, unstaged, or untracked change outside `.fluent/`,
+THEN THE SYSTEM SHALL reject the Writer before reserving the Task,
+creating or binding its branch or worktree, persisting its baseline, or
+launching its coder; SHALL name the dirty paths and explain that candidate
+worktrees use committed Git state; and SHALL leave the Attempt and Writer
+Task planned so the command can be retried after the user commits or
+reverts the changes.
+Test: tests/binary.rs (first_writer_rejects_uncommitted_init_instructions_before_side_effects)
+
+### B32b
+
+WHEN the first Writer binding starts while its source checkout contains
+changes only under `.fluent/`,
+THE SYSTEM SHALL allow candidate-worktree setup to proceed.
+Test: tests/binary.rs (first_writer_allows_fluent_only_source_changes)
+
+### B32c
+
+WHEN the user commits the instruction changes reported by `fluent init`
+and retries the same planned first Writer,
+THE SYSTEM SHALL bind the candidate from that committed source, include
+the managed instruction block in the candidate, record the committed
+source as its baseline, and allow the candidate to complete the public
+landing route.
+Test: tests/binary.rs (committed_init_instructions_reach_first_candidate_and_land)
+
 ### B33
 
 WHEN Fluent runs a Work-model behavior review Task for an Attempt whose
@@ -4563,6 +4592,23 @@ THEN THE SYSTEM SHALL print a warning and continue so `fluent init`
 still succeeds.
 Test: tests/binary.rs (init_succeeds_when_craft_section_write_fails)
 
+### B6
+
+WHEN `fluent init` changes one or more managed `AGENTS.md` or `CLAUDE.md`
+files in a Git source checkout,
+THE SYSTEM SHALL name each changed instruction file and tell the user to
+commit or revert it before running an Attempt because candidate worktrees
+use committed Git state.
+Test: tests/binary.rs (init_names_instruction_changes_that_require_git_resolution)
+
+### B7
+
+WHEN every managed instruction file already contains the current Fluent
+block,
+THE SYSTEM SHALL leave those files byte-for-byte unchanged and SHALL NOT
+claim that they require a new Git resolution.
+Test: tests/binary.rs (reinit_with_current_instructions_reports_no_new_instruction_changes)
+
 ---
 
 ## Local Preview guidance
@@ -5657,7 +5703,9 @@ Test: tests/binary.rs (attempt_create_output_names_attempt_run_next)
 
 WHEN `fluent attempt run` reaches a terminal outcome,
 THE SYSTEM SHALL print the next action for that specific outcome: a ready Merge Candidate
-names `merge-candidate show`/`land`; a planned follow-up round names `attempt run` again;
+names `merge-candidate show <work-item-id> <merge-candidate-id>` and
+`merge-candidate land <work-item-id> <merge-candidate-id>` with the
+authoritative identifiers; a planned follow-up round names `attempt run` again;
 a relaunchable Learner failure names `attempt run`; a non-relaunchable Learner evidence
 failure names Work Item inspection and forbids rerun and land; a failed Attempt names the
 recovery/inspection step; a review-only completion names its next step.
@@ -5720,11 +5768,16 @@ THE SYSTEM SHALL print a next-action line naming the `fluent` command for the
 most-actionable Work Item, choosing it by priority needs-user > merge-ready >
 learner-not-ready > task-ready, and SHALL print no next-action line when no Work
 Item is actionable. A `learner-blocked` row is visible but not actionable and
-SHALL NOT suppress another Work Item's next action.
+SHALL NOT suppress another Work Item's next action. For a `merge-ready`
+row, the next action SHALL render
+`fluent merge-candidate show <work-item-id> <merge-candidate-id>` with
+the row's authoritative Work Item and Merge Candidate identifiers.
 Test: tests/binary.rs (status_names_next_action_for_actionable_state)
+Test: tests/binary.rs (status_names_executable_merge_candidate_show)
 Test: src/guidance.rs (status_next_action_prioritizes_needs_user_over_merge_and_task_ready)
 Test: src/guidance.rs (status_next_action_ignores_learner_blocked_when_merge_ready_exists)
 Test: src/guidance.rs (status_next_action_names_merge_ready_over_task_ready)
+Test: src/guidance.rs (status_next_action_names_concrete_merge_candidate)
 Test: src/guidance.rs (status_next_action_names_learner_retry_over_task_ready)
 Test: src/guidance.rs (status_next_action_is_none_for_only_learner_blocked_work)
 Test: src/guidance.rs (status_next_action_is_none_when_nothing_actionable)
@@ -5779,6 +5832,15 @@ Test: src/guidance.rs (after_attempt_run_non_relaunchable_learner_failure_names_
 Test: src/guidance.rs (next_action_for_learner_blocked_is_none_to_avoid_inspection_loop)
 Test: src/guidance.rs (status_next_action_ignores_learner_blocked_when_merge_ready_exists)
 Test: src/guidance.rs (status_next_action_is_none_for_only_learner_blocked_work)
+
+### B14
+
+WHEN `fluent merge-candidate land` completes successfully,
+THE SYSTEM SHALL print `fluent cleanup` as the next command without a
+positional Work Item or Merge Candidate identifier, preserving cleanup's
+default dry run.
+Test: src/guidance.rs (after_merge_candidate_land_names_global_cleanup)
+Test: tests/binary.rs (successful_land_names_executable_cleanup)
 
 ## Fluent state tracking
 

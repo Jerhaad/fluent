@@ -101,6 +101,15 @@ or derives instructions from Work Item planning context into optional
 sibling git worktree beside the source checkout, runs the coder there,
 and completes the Task only after the workspace is clean and contains a
 new commit produced after Fluent bound the workspace for that Task run.
+Before Fluent binds a missing initial Writer workspace, its read-only
+worktree preflight checks the source checkout for staged, unstaged, and
+untracked changes outside `.fluent/`. If it finds any, it reports Git's
+porcelain paths and stops before Task reservation, branch or worktree
+creation, baseline persistence, and coder launch. The Attempt and Task
+remain planned so the user can commit or revert the source changes and
+retry the same command. Changes only under `.fluent/` retain the existing
+exception. Once the candidate workspace exists, recovery uses that
+authoritative workspace and does not repeat this source-checkout gate.
 The bridge stores workspace paths relative to the source root for
 portability, resolves them through the source checkout parent at
 execution time, and rejects writable Task workspace paths outside the
@@ -245,6 +254,10 @@ but later status and show commands emit no next action for that row, avoiding an
 inspection self-loop and allowing other actionable Work to surface. The boundary
 returns valid rows and per-file read errors together so one bad Work Item file
 does not hide the rest of the queue.
+Next-action guidance consumes these rows directly. A `merge-ready` row renders
+`merge-candidate show` and `merge-candidate land` with both its Work Item ID and
+Merge Candidate ID. A ready `attempt run` outcome uses the command's Work Item
+ID and the outcome's candidate ID for the same concrete commands.
 Write Task prompt generation reads `Task.instructions` from durable Work
 state and includes non-empty instructions in the coder prompt. A Task
 receives those instructions from explicit Work Item instructions first,
@@ -490,6 +503,11 @@ For an uninitialized project, the bundled full skill detects the missing
 init and then writes the nested `follow-up: { mode: execute }` mapping.
 Execute mode authorizes and queues corrective Work; it still requires a
 separately started scheduler and human candidate landing.
+Initialization creates or updates the managed Fluent block in `AGENTS.md` and
+`CLAUDE.md` without committing it. It skips byte-identical rewrites, then checks
+the resulting Git state and names each instruction file the user must commit or
+revert before an Attempt. This handoff and the initial Writer preflight enforce
+the same rule: candidate worktrees start from committed Git state.
 
 `fluent cleanup` takes the same land lock as land and post-land recovery, then
 re-reads each candidate before applying its plan. It retains an origin — its
@@ -506,6 +524,9 @@ then clears the recovery failure; cleanup also prunes a stale Git worktree
 registration when its checkout directory has already disappeared. Derived
 Observations and Work Items stay inspectable with self-contained corrective
 context and provenance identifiers after optional origin artifacts are gone.
+After a successful land, guidance names the global `fluent cleanup` command
+without an identifier. Cleanup remains a dry run unless the operator passes
+`--apply`.
 
 Fluent stores each Work Item as a top-level record plus split Attempt, Task, and
 Merge Candidate records. Aggregate reads and writes share one per-Work-Item
@@ -1603,7 +1624,8 @@ fluent/main/
     fargate.rs               ← Fargate launch, watch, stop, and pull for Work execution
     fargate_bootstrap.rs     ← JIT Fargate setup (CFN, base + project image builds)
     follow_up.rs             ← Land-gated follow-up materialization: pending operation, journal, corrective host gate, derived Work intake
-    git.rs                   ← Git command wrapper
+    git.rs                   ← Git command and source-cleanliness helpers
+    guidance.rs              ← Render concrete next-action commands
     hooks.rs                 ← Project hook execution (.fluent/hooks/<name>)
     keep_awake.rs            ← macOS idle-sleep prevention toggle
     lineage_lock.rs          ← Root-lineage serialization for corrective Work charges

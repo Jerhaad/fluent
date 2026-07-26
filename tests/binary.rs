@@ -16891,6 +16891,16 @@ git commit --allow-empty -m "mock write" 2>/dev/null
 exit 0
 "#,
     );
+    // Initial Writers require the source checkout to represent committed state.
+    // Keep the mock executable inside this fixture's source checkout, but commit
+    // it so the concurrency test reaches the scheduler boundary it exercises.
+    git::run(project, &["add", "mock-bin"], "stage mock coder").unwrap();
+    git::run(
+        project,
+        &["commit", "-m", "Add scheduler mock coder"],
+        "commit mock coder",
+    )
+    .unwrap();
 
     let token = run_token(&tmp);
     for n in 0..6 {
