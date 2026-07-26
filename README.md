@@ -4,9 +4,9 @@ Fluent is a factory that autonomously turns your ideas, bug reports, user feedba
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/fluent-at-a-glance-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/fluent-at-a-glance-light.png">
-    <img alt="The Fluent skill lets you drive the factory by chatting with Codex, Claude Code, or another coding agent. Agent traces, production logs, user feedback, and team ideas become Observations. Conversation shapes Work Items, which the scheduler delegates to a Writer, Tester, and specialist Reviewers. Reviewed changes pass through the Learner; new Observations return for later work, while Expertise informs future agents. A person or policy can approve and land the Merge Candidate before deployment. Delegated work can run in local sandboxes or on remote machines, and Fluent pulls in human context when needed." src=".github/assets/fluent-at-a-glance-light.png" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/fluent-at-a-glance-dark.gif">
+    <source media="(prefers-color-scheme: light)" srcset=".github/assets/fluent-at-a-glance-light.gif">
+    <img alt="The Fluent skill lets you drive the factory by chatting with Codex, Claude Code, or another coding agent. Agent traces, production logs, user feedback, and team vision and ideas become Observations. Conversation shapes Work Items, which the scheduler delegates to a Writer, Tester, and specialist Reviewers. Reviewed changes pass through the Learner; new Observations return for later work, while Expertise informs future agents. A person or policy can approve and land the Merge Candidate before deployment. Delegated work can run in local sandboxes or on remote machines, and Fluent pulls in human context when needed." src=".github/assets/fluent-at-a-glance-light.gif" width="100%">
   </picture>
 </p>
 
