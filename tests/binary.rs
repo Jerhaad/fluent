@@ -1425,6 +1425,7 @@ fn first_writer_rejects_uncommitted_init_instructions_before_side_effects() {
     fs::write(main_dir.join("CLAUDE.md"), "staged init instructions\n").unwrap();
     git::run(&main_dir, &["add", "CLAUDE.md"], "stage instruction change").unwrap();
     fs::write(main_dir.join("notes.txt"), "untracked source note\n").unwrap();
+    fs::write(main_dir.join("README.md"), "unstaged tracked change\n").unwrap();
     fs::create_dir_all(main_dir.join(".fluent/expertise")).unwrap();
     fs::write(
         main_dir.join(".fluent/expertise/local.md"),
@@ -1461,7 +1462,7 @@ fn first_writer_rejects_uncommitted_init_instructions_before_side_effects() {
         "dirty source should reject the Writer"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    for path in ["AGENTS.md", "CLAUDE.md", "notes.txt"] {
+    for path in ["AGENTS.md", "CLAUDE.md", "notes.txt", "README.md"] {
         assert!(
             stderr.contains(path),
             "rejection should name dirty path {path}: {stderr}"
