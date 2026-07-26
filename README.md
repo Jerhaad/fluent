@@ -14,19 +14,15 @@ You use the factory through the Fluent [skill](https://agentskills.io/) in Codex
 
 ## Install
 
+Fluent currently runs on macOS. From your repository, install the Fluent skill:
+
 ```sh
 npx skills add mrinalwadhwa/fluent --skill fluent
 ```
 
-This installs the Fluent skill. Open a Git repository in Codex, Claude Code, or Pi and ask it to use Fluent:
+Then open the repository in Codex, Claude Code, or Pi. Ask it to use Fluent, and describe what you want to explore, build, fix, or improve.
 
-> Use Fluent to add machine-readable JSON output to the status command.
-
-On first use, the skill installs Fluent's command-line machinery if it is missing, asks how the project should handle corrective follow-up Work, initializes the project, and starts shaping the Work with you.
-
-Fluent creates its work in sibling git worktrees next to your repo, so your working tree stays clean while it builds. Place your repo at `<project>/main/` so worktrees land as `<project>/work-*` siblings grouped under the project directory. Initialization prints a reminder if the directory is not named `main`.
-
-Fluent currently runs on macOS, on both Apple Silicon and Intel.
+The skill sets up Fluent in the repository, then starts shaping the work with you.
 
 ## How Fluent works
 
@@ -70,6 +66,8 @@ For example, “add machine-readable JSON output to our CLI's status command” 
 ## How Fluent builds it
 
 When you ask Fluent to run a Work Item, it starts an Attempt in an isolated worktree. In the Local Preview, the Attempt runs locally in the foreground, where you can watch each round.
+
+Fluent creates its worktrees next to your repo, so your working tree stays clean while it builds. Place your repo at `<project>/main/` to keep all of Fluent's worktrees grouped as siblings under the project directory. Initialization prints a reminder if the directory is not named `main`.
 
 The Writer implements the approved Plan and commits a candidate. The Tester runs the project's configured test commands. Five reviewers then inspect the same commit through separate tasks for behaviors, architecture, tests, documentation, and skills. Review tasks run in parallel up to the configured concurrency limit.
 
