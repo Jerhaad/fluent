@@ -4633,8 +4633,8 @@ Test: tests/binary.rs (init_names_instruction_changes_that_require_git_resolutio
 
 ### B7
 
-WHEN every managed instruction file already contains the current Fluent
-block,
+WHEN `fluent init` finds that every managed instruction file already
+contains the current Fluent block,
 THE SYSTEM SHALL leave those files byte-for-byte unchanged and SHALL NOT
 claim that they require a new Git resolution.
 Test: tests/binary.rs (reinit_with_current_instructions_reports_no_new_instruction_changes)
