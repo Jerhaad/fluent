@@ -10,7 +10,25 @@ Fluent is a factory that autonomously turns your team's vision, ideas, bug repor
   </picture>
 </p>
 
-You use the factory through the Fluent Agent Skill in Codex, Claude Code, or another coding agent. The skill turns your existing conversation into Fluent's interface and drives its command-line machinery for you.
+You use the factory through the Fluent [skill](https://agentskills.io/) in Codex, Claude Code, Pi, or another coding agent that supports skills. The skill turns your conversation into Fluent's interface and drives its command-line machinery for you.
+
+## Install
+
+```sh
+npx skills add mrinalwadhwa/fluent --skill fluent
+```
+
+This installs the Fluent skill. Open a Git repository in Codex, Claude Code, or Pi and ask it to use Fluent:
+
+> Use Fluent to add machine-readable JSON output to the status command.
+
+On first use, the skill installs Fluent's command-line machinery if it is missing, asks how the project should handle corrective follow-up Work, initializes the project, and starts shaping the Work with you.
+
+Fluent creates its work in sibling git worktrees next to your repo, so your working tree stays clean while it builds. Place your repo at `<project>/main/` so worktrees land as `<project>/work-*` siblings grouped under the project directory. Initialization prints a reminder if the directory is not named `main`.
+
+Fluent currently runs on macOS, on both Apple Silicon and Intel.
+
+## How Fluent works
 
 You can capture any of those inputs as an Observation, then shape it into one or more Work Items through conversation. Approved Work can run immediately or enter a queue; when you start the scheduler, it runs queued Work as execution capacity becomes available. Each Attempt loops through Writer → Tester → Reviewers until it passes; the Learner then captures any reusable project knowledge, and Fluent returns a ready Merge Candidate for you to inspect and land. After you approve it, the land gate updates, checks, reviews, and merges the candidate into your target branch; your delivery system can deploy it from there. Findings from shaping, building, landing, and running the software can feed the next cycle as new Observations or project Expertise.
 
@@ -114,19 +132,3 @@ Expertise changes are part of the Merge Candidate, so they land with the code th
 For the JSON status change, Fluent might retain the rule that machine-readable CLI output uses a versioned schema, serializes the existing status model, and does not change the text output. A later Writer starts with that rule, and later Reviewers check it.
 
 Follow-up Work changes what Fluent does next. Expertise changes how Fluent does future work.
-
-## Install
-
-```sh
-npx skills add mrinalwadhwa/fluent --skill fluent
-```
-
-This installs the bootstrap Agent Skill. Open your coding agent in a Git repository and ask it to use Fluent:
-
-> Use Fluent to add machine-readable JSON output to the status command.
-
-On first use, the skill installs the version-matched local CLI if it is missing, asks whether corrective follow-up Work should wait for your authorization or enter the execution queue automatically, initializes the project, and starts shaping the Work with you.
-
-Fluent creates its work in sibling git worktrees next to your repo, so your working tree stays clean while it builds. Place your repo at `<project>/main/` so worktrees land as `<project>/work-*` siblings grouped under the project directory. Initialization prints a reminder if the directory is not named `main`.
-
-Fluent currently runs on macOS, on both Apple Silicon and Intel.
