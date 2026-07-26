@@ -455,27 +455,57 @@ IF the first Writer binding starts while its source checkout contains a
 staged, unstaged, or untracked change outside `.fluent/`,
 THEN THE SYSTEM SHALL reject the Writer before reserving the Task,
 creating or binding its branch or worktree, persisting its baseline, or
-launching its coder; SHALL name the dirty paths and explain that candidate
-worktrees use committed Git state; and SHALL leave the Attempt and Writer
-Task planned so the command can be retried after the user commits or
-reverts the changes.
+launching its coder.
 Test: tests/binary.rs (first_writer_rejects_uncommitted_init_instructions_before_side_effects)
 
 ### B32b
+
+WHEN the first Writer rejects a source checkout that contains a staged,
+unstaged, or untracked change outside `.fluent/`,
+THE SYSTEM SHALL name the dirty paths and explain that candidate worktrees
+use committed Git state.
+Test: tests/binary.rs (first_writer_rejects_uncommitted_init_instructions_before_side_effects)
+
+### B32c
+
+WHEN the first Writer rejects a source checkout that contains a staged,
+unstaged, or untracked change outside `.fluent/`,
+THE SYSTEM SHALL leave the Attempt and Writer Task planned so the same
+command can be retried after the user commits or reverts the changes.
+Test: tests/binary.rs (first_writer_rejects_uncommitted_init_instructions_before_side_effects)
+
+### B32d
 
 WHEN the first Writer binding starts while its source checkout contains
 changes only under `.fluent/`,
 THE SYSTEM SHALL allow candidate-worktree setup to proceed.
 Test: tests/binary.rs (first_writer_allows_fluent_only_source_changes)
 
-### B32c
+### B32e
 
 WHEN the user commits the instruction changes reported by `fluent init`
 and retries the same planned first Writer,
-THE SYSTEM SHALL bind the candidate from that committed source, include
-the managed instruction block in the candidate, record the committed
-source as its baseline, and allow the candidate to complete the public
-landing route.
+THE SYSTEM SHALL bind the candidate from that committed source.
+Test: tests/binary.rs (committed_init_instructions_reach_first_candidate_and_land)
+
+### B32f
+
+WHEN the first Writer binds a candidate from source that contains committed
+Fluent instructions,
+THE SYSTEM SHALL include the managed instruction block in the candidate.
+Test: tests/binary.rs (committed_init_instructions_reach_first_candidate_and_land)
+
+### B32g
+
+WHEN the first Writer binds a candidate from committed source,
+THE SYSTEM SHALL record that source commit as the candidate baseline.
+Test: tests/binary.rs (committed_init_instructions_reach_first_candidate_and_land)
+
+### B32h
+
+WHEN a first candidate contains the committed managed instruction block
+and completes its required checks,
+THE SYSTEM SHALL allow it to complete the public landing route.
 Test: tests/binary.rs (committed_init_instructions_reach_first_candidate_and_land)
 
 ### B33
@@ -5701,18 +5731,52 @@ Test: tests/binary.rs (attempt_create_output_names_attempt_run_next)
 
 ### B2
 
-WHEN `fluent attempt run` reaches a terminal outcome,
-THE SYSTEM SHALL print the next action for that specific outcome: a ready Merge Candidate
-names `merge-candidate show <work-item-id> <merge-candidate-id>` and
+WHEN `fluent attempt run` reports a ready Merge Candidate,
+THE SYSTEM SHALL print next actions that name
+`merge-candidate show <work-item-id> <merge-candidate-id>` and
 `merge-candidate land <work-item-id> <merge-candidate-id>` with the
-authoritative identifiers; a planned follow-up round names `attempt run` again;
-a relaunchable Learner failure names `attempt run`; a non-relaunchable Learner evidence
-failure names Work Item inspection and forbids rerun and land; a failed Attempt names the
-recovery/inspection step; a review-only completion names its next step.
+authoritative Work Item and Merge Candidate identifiers.
 Test: tests/binary.rs (attempt_run_output_names_executable_merge_candidate_commands)
-Test: tests/binary.rs (attempt_run_output_names_next_action_for_failed)
+
+### B2a
+
+WHEN `fluent attempt run` plans a follow-up Writer round,
+THE SYSTEM SHALL print `attempt run` as the next action.
+Test: src/guidance.rs (after_attempt_run_planned_write_round_conveys_iteration)
+
+### B2b
+
+WHEN `fluent attempt run` reports a relaunchable Learner failure,
+THE SYSTEM SHALL print `attempt run` as the next action.
 Test: src/guidance.rs (after_attempt_run_relaunchable_learner_failure_names_retry)
+
+### B2c
+
+WHEN `fluent attempt run` reports a non-relaunchable Learner evidence
+failure,
+THE SYSTEM SHALL name Work Item inspection as the next action and SHALL
+NOT name rerun or land.
 Test: src/guidance.rs (after_attempt_run_non_relaunchable_learner_failure_names_human_inspection)
+
+### B2d
+
+WHEN `fluent attempt run` reports a failed Attempt,
+THE SYSTEM SHALL name the recovery or inspection step as the next action.
+Test: tests/binary.rs (attempt_run_output_names_next_action_for_failed)
+
+### B2e
+
+WHEN `fluent attempt run` reports a review-only completion,
+THE SYSTEM SHALL name the passing review results to inspect as the next
+action.
+Test: src/guidance.rs (after_attempt_run_review_only_complete_names_artifact)
+
+### B2f
+
+WHEN `fluent attempt run` reports a review-only failure,
+THE SYSTEM SHALL name the failed review results to inspect as the next
+action.
+Test: src/guidance.rs (after_attempt_run_review_only_failed_names_artifact)
 
 ### B3
 
@@ -5766,21 +5830,36 @@ WHEN `fluent status` or `fluent work-item show <id>` runs with at least one acti
 Work Item on the board,
 THE SYSTEM SHALL print a next-action line naming the `fluent` command for the
 most-actionable Work Item, choosing it by priority needs-user > merge-ready >
-learner-not-ready > task-ready, and SHALL print no next-action line when no Work
-Item is actionable. A `learner-blocked` row is visible but not actionable and
-SHALL NOT suppress another Work Item's next action. For a `merge-ready`
-row, the next action SHALL render
+learner-not-ready > task-ready.
+Test: tests/binary.rs (status_names_next_action_for_actionable_state)
+Test: src/guidance.rs (status_next_action_prioritizes_needs_user_over_merge_and_task_ready)
+Test: src/guidance.rs (status_next_action_names_merge_ready_over_task_ready)
+Test: src/guidance.rs (status_next_action_names_learner_retry_over_task_ready)
+
+### B9a
+
+WHEN `fluent status` or `fluent work-item show <id>` selects a
+`merge-ready` row for its next action,
+THE SYSTEM SHALL render
 `fluent merge-candidate show <work-item-id> <merge-candidate-id>` with
 the row's authoritative Work Item and Merge Candidate identifiers.
-Test: tests/binary.rs (status_names_next_action_for_actionable_state)
 Test: tests/binary.rs (status_names_executable_merge_candidate_show)
-Test: src/guidance.rs (status_next_action_prioritizes_needs_user_over_merge_and_task_ready)
-Test: src/guidance.rs (status_next_action_ignores_learner_blocked_when_merge_ready_exists)
-Test: src/guidance.rs (status_next_action_names_merge_ready_over_task_ready)
 Test: src/guidance.rs (status_next_action_names_concrete_merge_candidate)
-Test: src/guidance.rs (status_next_action_names_learner_retry_over_task_ready)
+
+### B9b
+
+WHEN `fluent status` or `fluent work-item show <id>` finds no actionable
+Work Item,
+THE SYSTEM SHALL print no next-action line.
 Test: src/guidance.rs (status_next_action_is_none_for_only_learner_blocked_work)
 Test: src/guidance.rs (status_next_action_is_none_when_nothing_actionable)
+
+### B9c
+
+WHEN a `learner-blocked` row appears with another actionable Work Item,
+THE SYSTEM SHALL keep the blocked row visible without letting it suppress
+the other Work Item's next action.
+Test: src/guidance.rs (status_next_action_ignores_learner_blocked_when_merge_ready_exists)
 
 ### B10
 
