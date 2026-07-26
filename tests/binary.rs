@@ -19197,13 +19197,14 @@ fn attempt_run_output_names_executable_merge_candidate_commands() {
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_next_action = "→ Next: fluent merge-candidate show work-1 \
+        attempt-1-merge-candidate, then fluent merge-candidate land work-1 \
+        attempt-1-merge-candidate";
     assert!(
-        stderr.contains("fluent merge-candidate show work-1 attempt-1-merge-candidate"),
-        "ready guidance should name the executable show command; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("fluent merge-candidate land work-1 attempt-1-merge-candidate"),
-        "ready guidance should name the executable land command; got:\n{stderr}"
+        stderr.lines().any(|line| line == expected_next_action),
+        "ready guidance should emit the exact executable show and land commands;\n\
+         expected: {expected_next_action}\n\
+         got:\n{stderr}"
     );
     assert!(!stderr.contains("<work-item-id>"));
     assert!(!stderr.contains("<merge-candidate-id>"));
@@ -19420,9 +19421,14 @@ fn status_names_executable_merge_candidate_show() {
             .unwrap();
         assert!(output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected_next_action = "→ Next: fluent merge-candidate show work-1 \
+            attempt-1-merge-candidate, then fluent merge-candidate land work-1 \
+            attempt-1-merge-candidate";
         assert!(
-            stderr.contains("fluent merge-candidate show work-1 attempt-1-merge-candidate"),
-            "{args:?} should name the executable show command; got:\n{stderr}"
+            stderr.lines().any(|line| line == expected_next_action),
+            "{args:?} should emit the exact executable show and land commands;\n\
+             expected: {expected_next_action}\n\
+             got:\n{stderr}"
         );
         assert!(!stderr.contains("<work-item-id>"));
         assert!(!stderr.contains("<merge-candidate-id>"));
