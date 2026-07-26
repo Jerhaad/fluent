@@ -4630,6 +4630,7 @@ THE SYSTEM SHALL name each changed instruction file and tell the user to
 commit or revert it before running an Attempt because candidate worktrees
 use committed Git state.
 Test: tests/binary.rs (init_names_instruction_changes_that_require_git_resolution)
+Test: tests/binary.rs (init_reports_changed_instructions_after_partial_seeding_failure)
 
 ### B7
 

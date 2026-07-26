@@ -1875,6 +1875,57 @@ fn init_succeeds_when_craft_section_write_fails() {
     );
 }
 
+#[test]
+fn init_reports_changed_instructions_after_partial_seeding_failure() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let project = setup_git_project(&tmp);
+    fs::write(project.join("AGENTS.md"), "# Existing instructions\n").unwrap();
+    git::run(&project, &["add", "AGENTS.md"], "stage instructions").unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add agent instructions"],
+        "commit instructions",
+    )
+    .unwrap();
+
+    // Seeding visits AGENTS.md first, then fails when it tries to read this
+    // directory as the later CLAUDE.md instruction file.
+    fs::create_dir(project.join("CLAUDE.md")).unwrap();
+
+    let output = fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "init must remain successful after a partial instruction-seeding failure"
+    );
+    assert!(
+        fs::read_to_string(project.join("AGENTS.md"))
+            .unwrap()
+            .contains("<!-- BEGIN fluent -->"),
+        "the earlier instruction file should retain its successful update"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: could not seed agent instructions"),
+        "init should report the later seeding failure: {stderr}"
+    );
+    let expected_git_guidance = "Resolve the Fluent instruction changes before running an \
+        Attempt:\n    AGENTS.md\n  commit or revert these files first; candidate worktrees use \
+        committed Git state.";
+    assert!(
+        stderr.contains(expected_git_guidance),
+        "init should name the successfully changed instruction file with its Git resolution \
+         explanation;\nexpected:\n{expected_git_guidance}\ngot:\n{stderr}"
+    );
+}
+
 // -------------------------------------------------------------------------
 // Status
 // -------------------------------------------------------------------------
