@@ -771,7 +771,12 @@ fn land_frozen_no_expertise(
     finish_fresh_land_with(
         execution,
         |result| {
-            recover_landed_candidate_result(config.store, config.work_item_id, &candidate.id, result)
+            recover_landed_candidate_result(
+                config.store,
+                config.work_item_id,
+                &candidate.id,
+                result,
+            )
         },
         |outcome| process_landed_follow_ups(config, outcome),
         |outcome, base_commit| schedule_post_merge_review(config, candidate, outcome, base_commit),
@@ -4394,9 +4399,7 @@ mod tests {
     /// the frozen-identity write guard, so a cell may persist an already-Merged state
     /// with an absent or divergent merged_commit that the guard would otherwise
     /// reject on a write to an existing aggregate.
-    fn build_frozen_fixture(
-        configure: impl FnOnce(&mut WorkItem, &str),
-    ) -> FrozenLandFixture {
+    fn build_frozen_fixture(configure: impl FnOnce(&mut WorkItem, &str)) -> FrozenLandFixture {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
@@ -4572,12 +4575,16 @@ mod tests {
     /// absolute path per registered worktree. Used to prove a rejected land leaks no
     /// disposable worktree beyond the one it is documented to retain (B4as).
     fn registered_worktrees(project_root: &Path) -> std::collections::BTreeSet<PathBuf> {
-        git::run_stdout(project_root, &["worktree", "list", "--porcelain"], "worktree list")
-            .unwrap()
-            .lines()
-            .filter_map(|line| line.strip_prefix("worktree "))
-            .map(|path| PathBuf::from(path.trim()))
-            .collect()
+        git::run_stdout(
+            project_root,
+            &["worktree", "list", "--porcelain"],
+            "worktree list",
+        )
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(|path| PathBuf::from(path.trim()))
+        .collect()
     }
 
     #[test]
@@ -5045,7 +5052,10 @@ mod tests {
         // no pre-existing worktree is removed and no additional worktree leaks.
         let registered_after = registered_worktrees(target);
         assert!(
-            registered_before.difference(&registered_after).next().is_none(),
+            registered_before
+                .difference(&registered_after)
+                .next()
+                .is_none(),
             "no pre-existing worktree is removed"
         );
         let added: Vec<PathBuf> = registered_after
@@ -5206,7 +5216,10 @@ mod tests {
             "the land stays successful even when follow-up persistence is unknown"
         );
         assert_eq!(
-            stored.merge_candidates[0].merge_state.merged_commit.as_deref(),
+            stored.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .as_deref(),
             Some(fx.reviewed_sha.as_str()),
             "the durable merged commit is exactly the reviewed SHA"
         );
@@ -5231,7 +5244,9 @@ mod tests {
             observed.rendered
         );
         assert!(
-            observed.rendered.contains("injected atomic Work-model storage fault"),
+            observed
+                .rendered
+                .contains("injected atomic Work-model storage fault"),
             "the failure originated at the real atomic storage write: {}",
             observed.rendered
         );
@@ -5264,7 +5279,10 @@ mod tests {
             Some(crate::work_model::AttemptLearning::in_progress(1)),
             Some(crate::work_model::AttemptLearning::handoff_pending(1)),
             Some(crate::work_model::AttemptLearning::failed(1, "retry me")),
-            Some(crate::work_model::AttemptLearning::succeeded(1, handoff.clone())),
+            Some(crate::work_model::AttemptLearning::succeeded(
+                1,
+                handoff.clone(),
+            )),
         ];
 
         #[derive(Clone, Copy)]
@@ -5283,8 +5301,7 @@ mod tests {
                 let learning = learning.clone();
                 let fx = build_frozen_fixture(|item, reviewed_sha| {
                     item.attempts[0].learning = learning.clone();
-                    item.merge_candidates[0].merge_state.status =
-                        MergeCandidateMergeStatus::Merged;
+                    item.merge_candidates[0].merge_state.status = MergeCandidateMergeStatus::Merged;
                     item.merge_candidates[0].merge_state.merged_commit = match column {
                         MergedColumn::Missing => None,
                         MergedColumn::Divergent => {
@@ -5442,7 +5459,10 @@ mod tests {
         // check-pre-merge in the disposable worktree each fail the land without
         // invoking fix-pre-merge, and each preserves the live candidate and target.
         let cases: [(&str, &str); 3] = [
-            ("dirty-only", "#!/bin/sh\necho mutated > extra.txt\nexit 0\n"),
+            (
+                "dirty-only",
+                "#!/bin/sh\necho mutated > extra.txt\nexit 0\n",
+            ),
             (
                 "staged-only",
                 "#!/bin/sh\necho mutated > extra.txt\ngit add -A\nexit 0\n",
@@ -5530,7 +5550,12 @@ mod tests {
             "the target never fast-forwards after live source drift"
         );
         let stored = fx.store.read_work_item("work-1").unwrap();
-        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert!(
+            stored.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .is_none()
+        );
         assert_eq!(
             stored.merge_candidates[0].merge_state.status,
             MergeCandidateMergeStatus::Failed
@@ -5559,7 +5584,12 @@ mod tests {
             "the target never fast-forwards to the reviewed SHA after target drift"
         );
         let stored = fx.store.read_work_item("work-1").unwrap();
-        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert!(
+            stored.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .is_none()
+        );
         assert_eq!(
             head_commit(&fx.source_workspace).unwrap(),
             fx.reviewed_sha,
@@ -5648,7 +5678,12 @@ mod tests {
             "the live candidate is unchanged"
         );
         let stored = fx.store.read_work_item("work-1").unwrap();
-        assert!(stored.merge_candidates[0].merge_state.merged_commit.is_none());
+        assert!(
+            stored.merge_candidates[0]
+                .merge_state
+                .merged_commit
+                .is_none()
+        );
         assert_eq!(
             stored.merge_candidates[0].merge_state.status,
             MergeCandidateMergeStatus::Failed,
@@ -5683,11 +5718,11 @@ mod tests {
             _extra_env: &[(String, String)],
             _capture: Option<&crate::coder::TranscriptCapture<'_>>,
         ) -> crate::coder::CoderRunCompletion {
-            let terminal = match git::run(working_dir, &["rebase", "main"], "capture rebase onto main")
-            {
-                Ok(()) => Ok(0),
-                Err(error) => Err(anyhow::anyhow!("{error}")),
-            };
+            let terminal =
+                match git::run(working_dir, &["rebase", "main"], "capture rebase onto main") {
+                    Ok(()) => Ok(0),
+                    Err(error) => Err(anyhow::anyhow!("{error}")),
+                };
             crate::coder::CoderRunCompletion {
                 terminal,
                 report: crate::coder::CoderSupervisionReport::default(),

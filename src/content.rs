@@ -1285,8 +1285,7 @@ Check item {{ITEM_ID}}.
             "architecture must name the residual out-of-band candidate-Git race after the last read"
         );
         assert!(
-            architecture
-                .contains("universal lock shared by every candidate-workspace Git writer")
+            architecture.contains("universal lock shared by every candidate-workspace Git writer")
                 && architecture.contains("outside this release correction"),
             "architecture must state the universal candidate-workspace Git lock is out of scope"
         );
@@ -1364,7 +1363,8 @@ Check item {{ITEM_ID}}.
 
         // Exact token comparison rejects a near-match value that a substring check
         // (`contains(\"--learner-mode no-expertise\")`) would wrongly accept.
-        let near_miss = shell_tokens("fluent work-item create x --learner-mode no-expertise-invalid");
+        let near_miss =
+            shell_tokens("fluent work-item create x --learner-mode no-expertise-invalid");
         assert_ne!(
             learner_mode_values(&near_miss),
             vec!["no-expertise".to_string()],
@@ -1436,7 +1436,10 @@ Check item {{ITEM_ID}}.
     /// satisfy a positive claim and a contradictory sentence elsewhere cannot coexist.
     /// Fails if either anchor is absent, ambiguously duplicated, or out of order.
     fn bounded_section<'a>(doc: &'a str, start_anchor: &str, end_anchor: &str) -> &'a str {
-        let starts: Vec<usize> = doc.match_indices(start_anchor).map(|(idx, _)| idx).collect();
+        let starts: Vec<usize> = doc
+            .match_indices(start_anchor)
+            .map(|(idx, _)| idx)
+            .collect();
         assert_eq!(
             starts.len(),
             1,
@@ -1473,13 +1476,16 @@ Check item {{ITEM_ID}}.
         let architecture = read_living_doc("documentation/architecture.md");
         let behaviors = read_living_doc("documentation/behaviors.md");
         let decisions = read_living_doc(".fluent/expertise/decisions.md");
-        let reserved = read_living_doc(".fluent/expertise/learnings/reserved-phase-terminal-finalizer.md");
-        let field_finalizer =
-            read_living_doc(".fluent/expertise/learnings/fresh-field-level-finalizer-preserves-concurrent-state.md");
+        let reserved =
+            read_living_doc(".fluent/expertise/learnings/reserved-phase-terminal-finalizer.md");
+        let field_finalizer = read_living_doc(
+            ".fluent/expertise/learnings/fresh-field-level-finalizer-preserves-concurrent-state.md",
+        );
         let route_tests =
             read_living_doc(".fluent/expertise/learnings/route-tests-drive-real-launch-wiring.md");
-        let mode_prompts =
-            read_living_doc(".fluent/expertise/learnings/mode-specific-prompts-replace-conflicting-base-instructions.md");
+        let mode_prompts = read_living_doc(
+            ".fluent/expertise/learnings/mode-specific-prompts-replace-conflicting-base-instructions.md",
+        );
 
         // Bound each living document to its no-expertise section. Extraction fails if
         // either anchor is missing, ambiguously duplicated, or out of order — no

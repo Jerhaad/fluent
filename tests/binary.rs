@@ -3278,7 +3278,10 @@ fn pre_land_no_expertise_ignores_no_sandbox_and_preserves_candidate_git() {
     let head = git::run_stdout(&candidate_ws, &["rev-parse", "HEAD"], "candidate head").unwrap();
     assert_eq!(head, candidate, "the candidate HEAD is preserved");
     let log = git::run_stdout(&candidate_ws, &["log", "--oneline"], "candidate log").unwrap();
-    assert!(!log.contains("Update expertise"), "no expertise commit: {log}");
+    assert!(
+        !log.contains("Update expertise"),
+        "no expertise commit: {log}"
+    );
 
     if real_sandbox_exec_is_usable() {
         assert_eq!(

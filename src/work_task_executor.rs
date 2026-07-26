@@ -2945,9 +2945,7 @@ pub(crate) fn run_learner_captured_in_mode(
         mode,
         capture,
         HostPreparation::Production,
-        move |sandbox| {
-            coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref())
-        },
+        move |sandbox| coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref()),
     )
 }
 
@@ -3264,7 +3262,11 @@ pub(crate) fn build_learner_prompts(inputs: &LearnerPromptInputs<'_>) -> Result<
                 ("expertise_index_path", inputs.expertise_index_path),
                 (
                     "has_learnings_index",
-                    if inputs.has_learnings_index { "yes" } else { "" },
+                    if inputs.has_learnings_index {
+                        "yes"
+                    } else {
+                        ""
+                    },
                 ),
                 ("draft_path", inputs.draft_path),
                 (
@@ -8874,9 +8876,7 @@ mod tests {
                     "{mode_name}/{invocation}: both prompts are non-empty"
                 );
                 assert!(
-                    !system.contains("{{")
-                        && !system.contains("}}")
-                        && !user.contains("{{"),
+                    !system.contains("{{") && !system.contains("}}") && !user.contains("{{"),
                     "{mode_name}/{invocation}: no template placeholder leaks to the coder"
                 );
 
@@ -8889,8 +8889,7 @@ mod tests {
                         "{mode_name}/{invocation}: capture grants the expertise capability"
                     ),
                     LearnerExecutionMode::PreLandNoExpertise => assert!(
-                        system.contains("no-expertise mode")
-                            && !system.contains("already merged"),
+                        system.contains("no-expertise mode") && !system.contains("already merged"),
                         "{mode_name}/{invocation}: no-expertise directive, no post-land wording"
                     ),
                     LearnerExecutionMode::PostLandHandoffOnly => assert!(
@@ -8982,7 +8981,11 @@ mod tests {
         let workspace = system_fault.path().join("workspace");
         let prompts = workspace.join(".fluent/prompts");
         std::fs::create_dir_all(&prompts).unwrap();
-        std::fs::write(prompts.join("learner-system.md"), "System {{unknown_token}}.").unwrap();
+        std::fs::write(
+            prompts.join("learner-system.md"),
+            "System {{unknown_token}}.",
+        )
+        .unwrap();
         let handoff_dir = system_fault.path().join("handoff");
         std::fs::create_dir_all(&handoff_dir).unwrap();
         let bundled_user = ContentResolver::new(None);
@@ -9006,11 +9009,16 @@ mod tests {
         let user_override = user_fault.path().join("project");
         let user_prompts = user_override.join(".fluent/prompts");
         std::fs::create_dir_all(&user_prompts).unwrap();
-        std::fs::write(user_prompts.join("learner-user.md"), "Audit {{unknown_token}}.").unwrap();
+        std::fs::write(
+            user_prompts.join("learner-user.md"),
+            "Audit {{unknown_token}}.",
+        )
+        .unwrap();
         let handoff_dir = user_fault.path().join("handoff");
         std::fs::create_dir_all(&handoff_dir).unwrap();
         let faulty_user = ContentResolver::new(Some(&user_override));
-        let (message, factory, launches) = run_faulted(&clean_workspace, &faulty_user, &handoff_dir);
+        let (message, factory, launches) =
+            run_faulted(&clean_workspace, &faulty_user, &handoff_dir);
         assert!(
             message.contains("learner-user.md template error"),
             "the user-prompt fault must surface: {message}"

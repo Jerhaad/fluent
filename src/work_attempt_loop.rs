@@ -1080,7 +1080,14 @@ fn run_learner_step(
     // producing the handoff to write. The handoff is written LAST, by
     // `finalize_learning`, after the terminal learning outcome is persisted or
     // composed from a write failure.
-    let learned = try_learn(project_root, item, attempt_index, candidate_id, mode, config);
+    let learned = try_learn(
+        project_root,
+        item,
+        attempt_index,
+        candidate_id,
+        mode,
+        config,
+    );
     finalize_learning(store, item, attempt_index, runs, learned, |handoff| {
         crate::learner::write_handoff(project_root, &work_item_id, &attempt_id, handoff)
     })
@@ -1148,7 +1155,14 @@ fn settle_no_expertise_learner(
     // its already-run coder is never rerun, a transcript-pump transport fault stays
     // relaunchable, and a rejected candidate Git mutation or unsupported host stays
     // relaunchable `Generic`. (B3, B4h, B4i, B5, B5b, B10, B10a)
-    let handoff = match try_learn(project_root, item, attempt_index, candidate_id, mode, config) {
+    let handoff = match try_learn(
+        project_root,
+        item,
+        attempt_index,
+        candidate_id,
+        mode,
+        config,
+    ) {
         Ok(handoff) => handoff,
         Err(run) => {
             settle_no_expertise_failure(store, &work_item_id, &attempt_id, runs, run)?;
@@ -1163,10 +1177,9 @@ fn settle_no_expertise_learner(
     // candidate Git, and changes only Learning to `HandoffPending` (pass) or
     // `Failed/Generic` (fail) — preserving every concurrent field and any
     // contradictory pointer as evidence. (B4b/B4c)
-    let check_identity =
-        |root: &Path, fresh: &WorkItem, idx: usize, cid: &str, stage: &str| {
-            check_no_expertise_pointer_identity(root, fresh, idx, cid, stage)
-        };
+    let check_identity = |root: &Path, fresh: &WorkItem, idx: usize, cid: &str, stage: &str| {
+        check_no_expertise_pointer_identity(root, fresh, idx, cid, stage)
+    };
     match prepare_no_expertise_handoff(
         store,
         project_root,
@@ -1258,11 +1271,19 @@ fn settle_no_expertise_failure(
     let diagnostic = format!("{error:#}");
     if let Err(store_err) = store.mutate_work_item(work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
-        if !learning_frontier_is(fresh, idx, runs, crate::work_model::LearningStatus::InProgress) {
+        if !learning_frontier_is(
+            fresh,
+            idx,
+            runs,
+            crate::work_model::LearningStatus::InProgress,
+        ) {
             return Ok(());
         }
-        fresh.attempts[idx].learning =
-            Some(AttemptLearning::failed_with_kind(runs, diagnostic.clone(), kind));
+        fresh.attempts[idx].learning = Some(AttemptLearning::failed_with_kind(
+            runs,
+            diagnostic.clone(),
+            kind,
+        ));
         Ok(())
     }) {
         // B4h1: the coder/preflight failure is the PRIMARY fault. The store failure is
@@ -1331,7 +1352,12 @@ fn prepare_no_expertise_handoff(
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this runner's exact in-progress reservation may advance; a peer that
         // already moved the frontier is honored rather than revived.
-        if !learning_frontier_is(fresh, idx, runs, crate::work_model::LearningStatus::InProgress) {
+        if !learning_frontier_is(
+            fresh,
+            idx,
+            runs,
+            crate::work_model::LearningStatus::InProgress,
+        ) {
             return Ok(NoExpertisePreparation::Superseded);
         }
         let attempt = &fresh.attempts[idx];
@@ -1343,7 +1369,13 @@ fn prepare_no_expertise_handoff(
         // Postflight against the CURRENT aggregate and candidate Git. A contradiction
         // fails closed: settle Failed/Generic in this same mutation, preserving the
         // contradictory pointer or context as evidence.
-        match check_identity(project_root, fresh, idx, candidate_id, "before advancing Learning") {
+        match check_identity(
+            project_root,
+            fresh,
+            idx,
+            candidate_id,
+            "before advancing Learning",
+        ) {
             Ok(()) => {
                 fresh.attempts[idx].learning = Some(AttemptLearning::handoff_pending(runs));
                 Ok(NoExpertisePreparation::Prepared)
@@ -1398,8 +1430,12 @@ fn publish_no_expertise_handoff(
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this run's exact HandoffPending frontier may publish; a newer frontier
         // or a peer's terminal record is honored, not overwritten.
-        if !learning_frontier_is(fresh, idx, runs, crate::work_model::LearningStatus::HandoffPending)
-        {
+        if !learning_frontier_is(
+            fresh,
+            idx,
+            runs,
+            crate::work_model::LearningStatus::HandoffPending,
+        ) {
             return Ok(());
         }
         let attempt = &fresh.attempts[idx];
@@ -1455,7 +1491,9 @@ fn publish_no_expertise_handoff(
                         // the reviewed Writer SHA and record no handoff reference.
                         fresh.attempts[idx].learning = Some(AttemptLearning::failed_with_kind(
                             runs,
-                            format!("learner produced a handoff but persisting it failed: {pub_err:#}"),
+                            format!(
+                                "learner produced a handoff but persisting it failed: {pub_err:#}"
+                            ),
                             classify_learning_failure(&pub_err),
                         ));
                         *triggering.borrow_mut() = Some(pub_err);
@@ -2173,7 +2211,9 @@ fn task_review_round(attempt_id: &str, task: &Task) -> Option<usize> {
             if suffix.is_empty() {
                 Some(1)
             } else {
-                suffix.strip_prefix('-').and_then(|n| n.parse::<usize>().ok())
+                suffix
+                    .strip_prefix('-')
+                    .and_then(|n| n.parse::<usize>().ok())
             }
         }
         _ => None,
@@ -2217,7 +2257,9 @@ fn check_no_expertise_pointer_identity(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref())
         .ok_or_else(|| {
-            anyhow::anyhow!("no completed write task with output for the no-expertise identity check")
+            anyhow::anyhow!(
+                "no completed write task with output for the no-expertise identity check"
+            )
         })?;
     let reviewed_sha = write_output.commit.as_str();
 
@@ -2273,8 +2315,7 @@ fn check_no_expertise_pointer_identity(
             continue;
         }
         let is_final_round_context = (task.kind == TaskKind::Tester
-            || (task.kind == TaskKind::Review
-                && review::REVIEWERS.contains(&task.role.as_str())))
+            || (task.kind == TaskKind::Review && review::REVIEWERS.contains(&task.role.as_str())))
             && task_review_round(&attempt.id, task) == Some(final_round);
         if !is_final_round_context {
             continue;
@@ -2296,7 +2337,6 @@ fn check_no_expertise_pointer_identity(
     }
     Ok(())
 }
-
 
 /// Whether an executing Task is still live. Liveness is owned by the Task's
 /// process-held lease, never by transcript age or pump-status timestamps: those
@@ -7103,10 +7143,7 @@ mod tests {
 
     /// The reviewed Writer SHA persisted on the latest completed Write output.
     fn write_output_commit(store: &WorkModelStore) -> String {
-        store
-            .read_work_item("work-1")
-            .unwrap()
-            .attempts[0]
+        store.read_work_item("work-1").unwrap().attempts[0]
             .tasks
             .iter()
             .rev()
@@ -7124,7 +7161,8 @@ mod tests {
         // succeeds; a dirty candidate worktree or a diverged HEAD launches no coder,
         // moves no pointer, and records a relaunchable Generic failure.
         let clean = tempfile::TempDir::new().unwrap();
-        let (store, project_root, _workspace, _base) = make_learner_passing_fixture(clean.path(), 1);
+        let (store, project_root, _workspace, _base) =
+            make_learner_passing_fixture(clean.path(), 1);
         mark_no_expertise(&store);
         let run_coder = draft_only_coder(r#"{"learning_summary":"noted","follow_ups":[]}"#);
         let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
@@ -7248,7 +7286,10 @@ mod tests {
         let learning = stored.attempts[0].learning.as_ref().unwrap();
         assert!(learning.is_failed() && learning.is_relaunchable());
         assert_eq!(learning.failure_kind, Some(LearningFailureKind::Generic));
-        assert!(learning.handoff.is_none(), "no handoff on a preflight failure");
+        assert!(
+            learning.handoff.is_none(),
+            "no handoff on a preflight failure"
+        );
         assert_eq!(
             stored.merge_candidates[0].candidate_commit, base,
             "the Merge Candidate stays at the reviewed Writer SHA"
@@ -8538,9 +8579,8 @@ mod tests {
             mark_no_expertise(&store);
 
             let make_error = case.make_error;
-            let run_coder = move |_request: &LearnerCoderRequest<'_>| -> Result<()> {
-                Err(make_error())
-            };
+            let run_coder =
+                move |_request: &LearnerCoderRequest<'_>| -> Result<()> { Err(make_error()) };
             let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
             match outcome {
                 WorkAttemptRunOutcome::LearnerNotReady { relaunchable, .. } => assert_eq!(
@@ -8569,7 +8609,11 @@ mod tests {
                 "{}: the record retains the kind's relaunchability",
                 case.name
             );
-            assert_eq!(learning.runs, 1, "{}: exactly one run is recorded", case.name);
+            assert_eq!(
+                learning.runs, 1,
+                "{}: exactly one run is recorded",
+                case.name
+            );
             assert!(
                 learning
                     .last_failure
@@ -8672,7 +8716,10 @@ mod tests {
         );
         let stored = store.read_work_item("work-1").unwrap();
         let learning = stored.attempts[0].learning.as_ref().unwrap();
-        assert_eq!(learning.failure_kind, Some(LearningFailureKind::EvidencePending));
+        assert_eq!(
+            learning.failure_kind,
+            Some(LearningFailureKind::EvidencePending)
+        );
         assert!(!learning.is_relaunchable());
         assert_eq!(learning.runs, 1);
         let first_diagnostic = learning.last_failure.clone();
@@ -8701,7 +8748,10 @@ mod tests {
             Some(LearningFailureKind::EvidencePending),
             "the evidence-pending diagnostic is preserved across recovery"
         );
-        assert_eq!(learning.runs, 1, "the run count is not advanced by recovery");
+        assert_eq!(
+            learning.runs, 1,
+            "the run count is not advanced by recovery"
+        );
         assert_eq!(
             learning.last_failure, first_diagnostic,
             "the typed diagnostic is preserved verbatim across recovery"
@@ -8831,10 +8881,11 @@ mod tests {
         let handoff = dummy_learner_handoff();
         let observed_title = Arc::new(Mutex::new(String::new()));
         let observed_for_check = Arc::clone(&observed_title);
-        let checker = move |_root: &Path, fresh: &WorkItem, _idx: usize, _cid: &str, _stage: &str| {
-            *observed_for_check.lock().unwrap() = fresh.title.clone();
-            Ok(())
-        };
+        let checker =
+            move |_root: &Path, fresh: &WorkItem, _idx: usize, _cid: &str, _stage: &str| {
+                *observed_for_check.lock().unwrap() = fresh.title.clone();
+                Ok(())
+            };
         publish_no_expertise_handoff(
             &store,
             &project_root,
@@ -8926,7 +8977,14 @@ mod tests {
         let stored = store.read_work_item("work-1").unwrap();
         assert!(stored.attempts[0].learning.as_ref().unwrap().is_succeeded());
         assert_eq!(
-            stored.attempts[0].learning.as_ref().unwrap().handoff.as_ref().unwrap().path,
+            stored.attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .handoff
+                .as_ref()
+                .unwrap()
+                .path,
             "handoff.json"
         );
         assert_eq!(
@@ -8977,11 +9035,13 @@ mod tests {
             would_block.load(std::sync::atomic::Ordering::SeqCst),
             "the publisher runs inside the held model lock"
         );
-        assert!(store.read_work_item("work-1").unwrap().attempts[0]
-            .learning
-            .as_ref()
-            .unwrap()
-            .is_succeeded());
+        assert!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .is_succeeded()
+        );
     }
 
     #[test]
@@ -9131,7 +9191,8 @@ mod tests {
                         .find(|task| task.kind == TaskKind::Tester)
                         .unwrap();
                     assert_eq!(
-                        task.review_context.as_ref().unwrap().candidate_commit, bogus,
+                        task.review_context.as_ref().unwrap().candidate_commit,
+                        bogus,
                         "the persisted Tester context contradiction is preserved"
                     );
                 }),
@@ -9153,7 +9214,8 @@ mod tests {
                         .find(|task| task.kind == TaskKind::Review && task.role == "documentation")
                         .unwrap();
                     assert_eq!(
-                        task.review_context.as_ref().unwrap().candidate_commit, bogus,
+                        task.review_context.as_ref().unwrap().candidate_commit,
+                        bogus,
                         "the persisted reviewer context contradiction is preserved"
                     );
                 }),
@@ -9248,7 +9310,11 @@ mod tests {
                 learning.is_failed() && learning.is_relaunchable(),
                 "{name}: Learning is relaunchable Failed"
             );
-            assert_eq!(learning.failure_kind, Some(LearningFailureKind::Generic), "{name}");
+            assert_eq!(
+                learning.failure_kind,
+                Some(LearningFailureKind::Generic),
+                "{name}"
+            );
             assert!(learning.handoff.is_none(), "{name}: no handoff reference");
             assert_eq!(
                 learning.last_failure.as_deref(),
@@ -9294,11 +9360,12 @@ mod tests {
             );
 
             let obstruct_root = project_root.clone();
-            let checker = move |root: &Path, item: &WorkItem, idx: usize, cid: &str, stage: &str| {
-                let real = check_no_expertise_pointer_identity(root, item, idx, cid, stage);
-                obstruct_transaction_commit(&obstruct_root);
-                real
-            };
+            let checker =
+                move |root: &Path, item: &WorkItem, idx: usize, cid: &str, stage: &str| {
+                    let real = check_no_expertise_pointer_identity(root, item, idx, cid, stage);
+                    obstruct_transaction_commit(&obstruct_root);
+                    real
+                };
             let err = prepare_no_expertise_handoff(
                 &store,
                 &project_root,
@@ -9309,19 +9376,26 @@ mod tests {
                 &checker,
             )
             .expect_err("an obstructed first-postflight settlement must surface an error");
-            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json")).ok();
+            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json"))
+                .ok();
 
             let rendered = format!("{err:#}");
             assert!(
                 rendered.contains(&exact),
                 "the complete real `before advancing Learning` contradiction survives byte-for-byte:\n  exact: {exact}\n  rendered: {rendered}"
             );
-            assert_eq!(classify_learning_failure(&err), LearningFailureKind::Generic);
+            assert_eq!(
+                classify_learning_failure(&err),
+                LearningFailureKind::Generic
+            );
             assert!(
-                err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some(),
+                err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                    .is_some(),
                 "the typed Work-model storage failure stays secondary context: {err:#}"
             );
-            assert!(rendered.contains("failed to persist the terminal no-expertise learning record"));
+            assert!(
+                rendered.contains("failed to persist the terminal no-expertise learning record")
+            );
             assert!(
                 store.read_work_item("work-1").unwrap().attempts[0]
                     .learning
@@ -9335,7 +9409,8 @@ mod tests {
         // (2) Final publication contradiction, exact `before publishing the canonical handoff`.
         {
             let tmp = tempfile::TempDir::new().unwrap();
-            let (store, project_root, workspace, _base) = handoff_pending_eligible_fixture(tmp.path());
+            let (store, project_root, workspace, _base) =
+                handoff_pending_eligible_fixture(tmp.path());
             fs::write(workspace.join("residual.txt"), "left over").unwrap();
             let item = store.read_work_item("work-1").unwrap();
             let exact = format!(
@@ -9353,11 +9428,12 @@ mod tests {
             let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let probe = Arc::clone(&published);
             let obstruct_root = project_root.clone();
-            let checker = move |root: &Path, item: &WorkItem, idx: usize, cid: &str, stage: &str| {
-                let real = check_no_expertise_pointer_identity(root, item, idx, cid, stage);
-                obstruct_transaction_commit(&obstruct_root);
-                real
-            };
+            let checker =
+                move |root: &Path, item: &WorkItem, idx: usize, cid: &str, stage: &str| {
+                    let real = check_no_expertise_pointer_identity(root, item, idx, cid, stage);
+                    obstruct_transaction_commit(&obstruct_root);
+                    real
+                };
             let publisher = move |_h: &crate::follow_up::LearnerHandoffV1| {
                 probe.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(sample_handoff_ref())
@@ -9374,7 +9450,8 @@ mod tests {
                 publisher,
             )
             .expect_err("an obstructed final-publication settlement must surface an error");
-            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json")).ok();
+            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json"))
+                .ok();
 
             assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
             let rendered = format!("{err:#}");
@@ -9382,20 +9459,31 @@ mod tests {
                 rendered.contains(&exact),
                 "the complete real `before publishing the canonical handoff` contradiction survives byte-for-byte:\n  exact: {exact}\n  rendered: {rendered}"
             );
-            assert_eq!(classify_learning_failure(&err), LearningFailureKind::Generic);
-            assert!(err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some());
-            assert!(rendered.contains("failed to persist the terminal no-expertise learning record"));
-            assert!(store.read_work_item("work-1").unwrap().attempts[0]
-                .learning
-                .as_ref()
-                .unwrap()
-                .is_handoff_pending());
+            assert_eq!(
+                classify_learning_failure(&err),
+                LearningFailureKind::Generic
+            );
+            assert!(
+                err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                    .is_some()
+            );
+            assert!(
+                rendered.contains("failed to persist the terminal no-expertise learning record")
+            );
+            assert!(
+                store.read_work_item("work-1").unwrap().attempts[0]
+                    .learning
+                    .as_ref()
+                    .unwrap()
+                    .is_handoff_pending()
+            );
         }
 
         // (3) Publisher failure, exact typed handoff-publication message.
         {
             let tmp = tempfile::TempDir::new().unwrap();
-            let (store, project_root, _workspace, _base) = handoff_pending_eligible_fixture(tmp.path());
+            let (store, project_root, _workspace, _base) =
+                handoff_pending_eligible_fixture(tmp.path());
             let obstruct_root = project_root.clone();
             let typed_message = "write handoff: disk full";
             // Capture the complete Display diagnostic of the concrete typed error before
@@ -9422,7 +9510,8 @@ mod tests {
                 publisher,
             )
             .expect_err("an obstructed publication-failure settlement must surface an error");
-            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json")).ok();
+            std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json"))
+                .ok();
 
             let rendered = format!("{err:#}");
             assert!(
@@ -9440,13 +9529,20 @@ mod tests {
                     .any(|cause| cause.is::<crate::transcript_pump::TranscriptPumpError>()),
                 "the typed publication cause stays downcastable: {rendered}"
             );
-            assert!(err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some());
-            assert!(rendered.contains("failed to persist the terminal no-expertise learning record"));
-            assert!(store.read_work_item("work-1").unwrap().attempts[0]
-                .learning
-                .as_ref()
-                .unwrap()
-                .is_handoff_pending());
+            assert!(
+                err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                    .is_some()
+            );
+            assert!(
+                rendered.contains("failed to persist the terminal no-expertise learning record")
+            );
+            assert!(
+                store.read_work_item("work-1").unwrap().attempts[0]
+                    .learning
+                    .as_ref()
+                    .unwrap()
+                    .is_handoff_pending()
+            );
         }
     }
 
@@ -9580,7 +9676,10 @@ mod tests {
         mark_no_expertise(&store);
         let handoff_path =
             project_root.join(crate::learner::handoff_path_rel("work-1", "attempt-1"));
-        assert!(!handoff_path.exists(), "no canonical handoff exists before the run");
+        assert!(
+            !handoff_path.exists(),
+            "no canonical handoff exists before the run"
+        );
 
         let root = project_root.clone();
         let bogus = "0000000000000000000000000000000000000000";
@@ -9727,9 +9826,9 @@ mod tests {
 
         let handoff = dummy_learner_handoff();
         let publisher = |_h: &crate::follow_up::LearnerHandoffV1| {
-            Err(anyhow::Error::new(crate::transcript_pump::TranscriptPumpError::new(
-                "write handoff: disk full",
-            )))
+            Err(anyhow::Error::new(
+                crate::transcript_pump::TranscriptPumpError::new("write handoff: disk full"),
+            ))
         };
         publish_no_expertise_handoff(
             &store,
@@ -9747,13 +9846,18 @@ mod tests {
         let stored = store.read_work_item("work-1").unwrap();
         let learning = stored.attempts[0].learning.as_ref().unwrap();
         assert!(learning.is_failed() && learning.is_relaunchable());
-        assert_eq!(learning.failure_kind, Some(LearningFailureKind::TranscriptPump));
+        assert_eq!(
+            learning.failure_kind,
+            Some(LearningFailureKind::TranscriptPump)
+        );
         assert!(learning.handoff.is_none());
-        assert!(learning
-            .last_failure
-            .as_deref()
-            .unwrap_or_default()
-            .contains("persisting it failed"));
+        assert!(
+            learning
+                .last_failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("persisting it failed")
+        );
         assert_eq!(stored.title, "post-pending change");
         assert_eq!(stored.merge_candidates[0].candidate_commit, base);
     }
@@ -9810,7 +9914,8 @@ mod tests {
             "an identity contradiction stays Generic without inventing a downcastable type"
         );
         assert!(
-            err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some(),
+            err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                .is_some(),
             "the store failure stays structurally discoverable: {err:#}"
         );
         let rendered = format!("{err:#}");
@@ -9868,16 +9973,24 @@ mod tests {
         std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json")).ok();
 
         assert!(!published.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(classify_learning_failure(&err), LearningFailureKind::Generic);
-        assert!(err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some());
+        assert_eq!(
+            classify_learning_failure(&err),
+            LearningFailureKind::Generic
+        );
+        assert!(
+            err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                .is_some()
+        );
         let rendered = format!("{err:#}");
         assert!(rendered.contains("failed to persist the terminal no-expertise learning record"));
         assert!(rendered.contains("pointer-identity check failed"));
-        assert!(store.read_work_item("work-1").unwrap().attempts[0]
-            .learning
-            .as_ref()
-            .unwrap()
-            .is_handoff_pending());
+        assert!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .is_handoff_pending()
+        );
     }
 
     #[test]
@@ -9915,17 +10028,25 @@ mod tests {
             LearningFailureKind::TranscriptPump,
             "the typed publication failure stays the classified primary"
         );
-        assert!(err
-            .chain()
-            .any(|cause| cause.is::<crate::transcript_pump::TranscriptPumpError>()));
-        assert!(err.downcast_ref::<crate::work_model::WorkModelStorageError>().is_some());
-        assert!(format!("{err:#}")
-            .contains("failed to persist the terminal no-expertise learning record"));
-        assert!(store.read_work_item("work-1").unwrap().attempts[0]
-            .learning
-            .as_ref()
-            .unwrap()
-            .is_handoff_pending());
+        assert!(
+            err.chain()
+                .any(|cause| cause.is::<crate::transcript_pump::TranscriptPumpError>())
+        );
+        assert!(
+            err.downcast_ref::<crate::work_model::WorkModelStorageError>()
+                .is_some()
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("failed to persist the terminal no-expertise learning record")
+        );
+        assert!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .is_handoff_pending()
+        );
     }
 
     #[test]
@@ -9957,8 +10078,10 @@ mod tests {
         // Clear the post-reducer commit obstruction so the durable state can be read.
         std::fs::remove_dir_all(project_root.join(".fluent/work/transactions/work-1.json")).ok();
 
-        assert!(format!("{err:#}")
-            .contains("failed to persist the terminal no-expertise learning record"));
+        assert!(
+            format!("{err:#}")
+                .contains("failed to persist the terminal no-expertise learning record")
+        );
         let learning = store.read_work_item("work-1").unwrap().attempts[0]
             .learning
             .clone()
@@ -9984,8 +10107,10 @@ mod tests {
         std::fs::create_dir_all(handoff_path.parent().unwrap()).unwrap();
         std::fs::write(&handoff_path, b"stale unreferenced handoff bytes").unwrap();
 
-        let run_coder =
-            |request: &LearnerCoderRequest<'_>| -> Result<()> { write_valid_learner_draft(request); Ok(()) };
+        let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
+            write_valid_learner_draft(request);
+            Ok(())
+        };
         let outcome = run_pre_land_learner_outcome(&project_root, &store, &run_coder);
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
@@ -9996,7 +10121,10 @@ mod tests {
         let learning = stored.attempts[0].learning.as_ref().unwrap();
         assert!(learning.is_succeeded(), "the rerun settles Succeeded");
         assert!(learning.runs >= 2, "the Learner reran from HandoffPending");
-        let handoff_ref = learning.handoff.as_ref().expect("a validated handoff reference");
+        let handoff_ref = learning
+            .handoff
+            .as_ref()
+            .expect("a validated handoff reference");
         // The stale unreferenced file was atomically replaced by the validated handoff.
         let loaded = crate::learner::load_verified_handoff(&project_root, handoff_ref).unwrap();
         assert_eq!(loaded.source_work_item_id, "work-1");
@@ -10038,8 +10166,10 @@ mod tests {
             publisher,
         )
         .expect_err("the obstructed item-record apply must surface an error");
-        assert!(format!("{err:#}")
-            .contains("failed to persist the terminal no-expertise learning record"));
+        assert!(
+            format!("{err:#}")
+                .contains("failed to persist the terminal no-expertise learning record")
+        );
 
         // Restore write access; the next supported read finishes the durable journal.
         std::fs::set_permissions(&items_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -10050,7 +10180,10 @@ mod tests {
             "recovery finishes the durable journal to Succeeded"
         );
         assert_eq!(learning.runs, 1, "recovery does not rerun the Learner");
-        let handoff_ref = learning.handoff.as_ref().expect("the exact digest-bearing reference");
+        let handoff_ref = learning
+            .handoff
+            .as_ref()
+            .expect("the exact digest-bearing reference");
         assert_eq!(
             handoff_ref.path,
             crate::learner::handoff_path_rel("work-1", "attempt-1")
@@ -10101,8 +10234,7 @@ mod tests {
         let mut_store = Arc::clone(&store);
         let mut_handle = thread::spawn(move || {
             let result = mut_store.mutate_work_item("work-1", |fresh| {
-                fresh.attempts[0].tasks[0].output.as_mut().unwrap().commit =
-                    "moved".to_string();
+                fresh.attempts[0].tasks[0].output.as_mut().unwrap().commit = "moved".to_string();
                 fresh.merge_candidates[0].candidate_commit = "moved".to_string();
                 Ok(())
             });
@@ -10125,7 +10257,14 @@ mod tests {
         let stored = store.read_work_item("work-1").unwrap();
         assert!(stored.attempts[0].learning.as_ref().unwrap().is_succeeded());
         assert_eq!(
-            stored.attempts[0].learning.as_ref().unwrap().handoff.as_ref().unwrap().path,
+            stored.attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .handoff
+                .as_ref()
+                .unwrap()
+                .path,
             "handoff.json"
         );
         assert_eq!(stored.merge_candidates[0].candidate_commit, base);

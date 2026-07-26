@@ -5059,7 +5059,9 @@ fn attempt_task_review_round(attempt_id: &str, task: &Task) -> Option<usize> {
             if suffix.is_empty() {
                 Some(1)
             } else {
-                suffix.strip_prefix('-').and_then(|n| n.parse::<usize>().ok())
+                suffix
+                    .strip_prefix('-')
+                    .and_then(|n| n.parse::<usize>().ok())
             }
         }
         _ => None,
@@ -9661,7 +9663,9 @@ random banner prose that must be ignored
     fn frozen_store(learning: AttemptLearning) -> (tempfile::TempDir, WorkModelStore) {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = WorkModelStore::new(tmp.path());
-        store.create_work_item(&no_expertise_frozen_item(learning)).unwrap();
+        store
+            .create_work_item(&no_expertise_frozen_item(learning))
+            .unwrap();
         (tmp, store)
     }
 
@@ -9709,7 +9713,10 @@ random banner prose that must be ignored
                 "commit-initial",
                 "a rejected reviewed-SHA move leaves the aggregate unchanged"
             );
-            assert_eq!(reread.merge_candidates[0].candidate_commit, "commit-initial");
+            assert_eq!(
+                reread.merge_candidates[0].candidate_commit,
+                "commit-initial"
+            );
 
             // Final-round reviewer context moves: rejected (validation permits it).
             let err = store
@@ -9722,7 +9729,10 @@ random banner prose that must be ignored
                     Ok(())
                 })
                 .unwrap_err();
-            assert!(is_frozen_identity_error(&err), "reviewer context move: {err:?}");
+            assert!(
+                is_frozen_identity_error(&err),
+                "reviewer context move: {err:?}"
+            );
 
             // The no-expertise policy that protects the pointers may not change.
             let err = store
@@ -9742,11 +9752,13 @@ random banner prose that must be ignored
                 Ok(())
             })
             .unwrap();
-        assert!(store.read_work_item("work-1").unwrap().attempts[0]
-            .learning
-            .as_ref()
-            .unwrap()
-            .is_succeeded());
+        assert!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .learning
+                .as_ref()
+                .unwrap()
+                .is_succeeded()
+        );
 
         // An unrelated field update is allowed under an exposed handoff.
         store
@@ -9795,11 +9807,15 @@ random banner prose that must be ignored
 
         let err = store
             .mutate_work_item("work-1", |item| {
-                item.merge_candidates[0].merge_state.merged_commit = Some("commit-other".to_string());
+                item.merge_candidates[0].merge_state.merged_commit =
+                    Some("commit-other".to_string());
                 Ok(())
             })
             .unwrap_err();
-        assert!(is_frozen_identity_error(&err), "mismatched merged_commit: {err:?}");
+        assert!(
+            is_frozen_identity_error(&err),
+            "mismatched merged_commit: {err:?}"
+        );
         assert!(
             store.read_work_item("work-1").unwrap().merge_candidates[0]
                 .merge_state
