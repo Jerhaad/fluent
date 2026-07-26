@@ -1571,6 +1571,135 @@ exit 0
 }
 
 #[test]
+#[serial]
+fn committed_init_instructions_reach_first_candidate_and_land() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let init = fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&main_dir)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(init.status.success());
+    assert!(
+        String::from_utf8_lossy(&init.stderr).contains("AGENTS.md"),
+        "fresh init should identify the instruction file to commit"
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "First journey"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let bin_dir = tmp.path().join("bin-first-journey");
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"first journey","follow_ups":[]}"#),
+    );
+    let rejected = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(
+        !rejected.status.success(),
+        "the first Writer should wait for the instruction commit"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("AGENTS.md"),
+        "the Writer rejection should name the init-created instruction file"
+    );
+
+    git::run(&main_dir, &["add", "AGENTS.md"], "stage init instructions").unwrap();
+    git::run(
+        &main_dir,
+        &["commit", "-m", "Add Fluent instructions"],
+        "commit init instructions",
+    )
+    .unwrap();
+    let source_baseline = git_head(&main_dir);
+
+    let retry = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "the same planned Writer should succeed after the commit: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&retry.stdout)
+            .contains("Merge Candidate attempt-1-merge-candidate is ready")
+    );
+
+    let candidate = main_dir.join("../work-6-work-1-attempt-1");
+    let candidate_instructions = fs::read_to_string(candidate.join("AGENTS.md")).unwrap();
+    assert!(candidate_instructions.contains("<!-- BEGIN fluent -->"));
+    assert!(candidate_instructions.contains("<!-- END fluent -->"));
+
+    let item = work_item_value(&main_dir, "work-1");
+    let write = item["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "write")
+        .unwrap();
+    assert_eq!(
+        write["output"]["base_commit"], source_baseline,
+        "the first candidate should bind the committed instruction source"
+    );
+    assert_no_non_fluent_changes(&main_dir);
+
+    let land = fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(
+        land.status.success(),
+        "public land should complete: stdout={} stderr={}",
+        String::from_utf8_lossy(&land.stdout),
+        String::from_utf8_lossy(&land.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&land.stdout)
+            .contains("Merged Merge Candidate attempt-1-merge-candidate")
+    );
+    assert!(
+        fs::read_to_string(main_dir.join("AGENTS.md"))
+            .unwrap()
+            .contains("<!-- BEGIN fluent -->")
+    );
+    assert_no_non_fluent_changes(&main_dir);
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+}
+
+#[test]
 fn craft_section_names_skill_and_lifecycle_stages() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
