@@ -1,6 +1,6 @@
 # Fluent – a self improving software factory
 
-Fluent is a factory that autonomously turns your ideas, bug reports, user feedback, production logs, and agent traces into working software.
+Fluent is a factory that autonomously turns your team's vision, ideas, bug reports, user feedback, production logs, and agent traces into working software.
 
 <p align="center">
   <picture>
