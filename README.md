@@ -18,9 +18,9 @@ You use the factory through the Fluent [skill](https://agentskills.io/) in Codex
 npx skills add mrinalwadhwa/fluent --skill fluent  # currently macOS only
 ```
 
-Use the command above to install the Fluent skill, then start your coding agent in the project folder you want Fluent to work on.
+Use the command above to install the Fluent skill. Start your coding agent in the project folder you want Fluent to work on, then ask it to use Fluent and describe what you want to explore, build, fix, or improve.
 
-Ask it to use Fluent and describe what you want to explore, build, fix, or improve. The first invocation sets up Fluent for that project and starts shaping the work with you. You can also invoke the skill explicitly: `$fluent` in Codex, `/fluent` in Claude Code, or `/skill:fluent` in Pi.
+The first invocation sets up Fluent for that project and starts shaping the work with you. You can also invoke the skill explicitly: `$fluent` in Codex, `/fluent` in Claude Code, or `/skill:fluent` in Pi.
 
 ## How Fluent works
 
