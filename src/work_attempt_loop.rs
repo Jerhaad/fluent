@@ -6513,15 +6513,24 @@ mod tests {
 
     #[test]
     fn checked_required_progress_admits_review_pass() {
-        // Advancement gates B2 (positive): the section exactly matches the manifest
-        // with every entry checked and carrying evidence, so a passing review
-        // advances to a ready Merge Candidate and the Learner runs.
+        // Attempt advancement B1: the required manifest is complete and the only
+        // extra top-level rows are checked legacy review follow-ups. Passing Tester
+        // and reviewer artifacts therefore advance to a ready Merge Candidate
+        // instead of planning another Writer, and the Learner runs.
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, project_root, _workspace, _base) = make_learner_passing_fixture(tmp.path(), 1);
         mark_required_progress(
             &store,
             &project_root,
-            "## Required completion\n\n- [x] step-1 — Do the thing; Evidence: src/x.rs\n",
+            concat!(
+                "## Required completion\n\n",
+                "- [x] Address review finding: Keep required ids stable\n",
+                "  - commit abc123\n",
+                "  - Evidence: src/work_model.rs\n",
+                "- [x] step-1 — Do the thing; Evidence: src/x.rs\n",
+                "- [x] Address review finding: Preserve follow-up history\n",
+                "  - commit def456\n",
+            ),
         );
 
         let run_coder = draft_only_coder(r#"{"learning_summary":"learned","follow_ups":[]}"#);
@@ -6540,7 +6549,18 @@ mod tests {
 
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
-            "checked required progress admits the pass; got {outcome:?}"
+            "checked legacy follow-ups do not plan another Writer; got {outcome:?}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].review_state,
+            Some(AttemptReviewState::Passed),
+            "the Attempt records the passing review state"
+        );
+        assert_eq!(
+            stored.merge_candidates.len(),
+            1,
+            "the pass creates one ready Merge Candidate"
         );
     }
 
