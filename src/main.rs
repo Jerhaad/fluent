@@ -1523,6 +1523,13 @@ fn cmd_init(cwd: &Path) -> Result<()> {
     if let Err(e) = seed_agent_instructions(cwd) {
         eprintln!("  warning: could not seed agent instructions: {e}");
     }
+    match instruction_files_requiring_git_resolution(cwd) {
+        Ok(paths) if !paths.is_empty() => {
+            eprintln!("{}", guidance::after_init_instruction_changes(&paths));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("  warning: could not inspect agent instruction changes: {e}"),
+    }
 
     eprintln!();
     eprintln!("  fluent keeps its learned project notes and test config in .fluent/ and");
@@ -1633,10 +1640,38 @@ fn seed_agent_instructions(cwd: &Path) -> Result<()> {
             String::new()
         };
         let updated = upsert_craft_block(&content);
-        fs::write(target, updated)?;
+        if updated != content {
+            fs::write(target, updated)?;
+        }
     }
 
     Ok(())
+}
+
+fn instruction_files_requiring_git_resolution(cwd: &Path) -> Result<Vec<String>> {
+    let inside_worktree = git::run_raw(cwd, &["rev-parse", "--is-inside-work-tree"])?;
+    if !inside_worktree.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let mut changed = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let output = git::run_raw(
+            cwd,
+            &["status", "--porcelain", "--untracked-files=all", "--", name],
+        )?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git status failed while checking {}: {}",
+                name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if !output.stdout.is_empty() {
+            changed.push(name.to_string());
+        }
+    }
+    Ok(changed)
 }
 
 fn upsert_craft_block(content: &str) -> String {

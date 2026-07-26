@@ -387,11 +387,23 @@ fn preflight_write_worktree(
         }
         ensure_same_git_repository(project_root, workspace_path)?;
         ensure_registered_worktree(project_root, workspace_path)?;
-    } else if git_branch_exists(project_root, branch_name)? {
-        bail!(
-            "Task branch {branch_name:?} already exists but workspace {} is missing; remove or rebind the branch before running the Task",
-            workspace_path.display()
-        );
+    } else {
+        let source_status = git::non_fluent_worktree_status(project_root)?;
+        if !source_status.is_empty() {
+            bail!(
+                "Source checkout {} has uncommitted changes outside .fluent/:\n{}\n\
+                 commit or revert these paths before retrying the Writer; candidate worktrees \
+                 use committed Git state",
+                project_root.display(),
+                source_status
+            );
+        }
+        if git_branch_exists(project_root, branch_name)? {
+            bail!(
+                "Task branch {branch_name:?} already exists but workspace {} is missing; remove or rebind the branch before running the Task",
+                workspace_path.display()
+            );
+        }
     }
     Ok(())
 }

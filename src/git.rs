@@ -110,6 +110,35 @@ pub fn run_raw(cwd: &Path, args: &[&str]) -> Result<Output> {
     run_with_lock_retry(|| build_command(cwd, args))
 }
 
+/// Return staged, unstaged, and untracked changes outside `.fluent/`.
+///
+/// Keep Git's porcelain diagnostic intact so callers can name every path without
+/// maintaining a second parser for quoted path syntax.
+pub fn non_fluent_worktree_status(cwd: &Path) -> Result<String> {
+    let output = run_raw(
+        cwd,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            ".",
+            ":(exclude).fluent",
+        ],
+    )?;
+    if !output.status.success() {
+        bail!(
+            "git status failed (exit {}) while checking source checkout status\n  cwd: {}\n{}",
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
 /// Run `git <args>` with byte input on stdin and check the exit status.
 pub fn run_with_stdin(cwd: &Path, args: &[&str], input: &[u8], action: &str) -> Result<()> {
     let mut child = build_command(cwd, args)

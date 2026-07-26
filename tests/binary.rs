@@ -1309,6 +1309,268 @@ fn init_updates_craft_section_in_place_idempotently() {
 }
 
 #[test]
+fn init_names_instruction_changes_that_require_git_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    init_git_repo(&project);
+    fs::write(project.join("AGENTS.md"), "# Agent instructions\n").unwrap();
+    fs::write(
+        project.join("CLAUDE.md"),
+        "<!-- BEGIN fluent -->\nold guidance\n<!-- END fluent -->\n",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &["add", "AGENTS.md", "CLAUDE.md"],
+        "stage instructions",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add agent instructions"],
+        "commit instructions",
+    )
+    .unwrap();
+
+    let output = fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("AGENTS.md") && stderr.contains("CLAUDE.md"),
+        "init should name every changed instruction file: {stderr}"
+    );
+    assert!(
+        stderr.contains("commit or revert"),
+        "init should tell the user how to resolve the changes: {stderr}"
+    );
+    assert!(
+        stderr.contains("candidate worktrees") && stderr.contains("committed Git state"),
+        "init should explain why resolution is required: {stderr}"
+    );
+}
+
+#[test]
+fn reinit_with_current_instructions_reports_no_new_instruction_changes() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    init_git_repo(&project);
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .arg("init")
+        .assert()
+        .success();
+    git::run(&project, &["add", "AGENTS.md"], "stage instructions").unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add Fluent instructions"],
+        "commit instructions",
+    )
+    .unwrap();
+    let before = fs::read(project.join("AGENTS.md")).unwrap();
+
+    let output = fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read(project.join("AGENTS.md")).unwrap(),
+        before,
+        "current managed instructions must remain byte-for-byte unchanged"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("commit or revert"),
+        "reinit should not claim current instructions need a new resolution: {stderr}"
+    );
+}
+
+#[test]
+fn first_writer_rejects_uncommitted_init_instructions_before_side_effects() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Dirty source"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    fs::write(
+        main_dir.join("AGENTS.md"),
+        "uncommitted init instructions\n",
+    )
+    .unwrap();
+    fs::write(main_dir.join("CLAUDE.md"), "staged init instructions\n").unwrap();
+    git::run(&main_dir, &["add", "CLAUDE.md"], "stage instruction change").unwrap();
+    fs::write(main_dir.join("notes.txt"), "untracked source note\n").unwrap();
+    fs::create_dir_all(main_dir.join(".fluent/expertise")).unwrap();
+    fs::write(
+        main_dir.join(".fluent/expertise/local.md"),
+        "allowed Fluent state\n",
+    )
+    .unwrap();
+
+    let bin_dir = tmp.path().join("bin-dirty-source");
+    let coder_marker = tmp.path().join("coder-launched");
+    write_mock_claude(
+        &bin_dir,
+        &format!(
+            "#!/bin/bash\nprintf launched > '{}'\nexit 0\n",
+            coder_marker.display()
+        ),
+    );
+
+    let output = fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "dirty source should reject the Writer"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for path in ["AGENTS.md", "CLAUDE.md", "notes.txt"] {
+        assert!(
+            stderr.contains(path),
+            "rejection should name dirty path {path}: {stderr}"
+        );
+    }
+    assert!(
+        stderr.contains("candidate worktrees") && stderr.contains("committed Git state"),
+        "rejection should explain the committed-source boundary: {stderr}"
+    );
+    assert!(
+        stderr.contains("commit or revert"),
+        "rejection should name the retryable resolution: {stderr}"
+    );
+
+    let workspace = main_dir.join("../work-6-work-1-attempt-1");
+    assert!(
+        !workspace.exists(),
+        "preflight must not create the worktree"
+    );
+    let branch = git::run_raw(
+        &main_dir,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/work/work-1/attempt-1/attempt-1-write-1",
+        ],
+    )
+    .unwrap();
+    assert!(
+        !branch.status.success(),
+        "preflight must not create the task branch"
+    );
+    assert!(
+        !coder_marker.exists(),
+        "preflight must not launch the coder"
+    );
+
+    let item = work_item_value(&main_dir, "work-1");
+    let attempt = &item["attempts"][0];
+    assert_eq!(attempt["status"], "planned");
+    let task = read_json_path(
+        &main_dir.join(".fluent/work/tasks/work-1/attempt-1/attempt-1-write-1.json"),
+    );
+    assert!(
+        task.get("status").is_none(),
+        "the persisted Task should retain its omitted-default planned status"
+    );
+    assert!(
+        task["output"].is_null(),
+        "preflight must not persist a baseline or output"
+    );
+}
+
+#[test]
+fn first_writer_allows_fluent_only_source_changes() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Fluent state"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    fs::create_dir_all(main_dir.join(".fluent/expertise")).unwrap();
+    fs::write(
+        main_dir.join(".fluent/expertise/local.md"),
+        "uncommitted Fluent state\n",
+    )
+    .unwrap();
+
+    let bin_dir = tmp.path().join("bin-fluent-only");
+    write_mock_claude(
+        &bin_dir,
+        r##"#!/bin/bash
+printf 'writer output\n' > writer-output.txt
+git add writer-output.txt
+git commit -m "Add writer output" >/dev/null
+exit 0
+"##,
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+
+    assert!(
+        main_dir
+            .join("../work-6-work-1-attempt-1/writer-output.txt")
+            .is_file(),
+        "Fluent-only source changes should allow candidate setup and coder launch"
+    );
+}
+
+#[test]
 fn craft_section_names_skill_and_lifecycle_stages() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
