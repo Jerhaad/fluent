@@ -2344,8 +2344,9 @@ impl Attempt {
     /// ignored) and returns the durable reason a review pass must be rejected: a
     /// missing or malformed section, a set that differs from the manifest (a
     /// deleted, unknown, duplicate, or rewritten entry), or an unchecked or
-    /// evidence-less required entry. It is `Ok(())` only when the section is exactly
-    /// the manifest with every entry checked and carrying evidence.
+    /// evidence-less required entry. It is `Ok(())` only when every manifest entry
+    /// is checked with evidence and any extra top-level rows are already-checked
+    /// legacy `Address review finding:` metadata.
     pub fn reconcile_required_progress(&self, source: &str) -> Result<(), String> {
         let Some(contract) = self.progress_contract.as_ref() else {
             return Ok(());
@@ -2354,10 +2355,16 @@ impl Attempt {
             format!("required progress is missing the `{REQUIRED_COMPLETION_HEADING}` section")
         })?;
 
-        // Parse every top-level checklist line; a non-conforming line is malformed.
+        // Parse every top-level checklist line. Existing Attempts may contain
+        // already-checked review follow-ups written by the old prompt; only that
+        // exact historical prefix is ignored. Unchecked follow-ups and every other
+        // non-conforming line still fail closed through the required-entry parser.
         let mut entries = Vec::new();
         for line in section {
             if !line.starts_with("- ") {
+                continue;
+            }
+            if line.starts_with("- [x] Address review finding:") {
                 continue;
             }
             entries.push(parse_required_entry(line)?);
@@ -5494,6 +5501,54 @@ mod tests {
 random banner prose that must be ignored
 ";
         assert!(marked.reconcile_required_progress(ok).is_ok());
+
+        // Already-checked legacy review rows and their nested notes are historical
+        // metadata. They do not change the required manifest or block advancement.
+        let checked_legacy_follow_ups = "\
+## Required completion
+
+- [x] Address review finding: Preserve the schema
+  - commit abc123
+  - Evidence: tests/review.rs
+- [x] step-1 — First; Evidence: src/a.rs
+- [x] Address review finding: Keep compatibility narrow
+  - commit def456
+- [x] step-2 — Second; Evidence: tests/b.rs
+";
+        assert!(
+            marked
+                .reconcile_required_progress(checked_legacy_follow_ups)
+                .is_ok(),
+            "checked legacy review follow-ups are historical metadata"
+        );
+
+        let unchecked_legacy_follow_up = "\
+## Required completion
+
+- [x] step-1 — First; Evidence: src/a.rs
+- [ ] Address review finding: Still unresolved
+- [x] step-2 — Second; Evidence: tests/b.rs
+";
+        assert!(
+            marked
+                .reconcile_required_progress(unchecked_legacy_follow_up)
+                .is_err(),
+            "an unchecked legacy review follow-up must remain blocking"
+        );
+
+        let arbitrary_malformed_row = "\
+## Required completion
+
+- [x] step-1 — First; Evidence: src/a.rs
+- [x] Historical note without the legacy label
+- [x] step-2 — Second; Evidence: tests/b.rs
+";
+        assert!(
+            marked
+                .reconcile_required_progress(arbitrary_malformed_row)
+                .is_err(),
+            "an arbitrary malformed top-level row must remain blocking"
+        );
 
         // Each violation is rejected.
         let cases = [
