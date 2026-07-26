@@ -2462,6 +2462,19 @@ fn build_write_task_prompt_with_workspace(
         ""
     };
     let has_prior_reviews_value = if has_prior_reviews { "yes" } else { "" };
+    let has_prior_reviews_with_required_progress_value =
+        if has_prior_reviews && has_required_progress {
+            "yes"
+        } else {
+            ""
+        };
+    let has_prior_reviews_without_required_progress_value =
+        if has_prior_reviews && !has_required_progress {
+            "yes"
+        } else {
+            ""
+        };
+    let has_no_prior_reviews_value = if has_prior_reviews { "" } else { "yes" };
     let has_progress_md_value = if has_progress_md { "yes" } else { "" };
     let has_project_expertise_index_value = if has_project_expertise_index {
         "yes"
@@ -2499,6 +2512,15 @@ fn build_write_task_prompt_with_workspace(
             ("bootstrap_tester_yaml", bootstrap_yaml_value),
             ("bootstrap_extract_script", bootstrap_extract_value),
             ("has_prior_reviews", has_prior_reviews_value),
+            (
+                "has_prior_reviews_with_required_progress",
+                has_prior_reviews_with_required_progress_value,
+            ),
+            (
+                "has_prior_reviews_without_required_progress",
+                has_prior_reviews_without_required_progress_value,
+            ),
+            ("has_no_prior_reviews", has_no_prior_reviews_value),
             ("has_progress_md", has_progress_md_value),
             ("has_required_progress", has_required_progress_value),
             ("general_expertise_index", &general_expertise_index),
@@ -7897,18 +7919,37 @@ mod tests {
             "the prompt preserves the required manifest while migrating legacy rows; got:\n{prompt}"
         );
 
-        // An unmarked (legacy) Attempt omits the required-progress schema entirely.
+        // An unmarked (legacy) follow-up still separates review findings, then
+        // resumes its ordinary plan checklist without required-progress terms.
         let plain_prompt = build_write_task_prompt_with_workspace(
             &review_item(),
             "attempt-1",
             "attempt-1-write-1",
-            &[],
+            std::slice::from_ref(&review_path),
             None,
             Some(tmp.path()),
         );
         assert!(
             !plain_prompt.contains("## Required completion"),
             "an unmarked Attempt omits the required-progress schema; got:\n{plain_prompt}"
+        );
+        assert!(
+            plain_prompt.contains("## Review follow-ups"),
+            "an unmarked follow-up still separates review findings; got:\n{plain_prompt}"
+        );
+        assert!(
+            plain_prompt.contains("remaining plan steps"),
+            "an unmarked follow-up resumes ordinary plan steps; got:\n{plain_prompt}"
+        );
+        assert!(
+            plain_prompt.contains("first `- [ ]` plan or progress item"),
+            "an unmarked follow-up selects the ordinary checklist after reviews; got:\n{plain_prompt}"
+        );
+        assert!(
+            !plain_prompt.contains("required manifest row")
+                && !plain_prompt.contains("remaining required steps")
+                && !plain_prompt.contains("first `- [ ]` required item"),
+            "an unmarked follow-up omits required-progress terminology; got:\n{plain_prompt}"
         );
     }
 

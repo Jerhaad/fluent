@@ -97,12 +97,18 @@ progress.md contains an authoritative `## Required completion` section the Fluen
 {{else}}
 1. Create progress.md at {{progress_md_path}}: identify the steps in plan.md and turn them into a `- [ ]` to-do checklist.
 {{/if}}
-{{#if has_prior_reviews}}
+{{#if has_prior_reviews_with_required_progress}}
 2. Ensure progress.md has a separate `## Review follow-ups` section outside `## Required completion`.
 3. If `## Required completion` contains legacy top-level `Address review finding:` rows, move each row and all of its nested evidence and commit notes as a unit to `## Review follow-ups`, without re-creating or rewording any required manifest row. Preserve checked findings as historical records and keep unchecked findings unresolved.
 4. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
 5. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
-{{else}}
+{{/if}}
+{{#if has_prior_reviews_without_required_progress}}
+2. Ensure progress.md has a `## Review follow-ups` section.
+3. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining plan steps.
+4. Find the first unchecked review follow-up, or otherwise the first `- [ ]` plan or progress item — that is your next step.
+{{/if}}
+{{#if has_no_prior_reviews}}
 2. Find the first `- [ ]` item — that is your next step.
 {{/if}}
 
