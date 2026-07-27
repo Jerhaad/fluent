@@ -3890,17 +3890,16 @@ Test: src/coder.rs (coder_kind_serializes_pi_as_kebab_case)
 
 ### B1
 
-WHEN fluent resolves the coder, model, and reasoning effort for a role (writer,
-reviewer, or behavior-tests),
-THE SYSTEM SHALL take each from the first source that provides it: a per-run
-`--coder`/`--model` override, then an env var, then the project
+WHEN Fluent creates an Attempt and resolves the coder, model, and reasoning
+effort for a role (writer, reviewer, or behavior-tests),
+THE SYSTEM SHALL take each from the first source that provides it: a
+command-line `--coder`/`--model` override, then an env var, then the project
 `.fluent/config.yaml`, then the user `~/.config/fluent/config.yaml`.
 Test: src/work_model.rs (resolve_coder_mapping_precedence_flag_env_config)
 
 ### B2
 
-WHEN `fluent attempt create` or `fluent attempt run` is given `--coder <kind>` or
-`--model <model>`,
+WHEN `fluent attempt create` is given `--coder <kind>` or `--model <model>`,
 THE SYSTEM SHALL apply it to that attempt, overriding config and env.
 Test: tests/binary.rs (attempt_coder_model_flags_override_config)
 
@@ -3967,6 +3966,44 @@ THE SYSTEM SHALL store the Attempt's coder mapping on the Attempt
 record so it can be inspected via `fluent work-item show <work-item-id>`.
 Test: src/work_model.rs (coder_mapping_round_trips_json)
 Test: src/work_model.rs (attempt_with_coder_mapping_round_trips)
+
+## Attempt coder mapping continuity
+
+### B1
+
+WHEN `fluent attempt run <work-item-id> <attempt-id>` is invoked without an
+explicit coder, model, or effort flag,
+THE SYSTEM SHALL execute the Attempt using its stored coder mapping and leave
+that mapping unchanged even when current configuration or environment values
+differ.
+Test: tests/binary.rs (attempt_run_without_overrides_preserves_stored_coder_mapping)
+
+### B2
+
+WHEN `fluent task run <work-item-id> <attempt-id> <task-id>` is invoked without
+an explicit coder, model, or effort flag,
+THE SYSTEM SHALL execute the Task using the matching entry in the Attempt's
+stored coder mapping and leave every mapping entry unchanged.
+Test: tests/binary.rs (task_run_without_overrides_preserves_stored_coder_mapping)
+
+### B3
+
+WHEN `fluent attempt run` or `fluent task run` is invoked with one or more
+explicit coder, model, or effort flags,
+THE SYSTEM SHALL apply only those supplied fields over the Attempt's stored
+coder mapping, preserve every field not overridden, and store the resulting
+mapping on the Attempt.
+Test: tests/binary.rs (attempt_run_overrides_only_explicit_coder_mapping_fields)
+Test: tests/binary.rs (task_run_overrides_only_explicit_coder_mapping_fields)
+
+### B4
+
+WHEN `fluent attempt run` resumes an Attempt whose next action is a Learner-only
+retry or recovery,
+THE SYSTEM SHALL invoke the Learner with the applicable entry from that
+Attempt's stored coder mapping unless the command supplies an explicit run
+override.
+Test: src/work_attempt_loop.rs (learner_only_resume_uses_attempt_coder_mapping)
 
 ## Pi invocation mechanics
 

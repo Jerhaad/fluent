@@ -5772,6 +5772,94 @@ mod tests {
     }
 
     #[test]
+    fn learner_only_resume_uses_attempt_coder_mapping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, project_root, _workspace, _base) = make_learner_passing_fixture(tmp.path(), 1);
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].coder_mapping.write = crate::work_model::CoderModelPair {
+                    coder: CoderKind::Codex,
+                    model: "stored-learner-model".to_string(),
+                    effort: Some("high".to_string()),
+                };
+                Ok(())
+            })
+            .unwrap();
+
+        let failing_coder =
+            |_request: &LearnerCoderRequest<'_>| -> Result<()> { bail!("learner failed") };
+        let first = interpret_reviews(
+            &project_root,
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            Some(LearnerConfig {
+                run_coder: &failing_coder,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            WorkAttemptRunOutcome::LearnerNotReady {
+                relaunchable: true,
+                ..
+            }
+        ));
+
+        let mut resumed = store.read_work_item("work-1").unwrap();
+        let task_count = resumed.attempts[0].tasks.len();
+        let candidate_id = resumed.merge_candidates[0].id.clone();
+        let observed = RefCell::new(None);
+        let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
+            observed.replace(Some((
+                request.coder_kind,
+                request.model.map(str::to_string),
+                request.effort.map(str::to_string),
+            )));
+            fs::create_dir_all(request.handoff_dir)?;
+            fs::write(
+                request.handoff_dir.join(crate::learner::DRAFT_FILE_NAME),
+                r#"{"learning_summary":"recovered","follow_ups":[]}"#,
+            )?;
+            Ok(())
+        };
+
+        run_learner_step(
+            &store,
+            &project_root,
+            &mut resumed,
+            0,
+            &candidate_id,
+            work_task_executor::LearnerExecutionMode::Capture,
+            &LearnerConfig {
+                run_coder: &run_coder,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.into_inner(),
+            Some((
+                CoderKind::Codex,
+                Some("stored-learner-model".to_string()),
+                Some("high".to_string()),
+            ))
+        );
+        assert_eq!(
+            resumed.attempts[0].tasks.len(),
+            task_count,
+            "Learner-only recovery must not run or plan another Task"
+        );
+        assert!(
+            resumed.attempts[0]
+                .learning
+                .as_ref()
+                .is_some_and(AttemptLearning::is_succeeded)
+        );
+    }
+
+    #[test]
     fn learner_handoff_failure_preserves_composite_diagnostic() {
         // B7: the Learner persists a durable, crash-observable in-progress
         // reservation BEFORE its coder runs and writes the canonical handoff LAST.

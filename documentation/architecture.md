@@ -713,9 +713,10 @@ human recovery remains required. When a relaunchable failure's candidate has
 already merged, the retry runs in handoff-only mode: it serializes against land
 on the land lock, denies expertise writes, and discards any commit it makes, so
 the merged commit and target branch stay unchanged.
-The command persists its resolved coder mapping through a fresh field-level
-Work-model mutation under that same lock; it never writes a whole Work Item
-snapshot captured before the serialization boundary.
+When the command carries explicit coder, model, or effort flags, it persists the
+changed coder mapping through a fresh field-level Work-model mutation under that
+land lock; a flagless recovery leaves the mapping unchanged. It never writes a
+whole Work Item snapshot captured before the serialization boundary.
 After taking the lock, retry re-reads the Attempt and candidate and skips the
 coder when another retry has already persisted success. It never repairs or
 resets the retained candidate before isolation, so malformed or concurrently
@@ -1255,10 +1256,17 @@ which Coder and model run each Task kind (write, review). Tester Tasks
 bypass the coder mapping entirely — they run as a deterministic
 subprocess without a Coder. Configure with per-Task-kind flags like
 `--write-coder pi --write-model qwen3-30b-a3b --review-coder claude`.
-When no per-Task-kind flag is set, `--coder` or `FLUENT_CODER` sets
-all Task kinds to the same Coder. The resolved mapping is stored on
-the Attempt record so different Attempts of the same Work Item can
-use different Coder configurations.
+At Attempt creation, per-role and global CLI flags take precedence over
+environment, project config, user config, and coder defaults. Fluent stores the
+resolved mapping on the Attempt record so different Attempts of the same Work
+Item can use different Coder configurations.
+
+Running or resuming an existing Attempt or one of its Tasks starts from that
+stored mapping. A flagless `attempt run` or `task run` does not resolve config or
+environment again and performs no mapping write. Explicit run flags overlay only
+their named fields; Fluent persists a changed mapping through a fresh
+field-level Work-model mutation before execution. Learner-only recovery reads
+the Writer entry from the same persisted Attempt mapping.
 
 Claude sessions use `claude -p --append-system-prompt` with stream-json
 output. Sandboxed Claude sessions run inside the macOS Seatbelt profile
