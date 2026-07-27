@@ -2542,10 +2542,11 @@ fn build_coder_sandbox_with_codex_home(
     let home = std::env::var("HOME").unwrap_or_default();
     let mut roots = vec![working_dir.to_path_buf()];
     roots.extend(additional_writable_roots.iter().cloned());
-    let profile = os::render_profile_for_access_for_coder_with_codex_home(
+    let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
         resolver,
         &home,
         &roots,
+        &[],
         &[],
         coder_kind,
         codex_home,

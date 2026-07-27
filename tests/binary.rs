@@ -20799,6 +20799,64 @@ printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
     (source_home, bin_dir, invocation_log)
 }
 
+fn prepare_strict_codex_worker_home_fixture(
+    tmp: &TempDir,
+    fixture_name: &str,
+    exec_body: &str,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    let (source_home, bin_dir, invocation_log) =
+        prepare_codex_worker_home_fixture(tmp, fixture_name, exec_body);
+    let alias_parent = tmp.path().join(format!("aliases-{fixture_name}"));
+    fs::create_dir_all(&alias_parent).unwrap();
+    let source_alias = alias_parent.join("source-codex-home");
+    let temporary_root = tmp.path().join(format!("worker-temp-real-{fixture_name}"));
+    fs::create_dir_all(&temporary_root).unwrap();
+    let temporary_alias = alias_parent.join("worker-temp");
+    #[cfg(unix)]
+    {
+        symlink(&source_home, &source_alias).unwrap();
+        symlink(&temporary_root, &temporary_alias).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&source_alias).unwrap();
+        fs::create_dir_all(&temporary_alias).unwrap();
+    }
+
+    write_mock_executable(
+        &bin_dir,
+        "sandbox-exec",
+        r##"#!/bin/bash
+set -euo pipefail
+trap 'printf "strict-failed=%s\\n" "$BASH_COMMAND" >> "$FLUENT_TEST_CODEX_INVOCATIONS"' ERR
+if [ "$#" -lt 4 ] || [ "$1" != "-f" ] || [ "$3" != "codex" ]; then
+  echo "unexpected sandbox-exec invocation: $*" >&2
+  exit 64
+fi
+PROFILE="$2"
+CANONICAL_SOURCE_HOME=$(cd "$FLUENT_TEST_SOURCE_CODEX_HOME" && pwd -P)
+CANONICAL_WORKER_HOME=$(cd "$CODEX_HOME" && pwd -P)
+test "$CODEX_HOME" = "$CANONICAL_WORKER_HOME"
+grep -Fq "(allow file-write* (subpath \"$CODEX_HOME\"))" "$PROFILE"
+grep -Fq "(deny file-read* (subpath \"$CANONICAL_SOURCE_HOME\"))" "$PROFILE"
+grep -Fq "(deny file-write* (subpath \"$CANONICAL_SOURCE_HOME\"))" "$PROFILE"
+if grep -Fq '(allow file-write* (subpath "/private/var/folders"))' "$PROFILE" || \
+   grep -Fq '(allow file-write* (subpath "/private/tmp"))' "$PROFILE"; then
+  echo "strict profile restores shared temporary-directory writes" >&2
+  exit 1
+fi
+printf 'strict=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+shift 3
+exec "$@"
+"##,
+    );
+
+    (source_alias, bin_dir, invocation_log, temporary_alias)
+}
+
 fn assert_codex_worker_home_was_cleaned(source_home: &Path, invocation_log: &Path) {
     let invocations = fs::read_to_string(invocation_log).unwrap();
     let worker_home = invocations
@@ -20953,6 +21011,187 @@ git rebase "$TARGET" 2>/dev/null"##,
         .assert()
         .success();
 
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
+#[test]
+fn autonomous_codex_learner_uses_canonical_worker_home_in_strict_profile() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let (source_home, bin_dir, invocation_log, temporary_alias) =
+        prepare_strict_codex_worker_home_fixture(
+            &tmp,
+            "strict-learner",
+            r##"PROMPT="${!#}"
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | sed -n 's#.*\(/[^ ]*follow-up-draft\.json\).*#\1#p')
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT"
+fi"##,
+        );
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+
+    create_completed_work_attempt(&tmp, &main_dir);
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["write"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("TMPDIR", &temporary_alias)
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_ALIAS_TMPDIR", &temporary_alias)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    assert!(
+        fs::read_to_string(&invocation_log)
+            .unwrap()
+            .contains("strict=")
+    );
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
+#[test]
+fn autonomous_codex_rebase_uses_canonical_worker_home_in_strict_profile() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let (source_home, bin_dir, invocation_log, temporary_alias) =
+        prepare_strict_codex_worker_home_fixture(
+            &tmp,
+            "strict-rebase",
+            r##"PROMPT="${!#}"
+TARGET=$(printf '%s' "$PROMPT" | sed -n 's/.*onto `\([^`]*\)`.*/\1/p')
+git rebase "$TARGET" 2>/dev/null"##,
+        );
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Strict Codex rebase",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+    commit_file(
+        &main_dir,
+        "target-only.txt",
+        "target advanced\n",
+        "Advance target",
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+            "--coder",
+            "codex",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("TMPDIR", &temporary_alias)
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_ALIAS_TMPDIR", &temporary_alias)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    assert!(
+        fs::read_to_string(&invocation_log)
+            .unwrap()
+            .contains("strict=")
+    );
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
+#[test]
+fn canonical_worker_home_learner_retry_consumes_no_writer_round() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let retry_marker = tmp.path().join("strict-learner-retry");
+    let (source_home, bin_dir, invocation_log, temporary_alias) =
+        prepare_strict_codex_worker_home_fixture(
+            &tmp,
+            "strict-learner-retry",
+            &format!(
+                r##"PROMPT="${{!#}}"
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  if [ ! -f "{0}" ]; then touch "{0}"; exit 1; fi
+  DRAFT=$(printf '%s' "$PROMPT" | sed -n 's#.*\(/[^ ]*follow-up-draft\.json\).*#\1#p')
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{{"learning_summary":"retried","follow_ups":[]}}' > "$DRAFT"
+fi"##,
+                retry_marker.display(),
+            ),
+        );
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+
+    create_completed_work_attempt(&tmp, &main_dir);
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["write"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&main_dir)
+            .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin_dir))
+            .env("TMPDIR", &temporary_alias)
+            .env("CODEX_HOME", &source_home)
+            .env("FLUENT_TEST_ALIAS_TMPDIR", &temporary_alias)
+            .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+            .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+            .assert()
+            .success();
+    }
+
+    let attempt = work_item_value(&main_dir, "work-1")["attempts"][0].clone();
+    assert_eq!(attempt["learning"]["status"], "succeeded");
+    assert_eq!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1,
+        "retry must not consume another Writer round"
+    );
     assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
 }
 
