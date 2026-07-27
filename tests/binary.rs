@@ -281,7 +281,9 @@ fn merge_candidate_land_model_override_retains_stored_effort() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-land-mapping-model-override");
-    let invocation_log = tmp.path().join("land-mapping-model-override-invocation.log");
+    let invocation_log = tmp
+        .path()
+        .join("land-mapping-model-override-invocation.log");
     let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
     write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
     write_mock_sandbox_exec(&bin_dir);
@@ -324,7 +326,9 @@ fn merge_candidate_land_effort_override_retains_stored_model() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-land-mapping-effort-override");
-    let invocation_log = tmp.path().join("land-mapping-effort-override-invocation.log");
+    let invocation_log = tmp
+        .path()
+        .join("land-mapping-effort-override-invocation.log");
     let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
     write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
     write_mock_sandbox_exec(&bin_dir);
