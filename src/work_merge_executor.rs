@@ -2542,15 +2542,19 @@ fn build_coder_sandbox_with_codex_home(
     let home = std::env::var("HOME").unwrap_or_default();
     let mut roots = vec![working_dir.to_path_buf()];
     roots.extend(additional_writable_roots.iter().cloned());
-    let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
-        resolver,
-        &home,
-        &roots,
-        &[],
-        &[],
-        coder_kind,
-        codex_home,
-    )?;
+    let profile = if let Some(codex_home) = codex_home {
+        os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+            resolver,
+            &home,
+            &roots,
+            &[],
+            &[],
+            coder_kind,
+            Some(codex_home),
+        )?
+    } else {
+        os::render_profile_for_access_for_coder(resolver, &home, &roots, &[], coder_kind)?
+    };
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))
 }
@@ -2681,6 +2685,30 @@ mod tests {
     use crate::content::ContentResolver;
     use crate::work_model::WorkItemAbandonment;
     use crate::work_model::{AttemptReviewState, AttemptStatus, TaskOutput, TaskStatus, WorkItem};
+
+    #[test]
+    fn non_codex_rebase_sandbox_retains_shared_temp_write_grants() {
+        let workspace = tempfile::tempdir().unwrap();
+        let resolver = ContentResolver::new(None);
+        let (_sandbox, profile) = build_coder_sandbox_with_codex_home(
+            CoderKind::Claude,
+            &resolver,
+            workspace.path(),
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(profile.unwrap().path).unwrap();
+        assert!(
+            content.contains("(allow file-write* (subpath \"/private/var/folders\"))"),
+            "non-Codex rebases retain the standard shared macOS temp grant: {content}"
+        );
+        assert!(
+            content.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+            "non-Codex rebases retain the standard shared /private/tmp grant: {content}"
+        );
+    }
 
     #[test]
     fn rebase_agent_installs_resolved_pump_config() {
