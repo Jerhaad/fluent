@@ -113,6 +113,12 @@ esac
 printf '%s\n' '{"type":"result","subtype":"success","result":"done","session_id":"mock"}'
 MOCK_SCRIPT
   chmod +x "${MOCK_BIN}/codex"
+  cat > "${MOCK_BIN}/sandbox-exec" <<'MOCK_SCRIPT'
+#!/usr/bin/env bash
+if [[ "$1" == "-f" ]]; then shift 2; fi
+exec "$@"
+MOCK_SCRIPT
+  chmod +x "${MOCK_BIN}/sandbox-exec"
 }
 
 assert_contains() {

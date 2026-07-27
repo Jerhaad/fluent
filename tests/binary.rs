@@ -14964,7 +14964,7 @@ fn write_mock_sandbox_exec(bin_dir: &Path) {
     let sandbox_path = bin_dir.join("sandbox-exec");
     fs::write(
         &sandbox_path,
-        "#!/bin/bash\nprintf 'used' > \"${SANDBOX_EXEC_LOG:?}\"\nif [ \"$1\" = \"-f\" ]; then shift 2; fi\nexec \"$@\"\n",
+        "#!/bin/bash\nif [ -n \"${SANDBOX_EXEC_LOG:-}\" ]; then printf 'used' > \"$SANDBOX_EXEC_LOG\"; fi\nif [ \"$1\" = \"-f\" ]; then shift 2; fi\nexec \"$@\"\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -19975,6 +19975,11 @@ fn replace_coder_config(main_dir: &Path) {
 }
 
 fn install_failing_coder_stubs(bin_dir: &Path) {
+    // Autonomous Codex must retain its Seatbelt boundary even when the caller
+    // requests --no-sandbox. The test fixture supplies a transparent launcher
+    // so the deterministic coder failure, rather than host sandbox support,
+    // remains the behavior under test.
+    write_mock_sandbox_exec(bin_dir);
     for (coder, exit_code) in [("claude", 71), ("codex", 72), ("pi", 73)] {
         write_mock_executable(
             bin_dir,
