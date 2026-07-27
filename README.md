@@ -78,7 +78,7 @@ You confirm each layer before Fluent uses it as the foundation for the next. The
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-you-tell-fluent-dark.png">
     <source media="(prefers-color-scheme: light)" srcset=".github/assets/how-you-tell-fluent-light.png">
-    <img alt="A request or selected Observation becomes a Brief, Behaviors, an Approach, and a Plan in a conversation where you confirm each stage, then becomes an approved Work Item that is not running yet" src=".github/assets/how-you-tell-fluent-light.png" width="100%">
+    <img alt="You and Fluent shape a slice in conversation. An earlier Observation can feed a Brief, followed by Behavior Specifications, a Technical Approach, and an Implementation Plan. Fluent offers focused questions and options; you add context, judgments, and decisions. Gaps return to an earlier layer, while an approved Plan becomes one or more Work Items." src=".github/assets/how-you-tell-fluent-light.png" width="100%">
   </picture>
 </p>
 
