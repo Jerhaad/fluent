@@ -40,16 +40,39 @@ When you want to act on an Observation, ask Fluent to shape it into a Work Item,
 
 ## How you tell Fluent what to build
 
-In the same agent conversation, start with a feature, a bug, or an Observation you recorded earlier. You do not need to arrive with a complete specification. The Fluent skill reads the relevant parts of the project, asks about decisions it cannot safely infer, and works through four questions with you:
+Ask Fluent to help shape what you want to build. You can start from an Observation you recorded earlier or begin directly with a Brief. Fluent reads the relevant project code along with the reusable conventions, constraints, and lessons captured as project Expertise.
 
-| Artifact | What it settles |
-|---|---|
-| Brief | What outcome do you want, why, and what context matters? |
-| Behaviors | What must be observably true when the work is done? |
-| Approach | What technical direction will deliver those behaviors, and what does that choice give up? |
-| Plan | What verifiable slices should the Writer reach, and which pieces can be built independently? |
+You do not need to arrive with a finished specification. Fluent collaborates with you as the slice takes shape. It grounds the conversation in the code and project Expertise, checks that it understands what you mean, and asks one focused question at a time. It uses structured methods for problem framing, behavior design, architecture, and planning to challenge assumptions, find missing cases, research technical choices, and present options with their tradeoffs. You provide context and judgment and make each decision.
 
-You confirm each answer before moving on. Unknowns stay explicit; if a later stage exposes a missing behavior or design decision, the conversation returns to that stage instead of guessing.
+The conversation produces four layers of shared context:
+
+**Brief.** A Brief describes one small slice of functionality. Fluent is designed to help you turn that slice into working software without first specifying the entire system. The Brief captures, in your words, what you want and why, grounded in the relevant project context. It keeps constraints, assumptions, and unknowns explicit without choosing a solution.
+
+**Behavior Specifications.** A Behavior Specification precisely describes how the software must behave in a particular situation. It is written so the specified observable behavior can be verified without prescribing its implementation.
+
+For the slice described in the Brief, Fluent reads the project’s existing Behavior Specifications and relevant code to understand what the software already guarantees. It then works with you to define the additions, changes, or removals needed for that slice. The result is a behavior diff, not a restatement of the entire system. If the project has no existing Behavior Specifications, the first slice starts them.
+
+Before writing Behavior Specifications, Fluent makes the important terms precise and maps the people and systems involved, the events that occur, and the states that matter. For a small slice, it considers only what changes. It works through one area at a time, proposing a few core behaviors before asking about gaps and important edge cases. If Fluent derives a behavior that was not stated in the Brief, it labels the behavior as derived so you can accept or reject it. Decisions about libraries, protocols, storage, and other solution choices wait for the Technical Approach.
+
+Fluent writes each Behavior Specification in a consistent form that names the situation and the required response. For example:
+
+```text
+WHEN a user selects Save on a draft,
+THE SYSTEM SHALL show a `Saved` status beside the draft title.
+Test: tests/drafts.spec.ts (shows_saved_status_after_save)
+```
+
+It describes something a person can observe and a test can verify, without choosing a UI framework, component structure, or persistence mechanism.
+
+Fluent writes Behavior Specifications in EARS, the Easy Approach to Requirements Syntax. EARS uses a small set of patterns that make the triggering event or condition and the required response explicit.
+
+Every new behavior includes either a `Test:` reference or an `Untestable:` reason. While defining the behavior, Fluent inspects nearby tests and names the intended test in the project’s existing style. The test usually does not exist yet. The Writer creates it during implementation and the Tester runs it. When the test passes, the Behavior Reviewer uses that as evidence that the behavior was delivered.
+
+**Technical Approach.** The Technical Approach document captures your technical expertise and judgment before the work is delegated to agents. You and Fluent decide the key technical choices that should guide implementation, including structure, interfaces, protocols, libraries, storage, and integrations. The document gives the Writer both the decisions and the reasoning behind them, while leaving implementation details that agents can safely determine during the work.
+
+**Implementation Plan.** The Implementation Plan turns the confirmed behaviors and technical decisions into work that agents can carry out. You and Fluent decide whether the slice should become one Work Item or several independently reviewable Work Items that can run in parallel. Each Work Item is divided into steps that state what will become observably true, which behaviors the step delivers, and how the result will be verified. Fluent orders those steps by what must be built first. When Work Items depend on one another, the plan pins the interfaces they share and the points at which their work must come together.
+
+You confirm each layer before Fluent uses it as the foundation for the next. The conversation can also move backward. If the Technical Approach reveals missing behavior, you return to the Behavior Specifications. If the Implementation Plan exposes an unresolved technical decision, you return to the Technical Approach rather than leaving the Writer to guess.
 
 <p align="center">
   <picture>
