@@ -145,10 +145,10 @@
   <text x="380" y="377.5" class="or-text">OR</text>
   <text x="380" y="417" class="card-title">APPROVE + LAND</text>
   <text x="380" y="440" class="approval-body">Evaluate the Merge Candidate and its</text>
-  <text x="380" y="453" class="approval-body">evidence. You can authorize landing, or</text>
-  <text x="380" y="466" class="approval-body">a policy can do so when confidence clears</text>
-  <text x="380" y="479" class="approval-body">a configured threshold. Fluent lands it</text>
-  <text x="380" y="492" class="approval-body">only after target-branch checks pass.</text>
+  <text x="380" y="453" class="approval-body">evidence. You can authorize landing, or an</text>
+  <text x="380" y="466" class="approval-body">opt-in policy can authorize it automatically.</text>
+  <text x="380" y="479" class="approval-body">Fluent lands it only after target-branch</text>
+  <text x="380" y="492" class="approval-body">checks pass.</text>
 
   <!-- Deploy -->
   <rect x="42" y="340" width="200" height="174" rx="3" class="card"/>
@@ -160,11 +160,12 @@
     <path d="M131 371 Q142 375 153 371"/>
     <path d="M131 385 Q142 381 153 385"/>
   </g>
-  <text x="142" y="417" class="card-title">DEPLOY</text>
-  <text x="142" y="447" class="compact-body">Put merged code into production through</text>
-  <text x="142" y="460" class="compact-body">the project’s deployment tools. Production</text>
-  <text x="142" y="473" class="compact-body">traces, logs, and user feedback become</text>
-  <text x="142" y="486" class="compact-body">new Observations.</text>
+  <text x="142" y="417" class="card-title">DEPLOY + WATCH</text>
+  <text x="142" y="440" class="compact-body">Once code is merged, Fluent can observe</text>
+  <text x="142" y="453" class="compact-body">deployment jobs, production logs, agent</text>
+  <text x="142" y="466" class="compact-body">traces, and user feedback. Findings that</text>
+  <text x="142" y="479" class="compact-body">call for exploration or change become</text>
+  <text x="142" y="492" class="compact-body">new Observations.</text>
 
   <!-- Main production flow -->
   <line x1="242" y1="221" x2="277" y2="221" class="connector"/>
