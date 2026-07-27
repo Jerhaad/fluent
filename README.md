@@ -142,4 +142,6 @@ Any Expertise the Learner adds becomes part of the Merge Candidate and lands wit
 
 Each completed change improves the project and shapes how Fluent approaches future work.
 
-[Join our conversation on building software factories, on Discord.](https://discord.gg/dygEVzG3gf)
+---
+
+👉 [Join our conversation on building software factories, on Discord.](https://discord.gg/dygEVzG3gf)
