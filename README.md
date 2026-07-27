@@ -24,7 +24,7 @@ The first invocation sets up Fluent for that project and starts shaping the work
 
 ## How Fluent works
 
-Fluent separates work that needs human attention from work agents can do on their own. The first queue waits for people with the right context, judgment, expertise, or authority. The second waits on both compute and agent capacity: a suitable environment with the models, tools, and hardware the work needs, and room to run an agent within subscription, rate, and budget limits.
+Fluent separates work that needs human attention from work agents can do on their own. You can think of it as two conceptual queues. The first queue waits for people with the right context, judgment, expertise, or authority. The second waits on both compute and agent capacity: a suitable environment with the models, tools, and hardware the work needs, and room to run an agent within subscription, rate, and budget limits.
 
 <p align="center">
   <picture>
