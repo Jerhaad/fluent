@@ -980,32 +980,35 @@ fn cmd_task(
             behavior_tests_effort,
             extra_args,
         } => {
-            let coder_mapping = work_model::resolve_coder_mapping(
-                &fluent::config::from_config(project_root)
-                    .merge(work_model::CoderMappingInputs::from_env())
-                    .merge_cli(
-                        write_coder,
-                        write_model,
-                        review_coder,
-                        review_model,
-                        behavior_tests_coder,
-                        behavior_tests_model,
-                        coder.or_else(|| global_coder.map(str::to_string)),
-                        model,
-                        write_effort,
-                        review_effort,
-                        behavior_tests_effort,
-                        effort,
-                    ),
-            )?;
+            let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
+                write_coder,
+                write_model,
+                review_coder,
+                review_model,
+                behavior_tests_coder,
+                behavior_tests_model,
+                coder.or_else(|| global_coder.map(str::to_string)),
+                model,
+                write_effort,
+                review_effort,
+                behavior_tests_effort,
+                effort,
+            );
+            let (_, coder_mapping_update) =
+                resolve_run_coder_mapping(&store, &work_item_id, &attempt_id, &cli_inputs)?;
 
-            // Store the resolved mapping on the Attempt before running.
-            {
-                let mut item = store.read_work_item(&work_item_id)?;
-                if let Some(attempt) = item.attempts.iter_mut().find(|a| a.id == attempt_id) {
-                    attempt.coder_mapping = coder_mapping;
-                }
-                store.write_work_item(&item)?;
+            if let Some(mapping) = coder_mapping_update {
+                store.mutate_work_item(&work_item_id, |item| {
+                    let attempt = item
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                        .ok_or_else(|| work_model::WorkModelError::AttemptNotFound {
+                            id: attempt_id.clone(),
+                        })?;
+                    attempt.coder_mapping = mapping;
+                    Ok(())
+                })?;
             }
 
             let result = work_task_executor::run_task(WorkTaskRunConfig {

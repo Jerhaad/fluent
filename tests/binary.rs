@@ -20073,3 +20073,83 @@ fn attempt_run_overrides_only_explicit_coder_mapping_fields() {
     assert_eq!(mapping["behavior-tests"]["effort"], "low");
     remove_sibling_worktrees(&main_dir, &token);
 }
+
+#[test]
+fn task_run_without_overrides_preserves_stored_coder_mapping() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let token = run_token(&tmp);
+    let work_item_id = format!("taskmapping{token}");
+    let bin_dir = tmp.path().join("bin-mapping");
+    install_failing_coder_stubs(&bin_dir);
+    create_attempt_with_distinct_coder_mapping(&main_dir, &work_item_id);
+    let before = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+
+    replace_coder_config(&main_dir);
+    let _ = run_with_changed_coder_environment(
+        &main_dir,
+        &bin_dir,
+        &[
+            "task",
+            "run",
+            &work_item_id,
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ],
+    );
+
+    let after = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+    assert_eq!(
+        after, before,
+        "a flagless direct Task run must keep every stored mapping entry"
+    );
+    remove_sibling_worktrees(&main_dir, &token);
+}
+
+#[test]
+fn task_run_overrides_only_explicit_coder_mapping_fields() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let token = run_token(&tmp);
+    let work_item_id = format!("taskoverride{token}");
+    let bin_dir = tmp.path().join("bin-mapping");
+    install_failing_coder_stubs(&bin_dir);
+    create_attempt_with_distinct_coder_mapping(&main_dir, &work_item_id);
+    replace_coder_config(&main_dir);
+
+    let _ = run_with_changed_coder_environment(
+        &main_dir,
+        &bin_dir,
+        &[
+            "task",
+            "run",
+            &work_item_id,
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+            "--coder",
+            "claude",
+            "--write-coder",
+            "pi",
+            "--model",
+            "task-global-model",
+            "--review-model",
+            "task-review-model",
+            "--review-effort",
+            "max",
+        ],
+    );
+
+    let mapping = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+    assert_eq!(mapping["write"]["coder"], "pi");
+    assert_eq!(mapping["write"]["model"], "task-global-model");
+    assert_eq!(mapping["write"]["effort"], "high");
+    assert_eq!(mapping["review"]["coder"], "claude");
+    assert_eq!(mapping["review"]["model"], "task-review-model");
+    assert_eq!(mapping["review"]["effort"], "max");
+    assert_eq!(mapping["behavior-tests"]["coder"], "claude");
+    assert_eq!(mapping["behavior-tests"]["model"], "task-global-model");
+    assert_eq!(mapping["behavior-tests"]["effort"], "low");
+    remove_sibling_worktrees(&main_dir, &token);
+}
