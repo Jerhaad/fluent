@@ -1801,6 +1801,16 @@ fn rebase_candidate_with_coder(
     artifact_dir: &Path,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<RebaseOutcome> {
+    // A Codex login problem must not create an executing Rebase Task. Keep the
+    // prepared home alive through the eventual sandboxed launch.
+    let codex_worker = if config.coder_kind == CoderKind::Codex {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+        Some(worker)
+    } else {
+        None
+    };
     let rebase_task_id = next_rebase_task_id(item, &candidate.attempt_id);
     let rebase_artifact_dir = artifact_dir.join(&rebase_task_id);
     fs::create_dir_all(&rebase_artifact_dir)?;
@@ -1850,6 +1860,7 @@ fn rebase_candidate_with_coder(
         target_branch,
         &rebase_artifact_dir,
         &rebase_task_id,
+        codex_worker.as_ref(),
         make_coder,
     ) {
         Ok(RebaseOutcome::NeedsUser { diagnostic }) => {
@@ -1888,16 +1899,9 @@ fn run_reserved_rebase(
     target_branch: &str,
     rebase_artifact_dir: &Path,
     rebase_task_id: &str,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<RebaseOutcome> {
-    let codex_worker = if config.coder_kind == CoderKind::Codex {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
-    } else {
-        None
-    };
     let workspace_resolver = ContentResolver::new(Some(source_workspace));
     let system_prompt = workspace_resolver
         .resolve_content("prompts/rebase-system.md")
@@ -1933,7 +1937,7 @@ fn run_reserved_rebase(
             config.resolver,
             source_workspace,
             &[common_git_dir, rebase_artifact_dir.to_path_buf()],
-            codex_worker.as_ref().map(|worker| worker.home()),
+            codex_worker.map(|worker| worker.home()),
         )?
     };
 
@@ -1959,7 +1963,6 @@ fn run_reserved_rebase(
         source_workspace,
         config.extra_args,
         &codex_worker
-            .as_ref()
             .map(|worker| vec![worker.launch_env()])
             .unwrap_or_default(),
         Some(&capture),

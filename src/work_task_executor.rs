@@ -122,6 +122,26 @@ struct TaskStartReservation {
     receipt: ReservationReceipt,
 }
 
+fn plan_coder_kind(item: &WorkItem, attempt_id: &str, task_kind: TaskKind) -> Result<CoderKind> {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .map(|attempt| attempt.coder_mapping.for_task_kind(task_kind).coder)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))
+}
+
+fn prepare_codex_worker(
+    coder_kind: CoderKind,
+) -> Result<Option<crate::codex_worker::CodexWorkerEnvironment>> {
+    if coder_kind != CoderKind::Codex {
+        return Ok(None);
+    }
+    let worker =
+        crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+    worker.preflight().map_err(anyhow::Error::new)?;
+    Ok(Some(worker))
+}
+
 /// Plan a Task start WITHOUT any durable write: validate identity, kind, and
 /// `Planned` status, run the executor-specific `validate`, and reject early when
 /// a peer has already taken the Attempt terminal.
@@ -497,6 +517,25 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         resolve_input_artifact_paths(config.project_root, &plan.task.input_artifacts)?;
     preflight_write_worktree(config.project_root, &workspace_path, &branch_name)?;
 
+    // Authenticate autonomous Codex before reserving execution.  A login failure
+    // leaves this Task unstarted and pauses the existing Attempt for recovery.
+    let codex_worker =
+        match prepare_codex_worker(plan_coder_kind(&item, config.attempt_id, TaskKind::Write)?) {
+            Ok(worker) => worker,
+            Err(error) => {
+                mark_task_failed_attempt_needs_user(
+                    config.store,
+                    config.project_root,
+                    config.work_item_id,
+                    config.attempt_id,
+                    config.task_id,
+                    &classify_task_failure(&error),
+                    &crate::notify::notify,
+                )?;
+                return Err(error);
+            }
+        };
+
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here with a typed
     // StartRejected error and nothing mutated. The fresh coder mapping and the
@@ -564,6 +603,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         reservation.model.as_deref(),
         reservation.effort.as_deref(),
         &pump_config,
+        codex_worker.as_ref(),
     );
     let mut retries = 0;
     while should_retry_coder_error(&run_result) && retries < max_task_retries() {
@@ -587,6 +627,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
             reservation.model.as_deref(),
             reservation.effort.as_deref(),
             &pump_config,
+            codex_worker.as_ref(),
         );
     }
 
@@ -827,6 +868,27 @@ fn run_review_task_with_coder(
         );
     }
 
+    let planned_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let codex_worker = match prepare_codex_worker(plan_coder_kind(
+        &planned_item,
+        config.attempt_id,
+        TaskKind::Review,
+    )?) {
+        Ok(worker) => worker,
+        Err(error) => {
+            mark_task_failed_attempt_needs_user(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+                config.task_id,
+                &classify_task_failure(&error),
+                &crate::notify::notify,
+            )?;
+            return Err(error);
+        }
+    };
+
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here, leaving prior
     // review.md evidence untouched.
@@ -934,6 +996,7 @@ fn run_review_task_with_coder(
         reservation.model.as_deref(),
         reservation.effort.as_deref(),
         &pump_config,
+        codex_worker.as_ref(),
         coder_override,
     );
     let mut retries = 0;
@@ -961,6 +1024,7 @@ fn run_review_task_with_coder(
             reservation.model.as_deref(),
             reservation.effort.as_deref(),
             &pump_config,
+            codex_worker.as_ref(),
             coder_override,
         );
     }
@@ -2194,6 +2258,7 @@ fn run_task_coder(
     model: Option<&str>,
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
 ) -> Result<()> {
     // Production launches the resolved coder; the `_with_coder` seam lets route
     // tests inject a recording coder to prove the resolved capture threads through
@@ -2212,6 +2277,7 @@ fn run_task_coder(
         model,
         effort,
         pump_config,
+        codex_worker,
         move |sandbox| coder_kind.boxed_with_model(sandbox, model, effort),
     )
 }
@@ -2231,6 +2297,7 @@ fn run_task_coder_with_coder(
     model: Option<&str>,
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     if !no_sandbox {
@@ -2239,18 +2306,8 @@ fn run_task_coder_with_coder(
         credential::setup_git_signing();
     }
 
-    // Keep this guard alive across sandbox construction and process completion so
-    // an autonomous Codex launch can access only its staged authentication home.
-    let codex_worker = if coder_kind == CoderKind::Codex {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
-    } else {
-        None
-    };
     let mut launch_env: Vec<(String, String)> = Vec::new();
-    if let Some(worker) = &codex_worker {
+    if let Some(worker) = codex_worker {
         launch_env.push(worker.launch_env());
     }
 
@@ -2333,7 +2390,7 @@ fn run_task_coder_with_coder(
             workspace_path,
             &additional_writable,
             &readable_roots,
-            codex_worker.as_ref().map(|worker| worker.home()),
+            codex_worker.map(|worker| worker.home()),
         )?
     };
 
@@ -3600,6 +3657,7 @@ fn run_review_coder(
     model: Option<&str>,
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     coder_override: Option<&dyn Fn(CoderSandbox) -> Box<dyn crate::coder::Coder>>,
 ) -> Result<()> {
     // Production launches the resolved coder; the `_with_coder` seam lets route
@@ -3625,6 +3683,7 @@ fn run_review_coder(
         model,
         effort,
         pump_config,
+        codex_worker,
         move |sandbox| match coder_override {
             Some(make) => make(sandbox),
             None => coder_kind.boxed_with_model(sandbox, model, effort),
@@ -3650,6 +3709,7 @@ fn run_review_coder_with_coder(
     model: Option<&str>,
     effort: Option<&str>,
     pump_config: &crate::transcript_pump::TranscriptPumpConfig,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
     if !no_sandbox {
@@ -3682,11 +3742,13 @@ fn run_review_coder_with_coder(
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
         readable_roots.push(review_skills_dir(project_root));
-        build_coder_sandbox_with_read_only_roots(
+        build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
             coder_kind,
             resolver,
             artifact_dir,
+            &[],
             &readable_roots,
+            codex_worker.map(|worker| worker.home()),
         )?
     };
 
@@ -5017,6 +5079,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
@@ -5100,6 +5163,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
@@ -5224,6 +5288,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
@@ -5345,6 +5410,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(CountingSupervisionCoder {
                     launches: Arc::clone(&launches_for_coder),
@@ -5424,6 +5490,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,
@@ -5484,6 +5551,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(SupervisionReportingCoder {
                     recorded_dir: recorded_for_coder,
@@ -5558,6 +5626,7 @@ mod tests {
             None,
             None,
             &pump_config,
+            None,
             move |_sandbox| {
                 Box::new(RecordingLearnerCoder {
                     recorded: recorded_for_coder,

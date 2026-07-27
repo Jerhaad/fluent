@@ -5971,6 +5971,34 @@ THE SYSTEM SHALL print a notice that fluent keeps its learned project notes and
 test config in `.fluent/` and commits them alongside the user's changes.
 Test: tests/binary.rs (init_output_notes_fluent_tracks_its_state)
 
+## Autonomous Codex worker boundary
+
+### B1
+
+WHEN Fluent launches an autonomous Codex Writer, Reviewer, Learner, or rebase
+worker, THE SYSTEM SHALL use a private temporary `CODEX_HOME`, disable hooks,
+ignore user configuration, avoid session persistence, and grant the sandbox no
+access to the interactive Codex home. Interactive Codex continues to use the
+user's normal configuration and home.
+Test: src/coder.rs (autonomous_codex_command_isolated_from_user_hooks_config_and_sessions)
+Test: src/os.rs (autonomous_codex_profile_grants_only_worker_home)
+Test: src/os.rs (interactive_codex_profile_preserves_source_home_access)
+
+### B2
+
+WHEN Fluent prepares an autonomous Codex worker, THE SYSTEM SHALL stage only
+the supported authentication state in the private home, run `codex login status`
+without a model request, and remove the private home after the launch scope.
+Test: src/codex_worker.rs (worker_home_stages_only_auth_from_effective_codex_home)
+Test: src/codex_worker.rs (login_status_preflight_accepts_authenticated_worker_home)
+
+### B3
+
+IF Codex authentication cannot be prepared before a Writer or Reviewer starts,
+THEN THE SYSTEM SHALL pause the same planned Task and Attempt without reserving
+execution or consuming a Writer round, tell the user to run `codex login`, and
+resume that Task through `fluent attempt run` after login succeeds.
+
 ## Generated commit wording
 
 ### B1

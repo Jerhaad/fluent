@@ -99,7 +99,15 @@ impl CodexWorkerEnvironment {
 
     fn preflight_with(&self, binary: &str) -> std::result::Result<(), CodexAuthError> {
         let status = Command::new(binary)
-            .args(["login", "status"])
+            // Keep preflight inside the same autonomous boundary as `codex exec`.
+            // Login status must not load interactive hooks or user configuration.
+            .args([
+                "--disable",
+                "hooks",
+                "--ignore-user-config",
+                "login",
+                "status",
+            ])
             .env("CODEX_HOME", self.home())
             .status()
             .map_err(|error| {
@@ -201,7 +209,7 @@ mod tests {
         let fake = tempfile::NamedTempFile::new().unwrap();
         fs::write(
             fake.path(),
-            "#!/bin/sh\ntest \"$1 $2\" = 'login status'\ntest -f \"$CODEX_HOME/auth.json\"\n",
+            "#!/bin/sh\ntest \"$1 $2 $3 $4 $5\" = '--disable hooks --ignore-user-config login status'\ntest -f \"$CODEX_HOME/auth.json\"\n",
         )
         .unwrap();
         #[cfg(unix)]

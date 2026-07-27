@@ -1045,6 +1045,19 @@ fn run_learner_step(
         }
     };
 
+    // Authenticate Codex before the reservation records an in-progress Learner
+    // run. The launch route repeats preparation to retain its private home until
+    // the process exits.
+    let learner_coder = item.attempts[attempt_index]
+        .coder_mapping
+        .for_task_kind(TaskKind::Write)
+        .coder;
+    if learner_coder == CoderKind::Codex {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+    }
+
     // A fresh, lock-held reservation with landing validation. It re-reads the durable
     // state under the model lock and decides whether THIS runner launches, so a
     // record a peer already succeeded, took non-relaunchable (its coder already ran

@@ -1611,6 +1611,28 @@ Claude OAuth token passed as env var at task launch. Short-lived; multi-hour
 runs will outlive it. Future: WIF (Workload Identity Federation) for
 automatic token refresh using the task's IAM identity.
 
+### Controlled Codex workers
+
+Autonomous Codex launches cross a provider-specific boundary in
+`codex_worker`. The boundary resolves the effective interactive `CODEX_HOME`,
+stages only supported authentication into a mode-private temporary home, and
+runs `codex login status` before useful work starts. The launch keeps that
+temporary directory alive through sandbox construction and process completion,
+then removes it by RAII cleanup.
+
+The autonomous command disables hooks, ignores user configuration, and uses an
+ephemeral session. Its Seatbelt profile receives the staged home as its only
+writable Codex-state root; it does not receive the interactive home. Interactive
+Codex deliberately remains outside this boundary and retains user configuration,
+hooks, and home access.
+
+Writer and Reviewer routes preflight before reserving their planned Tasks. An
+authentication failure pauses the existing Attempt for `codex login` recovery,
+so it does not consume a Writer round. Learner and rebase routes preflight
+before they record their respective in-progress work. Resuming with `fluent
+attempt run` reopens the authentication-paused Task using the Attempt's stored
+coder mapping.
+
 ## Repository structure
 
 ```
