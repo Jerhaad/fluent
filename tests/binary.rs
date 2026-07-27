@@ -20159,6 +20159,69 @@ fn task_run_without_overrides_preserves_stored_coder_mapping() {
 }
 
 #[test]
+fn codex_auth_failure_pauses_planned_task_before_reservation() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-auth-failure");
+    let launch_marker = tmp.path().join("coder-launched");
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *\"login status\"* ]]; then exit 1; fi\ntouch '{}'\n",
+            launch_marker.display()
+        ),
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "codex-auth", "--title", "Codex auth"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "create",
+            "codex-auth",
+            "attempt-1",
+            "--write-coder",
+            "codex",
+        ])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "codex-auth",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("codex login"));
+
+    let item = work_item_value(&main_dir, "codex-auth");
+    let attempt = &item["attempts"][0];
+    let task = &attempt["tasks"][0];
+    assert_eq!(attempt["status"], "needs-user");
+    assert_eq!(attempt["pause_kind"], "auth");
+    assert_eq!(task["status"], "needs-user");
+    assert!(task["started_at"].is_null(), "preflight must not reserve the task");
+    assert_eq!(attempt["tasks"].as_array().unwrap().len(), 1);
+    assert!(
+        !launch_marker.exists(),
+        "a failed authentication preflight must not launch the coder"
+    );
+}
+
+#[test]
 fn task_run_overrides_only_explicit_coder_mapping_fields() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
