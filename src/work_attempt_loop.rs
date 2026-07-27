@@ -5786,6 +5786,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -5835,6 +5836,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &failing_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -5962,6 +5964,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6062,6 +6065,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6116,6 +6120,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6172,6 +6177,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         );
         assert!(
@@ -6323,6 +6329,7 @@ mod tests {
                         work_task_executor::LearnerExecutionMode::Capture,
                         &LearnerConfig {
                             run_coder: &run_coder,
+                            codex_worker: None,
                         },
                     )
                     .unwrap();
@@ -6367,6 +6374,7 @@ mod tests {
                 work_task_executor::LearnerExecutionMode::Capture,
                 &LearnerConfig {
                     run_coder: &run_coder,
+                    codex_worker: None,
                 },
             )
             .unwrap();
@@ -6416,6 +6424,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6631,6 +6640,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6678,6 +6688,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -6723,6 +6734,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7032,6 +7044,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7065,6 +7078,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7101,6 +7115,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7139,6 +7154,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7170,6 +7186,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7254,6 +7271,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -7738,6 +7756,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -8213,6 +8232,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -8264,6 +8284,7 @@ mod tests {
             true,
             Some(LearnerConfig {
                 run_coder: &run_coder,
+                codex_worker: None,
             }),
         )
         .unwrap();
@@ -8344,7 +8365,10 @@ mod tests {
             item,
             "attempt-1",
             true,
-            Some(LearnerConfig { run_coder }),
+            Some(LearnerConfig {
+                run_coder,
+                codex_worker: None,
+            }),
         )
         .unwrap()
     }
