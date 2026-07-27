@@ -84,7 +84,7 @@ You confirm each layer before Fluent uses it as the foundation for the next. The
 
 When you confirm the Implementation Plan, Fluent creates one Work Item for each independently reviewable part of the slice. Each Work Item carries the approved Brief, Behavior Specifications, Technical Approach, and the part of the Plan its agents must deliver. Creating a Work Item records the handoff. It does not start an agent or place the Work Item in the agent queue.
 
-Ask Fluent to run a Work Item directly, or add it to the queue to wait for agent and compute capacity. Running it creates an Attempt, a durable record of one path through writing, testing, reviewing, and learning. Separate Work Items can proceed independently while the dependent steps inside each Attempt remain ordered.
+Ask Fluent to run a Work Item directly, or add it to the queue to wait for agent and compute capacity. Each time Fluent runs a Work Item, it creates an Attempt. The Attempt tracks that execution through the Writer, Tester, Reviewers, and Learner, including every revision, test run, review, and pause. Separate Work Items can proceed independently while the dependent steps inside each Attempt remain ordered.
 
 ## How Fluent builds it
 
