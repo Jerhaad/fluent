@@ -3,6 +3,7 @@ mod log;
 
 use fluent::git;
 use fluent::review;
+use fluent::work_model::WorkModelStore;
 use log::LoggedCommand;
 use predicates::prelude::*;
 use serial_test::serial;
@@ -96,6 +97,100 @@ fn fargate_land_rejects_unsupported_model_or_effort_override() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("not supported with --runtime fargate"),
         "unsupported Fargate land override should fail before launch"
+    );
+}
+
+fn land_mapping_codex_mock_script() -> &'static str {
+    r##"#!/bin/bash
+if [[ "$1" == "login" && "$2" == "status" ]]; then
+  exit 0
+fi
+exit 0
+"##
+}
+
+fn prepare_land_mapping_candidate(main_dir: &Path, bin_dir: &Path) -> serde_json::Value {
+    write_mock_claude(
+        bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(main_dir, bin_dir);
+
+    let store = WorkModelStore::new(main_dir);
+    store
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0].coder_mapping.write.coder = fluent::coder::CoderKind::Codex;
+            item.attempts[0].coder_mapping.write.model = "stored-land-model".to_string();
+            item.attempts[0].coder_mapping.write.effort = Some("medium".to_string());
+            Ok(())
+        })
+        .unwrap();
+    work_item_value(main_dir, "work-1")["attempts"][0]["coder_mapping"].clone()
+}
+
+#[test]
+fn merge_candidate_land_uses_owning_attempt_write_mapping() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-default");
+    let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    write_mock_codex(&bin_dir, land_mapping_codex_mock_script());
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .env("FLUENT_CODER", "claude")
+        .env("FLUENT_MODEL", "environment-model")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Rebase agent failed"));
+
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
+        stored_mapping,
+        "landing must not rewrite the owning Attempt mapping"
+    );
+}
+
+#[test]
+fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-override");
+    let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    write_mock_codex(&bin_dir, land_mapping_codex_mock_script());
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--model",
+            "override-land-model",
+            "--effort",
+            "low",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Rebase agent failed"));
+
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
+        stored_mapping,
+        "invocation-only overrides must not rewrite the owning Attempt mapping"
     );
 }
 

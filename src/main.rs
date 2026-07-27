@@ -916,6 +916,8 @@ fn cmd_merge_candidate(
                 resolver,
                 extra_args: &extra_args,
                 coder_kind: land_mapping.coder,
+                model: (!land_mapping.model.is_empty()).then_some(land_mapping.model.as_str()),
+                effort: land_mapping.effort.as_deref(),
                 no_sandbox: no_sandbox || global_no_sandbox,
                 run_post_merge_review,
             })?;

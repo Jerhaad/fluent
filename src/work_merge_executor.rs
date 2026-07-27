@@ -24,6 +24,10 @@ pub struct WorkMergeConfig<'a> {
     pub resolver: &'a ContentResolver,
     pub extra_args: &'a [String],
     pub coder_kind: CoderKind,
+    /// The optional model resolved at the command boundary.
+    pub model: Option<&'a str>,
+    /// The optional reasoning effort resolved at the command boundary.
+    pub effort: Option<&'a str>,
     pub no_sandbox: bool,
     /// Affirmative post-merge review policy. Every caller supplies this
     /// explicitly; an omitted CLI option and the legacy `--no-post-merge-review`
@@ -1147,7 +1151,9 @@ fn build_rebase_coder(
     if let Some(coder) = REBASE_CODER_OVERRIDE.with(|slot| slot.borrow().as_ref().map(|f| f())) {
         return coder;
     }
-    config.coder_kind.boxed(sandbox)
+    config
+        .coder_kind
+        .boxed_with_model(sandbox, config.model, config.effort)
 }
 
 #[cfg(not(test))]
@@ -1155,7 +1161,9 @@ fn build_rebase_coder(
     config: &WorkMergeConfig<'_>,
     sandbox: CoderSandbox,
 ) -> Box<dyn crate::coder::Coder> {
-    config.coder_kind.boxed(sandbox)
+    config
+        .coder_kind
+        .boxed_with_model(sandbox, config.model, config.effort)
 }
 
 fn execute_merge(
@@ -2816,6 +2824,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -2946,6 +2956,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -2998,6 +3010,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3106,6 +3120,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3243,6 +3259,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3354,6 +3372,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3465,6 +3485,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3546,6 +3568,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         }) {
@@ -4513,6 +4537,8 @@ mod tests {
             resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review,
         }
@@ -4922,6 +4948,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -4973,6 +5001,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -5888,6 +5918,8 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            model: None,
+            effort: None,
             no_sandbox: true,
             run_post_merge_review: false,
         };
