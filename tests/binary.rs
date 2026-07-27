@@ -277,6 +277,92 @@ fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
 }
 
 #[test]
+fn merge_candidate_land_model_override_retains_stored_effort() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-model-override");
+    let invocation_log = tmp.path().join("land-mapping-model-override-invocation.log");
+    let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
+    write_mock_sandbox_exec(&bin_dir);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--model",
+            "override-land-model",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        invocation.contains("--model override-land-model"),
+        "the model-only override must reach the launched rebase coder: {invocation}"
+    );
+    assert!(
+        invocation.contains("model_reasoning_effort=medium"),
+        "the model-only override must retain the stored effort: {invocation}"
+    );
+
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
+        stored_mapping,
+        "invocation-only model overrides must not rewrite the owning Attempt mapping"
+    );
+}
+
+#[test]
+fn merge_candidate_land_effort_override_retains_stored_model() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-effort-override");
+    let invocation_log = tmp.path().join("land-mapping-effort-override-invocation.log");
+    let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
+    write_mock_sandbox_exec(&bin_dir);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--effort",
+            "low",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        invocation.contains("--model stored-land-model"),
+        "the effort-only override must retain the stored model: {invocation}"
+    );
+    assert!(
+        invocation.contains("model_reasoning_effort=low"),
+        "the effort-only override must reach the launched rebase coder: {invocation}"
+    );
+
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
+        stored_mapping,
+        "invocation-only effort overrides must not rewrite the owning Attempt mapping"
+    );
+}
+
+#[test]
 fn merge_candidate_land_coder_override_replaces_only_the_coder() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
