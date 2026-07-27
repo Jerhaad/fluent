@@ -20477,6 +20477,151 @@ git commit -m "Add Codex worker output" >/dev/null
 }
 
 #[test]
+fn autonomous_codex_writer_uses_default_home_authentication() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let home = tmp.path().join("home");
+    let source_home = home.join(".codex");
+    let bin_dir = tmp.path().join("bin-default-codex-home");
+    let invocation_log = tmp.path().join("codex-invocations");
+    fs::create_dir_all(&source_home).unwrap();
+    fs::write(source_home.join("auth.json"), "default authentication").unwrap();
+    write_mock_sandbox_exec(&bin_dir);
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        r##"#!/bin/bash
+set -euo pipefail
+test "$CODEX_HOME" != "$HOME/.codex"
+test "$(cat "$CODEX_HOME/auth.json")" = "default authentication"
+if [[ "$*" == *"login status"* ]]; then
+  printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+  exit 0
+fi
+printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+printf 'default home output\n' > default-home-output.txt
+git add default-home-output.txt
+git commit -m "Add default home output" >/dev/null
+"##,
+    );
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "default-home", "--title", "Default Codex home"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "create",
+            "default-home",
+            "attempt-1",
+            "--write-coder",
+            "codex",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "default-home",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("HOME", &home)
+        .env_remove("CODEX_HOME")
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+    let invocations = fs::read_to_string(&invocation_log).unwrap();
+    let worker_home = invocations
+        .lines()
+        .find_map(|line| line.strip_prefix("exec="))
+        .expect("Codex exec should receive the staged default-home authentication");
+    assert!(invocations.contains(&format!("preflight={worker_home}")));
+    assert!(
+        !Path::new(worker_home).exists(),
+        "the worker home must be removed after the launch: {worker_home}"
+    );
+}
+
+#[test]
+fn autonomous_codex_writer_accepts_openai_api_key_without_auth_file() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let home = tmp.path().join("empty-home");
+    let bin_dir = tmp.path().join("bin-codex-environment-auth");
+    let invocation_log = tmp.path().join("codex-invocations");
+    fs::create_dir_all(&home).unwrap();
+    write_mock_sandbox_exec(&bin_dir);
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        r##"#!/bin/bash
+set -euo pipefail
+test "$OPENAI_API_KEY" = "environment-test-key"
+test ! -e "$CODEX_HOME/auth.json"
+if [[ "$*" == *"login status"* ]]; then
+  printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+  exit 0
+fi
+printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+printf 'environment auth output\n' > environment-auth-output.txt
+git add environment-auth-output.txt
+git commit -m "Add environment auth output" >/dev/null
+"##,
+    );
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "environment-auth", "--title", "Environment auth"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "create",
+            "environment-auth",
+            "attempt-1",
+            "--write-coder",
+            "codex",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "environment-auth",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("HOME", &home)
+        .env_remove("CODEX_HOME")
+        .env("OPENAI_API_KEY", "environment-test-key")
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+    let invocations = fs::read_to_string(&invocation_log).unwrap();
+    let worker_home = invocations
+        .lines()
+        .find_map(|line| line.strip_prefix("exec="))
+        .expect("Codex exec should receive the environment-auth worker home");
+    assert!(invocations.contains(&format!("preflight={worker_home}")));
+    assert!(
+        !Path::new(worker_home).exists(),
+        "the worker home must be removed after the launch: {worker_home}"
+    );
+}
+
+#[test]
 fn codex_auth_resume_reopens_same_task_without_new_writer_round() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
