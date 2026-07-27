@@ -20433,7 +20433,7 @@ test -f "$CODEX_HOME/auth.json"
 test "$(cat "$CODEX_HOME/auth.json")" = "source authentication"
 test ! -e "$CODEX_HOME/config.toml"
 test ! -e "$CODEX_HOME/sessions"
-if [[ "${{1:-}}" == "--disable" && "${{2:-}}" == "hooks" && "${{3:-}}" == "--ignore-user-config" && "${{4:-}}" == "login" && "${{5:-}}" == "status" ]]; then
+if [[ "${{1:-}}" == "login" && "${{2:-}}" == "status" && -z "${{3:-}}" ]]; then
   printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
   exit 0
 fi
@@ -20624,7 +20624,7 @@ test -f "$CODEX_HOME/auth.json"
 test "$(cat "$CODEX_HOME/auth.json")" = "source authentication"
 test ! -e "$CODEX_HOME/config.toml"
 test ! -e "$CODEX_HOME/sessions"
-if [[ "${1:-}" == "--disable" && "${2:-}" == "hooks" && "${3:-}" == "--ignore-user-config" && "${4:-}" == "login" && "${5:-}" == "status" ]]; then
+if [[ "${1:-}" == "login" && "${2:-}" == "status" && -z "${3:-}" ]]; then
   printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
   exit 0
 fi
