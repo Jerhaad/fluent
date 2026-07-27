@@ -1,6 +1,7 @@
 pub mod atomic_write;
 pub mod auto_merge;
 pub mod claude_auth;
+pub mod codex_worker;
 pub mod cleanup;
 pub mod cli;
 pub mod coder;
