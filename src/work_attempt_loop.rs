@@ -63,6 +63,11 @@ pub struct WorkAttemptRunConfig<'a> {
     /// Mapping resolved by the CLI for this invocation. Persist it through a
     /// fresh field-level mutation under the land lock, never a stale model write.
     pub resolved_coder_mapping: Option<&'a CoderMapping>,
+    /// Replace only the external Learner launch while unit tests drive the real
+    /// Attempt resume route.
+    #[cfg(test)]
+    pub(crate) learner_run_coder:
+        Option<&'a (dyn Fn(&LearnerCoderRequest<'_>) -> Result<()> + Sync)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,6 +517,11 @@ fn default_learner_run_coder(
     config: &WorkAttemptRunConfig<'_>,
     request: &LearnerCoderRequest<'_>,
 ) -> Result<()> {
+    #[cfg(test)]
+    if let Some(run_coder) = config.learner_run_coder {
+        return run_coder(request);
+    }
+
     // Resolve the immutable transcript capture here so no transient capture state
     // (project root or transcript path for late resolution) rides on the public
     // LearnerRunInputs; the public constructor never names the private pump config.
@@ -922,7 +932,7 @@ fn next_review_roles(attempt: &Attempt) -> Vec<&'static str> {
 
 /// Everything the Learner coder needs, assembled by the loop from the Attempt's
 /// completed change and every review round's artifacts.
-struct LearnerCoderRequest<'a> {
+pub(crate) struct LearnerCoderRequest<'a> {
     workspace_path: &'a Path,
     review_artifact_paths: &'a [PathBuf],
     tester_artifact_paths: &'a [PathBuf],
@@ -4600,6 +4610,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             resolved_coder_mapping: None,
+            learner_run_coder: None,
         }) {
             Ok(_) => panic!("abandoned Work Item should reject attempt run"),
             Err(error) => error,
@@ -5807,16 +5818,15 @@ mod tests {
             }
         ));
 
-        let mut resumed = store.read_work_item("work-1").unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
         let task_count = resumed.attempts[0].tasks.len();
-        let candidate_id = resumed.merge_candidates[0].id.clone();
-        let observed = RefCell::new(None);
+        let observed = Mutex::new(Vec::new());
         let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
-            observed.replace(Some((
+            observed.lock().unwrap().push((
                 request.coder_kind,
                 request.model.map(str::to_string),
                 request.effort.map(str::to_string),
-            )));
+            ));
             fs::create_dir_all(request.handoff_dir)?;
             fs::write(
                 request.handoff_dir.join(crate::learner::DRAFT_FILE_NAME),
@@ -5825,27 +5835,38 @@ mod tests {
             Ok(())
         };
 
-        run_learner_step(
-            &store,
-            &project_root,
-            &mut resumed,
-            0,
-            &candidate_id,
-            work_task_executor::LearnerExecutionMode::Capture,
-            &LearnerConfig {
-                run_coder: &run_coder,
-            },
-        )
+        let resolver = ContentResolver::new(None);
+        let result = run_attempt(WorkAttemptRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            resolved_coder_mapping: None,
+            learner_run_coder: Some(&run_coder),
+        })
         .unwrap();
+        assert!(
+            result.outcomes.iter().any(|outcome| matches!(
+                outcome,
+                WorkAttemptRunOutcome::MergeCandidateReady { .. }
+            )),
+            "Learner-only resume should advance the recovered candidate; got {:?}",
+            result.outcomes
+        );
 
         assert_eq!(
-            observed.into_inner(),
-            Some((
+            observed.into_inner().unwrap(),
+            vec![(
                 CoderKind::Codex,
                 Some("stored-learner-model".to_string()),
                 Some("high".to_string()),
-            ))
+            )],
+            "resume should invoke only one Learner"
         );
+        let resumed = store.read_work_item("work-1").unwrap();
         assert_eq!(
             resumed.attempts[0].tasks.len(),
             task_count,
@@ -8067,6 +8088,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             resolved_coder_mapping: None,
+            learner_run_coder: None,
         })
         .unwrap_err();
 

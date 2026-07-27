@@ -497,6 +497,8 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
         extra_args: &[],
         no_sandbox: true,
         resolved_coder_mapping: None,
+        #[cfg(test)]
+        learner_run_coder: None,
     }) {
         eprintln!(
             "  Post-merge review for {} failed: {error:#}",
@@ -614,6 +616,8 @@ fn auto_run_post_merge_review_fix(
         extra_args: &[],
         no_sandbox: false,
         resolved_coder_mapping: None,
+        #[cfg(test)]
+        learner_run_coder: None,
     })?;
     let had_merge_candidate = run_result
         .outcomes
