@@ -34,7 +34,9 @@ Fluent separates work that needs human attention from work agents can do on thei
   </picture>
 </p>
 
-People supply intent, judgment, domain knowledge, and authority to land changes. Execution environments supply model access, compute, tools, and hardware. Fluent keeps work that can run separate from work that needs a person: execution-ready Work Items wait for execution capacity, while questions and ready candidates wait for human attention. A scheduled Attempt that pauses for a person releases its execution slot, so other Work can continue.
+Whenever you encounter something to explore, build, fix, or improve, ask Fluent to record it as an Observation. Add whatever context you have in the moment; you do not need to know the solution or have worked out every detail. Agents and connected systems can record Observations too. You can return to any Observation later and refine it on your own timeline, bringing in someone with the right expertise or authority when needed.
+
+When you want to act on an Observation, ask Fluent to shape it into a Work Item, then ask it to run the Work Item. The Work Item waits until suitable agent and compute capacity is available. If its Attempt needs human context or a decision, Fluent places the question in the human queue and releases the capacity it was using, allowing other ready Work to continue.
 
 ## How you tell Fluent what to build
 
