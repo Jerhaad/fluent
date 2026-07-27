@@ -40,8 +40,6 @@ Commit each source change with all of its regenerated outputs. The renderer prod
 | `fluent-overall-flow-{light,dark}.svg` | 2040×1170 PNG |
 | `how-you-tell-fluent-{light,dark}.svg` | 2040×1260 PNG |
 | `how-fluent-builds-{light,dark}.svg` | 2040×1050 PNG |
-| `how-fluent-improves-{light,dark}.svg` | 2040×990 PNG |
-| `how-fluent-learns-{light,dark}.svg` | 2040×690 PNG |
 
 ## Change the animated flow
 

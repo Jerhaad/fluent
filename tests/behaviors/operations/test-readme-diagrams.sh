@@ -16,8 +16,6 @@ fluent-at-a-glance
 fluent-overall-flow
 how-you-tell-fluent
 how-fluent-builds
-how-fluent-improves
-how-fluent-learns
 "
 
 test_tracks_each_light_and_dark_source() {
@@ -37,8 +35,8 @@ test_tracks_each_light_and_dark_source() {
 
   local source_count
   source_count="$(find "$SOURCE_DIR" -maxdepth 1 -type f -name '*.svg' | wc -l | tr -d ' ')"
-  if [ "$source_count" -ne 12 ]; then
-    printf '    FAIL: expected six light/dark source pairs, found %s SVG files\n' "$source_count"
+  if [ "$source_count" -ne 8 ]; then
+    printf '    FAIL: expected four light/dark source pairs, found %s SVG files\n' "$source_count"
     return 1
   fi
 }

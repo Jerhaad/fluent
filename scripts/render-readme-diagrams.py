@@ -44,8 +44,6 @@ DIAGRAMS = (
     Diagram("fluent-overall-flow", 2040, 1170),
     Diagram("how-you-tell-fluent", 2040, 1260),
     Diagram("how-fluent-builds", 2040, 1050),
-    Diagram("how-fluent-improves", 2040, 990),
-    Diagram("how-fluent-learns", 2040, 690),
 )
 
 FLOW_TRACKS = (
