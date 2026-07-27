@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-fargate-entrypoint-codex — Verify Codex-specific Fargate entrypoint
-# auth validation, billing guardrails, and coder dispatch.
+# auth validation, billing guardrails, and stored Attempt mapping handoff.
 
 set -euo pipefail
 
@@ -140,8 +140,8 @@ test_codex_writes_auth_json_and_unsets_openai_key() {
     RESULT=1
   fi
 
-  if ! grep -q -- '--coder' "$MOCK_FLUENT_ARGS" || ! grep -q 'codex' "$MOCK_FLUENT_ARGS"; then
-    printf '    FAIL: fluent was not called with --coder codex\n'
+  if grep -q -- '^--coder$' "$MOCK_FLUENT_ARGS"; then
+    printf '    FAIL: launch coder was translated into an Attempt mapping override\n'
     RESULT=1
   fi
 
@@ -280,8 +280,8 @@ test_claude_path_unchanged() {
     CLAUDE_CODE_OAUTH_TOKEN="test-token"
 
   RESULT=0
-  if ! grep -q -- '--coder' "$MOCK_FLUENT_ARGS" || ! grep -q 'claude' "$MOCK_FLUENT_ARGS"; then
-    printf '    FAIL: fluent was not called with --coder claude\n'
+  if grep -q -- '^--coder$' "$MOCK_FLUENT_ARGS"; then
+    printf '    FAIL: launch coder was translated into an Attempt mapping override\n'
     RESULT=1
   fi
 
@@ -310,8 +310,8 @@ test_default_coder_is_claude() {
     bash "$ENTRYPOINT"
 
   RESULT=0
-  if ! grep -q 'claude' "$MOCK_FLUENT_ARGS"; then
-    printf '    FAIL: fluent was not called with --coder claude (default)\n'
+  if grep -q -- '^--coder$' "$MOCK_FLUENT_ARGS"; then
+    printf '    FAIL: default launch coder was translated into an Attempt mapping override\n'
     RESULT=1
   fi
 

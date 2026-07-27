@@ -1306,9 +1306,10 @@ Fargate.
 Fargate supports both Claude and Codex. The base image
 (`infrastructure/run/Dockerfile`) installs both `@anthropic-ai/claude-code`
 and `@openai/codex` via npm so `claude` and `codex` are both on the
-`PATH`. The entrypoint dispatches on `FLUENT_CODER` (default `claude`),
-validates the coder-specific auth env var, and passes `--coder $CODER` to
-the fluent binary.
+`PATH`. The entrypoint dispatches on `FLUENT_CODER` (default `claude`) and
+uses that selection only to validate and prepare coder-specific credentials.
+An Attempt run receives no coder flag and consumes the mapping persisted in
+its uploaded Work Item.
 
 Coder-specific auth for Fargate:
 
@@ -1400,7 +1401,7 @@ Local machine                    Fargate task
 2. start ECS task ───────────►
                                  3. pull workspace from S3
                                  4. fluent attempt run
-                                    --no-sandbox --coder $CODER
+                                    --no-sandbox
                                     <work-item> <attempt>
                                  5. Fluent launches coder
                                  6. ...hours pass...

@@ -159,7 +159,6 @@ case "$MODE" in
 
     "$FLUENT_BIN" attempt run \
       --no-sandbox \
-      --coder "$CODER" \
       "$FLUENT_WORK_ITEM_ID" \
       "$FLUENT_WORK_ATTEMPT_ID"
     ;;
