@@ -82,74 +82,52 @@ You confirm each layer before Fluent uses it as the foundation for the next. The
   </picture>
 </p>
 
-After you confirm the Plan, Fluent creates one or more Work Items containing the approved context. A Work Item is the durable handoff from planning to execution: creating it does not start a coder or schedule work. Independent pieces can become peer Work Items; implementation stays sequential inside one.
+When you confirm the Implementation Plan, Fluent creates one Work Item for each independently reviewable part of the slice. Each Work Item carries the approved Brief, Behavior Specifications, Technical Approach, and the part of the Plan its agents must deliver. Creating a Work Item records the handoff. It does not start an agent or place the Work Item in the agent queue.
 
-For example, “add machine-readable JSON output to our CLI's status command” can become a Brief explaining why CI needs it, a Behavior saying exactly what `status --json` emits, an Approach that reuses the existing status model, and a Plan that proves one end-to-end slice before covering compatibility and documentation.
+Ask Fluent to run a Work Item directly, or add it to the queue to wait for agent and compute capacity. Running it creates an Attempt, a durable record of one path through writing, testing, reviewing, and learning. Separate Work Items can proceed independently while the dependent steps inside each Attempt remain ordered.
 
 ## How Fluent builds it
 
-When you ask Fluent to run a Work Item, it starts an Attempt in an isolated worktree. In the Local Preview, the Attempt runs locally in the foreground, where you can watch each round.
+The Writer receives the approved planning context, the relevant project code and Expertise, and the instructions that apply to the files it will change. It works in an isolated Git worktree, writes the code and tests, and commits its candidate. The Attempt can run in a local sandbox or on a remote Fargate machine. Only the delegated work moves to that environment; questions still return to the human queue.
 
-Fluent creates its worktrees next to your repo, so your working tree stays clean while it builds. Place your repo at `<project>/main/` to keep all of Fluent's worktrees grouped as siblings under the project directory. Initialization prints a reminder if the directory is not named `main`.
+The Tester is a deterministic program rather than another coding agent. It runs the commands declared by the project, captures their output, and turns it into one structured test artifact. This gives every reviewer the same evidence and connects the `Test:` references in the Behavior Specifications to the tests that were actually run.
 
-The Writer implements the approved Plan and commits a candidate. The Tester runs the project's configured test commands. Five reviewers then inspect the same commit through separate tasks for behaviors, architecture, tests, documentation, and skills. Review tasks run in parallel up to the configured concurrency limit.
+Five reviewers inspect the same candidate through independent lenses:
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-fluent-builds-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/how-fluent-builds-light.png">
-    <img alt="A Work Item runs as a local foreground Attempt: the Writer produces a commit, the Tester runs project tests, five reviewers inspect it, and the Learner records project knowledge. Blocking failures return to the Writer and uncertainty pauses for you. A ready Merge Candidate still requires your acceptance before the land gate updates, checks, and reviews it for the target branch." src=".github/assets/how-fluent-builds-light.png" width="100%">
-  </picture>
-</p>
+- The Behavior Reviewer checks whether the change delivers the specified observable behavior.
+- The Architecture Reviewer checks the structure and technical decisions.
+- The Tests Reviewer checks the quality and coverage of the tests.
+- The Documentation Reviewer checks the documentation against the code and the project’s writing standards.
+- The Skills Reviewer checks any Agent Skills that the change adds or modifies.
 
-A new test failure or failing review verdict returns to the Writer, then Fluent tests and reviews the revision. An uncertain verdict or a decision outside the approved Behaviors and Approach pauses the Attempt at `needs-user` with the evidence collected so far instead of choosing for you. The current Local Preview can resume some infrastructure pauses in place; uncertain and exhausted-round pauses still require manual recovery.
+The reviewers run in parallel after the Tester finishes. Each returns `pass`, `fail`, or `uncertain` and writes the evidence behind that verdict. A failing review or a test regression sends its findings back to the Writer. The Writer revises the candidate, then the Tester and the relevant reviewers check the new commit. An uncertain verdict, a consequential decision outside the approved context, or a loop that stops making progress places the Attempt in the human queue with the evidence collected so far.
 
-Once the reviews pass, the Learner records reusable project knowledge and possible follow-ups. Only a successful Learner makes the Merge Candidate ready.
+When the Tester and all reviewers pass, the Learner examines the completed change and the evidence from every round. The Attempt produces a ready Merge Candidate only after the Learner succeeds. If the Work Item came through the scheduler, its agent and compute capacity is released at this point. The scheduler never lands the candidate.
 
-Ready does not mean merged. You inspect and accept the candidate first. The land gate then updates it against the current target branch, runs the configured checks and five review lenses again, and fast-forwards that branch only if they pass. If it cannot clear a conflict or finding within its bounds, it stops without moving the branch.
+### Land the Merge Candidate
 
-For the JSON status example, the Writer adds the response type and tests, the Tester runs the suite, and each reviewer checks one concern without editing the candidate it is reviewing.
+A ready Merge Candidate is the reviewed result of the Attempt, including any Expertise the Learner added. It has not changed the target branch. Ask Fluent to show you the candidate and inspect the change before accepting it. The default workflow waits for your acceptance; Fluent also provides a separate opt-in auto-merge process for projects that want ready candidates landed without an individual approval.
+
+During land, Fluent checks that the candidate and target worktrees are clean, updates the candidate against the current target branch, and runs the project’s `check-pre-merge` hook when one is configured. A project can also provide a `fix-pre-merge` hook to make a project-defined correction after a failed check and run the check again. If a rebase conflict cannot be resolved or a check still fails, Fluent stops without moving the target branch. When the gate passes, Fluent fast-forwards the target branch to the resulting commit.
 
 ## How Fluent keeps improving your code
 
-Some findings improve the candidate being built. Others become the next piece of Work. During an Attempt, a new test failure or failing review verdict stays with the current Work Item: the Writer addresses it, then Fluent reruns the Tester and the affected reviewers.
+Fluent uses different feedback loops for findings that belong to the current candidate and findings that should become later Work. Tester regressions and failing reviews stay inside the current Attempt and return to the Writer. The Learner records other findings in a handoff, but Fluent does not add them to the project’s Observation backlog unless the original candidate lands.
 
-The Learner can also record a separate change to make later, but it does not change the Observation backlog before the original candidate lands. After land, Fluent turns each follow-up into an Observation.
+After land, every Learner follow-up becomes an Observation linked to the Work Item, Attempt, Merge Candidate, and merged commit that produced it. The follow-up can also produce a corrective Work Item when it states a complete expected result and deterministic verification, names what is in and out of scope and the files it may change, leaves no decision unresolved, and is grounded in an existing Behavior Specification, an applicable project instruction, or project Expertise. If any of that context is missing or stale, the finding remains only an Observation for you to shape later.
 
-An Observation becomes corrective Work only when the change is bounded, testable, grounded in an existing Behavior, project instruction, or project Expertise, and requires no unresolved decision. Otherwise it stays an Observation for you to shape through the normal conversation.
+In the default `propose` mode, derived corrective Work waits for you to authorize it. In `execute` mode, Fluent can authorize and queue it automatically within the project’s configured follow-up limit. Both modes use the same Writer, Tester, Reviewer, and Learner loop. Queuing Work does not start the scheduler, and neither the scheduler nor follow-up authorization lands the resulting Merge Candidate.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-fluent-improves-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/how-fluent-improves-light.png">
-    <img alt="A blocking failure in the current Attempt returns to the Writer. After land, a Learner finding becomes an Observation; a strict corrective gate may turn it into proposed Work that you authorize and explicitly schedule. A separate opt-in post-merge review can start a forward-fix Attempt after a failing or uncertain review. Both follow-up paths stop at a candidate that waits for you." src=".github/assets/how-fluent-improves-light.png" width="100%">
-  </picture>
-</p>
-
-In the default `propose` mode, the skill shows you the corrective Work and waits. If you authorize it and ask Fluent to run queued Work, the same build loop starts. Authorization does not run or land anything by itself, and the scheduler stops at another ready Merge Candidate for you to inspect and land.
-
-A project can choose `execute` mode to authorize and queue trusted corrective Work automatically within its follow-up limits. The scheduler still runs only when you start it, and every candidate still needs your acceptance before land. The Fluent skill offers this choice before it initializes a new project.
-
-You can also ask Fluent to add a post-merge review when you land a candidate. On a clean fresh land, this separate opt-in schedules a detached Tester and reviewer pass against the landed change. A failing or uncertain review creates and runs a forward-fix Attempt. The Attempt can produce another candidate, but it cannot land it.
-
-In the running example, Fluent might notice that another CI script still parses the human-readable status output. If the project already says machine callers must use versioned JSON, Fluent can propose a bounded correction. Without that rule, it records the finding as an Observation instead.
+You can also opt into a post-merge review when you land a candidate. After a short debounce period, Fluent runs the Tester and five reviewers against the landed change. A failing or uncertain review starts a forward-fix Attempt through the normal build loop. That Attempt can produce another ready Merge Candidate, but it cannot land the candidate by itself.
 
 ## How Fluent learns your project
 
-Fluent's learning is project-local, versioned memory. It does not train the underlying model.
+Expertise is Fluent’s project-local, versioned memory. It is not training data for the underlying model. It lives under `.fluent/expertise/` and records project-level conventions, architectural constraints, testing patterns, and gotchas that future agents should know.
 
-After an Attempt produces code and passes review, the Learner sees the complete change and every Tester and reviewer artifact. It can add reusable conventions, constraints, testing patterns, and gotchas to `.fluent/expertise/`, or leave Expertise unchanged when the work taught it nothing durable. It cannot change project source, documentation, or the Observation backlog.
+The Learner receives the complete change and the Tester and reviewer artifacts from every round. In the default `capture` mode, it may refine Expertise or leave it unchanged when the Attempt taught it nothing reusable. Fluent confines those writes to `.fluent/expertise/` and records the complete Expertise change in a single `Update expertise` commit. The Learner cannot modify project source, documentation, Observations, or Work state.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/how-fluent-learns-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset=".github/assets/how-fluent-learns-light.png">
-    <img alt="The completed change plus Tester and reviewer evidence flows into the Learner, which records durable project Expertise in the Merge Candidate. After land, recorded decisions inform planning and relevant Expertise informs Writers and Reviewers. You can inspect and edit it." src=".github/assets/how-fluent-learns-light.png" width="100%">
-  </picture>
-</p>
+If a Work Item must preserve one exact reviewed commit, it can use `no-expertise` mode. The Learner still audits the change and identifies follow-ups, but it cannot write Expertise or change the candidate commit. This mode must be selected before Fluent creates the Work Item, and its Attempt runs locally rather than on Fargate.
 
-Expertise changes are part of the Merge Candidate, so they land with the code that taught them. A Learner failure keeps the candidate from becoming ready. Future planning checks recorded project decisions; Writers and Reviewers load the relevant Expertise. You can edit it directly when it is stale or wrong.
+Expertise changes become part of the Merge Candidate, so they land with the code that taught them. Future shaping conversations, Writers, and Reviewers can read the relevant Expertise instead of rediscovering the same project knowledge. You can inspect and edit it when a convention changes or an earlier lesson is wrong.
 
-For the JSON status change, Fluent might retain the rule that machine-readable CLI output uses a versioned schema, serializes the existing status model, and does not change the text output. A later Writer starts with that rule, and later Reviewers check it.
-
-Follow-up Work changes what Fluent does next. Expertise changes how Fluent does future work.
+The Learner also identifies possible follow-ups. After land, Fluent decides which remain only Observations and which also qualify as corrective Work. Follow-up Work changes what Fluent does next. Expertise changes how Fluent approaches future Work. A Learner failure keeps the Merge Candidate from becoming ready. When the failure is retryable, rerunning the Attempt retries only the Learner rather than rerunning the Writer, Tester, and reviewers.
