@@ -136,8 +136,10 @@ Fluent can also inspect code after it lands. Post-merge review is optional and o
 
 Each completed change can teach Fluent something about the project: a convention to follow, an architectural constraint to preserve, a testing pattern to reuse, or a gotcha to avoid. The Learner records reusable lessons as Expertise under `.fluent/expertise/`. Fluent draws on that Expertise when it shapes, builds, and reviews future work.
 
-After the Tester and every Reviewer pass, the Learner examines the complete accepted change, existing Expertise, and the Tester and Reviewer evidence from every round. It identifies project-specific knowledge that could guide future work and updates Expertise when there is something reusable to capture. If the Attempt taught it nothing worth carrying forward, Expertise remains unchanged.
+After the Tester and every Reviewer pass, the Learner examines the accepted change, existing Expertise, and the Tester and Reviewer evidence from every round. The Learner updates Expertise when the Attempt reveals project-specific knowledge that future agents should reuse. If the Attempt taught Fluent nothing worth carrying forward, Expertise remains unchanged.
 
 Any Expertise the Learner adds becomes part of the Merge Candidate and lands with the change that produced it. Over time, lessons from many Work Items accumulate in project Expertise, where future shaping conversations, Writers, and Reviewers can build on them. You can inspect and edit Expertise directly when a convention changes or a recorded lesson no longer applies.
 
 Each completed change improves the project and shapes how Fluent approaches future work.
+
+[Join our conversation on building software factories, on Discord.](https://discord.gg/dygEVzG3gf)
