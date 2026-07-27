@@ -1,6 +1,6 @@
 ---
 name: route-tests-drive-real-launch-wiring
-description: A launch-route regression must drive the real phase launch path and fail if it drops or re-resolves the threaded value — a helper test that only asserts config/resolver layering does not verify the wiring and the tests reviewer blocks on it
+description: A launch-route regression must drive the real phase or resume path and observe what reaches the coder; helper or persistence-only assertions do not verify execution wiring
 metadata:
   type: testing
 ---
@@ -51,5 +51,23 @@ asserts the counters stay at zero directly.
 This is the same "test the real path, not a copy of it" principle as
 [[extract-logic-to-avoid-test-duplication]], applied to launch wiring: a helper
 test verifies the resolver, only a route test verifies the route.
+
+The same rule applies when the value already lives in durable Work state.
+Asserting only that an Attempt's persisted coder mapping remains unchanged does
+not prove execution used it: the command could launch a coder selected from
+current configuration, or fail before launching any coder, while the JSON still
+looks correct. Use observably distinct coder stubs that record the invoked
+executable and arguments, supply conflicting configuration and environment
+values, and assert that the stored coder, model, and effort reached the launch.
+Also assert a deterministic outcome from the selected stub so the test proves
+the intended command path ran.
+
+For a recovery-only route, create the durable relaunchable state and resume
+through `run_attempt` or the public CLI. Calling the recovery helper directly
+does not prove the resume dispatcher selects that phase. Inject only the
+external coder leaf, record its request, and assert that no unrelated Task was
+planned or run.
+
 Related: [[public-api-surface-test]], [[declared-behavior-tests-must-exist-before-land]],
-[[mode-specific-prompts-replace-conflicting-base-instructions]].
+[[mode-specific-prompts-replace-conflicting-base-instructions]],
+[[attempt-coder-mapping-is-runtime-authority]].
