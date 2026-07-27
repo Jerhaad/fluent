@@ -19975,9 +19975,37 @@ fn replace_coder_config(main_dir: &Path) {
 }
 
 fn install_failing_coder_stubs(bin_dir: &Path) {
-    for coder in ["claude", "codex", "pi"] {
-        write_mock_executable(bin_dir, coder, "#!/bin/bash\nexit 7\n");
+    for (coder, exit_code) in [("claude", 71), ("codex", 72), ("pi", 73)] {
+        write_mock_executable(
+            bin_dir,
+            coder,
+            &format!(
+                r#"#!/bin/bash
+{{
+  printf 'coder={coder}\n'
+  printf 'arg=%s\n' "$@"
+}} > "$FLUENT_TEST_CODER_INVOCATION"
+exit {exit_code}
+"#
+            ),
+        );
     }
+}
+
+fn assert_stored_writer_invocation(bin_dir: &Path) {
+    let invocation = fs::read_to_string(bin_dir.join("invocation")).unwrap();
+    assert!(
+        invocation.starts_with("coder=codex\n"),
+        "stored writer coder should run; invocation:\n{invocation}"
+    );
+    assert!(
+        invocation.contains("arg=--model\narg=stored-write-model\n"),
+        "stored writer model should reach Codex; invocation:\n{invocation}"
+    );
+    assert!(
+        invocation.contains("arg=-c\narg=model_reasoning_effort=high\n"),
+        "stored writer effort should reach Codex; invocation:\n{invocation}"
+    );
 }
 
 fn run_with_changed_coder_environment(
@@ -19989,6 +20017,7 @@ fn run_with_changed_coder_environment(
         .current_dir(main_dir)
         .args(args)
         .env("PATH", mock_path(bin_dir))
+        .env("FLUENT_TEST_CODER_INVOCATION", bin_dir.join("invocation"))
         .env("FLUENT_WRITE_CODER", "pi")
         .env("FLUENT_WRITE_MODEL", "env-write")
         .env("FLUENT_WRITE_EFFORT", "low")
@@ -20014,11 +20043,16 @@ fn attempt_run_without_overrides_preserves_stored_coder_mapping() {
     let before = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
 
     replace_coder_config(&main_dir);
-    let _ = run_with_changed_coder_environment(
+    let output = run_with_changed_coder_environment(
         &main_dir,
         &bin_dir,
         &["attempt", "run", &work_item_id, "attempt-1", "--no-sandbox"],
     );
+    assert!(
+        !output.status.success(),
+        "the distinct Codex stub should produce its deterministic failure"
+    );
+    assert_stored_writer_invocation(&bin_dir);
 
     let after = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
     assert_eq!(
@@ -20086,7 +20120,7 @@ fn task_run_without_overrides_preserves_stored_coder_mapping() {
     let before = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
 
     replace_coder_config(&main_dir);
-    let _ = run_with_changed_coder_environment(
+    let output = run_with_changed_coder_environment(
         &main_dir,
         &bin_dir,
         &[
@@ -20098,6 +20132,11 @@ fn task_run_without_overrides_preserves_stored_coder_mapping() {
             "--no-sandbox",
         ],
     );
+    assert!(
+        !output.status.success(),
+        "the distinct Codex stub should produce its deterministic failure"
+    );
+    assert_stored_writer_invocation(&bin_dir);
 
     let after = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
     assert_eq!(
