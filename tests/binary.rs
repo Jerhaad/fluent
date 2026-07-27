@@ -21027,7 +21027,7 @@ fn codex_auth_resume_reopens_same_task_without_new_writer_round() {
         "codex",
         r##"#!/bin/bash
 set -euo pipefail
-if [[ "${1:-}" == "--disable" && "${4:-}" == "login" ]]; then
+if [[ "${1:-}" == "login" && "${2:-}" == "status" ]]; then
   test -f "$FLUENT_TEST_CODEX_AUTHENTICATED"
   exit 0
 fi
