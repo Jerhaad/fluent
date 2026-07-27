@@ -6028,6 +6028,14 @@ preflight after authentication succeeds, THE SYSTEM SHALL reopen and run the
 same Task through its stored coder mapping without adding a Writer round.
 Test: tests/binary.rs (codex_auth_resume_reopens_same_task_without_new_writer_round)
 
+### B9
+
+IF Codex authentication cannot be prepared before a Learner or rebase launch,
+THEN THE SYSTEM SHALL record neither a Learner run nor an executing Rebase Task,
+and tell the user to run `codex login`.
+Test: tests/binary.rs (learner_codex_auth_preflight_precedes_run_reservation)
+Test: tests/binary.rs (rebase_codex_auth_preflight_precedes_task_creation)
+
 ## Generated commit wording
 
 ### B1

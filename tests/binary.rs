@@ -20281,6 +20281,121 @@ fn codex_auth_failure_pauses_planned_reviewer_before_reservation() {
 }
 
 #[test]
+fn learner_codex_auth_preflight_precedes_run_reservation() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-learner-auth-failure");
+    let launch_marker = tmp.path().join("learner-launched");
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *\"login status\"* ]]; then exit 1; fi\ntouch '{}'\n",
+            launch_marker.display()
+        ),
+    );
+    write_mock_claude(&bin_dir, &loop_mock_script("pass"));
+    create_completed_work_attempt(&tmp, &main_dir);
+
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["write"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("codex login"));
+
+    let item = work_item_value(&main_dir, "work-1");
+    let attempt = &item["attempts"][0];
+    assert!(
+        attempt["learning"].is_null(),
+        "a failed preflight must not reserve a Learner run: {attempt}"
+    );
+    assert!(
+        !launch_marker.exists(),
+        "a failed authentication preflight must not launch the Learner"
+    );
+}
+
+#[test]
+fn rebase_codex_auth_preflight_precedes_task_creation() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-rebase-auth-failure");
+    let launch_marker = tmp.path().join("rebase-launched");
+    write_mock_claude(&bin_dir, &rebase_mock_script("pass"));
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *\"login status\"* ]]; then exit 1; fi\ntouch '{}'\n",
+            launch_marker.display()
+        ),
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Codex rebase auth"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+    commit_file(
+        &main_dir,
+        "target-only.txt",
+        "target advanced\n",
+        "Advance target",
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--coder",
+            "codex",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("codex login"));
+
+    let item = work_item_value(&main_dir, "work-1");
+    let attempt = &item["attempts"][0];
+    assert!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| task["kind"] != "rebase"),
+        "a failed preflight must not create an executing Rebase Task: {attempt}"
+    );
+    assert!(
+        !launch_marker.exists(),
+        "a failed authentication preflight must not launch the rebase coder"
+    );
+}
+
+#[test]
 fn autonomous_codex_writer_uses_and_removes_worker_home() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
