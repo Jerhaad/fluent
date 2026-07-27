@@ -99,6 +99,14 @@ The round outcome determines what happens next:
 
 The user provides input; `fluent attempt run` resumes the loop where it left off.
 
+### Codex authentication pauses
+
+Autonomous Codex workers use a private authentication home and do not load the
+interactive Codex configuration or hooks. If Fluent pauses an Attempt for Codex
+authentication, run `codex login`, then resume the same work with `fluent attempt
+run <work-item-id> [attempt-id]`. Interactive Codex sessions continue to use the
+user's normal configuration and hooks.
+
 For unrelated work that can proceed in parallel, create independent Work Items.
 
 For codebase, module, or area review-only work, create a Work Item, run `fluent review codebase <work-item-id> <attempt-id>`, then `fluent attempt run <work-item-id> <attempt-id>`.

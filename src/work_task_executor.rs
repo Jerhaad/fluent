@@ -1657,10 +1657,9 @@ fn mark_task_failed(
 }
 
 fn is_auth_error(result: &Result<()>) -> bool {
-    result
-        .as_ref()
-        .err()
-        .map_or(false, |e| e.is::<crate::claude_auth::AuthError>())
+    result.as_ref().err().map_or(false, |e| {
+        e.is::<crate::claude_auth::AuthError>() || e.is::<crate::codex_worker::CodexAuthError>()
+    })
 }
 
 /// A transcript-pump infrastructure failure is not a retryable coder error:
@@ -1714,6 +1713,8 @@ enum TaskFailure {
 fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
     if let Some(auth) = error.downcast_ref::<crate::claude_auth::AuthError>() {
         TaskFailure::Auth(auth.user_message())
+    } else if let Some(auth) = error.downcast_ref::<crate::codex_worker::CodexAuthError>() {
+        TaskFailure::Auth(auth.to_string())
     } else if let Some(pump) = error.downcast_ref::<crate::transcript_pump::TranscriptPumpError>() {
         TaskFailure::TranscriptPump(pump.message().to_string())
     } else {
@@ -1763,10 +1764,7 @@ fn mark_task_failed_attempt_needs_user(
         store.write_work_item(&item)?;
 
         match failure {
-            TaskFailure::Auth(_) => notify_fn(
-                "Fluent",
-                "Auth token expired. Run 'claude /login' to re-authenticate, then 'fluent attempt run'.",
-            ),
+            TaskFailure::Auth(message) => notify_fn("Fluent", message),
             TaskFailure::TranscriptPump(_) => notify_fn(
                 "Fluent",
                 "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
@@ -2241,6 +2239,21 @@ fn run_task_coder_with_coder(
         credential::setup_git_signing();
     }
 
+    // Keep this guard alive across sandbox construction and process completion so
+    // an autonomous Codex launch can access only its staged authentication home.
+    let codex_worker = if coder_kind == CoderKind::Codex {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+        Some(worker)
+    } else {
+        None
+    };
+    let mut launch_env: Vec<(String, String)> = Vec::new();
+    if let Some(worker) = &codex_worker {
+        launch_env.push(worker.launch_env());
+    }
+
     let task = item
         .attempts
         .iter()
@@ -2314,12 +2327,13 @@ fn run_task_coder_with_coder(
                 additional_writable.push(artifact_dir.to_path_buf());
             }
         }
-        build_coder_sandbox_with_writable_and_read_only_roots(
+        build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
             coder_kind,
             resolver,
             workspace_path,
             &additional_writable,
             &readable_roots,
+            codex_worker.as_ref().map(|worker| worker.home()),
         )?
     };
 
@@ -2360,7 +2374,7 @@ fn run_task_coder_with_coder(
         &system_prompt,
         workspace_path,
         extra_args,
-        &[],
+        &launch_env,
         capture.as_ref(),
     );
     let exit_code = match transcript_path.as_deref().and_then(Path::parent) {
@@ -3030,6 +3044,17 @@ fn run_learner_with_coder(
 ) -> Result<()> {
     eprintln!("  Running the Learner after passing reviews…");
 
+    // The guard survives until the process has completed, reclaiming the
+    // isolated authentication copy even when launch or execution fails.
+    let codex_worker = if inputs.coder_kind == CoderKind::Codex {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+        Some(worker)
+    } else {
+        None
+    };
+
     let workspace_path = inputs.workspace_path;
     let workspace_resolver = ContentResolver::new(Some(workspace_path));
     let learnings_dir = workspace_path.join(".fluent/expertise/learnings");
@@ -3110,6 +3135,9 @@ fn run_learner_with_coder(
         private_temp_roots.push(private_temp.path().to_path_buf());
         _private_temp_guard = Some(private_temp);
     }
+    if let Some(worker) = &codex_worker {
+        extra_env.push(worker.launch_env());
+    }
 
     // Every effectively sandboxed branch renders through the denied-writes
     // helper, which strips the shared `/private/tmp` and per-user
@@ -3132,14 +3160,16 @@ fn run_learner_with_coder(
             // only writable path beneath the host-owned run surface; the
             // transcript and submitted-draft evidence are siblings the coder
             // cannot reach.
-            let profile = os::render_profile_for_access_for_coder_with_denied_writes(
-                inputs.resolver,
-                &home,
-                &writable,
-                &readable_roots,
-                &[],
-                inputs.coder_kind,
-            )?;
+            let profile =
+                os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+                    inputs.resolver,
+                    &home,
+                    &writable,
+                    &readable_roots,
+                    &[],
+                    inputs.coder_kind,
+                    codex_worker.as_ref().map(|worker| worker.home()),
+                )?;
             let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
             (sandbox, Some(profile))
         } else {
@@ -3158,14 +3188,16 @@ fn run_learner_with_coder(
             denied.dedup();
             let mut writable = vec![inputs.handoff_dir.to_path_buf()];
             writable.extend(private_temp_roots.iter().cloned());
-            let profile = os::render_profile_for_access_for_coder_with_denied_writes(
-                inputs.resolver,
-                &home,
-                &writable,
-                &readable_roots,
-                &denied,
-                inputs.coder_kind,
-            )?;
+            let profile =
+                os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+                    inputs.resolver,
+                    &home,
+                    &writable,
+                    &readable_roots,
+                    &denied,
+                    inputs.coder_kind,
+                    codex_worker.as_ref().map(|worker| worker.home()),
+                )?;
             let sandbox =
                 CoderSandbox::TrustedSeatbeltProfile(profile.path.to_string_lossy().to_string());
             (sandbox, Some(profile))
@@ -4012,15 +4044,34 @@ fn build_coder_sandbox_with_writable_and_read_only_roots(
     additional_writable_roots: &[PathBuf],
     readable_roots: &[PathBuf],
 ) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
+    build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
+        coder_kind,
+        resolver,
+        working_dir,
+        additional_writable_roots,
+        readable_roots,
+        None,
+    )
+}
+
+fn build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
+    coder_kind: CoderKind,
+    resolver: &ContentResolver,
+    working_dir: &Path,
+    additional_writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: Option<&Path>,
+) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut roots = vec![working_dir.to_path_buf()];
     roots.extend(additional_writable_roots.iter().cloned());
-    let profile = os::render_profile_for_access_for_coder(
+    let profile = os::render_profile_for_access_for_coder_with_codex_home(
         resolver,
         &home,
         &roots,
         readable_roots,
         coder_kind,
+        codex_home,
     )?;
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))

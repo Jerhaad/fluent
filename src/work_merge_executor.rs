@@ -1890,6 +1890,14 @@ fn run_reserved_rebase(
     rebase_task_id: &str,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<RebaseOutcome> {
+    let codex_worker = if config.coder_kind == CoderKind::Codex {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+        Some(worker)
+    } else {
+        None
+    };
     let workspace_resolver = ContentResolver::new(Some(source_workspace));
     let system_prompt = workspace_resolver
         .resolve_content("prompts/rebase-system.md")
@@ -1920,11 +1928,12 @@ fn run_reserved_rebase(
         (CoderSandbox::None, None)
     } else {
         let common_git_dir = worktree::git_common_dir(source_workspace)?;
-        build_coder_sandbox(
+        build_coder_sandbox_with_codex_home(
             config.coder_kind,
             config.resolver,
             source_workspace,
             &[common_git_dir, rebase_artifact_dir.to_path_buf()],
+            codex_worker.as_ref().map(|worker| worker.home()),
         )?
     };
 
@@ -1949,7 +1958,10 @@ fn run_reserved_rebase(
         &system_prompt,
         source_workspace,
         config.extra_args,
-        &[],
+        &codex_worker
+            .as_ref()
+            .map(|worker| vec![worker.launch_env()])
+            .unwrap_or_default(),
         Some(&capture),
     );
     let exit_code = match crate::coder::finish_supervised_coder_run(completion, rebase_artifact_dir)
@@ -2440,17 +2452,24 @@ fn regenerate_provenance(
     Ok(())
 }
 
-fn build_coder_sandbox(
+fn build_coder_sandbox_with_codex_home(
     coder_kind: CoderKind,
     resolver: &ContentResolver,
     working_dir: &Path,
     additional_writable_roots: &[PathBuf],
+    codex_home: Option<&Path>,
 ) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut roots = vec![working_dir.to_path_buf()];
     roots.extend(additional_writable_roots.iter().cloned());
-    let profile =
-        os::render_profile_for_access_for_coder(resolver, &home, &roots, &[], coder_kind)?;
+    let profile = os::render_profile_for_access_for_coder_with_codex_home(
+        resolver,
+        &home,
+        &roots,
+        &[],
+        coder_kind,
+        codex_home,
+    )?;
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))
 }

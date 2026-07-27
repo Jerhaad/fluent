@@ -93,6 +93,28 @@ pub fn render_profile_for_access_for_coder_with_denied_writes(
     denied_write_roots: &[PathBuf],
     coder_kind: CoderKind,
 ) -> Result<SandboxProfile> {
+    render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        None,
+    )
+}
+
+/// Render a confined coder profile and, for Codex, grant only the supplied
+/// worker home rather than the interactive user's source home.
+pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: CoderKind,
+    codex_home: Option<&Path>,
+) -> Result<SandboxProfile> {
     let profile = render_profile_for_access(
         resolver,
         home,
@@ -100,7 +122,7 @@ pub fn render_profile_for_access_for_coder_with_denied_writes(
         readable_roots,
         denied_write_roots,
         Some(coder_kind),
-        None,
+        codex_home,
     )?;
     let content = std::fs::read_to_string(&profile.path)?
         .replace(
@@ -183,14 +205,15 @@ fn render_profile_for_access(
             1,
         )
     };
+    // `_CODEX_HOME_` contains `_HOME_`; replace the more specific token first.
     let rendered = combined
-        .replace("_HOME_", home)
         .replace(
             "_CODEX_HOME_",
             &codex_home
                 .map(|path| path.to_string_lossy().into_owned())
                 .unwrap_or_else(|| format!("{home}/.codex")),
         )
+        .replace("_HOME_", home)
         .replace("_SANDBOX_ROOT_", &primary_root);
 
     let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
