@@ -422,7 +422,10 @@ fn truncate_tail(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let start = s.len() - max;
+        let mut start = s.len() - max;
+        while !s.is_char_boundary(start) {
+            start += 1;
+        }
         format!("…{}", &s[start..])
     }
 }
@@ -595,6 +598,44 @@ echo '[{{"id": "tests::bar", "test_harness": "cargo-nextest", "status": "fail", 
         let results = read_results(artifact_dir.path());
 
         let excerpt = results.tests[0].failure_excerpt.as_ref().unwrap();
+        assert!(excerpt.len() <= FAILURE_EXCERPT_MAX + "…".len());
+    }
+
+    #[test]
+    fn truncate_tail_preserves_utf8_boundaries() {
+        let excerpt = format!("{}…{}", "x".repeat(499), "z".repeat(498));
+
+        let truncated = truncate_tail(&excerpt, FAILURE_EXCERPT_MAX);
+
+        assert_eq!(truncated, format!("…{}", "z".repeat(498)));
+        assert!(truncated.len() <= FAILURE_EXCERPT_MAX + "…".len());
+    }
+
+    #[test]
+    fn tester_results_caps_multibyte_failure_excerpt_without_panicking() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+
+        let long_excerpt = format!("{}…{}", "x".repeat(499), "z".repeat(498));
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: false\n    test_harness: cargo-nextest\n",
+        );
+        write_extractor(
+            workspace.path(),
+            &format!(
+                r#"#!/bin/sh
+echo '[{{"id": "tests::multibyte", "test_harness": "cargo-nextest", "status": "fail", "duration_ms": 10, "failure_excerpt": "{long_excerpt}"}}]'
+"#,
+            ),
+        );
+
+        run(workspace.path(), artifact_dir.path(), true, &resolver()).unwrap();
+        let results = read_results(artifact_dir.path());
+
+        let excerpt = results.tests[0].failure_excerpt.as_ref().unwrap();
+        assert_eq!(excerpt, &format!("…{}", "z".repeat(498)));
         assert!(excerpt.len() <= FAILURE_EXCERPT_MAX + "…".len());
     }
 
