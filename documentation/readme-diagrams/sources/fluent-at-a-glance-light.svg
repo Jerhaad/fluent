@@ -4,7 +4,7 @@
       .card { fill: none; stroke: #D0D7DE; stroke-width: 1; }
       .execution-boundary { fill: #F6F8FA; stroke: none; }
       .learn-card { fill: #B45309; fill-opacity: 0.04; stroke: #B45309; stroke-width: 1; }
-      .signal-box, .authority-box { fill: #FFFFFF; stroke: #B45309; stroke-width: 0.9; }
+      .source-box, .authority-box { fill: #FFFFFF; stroke: #B45309; stroke-width: 0.9; }
       .brand { fill: #1F2328; font-size: 15px; font-weight: 600; letter-spacing: 0.2px; }
       .tagline { fill: #59636E; font-size: 9.5px; font-weight: 400; letter-spacing: 0.1px; }
       .interface-line { fill: #59636E; font-size: 9.5px; font-weight: 400; letter-spacing: 0.1px; text-anchor: end; }
@@ -15,8 +15,7 @@
       .approval-body { fill: #59636E; font-size: 7.2px; text-anchor: middle; }
       .learn-body { fill: #B45309; font-size: 7.4px; text-anchor: middle; }
       .role { fill: #1F2328; font-size: 7.2px; font-weight: 600; letter-spacing: 0.2px; text-anchor: middle; }
-      .signal-label { fill: #B45309; font-size: 6.5px; font-weight: 600; letter-spacing: 0.9px; text-anchor: middle; }
-      .signal-text { fill: #B45309; font-size: 6.2px; font-weight: 600; letter-spacing: 0.1px; text-anchor: middle; }
+      .source-text { fill: #B45309; font-size: 6.2px; font-weight: 600; letter-spacing: 0.1px; text-anchor: middle; }
       .authority-text { fill: #B45309; font-size: 6px; font-weight: 600; letter-spacing: 0.1px; text-anchor: middle; }
       .or-text { fill: #59636E; font-size: 6px; font-weight: 600; letter-spacing: 0.4px; text-anchor: middle; }
       .icon { fill: none; stroke: #1F2328; stroke-width: 1.25; stroke-linecap: round; stroke-linejoin: round; }
@@ -60,25 +59,24 @@
   <rect x="506" y="126" width="240" height="418" rx="3" class="execution-boundary"/>
   <text x="626" y="535" class="execution-caption">Delegated work runs in local sandboxes or on remote machines.</text>
 
-  <!-- Signals entering the factory -->
-  <text x="163" y="89" class="signal-label">INPUT SIGNALS</text>
-  <rect x="18" y="96" width="56" height="20" rx="2" class="signal-box"/>
-  <rect x="79" y="96" width="68" height="20" rx="2" class="signal-box"/>
-  <rect x="152" y="96" width="61" height="20" rx="2" class="signal-box"/>
-  <rect x="218" y="96" width="90" height="20" rx="2" class="signal-box"/>
-  <text x="46" y="109" class="signal-text">AGENT TRACES</text>
-  <text x="113" y="109" class="signal-text">PRODUCTION LOGS</text>
-  <text x="182.5" y="109" class="signal-text">USER FEEDBACK</text>
-  <text x="263" y="109" class="signal-text">TEAM VISION AND IDEAS</text>
-  <line x1="46" y1="116" x2="46" y2="126" class="collector"/>
-  <line x1="113" y1="116" x2="113" y2="126" class="collector"/>
-  <line x1="182.5" y1="116" x2="182.5" y2="126" class="collector"/>
-  <line x1="263" y1="116" x2="263" y2="126" class="collector"/>
+  <!-- Sources of Observations -->
+  <rect x="18" y="82" width="56" height="22" rx="2" class="source-box"/>
+  <rect x="79" y="82" width="68" height="22" rx="2" class="source-box"/>
+  <rect x="152" y="82" width="61" height="22" rx="2" class="source-box"/>
+  <rect x="218" y="82" width="90" height="22" rx="2" class="source-box"/>
+  <text x="46" y="96" class="source-text">AGENT TRACES</text>
+  <text x="113" y="96" class="source-text">PRODUCTION LOGS</text>
+  <text x="182.5" y="96" class="source-text">USER FEEDBACK</text>
+  <text x="263" y="96" class="source-text">TEAM VISION AND IDEAS</text>
+  <line x1="46" y1="104" x2="46" y2="126" class="collector"/>
+  <line x1="113" y1="104" x2="113" y2="126" class="collector"/>
+  <line x1="182.5" y1="104" x2="182.5" y2="126" class="collector"/>
+  <line x1="263" y1="104" x2="263" y2="126" class="collector"/>
   <line x1="46" y1="126" x2="263" y2="126" class="collector"/>
   <line x1="142" y1="126" x2="142" y2="135" class="ingress"/>
 
-  <rect x="545" y="82" width="146" height="22" rx="2" class="signal-box"/>
-  <text x="618" y="96" class="signal-text">Human context and decisions</text>
+  <rect x="545" y="82" width="146" height="22" rx="2" class="source-box"/>
+  <text x="618" y="96" class="source-text">Human context and decisions</text>
   <line x1="610" y1="135" x2="610" y2="108" class="dialogue"/>
   <text x="570" y="119" class="dialogue-label">Pull in a human</text>
   <line x1="626" y1="108" x2="626" y2="135" class="dialogue"/>
@@ -186,5 +184,5 @@
   <path d="M548 340 V322 H142 V307" class="learning-return"/>
   <text x="345" y="318" class="return-label">NEW OBSERVATIONS</text>
   <path d="M42 427 H22 V126 H43" class="return"/>
-  <text x="32" y="277" class="side-label" transform="rotate(-90 32 277)">NEW SIGNALS</text>
+  <text x="32" y="277" class="side-label" transform="rotate(-90 32 277)">NEW OBSERVATIONS</text>
 </svg>

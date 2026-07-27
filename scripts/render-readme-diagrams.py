@@ -49,11 +49,11 @@ DIAGRAMS = (
 )
 
 FLOW_TRACKS = (
-    # Input signals converge on Observations.
-    Track(((46, 116), (46, 126), (142, 126), (142, 135)), cycles=1, offset=0.00),
-    Track(((113, 116), (113, 126), (142, 126), (142, 135)), cycles=2, offset=0.25),
-    Track(((182.5, 116), (182.5, 126), (142, 126), (142, 135)), cycles=1, offset=0.50),
-    Track(((263, 116), (263, 126), (142, 126), (142, 135)), cycles=1, offset=0.75),
+    # Observation sources converge on Observations.
+    Track(((46, 104), (46, 126), (142, 126), (142, 135)), cycles=1, offset=0.00),
+    Track(((113, 104), (113, 126), (142, 126), (142, 135)), cycles=2, offset=0.25),
+    Track(((182.5, 104), (182.5, 126), (142, 126), (142, 135)), cycles=1, offset=0.50),
+    Track(((263, 104), (263, 126), (142, 126), (142, 135)), cycles=1, offset=0.75),
     # Primary production flow.
     Track(((242, 221), (277, 221)), cycles=2, offset=0.05),
     Track(((480, 221), (515, 221)), cycles=2, offset=0.38),
