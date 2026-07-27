@@ -3928,8 +3928,8 @@ Test: src/work_model.rs (coder_mapping_for_task_kind_returns_correct_pair)
 
 ### B2
 
-WHEN `--coder X` or `FLUENT_CODER=X` is set and no per-Task-kind
-mapping is specified for an Attempt,
+WHEN Fluent creates an Attempt with `--coder X` or `FLUENT_CODER=X` set and no
+per-Task-kind mapping specified,
 THE SYSTEM SHALL set that Attempt's coder mapping so every Task
 kind uses Coder X.
 Test: src/work_model.rs (resolve_coder_mapping_fluent_coder_sets_all_task_kinds)

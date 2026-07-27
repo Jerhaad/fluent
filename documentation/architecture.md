@@ -1248,8 +1248,9 @@ both the query and the nudge. Offline check failures are silent.
 ### Coder selection
 
 Fluent supports three Coders: Claude Code, OpenAI Codex, and Pi.
-Claude is the default. Select a different Coder with `--coder codex`,
-`--coder pi`, or `FLUENT_CODER=<coder>`.
+Claude is the creation-time default. When creating an Attempt, select a
+different Coder with `--coder codex`, `--coder pi`, or
+`FLUENT_CODER=<coder>`.
 
 Each Attempt stores a per-Task-kind **coder mapping** that determines
 which Coder and model run each Task kind (write, review). Tester Tasks
@@ -1936,8 +1937,9 @@ current checkout.
 `FLUENT_CLAUDE_MODEL` first, falls back to `FLUENT_MODEL`, then uses
 the built-in default `claude-opus-4-6`. Codex uses
 `FLUENT_CODEX_MODEL` when set; otherwise Fluent leaves Codex model
-selection to the Codex CLI default. `FLUENT_CODER` selects the default
-coder when the CLI does not pass `--coder`.
+selection to the Codex CLI default. When Fluent creates an Attempt,
+`FLUENT_CODER` selects the default coder if the CLI does not pass `--coder`.
+It does not reselect the coder mapping when Fluent runs an existing Attempt.
 
 `FLUENT_CODEX_CA_BUNDLE` is not a model selector, but it lives beside
 Codex launch configuration: for sandboxed Codex runs it overrides the
