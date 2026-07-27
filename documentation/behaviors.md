@@ -3893,8 +3893,10 @@ Test: src/coder.rs (coder_kind_serializes_pi_as_kebab_case)
 WHEN Fluent creates an Attempt and resolves the coder, model, and reasoning
 effort for a role (writer, reviewer, or behavior-tests),
 THE SYSTEM SHALL take each from the first source that provides it: a
-command-line `--coder`/`--model` override, then an env var, then the project
-`.fluent/config.yaml`, then the user `~/.config/fluent/config.yaml`.
+global command-line `--coder`, `--model`, or `--effort` override or its
+`--write-*`, `--review-*`, or `--behavior-tests-*` per-role override, then an
+env var, then the project `.fluent/config.yaml`, then the user
+`~/.config/fluent/config.yaml`.
 Test: src/work_model.rs (resolve_coder_mapping_precedence_flag_env_config)
 
 ### B2
