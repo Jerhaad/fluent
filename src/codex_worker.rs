@@ -34,7 +34,8 @@ impl CodexAuthError {
 /// value drops. Only `auth.json` is staged; configuration, hooks, sessions,
 /// logs, and cache remain in the interactive home.
 pub struct CodexWorkerEnvironment {
-    home: tempfile::TempDir,
+    home_guard: tempfile::TempDir,
+    home: PathBuf,
 }
 
 impl CodexWorkerEnvironment {
@@ -72,19 +73,33 @@ impl CodexWorkerEnvironment {
         source_home: &Path,
         environment_auth: bool,
     ) -> std::result::Result<Self, CodexAuthError> {
-        let home = tempfile::Builder::new()
-            .prefix("fluent-codex-worker-")
-            .tempdir()
-            .map_err(|error| {
-                CodexAuthError::new(format!("cannot create a private worker home: {error}"))
-            })?;
-        set_private_mode(home.path(), 0o700).map_err(|error| {
+        Self::prepare_from_with_environment_auth_in(source_home, environment_auth, None)
+    }
+
+    fn prepare_from_with_environment_auth_in(
+        source_home: &Path,
+        environment_auth: bool,
+        temporary_root: Option<&Path>,
+    ) -> std::result::Result<Self, CodexAuthError> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("fluent-codex-worker-");
+        let home_guard = match temporary_root {
+            Some(root) => builder.tempdir_in(root),
+            None => builder.tempdir(),
+        }
+        .map_err(|error| {
+            CodexAuthError::new(format!("cannot create a private worker home: {error}"))
+        })?;
+        set_private_mode(home_guard.path(), 0o700).map_err(|error| {
             CodexAuthError::new(format!("cannot secure the worker home: {error}"))
+        })?;
+        let home = fs::canonicalize(home_guard.path()).map_err(|error| {
+            CodexAuthError::new(format!("cannot resolve the worker home: {error}"))
         })?;
 
         if !environment_auth {
             let source_auth = source_home.join("auth.json");
-            let worker_auth = home.path().join("auth.json");
+            let worker_auth = home.join("auth.json");
             fs::copy(&source_auth, &worker_auth).map_err(|error| {
                 CodexAuthError::new(format!(
                     "cannot copy authentication from {}: {error}",
@@ -96,19 +111,19 @@ impl CodexWorkerEnvironment {
             })?;
         }
 
-        Ok(Self { home })
+        Ok(Self { home_guard, home })
     }
 
     /// The only Codex state directory an autonomous launch may use.
     pub fn home(&self) -> &Path {
-        self.home.path()
+        &self.home
     }
 
     /// Add this worker's home to a per-launch command environment.
     pub fn launch_env(&self) -> (String, String) {
         (
             "CODEX_HOME".to_string(),
-            self.home.path().to_string_lossy().to_string(),
+            self.home.to_string_lossy().to_string(),
         )
     }
 
@@ -150,10 +165,22 @@ impl CodexWorkerEnvironment {
 
 /// Return the interactive Codex home that supplies autonomous authentication.
 pub fn effective_source_home() -> PathBuf {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
+    effective_source_home_from(
+        env::var_os("CODEX_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn effective_source_home_from(codex_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    canonical_existing_path(
+        codex_home
+            .or_else(|| home.map(|home| home.join(".codex")))
+            .unwrap_or_else(|| PathBuf::from(".codex")),
+    )
+}
+
+fn canonical_existing_path(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn has_environment_auth() -> bool {
@@ -225,6 +252,52 @@ mod tests {
         let path = worker.home().to_path_buf();
         drop(worker);
         assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_home_exposes_canonical_path_from_aliased_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("auth.json"), "auth").unwrap();
+        let real_root = tempfile::tempdir().unwrap();
+        let alias_parent = tempfile::tempdir().unwrap();
+        let alias = alias_parent.path().join("temporary-root");
+        symlink(real_root.path(), &alias).unwrap();
+
+        let worker = CodexWorkerEnvironment::prepare_from_with_environment_auth_in(
+            source.path(),
+            false,
+            Some(&alias),
+        )
+        .unwrap();
+
+        assert_eq!(worker.home(), fs::canonicalize(worker.home()).unwrap());
+        assert!(!worker.home().starts_with(&alias));
+        assert_eq!(worker.launch_env().1, worker.home().to_string_lossy());
+    }
+
+    #[test]
+    fn canonical_existing_path_preserves_missing_path_spelling() {
+        let missing = PathBuf::from("missing-codex-home");
+        assert_eq!(canonical_existing_path(missing.clone()), missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_source_home_canonicalizes_an_existing_aliased_home() {
+        use std::os::unix::fs::symlink;
+
+        let real_home = tempfile::tempdir().unwrap();
+        let alias_parent = tempfile::tempdir().unwrap();
+        let alias = alias_parent.path().join("codex-home");
+        symlink(real_home.path(), &alias).unwrap();
+
+        assert_eq!(
+            effective_source_home_from(Some(alias), None),
+            fs::canonicalize(real_home.path()).unwrap()
+        );
     }
 
     #[test]
