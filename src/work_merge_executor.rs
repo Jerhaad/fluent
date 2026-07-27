@@ -1803,7 +1803,7 @@ fn rebase_candidate_with_coder(
 ) -> Result<RebaseOutcome> {
     // A Codex login problem must not create an executing Rebase Task. Keep the
     // prepared home alive through the eventual sandboxed launch.
-    let codex_worker = if config.coder_kind == CoderKind::Codex {
+    let codex_worker = if config.coder_kind == CoderKind::Codex && !cfg!(test) {
         let worker =
             crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
         worker.preflight().map_err(anyhow::Error::new)?;

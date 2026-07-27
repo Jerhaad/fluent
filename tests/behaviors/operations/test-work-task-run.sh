@@ -22,6 +22,7 @@ setup_test_project() {
   printf 'test\n' > README.md
   seed_review_skill_stubs "."
   seed_tester_config "."
+  export OPENAI_API_KEY="fluent-test-key"
   git add . && git commit -m "init" > /dev/null 2>&1
   MOCK_BIN="$TEST_DIR/bin"
 }
@@ -62,6 +63,12 @@ physical_workspace_path() {
 write_mock_codex() {
   cat > "${MOCK_BIN}/codex" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+if [[ "$*" == *"login status"* ]]; then
+  exit 0
+fi
+if [[ "$*" == "--version" ]]; then
+  exit 0
+fi
 printf '%s\n' "$PWD" >> "$CODER_CWD_LOG"
 printf '%s\n' "$*" >> "$CODER_ARGS_LOG"
 last_arg=""

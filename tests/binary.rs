@@ -19981,10 +19981,16 @@ fn install_failing_coder_stubs(bin_dir: &Path) {
             coder,
             &format!(
                 r#"#!/bin/bash
+if [[ "$*" == *"login status"* ]]; then
+  exit 0
+fi
+if [[ "$*" == "--version" ]]; then
+  exit 0
+fi
 {{
   printf 'coder={coder}\n'
   printf 'arg=%s\n' "$@"
-}} > "$FLUENT_TEST_CODER_INVOCATION"
+}} >> "$FLUENT_TEST_CODER_INVOCATION"
 exit {exit_code}
 "#
             ),
@@ -20017,6 +20023,7 @@ fn run_with_changed_coder_environment(
         .current_dir(main_dir)
         .args(args)
         .env("PATH", mock_path(bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
         .env("FLUENT_TEST_CODER_INVOCATION", bin_dir.join("invocation"))
         .env("FLUENT_WRITE_CODER", "pi")
         .env("FLUENT_WRITE_MODEL", "env-write")

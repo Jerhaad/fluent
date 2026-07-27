@@ -40,7 +40,27 @@ pub struct CodexWorkerEnvironment {
 impl CodexWorkerEnvironment {
     /// Prepare a private worker home from the effective source `CODEX_HOME`.
     pub fn prepare() -> std::result::Result<Self, CodexAuthError> {
+        #[cfg(test)]
+        {
+            return Self::prepare_test_worker();
+        }
+
+        #[cfg(not(test))]
         Self::prepare_from_with_environment_auth(&effective_source_home(), has_environment_auth())
+    }
+
+    /// Give launch-route unit tests a private, authenticated worker home without
+    /// reading the developer's interactive Codex state. External tests exercise
+    /// the public production entry point with an explicit authentication source.
+    #[cfg(test)]
+    fn prepare_test_worker() -> std::result::Result<Self, CodexAuthError> {
+        let source = tempfile::tempdir().map_err(|error| {
+            CodexAuthError::new(format!("cannot create test authentication source: {error}"))
+        })?;
+        fs::write(source.path().join("auth.json"), "test authentication").map_err(|error| {
+            CodexAuthError::new(format!("cannot write test authentication source: {error}"))
+        })?;
+        Self::prepare_from_with_environment_auth(source.path(), false)
     }
 
     #[cfg(test)]
@@ -94,6 +114,15 @@ impl CodexWorkerEnvironment {
 
     /// Ask Codex itself whether this worker home is authenticated.
     pub fn preflight(&self) -> std::result::Result<(), CodexAuthError> {
+        #[cfg(test)]
+        {
+            // Route unit tests inject a recording coder, not a Codex CLI. Keep
+            // their focus on launch wiring; `preflight_with` tests the CLI
+            // contract directly and external tests cover the production route.
+            return Ok(());
+        }
+
+        #[cfg(not(test))]
         self.preflight_with("codex")
     }
 
