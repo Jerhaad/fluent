@@ -20222,6 +20222,87 @@ fn codex_auth_failure_pauses_planned_task_before_reservation() {
 }
 
 #[test]
+fn autonomous_codex_writer_uses_and_removes_worker_home() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let source_home = tmp.path().join("source-codex-home");
+    let bin_dir = tmp.path().join("bin-codex-worker-home");
+    let invocation_log = tmp.path().join("codex-invocations");
+    fs::create_dir_all(source_home.join("sessions")).unwrap();
+    fs::write(source_home.join("auth.json"), "source authentication").unwrap();
+    fs::write(source_home.join("config.toml"), "hooks = true").unwrap();
+    fs::write(source_home.join("sessions/session.json"), "session").unwrap();
+    write_mock_sandbox_exec(&bin_dir);
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        r##"#!/bin/bash
+set -euo pipefail
+test "$CODEX_HOME" != "$FLUENT_TEST_SOURCE_CODEX_HOME"
+test -f "$CODEX_HOME/auth.json"
+test "$(cat "$CODEX_HOME/auth.json")" = "source authentication"
+test ! -e "$CODEX_HOME/config.toml"
+test ! -e "$CODEX_HOME/sessions"
+if [[ "${1:-}" == "--disable" && "${2:-}" == "hooks" && "${3:-}" == "--ignore-user-config" && "${4:-}" == "login" && "${5:-}" == "status" ]]; then
+  printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+  exit 0
+fi
+printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+printf 'codex worker output\n' > codex-worker-output.txt
+git add codex-worker-output.txt
+git commit -m "Add Codex worker output" >/dev/null
+"##,
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "codex-worker", "--title", "Codex worker"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "create",
+            "codex-worker",
+            "attempt-1",
+            "--write-coder",
+            "codex",
+        ])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "codex-worker",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    let invocations = fs::read_to_string(&invocation_log).unwrap();
+    let worker_home = invocations
+        .lines()
+        .find_map(|line| line.strip_prefix("exec="))
+        .expect("Codex exec should receive the staged home");
+    assert!(invocations.contains(&format!("preflight={worker_home}")));
+    assert_ne!(Path::new(worker_home), source_home);
+    assert!(
+        !Path::new(worker_home).exists(),
+        "the worker home must be removed after the launch: {worker_home}"
+    );
+}
+
+#[test]
 fn task_run_overrides_only_explicit_coder_mapping_fields() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
