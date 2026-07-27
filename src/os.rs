@@ -191,11 +191,22 @@ fn render_profile_for_access(
             &root_rules,
         )
     };
-    let deny_rules = denied_write_roots
+    let mut deny_rules = denied_write_roots
         .iter()
         .map(|root| format!("(deny file-write* (subpath {}))", sbpl_string(root)))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    // Autonomous Codex workers use a staged home.  Deny the interactive source
+    // explicitly before common.sb's broad home read grants so the profile cannot
+    // reach hooks, configuration, sessions, or the original credentials.
+    if let Some(worker_home) = codex_home {
+        let source_home = crate::codex_worker::effective_source_home();
+        if worker_home != source_home {
+            let source = sbpl_string(&source_home);
+            deny_rules.push(format!("(deny file-read* (subpath {source}))"));
+            deny_rules.push(format!("(deny file-write* (subpath {source}))"));
+        }
+    }
+    let deny_rules = deny_rules.join("\n");
     let combined = if deny_rules.is_empty() {
         combined
     } else {

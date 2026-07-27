@@ -123,7 +123,8 @@ impl CodexWorkerEnvironment {
     }
 }
 
-fn effective_source_home() -> PathBuf {
+/// Return the interactive Codex home that supplies autonomous authentication.
+pub fn effective_source_home() -> PathBuf {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))

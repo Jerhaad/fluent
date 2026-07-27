@@ -1922,13 +1922,13 @@ fn run_reserved_rebase(
 
     let transcript_path = rebase_artifact_dir.join("transcript.jsonl");
 
-    if !config.no_sandbox {
+    if !config.no_sandbox || codex_worker.is_some() {
         os::check_prerequisites_for(config.coder_kind)?;
         credential::inject_credentials()?;
         credential::setup_git_signing();
     }
 
-    let (sandbox, _sandbox_profile) = if config.no_sandbox {
+    let (sandbox, _sandbox_profile) = if config.no_sandbox && codex_worker.is_none() {
         (CoderSandbox::None, None)
     } else {
         let common_git_dir = worktree::git_common_dir(source_workspace)?;

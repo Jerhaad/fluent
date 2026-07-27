@@ -212,6 +212,7 @@ fn reserve_task_start(
     task_id: &str,
     expected_kind: TaskKind,
     active_status: AttemptStatus,
+    expected_coder: CoderKind,
 ) -> Result<TaskStartReservation> {
     enum Decision {
         Reserved(Box<TaskStartReservation>),
@@ -240,6 +241,12 @@ fn reserve_task_start(
         }
         let mapping = attempt.coder_mapping.for_task_kind(expected_kind);
         let coder = mapping.coder;
+        // The Codex boundary was prepared for this exact mapping before the
+        // reservation. A concurrent provider change must replan instead of
+        // launching an un-preflighted coder.
+        if coder != expected_coder {
+            return Ok(Decision::Rejected);
+        }
         let model = if mapping.model.is_empty() {
             None
         } else {
@@ -547,6 +554,7 @@ fn run_write_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         config.task_id,
         TaskKind::Write,
         AttemptStatus::Executing,
+        plan_coder_kind(&item, config.attempt_id, TaskKind::Write)?,
     )?;
 
     // Side-effectful setup after the reservation. Only non-deterministic failures
@@ -899,6 +907,7 @@ fn run_review_task_with_coder(
         config.task_id,
         TaskKind::Review,
         AttemptStatus::Reviewing,
+        plan_coder_kind(&planned_item, config.attempt_id, TaskKind::Review)?,
     )?;
     // Every launch input derives from the reservation's fresh lock-held snapshot,
     // not the read-only plan used for the preflight.
@@ -1336,6 +1345,11 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         config.task_id,
         TaskKind::Tester,
         AttemptStatus::Reviewing,
+        plan_coder_kind(
+            &read_work_item_or_not_found(config.store, config.work_item_id)?,
+            config.attempt_id,
+            TaskKind::Tester,
+        )?,
     )?;
 
     // Side-effectful setup after the reservation: create the artifact directory. A
@@ -1795,9 +1809,20 @@ fn mark_task_failed_attempt_needs_user(
     failure: &TaskFailure,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<()> {
-    let mut item = read_work_item_or_not_found(store, work_item_id)?;
-    if let Some((attempt_index, task_index)) = find_attempt_task_indexes(&item, attempt_id, task_id)
-    {
+    let transitioned = store.mutate_work_item(work_item_id, |item| {
+        let Some((attempt_index, task_index)) =
+            find_attempt_task_indexes(item, attempt_id, task_id)
+        else {
+            return Ok(false);
+        };
+        // A preflight failure owns a Planned Task; a later coder auth failure
+        // owns its Executing Task. Do not overwrite a peer's terminal state.
+        if !matches!(
+            item.attempts[attempt_index].tasks[task_index].status,
+            TaskStatus::Planned | TaskStatus::Executing
+        ) {
+            return Ok(false);
+        }
         // A resumable Auth/transcript failure gets durable `NeedsUser` Task state,
         // distinct from a hard `Failed`, so a supported resume can reopen exactly
         // that Task and reject a mixed hard-Failed/still-live Attempt.
@@ -1821,14 +1846,21 @@ fn mark_task_failed_attempt_needs_user(
             crate::work_model::AttemptStatus::NeedsUser,
             Some(pause_kind),
         );
-        // Persist the authoritative terminal Task/Attempt state FIRST, before any
-        // auxiliary handoff or notification. If a later diagnostic effect fails, the
-        // durable transition is already recorded, so the Task can never be left
-        // Executing by a handoff or notify failure.
-        store.write_work_item(&item)?;
+        Ok(true)
+    })?;
 
+    // Persist the authoritative terminal Task/Attempt state before any auxiliary
+    // handoff or notification. A later effect failure cannot undo the pause.
+    if transitioned {
         match failure {
-            TaskFailure::Auth(message) => notify_fn("Fluent", message),
+            TaskFailure::Auth(message) => {
+                let message = if message.contains("codex login") {
+                    message.as_str()
+                } else {
+                    "Claude authentication needs attention. Run 'claude /login' to re-authenticate, then 'fluent attempt run'."
+                };
+                notify_fn("Fluent", message)
+            }
             TaskFailure::TranscriptPump(_) => notify_fn(
                 "Fluent",
                 "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
@@ -2300,7 +2332,7 @@ fn run_task_coder_with_coder(
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
-    if !no_sandbox {
+    if !no_sandbox || codex_worker.is_some() {
         os::check_prerequisites_for(coder_kind)?;
         credential::inject_credentials()?;
         credential::setup_git_signing();
@@ -2320,7 +2352,7 @@ fn run_task_coder_with_coder(
     materialize_planning_files(item, project_root)?;
     materialize_general_expertise(project_root)?;
 
-    if should_seed_project_model(task.kind, workspace_path) {
+    if should_seed_project_model(task.kind, workspace_path) && coder_kind != CoderKind::Codex {
         if let Err(err) = run_seed_project_model(
             workspace_path,
             resolver,
@@ -2371,7 +2403,7 @@ fn run_task_coder_with_coder(
     let system_prompt = workspace_resolver
         .resolve_content("prompts/write-system.md")
         .unwrap_or_default();
-    let (sandbox, _sandbox_profile) = if no_sandbox {
+    let (sandbox, _sandbox_profile) = if no_sandbox && codex_worker.is_none() {
         (CoderSandbox::None, None)
     } else {
         let common_git_dir = worktree::git_common_dir(workspace_path)?;
@@ -3164,7 +3196,10 @@ fn run_learner_with_coder(
     // Only ordinary capture may honor `--no-sandbox`. A no-expertise or post-land
     // run forces the trusted boundary so a candidate cannot be retargeted or the
     // merged branch mutated even when the caller requested no sandbox.
-    let effectively_sandboxed = mode.effectively_sandboxed(inputs.no_sandbox);
+    // `--no-sandbox` remains available to other coders, but autonomous Codex
+    // must keep the source-home denial that protects its staged credentials.
+    let effectively_sandboxed =
+        mode.effectively_sandboxed(inputs.no_sandbox) || inputs.coder_kind == CoderKind::Codex;
 
     // The managed Learner surface is the last trusted host boundary before
     // environment filtering and Seatbelt. When the coder launches effectively
@@ -3712,7 +3747,7 @@ fn run_review_coder_with_coder(
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
-    if !no_sandbox {
+    if !no_sandbox || codex_worker.is_some() {
         os::check_prerequisites_for(coder_kind)?;
         credential::inject_credentials()?;
         credential::setup_git_signing();
@@ -3734,7 +3769,7 @@ fn run_review_coder_with_coder(
         review_only,
     })?;
 
-    let (sandbox, _sandbox_profile) = if no_sandbox {
+    let (sandbox, _sandbox_profile) = if no_sandbox && codex_worker.is_none() {
         (CoderSandbox::None, None)
     } else {
         let mut readable_roots = review_readable_sandbox_roots(readable_workspaces)?;
@@ -6980,6 +7015,7 @@ mod tests {
                     "attempt-1-write-1",
                     TaskKind::Write,
                     AttemptStatus::Executing,
+                    CoderKind::Claude,
                 )
             });
             let start_result = starter.join().unwrap();
