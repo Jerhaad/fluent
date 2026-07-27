@@ -356,6 +356,28 @@ fn resolve_paused_coder(attempt: &work_model::Attempt) -> Option<String> {
     Some(pair.coder.as_str().to_string())
 }
 
+/// Resolve an existing Attempt's effective mapping from its persisted mapping
+/// plus command-line inputs. Return a mutation only when an explicit field
+/// changes the mapping.
+fn resolve_run_coder_mapping(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    cli_inputs: &work_model::CoderMappingInputs,
+) -> Result<(work_model::CoderMapping, Option<work_model::CoderMapping>)> {
+    let item = store.read_work_item(work_item_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Attempt {attempt_id:?} not found in Work Item {work_item_id:?}")
+        })?;
+    let effective = attempt.coder_mapping.overlay_run_inputs(cli_inputs)?;
+    let update = (effective != attempt.coder_mapping).then(|| effective.clone());
+    Ok((effective, update))
+}
+
 fn cmd_attempt(
     project_root: &Path,
     command: AttemptCommands,
@@ -514,24 +536,22 @@ fn cmd_attempt(
                         .to_string()
                 }
             };
-            let coder_mapping = work_model::resolve_coder_mapping(
-                &fluent::config::from_config(project_root)
-                    .merge(work_model::CoderMappingInputs::from_env())
-                    .merge_cli(
-                        write_coder,
-                        write_model,
-                        review_coder,
-                        review_model,
-                        behavior_tests_coder,
-                        behavior_tests_model,
-                        coder.or_else(|| global_coder.map(str::to_string)),
-                        model,
-                        write_effort,
-                        review_effort,
-                        behavior_tests_effort,
-                        effort,
-                    ),
-            )?;
+            let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
+                write_coder,
+                write_model,
+                review_coder,
+                review_model,
+                behavior_tests_coder,
+                behavior_tests_model,
+                coder.or_else(|| global_coder.map(str::to_string)),
+                model,
+                write_effort,
+                review_effort,
+                behavior_tests_effort,
+                effort,
+            );
+            let (coder_mapping, coder_mapping_update) =
+                resolve_run_coder_mapping(&store, &work_item_id, &attempt_id, &cli_inputs)?;
             let runtime = runtime.unwrap_or_else(|| "local".to_string());
             match runtime.as_str() {
                 "fargate" => {
@@ -563,7 +583,7 @@ fn cmd_attempt(
                 resolver,
                 extra_args: &extra_args,
                 no_sandbox: no_sandbox || global_no_sandbox,
-                resolved_coder_mapping: Some(&coder_mapping),
+                resolved_coder_mapping: coder_mapping_update.as_ref(),
             })?;
             // Resolve the runtime context the guidance hints need — why the
             // Attempt paused, which coder to re-authenticate, and where its latest

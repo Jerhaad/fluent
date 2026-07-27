@@ -2074,6 +2074,59 @@ impl CoderMapping {
             _ => &self.write,
         }
     }
+
+    /// Apply only the supplied run-time fields over this persisted mapping.
+    ///
+    /// Callers must pass command-line inputs only. Configuration and environment
+    /// inputs select a mapping when an Attempt is created, not when it runs.
+    pub fn overlay_run_inputs(&self, inputs: &CoderMappingInputs) -> Result<Self, anyhow::Error> {
+        let mut mapping = self.clone();
+
+        if let Some(coder) = inputs.global_coder.as_deref() {
+            let coder = CoderKind::resolve(Some(coder))?;
+            mapping.write.coder = coder;
+            mapping.review.coder = coder;
+            mapping.behavior_tests.coder = coder;
+        }
+
+        let overlay_pair = |pair: &mut CoderModelPair,
+                            coder: &Option<String>,
+                            model: &Option<String>,
+                            effort: &Option<String>|
+         -> Result<(), anyhow::Error> {
+            if let Some(coder) = coder.as_deref() {
+                pair.coder = CoderKind::resolve(Some(coder))?;
+            }
+            if let Some(model) = model {
+                pair.model = model.clone();
+            }
+            if let Some(effort) = effort {
+                pair.effort = Some(effort.clone());
+            }
+            Ok(())
+        };
+
+        overlay_pair(
+            &mut mapping.write,
+            &inputs.write_coder,
+            &inputs.write_model,
+            &inputs.write_effort,
+        )?;
+        overlay_pair(
+            &mut mapping.review,
+            &inputs.review_coder,
+            &inputs.review_model,
+            &inputs.review_effort,
+        )?;
+        overlay_pair(
+            &mut mapping.behavior_tests,
+            &inputs.behavior_tests_coder,
+            &inputs.behavior_tests_model,
+            &inputs.behavior_tests_effort,
+        )?;
+
+        Ok(mapping)
+    }
 }
 
 /// Inputs for resolving a CoderMapping at Attempt creation time.
@@ -9011,6 +9064,53 @@ random banner prose that must be ignored
             merged.behavior_tests_coder.is_none(),
             "both None remains None"
         );
+    }
+
+    #[test]
+    fn overlay_run_inputs_changes_only_explicit_fields() {
+        let stored = CoderMapping {
+            write: CoderModelPair {
+                coder: CoderKind::Codex,
+                model: "stored-write".to_string(),
+                effort: Some("high".to_string()),
+            },
+            review: CoderModelPair {
+                coder: CoderKind::Pi,
+                model: "stored-review".to_string(),
+                effort: Some("medium".to_string()),
+            },
+            behavior_tests: CoderModelPair {
+                coder: CoderKind::Claude,
+                model: "stored-behavior".to_string(),
+                effort: Some("low".to_string()),
+            },
+        };
+        let inputs = CoderMappingInputs::default().merge_cli(
+            Some("pi".to_string()),
+            None,
+            None,
+            Some("review-override".to_string()),
+            None,
+            None,
+            Some("claude".to_string()),
+            Some("global-override".to_string()),
+            None,
+            Some("max".to_string()),
+            None,
+            None,
+        );
+
+        let overlaid = stored.overlay_run_inputs(&inputs).unwrap();
+
+        assert_eq!(overlaid.write.coder, CoderKind::Pi);
+        assert_eq!(overlaid.write.model, "global-override");
+        assert_eq!(overlaid.write.effort.as_deref(), Some("high"));
+        assert_eq!(overlaid.review.coder, CoderKind::Claude);
+        assert_eq!(overlaid.review.model, "review-override");
+        assert_eq!(overlaid.review.effort.as_deref(), Some("max"));
+        assert_eq!(overlaid.behavior_tests.coder, CoderKind::Claude);
+        assert_eq!(overlaid.behavior_tests.model, "global-override");
+        assert_eq!(overlaid.behavior_tests.effort.as_deref(), Some("low"));
     }
 
     #[test]

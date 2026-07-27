@@ -16,7 +16,7 @@ use crate::review_only_worktree;
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMapping,
     MergeCandidateMergeStatus, PauseKind, Task, TaskKind, TaskOutput, TaskStatus, WorkItem,
-    WorkModelStorageError, WorkModelStore, resolve_managed_sibling_workspace_path,
+    WorkModelError, WorkModelStorageError, WorkModelStore, resolve_managed_sibling_workspace_path,
     work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
@@ -120,14 +120,17 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
     if let Some(mapping) = config.resolved_coder_mapping {
         let _land_lock =
             crate::land_lock::acquire(&crate::land_lock::lock_path(config.project_root))?;
-        let mut item = read_work_item_or_not_found(config.store, config.work_item_id)?;
-        let attempt = item
-            .attempts
-            .iter_mut()
-            .find(|attempt| attempt.id == config.attempt_id)
-            .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
-        attempt.coder_mapping = mapping.clone();
-        config.store.write_work_item(&item)?;
+        config.store.mutate_work_item(config.work_item_id, |item| {
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == config.attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: config.attempt_id.to_string(),
+                })?;
+            attempt.coder_mapping = mapping.clone();
+            Ok(())
+        })?;
     }
 
     let mut outcomes = Vec::new();

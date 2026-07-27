@@ -19923,3 +19923,153 @@ fn attempt_coder_model_flags_override_config() {
         "CLI --effort should apply to behavior-tests"
     );
 }
+
+fn create_attempt_with_distinct_coder_mapping(main_dir: &Path, work_item_id: &str) {
+    fluent_cmd()
+        .current_dir(main_dir)
+        .args([
+            "work-item",
+            "create",
+            work_item_id,
+            "--title",
+            "Coder mapping continuity",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(main_dir)
+        .args([
+            "attempt",
+            "create",
+            work_item_id,
+            "attempt-1",
+            "--write-coder",
+            "codex",
+            "--write-model",
+            "stored-write-model",
+            "--write-effort",
+            "high",
+            "--review-coder",
+            "pi",
+            "--review-model",
+            "stored-review-model",
+            "--review-effort",
+            "medium",
+            "--behavior-tests-coder",
+            "claude",
+            "--behavior-tests-model",
+            "stored-behavior-model",
+            "--behavior-tests-effort",
+            "low",
+        ])
+        .assert()
+        .success();
+}
+
+fn replace_coder_config(main_dir: &Path) {
+    fs::write(
+        main_dir.join(".fluent/config.yaml"),
+        "coders:\n  writer:\n    coder: claude\n    model: config-write\n    effort: low\n  reviewer:\n    coder: claude\n    model: config-review\n    effort: low\n  behavior-tests:\n    coder: pi\n    model: config-behavior\n    effort: high\n",
+    )
+    .unwrap();
+}
+
+fn install_failing_coder_stubs(bin_dir: &Path) {
+    for coder in ["claude", "codex", "pi"] {
+        write_mock_executable(bin_dir, coder, "#!/bin/bash\nexit 7\n");
+    }
+}
+
+fn run_with_changed_coder_environment(
+    main_dir: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    fluent_cmd()
+        .current_dir(main_dir)
+        .args(args)
+        .env("PATH", mock_path(bin_dir))
+        .env("FLUENT_WRITE_CODER", "pi")
+        .env("FLUENT_WRITE_MODEL", "env-write")
+        .env("FLUENT_WRITE_EFFORT", "low")
+        .env("FLUENT_REVIEW_CODER", "claude")
+        .env("FLUENT_REVIEW_MODEL", "env-review")
+        .env("FLUENT_REVIEW_EFFORT", "high")
+        .env("FLUENT_BEHAVIOR_TESTS_CODER", "codex")
+        .env("FLUENT_BEHAVIOR_TESTS_MODEL", "env-behavior")
+        .env("FLUENT_BEHAVIOR_TESTS_EFFORT", "medium")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn attempt_run_without_overrides_preserves_stored_coder_mapping() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let token = run_token(&tmp);
+    let work_item_id = format!("mapping{token}");
+    let bin_dir = tmp.path().join("bin-mapping");
+    install_failing_coder_stubs(&bin_dir);
+    create_attempt_with_distinct_coder_mapping(&main_dir, &work_item_id);
+    let before = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+
+    replace_coder_config(&main_dir);
+    let _ = run_with_changed_coder_environment(
+        &main_dir,
+        &bin_dir,
+        &["attempt", "run", &work_item_id, "attempt-1", "--no-sandbox"],
+    );
+
+    let after = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+    assert_eq!(
+        after, before,
+        "a flagless run must keep the Attempt's creation-time mapping"
+    );
+    remove_sibling_worktrees(&main_dir, &token);
+}
+
+#[test]
+fn attempt_run_overrides_only_explicit_coder_mapping_fields() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let token = run_token(&tmp);
+    let work_item_id = format!("override{token}");
+    let bin_dir = tmp.path().join("bin-mapping");
+    install_failing_coder_stubs(&bin_dir);
+    create_attempt_with_distinct_coder_mapping(&main_dir, &work_item_id);
+    replace_coder_config(&main_dir);
+
+    let _ = run_with_changed_coder_environment(
+        &main_dir,
+        &bin_dir,
+        &[
+            "attempt",
+            "run",
+            &work_item_id,
+            "attempt-1",
+            "--no-sandbox",
+            "--coder",
+            "claude",
+            "--write-coder",
+            "pi",
+            "--model",
+            "run-global-model",
+            "--review-model",
+            "run-review-model",
+            "--review-effort",
+            "max",
+        ],
+    );
+
+    let mapping = work_item_value(&main_dir, &work_item_id)["attempts"][0]["coder_mapping"].clone();
+    assert_eq!(mapping["write"]["coder"], "pi");
+    assert_eq!(mapping["write"]["model"], "run-global-model");
+    assert_eq!(mapping["write"]["effort"], "high");
+    assert_eq!(mapping["review"]["coder"], "claude");
+    assert_eq!(mapping["review"]["model"], "run-review-model");
+    assert_eq!(mapping["review"]["effort"], "max");
+    assert_eq!(mapping["behavior-tests"]["coder"], "claude");
+    assert_eq!(mapping["behavior-tests"]["model"], "run-global-model");
+    assert_eq!(mapping["behavior-tests"]["effort"], "low");
+    remove_sibling_worktrees(&main_dir, &token);
+}
