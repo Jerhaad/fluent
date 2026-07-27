@@ -3064,6 +3064,27 @@ pub(crate) fn run_learner_captured_in_mode(
     )
 }
 
+/// Run a Learner with a Codex worker environment prepared before its durable
+/// reservation. The caller retains the guard until this launch returns.
+pub(crate) fn run_learner_captured_in_mode_with_codex_worker(
+    inputs: LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
+    capture: Option<crate::coder::TranscriptCapture<'_>>,
+    codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+) -> Result<()> {
+    let coder_kind = inputs.coder_kind;
+    let model = inputs.model.map(|s| s.to_string());
+    let effort = inputs.effort.map(|s| s.to_string());
+    run_learner_with_coder_with_codex_worker(
+        inputs,
+        mode,
+        capture,
+        codex_worker,
+        HostPreparation::Production,
+        move |sandbox| coder_kind.boxed_with_model(sandbox, model.as_deref(), effort.as_deref()),
+    )
+}
+
 /// Prepare the sandboxed host before an effectively sandboxed Learner launch:
 /// verify the coder's prerequisites, inject its supported credentials on the host
 /// (where the sandbox denies the credential store), and set up Git signing. This is
@@ -3131,18 +3152,38 @@ fn run_learner_with_coder(
     mut host_preparation: HostPreparation<'_>,
     make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
 ) -> Result<()> {
+    run_learner_with_coder_with_codex_worker(
+        inputs,
+        mode,
+        capture,
+        None,
+        host_preparation,
+        make_coder,
+    )
+}
+
+fn run_learner_with_coder_with_codex_worker(
+    inputs: LearnerRunInputs<'_>,
+    mode: LearnerExecutionMode,
+    capture: Option<crate::coder::TranscriptCapture<'_>>,
+    prepared_codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    mut host_preparation: HostPreparation<'_>,
+    make_coder: impl FnOnce(CoderSandbox) -> Box<dyn crate::coder::Coder>,
+) -> Result<()> {
     eprintln!("  Running the Learner after passing reviews…");
 
     // The guard survives until the process has completed, reclaiming the
     // isolated authentication copy even when launch or execution fails.
-    let codex_worker = if inputs.coder_kind == CoderKind::Codex {
-        let worker =
-            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
-        worker.preflight().map_err(anyhow::Error::new)?;
-        Some(worker)
-    } else {
-        None
-    };
+    let local_codex_worker =
+        if inputs.coder_kind == CoderKind::Codex && prepared_codex_worker.is_none() {
+            let worker = crate::codex_worker::CodexWorkerEnvironment::prepare()
+                .map_err(anyhow::Error::new)?;
+            worker.preflight().map_err(anyhow::Error::new)?;
+            Some(worker)
+        } else {
+            None
+        };
+    let codex_worker = prepared_codex_worker.or(local_codex_worker.as_ref());
 
     let workspace_path = inputs.workspace_path;
     let workspace_resolver = ContentResolver::new(Some(workspace_path));

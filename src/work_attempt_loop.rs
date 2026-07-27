@@ -270,6 +270,8 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                         mode,
                         &LearnerConfig {
                             run_coder: &run_coder,
+                            #[cfg(not(test))]
+                            codex_worker: None,
                         },
                     )?;
                     // A no-expertise Learner persists every terminal transition
@@ -478,6 +480,8 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 can_advance,
                 Some(LearnerConfig {
                     run_coder: &run_coder,
+                    #[cfg(not(test))]
+                    codex_worker: None,
                 }),
             )?;
             let should_stop = matches!(
@@ -525,7 +529,7 @@ fn default_learner_run_coder(
     // The public `handoff_only` Boolean only distinguishes capture from post-land;
     // the internal mode is passed explicitly so a pre-land no-expertise run selects
     // its confinement without a contradictory Boolean.
-    work_task_executor::run_learner_captured_in_mode(
+    work_task_executor::run_learner_captured_in_mode_with_codex_worker(
         work_task_executor::LearnerRunInputs {
             workspace_path: request.workspace_path,
             resolver: config.resolver,
@@ -544,6 +548,16 @@ fn default_learner_run_coder(
         },
         request.mode,
         Some(capture),
+        {
+            #[cfg(not(test))]
+            {
+                request.codex_worker
+            }
+            #[cfg(test)]
+            {
+                None
+            }
+        },
     )
 }
 
@@ -939,6 +953,8 @@ pub(crate) struct LearnerCoderRequest<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     mode: work_task_executor::LearnerExecutionMode,
+    #[cfg(not(test))]
+    codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
     /// When set, a bounded schema repair rather than a fresh audit.
     repair: Option<work_task_executor::SchemaRepairInput<'a>>,
 }
@@ -948,6 +964,8 @@ pub(crate) struct LearnerCoderRequest<'a> {
 /// exercised without spawning a real coder.
 struct LearnerConfig<'a> {
     run_coder: &'a dyn Fn(&LearnerCoderRequest<'_>) -> Result<()>,
+    #[cfg(not(test))]
+    codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
 }
 
 /// The verdict of a fresh, serialized Learner reservation.
@@ -973,6 +991,7 @@ fn reserve_learner_run(
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
+    expected_coder: CoderKind,
 ) -> Result<LearnerReservation> {
     let reservation = store.mutate_work_item(work_item_id, |fresh| {
         let attempt = fresh
@@ -989,6 +1008,9 @@ fn reserve_learner_run(
         let landing_eligible = attempt.status == AttemptStatus::Complete
             && attempt.review_state == Some(AttemptReviewState::Passed);
         if !landing_eligible {
+            return Ok(LearnerReservation::Skip);
+        }
+        if attempt.coder_mapping.for_task_kind(TaskKind::Write).coder != expected_coder {
             return Ok(LearnerReservation::Skip);
         }
 
@@ -1046,17 +1068,20 @@ fn run_learner_step(
     };
 
     // Authenticate Codex before the reservation records an in-progress Learner
-    // run. The launch route repeats preparation to retain its private home until
-    // the process exits.
+    // run. The same guard is passed to the launch route and remains alive through
+    // process completion, so no second post-reservation preflight is possible.
     let learner_coder = item.attempts[attempt_index]
         .coder_mapping
         .for_task_kind(TaskKind::Write)
         .coder;
-    if learner_coder == CoderKind::Codex {
+    let codex_worker = if learner_coder == CoderKind::Codex {
         let worker =
             crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
         worker.preflight().map_err(anyhow::Error::new)?;
-    }
+        Some(worker)
+    } else {
+        None
+    };
 
     // A fresh, lock-held reservation with landing validation. It re-reads the durable
     // state under the model lock and decides whether THIS runner launches, so a
@@ -1065,7 +1090,7 @@ fn run_learner_step(
     // reservation, not this stale snapshot, is authoritative. A crash after it
     // reserves the in-progress state leaves a retryable record rather than an orphan
     // handoff with no durable learning state.
-    let runs = match reserve_learner_run(store, &work_item_id, &attempt_id)? {
+    let runs = match reserve_learner_run(store, &work_item_id, &attempt_id, learner_coder)? {
         LearnerReservation::Skip => {
             *item = store.read_work_item(&work_item_id)?;
             return Ok(());
@@ -1075,6 +1100,11 @@ fn run_learner_step(
     // The reservation wrote the in-progress state; refresh the in-memory snapshot so
     // `try_learn`/`finalize_learning` operate on the reserved durable record.
     *item = store.read_work_item(&work_item_id)?;
+    let config = LearnerConfig {
+        run_coder: config.run_coder,
+        #[cfg(not(test))]
+        codex_worker: codex_worker.as_ref(),
+    };
 
     // A pre-land no-expertise run must leave every candidate pointer at the reviewed
     // Writer SHA, so — unlike capture, which moves canonical pointers through the
@@ -1092,7 +1122,7 @@ fn run_learner_step(
             attempt_index,
             candidate_id,
             mode,
-            config,
+            &config,
             runs,
         );
     }
@@ -1107,7 +1137,7 @@ fn run_learner_step(
         attempt_index,
         candidate_id,
         mode,
-        config,
+        &config,
     );
     finalize_learning(store, item, attempt_index, runs, learned, |handoff| {
         crate::learner::write_handoff(project_root, &work_item_id, &attempt_id, handoff)
@@ -1885,6 +1915,8 @@ fn try_learn(
         model: model.as_deref(),
         effort: effort.as_deref(),
         mode,
+        #[cfg(not(test))]
+        codex_worker: config.codex_worker,
         repair: None,
     });
     // Account for this invocation's return before inspecting its result. A
@@ -1994,6 +2026,8 @@ fn try_learn(
                     model: model.as_deref(),
                     effort: effort.as_deref(),
                     mode,
+                    #[cfg(not(test))]
+                    codex_worker: config.codex_worker,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,
                         validation_error: &validation_error,
@@ -2101,6 +2135,8 @@ fn run_pre_land_learner(
         model: ctx.model,
         effort: ctx.effort,
         mode: work_task_executor::LearnerExecutionMode::Capture,
+        #[cfg(not(test))]
+        codex_worker: config.codex_worker,
         repair: None,
     });
     transaction.capture_return(workspace_path)?;
@@ -2156,6 +2192,8 @@ fn run_pre_land_learner(
                     model: ctx.model,
                     effort: ctx.effort,
                     mode: work_task_executor::LearnerExecutionMode::Capture,
+                    #[cfg(not(test))]
+                    codex_worker: config.codex_worker,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,
                         validation_error: &validation_error,
@@ -6364,7 +6402,7 @@ mod tests {
             let mut item = store.read_work_item("work-1").unwrap();
             item.attempts[0].learning = Some(AttemptLearning::in_progress(1));
             store.write_work_item(&item).unwrap();
-            match reserve_learner_run(&store, "work-1", "attempt-1").unwrap() {
+            match reserve_learner_run(&store, "work-1", "attempt-1", CoderKind::Claude).unwrap() {
                 LearnerReservation::Launch { runs } => assert_eq!(
                     runs, 2,
                     "a crash-left in-progress record is relaunched with the next run index"
