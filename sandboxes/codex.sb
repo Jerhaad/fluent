@@ -10,6 +10,7 @@
 ;; infrastructure for all local sandboxed coders.
 ;; ==========================================================================
 
-;; Codex configuration, auth, sessions, and cache.
-(allow file-read*  (subpath "_HOME_/.codex"))
-(allow file-write* (subpath "_HOME_/.codex"))
+;; The caller resolves this to the interactive Source home or the private
+;; autonomous Worker home. Do not replace it with a broad user-home grant.
+(allow file-read*  (subpath "_CODEX_HOME_"))
+(allow file-write* (subpath "_CODEX_HOME_"))

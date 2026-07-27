@@ -55,9 +55,12 @@ impl CodexWorkerEnvironment {
         let home = tempfile::Builder::new()
             .prefix("fluent-codex-worker-")
             .tempdir()
-            .map_err(|error| CodexAuthError::new(format!("cannot create a private worker home: {error}")))?;
-        set_private_mode(home.path(), 0o700)
-            .map_err(|error| CodexAuthError::new(format!("cannot secure the worker home: {error}")))?;
+            .map_err(|error| {
+                CodexAuthError::new(format!("cannot create a private worker home: {error}"))
+            })?;
+        set_private_mode(home.path(), 0o700).map_err(|error| {
+            CodexAuthError::new(format!("cannot secure the worker home: {error}"))
+        })?;
 
         if !environment_auth {
             let source_auth = source_home.join("auth.json");
@@ -99,11 +102,15 @@ impl CodexWorkerEnvironment {
             .args(["login", "status"])
             .env("CODEX_HOME", self.home())
             .status()
-            .map_err(|error| CodexAuthError::new(format!("cannot run `codex login status`: {error}")))?;
+            .map_err(|error| {
+                CodexAuthError::new(format!("cannot run `codex login status`: {error}"))
+            })?;
         if status.success() {
             Ok(())
         } else {
-            Err(CodexAuthError::new("`codex login status` reports no valid login"))
+            Err(CodexAuthError::new(
+                "`codex login status` reports no valid login",
+            ))
         }
     }
 }
@@ -152,14 +159,27 @@ mod tests {
 
         let worker = CodexWorkerEnvironment::prepare_from(source.path()).unwrap();
 
-        assert_eq!(fs::read_to_string(worker.home().join("auth.json")).unwrap(), "auth");
+        assert_eq!(
+            fs::read_to_string(worker.home().join("auth.json")).unwrap(),
+            "auth"
+        );
         assert!(!worker.home().join("config.toml").exists());
         assert!(!worker.home().join("sessions").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(worker.home()).unwrap().permissions().mode() & 0o777, 0o700);
-            assert_eq!(fs::metadata(worker.home().join("auth.json")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(worker.home()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(worker.home().join("auth.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 
@@ -179,11 +199,17 @@ mod tests {
         fs::write(source.path().join("auth.json"), "auth").unwrap();
         let worker = CodexWorkerEnvironment::prepare_from(source.path()).unwrap();
         let fake = tempfile::NamedTempFile::new().unwrap();
-        fs::write(fake.path(), "#!/bin/sh\ntest \"$1 $2\" = 'login status'\ntest -f \"$CODEX_HOME/auth.json\"\n").unwrap();
+        fs::write(
+            fake.path(),
+            "#!/bin/sh\ntest \"$1 $2\" = 'login status'\ntest -f \"$CODEX_HOME/auth.json\"\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         set_private_mode(fake.path(), 0o700).unwrap();
 
-        worker.preflight_with(&fake.path().to_string_lossy()).unwrap();
+        worker
+            .preflight_with(&fake.path().to_string_lossy())
+            .unwrap();
     }
 
     #[test]
@@ -196,7 +222,9 @@ mod tests {
         #[cfg(unix)]
         set_private_mode(fake.path(), 0o700).unwrap();
 
-        let error = worker.preflight_with(&fake.path().to_string_lossy()).unwrap_err();
+        let error = worker
+            .preflight_with(&fake.path().to_string_lossy())
+            .unwrap_err();
         assert!(error.to_string().contains("codex login"));
         assert!(error.to_string().contains("fluent attempt run"));
     }
@@ -204,8 +232,9 @@ mod tests {
     #[test]
     fn environment_auth_does_not_require_source_auth_file() {
         let source = tempfile::tempdir().unwrap();
-        let worker = CodexWorkerEnvironment::prepare_from_with_environment_auth(source.path(), true)
-            .unwrap();
+        let worker =
+            CodexWorkerEnvironment::prepare_from_with_environment_auth(source.path(), true)
+                .unwrap();
         assert!(!worker.home().join("auth.json").exists());
     }
 }

@@ -697,6 +697,11 @@ impl CodexCode {
         }
         if exec_mode {
             cmd.arg("exec");
+            // Autonomous workers must not inherit user configuration, hooks, or
+            // session continuity from an interactive Codex home.
+            cmd.args(["--disable", "hooks"]);
+            cmd.arg("--ignore-user-config");
+            cmd.arg("--ephemeral");
         }
         cmd.args(["--cd", &working_dir.to_string_lossy()]);
         cmd.args(["--dangerously-bypass-approvals-and-sandbox"]);
@@ -4495,6 +4500,42 @@ mod model_default_tests {
             !cmd_has_arg(&cmd, "--model"),
             "codex should not pass --model when no model is configured"
         );
+    }
+
+    #[test]
+    fn autonomous_codex_command_isolated_from_user_hooks_config_and_sessions() {
+        let coder = CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: Some("gpt-5".to_string()),
+            effort: Some("high".to_string()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = coder.build_command(dir.path(), true);
+
+        assert!(cmd_has_arg(&cmd, "exec"));
+        assert!(cmd_has_arg(&cmd, "--disable"));
+        assert!(cmd_has_arg(&cmd, "hooks"));
+        assert!(cmd_has_arg(&cmd, "--ignore-user-config"));
+        assert!(cmd_has_arg(&cmd, "--ephemeral"));
+        assert!(cmd_has_arg(&cmd, "gpt-5"));
+        assert!(cmd_has_arg(&cmd, "model_reasoning_effort=high"));
+    }
+
+    #[test]
+    fn interactive_codex_command_preserves_user_configuration() {
+        let coder = CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = coder.build_command(dir.path(), false);
+
+        assert!(!cmd_has_arg(&cmd, "--ignore-user-config"));
+        assert!(!cmd_has_arg(&cmd, "--ephemeral"));
+        assert!(!cmd_has_arg(&cmd, "hooks"));
     }
 
     #[test]

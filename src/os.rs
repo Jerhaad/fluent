@@ -52,6 +52,26 @@ pub fn render_profile_for_access_for_coder(
     readable_roots: &[PathBuf],
     coder_kind: CoderKind,
 ) -> Result<SandboxProfile> {
+    render_profile_for_access_for_coder_with_codex_home(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        coder_kind,
+        None,
+    )
+}
+
+/// Render a profile for an autonomous coder, optionally replacing Codex's
+/// interactive home grant with its private worker home.
+pub fn render_profile_for_access_for_coder_with_codex_home(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    coder_kind: CoderKind,
+    codex_home: Option<&Path>,
+) -> Result<SandboxProfile> {
     render_profile_for_access(
         resolver,
         home,
@@ -59,6 +79,7 @@ pub fn render_profile_for_access_for_coder(
         readable_roots,
         &[],
         Some(coder_kind),
+        codex_home,
     )
 }
 
@@ -79,6 +100,7 @@ pub fn render_profile_for_access_for_coder_with_denied_writes(
         readable_roots,
         denied_write_roots,
         Some(coder_kind),
+        None,
     )?;
     let content = std::fs::read_to_string(&profile.path)?
         .replace(
@@ -100,7 +122,15 @@ pub fn render_profile_common_only(
     writable_roots: &[PathBuf],
     readable_roots: &[PathBuf],
 ) -> Result<SandboxProfile> {
-    render_profile_for_access(resolver, home, writable_roots, readable_roots, &[], None)
+    render_profile_for_access(
+        resolver,
+        home,
+        writable_roots,
+        readable_roots,
+        &[],
+        None,
+        None,
+    )
 }
 
 fn render_profile_for_access(
@@ -110,6 +140,7 @@ fn render_profile_for_access(
     readable_roots: &[PathBuf],
     denied_write_roots: &[PathBuf],
     coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
 ) -> Result<SandboxProfile> {
     if writable_roots.is_empty() {
         bail!("At least one writable sandbox root is required");
@@ -154,6 +185,12 @@ fn render_profile_for_access(
     };
     let rendered = combined
         .replace("_HOME_", home)
+        .replace(
+            "_CODEX_HOME_",
+            &codex_home
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("{home}/.codex")),
+        )
         .replace("_SANDBOX_ROOT_", &primary_root);
 
     let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
@@ -344,6 +381,46 @@ mod tests {
         assert!(content.contains("Codex CLI -- profile-specific Seatbelt rules"));
         assert!(content.contains("/Users/test/.codex"));
         assert!(!content.contains("Claude Code CLI -- profile-specific Seatbelt rules"));
+    }
+
+    #[test]
+    fn autonomous_codex_profile_grants_only_worker_home() {
+        let resolver = ContentResolver::new(None);
+        let worker_home = PathBuf::from("/private/tmp/fluent-codex-worker");
+        let profile = render_profile_for_access_for_coder_with_codex_home(
+            &resolver,
+            "/Users/test",
+            &[
+                PathBuf::from("/Users/test/workspace/run"),
+                worker_home.clone(),
+            ],
+            &[],
+            CoderKind::Codex,
+            Some(&worker_home),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        assert!(
+            content.contains("/private/tmp/fluent-codex-worker"),
+            "{content}"
+        );
+        assert!(!content.contains("/Users/test/.codex"), "{content}");
+    }
+
+    #[test]
+    fn interactive_codex_profile_preserves_source_home_access() {
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_roots_for_coder(
+            &resolver,
+            "/Users/test",
+            &[PathBuf::from("/Users/test/workspace/run")],
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        assert!(content.contains("/Users/test/.codex"), "{content}");
     }
 
     #[test]
