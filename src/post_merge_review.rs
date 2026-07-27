@@ -496,7 +496,7 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
         resolver: &resolver,
         extra_args: &[],
         no_sandbox: true,
-        resolved_coder_mapping: None,
+        coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,
     }) {
@@ -615,7 +615,7 @@ fn auto_run_post_merge_review_fix(
         resolver: &resolver,
         extra_args: &[],
         no_sandbox: false,
-        resolved_coder_mapping: None,
+        coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,
     })?;

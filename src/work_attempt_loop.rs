@@ -14,9 +14,9 @@ use crate::review::{self, Verdict};
 use crate::review_diff_command;
 use crate::review_only_worktree;
 use crate::work_model::{
-    ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMapping,
+    ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMappingInputs,
     MergeCandidateMergeStatus, PauseKind, Task, TaskKind, TaskOutput, TaskStatus, WorkItem,
-    WorkModelError, WorkModelStorageError, WorkModelStore, resolve_managed_sibling_workspace_path,
+    WorkModelStorageError, WorkModelStore, resolve_managed_sibling_workspace_path,
     work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
@@ -60,9 +60,9 @@ pub struct WorkAttemptRunConfig<'a> {
     pub resolver: &'a ContentResolver,
     pub extra_args: &'a [String],
     pub no_sandbox: bool,
-    /// Mapping resolved by the CLI for this invocation. Persist it through a
-    /// fresh field-level mutation under the land lock, never a stale model write.
-    pub resolved_coder_mapping: Option<&'a CoderMapping>,
+    /// Explicit CLI mapping fields for this invocation. Overlay them on the
+    /// freshly locked Attempt mapping under the land lock.
+    pub coder_mapping_inputs: Option<&'a CoderMappingInputs>,
     /// Replace only the external Learner launch while unit tests drive the real
     /// Attempt resume route.
     #[cfg(test)]
@@ -122,20 +122,15 @@ pub struct WorkAttemptRunResult {
 }
 
 pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunResult> {
-    if let Some(mapping) = config.resolved_coder_mapping {
+    if let Some(inputs) = config.coder_mapping_inputs {
         let _land_lock =
             crate::land_lock::acquire(&crate::land_lock::lock_path(config.project_root))?;
-        config.store.mutate_work_item(config.work_item_id, |item| {
-            let attempt = item
-                .attempts
-                .iter_mut()
-                .find(|attempt| attempt.id == config.attempt_id)
-                .ok_or_else(|| WorkModelError::AttemptNotFound {
-                    id: config.attempt_id.to_string(),
-                })?;
-            attempt.coder_mapping = mapping.clone();
-            Ok(())
-        })?;
+        crate::work_model::overlay_attempt_coder_mapping(
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+            inputs,
+        )?;
     }
 
     let mut outcomes = Vec::new();
@@ -4609,7 +4604,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
-            resolved_coder_mapping: None,
+            coder_mapping_inputs: None,
             learner_run_coder: None,
         }) {
             Ok(_) => panic!("abandoned Work Item should reject attempt run"),
@@ -5844,7 +5839,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
-            resolved_coder_mapping: None,
+            coder_mapping_inputs: None,
             learner_run_coder: Some(&run_coder),
         })
         .unwrap();
@@ -8087,7 +8082,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
-            resolved_coder_mapping: None,
+            coder_mapping_inputs: None,
             learner_run_coder: None,
         })
         .unwrap_err();

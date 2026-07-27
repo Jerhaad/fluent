@@ -356,15 +356,14 @@ fn resolve_paused_coder(attempt: &work_model::Attempt) -> Option<String> {
     Some(pair.coder.as_str().to_string())
 }
 
-/// Resolve an existing Attempt's effective mapping from its persisted mapping
-/// plus command-line inputs. Return a mutation only when an explicit field
-/// changes the mapping.
+/// Resolve an existing Attempt's effective mapping for display and launch
+/// selection. Execution persists explicit inputs through a fresh mutation.
 fn resolve_run_coder_mapping(
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
     cli_inputs: &work_model::CoderMappingInputs,
-) -> Result<(work_model::CoderMapping, Option<work_model::CoderMapping>)> {
+) -> Result<work_model::CoderMapping> {
     let item = store.read_work_item(work_item_id)?;
     let attempt = item
         .attempts
@@ -373,9 +372,7 @@ fn resolve_run_coder_mapping(
         .ok_or_else(|| {
             anyhow::anyhow!("Attempt {attempt_id:?} not found in Work Item {work_item_id:?}")
         })?;
-    let effective = attempt.coder_mapping.overlay_run_inputs(cli_inputs)?;
-    let update = (effective != attempt.coder_mapping).then(|| effective.clone());
-    Ok((effective, update))
+    attempt.coder_mapping.overlay_run_inputs(cli_inputs)
 }
 
 fn cmd_attempt(
@@ -550,11 +547,24 @@ fn cmd_attempt(
                 behavior_tests_effort,
                 effort,
             );
-            let (coder_mapping, coder_mapping_update) =
+            let coder_mapping =
                 resolve_run_coder_mapping(&store, &work_item_id, &attempt_id, &cli_inputs)?;
             let runtime = runtime.unwrap_or_else(|| "local".to_string());
             match runtime.as_str() {
                 "fargate" => {
+                    let coder_mapping = if cli_inputs.has_run_overrides() {
+                        let _land_lock = fluent::land_lock::acquire(
+                            &fluent::land_lock::lock_path(project_root),
+                        )?;
+                        work_model::overlay_attempt_coder_mapping(
+                            &store,
+                            &work_item_id,
+                            &attempt_id,
+                            &cli_inputs,
+                        )?
+                    } else {
+                        coder_mapping
+                    };
                     let coder_kind = CoderKind::resolve(coder_mapping.write.coder.as_str().into())?;
                     fargate::launch_work_attempt(
                         project_root,
@@ -583,7 +593,7 @@ fn cmd_attempt(
                 resolver,
                 extra_args: &extra_args,
                 no_sandbox: no_sandbox || global_no_sandbox,
-                resolved_coder_mapping: coder_mapping_update.as_ref(),
+                coder_mapping_inputs: cli_inputs.has_run_overrides().then_some(&cli_inputs),
             })?;
             // Resolve the runtime context the guidance hints need — why the
             // Attempt paused, which coder to re-authenticate, and where its latest
@@ -994,22 +1004,12 @@ fn cmd_task(
                 behavior_tests_effort,
                 effort,
             );
-            let (_, coder_mapping_update) =
-                resolve_run_coder_mapping(&store, &work_item_id, &attempt_id, &cli_inputs)?;
-
-            if let Some(mapping) = coder_mapping_update {
-                store.mutate_work_item(&work_item_id, |item| {
-                    let attempt = item
-                        .attempts
-                        .iter_mut()
-                        .find(|attempt| attempt.id == attempt_id)
-                        .ok_or_else(|| work_model::WorkModelError::AttemptNotFound {
-                            id: attempt_id.clone(),
-                        })?;
-                    attempt.coder_mapping = mapping;
-                    Ok(())
-                })?;
-            }
+            work_model::overlay_attempt_coder_mapping(
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &cli_inputs,
+            )?;
 
             let result = work_task_executor::run_task(WorkTaskRunConfig {
                 project_root,

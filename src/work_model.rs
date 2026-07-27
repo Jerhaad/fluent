@@ -2129,7 +2129,10 @@ impl CoderMapping {
     }
 }
 
-/// Inputs for resolving a CoderMapping at Attempt creation time.
+/// Sparse inputs for creation-time resolution or an explicit run-time overlay.
+///
+/// Creation may merge configuration and environment values into this shape.
+/// Existing Attempt execution must construct it from command-line flags only.
 #[derive(Debug, Default)]
 pub struct CoderMappingInputs {
     pub write_coder: Option<String>,
@@ -2145,6 +2148,20 @@ pub struct CoderMappingInputs {
 }
 
 impl CoderMappingInputs {
+    /// Return whether this invocation supplied any run-time mapping field.
+    pub fn has_run_overrides(&self) -> bool {
+        self.write_coder.is_some()
+            || self.write_model.is_some()
+            || self.write_effort.is_some()
+            || self.review_coder.is_some()
+            || self.review_model.is_some()
+            || self.review_effort.is_some()
+            || self.behavior_tests_coder.is_some()
+            || self.behavior_tests_model.is_some()
+            || self.behavior_tests_effort.is_some()
+            || self.global_coder.is_some()
+    }
+
     pub fn from_env() -> Self {
         Self {
             write_coder: std::env::var("FLUENT_WRITE_CODER").ok(),
@@ -2256,6 +2273,47 @@ impl CoderMappingInputs {
         }
         self
     }
+}
+
+/// Apply explicit run-time mapping fields to a freshly locked Attempt record.
+///
+/// A flagless invocation performs a read only. With overrides, the reducer
+/// derives the effective mapping from the Attempt read under the Work-model lock
+/// and changes only `coder_mapping`, preserving both untouched mapping fields and
+/// unrelated concurrent Work state.
+pub fn overlay_attempt_coder_mapping(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    inputs: &CoderMappingInputs,
+) -> Result<CoderMapping, anyhow::Error> {
+    if !inputs.has_run_overrides() {
+        let item = store.read_work_item(work_item_id)?;
+        return item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .map(|attempt| attempt.coder_mapping.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Attempt {attempt_id:?} not found in Work Item {work_item_id:?}")
+            });
+    }
+
+    let effective = store.mutate_work_item(work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let effective = attempt.coder_mapping.overlay_run_inputs(inputs);
+        if let Ok(mapping) = &effective {
+            attempt.coder_mapping = mapping.clone();
+        }
+        Ok(effective)
+    })??;
+    Ok(effective)
 }
 
 /// Resolve a fully-populated CoderMapping from CLI flags, env vars, and defaults.
@@ -9111,6 +9169,55 @@ random banner prose that must be ignored
         assert_eq!(overlaid.behavior_tests.coder, CoderKind::Claude);
         assert_eq!(overlaid.behavior_tests.model, "global-override");
         assert_eq!(overlaid.behavior_tests.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn overlay_attempt_coder_mapping_preserves_fresh_untouched_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Fresh coder mapping overlay".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].coder_mapping.write.effort = Some("before-peer".to_string());
+        store.create_work_item(&item).unwrap();
+
+        let overrides = CoderMappingInputs::default().merge_cli(
+            None,
+            None,
+            None,
+            Some("explicit-review-model".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        store
+            .mutate_work_item("work-1", |fresh| {
+                fresh.attempts[0].coder_mapping.write.effort =
+                    Some("concurrent-writer-effort".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let effective =
+            overlay_attempt_coder_mapping(&store, "work-1", "attempt-1", &overrides).unwrap();
+
+        assert_eq!(
+            effective.write.effort.as_deref(),
+            Some("concurrent-writer-effort"),
+            "the override transaction must preserve an untouched field from fresh state"
+        );
+        assert_eq!(effective.review.model, "explicit-review-model");
+        let persisted = store.read_work_item("work-1").unwrap();
+        assert_eq!(persisted.attempts[0].coder_mapping, effective);
     }
 
     #[test]
