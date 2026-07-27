@@ -3847,6 +3847,9 @@ fn run_review_coder_with_coder(
 
     let transcript_path = artifact_dir.join("transcript.jsonl");
     let coder = make_coder(sandbox);
+    let launch_env = codex_worker
+        .map(|worker| vec![worker.launch_env()])
+        .unwrap_or_default();
     // Use the capture config the caller resolved once per logical Reviewer run, so
     // every outer retry threads the SAME immutable config rather than re-resolving.
     let capture =
@@ -3858,7 +3861,7 @@ fn run_review_coder_with_coder(
         &prompts.system_prompt,
         artifact_dir,
         extra_args,
-        &[],
+        &launch_env,
         Some(&capture),
     );
     let exit_code = crate::coder::finish_supervised_coder_run(completion, artifact_dir)?;

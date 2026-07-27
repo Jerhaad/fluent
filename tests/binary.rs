@@ -20395,6 +20395,202 @@ fn rebase_codex_auth_preflight_precedes_task_creation() {
     );
 }
 
+fn prepare_codex_worker_home_fixture(
+    tmp: &TempDir,
+    fixture_name: &str,
+    exec_body: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let source_home = tmp.path().join(format!("source-codex-home-{fixture_name}"));
+    let bin_dir = tmp.path().join(format!("bin-codex-worker-home-{fixture_name}"));
+    let invocation_log = tmp.path().join(format!("codex-invocations-{fixture_name}"));
+    fs::create_dir_all(source_home.join("sessions")).unwrap();
+    fs::write(source_home.join("auth.json"), "source authentication").unwrap();
+    fs::write(source_home.join("config.toml"), "hooks = true").unwrap();
+    fs::write(source_home.join("sessions/session.json"), "session").unwrap();
+    write_mock_sandbox_exec(&bin_dir);
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        &format!(
+            r##"#!/bin/bash
+set -euo pipefail
+test "$CODEX_HOME" != "$FLUENT_TEST_SOURCE_CODEX_HOME"
+test -f "$CODEX_HOME/auth.json"
+test "$(cat "$CODEX_HOME/auth.json")" = "source authentication"
+test ! -e "$CODEX_HOME/config.toml"
+test ! -e "$CODEX_HOME/sessions"
+if [[ "${{1:-}}" == "--disable" && "${{2:-}}" == "hooks" && "${{3:-}}" == "--ignore-user-config" && "${{4:-}}" == "login" && "${{5:-}}" == "status" ]]; then
+  printf 'preflight=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+  exit 0
+fi
+printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
+{exec_body}
+"##
+        ),
+    );
+    (source_home, bin_dir, invocation_log)
+}
+
+fn assert_codex_worker_home_was_cleaned(
+    source_home: &Path,
+    invocation_log: &Path,
+) {
+    let invocations = fs::read_to_string(invocation_log).unwrap();
+    let worker_home = invocations
+        .lines()
+        .find_map(|line| line.strip_prefix("exec="))
+        .expect("Codex exec should receive the staged home");
+    assert!(
+        invocations.contains(&format!("preflight={worker_home}")),
+        "authentication preflight and execution must use the same worker home: {invocations}"
+    );
+    assert_ne!(Path::new(worker_home), source_home);
+    assert!(
+        !Path::new(worker_home).exists(),
+        "the worker home must be removed after the launch: {worker_home}"
+    );
+}
+
+#[test]
+fn autonomous_codex_reviewer_uses_and_removes_worker_home() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    create_completed_work_attempt(&tmp, &main_dir);
+    let (source_home, bin_dir, invocation_log) = prepare_codex_worker_home_fixture(
+        &tmp,
+        "reviewer",
+        "printf 'Verdict: pass\\n\\nCodex review.\\n' > review.md",
+    );
+
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["review"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["review", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-tests",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
+#[test]
+fn autonomous_codex_learner_uses_and_removes_worker_home() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-worker-home-learner");
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+    create_completed_work_attempt(&tmp, &main_dir);
+    let (source_home, bin_dir, invocation_log) = prepare_codex_worker_home_fixture(
+        &tmp,
+        "learner",
+        r##"PROMPT="${!#}"
+DRAFT=$(printf '%s' "$PROMPT" | sed -n 's#.*\(/[^ ]*follow-up-draft\.json\).*#\1#p')
+mkdir -p "$(dirname "$DRAFT")"
+printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT""##,
+    );
+
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["write"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
+#[test]
+fn autonomous_codex_rebase_uses_and_removes_worker_home() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-worker-home-rebase");
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
+    let (source_home, bin_dir, invocation_log) = prepare_codex_worker_home_fixture(
+        &tmp,
+        "rebase",
+        r##"PROMPT="${!#}"
+TARGET=$(printf '%s' "$PROMPT" | sed -n 's/.*onto `\([^`]*\)`.*/\1/p')
+git rebase "$TARGET" 2>/dev/null"##,
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Codex rebase"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+    commit_file(
+        &main_dir,
+        "target-only.txt",
+        "target advanced\n",
+        "Advance target",
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--no-post-merge-review",
+            "--coder",
+            "codex",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
+        .assert()
+        .success();
+
+    assert_codex_worker_home_was_cleaned(&source_home, &invocation_log);
+}
+
 #[test]
 fn autonomous_codex_writer_uses_and_removes_worker_home() {
     let tmp = TempDir::new().unwrap();
