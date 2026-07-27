@@ -186,6 +186,52 @@ fn merge_candidate_land_uses_owning_attempt_write_mapping() {
 }
 
 #[test]
+fn merge_candidate_land_preserves_coder_defaults_for_missing_mapping_values() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-default-values");
+    let invocation_log = tmp
+        .path()
+        .join("land-mapping-default-values-invocation.log");
+    prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    let store = WorkModelStore::new(&main_dir);
+    store
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0].coder_mapping.write.model.clear();
+            item.attempts[0].coder_mapping.write.effort = None;
+            Ok(())
+        })
+        .unwrap();
+    write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
+    write_mock_sandbox_exec(&bin_dir);
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .env_remove("FLUENT_CODEX_MODEL")
+        .assert()
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        !invocation.contains("--model"),
+        "an empty stored model must preserve the Codex CLI default: {invocation}"
+    );
+    assert!(
+        !invocation.contains("model_reasoning_effort="),
+        "an absent stored effort must preserve the Codex CLI default: {invocation}"
+    );
+}
+
+#[test]
 fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
@@ -235,7 +281,9 @@ fn merge_candidate_land_coder_override_replaces_only_the_coder() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-land-mapping-coder-override");
-    let invocation_log = tmp.path().join("land-mapping-coder-override-invocation.log");
+    let invocation_log = tmp
+        .path()
+        .join("land-mapping-coder-override-invocation.log");
     let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
     write_mock_claude(&bin_dir, &land_mapping_claude_mock_script(&invocation_log));
 
