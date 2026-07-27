@@ -6,8 +6,8 @@
       .ticket-input { fill: #A88BC2; }
       .ticket-change { fill: #7FA58A; }
       .lane-title { fill: #E6EDF3; font-size: 10px; font-weight: 600; letter-spacing: 0.55px; }
-      .ticket-label { fill: #0D1117; font-size: 4.9px; font-weight: 600; letter-spacing: 0.18px; text-anchor: middle; dominant-baseline: middle; }
-      .flow-label { fill: #F0883E; font-size: 6.2px; font-weight: 600; letter-spacing: 0.2px; text-anchor: middle; }
+      .ticket-label { fill: #0D1117; font-size: 5.7px; font-weight: 600; letter-spacing: 0.12px; text-anchor: middle; dominant-baseline: middle; }
+      .flow-label { fill: #F0883E; font-size: 7px; font-weight: 600; letter-spacing: 0.16px; text-anchor: middle; }
       .connector { fill: none; stroke: #F0883E; stroke-width: 1; marker-end: url(#arrowhead); }
     </style>
     <marker id="arrowhead" markerWidth="7" markerHeight="6" refX="6" refY="3" orient="auto">
@@ -21,12 +21,16 @@
   <rect x="0" y="0" width="680" height="390" fill="#0D1117"/>
   <rect x="18" y="18" width="644" height="354" fill="url(#dot-grid)"/>
 
+  <g transform="translate(0 12)">
   <!-- Work waiting for a person -->
+  <g transform="translate(16 0)">
   <text x="140" y="45" class="lane-title">WAITING FOR HUMAN ATTENTION</text>
+  </g>
   <text x="82" y="80" class="flow-label">New signals and</text>
   <text x="82" y="91" class="flow-label">agent handoffs</text>
-  <line x1="34" y1="106" x2="134" y2="106" class="connector"/>
+  <line x1="34" y1="106" x2="150" y2="106" class="connector"/>
 
+  <g transform="translate(16 0)">
   <rect x="140" y="60" width="400" height="92" rx="3" class="queue-frame"/>
   <rect x="152" y="72" width="24" height="68" rx="2" class="ticket-work"/>
   <text x="164" y="106" class="ticket-label" transform="rotate(-90 164 106)">OBSERVATION</text>
@@ -44,13 +48,17 @@
   <rect x="452" y="72" width="24" height="68" rx="2" class="ticket-input"/>
   <rect x="482" y="72" width="24" height="68" rx="2" class="ticket-change"/>
   <rect x="510" y="72" width="24" height="68" rx="2" class="ticket-work"/>
+  </g>
 
   <!-- Work waiting for agent and compute capacity -->
+  <g transform="translate(16 0)">
   <text x="140" y="223" class="lane-title">WAITING FOR AGENT AND COMPUTE CAPACITY</text>
+  </g>
   <text x="82" y="258" class="flow-label">Shaped work, answers,</text>
   <text x="82" y="269" class="flow-label">and approvals</text>
-  <line x1="34" y1="284" x2="134" y2="284" class="connector"/>
+  <line x1="34" y1="284" x2="150" y2="284" class="connector"/>
 
+  <g transform="translate(16 0)">
   <rect x="140" y="238" width="400" height="92" rx="3" class="queue-frame"/>
   <rect x="152" y="250" width="24" height="68" rx="2" class="ticket-work"/>
   <text x="164" y="284" class="ticket-label" transform="rotate(-90 164 284)">WORK ITEM</text>
@@ -68,5 +76,6 @@
   <rect x="452" y="250" width="24" height="68" rx="2" class="ticket-input"/>
   <rect x="482" y="250" width="24" height="68" rx="2" class="ticket-change"/>
   <rect x="510" y="250" width="24" height="68" rx="2" class="ticket-work"/>
-
+  </g>
+  </g>
 </svg>
