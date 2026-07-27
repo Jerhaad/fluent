@@ -16,6 +16,7 @@ use crate::work_model::{
 use crate::worktree;
 use crate::{credential, os};
 
+#[derive(Clone, Copy)]
 pub struct WorkMergeConfig<'a> {
     pub project_root: &'a Path,
     pub store: &'a WorkModelStore,
@@ -24,10 +25,16 @@ pub struct WorkMergeConfig<'a> {
     pub resolver: &'a ContentResolver,
     pub extra_args: &'a [String],
     pub coder_kind: CoderKind,
+    /// An invocation-only coder override for a land that otherwise inherits the
+    /// owning Attempt's Writer mapping.
+    pub coder_override: Option<CoderKind>,
     /// The optional model resolved at the command boundary.
     pub model: Option<&'a str>,
     /// The optional reasoning effort resolved at the command boundary.
     pub effort: Option<&'a str>,
+    /// Resolve the local land mapping from the owning Attempt after Merge
+    /// Candidate validation has established the candidate's durable state.
+    pub use_attempt_mapping: bool,
     pub no_sandbox: bool,
     /// Affirmative post-merge review policy. Every caller supplies this
     /// explicitly; an omitted CLI option and the legacy `--no-post-merge-review`
@@ -91,6 +98,24 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         }
         bail!("{error}");
     }
+
+    // Resolve an interactive land only after the executor has validated the
+    // candidate. Validation failures must retain this boundary so they settle
+    // the candidate as failed before any mapping lookup can report an error.
+    let resolved_mapping;
+    let config = if config.use_attempt_mapping {
+        resolved_mapping = resolve_attempt_land_mapping(&item, &candidate, &config)?;
+        WorkMergeConfig {
+            coder_kind: resolved_mapping.coder,
+            coder_override: None,
+            model: (!resolved_mapping.model.is_empty()).then_some(resolved_mapping.model.as_str()),
+            effort: resolved_mapping.effort.as_deref(),
+            use_attempt_mapping: false,
+            ..config
+        }
+    } else {
+        config
+    };
 
     // Advancement gate: a candidate may land only once its Attempt's Learner has
     // SUCCEEDED. A non-succeeded Learner blocks landing with the same durable reason
@@ -239,6 +264,39 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         },
         config.run_post_merge_review,
     )
+}
+
+fn resolve_attempt_land_mapping(
+    item: &WorkItem,
+    candidate: &MergeCandidate,
+    config: &WorkMergeConfig<'_>,
+) -> Result<crate::work_model::CoderModelPair> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attempt {:?} owning Merge Candidate {:?} not found in Work Item {:?}",
+                candidate.attempt_id,
+                candidate.id,
+                item.id
+            )
+        })?;
+    let mut mapping = attempt
+        .coder_mapping
+        .for_task_kind(TaskKind::Rebase)
+        .clone();
+    if let Some(coder) = config.coder_override {
+        mapping.coder = coder;
+    }
+    if let Some(model) = config.model {
+        mapping.model = model.to_string();
+    }
+    if let Some(effort) = config.effort {
+        mapping.effort = Some(effort.to_string());
+    }
+    Ok(mapping)
 }
 
 // A `#[cfg(test)]`-only observer of the follow-up-processing persistence error the
@@ -1115,7 +1173,7 @@ fn remove_disposable_worktree_checked(source_workspace: &Path, disposable: &Path
 #[cfg(test)]
 thread_local! {
     static REBASE_CODER_OVERRIDE: std::cell::RefCell<
-        Option<Box<dyn Fn() -> Box<dyn crate::coder::Coder>>>,
+        Option<Box<dyn Fn(CoderKind, Option<String>, Option<String>) -> Box<dyn crate::coder::Coder>>>,
     > = const { std::cell::RefCell::new(None) };
 }
 
@@ -1127,7 +1185,10 @@ struct RebaseCoderOverrideGuard;
 
 #[cfg(test)]
 impl RebaseCoderOverrideGuard {
-    fn engage(factory: impl Fn() -> Box<dyn crate::coder::Coder> + 'static) -> Self {
+    fn engage(
+        factory: impl Fn(CoderKind, Option<String>, Option<String>) -> Box<dyn crate::coder::Coder>
+        + 'static,
+    ) -> Self {
         REBASE_CODER_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Box::new(factory)));
         RebaseCoderOverrideGuard
     }
@@ -1148,7 +1209,15 @@ fn build_rebase_coder(
     config: &WorkMergeConfig<'_>,
     sandbox: CoderSandbox,
 ) -> Box<dyn crate::coder::Coder> {
-    if let Some(coder) = REBASE_CODER_OVERRIDE.with(|slot| slot.borrow().as_ref().map(|f| f())) {
+    if let Some(coder) = REBASE_CODER_OVERRIDE.with(|slot| {
+        slot.borrow().as_ref().map(|f| {
+            f(
+                config.coder_kind,
+                config.model.map(str::to_string),
+                config.effort.map(str::to_string),
+            )
+        })
+    }) {
         return coder;
     }
     config
@@ -2824,8 +2893,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -2956,8 +3027,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3010,8 +3083,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3120,8 +3195,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3259,8 +3336,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3372,8 +3451,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3485,8 +3566,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -3568,8 +3651,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         }) {
@@ -4537,8 +4622,10 @@ mod tests {
             resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review,
         }
@@ -4948,8 +5035,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -5001,8 +5090,10 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: None,
             model: None,
             effort: None,
+            use_attempt_mapping: false,
             no_sandbox: true,
             run_post_merge_review: false,
         };
@@ -5793,7 +5884,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_land_public_route_retains_rebase_provenance_and_autofix() {
+    fn public_land_route_threads_resolved_model_and_effort_to_rebase_coder() {
         // B4al: a capture-mode land driven through public `merge_candidate` still
         // reaches the rebase and provenance regeneration steps and still runs
         // check → fix → recheck. The capture route is never gated into the frozen
@@ -5895,6 +5986,11 @@ mod tests {
             commit: candidate_commit.clone(),
         });
         item.create_or_get_merge_candidate("attempt-1").unwrap();
+        item.attempts[0].coder_mapping.write = crate::work_model::CoderModelPair {
+            coder: CoderKind::Codex,
+            model: "gpt-5.6-terra".to_string(),
+            effort: Some("high".to_string()),
+        };
         store.create_work_item(&item).unwrap();
         let item = store.read_work_item("work-1").unwrap();
         let candidate = item.merge_candidates[0].clone();
@@ -5918,16 +6014,33 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             coder_kind: CoderKind::Codex,
+            coder_override: Some(CoderKind::Pi),
             model: None,
-            effort: None,
+            effort: Some("medium"),
+            use_attempt_mapping: true,
             no_sandbox: true,
             run_post_merge_review: false,
         };
         // Drive the real public route; only the rebase coder is injected.
+        let observed_mapping = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed_for_coder = std::sync::Arc::clone(&observed_mapping);
         let outcome = {
-            let _coder = RebaseCoderOverrideGuard::engage(|| Box::new(RealRebaseCoder));
+            let _coder = RebaseCoderOverrideGuard::engage(move |coder, model, effort| {
+                *observed_for_coder.lock().unwrap() = Some((coder, model, effort));
+                Box::new(RealRebaseCoder)
+            });
             merge_candidate(config).unwrap()
         };
+
+        assert_eq!(
+            *observed_mapping.lock().unwrap(),
+            Some((
+                CoderKind::Pi,
+                Some("gpt-5.6-terra".to_string()),
+                Some("medium".to_string()),
+            )),
+            "the real public land route passes sparse land overrides and stored fields to the rebase constructor"
+        );
 
         // The rebase ran: a Rebase Task was created and completed.
         let stored = store.read_work_item("work-1").unwrap();

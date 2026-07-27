@@ -79,25 +79,28 @@ fn merge_candidate_land_help_lists_model_and_effort_options() {
 #[test]
 fn fargate_land_rejects_unsupported_model_or_effort_override() {
     let tmp = TempDir::new().unwrap();
-    let output = fluent_cmd()
-        .current_dir(tmp.path())
-        .args([
-            "merge-candidate",
-            "land",
-            "work-1",
-            "candidate-1",
-            "--runtime",
-            "fargate",
-            "--model",
-            "gpt-5.6",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not supported with --runtime fargate"),
-        "unsupported Fargate land override should fail before launch"
-    );
+    for override_args in [["--model", "gpt-5.6"], ["--effort", "medium"]] {
+        let output = fluent_cmd()
+            .current_dir(tmp.path())
+            .args([
+                "merge-candidate",
+                "land",
+                "work-1",
+                "candidate-1",
+                "--runtime",
+                "fargate",
+                override_args[0],
+                override_args[1],
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("not supported with --runtime fargate"),
+            "unsupported Fargate land override should fail before launch"
+        );
+    }
 }
 
 fn land_mapping_codex_mock_script() -> &'static str {

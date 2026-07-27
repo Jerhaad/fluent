@@ -33,8 +33,7 @@ use fluent::version;
 use fluent::work_attempt_loop::{self, WorkAttemptRunConfig, WorkAttemptRunOutcome};
 use fluent::work_merge_executor::{self, WorkMergeConfig};
 use fluent::work_model::{
-    self, PlanningContext, TaskKind, WorkItem, WorkModelStorageError, WorkModelStore,
-    to_json_pretty,
+    self, PlanningContext, WorkItem, WorkModelStorageError, WorkModelStore, to_json_pretty,
 };
 use fluent::work_status;
 use fluent::work_task_executor::{self, WorkTaskRunConfig};
@@ -374,54 +373,6 @@ fn resolve_run_coder_mapping(
             anyhow::anyhow!("Attempt {attempt_id:?} not found in Work Item {work_item_id:?}")
         })?;
     attempt.coder_mapping.overlay_run_inputs(cli_inputs)
-}
-
-/// Resolve the mapping for one local Merge Candidate land. The candidate's
-/// owning Attempt is the durable authority; command-line fields apply only to
-/// this invocation and never rewrite that Attempt.
-fn resolve_land_coder_mapping(
-    store: &WorkModelStore,
-    work_item_id: &str,
-    merge_candidate_id: &str,
-    coder: Option<&str>,
-    model: Option<String>,
-    effort: Option<String>,
-) -> Result<work_model::CoderModelPair> {
-    let item = store.read_work_item(work_item_id)?;
-    let candidate = item
-        .merge_candidates
-        .iter()
-        .find(|candidate| candidate.id == merge_candidate_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Merge Candidate {merge_candidate_id:?} not found in Work Item {work_item_id:?}"
-            )
-        })?;
-    let attempt = item
-        .attempts
-        .iter()
-        .find(|attempt| attempt.id == candidate.attempt_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Attempt {:?} owning Merge Candidate {merge_candidate_id:?} not found in Work Item {work_item_id:?}",
-                candidate.attempt_id
-            )
-        })?;
-
-    let mut mapping = attempt
-        .coder_mapping
-        .for_task_kind(TaskKind::Rebase)
-        .clone();
-    if let Some(coder) = coder {
-        mapping.coder = CoderKind::resolve(Some(coder))?;
-    }
-    if let Some(model) = model {
-        mapping.model = model;
-    }
-    if let Some(effort) = effort {
-        mapping.effort = Some(effort);
-    }
-    Ok(mapping)
 }
 
 fn cmd_attempt(
@@ -900,14 +851,6 @@ fn cmd_merge_candidate(
                 "local" => {}
                 other => bail!("Unknown runtime '{other}'. Available: local, fargate."),
             }
-            let land_mapping = resolve_land_coder_mapping(
-                &store,
-                &work_item_id,
-                &merge_candidate_id,
-                coder.as_deref(),
-                model,
-                effort,
-            )?;
             let result = work_merge_executor::merge_candidate(WorkMergeConfig {
                 project_root,
                 store: &store,
@@ -915,9 +858,16 @@ fn cmd_merge_candidate(
                 merge_candidate_id: &merge_candidate_id,
                 resolver,
                 extra_args: &extra_args,
-                coder_kind: land_mapping.coder,
-                model: (!land_mapping.model.is_empty()).then_some(land_mapping.model.as_str()),
-                effort: land_mapping.effort.as_deref(),
+                // The executor resolves this mapping only after it has
+                // validated and, when required, settled the Merge Candidate.
+                coder_kind: CoderKind::Claude,
+                coder_override: coder
+                    .as_deref()
+                    .map(|coder| CoderKind::resolve(Some(coder)))
+                    .transpose()?,
+                model: model.as_deref(),
+                effort: effort.as_deref(),
+                use_attempt_mapping: true,
                 no_sandbox: no_sandbox || global_no_sandbox,
                 run_post_merge_review,
             })?;
@@ -2104,63 +2054,9 @@ mod tests {
     use super::*;
     use fluent::coder::CoderKind;
     use fluent::work_model::{
-        Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, CoderModelPair,
-        Task, TaskKind, TaskOutput, TaskStatus, WorkspaceAccess,
+        Attempt, AttemptKind, AttemptStatus, CoderMapping, CoderModelPair, Task, TaskKind,
+        TaskStatus, WorkspaceAccess,
     };
-
-    #[test]
-    fn resolve_land_coder_mapping_overlays_only_supplied_fields() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkModelStore::new(tmp.path());
-        let mut item = WorkItem {
-            id: "work-1".to_string(),
-            title: "Land mapping".to_string(),
-            ..Default::default()
-        };
-        item.add_initial_attempt("attempt-1").unwrap();
-        item.attempts[0].status = AttemptStatus::Complete;
-        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
-        let task = &mut item.attempts[0].tasks[0];
-        let workspace_id = task.workspace_access.writes[0].id.clone();
-        task.status = TaskStatus::Complete;
-        task.output = Some(TaskOutput {
-            workspace_id,
-            workspace_path: tmp.path().join("workspace").to_string_lossy().into_owned(),
-            source_branch: "work-1-attempt-1".to_string(),
-            base_commit: None,
-            commit: "abc123".to_string(),
-        });
-        item.attempts[0].coder_mapping.write = CoderModelPair {
-            coder: CoderKind::Codex,
-            model: "stored-model".to_string(),
-            effort: Some("high".to_string()),
-        };
-        item.create_or_get_merge_candidate("attempt-1").unwrap();
-        store.create_work_item(&item).unwrap();
-
-        let resolved = resolve_land_coder_mapping(
-            &store,
-            "work-1",
-            "attempt-1-merge-candidate",
-            Some("pi"),
-            None,
-            Some("low".to_string()),
-        )
-        .unwrap();
-        assert_eq!(resolved.coder, CoderKind::Pi);
-        assert_eq!(resolved.model, "stored-model");
-        assert_eq!(resolved.effort.as_deref(), Some("low"));
-        assert_eq!(
-            store.read_work_item("work-1").unwrap().attempts[0]
-                .coder_mapping
-                .write,
-            CoderModelPair {
-                coder: CoderKind::Codex,
-                model: "stored-model".to_string(),
-                effort: Some("high".to_string()),
-            }
-        );
-    }
 
     /// Build an Attempt whose single task is paused, with a distinct coder in
     /// each mapping slot so the resolved coder identifies which slot was used.

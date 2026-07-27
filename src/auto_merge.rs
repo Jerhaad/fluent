@@ -179,8 +179,10 @@ fn merge_config<'a>(
         resolver,
         extra_args: &[],
         coder_kind,
+        coder_override: None,
         model: None,
         effort: None,
+        use_attempt_mapping: false,
         no_sandbox,
         run_post_merge_review,
     }
