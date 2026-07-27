@@ -20303,6 +20303,109 @@ git commit -m "Add Codex worker output" >/dev/null
 }
 
 #[test]
+fn codex_auth_resume_reopens_same_task_without_new_writer_round() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let source_home = tmp.path().join("source-codex-home");
+    let bin_dir = tmp.path().join("bin-codex-auth-resume");
+    let authenticated = tmp.path().join("authenticated");
+    let exec_log = tmp.path().join("codex-exec");
+    fs::create_dir_all(&source_home).unwrap();
+    fs::write(source_home.join("auth.json"), "source authentication").unwrap();
+    write_mock_sandbox_exec(&bin_dir);
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        r##"#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == "--disable" && "${4:-}" == "login" ]]; then
+  test -f "$FLUENT_TEST_CODEX_AUTHENTICATED"
+  exit 0
+fi
+printf '%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_EXEC_LOG"
+printf 'resumed writer output\n' > resumed-writer-output.txt
+git add resumed-writer-output.txt
+git commit -m "Add resumed writer output" >/dev/null
+"##,
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "codex-resume", "--title", "Codex resume"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "create",
+            "codex-resume",
+            "attempt-1",
+            "--write-coder",
+            "codex",
+        ])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "codex-resume", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_AUTHENTICATED", &authenticated)
+        .env("FLUENT_TEST_CODEX_EXEC_LOG", &exec_log)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("codex login"));
+
+    let paused = work_item_value(&main_dir, "codex-resume");
+    assert_eq!(paused["attempts"][0]["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(paused["attempts"][0]["tasks"][0]["status"], "needs-user");
+    assert_eq!(
+        paused["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1
+    );
+    let stored_mapping = paused["attempts"][0]["coder_mapping"].clone();
+
+    fs::write(&authenticated, "logged in").unwrap();
+    let resumed = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "codex-resume", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("CODEX_HOME", &source_home)
+        .env("FLUENT_TEST_CODEX_AUTHENTICATED", &authenticated)
+        .env("FLUENT_TEST_CODEX_EXEC_LOG", &exec_log)
+        .output()
+        .unwrap();
+
+    let resumed_item = work_item_value(&main_dir, "codex-resume");
+    let write_task = &resumed_item["attempts"][0]["tasks"][0];
+    assert_eq!(write_task["id"], "attempt-1-write-1");
+    assert_eq!(write_task["status"], "complete");
+    assert_eq!(
+        resumed_item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1,
+        "resuming authentication must not create a new Writer round"
+    );
+    assert_eq!(resumed_item["attempts"][0]["coder_mapping"], stored_mapping);
+    assert!(
+        fs::read_to_string(&exec_log).is_ok_and(|homes| !homes.trim().is_empty()),
+        "the resumed attempt should launch Codex: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+}
+
+#[test]
 fn task_run_overrides_only_explicit_coder_mapping_fields() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);

@@ -5976,28 +5976,56 @@ Test: tests/binary.rs (init_output_notes_fluent_tracks_its_state)
 ### B1
 
 WHEN Fluent launches an autonomous Codex Writer, Reviewer, Learner, or rebase
-worker, THE SYSTEM SHALL use a private temporary `CODEX_HOME`, disable hooks,
-ignore user configuration, avoid session persistence, and grant the sandbox no
-access to the interactive Codex home. Interactive Codex continues to use the
-user's normal configuration and home.
+worker, THE SYSTEM SHALL disable hooks, ignore user configuration, avoid
+session persistence, and preserve the Attempt's selected model and effort.
 Test: src/coder.rs (autonomous_codex_command_isolated_from_user_hooks_config_and_sessions)
-Test: src/os.rs (autonomous_codex_profile_grants_only_worker_home)
-Test: src/os.rs (interactive_codex_profile_preserves_source_home_access)
 
 ### B2
 
-WHEN Fluent prepares an autonomous Codex worker, THE SYSTEM SHALL stage only
-the supported authentication state in the private home, run `codex login status`
-without a model request, and remove the private home after the launch scope.
-Test: src/codex_worker.rs (worker_home_stages_only_auth_from_effective_codex_home)
-Test: src/codex_worker.rs (login_status_preflight_accepts_authenticated_worker_home)
+WHEN Fluent launches an autonomous Codex worker, THE SYSTEM SHALL use a private
+temporary `CODEX_HOME` and grant the sandbox no access to the interactive Codex
+home.
+Test: src/os.rs (autonomous_codex_profile_grants_only_worker_home)
 
 ### B3
 
+WHEN Fluent launches Codex interactively, THE SYSTEM SHALL continue using the
+user's normal configuration, hooks, and Codex home.
+Test: src/coder.rs (interactive_codex_command_preserves_user_configuration)
+Test: src/os.rs (interactive_codex_profile_preserves_source_home_access)
+
+### B4
+
+WHEN Fluent prepares an autonomous Codex worker, THE SYSTEM SHALL stage only
+the supported authentication state in the private home.
+Test: src/codex_worker.rs (worker_home_stages_only_auth_from_effective_codex_home)
+
+### B5
+
+WHEN Fluent prepares an autonomous Codex worker, THE SYSTEM SHALL run `codex
+login status` without making a model request.
+Test: src/codex_worker.rs (login_status_preflight_accepts_authenticated_worker_home)
+
+### B6
+
+WHEN an autonomous Codex worker finishes or fails to launch, THE SYSTEM SHALL
+remove its private home and copied authentication state.
+Test: src/codex_worker.rs (worker_home_is_removed_after_launch_scope)
+Test: tests/binary.rs (autonomous_codex_writer_uses_and_removes_worker_home)
+
+### B7
+
 IF Codex authentication cannot be prepared before a Writer or Reviewer starts,
 THEN THE SYSTEM SHALL pause the same planned Task and Attempt without reserving
-execution or consuming a Writer round, tell the user to run `codex login`, and
-resume that Task through `fluent attempt run` after login succeeds.
+execution or consuming a Writer round, and tell the user to run `codex login`.
+Test: tests/binary.rs (codex_auth_failure_pauses_planned_task_before_reservation)
+
+### B8
+
+WHEN `fluent attempt run` resumes an Attempt paused by Codex authentication
+preflight after authentication succeeds, THE SYSTEM SHALL reopen and run the
+same Task through its stored coder mapping without adding a Writer round.
+Test: tests/binary.rs (codex_auth_resume_reopens_same_task_without_new_writer_round)
 
 ## Generated commit wording
 
