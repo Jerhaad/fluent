@@ -113,6 +113,16 @@ exit 0
     )
 }
 
+fn land_mapping_claude_mock_script(invocation_log: &Path) -> String {
+    format!(
+        r##"#!/bin/bash
+printf '%s\n' "$*" >> '{}'
+exit 0
+"##,
+        invocation_log.display()
+    )
+}
+
 fn prepare_land_mapping_candidate(main_dir: &Path, bin_dir: &Path) -> serde_json::Value {
     write_mock_claude(
         bin_dir,
@@ -217,6 +227,47 @@ fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
         work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
         stored_mapping,
         "invocation-only overrides must not rewrite the owning Attempt mapping"
+    );
+}
+
+#[test]
+fn merge_candidate_land_coder_override_replaces_only_the_coder() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-land-mapping-coder-override");
+    let invocation_log = tmp.path().join("land-mapping-coder-override-invocation.log");
+    let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
+    write_mock_claude(&bin_dir, &land_mapping_claude_mock_script(&invocation_log));
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "attempt-1-merge-candidate",
+            "--no-sandbox",
+            "--coder",
+            "claude",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        invocation.contains("--model stored-land-model"),
+        "the coder-only override must retain the stored model: {invocation}"
+    );
+    assert!(
+        invocation.contains("--effort medium"),
+        "the coder-only override must retain the stored effort: {invocation}"
+    );
+
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
+        stored_mapping,
+        "invocation-only coder overrides must not rewrite the owning Attempt mapping"
     );
 }
 
