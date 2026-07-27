@@ -49,3 +49,4 @@
 - [terminal-coder-errors-bypass-retry-budget](terminal-coder-errors-bypass-retry-budget.md) — Classify typed coder failures that may leave invisible side effects as terminal in should_retry_coder_error, never retried
 - [test-fixtures-use-production-state](test-fixtures-use-production-state.md) — Test fixtures must use state values that production code actually creates, not unreachable states
 - [test-names-match-assertions](test-names-match-assertions.md) — Test function names must describe the behavior the test actually asserts, not what a behavior statement claims
+- [utf8-safe-diagnostic-truncation](utf8-safe-diagnostic-truncation.md) — Byte-capped diagnostic excerpts must realign truncation to a UTF-8 character boundary before slicing
