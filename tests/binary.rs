@@ -20213,7 +20213,10 @@ fn codex_auth_failure_pauses_planned_task_before_reservation() {
     assert_eq!(attempt["status"], "needs-user");
     assert_eq!(attempt["pause_kind"], "auth");
     assert_eq!(task["status"], "needs-user");
-    assert!(task["started_at"].is_null(), "preflight must not reserve the task");
+    assert!(
+        task["started_at"].is_null(),
+        "preflight must not reserve the task"
+    );
     assert_eq!(attempt["tasks"].as_array().unwrap().len(), 1);
     assert!(
         !launch_marker.exists(),
@@ -20273,7 +20276,10 @@ fn codex_auth_failure_pauses_planned_reviewer_before_reservation() {
     assert_eq!(attempt["status"], "needs-user");
     assert_eq!(attempt["pause_kind"], "auth");
     assert_eq!(task["status"], "needs-user");
-    assert!(task["started_at"].is_null(), "preflight must not reserve the task");
+    assert!(
+        task["started_at"].is_null(),
+        "preflight must not reserve the task"
+    );
     assert!(
         !launch_marker.exists(),
         "a failed authentication preflight must not launch the reviewer"
@@ -20341,7 +20347,13 @@ fn rebase_codex_auth_preflight_precedes_task_creation() {
 
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "work-1", "--title", "Codex rebase auth"])
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Codex rebase auth",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -20401,7 +20413,9 @@ fn prepare_codex_worker_home_fixture(
     exec_body: &str,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let source_home = tmp.path().join(format!("source-codex-home-{fixture_name}"));
-    let bin_dir = tmp.path().join(format!("bin-codex-worker-home-{fixture_name}"));
+    let bin_dir = tmp
+        .path()
+        .join(format!("bin-codex-worker-home-{fixture_name}"));
     let invocation_log = tmp.path().join(format!("codex-invocations-{fixture_name}"));
     fs::create_dir_all(source_home.join("sessions")).unwrap();
     fs::write(source_home.join("auth.json"), "source authentication").unwrap();
@@ -20431,10 +20445,7 @@ printf 'exec=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
     (source_home, bin_dir, invocation_log)
 }
 
-fn assert_codex_worker_home_was_cleaned(
-    source_home: &Path,
-    invocation_log: &Path,
-) {
+fn assert_codex_worker_home_was_cleaned(source_home: &Path, invocation_log: &Path) {
     let invocations = fs::read_to_string(invocation_log).unwrap();
     let worker_home = invocations
         .lines()
@@ -20626,7 +20637,13 @@ git commit -m "Add Codex worker output" >/dev/null
 
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "codex-worker", "--title", "Codex worker"])
+        .args([
+            "work-item",
+            "create",
+            "codex-worker",
+            "--title",
+            "Codex worker",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -20702,7 +20719,13 @@ git commit -m "Add default home output" >/dev/null
     );
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "default-home", "--title", "Default Codex home"])
+        .args([
+            "work-item",
+            "create",
+            "default-home",
+            "--title",
+            "Default Codex home",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -20773,7 +20796,13 @@ git commit -m "Add environment auth output" >/dev/null
     );
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "environment-auth", "--title", "Environment auth"])
+        .args([
+            "work-item",
+            "create",
+            "environment-auth",
+            "--title",
+            "Environment auth",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -20846,7 +20875,13 @@ git commit -m "Add resumed writer output" >/dev/null
 
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "codex-resume", "--title", "Codex resume"])
+        .args([
+            "work-item",
+            "create",
+            "codex-resume",
+            "--title",
+            "Codex resume",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -20864,7 +20899,13 @@ git commit -m "Add resumed writer output" >/dev/null
 
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["attempt", "run", "codex-resume", "attempt-1", "--no-sandbox"])
+        .args([
+            "attempt",
+            "run",
+            "codex-resume",
+            "attempt-1",
+            "--no-sandbox",
+        ])
         .env("PATH", mock_path(&bin_dir))
         .env("CODEX_HOME", &source_home)
         .env("FLUENT_TEST_CODEX_AUTHENTICATED", &authenticated)
@@ -20890,7 +20931,13 @@ git commit -m "Add resumed writer output" >/dev/null
     fs::write(&authenticated, "logged in").unwrap();
     let resumed = fluent_cmd()
         .current_dir(&main_dir)
-        .args(["attempt", "run", "codex-resume", "attempt-1", "--no-sandbox"])
+        .args([
+            "attempt",
+            "run",
+            "codex-resume",
+            "attempt-1",
+            "--no-sandbox",
+        ])
         .env("PATH", mock_path(&bin_dir))
         .env("CODEX_HOME", &source_home)
         .env("FLUENT_TEST_CODEX_AUTHENTICATED", &authenticated)

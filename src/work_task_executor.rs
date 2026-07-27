@@ -3174,18 +3174,17 @@ fn run_learner_with_coder_with_codex_worker(
 
     // The guard survives until the process has completed, reclaiming the
     // isolated authentication copy even when launch or execution fails.
-    let local_codex_worker =
-        if inputs.coder_kind == CoderKind::Codex
-            && prepared_codex_worker.is_none()
-            && !cfg!(test)
-        {
-            let worker = crate::codex_worker::CodexWorkerEnvironment::prepare()
-                .map_err(anyhow::Error::new)?;
-            worker.preflight().map_err(anyhow::Error::new)?;
-            Some(worker)
-        } else {
-            None
-        };
+    let local_codex_worker = if inputs.coder_kind == CoderKind::Codex
+        && prepared_codex_worker.is_none()
+        && !cfg!(test)
+    {
+        let worker =
+            crate::codex_worker::CodexWorkerEnvironment::prepare().map_err(anyhow::Error::new)?;
+        worker.preflight().map_err(anyhow::Error::new)?;
+        Some(worker)
+    } else {
+        None
+    };
     let codex_worker = prepared_codex_worker.or(local_codex_worker.as_ref());
 
     let workspace_path = inputs.workspace_path;
