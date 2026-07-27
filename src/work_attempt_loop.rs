@@ -270,7 +270,6 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                         mode,
                         &LearnerConfig {
                             run_coder: &run_coder,
-                            #[cfg(not(test))]
                             codex_worker: None,
                         },
                     )?;
@@ -480,7 +479,6 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
                 can_advance,
                 Some(LearnerConfig {
                     run_coder: &run_coder,
-                    #[cfg(not(test))]
                     codex_worker: None,
                 }),
             )?;
@@ -548,16 +546,7 @@ fn default_learner_run_coder(
         },
         request.mode,
         Some(capture),
-        {
-            #[cfg(not(test))]
-            {
-                request.codex_worker
-            }
-            #[cfg(test)]
-            {
-                None
-            }
-        },
+        request.codex_worker,
     )
 }
 
@@ -953,7 +942,6 @@ pub(crate) struct LearnerCoderRequest<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     mode: work_task_executor::LearnerExecutionMode,
-    #[cfg(not(test))]
     codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
     /// When set, a bounded schema repair rather than a fresh audit.
     repair: Option<work_task_executor::SchemaRepairInput<'a>>,
@@ -964,7 +952,6 @@ pub(crate) struct LearnerCoderRequest<'a> {
 /// exercised without spawning a real coder.
 struct LearnerConfig<'a> {
     run_coder: &'a dyn Fn(&LearnerCoderRequest<'_>) -> Result<()>,
-    #[cfg(not(test))]
     codex_worker: Option<&'a crate::codex_worker::CodexWorkerEnvironment>,
 }
 
@@ -1102,7 +1089,6 @@ fn run_learner_step(
     *item = store.read_work_item(&work_item_id)?;
     let config = LearnerConfig {
         run_coder: config.run_coder,
-        #[cfg(not(test))]
         codex_worker: codex_worker.as_ref(),
     };
 
@@ -1915,7 +1901,6 @@ fn try_learn(
         model: model.as_deref(),
         effort: effort.as_deref(),
         mode,
-        #[cfg(not(test))]
         codex_worker: config.codex_worker,
         repair: None,
     });
@@ -2026,7 +2011,6 @@ fn try_learn(
                     model: model.as_deref(),
                     effort: effort.as_deref(),
                     mode,
-                    #[cfg(not(test))]
                     codex_worker: config.codex_worker,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,
@@ -2135,7 +2119,6 @@ fn run_pre_land_learner(
         model: ctx.model,
         effort: ctx.effort,
         mode: work_task_executor::LearnerExecutionMode::Capture,
-        #[cfg(not(test))]
         codex_worker: config.codex_worker,
         repair: None,
     });
@@ -2192,7 +2175,6 @@ fn run_pre_land_learner(
                     model: ctx.model,
                     effort: ctx.effort,
                     mode: work_task_executor::LearnerExecutionMode::Capture,
-                    #[cfg(not(test))]
                     codex_worker: config.codex_worker,
                     repair: Some(work_task_executor::SchemaRepairInput {
                         rejected_draft: &rejected_draft,

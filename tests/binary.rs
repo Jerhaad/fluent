@@ -20849,8 +20849,8 @@ if grep -Fq '(allow file-write* (subpath "/private/var/folders"))' "$PROFILE" ||
   exit 1
 fi
 printf 'strict=%s\n' "$CODEX_HOME" >> "$FLUENT_TEST_CODEX_INVOCATIONS"
-shift 3
-exec "$@"
+shift 2
+exec -- "$@"
 "##,
     );
 
@@ -21018,6 +21018,11 @@ git rebase "$TARGET" 2>/dev/null"##,
 fn autonomous_codex_learner_uses_canonical_worker_home_in_strict_profile() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-worker-home-strict-learner");
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
     let (source_home, bin_dir, invocation_log, temporary_alias) =
         prepare_strict_codex_worker_home_fixture(
             &tmp,
@@ -21029,11 +21034,6 @@ if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
   printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT"
 fi"##,
         );
-    write_mock_claude(
-        &bin_dir,
-        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
-    );
-
     create_completed_work_attempt(&tmp, &main_dir);
     let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
     let mut attempt = read_json_value(&attempt_path);
@@ -21064,6 +21064,11 @@ fi"##,
 fn autonomous_codex_rebase_uses_canonical_worker_home_in_strict_profile() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-worker-home-strict-rebase");
+    write_mock_claude(
+        &bin_dir,
+        &learner_land_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
     let (source_home, bin_dir, invocation_log, temporary_alias) =
         prepare_strict_codex_worker_home_fixture(
             &tmp,
@@ -21072,11 +21077,6 @@ fn autonomous_codex_rebase_uses_canonical_worker_home_in_strict_profile() {
 TARGET=$(printf '%s' "$PROMPT" | sed -n 's/.*onto `\([^`]*\)`.*/\1/p')
 git rebase "$TARGET" 2>/dev/null"##,
         );
-    write_mock_claude(
-        &bin_dir,
-        &learner_land_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
-    );
-
     fluent_cmd()
         .current_dir(&main_dir)
         .args([
@@ -21139,35 +21139,30 @@ git rebase "$TARGET" 2>/dev/null"##,
 fn canonical_worker_home_learner_retry_consumes_no_writer_round() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
-    let retry_marker = tmp.path().join("strict-learner-retry");
-    let (source_home, bin_dir, invocation_log, temporary_alias) =
-        prepare_strict_codex_worker_home_fixture(
-            &tmp,
-            "strict-learner-retry",
-            &format!(
-                r##"PROMPT="${{!#}}"
-if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
-  if [ ! -f "{0}" ]; then touch "{0}"; exit 1; fi
-  DRAFT=$(printf '%s' "$PROMPT" | sed -n 's#.*\(/[^ ]*follow-up-draft\.json\).*#\1#p')
-  mkdir -p "$(dirname "$DRAFT")"
-  printf '%s\n' '{{"learning_summary":"retried","follow_ups":[]}}' > "$DRAFT"
-fi"##,
-                retry_marker.display(),
-            ),
-        );
+    let bin_dir = tmp
+        .path()
+        .join("bin-codex-worker-home-strict-learner-retry");
     write_mock_claude(
         &bin_dir,
         &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
     );
-
+    let (source_home, bin_dir, invocation_log, temporary_alias) =
+        prepare_strict_codex_worker_home_fixture(
+            &tmp,
+            "strict-learner-retry",
+            r##"if [ "${FLUENT_TEST_LEARNER_RETRY:-}" != "1" ]; then exit 1; fi
+mkdir -p "$(dirname "$FLUENT_TEST_LEARNER_DRAFT")"
+printf '%s\n' '{"learning_summary":"retried","follow_ups":[]}' > "$FLUENT_TEST_LEARNER_DRAFT""##,
+        );
     create_completed_work_attempt(&tmp, &main_dir);
     let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
     let mut attempt = read_json_value(&attempt_path);
     attempt["coder_mapping"]["write"]["coder"] = serde_json::json!("codex");
     write_json_value(&attempt_path, &attempt);
 
-    for _ in 0..2 {
-        fluent_cmd()
+    for retry in 0..2 {
+        let mut command = fluent_cmd();
+        command
             .current_dir(&main_dir)
             .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
             .env("PATH", mock_path(&bin_dir))
@@ -21175,9 +21170,18 @@ fi"##,
             .env("CODEX_HOME", &source_home)
             .env("FLUENT_TEST_ALIAS_TMPDIR", &temporary_alias)
             .env("FLUENT_TEST_SOURCE_CODEX_HOME", &source_home)
-            .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log)
-            .assert()
-            .success();
+            .env("FLUENT_TEST_CODEX_INVOCATIONS", &invocation_log);
+        if retry == 1 {
+            command
+                .env("FLUENT_TEST_LEARNER_RETRY", "1")
+                .env(
+                    "FLUENT_TEST_LEARNER_DRAFT",
+                    main_dir.join(
+                        ".fluent/work/artifacts/work-1/attempt-1/learner/runs/run-2/staging/follow-up-draft.json",
+                    ),
+                );
+        }
+        command.assert().success();
     }
 
     let attempt = work_item_value(&main_dir, "work-1")["attempts"][0].clone();
