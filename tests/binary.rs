@@ -56,6 +56,50 @@ fn fluent_help_lists_tester_subcommand() {
 }
 
 #[test]
+fn merge_candidate_land_help_lists_model_and_effort_options() {
+    let tmp = TempDir::new().unwrap();
+    let output = fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["merge-candidate", "land", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--model"),
+        "help should list --model: {stdout}"
+    );
+    assert!(
+        stdout.contains("--effort"),
+        "help should list --effort: {stdout}"
+    );
+}
+
+#[test]
+fn fargate_land_rejects_unsupported_model_or_effort_override() {
+    let tmp = TempDir::new().unwrap();
+    let output = fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "merge-candidate",
+            "land",
+            "work-1",
+            "candidate-1",
+            "--runtime",
+            "fargate",
+            "--model",
+            "gpt-5.6",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not supported with --runtime fargate"),
+        "unsupported Fargate land override should fail before launch"
+    );
+}
+
+#[test]
 fn version_prints_package_version_and_commit() {
     let tmp = TempDir::new().unwrap();
 

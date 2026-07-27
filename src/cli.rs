@@ -495,6 +495,14 @@ pub enum MergeCandidateCommands {
         #[arg(long)]
         coder: Option<String>,
 
+        /// Model to use for this land invocation
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Reasoning effort to use for this land invocation
+        #[arg(long)]
+        effort: Option<String>,
+
         /// Execution runtime: local (default) or fargate
         #[arg(long)]
         runtime: Option<String>,
