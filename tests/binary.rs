@@ -103,13 +103,14 @@ fn fargate_land_rejects_unsupported_model_or_effort_override() {
     }
 }
 
-fn land_mapping_codex_mock_script() -> &'static str {
-    r##"#!/bin/bash
-if [[ "$1" == "login" && "$2" == "status" ]]; then
-  exit 0
-fi
+fn land_mapping_codex_mock_script(invocation_log: &Path) -> String {
+    format!(
+        r##"#!/bin/bash
+printf '%s\n' "$*" >> '{}'
 exit 0
-"##
+"##,
+        invocation_log.display()
+    )
 }
 
 fn prepare_land_mapping_candidate(main_dir: &Path, bin_dir: &Path) -> serde_json::Value {
@@ -136,8 +137,10 @@ fn merge_candidate_land_uses_owning_attempt_write_mapping() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-land-mapping-default");
+    let invocation_log = tmp.path().join("land-mapping-default-invocation.log");
     let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
-    write_mock_codex(&bin_dir, land_mapping_codex_mock_script());
+    write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
+    write_mock_sandbox_exec(&bin_dir);
 
     fluent_cmd()
         .current_dir(&main_dir)
@@ -153,8 +156,17 @@ fn merge_candidate_land_uses_owning_attempt_write_mapping() {
         .env("FLUENT_CODER", "claude")
         .env("FLUENT_MODEL", "environment-model")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("Rebase agent failed"));
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        invocation.contains("--model stored-land-model"),
+        "the stored Codex model must reach the launched rebase coder: {invocation}"
+    );
+    assert!(
+        invocation.contains("model_reasoning_effort=medium"),
+        "the stored Codex effort must reach the launched rebase coder: {invocation}"
+    );
 
     assert_eq!(
         work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
@@ -168,8 +180,10 @@ fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-land-mapping-override");
+    let invocation_log = tmp.path().join("land-mapping-override-invocation.log");
     let stored_mapping = prepare_land_mapping_candidate(&main_dir, &bin_dir);
-    write_mock_codex(&bin_dir, land_mapping_codex_mock_script());
+    write_mock_codex(&bin_dir, &land_mapping_codex_mock_script(&invocation_log));
+    write_mock_sandbox_exec(&bin_dir);
 
     fluent_cmd()
         .current_dir(&main_dir)
@@ -187,8 +201,17 @@ fn merge_candidate_land_overrides_only_supplied_mapping_fields() {
         .env("PATH", mock_path(&bin_dir))
         .env("OPENAI_API_KEY", "fluent-test-key")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("Rebase agent failed"));
+        .success();
+
+    let invocation = fs::read_to_string(&invocation_log).unwrap();
+    assert!(
+        invocation.contains("--model override-land-model"),
+        "the model-only land override must reach the launched rebase coder: {invocation}"
+    );
+    assert!(
+        invocation.contains("model_reasoning_effort=low"),
+        "the effort override must reach the launched rebase coder: {invocation}"
+    );
 
     assert_eq!(
         work_item_value(&main_dir, "work-1")["attempts"][0]["coder_mapping"],
