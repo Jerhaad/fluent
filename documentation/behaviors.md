@@ -6019,6 +6019,7 @@ IF Codex authentication cannot be prepared before a Writer or Reviewer starts,
 THEN THE SYSTEM SHALL pause the same planned Task and Attempt without reserving
 execution or consuming a Writer round, and tell the user to run `codex login`.
 Test: tests/binary.rs (codex_auth_failure_pauses_planned_task_before_reservation)
+Test: tests/binary.rs (codex_auth_failure_pauses_planned_reviewer_before_reservation)
 
 ### B8
 

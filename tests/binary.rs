@@ -20222,6 +20222,65 @@ fn codex_auth_failure_pauses_planned_task_before_reservation() {
 }
 
 #[test]
+fn codex_auth_failure_pauses_planned_reviewer_before_reservation() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-codex-review-auth-failure");
+    let launch_marker = tmp.path().join("reviewer-launched");
+    write_mock_executable(
+        &bin_dir,
+        "codex",
+        &format!(
+            "#!/bin/bash\nif [[ \"$*\" == *\"login status\"* ]]; then exit 1; fi\ntouch '{}'\n",
+            launch_marker.display()
+        ),
+    );
+    create_completed_work_attempt(&tmp, &main_dir);
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_value(&attempt_path);
+    attempt["coder_mapping"]["review"]["coder"] = serde_json::json!("codex");
+    write_json_value(&attempt_path, &attempt);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["review", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-tests",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("OPENAI_API_KEY", "fluent-test-key")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("codex login"));
+
+    let item = work_item_value(&main_dir, "work-1");
+    let attempt = &item["attempts"][0];
+    let task = attempt["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "attempt-1-review-tests")
+        .unwrap();
+    assert_eq!(attempt["status"], "needs-user");
+    assert_eq!(attempt["pause_kind"], "auth");
+    assert_eq!(task["status"], "needs-user");
+    assert!(task["started_at"].is_null(), "preflight must not reserve the task");
+    assert!(
+        !launch_marker.exists(),
+        "a failed authentication preflight must not launch the reviewer"
+    );
+}
+
+#[test]
 fn autonomous_codex_writer_uses_and_removes_worker_home() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
