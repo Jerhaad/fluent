@@ -25,3 +25,6 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 serial_test = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
