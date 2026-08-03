@@ -29,10 +29,15 @@ const SYSTEM_READ: &[&str] = &[
 
 /// Writable system hierarchies, each more specific than a `SYSTEM_READ` entry
 /// so the union raises them from read-only to read-write.
-const SYSTEM_WRITE: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
+pub(crate) const SYSTEM_WRITE: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
 /// Device nodes a coder writes: terminals for pty allocation, the null/zero
 /// sinks, and the entropy sources. The rest of `/dev` stays read-only.
+///
+/// `/dev/fd`, `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` are absent on
+/// purpose. They are symlinks into `/proc/self/fd`, which the kernel refuses as
+/// a rule target with `EBADFD`, and a rule would buy nothing: Landlock mediates
+/// opening a path, not writing through a descriptor that is already open.
 const DEVICE_WRITE: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -42,10 +47,6 @@ const DEVICE_WRITE: &[&str] = &[
     "/dev/tty",
     "/dev/ptmx",
     "/dev/pts",
-    "/dev/fd",
-    "/dev/stdin",
-    "/dev/stdout",
-    "/dev/stderr",
 ];
 
 /// Home-relative paths withheld from the coder. Nested entries force `$HOME`
@@ -169,9 +170,10 @@ pub fn render(request: &PolicyRequest<'_>) -> Result<Policy> {
         bail!("At least one writable sandbox root is required");
     }
 
+    let withheld = withheld_paths(request);
     let mut rules = Vec::new();
-    push_system_rules(request, &mut rules);
-    push_home_rules(request, &mut rules)?;
+    push_system_rules(request, &withheld, &mut rules)?;
+    push_home_rules(request, &withheld, &mut rules)?;
     push_coder_rules(request, &mut rules);
     push_root_rules(request, &mut rules)?;
 
@@ -182,25 +184,8 @@ pub fn render(request: &PolicyRequest<'_>) -> Result<Policy> {
     })
 }
 
-fn push_system_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) {
-    for path in SYSTEM_READ {
-        rules.push(Rule::optional(path, Access::Read));
-    }
-    rules.push(Rule::optional("/dev", Access::Read));
-    for path in DEVICE_WRITE {
-        rules.push(Rule::optional(path, Access::ReadWrite));
-    }
-    if request.grant_shared_temp {
-        for path in SYSTEM_WRITE {
-            rules.push(Rule::optional(path, Access::ReadWrite));
-        }
-        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-            rules.push(Rule::optional(runtime_dir, Access::ReadWrite));
-        }
-    }
-}
-
-fn push_home_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result<()> {
+/// Paths no rule may grant, whichever hierarchy they happen to fall under.
+fn withheld_paths(request: &PolicyRequest<'_>) -> BTreeSet<PathBuf> {
     let mut withheld: BTreeSet<PathBuf> = HOME_SECRETS
         .iter()
         .map(|relative| request.home.join(relative))
@@ -214,8 +199,48 @@ fn push_home_rules(request: &PolicyRequest<'_>, rules: &mut Vec<Rule>) -> Result
             withheld.insert(source_home);
         }
     }
+    withheld
+}
 
-    grant_excluding(request.home, Access::Read, &withheld, rules)?;
+/// A system hierarchy is carved around the withheld paths too. Landlock unions
+/// rules, so a home under a granted tree — `/tmp` for a scratch checkout, say —
+/// would otherwise hand back every secret the home rules withhold.
+fn push_system_rules(
+    request: &PolicyRequest<'_>,
+    withheld: &BTreeSet<PathBuf>,
+    rules: &mut Vec<Rule>,
+) -> Result<()> {
+    for path in SYSTEM_READ {
+        grant_excluding(Path::new(path), Access::Read, withheld, rules)?;
+    }
+    rules.push(Rule::optional("/dev", Access::Read));
+    for path in DEVICE_WRITE {
+        rules.push(Rule::optional(path, Access::ReadWrite));
+    }
+    if request.grant_shared_temp {
+        let mut unwritable = withheld.clone();
+        unwritable.extend(request.denied_write_roots.iter().cloned());
+        for path in SYSTEM_WRITE {
+            grant_excluding(Path::new(path), Access::ReadWrite, &unwritable, rules)?;
+        }
+        if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+            grant_excluding(
+                Path::new(&runtime_dir),
+                Access::ReadWrite,
+                &unwritable,
+                rules,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn push_home_rules(
+    request: &PolicyRequest<'_>,
+    withheld: &BTreeSet<PathBuf>,
+    rules: &mut Vec<Rule>,
+) -> Result<()> {
+    grant_excluding(request.home, Access::Read, withheld, rules)?;
 
     for relative in SSH_READABLE {
         rules.push(Rule::optional(request.home.join(relative), Access::Read));
@@ -306,9 +331,21 @@ fn grant_excluding(
         return Ok(());
     }
 
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        // A hierarchy this host does not have cannot contain an exclusion, so
+        // the plain rule is safe; `apply` drops it when the path is absent.
+        Err(_) if !root.exists() => {
+            out.push(Rule::optional(root, access));
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("enumerating {} to withhold nested paths", root.display())
+            });
+        }
+    };
     out.push(Rule::optional(root, Access::List));
-    let entries = std::fs::read_dir(root)
-        .with_context(|| format!("enumerating {} to withhold nested paths", root.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("reading an entry of {}", root.display()))?;
         grant_excluding(&entry.path(), access, exclusions, out)?;
@@ -435,12 +472,18 @@ mod enforce {
         Ok(())
     }
 
+    /// Report whether this kernel enforces Landlock at all.
+    ///
+    /// The probe demands ABI 1 outright instead of asking best-effort, which
+    /// reports success on a kernel that would enforce nothing: Landlock is
+    /// commonly compiled in but left out of the boot `lsm=` list, and there the
+    /// syscall fails with `EOPNOTSUPP` while best-effort degrades to silence.
     pub fn is_available() -> bool {
-        let probe = Ruleset::default()
-            .set_compatibility(CompatLevel::BestEffort)
+        Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessFs::from_all(ABI::V1))
-            .and_then(|ruleset| ruleset.create());
-        matches!(probe, Ok(_))
+            .and_then(|ruleset| ruleset.create())
+            .is_ok()
     }
 }
 

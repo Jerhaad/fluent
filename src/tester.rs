@@ -290,9 +290,8 @@ fn run_command(
 
     let start = Instant::now();
     let output = if let Some(profile) = sandbox_path {
-        Command::new("sandbox-exec")
-            .arg("-f")
-            .arg(profile)
+        Command::new(crate::os::sandbox_launcher(false))
+            .args(crate::os::sandbox_launcher_args(&profile.to_string_lossy()))
             .arg("sh")
             .arg("-c")
             .arg(command)
@@ -333,9 +332,8 @@ fn run_extractor(
     sandbox_path: Option<&PathBuf>,
 ) -> Result<Vec<TestResult>> {
     let output = if let Some(profile) = sandbox_path {
-        Command::new("sandbox-exec")
-            .arg("-f")
-            .arg(profile)
+        Command::new(crate::os::sandbox_launcher(false))
+            .args(crate::os::sandbox_launcher_args(&profile.to_string_lossy()))
             .arg(extractor_path)
             .arg(artifact_dir)
             .output()

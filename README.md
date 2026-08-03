@@ -15,7 +15,7 @@ You use the factory through the Fluent [skill](https://agentskills.io/) in Codex
 ### Install
 
 ```bash
-npx skills add mrinalwadhwa/fluent --skill fluent  # currently macOS only
+npx skills add Jerhaad/fluent --skill fluent  # macOS and Linux
 ```
 
 Use the command above to install the Fluent skill. Start your coding agent in the project folder you want Fluent to work on, then ask it to use Fluent and describe what you want to explore, build, fix, or improve.
