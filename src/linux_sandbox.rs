@@ -531,6 +531,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Build fixtures outside the granted system hierarchies.
+    ///
+    /// The platform temp directory sits inside one on both hosts — `/tmp` on
+    /// Linux, `/var/folders` on macOS — so a fixture there is enumerated as
+    /// part of a system rule, and assertions about that rule would be reading
+    /// the fixture's own effect instead.
+    fn fixture_home() -> TempDir {
+        match std::env::var_os("HOME") {
+            Some(home) => TempDir::new_in(home).expect("creating a fixture under HOME"),
+            None => TempDir::new().unwrap(),
+        }
+    }
+
     fn request<'a>(home: &'a Path, roots: &'a [PathBuf]) -> PolicyRequest<'a> {
         PolicyRequest {
             home,
@@ -553,14 +566,14 @@ mod tests {
 
     #[test]
     fn rendering_requires_a_writable_root() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let error = render(&request(home.path(), &[])).unwrap_err();
         assert!(error.to_string().contains("writable sandbox root"));
     }
 
     #[test]
     fn home_secrets_are_withheld_by_enumerating_their_siblings() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         std::fs::create_dir(home.path().join(".ssh")).unwrap();
         std::fs::create_dir(home.path().join("code")).unwrap();
         let roots = vec![home.path().join("code")];
@@ -586,7 +599,7 @@ mod tests {
 
     #[test]
     fn signing_material_stays_readable_inside_the_withheld_ssh_directory() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         std::fs::create_dir(home.path().join(".ssh")).unwrap();
         let roots = vec![home.path().to_path_buf()];
 
@@ -601,7 +614,7 @@ mod tests {
 
     #[test]
     fn an_enumerated_root_stays_listable() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         std::fs::create_dir(home.path().join("code")).unwrap();
         let roots = vec![home.path().join("code")];
 
@@ -616,7 +629,7 @@ mod tests {
 
     #[test]
     fn a_denied_write_root_keeps_read_and_loses_write() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let workspace = home.path().join("workspace");
         let candidate = workspace.join("candidate");
         std::fs::create_dir_all(&candidate).unwrap();
@@ -647,7 +660,7 @@ mod tests {
 
     #[test]
     fn a_handoff_policy_withholds_the_shared_temp_trees() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let workspace = home.path().join("workspace");
         let candidate = workspace.join("candidate");
         std::fs::create_dir_all(&candidate).unwrap();
@@ -667,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_writable_root_is_required_so_a_missing_one_fails_the_launch() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let root = home.path().join("code");
         std::fs::create_dir(&root).unwrap();
         let roots = vec![root.clone()];
@@ -680,7 +693,7 @@ mod tests {
 
     #[test]
     fn system_hierarchies_are_optional_so_a_minimal_host_still_launches() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let roots = vec![home.path().to_path_buf()];
 
         let policy = render(&request(home.path(), &roots)).unwrap();
@@ -695,7 +708,7 @@ mod tests {
 
     #[test]
     fn writable_system_paths_outrank_the_read_only_hierarchy_containing_them() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let roots = vec![home.path().to_path_buf()];
 
         let policy = render(&request(home.path(), &roots)).unwrap();
@@ -714,7 +727,7 @@ mod tests {
 
     #[test]
     fn the_filesystem_root_is_never_granted() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let roots = vec![home.path().to_path_buf()];
 
         let policy = render(&request(home.path(), &roots)).unwrap();
@@ -724,7 +737,7 @@ mod tests {
 
     #[test]
     fn each_coder_gets_only_its_own_configuration() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let roots = vec![home.path().to_path_buf()];
 
         let claude = render(&PolicyRequest {
@@ -751,7 +764,7 @@ mod tests {
 
     #[test]
     fn a_policy_round_trips_through_its_serialized_form() {
-        let home = TempDir::new().unwrap();
+        let home = fixture_home();
         let roots = vec![home.path().to_path_buf()];
         let policy = render(&request(home.path(), &roots)).unwrap();
 
