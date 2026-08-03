@@ -1,15 +1,66 @@
 use anyhow::{Context, Result, bail};
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::coder::CoderKind;
 use crate::content::ContentResolver;
+use crate::linux_sandbox;
 
 /// Rendered sandbox profile that cleans up on drop.
 pub struct SandboxProfile {
     _temp_file: NamedTempFile,
     pub path: PathBuf,
+}
+
+/// Kernel mechanism that confines a coder or Tester command on this host.
+///
+/// Seatbelt and Landlock differ enough that the rendered profile is not a
+/// common format with two writers: Seatbelt takes ordered allow/deny rules
+/// where the first match wins, Landlock takes an allowlist whose rules only
+/// ever union. Each backend renders its own file and names its own launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxBackend {
+    Seatbelt,
+    Landlock,
+}
+
+pub fn backend() -> SandboxBackend {
+    if cfg!(target_os = "macos") {
+        SandboxBackend::Seatbelt
+    } else {
+        SandboxBackend::Landlock
+    }
+}
+
+/// Program that applies a rendered profile and then runs the confined command.
+///
+/// `trusted` asks for a path that a `PATH` entry cannot shadow. Landlock has no
+/// launcher binary of its own, so Fluent re-executes itself; `current_exe`
+/// resolves through `/proc/self/exe` and is already unshadowable, which is why
+/// both cases return the same path there.
+pub fn sandbox_launcher(trusted: bool) -> OsString {
+    match backend() {
+        SandboxBackend::Seatbelt if trusted => OsString::from("/usr/bin/sandbox-exec"),
+        SandboxBackend::Seatbelt => OsString::from("sandbox-exec"),
+        SandboxBackend::Landlock => env::current_exe()
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|_| OsString::from("fluent")),
+    }
+}
+
+/// Arguments that sit between the launcher and the command being confined.
+pub fn sandbox_launcher_args(profile: &str) -> Vec<String> {
+    match backend() {
+        SandboxBackend::Seatbelt => vec!["-f".to_string(), profile.to_string()],
+        SandboxBackend::Landlock => vec![
+            "sandbox-run".to_string(),
+            "--policy".to_string(),
+            profile.to_string(),
+            "--".to_string(),
+        ],
+    }
 }
 
 /// Render a Claude Seatbelt sandbox profile with placeholder substitution.
@@ -124,16 +175,18 @@ pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
         Some(coder_kind),
         codex_home,
     )?;
-    let content = std::fs::read_to_string(&profile.path)?
-        .replace(
-            "(allow file-write* (subpath \"/private/var/folders\"))",
-            "; handoff-only profiles do not grant the shared macOS temp tree",
-        )
-        .replace(
-            "(allow file-write* (subpath \"/private/tmp\"))",
-            "; handoff-only profiles do not grant shared /private/tmp",
-        );
-    std::fs::write(&profile.path, content)?;
+    if backend() == SandboxBackend::Seatbelt {
+        let content = std::fs::read_to_string(&profile.path)?
+            .replace(
+                "(allow file-write* (subpath \"/private/var/folders\"))",
+                "; handoff-only profiles do not grant the shared macOS temp tree",
+            )
+            .replace(
+                "(allow file-write* (subpath \"/private/tmp\"))",
+                "; handoff-only profiles do not grant shared /private/tmp",
+            );
+        std::fs::write(&profile.path, content)?;
+    }
     Ok(profile)
 }
 
@@ -156,6 +209,69 @@ pub fn render_profile_common_only(
 }
 
 fn render_profile_for_access(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
+) -> Result<SandboxProfile> {
+    match backend() {
+        SandboxBackend::Seatbelt => render_seatbelt_profile(
+            resolver,
+            home,
+            writable_roots,
+            readable_roots,
+            denied_write_roots,
+            coder_kind,
+            codex_home,
+        ),
+        SandboxBackend::Landlock => render_landlock_policy(
+            home,
+            writable_roots,
+            readable_roots,
+            denied_write_roots,
+            coder_kind,
+            codex_home,
+        ),
+    }
+}
+
+/// Render a Landlock policy and write it where the launcher will read it.
+///
+/// A handoff-only profile — one that names denied write roots — also loses the
+/// shared temp trees, matching what the Seatbelt renderer strips from
+/// `common.sb`: a writable `/tmp` is a channel out of the confinement the
+/// denials exist to create.
+fn render_landlock_policy(
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+    coder_kind: Option<CoderKind>,
+    codex_home: Option<&Path>,
+) -> Result<SandboxProfile> {
+    let policy = linux_sandbox::render(&linux_sandbox::PolicyRequest {
+        home: Path::new(home),
+        writable_roots,
+        readable_roots,
+        denied_write_roots,
+        coder_kind,
+        codex_home,
+        grant_shared_temp: denied_write_roots.is_empty(),
+    })?;
+
+    let temp_file = NamedTempFile::with_prefix("fluent-sandbox-")?;
+    std::fs::write(temp_file.path(), linux_sandbox::serialize(&policy)?)?;
+    let path = temp_file.path().to_path_buf();
+    Ok(SandboxProfile {
+        _temp_file: temp_file,
+        path,
+    })
+}
+
+fn render_seatbelt_profile(
     resolver: &ContentResolver,
     home: &str,
     writable_roots: &[PathBuf],
