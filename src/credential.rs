@@ -8,45 +8,86 @@ fn set_env_var(key: &str, value: &str) {
     unsafe { std::env::set_var(key, value) };
 }
 
+/// Keychain item class. A generic password and an internet password are
+/// separate classes with separate lookup commands, and `find-generic-password`
+/// does not find an item stored as the other. Linux has no equivalent split:
+/// `secret-tool` looks up by attribute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeychainItem {
+    Generic,
+    Internet,
+}
+
 /// Configuration for a named secret: service identifier, optional account,
-/// and environment variable fallback name.
+/// Keychain item class, and environment variable fallback name.
 struct CredentialConfig {
     service: &'static str,
     account: Option<&'static str>,
+    /// Chooses the Keychain lookup. Linux resolves by attribute and has no
+    /// equivalent class to pick.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    keychain_item: KeychainItem,
+    /// Names the variable the Linux fallback reads. The Keychain holds every
+    /// secret Fluent needs, so macOS never consults it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     env_var: &'static str,
 }
 
 const OAUTH_TOKEN: CredentialConfig = CredentialConfig {
     service: "Claude Code-credentials",
     account: None,
+    keychain_item: KeychainItem::Generic,
     env_var: "CLAUDE_CODE_OAUTH_TOKEN",
 };
 
 const ANTHROPIC_API_KEY: CredentialConfig = CredentialConfig {
     service: "https://api.anthropic.com",
     account: Some("Bearer"),
+    keychain_item: KeychainItem::Internet,
     env_var: "ANTHROPIC_API_KEY",
 };
 
 const BRAVE_SEARCH_KEY: CredentialConfig = CredentialConfig {
     service: "zed-sandbox",
     account: Some("brave_api_key"),
+    keychain_item: KeychainItem::Generic,
     env_var: "BRAVE_SEARCH_API_KEY",
 };
 
+/// Whether a lookup may fall back to the environment when the store has no
+/// entry.
+///
+/// Injection may: a headless Linux host often runs no keyring daemon, and the
+/// environment is where the secret arrives instead. A refresh may not — the
+/// variable it would read is the stale token it was called to replace, so
+/// falling back would report success while changing nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvFallback {
+    Allowed,
+    Denied,
+}
+
+/// Name the `security` subcommand that reads this item class.
+///
+/// Kept outside the `cfg` split so a Linux builder still fails when the two
+/// classes are collapsed into one lookup.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn keychain_lookup_command(item: KeychainItem) -> &'static str {
+    match item {
+        KeychainItem::Generic => "find-generic-password",
+        KeychainItem::Internet => "find-internet-password",
+    }
+}
+
 /// Read a named secret from the platform credential store.
 ///
-/// On macOS, queries the Keychain. On Linux, queries `secret-tool` and
-/// falls back to the configured environment variable when the secret
-/// service is unavailable or returns nothing.
+/// On macOS, queries the Keychain, which holds every secret Fluent needs and
+/// takes no environment fallback. On Linux, queries `secret-tool` and then the
+/// configured environment variable when `env_fallback` allows it.
 #[cfg(target_os = "macos")]
-fn read_secret(config: &CredentialConfig) -> Option<String> {
-    let mut args = vec![
-        "find-generic-password",
-        "-s",
-        config.service,
-        "-w",
-    ];
+fn read_secret(config: &CredentialConfig, _env_fallback: EnvFallback) -> Option<String> {
+    let lookup = keychain_lookup_command(config.keychain_item);
+    let mut args = vec![lookup, "-s", config.service, "-w"];
     if let Some(account) = config.account {
         args.push("-a");
         args.push(account);
@@ -72,7 +113,7 @@ fn read_secret(config: &CredentialConfig) -> Option<String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_secret(config: &CredentialConfig) -> Option<String> {
+fn read_secret(config: &CredentialConfig, env_fallback: EnvFallback) -> Option<String> {
     // Try secret-tool (libsecret CLI)
     let mut args = vec!["lookup", "service", config.service];
     if let Some(account) = config.account {
@@ -94,7 +135,9 @@ fn read_secret(config: &CredentialConfig) -> Option<String> {
         }
     }
 
-    // Fallback: environment variable
+    if env_fallback == EnvFallback::Denied {
+        return None;
+    }
     std::env::var(config.env_var).ok()
 }
 
@@ -135,7 +178,7 @@ fn inject_oauth_token() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(token) = read_secret(&OAUTH_TOKEN) {
+    if let Some(token) = read_secret(&OAUTH_TOKEN, EnvFallback::Allowed) {
         set_env_var("CLAUDE_CODE_OAUTH_TOKEN", &token);
         eprintln!("  OAuth token injected from credential store");
         return Ok(());
@@ -145,7 +188,7 @@ fn inject_oauth_token() -> Result<()> {
     if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_err()
         && std::env::var("ANTHROPIC_API_KEY").is_err()
     {
-        if let Some(key) = read_secret(&ANTHROPIC_API_KEY) {
+        if let Some(key) = read_secret(&ANTHROPIC_API_KEY, EnvFallback::Allowed) {
             set_env_var("ANTHROPIC_API_KEY", &key);
             eprintln!("  Anthropic key injected from credential store");
         }
@@ -156,7 +199,7 @@ fn inject_oauth_token() -> Result<()> {
 
 /// Re-read the OAuth token from the credential store, replacing any existing value.
 fn refresh_oauth_token() -> Result<()> {
-    if let Some(token) = read_secret(&OAUTH_TOKEN) {
+    if let Some(token) = read_secret(&OAUTH_TOKEN, EnvFallback::Denied) {
         set_env_var("CLAUDE_CODE_OAUTH_TOKEN", &token);
     }
     Ok(())
@@ -181,7 +224,7 @@ fn inject_brave_search_key() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(key) = read_secret(&BRAVE_SEARCH_KEY) {
+    if let Some(key) = read_secret(&BRAVE_SEARCH_KEY, EnvFallback::Allowed) {
         set_env_var("BRAVE_SEARCH_API_KEY", &key);
         eprintln!("  Brave Search key injected from credential store");
     }
@@ -318,9 +361,10 @@ mod tests {
         let config = CredentialConfig {
             service: "test-service",
             account: None,
+            keychain_item: KeychainItem::Generic,
             env_var: TEST_SECRET,
         };
-        let result = read_secret(&config);
+        let result = read_secret(&config, EnvFallback::Allowed);
         // SAFETY: test runs single-threaded, no child processes exist
         unsafe { std::env::remove_var(TEST_SECRET) };
         assert_eq!(result, Some("env-secret-value".to_string()));
@@ -332,10 +376,53 @@ mod tests {
         let config = CredentialConfig {
             service: "nonexistent-service",
             account: None,
+            keychain_item: KeychainItem::Generic,
             env_var: "CREDENTIAL_NONEXISTENT_VAR",
         };
         assert!(std::env::var("CREDENTIAL_NONEXISTENT_VAR").is_err());
-        assert_eq!(read_secret(&config), None);
+        assert_eq!(read_secret(&config, EnvFallback::Allowed), None);
+    }
+
+    #[test]
+    fn an_internet_password_is_read_with_its_own_lookup() {
+        // The Anthropic key is stored as an internet password, which
+        // find-generic-password does not return.
+        assert_eq!(
+            keychain_lookup_command(ANTHROPIC_API_KEY.keychain_item),
+            "find-internet-password"
+        );
+        assert_eq!(
+            keychain_lookup_command(OAUTH_TOKEN.keychain_item),
+            "find-generic-password"
+        );
+        assert_eq!(
+            keychain_lookup_command(BRAVE_SEARCH_KEY.keychain_item),
+            "find-generic-password"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_refusing_lookup_ignores_the_environment_it_would_otherwise_read() {
+        // A refresh reads past the variable it is about to replace; falling
+        // back to it would re-set the stale token and report success.
+        const TEST_SECRET: &str = "CREDENTIAL_TEST_NO_FALLBACK";
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::set_var(TEST_SECRET, "stale-token") };
+        let config = CredentialConfig {
+            service: "nonexistent-service",
+            account: None,
+            keychain_item: KeychainItem::Generic,
+            env_var: TEST_SECRET,
+        };
+
+        let denied = read_secret(&config, EnvFallback::Denied);
+        let allowed = read_secret(&config, EnvFallback::Allowed);
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::remove_var(TEST_SECRET) };
+
+        assert_eq!(denied, None);
+        assert_eq!(allowed, Some("stale-token".to_string()));
     }
 
     #[test]
