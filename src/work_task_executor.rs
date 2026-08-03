@@ -1278,6 +1278,28 @@ fn complete_review_task(
     })
 }
 
+/// Paths the candidate changed since the Attempt's base commit.
+///
+/// `None` when the base is unrecorded or Git cannot answer, which runs every
+/// scoped command rather than silently narrowing the suite.
+fn candidate_changed_paths(workspace: &Path, base_commit: Option<&str>) -> Option<Vec<String>> {
+    let base = base_commit?;
+    let output = crate::git::run_stdout(
+        workspace,
+        &["diff", "--name-only", base, "HEAD"],
+        "listing the candidate's changed paths",
+    )
+    .ok()?;
+    Some(
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 fn capture_baseline_tester(
     project_root: &Path,
     candidate_workspace: &Path,
@@ -1294,7 +1316,11 @@ fn capture_baseline_tester(
         return;
     }
     eprintln!("  Baseline tester   running on pre-write workspace");
-    if let Err(e) = crate::tester::run(candidate_workspace, &artifact_dir, no_sandbox, resolver) {
+    // The baseline runs before the Writer, so nothing has changed yet and a
+    // change set would skip every scoped command. Passing none runs them all,
+    // which is what gives a scoped gate a baseline to be compared against.
+    if let Err(e) = crate::tester::run(candidate_workspace, &artifact_dir, no_sandbox, resolver, None)
+    {
         eprintln!("  Baseline tester: run failed: {e:#}");
     }
 }
@@ -1392,11 +1418,15 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
 
     let results_path = artifact_dir.join("tester-results.json");
 
+    let changed_paths =
+        candidate_changed_paths(&candidate_workspace, review_context.base_commit.as_deref());
+
     let mut tester_result = crate::tester::run(
         &candidate_workspace,
         &artifact_dir,
         config.no_sandbox,
         config.resolver,
+        changed_paths.as_deref(),
     );
     let mut retries = 0;
     while tester_result.is_err() && retries < max_task_retries() {
@@ -1411,6 +1441,7 @@ fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
             &artifact_dir,
             config.no_sandbox,
             config.resolver,
+            changed_paths.as_deref(),
         );
     }
 
