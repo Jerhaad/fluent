@@ -353,6 +353,7 @@ mod tests {
     // -- Linux credential lookup tests --
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn test_read_secret_env_fallback() {
         // secret-tool is absent on this host; the env var should be used
         const TEST_SECRET: &str = "CREDENTIAL_TEST_SECRET";
