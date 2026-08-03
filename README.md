@@ -1,5 +1,10 @@
 # Fluent – a self improving software factory
 
+> **Fork.** This is a fork of [`mrinalwadhwa/fluent`](https://github.com/mrinalwadhwa/fluent)
+> by Mrinal Wadhwa, adding a Linux platform layer so Linux is a first-class host
+> alongside macOS. See [`NOTICE.md`](NOTICE.md) for provenance and licensing —
+> the upstream work carries no license grant, and this fork does not relicense it.
+
 Fluent is a factory that autonomously turns your team's vision, ideas, bug reports, user feedback, production logs, and agent traces into working software.
 
 <p align="center">
