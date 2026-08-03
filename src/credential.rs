@@ -8,7 +8,97 @@ fn set_env_var(key: &str, value: &str) {
     unsafe { std::env::set_var(key, value) };
 }
 
-/// Inject credentials from macOS Keychain into environment variables.
+/// Configuration for a named secret: service identifier, optional account,
+/// and environment variable fallback name.
+struct CredentialConfig {
+    service: &'static str,
+    account: Option<&'static str>,
+    env_var: &'static str,
+}
+
+const OAUTH_TOKEN: CredentialConfig = CredentialConfig {
+    service: "Claude Code-credentials",
+    account: None,
+    env_var: "CLAUDE_CODE_OAUTH_TOKEN",
+};
+
+const ANTHROPIC_API_KEY: CredentialConfig = CredentialConfig {
+    service: "https://api.anthropic.com",
+    account: Some("Bearer"),
+    env_var: "ANTHROPIC_API_KEY",
+};
+
+const BRAVE_SEARCH_KEY: CredentialConfig = CredentialConfig {
+    service: "zed-sandbox",
+    account: Some("brave_api_key"),
+    env_var: "BRAVE_SEARCH_API_KEY",
+};
+
+/// Read a named secret from the platform credential store.
+///
+/// On macOS, queries the Keychain. On Linux, queries `secret-tool` and
+/// falls back to the configured environment variable when the secret
+/// service is unavailable or returns nothing.
+#[cfg(target_os = "macos")]
+fn read_secret(config: &CredentialConfig) -> Option<String> {
+    let mut args = vec![
+        "find-generic-password",
+        "-s",
+        config.service,
+        "-w",
+    ];
+    if let Some(account) = config.account {
+        args.push("-a");
+        args.push(account);
+    }
+
+    let output = Command::new("security").args(args).output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    // OAuth token is stored as JSON; extract the access token
+    if config.service == OAUTH_TOKEN.service {
+        return extract_oauth_token(&value);
+    }
+
+    Some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_secret(config: &CredentialConfig) -> Option<String> {
+    // Try secret-tool (libsecret CLI)
+    let mut args = vec!["lookup", "service", config.service];
+    if let Some(account) = config.account {
+        args.push("username");
+        args.push(account);
+    }
+    let output = Command::new("secret-tool").args(args).output();
+
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            // OAuth token is stored as JSON; extract the access token
+            if config.service == OAUTH_TOKEN.service {
+                return extract_oauth_token(&value);
+            }
+            return Some(value);
+        }
+    }
+
+    // Fallback: environment variable
+    std::env::var(config.env_var).ok()
+}
+
+/// Inject credentials from the platform credential store into environment variables.
 /// This runs OUTSIDE the sandbox.
 pub fn inject_credentials() -> Result<()> {
     inject_oauth_token()?;
@@ -20,9 +110,9 @@ pub fn inject_credentials() -> Result<()> {
 /// Refresh credentials before a new session.
 ///
 /// Runs `claude -p "ok" --max-turns 1` outside the sandbox to trigger
-/// OAuth token refresh, then re-reads credentials from Keychain.
+/// OAuth token refresh, then re-reads credentials from the credential store.
 /// Called between sessions in sandboxed mode because the sandbox blocks
-/// Keychain access — the agent cannot refresh tokens itself.
+/// credential store access — the agent cannot refresh tokens itself.
 pub fn refresh_credentials() -> Result<()> {
     eprintln!("  Refreshing credentials...");
 
@@ -34,44 +124,20 @@ pub fn refresh_credentials() -> Result<()> {
         .status()
         .ok();
 
-    // Re-read OAuth token from Keychain (force refresh)
+    // Re-read OAuth token from credential store (force refresh)
     refresh_oauth_token()?;
     Ok(())
 }
 
-/// Read the OAuth token from Keychain via `security find-generic-password`.
-fn read_oauth_from_keychain() -> Option<String> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let cred_json = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if cred_json.is_empty() {
-        return None;
-    }
-
-    extract_oauth_token(&cred_json)
-}
-
-/// Inject OAuth token from Keychain if not already set.
+/// Inject OAuth token from credential store if not already set.
 fn inject_oauth_token() -> Result<()> {
     if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok() {
         return Ok(());
     }
 
-    if let Some(token) = read_oauth_from_keychain() {
+    if let Some(token) = read_secret(&OAUTH_TOKEN) {
         set_env_var("CLAUDE_CODE_OAUTH_TOKEN", &token);
-        eprintln!("  OAuth token injected from Keychain");
+        eprintln!("  OAuth token injected from credential store");
         return Ok(());
     }
 
@@ -79,40 +145,24 @@ fn inject_oauth_token() -> Result<()> {
     if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_err()
         && std::env::var("ANTHROPIC_API_KEY").is_err()
     {
-        let output = Command::new("security")
-            .args([
-                "find-internet-password",
-                "-s",
-                "https://api.anthropic.com",
-                "-a",
-                "Bearer",
-                "-w",
-            ])
-            .output();
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !key.is_empty() {
-                set_env_var("ANTHROPIC_API_KEY", &key);
-                eprintln!("  Anthropic key injected from Keychain");
-            }
+        if let Some(key) = read_secret(&ANTHROPIC_API_KEY) {
+            set_env_var("ANTHROPIC_API_KEY", &key);
+            eprintln!("  Anthropic key injected from credential store");
         }
     }
 
     Ok(())
 }
 
-/// Re-read the OAuth token from Keychain, replacing any existing value.
+/// Re-read the OAuth token from the credential store, replacing any existing value.
 fn refresh_oauth_token() -> Result<()> {
-    if let Some(token) = read_oauth_from_keychain() {
+    if let Some(token) = read_secret(&OAUTH_TOKEN) {
         set_env_var("CLAUDE_CODE_OAUTH_TOKEN", &token);
     }
     Ok(())
 }
 
-/// Force a fresh OAuth token read from the Keychain, bypassing the
+/// Force a fresh OAuth token read from the credential store, bypassing the
 /// inject guard that skips when a token is already set.
 pub fn force_refresh_oauth_token() -> Result<()> {
     refresh_oauth_token()
@@ -131,25 +181,9 @@ fn inject_brave_search_key() -> Result<()> {
         return Ok(());
     }
 
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "zed-sandbox",
-            "-a",
-            "brave_api_key",
-            "-w",
-        ])
-        .output();
-
-    if let Ok(output) = output
-        && output.status.success()
-    {
-        let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !key.is_empty() {
-            set_env_var("BRAVE_SEARCH_API_KEY", &key);
-            eprintln!("  Brave Search key injected from Keychain");
-        }
+    if let Some(key) = read_secret(&BRAVE_SEARCH_KEY) {
+        set_env_var("BRAVE_SEARCH_API_KEY", &key);
+        eprintln!("  Brave Search key injected from credential store");
     }
 
     Ok(())
@@ -235,13 +269,13 @@ mod tests {
 
     #[test]
     fn test_extract_oauth_token_valid() {
-        let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-abc123"}}"#;
-        assert_eq!(extract_oauth_token(json), Some("sk-ant-abc123".to_string()));
+        let json = r#"{"claudeAiOauth":{"accessToken":"«redacted:sk-…»"}}"#;
+        assert_eq!(extract_oauth_token(json), Some("«redacted:sk-…»".to_string()));
     }
 
     #[test]
     fn test_extract_oauth_token_missing_outer_key() {
-        let json = r#"{"otherKey":{"accessToken":"sk-ant-abc123"}}"#;
+        let json = r#"{"otherKey":{"accessToken":"«redacted:sk-…»"}}"#;
         assert_eq!(extract_oauth_token(json), None);
     }
 
@@ -271,5 +305,48 @@ mod tests {
     fn test_extract_oauth_token_non_string_value() {
         let json = r#"{"claudeAiOauth":{"accessToken":12345}}"#;
         assert_eq!(extract_oauth_token(json), None);
+    }
+
+    // -- Linux credential lookup tests --
+
+    #[test]
+    fn test_read_secret_env_fallback() {
+        // secret-tool is absent on this host; the env var should be used
+        const TEST_SECRET: &str = "CREDENTIAL_TEST_SECRET";
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::set_var(TEST_SECRET, "env-secret-value") };
+        let config = CredentialConfig {
+            service: "test-service",
+            account: None,
+            env_var: TEST_SECRET,
+        };
+        let result = read_secret(&config);
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::remove_var(TEST_SECRET) };
+        assert_eq!(result, Some("env-secret-value".to_string()));
+    }
+
+    #[test]
+    fn test_read_secret_absent_secret_tool_and_env() {
+        // Neither secret-tool nor env var available -> None
+        let config = CredentialConfig {
+            service: "nonexistent-service",
+            account: None,
+            env_var: "CREDENTIAL_NONEXISTENT_VAR",
+        };
+        assert!(std::env::var("CREDENTIAL_NONEXISTENT_VAR").is_err());
+        assert_eq!(read_secret(&config), None);
+    }
+
+    #[test]
+    fn test_inject_oauth_token_skips_when_already_set() {
+        const TEST_TOKEN: &str = "CREDENTIAL_TEST_TOKEN";
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", TEST_TOKEN) };
+        inject_oauth_token().unwrap();
+        // Token should remain unchanged
+        assert_eq!(std::env::var("CLAUDE_CODE_OAUTH_TOKEN").unwrap(), TEST_TOKEN);
+        // SAFETY: test runs single-threaded, no child processes exist
+        unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") };
     }
 }
