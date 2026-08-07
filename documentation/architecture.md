@@ -371,23 +371,38 @@ or write a transcript — it is a deterministic subprocess, not an LLM agent.
 Review-only Attempts keep their existing Tester-first contract because no Writer
 produces focused candidate evidence for them.
 
-The pre-write baseline remains part of each Attempt's evidence. Fluent captures
-it before the initial Writer and identifies that boundary by the absence of an
-earlier Writer Task, so corrective Writers reuse the same baseline even though
-no final Tester has been planned yet.
+The pre-write baseline remains part of each Attempt's evidence. Before the
+initial Writer, Fluent resolves the exact source commit's baseline and copies it
+into the Attempt artifact. Corrective Writers reuse that same Attempt-local copy
+even though no final Tester has been planned yet.
 
-Scheduler-launched Attempts receive one opaque baseline-session id from their
-coordinator. Within that scheduler lifetime, Attempts with the same source
-commit, Tester configuration and extractor digests, Fluent build, platform,
-architecture, and sandbox mode use one project-wide baseline. A file lease
-serializes the first capture; peers wait, validate the published artifact
-digest, and copy the complete evidence into their own Attempt artifact with a
-digest-bearing provenance record. The scheduler deletes its temporary shared
-cache after its workers drain; a newly elected scheduler clears any cache left
-by an interrupted predecessor. Direct Attempts and later scheduler processes do
-not reuse it. Harness errors stay Attempt-local, while missing or changed
-shared results fail closed before reuse. Suite-health checks always read the
-Attempt-local copy.
+Every final Tester writes a host-owned baseline-seed manifest after binding its
+results to the exact reviewed commit. The manifest records the source commit,
+Tester configuration and extractor digests, Fluent build, platform,
+architecture, sandbox mode, and artifact and result digests. When that exact
+commit lands under the same boundary, Fluent atomically promotes the final
+Tester artifact into the project's durable landed-baseline cache. Known test
+failures remain useful baseline evidence; a harness error does not.
+
+Rebase, Learner, or merge-time repair can make the landed commit differ from the
+commit tested before land. A mismatched or unavailable seed is never relabeled.
+Fluent creates a detached worktree at the merged commit, runs one fresh baseline
+there, publishes only trustworthy evidence, and removes the worktree before the
+land command returns. Because the Git fast-forward is already durable, a
+capture or cleanup error warns rather than reporting that the merge failed. A
+repeated land invocation retries preparation, and the next Attempt retains its
+ordinary capture fallback.
+
+Direct and scheduler-launched Attempts first check the durable cache using the
+same immutable identity. A file lease serializes publication; consumers validate
+the manifest and artifact digests before copying the complete evidence into
+their own Attempt artifact with digest-bearing provenance. Scheduler-launched
+Attempts still receive one opaque baseline-session id. When no landed entry
+exists, matching Attempts share one run within that scheduler lifetime. The
+scheduler deletes only its temporary session cache after workers drain and
+preserves durable landed entries. Harness errors stay Attempt-local, while
+missing or changed cached results fail closed before reuse. Suite-health checks
+always read the Attempt-local copy.
 
 The scheduler launches each Attempt with the ordinary sandbox default. Its
 baseline-session id is host coordination data: Fluent consumes it while resolving

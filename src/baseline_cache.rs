@@ -1,8 +1,9 @@
-//! Scheduler-session cache for immutable pre-write Tester baselines.
+//! Cache for immutable pre-write Tester baselines.
 //!
-//! Direct Attempts retain Attempt-local capture. Scheduler children receive one
-//! opaque session id, allowing Work Items with the same source and Tester
-//! boundary to share one host-owned run within that scheduler lifetime.
+//! A successful land publishes one durable baseline for its exact Tester
+//! boundary. Direct and scheduler-launched Attempts prefer that evidence.
+//! Scheduler children retain a temporary session cache as a fallback for source
+//! commits that have no landed baseline.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -16,15 +17,19 @@ use crate::tester::{TesterOutcome, TesterResults};
 
 pub(crate) const BASELINE_SESSION_ENV: &str = "FLUENT_SCHEDULER_BASELINE_SESSION";
 const CACHE_ROOT: &str = ".fluent/work/baselines";
+const LANDED_ROOT: &str = "landed";
+const SESSIONS_ROOT: &str = "sessions";
 const PROVENANCE_FILE: &str = "baseline-provenance.json";
 const MANIFEST_FILE: &str = "manifest.json";
+const FINAL_TESTER_SEED_FILE: &str = "landed-baseline-seed.json";
 const RESULTS_FILE: &str = "tester-results.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct BaselineIdentity {
     schema_version: u32,
-    scheduler_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scheduler_session: Option<String>,
     source_commit: String,
     tester_config_digest: String,
     extractor_digest: String,
@@ -54,17 +59,33 @@ struct BaselineProvenance {
     results_digest: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct FinalTesterSeed {
+    identity: BaselineIdentity,
+    artifact_digest: String,
+    results_digest: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CaptureDisposition {
     AttemptLocal,
     Published { cache_key: String },
+    Reused { cache_key: String },
+    ReusedLanded { cache_key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LandedSeedDisposition {
+    Promoted { cache_key: String },
+    Captured { cache_key: String },
     Reused { cache_key: String },
 }
 
 /// Start one elected scheduler's cache, removing evidence left by an interrupted
 /// predecessor before any child can publish a new baseline.
 pub(crate) fn prepare_scheduler_session(project_root: &Path, session: &str) -> Result<()> {
-    let root = project_root.join(CACHE_ROOT);
+    let root = project_root.join(CACHE_ROOT).join(SESSIONS_ROOT);
     if root.exists() {
         let metadata = fs::symlink_metadata(&root)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -80,7 +101,10 @@ pub(crate) fn prepare_scheduler_session(project_root: &Path, session: &str) -> R
 /// Remove the elected scheduler's temporary cache after its workers have
 /// stopped. Each completed Attempt keeps its own evidence copy.
 pub(crate) fn finish_scheduler_session(project_root: &Path, session: &str) -> Result<()> {
-    let session_dir = project_root.join(CACHE_ROOT).join(session_key(session));
+    let session_dir = project_root
+        .join(CACHE_ROOT)
+        .join(SESSIONS_ROOT)
+        .join(session_key(session));
     match fs::remove_dir_all(&session_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -100,6 +124,15 @@ pub(crate) fn capture(
     no_sandbox: bool,
     resolver: &ContentResolver,
 ) -> Result<CaptureDisposition> {
+    let landed_identity = resolve_identity(candidate_workspace, no_sandbox, None)?;
+    if let Some((manifest, cache_key)) = reuse_existing(project_root, &landed_identity)? {
+        let landed_cache_dir =
+            identity_cache_root(project_root, &landed_identity)?.join(&cache_key);
+        copy_tree(&landed_cache_dir.join("artifact"), attempt_artifact_dir)?;
+        write_provenance(attempt_artifact_dir, &manifest, "reused-landed-baseline")?;
+        return Ok(CaptureDisposition::ReusedLanded { cache_key });
+    }
+
     let Some(session) = std::env::var(BASELINE_SESSION_ENV)
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -114,7 +147,7 @@ pub(crate) fn capture(
         return Ok(CaptureDisposition::AttemptLocal);
     };
 
-    let identity = resolve_identity(candidate_workspace, no_sandbox, &session)?;
+    let identity = resolve_identity(candidate_workspace, no_sandbox, Some(&session))?;
     capture_with(
         project_root,
         attempt_artifact_dir,
@@ -130,9 +163,7 @@ fn capture_with(
     run: impl FnOnce(&Path) -> Result<TesterOutcome>,
 ) -> Result<CaptureDisposition> {
     let cache_key = identity_key(&identity)?;
-    let cache_root = project_root
-        .join(CACHE_ROOT)
-        .join(session_key(&identity.scheduler_session));
+    let cache_root = identity_cache_root(project_root, &identity)?;
     let cache_dir = cache_root.join(&cache_key);
     let lock_path = cache_root.join("locks").join(format!("{cache_key}.lock"));
     let _lease = crate::lease::acquire_blocking(&lock_path)
@@ -140,7 +171,12 @@ fn capture_with(
 
     if let Some(manifest) = validated_manifest(&cache_dir, &identity, &cache_key)? {
         copy_tree(&cache_dir.join("artifact"), attempt_artifact_dir)?;
-        write_provenance(attempt_artifact_dir, &manifest, "reused-scheduler-baseline")?;
+        let source = if identity.scheduler_session.is_some() {
+            "reused-scheduler-baseline"
+        } else {
+            "reused-landed-baseline"
+        };
+        write_provenance(attempt_artifact_dir, &manifest, source)?;
         return Ok(CaptureDisposition::Reused { cache_key });
     }
 
@@ -203,22 +239,23 @@ fn capture_with(
         )
     })?;
     copy_tree(&cache_dir.join("artifact"), attempt_artifact_dir)?;
-    write_provenance(
-        attempt_artifact_dir,
-        &manifest,
-        "captured-scheduler-baseline",
-    )?;
+    let source = if manifest.identity.scheduler_session.is_some() {
+        "captured-scheduler-baseline"
+    } else {
+        "captured-landed-baseline"
+    };
+    write_provenance(attempt_artifact_dir, &manifest, source)?;
     Ok(CaptureDisposition::Published { cache_key })
 }
 
 fn resolve_identity(
     candidate_workspace: &Path,
     no_sandbox: bool,
-    scheduler_session: &str,
+    scheduler_session: Option<&str>,
 ) -> Result<BaselineIdentity> {
     Ok(BaselineIdentity {
-        schema_version: 1,
-        scheduler_session: scheduler_session.to_string(),
+        schema_version: 2,
+        scheduler_session: scheduler_session.map(str::to_string),
         source_commit: crate::git::run_stdout(
             candidate_workspace,
             &["rev-parse", "HEAD"],
@@ -231,6 +268,172 @@ fn resolve_identity(
         architecture: std::env::consts::ARCH.to_string(),
         sandboxed: !no_sandbox,
     })
+}
+
+fn identity_cache_root(project_root: &Path, identity: &BaselineIdentity) -> Result<PathBuf> {
+    let root = project_root.join(CACHE_ROOT);
+    match identity.scheduler_session.as_deref() {
+        Some(session) if !session.trim().is_empty() => {
+            Ok(root.join(SESSIONS_ROOT).join(session_key(session)))
+        }
+        Some(_) => bail!("shared baseline scheduler session must not be empty"),
+        None => Ok(root.join(LANDED_ROOT)),
+    }
+}
+
+fn reuse_existing(
+    project_root: &Path,
+    identity: &BaselineIdentity,
+) -> Result<Option<(BaselineManifest, String)>> {
+    let cache_key = identity_key(identity)?;
+    let cache_root = identity_cache_root(project_root, identity)?;
+    let lock_path = cache_root.join("locks").join(format!("{cache_key}.lock"));
+    let _lease = crate::lease::acquire_blocking(&lock_path)
+        .with_context(|| format!("acquire shared baseline lock {}", lock_path.display()))?;
+    Ok(
+        validated_manifest(&cache_root.join(&cache_key), identity, &cache_key)?
+            .map(|manifest| (manifest, cache_key)),
+    )
+}
+
+/// Bind a completed final Tester artifact to the immutable baseline identity it
+/// can seed if that exact commit later lands.
+pub(crate) fn record_final_tester_seed(
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    no_sandbox: bool,
+) -> Result<()> {
+    let identity = resolve_identity(candidate_workspace, no_sandbox, None)?;
+    let results_bytes = fs::read(artifact_dir.join(RESULTS_FILE))?;
+    let results: TesterResults = serde_json::from_slice(&results_bytes)?;
+    if results.error.is_some() {
+        bail!("final Tester evidence contains a harness error");
+    }
+    if results.candidate_commit.as_deref() != Some(identity.source_commit.as_str()) {
+        bail!(
+            "final Tester evidence is not bound to its exact source commit {}",
+            identity.source_commit
+        );
+    }
+    let seed = FinalTesterSeed {
+        identity,
+        artifact_digest: digest_tree_without_seed(artifact_dir)?,
+        results_digest: digest_bytes(&results_bytes),
+    };
+    crate::atomic_write::atomic_write(
+        &artifact_dir.join(FINAL_TESTER_SEED_FILE),
+        &serde_json::to_vec_pretty(&seed)?,
+    )?;
+    Ok(())
+}
+
+/// Promote final Tester evidence when it exactly matches the landed commit and
+/// the current land boundary. A mismatch is not an error: the caller captures a
+/// fresh landed baseline instead.
+pub(crate) fn promote_final_tester(
+    project_root: &Path,
+    merged_workspace: &Path,
+    artifact_dir: &Path,
+    merged_commit: &str,
+    no_sandbox: bool,
+) -> Result<Option<LandedSeedDisposition>> {
+    let seed_path = artifact_dir.join(FINAL_TESTER_SEED_FILE);
+    if !seed_path.is_file() {
+        return Ok(None);
+    }
+    let seed: FinalTesterSeed = serde_json::from_slice(&fs::read(&seed_path)?)?;
+    let expected = resolve_identity(merged_workspace, no_sandbox, None)?;
+    if expected.source_commit != merged_commit || seed.identity != expected {
+        return Ok(None);
+    }
+
+    let results_bytes = fs::read(artifact_dir.join(RESULTS_FILE))?;
+    let results: TesterResults = serde_json::from_slice(&results_bytes)?;
+    if results.error.is_some()
+        || results.candidate_commit.as_deref() != Some(merged_commit)
+        || digest_bytes(&results_bytes) != seed.results_digest
+        || digest_tree_without_seed(artifact_dir)? != seed.artifact_digest
+    {
+        bail!("final Tester seed evidence is not trustworthy");
+    }
+
+    Ok(Some(publish_existing_artifact(
+        project_root,
+        artifact_dir,
+        seed.identity,
+    )?))
+}
+
+fn publish_existing_artifact(
+    project_root: &Path,
+    artifact_dir: &Path,
+    identity: BaselineIdentity,
+) -> Result<LandedSeedDisposition> {
+    let cache_key = identity_key(&identity)?;
+    let cache_root = identity_cache_root(project_root, &identity)?;
+    let cache_dir = cache_root.join(&cache_key);
+    let lock_path = cache_root.join("locks").join(format!("{cache_key}.lock"));
+    let _lease = crate::lease::acquire_blocking(&lock_path)
+        .with_context(|| format!("acquire landed baseline lock {}", lock_path.display()))?;
+
+    if validated_manifest(&cache_dir, &identity, &cache_key)?.is_some() {
+        return Ok(LandedSeedDisposition::Reused { cache_key });
+    }
+
+    fs::create_dir_all(&cache_root)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".baseline-")
+        .tempdir_in(&cache_root)
+        .context("create landed baseline staging directory")?;
+    let staged_artifact = staging.path().join("artifact");
+    copy_tree(artifact_dir, &staged_artifact)?;
+    let results_bytes = fs::read(staged_artifact.join(RESULTS_FILE))?;
+    let manifest = BaselineManifest {
+        identity,
+        cache_key: cache_key.clone(),
+        artifact_digest: digest_tree(&staged_artifact)?,
+        results_digest: digest_bytes(&results_bytes),
+    };
+    crate::atomic_write::atomic_write(
+        &staging.path().join(MANIFEST_FILE),
+        &serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    let staged_path = staging.keep();
+    fs::rename(&staged_path, &cache_dir).with_context(|| {
+        format!(
+            "publish landed baseline {} as {}",
+            staged_path.display(),
+            cache_dir.display()
+        )
+    })?;
+    Ok(LandedSeedDisposition::Promoted { cache_key })
+}
+
+pub(crate) fn capture_landed(
+    project_root: &Path,
+    merged_workspace: &Path,
+    landing_artifact_dir: &Path,
+    no_sandbox: bool,
+    resolver: &ContentResolver,
+) -> Result<LandedSeedDisposition> {
+    let identity = resolve_identity(merged_workspace, no_sandbox, None)?;
+    match capture_with(
+        project_root,
+        landing_artifact_dir,
+        identity,
+        |artifact_dir| crate::tester::run(merged_workspace, artifact_dir, no_sandbox, resolver),
+    )? {
+        CaptureDisposition::Published { cache_key } => {
+            Ok(LandedSeedDisposition::Captured { cache_key })
+        }
+        CaptureDisposition::Reused { cache_key }
+        | CaptureDisposition::ReusedLanded { cache_key } => {
+            Ok(LandedSeedDisposition::Reused { cache_key })
+        }
+        CaptureDisposition::AttemptLocal => {
+            bail!("landed baseline Tester did not produce reusable evidence")
+        }
+    }
 }
 
 fn identity_key(identity: &BaselineIdentity) -> Result<String> {
@@ -328,6 +531,17 @@ fn digest_bytes(bytes: &[u8]) -> String {
 fn digest_tree(root: &Path) -> Result<String> {
     let mut files = Vec::new();
     collect_files(root, root, &mut files)?;
+    digest_files(root, files)
+}
+
+fn digest_tree_without_seed(root: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.retain(|path| path != Path::new(FINAL_TESTER_SEED_FILE));
+    digest_files(root, files)
+}
+
+fn digest_files(root: &Path, mut files: Vec<PathBuf>) -> Result<String> {
     files.sort();
     let mut hasher = Sha256::new();
     for relative in files {
@@ -393,10 +607,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
+    fn initialized_project(path: &Path) -> String {
+        fs::create_dir_all(path.join(".fluent")).unwrap();
+        fs::write(
+            path.join(".fluent/tester.yaml"),
+            "commands:\n  - command: echo ok\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        fs::write(
+            path.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        crate::git::run(path, &["init", "-q", "-b", "main"], "init baseline fixture").unwrap();
+        crate::git::run(
+            path,
+            &["config", "user.email", "test@example.com"],
+            "configure fixture email",
+        )
+        .unwrap();
+        crate::git::run(
+            path,
+            &["config", "user.name", "Test User"],
+            "configure fixture name",
+        )
+        .unwrap();
+        crate::git::run(path, &["add", ".fluent"], "stage baseline fixture").unwrap();
+        crate::git::run(path, &["commit", "-q", "-m", "baseline"], "commit fixture").unwrap();
+        crate::git::run_stdout(path, &["rev-parse", "HEAD"], "resolve fixture head").unwrap()
+    }
+
     fn identity(session: &str, commit: &str) -> BaselineIdentity {
         BaselineIdentity {
-            schema_version: 1,
-            scheduler_session: session.to_string(),
+            schema_version: 2,
+            scheduler_session: Some(session.to_string()),
             source_commit: commit.to_string(),
             tester_config_digest: "sha256:config".to_string(),
             extractor_digest: "sha256:extractor".to_string(),
@@ -404,6 +648,13 @@ mod tests {
             operating_system: "test-os".to_string(),
             architecture: "test-arch".to_string(),
             sandboxed: false,
+        }
+    }
+
+    fn landed_identity(commit: &str) -> BaselineIdentity {
+        BaselineIdentity {
+            scheduler_session: None,
+            ..identity("unused", commit)
         }
     }
 
@@ -426,6 +677,95 @@ mod tests {
             })?,
         )?;
         Ok(TesterOutcome::Passed)
+    }
+
+    fn write_bound_artifact(path: &Path, commit: &str) {
+        fs::create_dir_all(path.join("commands")).unwrap();
+        fs::write(path.join("commands/0-stdout.log"), "ok").unwrap();
+        fs::write(
+            path.join(RESULTS_FILE),
+            serde_json::to_vec_pretty(&TesterResults {
+                candidate_commit: Some(commit.to_string()),
+                commands: Vec::new(),
+                tests: Vec::new(),
+                summary: crate::tester::Summary {
+                    total: 0,
+                    pass: 0,
+                    fail: 0,
+                    skipped: 0,
+                },
+                error: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn landed_baseline_replaces_next_attempt_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let commit = initialized_project(root.path());
+        let final_artifact = root.path().join("final-tester");
+        write_bound_artifact(&final_artifact, &commit);
+        record_final_tester_seed(root.path(), &final_artifact, true).unwrap();
+
+        let disposition =
+            promote_final_tester(root.path(), root.path(), &final_artifact, &commit, true).unwrap();
+        assert!(matches!(
+            disposition,
+            Some(LandedSeedDisposition::Promoted { .. })
+        ));
+
+        let attempt_artifact = root.path().join("attempt-baseline");
+        let resolver = ContentResolver::new(Some(root.path()));
+        let reused = capture(root.path(), root.path(), &attempt_artifact, true, &resolver).unwrap();
+        assert!(matches!(reused, CaptureDisposition::ReusedLanded { .. }));
+        assert_eq!(
+            fs::read(final_artifact.join(RESULTS_FILE)).unwrap(),
+            fs::read(attempt_artifact.join(RESULTS_FILE)).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_landed_commit_refuses_final_tester_promotion() {
+        let root = tempfile::tempdir().unwrap();
+        let tested = initialized_project(root.path());
+        let final_artifact = root.path().join("final-tester");
+        write_bound_artifact(&final_artifact, &tested);
+        record_final_tester_seed(root.path(), &final_artifact, true).unwrap();
+
+        fs::write(root.path().join("changed"), "changed").unwrap();
+        crate::git::run(root.path(), &["add", "changed"], "stage changed fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "change"],
+            "commit changed fixture",
+        )
+        .unwrap();
+        let landed =
+            crate::git::run_stdout(root.path(), &["rev-parse", "HEAD"], "resolve changed head")
+                .unwrap();
+
+        assert_eq!(
+            promote_final_tester(root.path(), root.path(), &final_artifact, &landed, true,)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn changed_final_tester_artifact_fails_before_promotion() {
+        let root = tempfile::tempdir().unwrap();
+        let commit = initialized_project(root.path());
+        let final_artifact = root.path().join("final-tester");
+        write_bound_artifact(&final_artifact, &commit);
+        record_final_tester_seed(root.path(), &final_artifact, true).unwrap();
+        fs::write(final_artifact.join("commands/0-stdout.log"), "changed").unwrap();
+
+        let error = promote_final_tester(root.path(), root.path(), &final_artifact, &commit, true)
+            .unwrap_err();
+        assert!(error.to_string().contains("not trustworthy"));
+        assert!(!root.path().join(CACHE_ROOT).join(LANDED_ROOT).is_dir());
     }
 
     #[test]
@@ -455,6 +795,24 @@ mod tests {
         );
         assert!(first.join(PROVENANCE_FILE).is_file());
         assert!(second.join(PROVENANCE_FILE).is_file());
+    }
+
+    #[test]
+    fn landed_capture_publishes_ordinary_test_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = root.path().join("landing");
+        let disposition = capture_with(root.path(), &artifact, landed_identity("abc"), |path| {
+            write_trustworthy_artifact(path, "known failure")?;
+            let results_path = path.join(RESULTS_FILE);
+            let mut results: TesterResults = serde_json::from_slice(&fs::read(&results_path)?)?;
+            results.summary.fail = 1;
+            fs::write(results_path, serde_json::to_vec_pretty(&results)?)?;
+            Ok(TesterOutcome::TestFailures)
+        })
+        .unwrap();
+
+        assert!(matches!(disposition, CaptureDisposition::Published { .. }));
+        assert!(root.path().join(CACHE_ROOT).join(LANDED_ROOT).is_dir());
     }
 
     #[test]
@@ -500,7 +858,7 @@ mod tests {
         changed.schema_version += 1;
         identities.push(changed);
         let mut changed = original.clone();
-        changed.scheduler_session = "other-session".to_string();
+        changed.scheduler_session = Some("other-session".to_string());
         identities.push(changed);
         let mut changed = original.clone();
         changed.source_commit = "def".to_string();
@@ -563,6 +921,7 @@ mod tests {
             !root
                 .path()
                 .join(CACHE_ROOT)
+                .join(SESSIONS_ROOT)
                 .join(session_key("session"))
                 .join(key)
                 .exists()
@@ -585,6 +944,7 @@ mod tests {
         fs::write(
             root.path()
                 .join(CACHE_ROOT)
+                .join(SESSIONS_ROOT)
                 .join(session_key("session"))
                 .join(cache_key)
                 .join("artifact")
@@ -607,17 +967,21 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_session_preparation_clears_stale_cache_and_finish_removes_current_cache() {
+    fn scheduler_session_cleanup_preserves_landed_baselines() {
         let root = tempfile::tempdir().unwrap();
-        let cache_root = root.path().join(CACHE_ROOT);
+        let cache_root = root.path().join(CACHE_ROOT).join(SESSIONS_ROOT);
+        let landed = root.path().join(CACHE_ROOT).join(LANDED_ROOT).join("kept");
         fs::create_dir_all(cache_root.join("stale-session")).unwrap();
+        fs::create_dir_all(&landed).unwrap();
 
         prepare_scheduler_session(root.path(), "current-session").unwrap();
 
         assert!(!cache_root.join("stale-session").exists());
         assert!(cache_root.join(session_key("current-session")).is_dir());
+        assert!(landed.is_dir());
 
         finish_scheduler_session(root.path(), "current-session").unwrap();
         assert!(!cache_root.join(session_key("current-session")).exists());
+        assert!(landed.is_dir());
     }
 }

@@ -1752,6 +1752,9 @@ fn capture_baseline_tester(
         Ok(crate::baseline_cache::CaptureDisposition::Reused { cache_key }) => {
             eprintln!("  Baseline tester   reused shared {}", &cache_key[..12]);
         }
+        Ok(crate::baseline_cache::CaptureDisposition::ReusedLanded { cache_key }) => {
+            eprintln!("  Baseline tester   reused landed {}", &cache_key[..12]);
+        }
         Err(e) => {
             eprintln!("  Baseline tester: run failed: {e:#}");
         }
@@ -1945,6 +1948,14 @@ fn run_tester_task_with_settlement_preparer(
     {
         settle_tester_harness_failure(&config)?;
         return Err(error);
+    }
+
+    if let Err(error) = crate::baseline_cache::record_final_tester_seed(
+        &candidate_workspace,
+        &artifact_dir,
+        config.no_sandbox,
+    ) {
+        eprintln!("  Warning: final Tester baseline seed was not recorded: {error:#}");
     }
 
     if !results_path.is_file() {
@@ -14496,6 +14507,40 @@ mod tests {
         std::fs::write(
             workspace.join(".fluent/tester.yaml"),
             "commands:\n  - command: \"echo ok\"\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        std::fs::write(&extractor, "#!/bin/sh\nprintf '[]\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&extractor).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&extractor, permissions).unwrap();
+        }
+        crate::git::run(
+            &workspace,
+            &["init", "-q", "-b", "main"],
+            "init baseline fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "test@example.com"],
+            "configure baseline fixture email",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Test User"],
+            "configure baseline fixture name",
+        )
+        .unwrap();
+        crate::git::run(&workspace, &["add", ".fluent"], "stage baseline fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "baseline"],
+            "commit baseline fixture",
         )
         .unwrap();
 

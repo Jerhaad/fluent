@@ -176,7 +176,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                 );
             }
             let outcome = WorkMergeOutcome {
-                merge_candidate_id: candidate.id,
+                merge_candidate_id: candidate.id.clone(),
                 merged_commit: merged_commit.to_string(),
             };
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
@@ -184,11 +184,12 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
                 );
             }
+            prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
             return Ok(outcome);
         }
         if let Some(merged_commit) = candidate.merge_state.merged_commit.clone() {
             let outcome = WorkMergeOutcome {
-                merge_candidate_id: candidate.id,
+                merge_candidate_id: candidate.id.clone(),
                 merged_commit,
             };
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
@@ -196,6 +197,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
                 );
             }
+            prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
             return Ok(outcome);
         }
     }
@@ -214,13 +216,15 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         )?;
         let target_workspace =
             resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
-        return land_frozen_no_expertise(
+        let outcome = land_frozen_no_expertise(
             &config,
             &candidate,
             &source_workspace,
             &target_workspace,
             &reviewed_sha,
-        );
+        )?;
+        prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+        return Ok(outcome);
     }
 
     let source_workspace = resolve_managed_candidate_workspace_path(
@@ -249,7 +253,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
         &target_workspace,
         &artifact_dir,
     );
-    finish_fresh_land_with(
+    let outcome = finish_fresh_land_with(
         execution,
         |result| {
             recover_landed_candidate_result(
@@ -264,7 +268,9 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
             schedule_post_merge_review(&config, &candidate, outcome, base_commit)
         },
         config.run_post_merge_review,
-    )
+    )?;
+    prepare_landed_baseline_or_warn(&config, &candidate, &outcome);
+    Ok(outcome)
 }
 
 fn resolve_attempt_land_mapping(
@@ -360,6 +366,178 @@ fn finish_fresh_land_with(
     }
 
     Ok(outcome)
+}
+
+/// Make the exact landed commit's Tester boundary available before returning
+/// from land. An exact final Tester is promoted without execution; otherwise a
+/// detached checkout captures one fresh baseline. A failure cannot undo the
+/// already-durable fast-forward, so it warns and remains retryable by invoking
+/// land again or by the next Attempt's existing fallback capture.
+fn prepare_landed_baseline_or_warn(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    outcome: &WorkMergeOutcome,
+) {
+    match prepare_landed_baseline(config, candidate, outcome) {
+        Ok(crate::baseline_cache::LandedSeedDisposition::Promoted { cache_key }) => {
+            eprintln!("  Landed baseline   promoted {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::LandedSeedDisposition::Captured { cache_key }) => {
+            eprintln!("  Landed baseline   captured {}", &cache_key[..12]);
+        }
+        Ok(crate::baseline_cache::LandedSeedDisposition::Reused { cache_key }) => {
+            eprintln!("  Landed baseline   reused {}", &cache_key[..12]);
+        }
+        Err(error) => {
+            eprintln!(
+                "  Warning: Merge Candidate {} landed, but its baseline was not prepared: {error:#}",
+                candidate.id
+            );
+        }
+    }
+}
+
+fn prepare_landed_baseline(
+    config: &WorkMergeConfig<'_>,
+    candidate: &crate::work_model::MergeCandidate,
+    outcome: &WorkMergeOutcome,
+) -> Result<crate::baseline_cache::LandedSeedDisposition> {
+    let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    let final_tester = latest_final_tester_artifact_dir(config.project_root, &item, candidate)?;
+    let target_workspace =
+        resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
+
+    if head_commit(&target_workspace).ok().as_deref() == Some(outcome.merged_commit.as_str())
+        && let Some(artifact_dir) = final_tester.as_deref()
+    {
+        match crate::baseline_cache::promote_final_tester(
+            config.project_root,
+            &target_workspace,
+            artifact_dir,
+            &outcome.merged_commit,
+            config.no_sandbox,
+        ) {
+            Ok(Some(disposition)) => return Ok(disposition),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "  Warning: exact final Tester evidence could not be promoted; recapturing: {error:#}"
+            ),
+        }
+    }
+
+    with_detached_landed_checkout(
+        config.project_root,
+        &target_workspace,
+        &outcome.merged_commit,
+        |checkout| {
+            if let Some(artifact_dir) = final_tester.as_deref() {
+                match crate::baseline_cache::promote_final_tester(
+                    config.project_root,
+                    checkout,
+                    artifact_dir,
+                    &outcome.merged_commit,
+                    config.no_sandbox,
+                ) {
+                    Ok(Some(disposition)) => return Ok(disposition),
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "  Warning: exact final Tester evidence could not be promoted; recapturing: {error:#}"
+                    ),
+                }
+            }
+
+            let artifact_dir = merge_artifact_dir(
+                config.project_root,
+                config.work_item_id,
+                &candidate.attempt_id,
+                &candidate.id,
+            )
+            .join("landed-baseline");
+            crate::baseline_cache::capture_landed(
+                config.project_root,
+                checkout,
+                &artifact_dir,
+                config.no_sandbox,
+                config.resolver,
+            )
+        },
+    )
+}
+
+fn latest_final_tester_artifact_dir(
+    project_root: &Path,
+    item: &WorkItem,
+    candidate: &crate::work_model::MergeCandidate,
+) -> Result<Option<PathBuf>> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attempt {:?} not found for Merge Candidate {:?}",
+                candidate.attempt_id,
+                candidate.id
+            )
+        })?;
+    let after_latest_write = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    attempt.tasks[after_latest_write..]
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester && task.status == crate::work_model::TaskStatus::Complete
+        })
+        .and_then(|task| task.artifact_area.as_ref())
+        .map(|area| {
+            crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+        })
+        .transpose()
+}
+
+fn with_detached_landed_checkout<T>(
+    project_root: &Path,
+    repository: &Path,
+    commit: &str,
+    operation: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let temporary_root = project_root.join(".fluent/tmp/landed-baselines");
+    fs::create_dir_all(&temporary_root)?;
+    let holder = tempfile::Builder::new()
+        .prefix("landed-")
+        .tempdir_in(&temporary_root)
+        .context("create landed baseline checkout holder")?;
+    let checkout = holder.path().join("checkout");
+    git::run(
+        repository,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &checkout.to_string_lossy(),
+            commit,
+        ],
+        "create landed baseline checkout",
+    )?;
+
+    let result = operation(&checkout);
+    let cleanup = git::run(
+        repository,
+        &["worktree", "remove", "--force", &checkout.to_string_lossy()],
+        "remove landed baseline checkout",
+    );
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "additionally, removing landed baseline checkout failed: {cleanup:#}"
+        ))),
+    }
 }
 
 /// Schedule the optional detached post-merge review for a fresh land, after the
@@ -4492,6 +4670,31 @@ mod tests {
     }
 
     #[test]
+    fn landed_baseline_checkout_uses_exact_commit_and_is_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_test_repo(&repo);
+        let landed = head_commit(&repo).unwrap();
+
+        fs::write(repo.join("file.txt"), "later").unwrap();
+        git::run(&repo, &["add", "file.txt"], "stage later commit").unwrap();
+        git::run(&repo, &["commit", "-m", "later"], "commit later change").unwrap();
+        let current = head_commit(&repo).unwrap();
+
+        let observed = with_detached_landed_checkout(&repo, &repo, &landed, |checkout| {
+            assert_eq!(fs::read_to_string(checkout.join("file.txt"))?, "initial");
+            head_commit(checkout)
+        })
+        .unwrap();
+
+        assert_eq!(observed, landed);
+        assert_eq!(head_commit(&repo).unwrap(), current);
+        let temporary_root = repo.join(".fluent/tmp/landed-baselines");
+        assert_eq!(fs::read_dir(temporary_root).unwrap().count(), 0);
+    }
+
+    #[test]
     fn rebase_in_progress_after_exit_zero_is_failed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
@@ -4705,15 +4908,18 @@ mod tests {
 
     // --- Exact-SHA no-expertise land (B4u–B4z) ---
 
-    fn write_hook(project_root: &Path, name: &str, script: &str) {
+    fn write_executable(path: &Path, script: &str) {
         use std::os::unix::fs::OpenOptionsExt;
-        let hooks_dir = project_root.join(".fluent/hooks");
-        fs::create_dir_all(&hooks_dir).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut opts = fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true).mode(0o755);
         use std::io::Write;
-        let mut file = opts.open(hooks_dir.join(name)).unwrap();
+        let mut file = opts.open(path).unwrap();
         file.write_all(script.as_bytes()).unwrap();
+    }
+
+    fn write_hook(project_root: &Path, name: &str, script: &str) {
+        write_executable(&project_root.join(".fluent/hooks").join(name), script);
     }
 
     struct FrozenLandFixture {
@@ -4765,6 +4971,16 @@ mod tests {
         git(&project_root, &["config", "user.email", "t@t.co"]);
         git(&project_root, &["config", "user.name", "t"]);
         fs::write(project_root.join("file.txt"), "base").unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\nprintf '[]\\n'\n",
+        );
         git(&project_root, &["add", "."]);
         git(&project_root, &["commit", "-q", "-m", "baseline"]);
 
@@ -4859,6 +5075,127 @@ mod tests {
 
     fn target_head(fx: &FrozenLandFixture) -> String {
         git::run_stdout(&fx.project_root, &["rev-parse", "main"], "target head").unwrap()
+    }
+
+    #[test]
+    fn public_land_promotes_final_tester_and_merged_retry_reuses_it() {
+        let fx = build_frozen_fixture(|item, reviewed_sha| {
+            item.merge_candidates.clear();
+            let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+            let attempt = item.attempts.first_mut().unwrap();
+            let tester = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == tester_id)
+                .unwrap();
+            tester.status = TaskStatus::Complete;
+            attempt.status = AttemptStatus::Complete;
+            attempt.review_state = Some(AttemptReviewState::Passed);
+            attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+                1,
+                crate::follow_up::ArtifactRef {
+                    path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json"
+                        .to_string(),
+                    digest: "sha256:test".to_string(),
+                },
+            ));
+            item.create_or_get_merge_candidate("attempt-1").unwrap();
+            assert_eq!(
+                item.merge_candidates[0].candidate_commit, reviewed_sha,
+                "the fixture's final Tester and candidate name the reviewed commit"
+            );
+        });
+        let tester_artifact = fx
+            .project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
+        fs::create_dir_all(tester_artifact.join("commands")).unwrap();
+        fs::write(tester_artifact.join("commands/0-stdout.log"), "tested").unwrap();
+        fs::write(
+            tester_artifact.join("tester-results.json"),
+            serde_json::to_vec_pretty(&crate::tester::TesterResults {
+                candidate_commit: Some(fx.reviewed_sha.clone()),
+                commands: Vec::new(),
+                tests: Vec::new(),
+                summary: crate::tester::Summary {
+                    total: 0,
+                    pass: 0,
+                    fail: 0,
+                    skipped: 0,
+                },
+                error: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        crate::baseline_cache::record_final_tester_seed(
+            &fx.source_workspace,
+            &tester_artifact,
+            true,
+        )
+        .unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let first = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(first.merged_commit, fx.reviewed_sha);
+
+        let landed_root = fx.project_root.join(".fluent/work/baselines/landed");
+        let cache_entries: Vec<PathBuf> = fs::read_dir(&landed_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.len() == 64)
+            })
+            .collect();
+        assert_eq!(cache_entries.len(), 1);
+        let cached: crate::tester::TesterResults = serde_json::from_slice(
+            &fs::read(cache_entries[0].join("artifact/tester-results.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cached.candidate_commit.as_deref(),
+            Some(fx.reviewed_sha.as_str()),
+            "the landed cache contains the promoted final Tester, not a fresh baseline run"
+        );
+
+        let second = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(second.merged_commit, fx.reviewed_sha);
+        let cache_entry_count = fs::read_dir(&landed_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().len() == 64)
+            .count();
+        assert_eq!(cache_entry_count, 1, "merged recovery reuses the seed");
+    }
+
+    #[test]
+    fn baseline_preparation_failure_keeps_land_merged_and_retry_recovers() {
+        let fx = frozen_land_fixture(true);
+        let landed_root = fx.project_root.join(".fluent/work/baselines/landed");
+        fs::create_dir_all(landed_root.parent().unwrap()).unwrap();
+        fs::write(&landed_root, "blocked").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let first = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(first.merged_commit, fx.reviewed_sha);
+        let stored = fx.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Merged,
+            "baseline preparation cannot turn a durable land into a failed candidate"
+        );
+
+        fs::remove_file(&landed_root).unwrap();
+        let second = merge_candidate(frozen_config(&fx, &resolver, false)).unwrap();
+        assert_eq!(second.merged_commit, fx.reviewed_sha);
+        assert!(
+            fs::read_dir(&landed_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().len() == 64),
+            "retrying an already-merged candidate prepares the missing baseline"
+        );
     }
 
     /// A complete snapshot of a workspace's Git state, used to prove a rejected land

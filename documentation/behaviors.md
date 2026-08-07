@@ -5194,6 +5194,71 @@ THE SYSTEM SHALL preserve existing project files and SHALL NOT create
 initialization files such as `.fluent/.gitignore` or edit `AGENTS.md`.
 Test: tests/behaviors/operations/test-tester-check-source-integrity.sh (tester check preserves project files)
 
+### B35
+
+WHEN a final Tester binds trustworthy evidence to its exact reviewed commit,
+THE SYSTEM SHALL preserve enough identity and integrity evidence to reuse that
+test run if the same commit later lands, without changing the Tester verdict.
+Test: src/baseline_cache.rs (landed_baseline_replaces_next_attempt_capture)
+
+### B36
+
+WHEN a Merge Candidate lands at the exact commit and Tester boundary named by
+its final Tester seed,
+THE SYSTEM SHALL make that existing evidence the durable landed baseline without
+running the Tester again.
+Test: src/baseline_cache.rs (landed_baseline_replaces_next_attempt_capture)
+Test: src/work_merge_executor.rs (public_land_promotes_final_tester_and_merged_retry_reuses_it)
+
+### B37
+
+WHEN the merged commit or current Tester boundary differs from the final Tester
+seed,
+THE SYSTEM SHALL NOT reuse the final Tester evidence as the landed baseline.
+Test: src/baseline_cache.rs (changed_landed_commit_refuses_final_tester_promotion)
+
+### B38
+
+WHEN no exact final Tester evidence is reusable after a successful land,
+THE SYSTEM SHALL run one fresh baseline against the exact merged commit without
+changing the target checkout.
+Test: src/work_merge_executor.rs (landed_baseline_checkout_uses_exact_commit_and_is_removed)
+
+### B39
+
+WHEN a direct or scheduler-launched Attempt matches a durable landed-baseline
+identity,
+THE SYSTEM SHALL copy and validate that evidence before its initial Writer and
+SHALL NOT run another baseline.
+Test: src/baseline_cache.rs (landed_baseline_replaces_next_attempt_capture)
+
+### B40
+
+WHEN a scheduler session starts or stops,
+THE SYSTEM SHALL preserve durable landed-baseline entries.
+Test: src/baseline_cache.rs (scheduler_session_cleanup_preserves_landed_baselines)
+
+### B41
+
+IF final Tester evidence changes after its seed manifest is written, contains a
+harness error, or otherwise lacks trustworthy provenance,
+THEN THE SYSTEM SHALL NOT promote it as a landed baseline.
+Test: src/baseline_cache.rs (changed_final_tester_artifact_fails_before_promotion)
+Test: src/baseline_cache.rs (harness_error_stays_attempt_local_and_is_not_cached)
+
+### B42
+
+WHEN a fresh landed baseline reports ordinary test failures,
+THE SYSTEM SHALL retain that result as reusable baseline evidence.
+Test: src/baseline_cache.rs (landed_capture_publishes_ordinary_test_failures)
+
+### B43
+
+IF baseline preparation fails after a durable fast-forward,
+THEN THE SYSTEM SHALL leave the candidate merged and retry preparation when the
+same land command is invoked again.
+Test: src/work_merge_executor.rs (baseline_preparation_failure_keeps_land_merged_and_retry_recovers)
+
 ## Pre-review completion gate
 
 ### B1
