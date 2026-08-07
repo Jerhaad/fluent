@@ -820,6 +820,7 @@ fn spawn_registry_child(
 #[test]
 fn concurrent_registry_mutations_preserve_every_successful_change() {
     const N: usize = 8;
+    const REMOVED: usize = N / 2;
     let home = TempDir::new().unwrap();
     let projects: Vec<TempDir> = (0..N).map(|_| TempDir::new().unwrap()).collect();
     let identities: Vec<String> = (0..N).map(|i| format!("ident{i:08x}")).collect();
@@ -848,6 +849,47 @@ fn concurrent_registry_mutations_preserve_every_successful_change() {
         assert_eq!(
             registered.0, *identity,
             "project {i} has the wrong identity in the registry"
+        );
+    }
+
+    // Concurrently remove a deterministic half of the registered checkouts.
+    let mut children: Vec<_> = projects
+        .iter()
+        .take(REMOVED)
+        .map(|project| spawn_registry_child("unregister", home.path(), project.path(), None))
+        .collect();
+
+    for (i, child) in children.iter_mut().enumerate() {
+        let status = child.wait().expect("wait for unregister child process");
+        assert!(
+            status.success(),
+            "unregister child process {i} exited with {status:?}"
+        );
+    }
+
+    // Every selected checkout must be gone, while untouched entries retain
+    // their original identities.
+    let registry = scheduler_service::read_registry(home.path()).unwrap();
+    for (i, project) in projects.iter().take(REMOVED).enumerate() {
+        let canonical = project.path().canonicalize().unwrap();
+        assert!(
+            !registry.contains_key(&canonical),
+            "project {i} remains in the registry after concurrent unregistration"
+        );
+    }
+    for (i, (project, identity)) in projects
+        .iter()
+        .zip(identities.iter())
+        .enumerate()
+        .skip(REMOVED)
+    {
+        let canonical = project.path().canonicalize().unwrap();
+        assert_eq!(
+            registry.get(&canonical),
+            Some(&fluent::scheduler_service::CheckoutIdentity(
+                identity.clone()
+            )),
+            "untouched project {i} lost or changed its identity after concurrent unregistration"
         );
     }
 }
