@@ -931,72 +931,13 @@ enum TerminalCheck {
     Reopen,
 }
 
-fn is_writer_completion_pause(attempt: &Attempt) -> bool {
-    attempt.pause_kind == Some(PauseKind::WriterCompletion)
-        || (attempt.pause_kind == Some(PauseKind::Uncertain)
-            && attempt.review_state == Some(AttemptReviewState::NotReviewed)
-            && attempt.artifacts.iter().any(|artifact| {
-                artifact.producer_id == "required-progress"
-                    && artifact.path.ends_with("/writer-completion-needs-user.md")
-            }))
-}
-
-fn resumable_terminal_check(attempt: &Attempt) -> Result<TerminalCheck> {
-    if attempt
-        .tasks
-        .iter()
-        .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Executing))
-    {
-        bail!(
-            "Attempt paused on recoverable infrastructure or completion evidence but also has a \
-             hard-failed or still-running Task; resolve it before re-running."
-        );
-    }
-    Ok(TerminalCheck::Reopen)
-}
-
 fn reject_terminal_attempt(attempt: &Attempt) -> Result<TerminalCheck> {
     match attempt.status {
         AttemptStatus::Failed => bail!("Attempt is failed and cannot be advanced"),
-        AttemptStatus::NeedsUser => match attempt.pause_kind.as_ref() {
-            Some(PauseKind::Auth)
-            | Some(PauseKind::TranscriptPump)
-            | Some(PauseKind::HostSandbox)
-            | Some(PauseKind::TesterHarness)
-            | Some(PauseKind::ProviderUnavailable)
-            | Some(PauseKind::Interrupted)
-            | Some(PauseKind::WriterCompletion) => resumable_terminal_check(attempt),
-            Some(PauseKind::Uncertain) if is_writer_completion_pause(attempt) => {
-                resumable_terminal_check(attempt)
-            }
-            Some(PauseKind::Uncertain) => bail!(
-                "Attempt is paused with uncertain reviews. \
-                 Resolve the uncertain verdicts and re-run; \
-                 resuming this pause kind is not yet supported."
-            ),
-            Some(PauseKind::RoundCap) => {
-                let write_rounds = attempt
-                    .tasks
-                    .iter()
-                    .filter(|task| task.kind == TaskKind::Write)
-                    .count();
-                if attempt
-                    .round_cap_extensions
-                    .last()
-                    .is_some_and(|extension| extension.new_cap > write_rounds)
-                {
-                    Ok(TerminalCheck::Reopen)
-                } else {
-                    bail!(
-                        "Attempt is paused at the write-round cap. Approve an extension before re-running."
-                    )
-                }
-            }
-            Some(PauseKind::Unknown(value)) => bail!(
-                "Attempt is paused with unknown pause kind {value:?}; upgrade Fluent before mutating this Work Item."
-            ),
-            None => bail!("Attempt needs user input before it can advance"),
-        },
+        AttemptStatus::NeedsUser => {
+            attempt.ensure_resume_ready()?;
+            Ok(TerminalCheck::Reopen)
+        }
         _ => Ok(TerminalCheck::Continue),
     }
 }
@@ -1020,24 +961,13 @@ fn reopen_resumable_attempt(
             .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
-        let can_reopen = attempt.status == AttemptStatus::NeedsUser
-            && (matches!(
-                attempt.pause_kind,
-                Some(PauseKind::Auth)
-                    | Some(PauseKind::TranscriptPump)
-                    | Some(PauseKind::HostSandbox)
-                    | Some(PauseKind::TesterHarness)
-                    | Some(PauseKind::ProviderUnavailable)
-                    | Some(PauseKind::Interrupted)
-                    | Some(PauseKind::WriterCompletion)
-            ) || is_writer_completion_pause(attempt))
-            && !attempt
-                .tasks
-                .iter()
-                .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Executing));
-        if can_reopen {
-            crate::work_model::reopen_attempt(attempt);
+        attempt.ensure_resume_ready()?;
+        if attempt.pause_kind == Some(PauseKind::RoundCap) {
+            return Err(round_cap_ineligible(
+                "the pause changed to round-cap before the recovery transaction",
+            ));
         }
+        crate::work_model::reopen_attempt(attempt);
         Ok(())
     })?;
     Ok(())
@@ -6217,7 +6147,7 @@ fn write_budget_exhausted_handoff(
         .join("\n");
     let recovery = if round_cap_reached {
         format!(
-            "The current write-round ceiling was reached. To approve one to three additional Writer rounds for this exact candidate and failed-review content, run:\n\n`fluent attempt extend {work_item_id} {attempt_id} --additional-write-rounds 1`\n\nThen run `fluent attempt run {work_item_id} {attempt_id}`."
+            "The current write-round ceiling was reached. To approve one to three additional Writer rounds for this exact candidate and failed-review content, run:\n\n`fluent attempt extend {work_item_id} {attempt_id} --additional-write-rounds 1`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return it to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly."
         )
     } else {
         format!(
@@ -12676,6 +12606,37 @@ mod tests {
             TaskStatus::Complete,
             "the fresh lock-held reopen must retain a peer completion"
         );
+    }
+
+    #[test]
+    fn generic_reopen_never_bypasses_round_cap_frontier_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("round-cap-race", "Round cap race");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        attempt.round_cap_extensions.push(RoundCapExtension {
+            id: "round-cap-1-2".to_string(),
+            old_cap: 1,
+            new_cap: 2,
+            additional_write_rounds: 1,
+            candidate_commit: "abc123".to_string(),
+            failed_reviews: Vec::new(),
+            approved_at: "2026-08-07T00:00:00Z".to_string(),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let error = reopen_resumable_attempt(&store, "round-cap-race", "attempt-1")
+            .expect_err("generic recovery must not reopen a round-cap pause");
+
+        assert!(error.to_string().contains("changed to round-cap"));
+        let stored = store.read_work_item("round-cap-race").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::RoundCap));
     }
 
     #[test]

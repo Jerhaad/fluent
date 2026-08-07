@@ -2691,8 +2691,9 @@ list of dispatches (oldest first): terminal history plus at most one
 active dispatch, always the last entry. Each dispatch carries
 `work_item_id`, `queued_at` (RFC 3339 UTC), `priority` (numeric,
 higher = sooner, default 0), `status`, a monotonic `generation` bumped
-on every state mutation, an optional `bound_attempt_id`, and a block
-reason when blocked. The status vocabulary is `queued`, `claimed`,
+on every state mutation, an optional `bound_attempt_id`, an admission
+`intent`, an optional prior-dispatch link for resumes, and a block reason when
+blocked. The status vocabulary is `queued`, `claimed`,
 `running`, `candidate-ready`, `failed`, `needs-user`, `canceled`, and
 `blocked`; `queued`/`claimed`/`running` are active and the rest are
 terminal.
@@ -2713,15 +2714,28 @@ another one. Repeating `add` while a dispatch is already active preserves
 its queue time and changes priority only when an explicit `--priority` is
 given.
 
+`fluent queue resume <work-item-id> --attempt <attempt-id> [--priority N]`
+is the explicit scheduler recovery boundary for a supported current
+`needs-user` Attempt. It never revives or rewrites the prior terminal dispatch.
+Instead it appends a queued dispatch with `intent: "resume-attempt"`, binds the
+exact Attempt before claim, and records `resume_of_dispatch_id` when a prior
+needs-user dispatch exists. Repeating the command while that same resume is
+active is idempotent; a later needs-user outcome requires a new explicit
+authorization. Mismatched Attempts, unsupported pause kinds, unrelated active
+dispatches, and contradictory terminal history fail without queue mutation.
+Legacy dispatches omit the new fields and deserialize as ordinary run intent.
+
 Automatic promotion enqueues through `ensure_dispatch`, which reconciles
 or creates one origin-bound dispatch without reviving terminal history. A
 receipt-loss replay recognizes its own durable dispatch by operation id even
 after Work lifecycle advances, and reports that it created no new dispatch.
 An active, canceled, or terminal dispatch from another origin fails closed;
 it cannot satisfy the automatic operation's completion proof. Automatic
-dispatch and claim paths apply the same lifecycle checks as explicit queueing,
-so proposed, abandoned, suspended, or land-pending Work cannot enter or resume
-execution through replay.
+dispatch and ordinary claim paths apply the same lifecycle checks as explicit
+queueing, so proposed, abandoned, suspended, or land-pending Work cannot enter
+or resume execution through replay. Resume claims use the Attempt loop's shared
+pause predicate and require the persisted intent and Attempt binding, so a bare
+bound id cannot impersonate user authorization.
 
 Queue creation and claim acquire the Work Item's aggregate model lock before
 the project queue lock. They read lifecycle state while holding that Work lock
@@ -2765,8 +2779,15 @@ to `running`. A `DispatchToken` carries the Work Item, dispatch id,
 generation, bound Attempt id, and priority so a launch or reconcile can
 confirm it still acts on the dispatch it claimed. Each worker holds a
 whole-Attempt lease for the life of the dispatch, and drives execution
-via `fluent attempt run <id> <attempt-id> --no-sandbox` (sandbox
-disabled for unattended runs).
+via `fluent attempt run <id> <attempt-id>`.
+
+For a resume dispatch, the Attempt binding is already durable at enqueue time.
+Claim verifies that the persisted binding still names the current supported
+needs-user Attempt and then launches that same Attempt; `ensure_bound_attempt`
+therefore finds it instead of allocating another one. Coordinator restart leaves
+an unclaimed resume queued. A resumed Attempt that pauses again terminalizes
+only the new dispatch at `needs-user`, preserving every earlier dispatch and
+requiring another explicit resume command.
 
 Before each poll, `recover_and_reconcile` reads model state first and
 then applies a generation-checked queue update, so recovery never nests

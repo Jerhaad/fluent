@@ -3688,6 +3688,86 @@ impl Default for Attempt {
 }
 
 impl Attempt {
+    /// Validate that this exact suspended Attempt can be explicitly resumed.
+    ///
+    /// Both direct Attempt execution and scheduler resume dispatches use this
+    /// predicate so queue admission cannot drift from the Attempt loop's
+    /// supported pause vocabulary. Checks that depend on live Git or artifact
+    /// bytes remain in the Attempt loop and run immediately before reopening.
+    pub fn ensure_resume_ready(&self) -> Result<(), WorkModelError> {
+        let ineligible = |reason: String| WorkModelError::AttemptResumeIneligible {
+            attempt_id: self.id.clone(),
+            reason,
+        };
+
+        if self.status != AttemptStatus::NeedsUser {
+            return Err(ineligible(format!(
+                "Attempt is {} and is not paused at needs-user",
+                self.status.as_str()
+            )));
+        }
+        if self
+            .tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Executing))
+        {
+            return Err(ineligible(
+                "Attempt paused on recoverable infrastructure or completion evidence but also has a hard-failed or still-running Task; resolve it before re-running."
+                    .to_string(),
+            ));
+        }
+
+        match self.pause_kind.as_ref() {
+            Some(PauseKind::Auth)
+            | Some(PauseKind::TranscriptPump)
+            | Some(PauseKind::HostSandbox)
+            | Some(PauseKind::TesterHarness)
+            | Some(PauseKind::ProviderUnavailable)
+            | Some(PauseKind::Interrupted)
+            | Some(PauseKind::WriterCompletion) => Ok(()),
+            Some(PauseKind::Uncertain) if self.is_legacy_writer_completion_pause() => Ok(()),
+            Some(PauseKind::Uncertain) => Err(ineligible(
+                "Attempt is paused with uncertain reviews. Resolve the uncertain verdicts and re-run; resuming this pause kind is not yet supported."
+                    .to_string(),
+            )),
+            Some(PauseKind::RoundCap) => {
+                let write_rounds = self
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count();
+                if self.review_state == Some(AttemptReviewState::Failed)
+                    && self
+                        .round_cap_extensions
+                        .last()
+                        .is_some_and(|extension| extension.new_cap > write_rounds)
+                {
+                    Ok(())
+                } else {
+                    Err(ineligible(
+                        "Attempt is paused at the write-round cap. Approve an extension before re-running."
+                            .to_string(),
+                    ))
+                }
+            }
+            Some(PauseKind::Unknown(value)) => Err(ineligible(format!(
+                "Attempt is paused with unknown pause kind {value:?}; upgrade Fluent before mutating this Work Item."
+            ))),
+            None => Err(ineligible(
+                "Attempt needs user input before it can advance".to_string(),
+            )),
+        }
+    }
+
+    fn is_legacy_writer_completion_pause(&self) -> bool {
+        self.pause_kind == Some(PauseKind::Uncertain)
+            && self.review_state == Some(AttemptReviewState::NotReviewed)
+            && self.artifacts.iter().any(|artifact| {
+                artifact.producer_id == "required-progress"
+                    && artifact.path.ends_with("/writer-completion-needs-user.md")
+            })
+    }
+
     pub fn effective_write_round_cap(&self, base_cap: usize) -> usize {
         self.round_cap_extensions
             .last()
@@ -5079,6 +5159,10 @@ pub fn set_merge_candidate_terminal(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkModelError {
+    AttemptResumeIneligible {
+        attempt_id: String,
+        reason: String,
+    },
     RoundCapExtensionIncrementOutOfRange {
         requested: usize,
     },
@@ -5241,6 +5325,7 @@ pub enum WorkModelError {
 impl fmt::Display for WorkModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AttemptResumeIneligible { reason, .. } => f.write_str(reason),
             Self::RoundCapExtensionIncrementOutOfRange { requested } => write!(
                 f,
                 "round-cap extensions must add {MIN_ADDITIONAL_WRITE_ROUNDS} to {MAX_ADDITIONAL_WRITE_ROUNDS} Writer rounds, not {requested}"

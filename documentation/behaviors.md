@@ -4381,14 +4381,12 @@ Test: src/usage.rs (recompute_summary_creates_zero_summary_when_log_missing)
 ### B1
 
 WHEN `fluent queue add <work-item-id>` is invoked,
-THE SYSTEM SHALL write
-`.fluent/work/queue/<work-item-id>.json` with `{work_item_id,
-queued_at, priority (default 0), status: "queued"}`. If the
-file already exists, SHALL update `priority` if `--priority N`
-was passed; otherwise leave existing fields unchanged.
-Test: src/queue.rs (add_writes_queued_entry_with_default_priority,
-add_idempotent_updates_priority_only_when_passed,
-add_idempotent_preserves_queued_at_on_existing_entry)
+THE SYSTEM SHALL append a `queued` dispatch to the Work Item's ledger when no
+dispatch is active, preserving earlier terminal history. If a dispatch is
+already active, THE SYSTEM SHALL update its priority only when `--priority N`
+was passed and otherwise preserve its fields and queue time.
+Test: src/queue.rs (add_ready_work_creates_one_active_entry,
+repeated_add_preserves_time_and_updates_only_explicit_priority)
 Test: tests/binary.rs (work_queue_add_and_list_round_trip,
 work_queue_add_existing_with_priority_updates_only_priority)
 
@@ -4404,7 +4402,8 @@ Test: tests/binary.rs (work_queue_add_unknown_work_item_errors)
 ### B2a
 
 WHEN a Work Item's current Attempt is suspended at `needs-user`,
-THE SYSTEM SHALL reject `fluent queue add` and direct the user to resume it.
+THE SYSTEM SHALL reject `fluent queue add` and name the exact
+`fluent queue resume <work-item-id> --attempt <attempt-id>` command.
 Test: tests/binary.rs (queue_add_rejects_suspended_attempt_and_pending_candidate)
 
 ### B2b
@@ -4415,24 +4414,65 @@ Attempt and SHALL bind the scheduler dispatch to that planned Attempt.
 Test: tests/binary.rs (queue_add_allows_planned_attempt_after_older_suspension)
 Test: src/scheduler.rs (claim_binds_existing_current_planned_attempt)
 
+### B2c
+
+WHEN `fluent queue resume <work-item-id> --attempt <attempt-id>` names the
+current `needs-user` Attempt and its pause kind is supported for recovery,
+THE SYSTEM SHALL preserve the earlier terminal dispatch and append one queued
+dispatch with durable `resume-attempt` intent, the exact Attempt binding, and a
+link to the prior dispatch when one exists.
+Test: src/queue.rs (resume_preserves_history_binds_exact_attempt_and_is_idempotent)
+Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent)
+
+### B2d
+
+WHEN the same explicit resume command is repeated while its matching resume
+dispatch is active, THE SYSTEM SHALL reuse that dispatch and SHALL NOT create a
+second one; an explicit priority MAY update the active dispatch. A mismatched
+Attempt, unsupported pause, or unrelated active or terminal dispatch SHALL fail
+without changing the queue.
+Test: src/queue.rs (resume_preserves_history_binds_exact_attempt_and_is_idempotent,
+resume_rejects_wrong_or_unsupported_attempt_without_mutating_queue,
+resume_rejects_unrelated_active_and_contradictory_terminal_dispatches)
+
+### B2e
+
+WHEN the scheduler claims a queued resume dispatch, THE SYSTEM SHALL run its
+persisted Attempt binding without creating another Attempt. The authorization
+SHALL survive coordinator restart; if execution pauses again, the new dispatch
+SHALL end at `needs-user` and another explicit resume SHALL be required.
+Test: src/scheduler.rs (explicit_resume_survives_restart_and_runs_exact_attempt,
+explicit_resume_can_return_to_needs_user_without_losing_history)
+Test: src/queue.rs (claim_accepts_explicit_resume_and_repeated_pause_needs_new_dispatch)
+
+### B2f
+
+WHEN status summarizes a supported current `needs-user` Attempt before it is
+queued, THE SYSTEM SHALL name its exact queue-resume command. WHEN that resume
+is queued and no coordinator is live, project status SHALL instead name
+`fluent scheduler run` as the next action.
+Test: src/work_status.rs (resumable_needs_user_status_names_exact_queue_resume_command)
+Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent,
+status_reports_queued_work_without_live_scheduler)
+
 ### B3
 
 WHEN `fluent queue list` is invoked,
 THE SYSTEM SHALL print each queue entry on its own line, sorted
 by `priority` descending then `queued_at` ascending, in the
 format `<priority> <queued_at> <status> <work-item-id>`.
-Test: src/queue.rs (list_sorts_by_priority_then_queued_at,
-list_returns_empty_when_no_queue_files)
+Test: src/queue.rs (list_sorts_by_priority_then_queue_time)
 Test: tests/binary.rs (work_queue_list_format_includes_priority_queued_at_status_id)
 
 ### B4
 
 WHEN `fluent queue remove <work-item-id>` is invoked and
-the file exists,
-THE SYSTEM SHALL delete the file and exit zero. If the file
-does not exist, SHALL exit non-zero with a clear "not queued"
-message.
-Test: src/queue.rs (remove_deletes_file, remove_errors_when_not_queued)
+an unclaimed dispatch is active,
+THE SYSTEM SHALL record a terminal `canceled` disposition and exit zero. If no
+active dispatch exists, it SHALL exit non-zero with a clear "not queued"
+message; a live claim SHALL reject removal.
+Test: src/queue.rs (remove_unclaimed_entry_preserves_cancellation_disposition,
+remove_missing_entry_reports_not_queued, remove_rejects_live_claim)
 Test: tests/binary.rs (work_queue_remove_after_add_removes_entry,
 work_queue_remove_unknown_errors)
 
@@ -4441,30 +4481,30 @@ work_queue_remove_unknown_errors)
 ### B1
 
 WHEN `fluent scheduler run` is invoked,
-THE SYSTEM SHALL enter a polling loop that, on each iteration:
-reads `.fluent/work/queue/`, picks the highest-priority entry
-with `status == "queued"` (ties broken by `queued_at` ascending),
-updates its `status` to `running`, and invokes the equivalent
-of `fluent attempt create <work-item-id>` to create the next
-Attempt followed by `fluent attempt run <work-item-id>`
-to execute it.
-Test: src/scheduler.rs (pick_next_queued_returns_highest_priority_queued,
-pick_next_queued_breaks_priority_ties_by_queued_at,
-run_one_marks_running_before_invoking_attempt)
-Test: tests/binary.rs (work_scheduler_run_processes_queued_work_item_end_to_end)
+THE SYSTEM SHALL elect one project coordinator and fill available local
+capacity from queued dispatches by priority descending and queue time
+ascending. Each claim SHALL durably bind one Attempt before launch, transition
+through `claimed` and `running`, and invoke `fluent attempt run` for that exact
+Attempt.
+Test: src/scheduler.rs (concurrent_starts_elect_one_coordinator,
+scheduler_fills_available_project_capacity,
+scheduler_orders_priority_then_fifo_without_preemption,
+claim_persists_bound_attempt_before_launch,
+bound_claim_transitions_to_running_on_launch)
+Test: tests/binary.rs (work_scheduler_run_processes_queued_work_item_end_to_end,
+scheduler_runs_four_work_items_concurrently_by_default)
 
 ### B2
 
 WHEN the running Attempt terminates,
 THE SYSTEM SHALL update the queue entry's `status` to:
-- `done` if the Attempt completes
+- `candidate-ready` if the Attempt completes with a passing Merge Candidate
 - `failed` if the Attempt ends in a `failed` terminal state
 - `needs-user` if the Attempt ends in `needs-user`
-The entry SHALL NOT be deleted; the user inspects via `fluent
-work queue list`.
-Test: src/scheduler.rs (run_one_updates_status_to_done_on_complete_outcome,
-run_one_updates_status_to_failed_on_failed_outcome,
-run_one_updates_status_to_needs_user_on_needs_user_outcome)
+The dispatch SHALL NOT be deleted; the user inspects active work through
+`fluent queue list` and terminal history in the durable ledger.
+Test: src/scheduler.rs (concurrent_terminal_outcomes_are_independent,
+passing_attempt_becomes_candidate_ready_without_land)
 
 ### B3
 
@@ -4472,16 +4512,14 @@ WHEN the running Attempt terminates,
 THE SYSTEM SHALL NOT invoke merge logic itself. Merging is the
 job of `fluent auto-merge --all`, which the user runs
 separately as a sibling long-running process.
-Test: src/scheduler.rs (run_one_updates_status_to_done_on_complete_outcome
-— mock invoker does not call merge; CliAttemptInvoker invokes
-only `fluent attempt create` and `fluent attempt run`)
+Test: src/scheduler.rs (scheduler_never_invokes_merge,
+passing_attempt_becomes_candidate_ready_without_land)
 
 ### B4
 
 WHEN the scheduler's poll finds no `queued` entries,
 THE SYSTEM SHALL sleep for a configurable interval (default 30
 seconds) before re-polling.
-Test: src/scheduler.rs (pick_next_queued_returns_none_when_empty)
 Test: tests/binary.rs (work_scheduler_run_exits_clean_on_sigterm_when_idle)
 
 ### B5
@@ -4498,9 +4536,8 @@ is mid-execution,
 THE SYSTEM SHALL allow the Attempt to complete (do not interrupt
 the child `fluent attempt run` process), update the queue
 entry's `status` accordingly, then exit zero.
-Test: src/scheduler.rs (signal handling uses AtomicBool checked
-at loop boundaries, not mid-invocation; run_one completes
-before shutdown check)
+Test: src/scheduler.rs (graceful_shutdown_drains_claimed_work,
+shutdown_stops_claiming_and_preserves_unclaimed_work)
 
 ### B7
 
@@ -4508,8 +4545,8 @@ WHEN the scheduler reads a queue file that fails to parse,
 THE SYSTEM SHALL skip that entry, log a one-line warning to
 stderr, and continue with the next entry. The malformed file
 SHALL NOT be deleted automatically.
-Test: src/queue.rs (list function skips malformed files with
-warning, does not delete them)
+Test: src/queue.rs (scheduler_warns_and_preserves_malformed_entry,
+scheduler_skips_malformed_entry_without_stalling)
 
 ## Scheduler cross-cutting
 

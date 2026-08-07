@@ -681,7 +681,7 @@ fn cmd_attempt(
                 extension.additional_write_rounds, attempt_id, extension.old_cap, extension.new_cap
             );
             println!(
-                "Reviewed candidate remains {}. Next: fluent attempt run {work_item_id} {attempt_id}",
+                "Reviewed candidate remains {}. Next: fluent queue resume {work_item_id} --attempt {attempt_id}",
                 extension.candidate_commit
             );
         }
@@ -1282,6 +1282,21 @@ fn cmd_queue(project_root: &Path, command: QueueCommands) -> Result<()> {
             fluent::queue::add(project_root, &work_item_id, priority)?;
             println!("Queued Work Item {work_item_id}");
         }
+        QueueCommands::Resume {
+            work_item_id,
+            attempt,
+            priority,
+        } => {
+            let outcome = fluent::queue::resume(project_root, &work_item_id, &attempt, priority)?;
+            match outcome {
+                fluent::queue::ResumeDispatchOutcome::Created => {
+                    println!("Queued resume of Attempt {attempt} for Work Item {work_item_id}")
+                }
+                fluent::queue::ResumeDispatchOutcome::ExistingMatching => println!(
+                    "Resume of Attempt {attempt} for Work Item {work_item_id} is already queued"
+                ),
+            }
+        }
         QueueCommands::List => {
             let entries = fluent::queue::list(project_root)?;
             if entries.is_empty() {
@@ -1767,7 +1782,8 @@ fn cmd_status(search_root: &Path) -> Result<()> {
 
     // Surface stalled execution: queued Work with no live coordinator to claim
     // it stays queued until the scheduler is started or recovered.
-    if fluent::scheduler::execution_is_stopped(search_root)? {
+    let execution_is_stopped = fluent::scheduler::execution_is_stopped(search_root)?;
+    if execution_is_stopped {
         println!(
             "\nExecution is stopped: queued Work is waiting but no scheduler is running.\n\
              Start or recover it with: fluent scheduler run"
@@ -1777,6 +1793,8 @@ fn cmd_status(search_root: &Path) -> Result<()> {
     if guidance::guidance_enabled() {
         if is_empty {
             eprintln!("{}", guidance::empty_status_primer());
+        } else if execution_is_stopped {
+            eprintln!("\n→ Next: fluent scheduler run");
         } else if let Some(hint) = guidance::status_next_action(&work_status) {
             eprintln!("{hint}");
         }
@@ -1909,8 +1927,10 @@ This section is the always-loaded summary and is enough to drive fluent on its o
 - **Observations:** capture durable lessons and future work with `fluent observation
   create`; list them with `fluent observation list`.
 - **Pause for the user:** when a decision genuinely needs a human, fluent sets
-  `needs-user` and pauses; read the named handoff file, then resume with `fluent attempt
-  run` once resolved.
+  `needs-user` and pauses. Read the named handoff file, resolve it, then use the exact
+  `fluent queue resume <work-item-id> --attempt <attempt-id>` action from `fluent status`
+  to return scheduler-owned work to the queue. `fluent attempt run` remains the direct,
+  foreground recovery path.
 - **Committed scaffolding:** fluent commits its `.fluent/` notes and test config alongside
   your code changes, so its learned project state persists across runs.
 - **Local Preview:** Attempts run locally in the foreground. Corrective follow-ups become

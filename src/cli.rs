@@ -767,6 +767,20 @@ pub enum QueueCommands {
         priority: Option<i64>,
     },
 
+    /// Explicitly queue recovery of one suspended Attempt
+    Resume {
+        /// Work Item ID
+        work_item_id: String,
+
+        /// Exact needs-user Attempt to resume
+        #[arg(long)]
+        attempt: String,
+
+        /// Numeric priority (higher = sooner; default 0)
+        #[arg(long)]
+        priority: Option<i64>,
+    },
+
     /// List queued Work Items
     List,
 

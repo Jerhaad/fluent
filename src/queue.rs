@@ -73,6 +73,24 @@ impl std::fmt::Display for DispatchStatus {
     }
 }
 
+/// Why this dispatch was admitted to the queue.
+///
+/// Ordinary dispatches run execution-ready Work. A resume dispatch is a
+/// separate, explicit authorization to advance one exact suspended Attempt.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DispatchIntent {
+    #[default]
+    Run,
+    ResumeAttempt,
+}
+
+impl DispatchIntent {
+    fn is_run(intent: &Self) -> bool {
+        *intent == Self::Run
+    }
+}
+
 /// One dispatch of a Work Item onto the queue: a single trip from `queued`
 /// through a bound Attempt to a terminal disposition.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -91,6 +109,9 @@ pub struct Dispatch {
     /// launch, or reconcile can detect a concurrent change and fail closed.
     #[serde(default)]
     pub generation: u64,
+    /// Explicit admission intent. Omitted legacy records are ordinary runs.
+    #[serde(default, skip_serializing_if = "DispatchIntent::is_run")]
+    pub intent: DispatchIntent,
     /// The single Attempt durably bound to this dispatch, persisted before the
     /// Attempt is ensured so recovery advances that exact Attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +124,9 @@ pub struct Dispatch {
     /// and stay idempotent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_operation_id: Option<String>,
+    /// The earlier terminal needs-user dispatch this explicit resume follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_of_dispatch_id: Option<String>,
     /// Reason a dispatch was blocked, when `status` is `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
@@ -122,9 +146,34 @@ impl Dispatch {
             priority,
             status: DispatchStatus::Queued,
             generation: 0,
+            intent: DispatchIntent::Run,
             bound_attempt_id: None,
             claimed_at: None,
             origin_operation_id,
+            resume_of_dispatch_id: None,
+            blocked_reason: None,
+        }
+    }
+
+    fn new_resume(
+        work_item_id: &str,
+        attempt_id: &str,
+        priority: i64,
+        resume_of_dispatch_id: Option<String>,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            dispatch_id: format!("dispatch-{sequence}"),
+            work_item_id: work_item_id.to_string(),
+            queued_at: crate::work_model::now_iso8601(),
+            priority,
+            status: DispatchStatus::Queued,
+            generation: 0,
+            intent: DispatchIntent::ResumeAttempt,
+            bound_attempt_id: Some(attempt_id.to_string()),
+            claimed_at: None,
+            origin_operation_id: None,
+            resume_of_dispatch_id,
             blocked_reason: None,
         }
     }
@@ -148,6 +197,13 @@ pub enum EnsureDispatchOutcome {
     /// This call created the operation's dispatch.
     Created,
     /// The operation's matching dispatch was already durable.
+    ExistingMatching,
+}
+
+/// Result of explicitly authorizing scheduler recovery for one Attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDispatchOutcome {
+    Created,
     ExistingMatching,
 }
 
@@ -287,9 +343,11 @@ fn parse_ledger(content: &str) -> Result<DispatchLedger> {
             priority: legacy.priority,
             status: legacy_status_to_dispatch(&legacy.status),
             generation: 0,
+            intent: DispatchIntent::Run,
             bound_attempt_id: None,
             claimed_at: None,
             origin_operation_id: None,
+            resume_of_dispatch_id: None,
             blocked_reason: None,
         };
         Ok(DispatchLedger {
@@ -347,6 +405,83 @@ pub fn add(project_root: &Path, id: &str, priority: Option<i64>) -> Result<()> {
     ));
     write_ledger(project_root, &ledger)?;
     Ok(())
+}
+
+/// Explicitly authorize the scheduler to resume one exact needs-user Attempt.
+///
+/// A new resume dispatch preserves the earlier terminal dispatch as history
+/// and carries both the authorization intent and Attempt binding before any
+/// scheduler claim. Repeating the command while that same resume is active is
+/// idempotent; a later needs-user outcome requires another explicit resume.
+pub fn resume(
+    project_root: &Path,
+    id: &str,
+    attempt_id: &str,
+    priority: Option<i64>,
+) -> Result<ResumeDispatchOutcome> {
+    if !work_item_exists(project_root, id) {
+        bail!("Work Item {id:?} not found");
+    }
+    let store = WorkModelStore::new(project_root);
+    let _model_lock = store.lock_work_item_model(id)?;
+    let item = store.read_work_item_under_model_lock(id)?;
+
+    let _lock = lock_queue(project_root)?;
+    let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
+
+    if let Some(active) = ledger.active_mut() {
+        if active.intent == DispatchIntent::ResumeAttempt
+            && active.bound_attempt_id.as_deref() == Some(attempt_id)
+        {
+            if let Some(priority) = priority {
+                active.priority = priority;
+                write_ledger(project_root, &ledger)?;
+            }
+            return Ok(ResumeDispatchOutcome::ExistingMatching);
+        }
+        bail!(
+            "Work Item {id:?} already has active dispatch {:?} ({})",
+            active.dispatch_id,
+            active.status
+        );
+    }
+
+    ensure_resume_eligible(&item, id, attempt_id)?;
+
+    let resume_of_dispatch_id = match ledger.latest() {
+        Some(previous) => {
+            if previous.status != DispatchStatus::NeedsUser {
+                bail!(
+                    "Work Item {id:?} latest dispatch {:?} is {}, not needs-user",
+                    previous.dispatch_id,
+                    previous.status
+                );
+            }
+            if previous
+                .bound_attempt_id
+                .as_deref()
+                .is_some_and(|bound| bound != attempt_id)
+            {
+                bail!(
+                    "Work Item {id:?} latest needs-user dispatch is bound to Attempt {:?}, not {attempt_id:?}",
+                    previous.bound_attempt_id.as_deref().unwrap_or_default()
+                );
+            }
+            Some(previous.dispatch_id.clone())
+        }
+        None => None,
+    };
+
+    let sequence = ledger.next_sequence();
+    ledger.dispatches.push(Dispatch::new_resume(
+        id,
+        attempt_id,
+        priority.unwrap_or(0),
+        resume_of_dispatch_id,
+        sequence,
+    ));
+    write_ledger(project_root, &ledger)?;
+    Ok(ResumeDispatchOutcome::Created)
 }
 
 /// Idempotently enqueue an execution-ready Work Item on behalf of automatic
@@ -502,7 +637,8 @@ fn ensure_lifecycle_eligible(item: &WorkItem, id: &str) -> Result<()> {
         .filter(|attempt| attempt.status == AttemptStatus::NeedsUser)
     {
         bail!(
-            "Work Item {id:?} has current Attempt {:?} suspended at needs-user; resume it instead of queueing",
+            "Work Item {id:?} has current Attempt {:?} suspended at needs-user; run `fluent queue resume {id} --attempt {}` instead of queueing",
+            attempt.id,
             attempt.id
         );
     }
@@ -515,6 +651,23 @@ fn ensure_lifecycle_eligible(item: &WorkItem, id: &str) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn ensure_resume_eligible(item: &WorkItem, id: &str, attempt_id: &str) -> Result<()> {
+    item.ensure_not_abandoned()?;
+    item.ensure_execution_ready()?;
+    let attempt = item
+        .attempts
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
+    if attempt.id != attempt_id {
+        bail!(
+            "Work Item {id:?} current Attempt is {:?}, not {attempt_id:?}",
+            attempt.id
+        );
+    }
+    attempt.ensure_resume_ready()?;
     Ok(())
 }
 
@@ -548,7 +701,6 @@ pub fn claim(
     let store = WorkModelStore::new(project_root);
     let _model_lock = store.lock_work_item_model(work_item_id)?;
     let item = store.read_work_item_under_model_lock(work_item_id)?;
-    ensure_lifecycle_eligible(&item, work_item_id)?;
     #[cfg(test)]
     crate::test_lock_probe::reach("queue-lifecycle", work_item_id, "claim", "ELIGIBLE");
     let _lock = lock_queue(project_root)?;
@@ -564,16 +716,49 @@ pub fn claim(
         return Ok(None);
     }
 
+    match active.intent {
+        DispatchIntent::Run => ensure_lifecycle_eligible(&item, work_item_id)?,
+        DispatchIntent::ResumeAttempt => {
+            let persisted_attempt_id = active.bound_attempt_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "resume dispatch {:?} has no bound Attempt",
+                    active.dispatch_id
+                )
+            })?;
+            if persisted_attempt_id != bound_attempt_id {
+                bail!(
+                    "resume dispatch {:?} is bound to Attempt {persisted_attempt_id:?}, not {bound_attempt_id:?}",
+                    active.dispatch_id
+                );
+            }
+            ensure_resume_eligible(&item, work_item_id, persisted_attempt_id)?;
+        }
+    }
+    if let Some(persisted) = active.bound_attempt_id.as_deref() {
+        if persisted != bound_attempt_id {
+            bail!(
+                "dispatch {:?} is bound to Attempt {persisted:?}, not {bound_attempt_id:?}",
+                active.dispatch_id
+            );
+        }
+    } else {
+        active.bound_attempt_id = Some(bound_attempt_id.to_string());
+    }
+
     active.status = DispatchStatus::Claimed;
-    active.bound_attempt_id = Some(bound_attempt_id.to_string());
     active.claimed_at = Some(crate::work_model::now_iso8601());
     active.generation += 1;
+
+    let persisted_attempt_id = active
+        .bound_attempt_id
+        .clone()
+        .expect("claim persisted an Attempt binding");
 
     let token = DispatchToken {
         work_item_id: work_item_id.to_string(),
         dispatch_id: active.dispatch_id.clone(),
         generation: active.generation,
-        bound_attempt_id: bound_attempt_id.to_string(),
+        bound_attempt_id: persisted_attempt_id,
         priority: active.priority,
     };
     write_ledger(project_root, &ledger)?;
@@ -725,6 +910,7 @@ fn with_matching_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::work_model::{PauseKind, TaskStatus};
 
     fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
@@ -756,6 +942,38 @@ mod tests {
         fs::write(tmp.join(format!(".fluent/work/items/{id}.json")), json).unwrap();
     }
 
+    fn write_planned_attempt(tmp: &Path, id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(tmp);
+        let mut item = WorkItem::planned(id, "Test");
+        item.add_initial_attempt(attempt_id).unwrap();
+        store.create_work_item(&item).unwrap();
+    }
+
+    fn suspend_attempt(tmp: &Path, id: &str, attempt_id: &str, pause_kind: PauseKind) {
+        let store = WorkModelStore::new(tmp);
+        store
+            .mutate_work_item(id, |item| {
+                let attempt = item
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap();
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(pause_kind);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn write_scheduler_suspension(tmp: &Path, id: &str, attempt_id: &str) {
+        write_planned_attempt(tmp, id, attempt_id);
+        add(tmp, id, Some(3)).unwrap();
+        claim(tmp, id, attempt_id).unwrap().unwrap();
+        suspend_attempt(tmp, id, attempt_id, PauseKind::WriterCompletion);
+        reconcile_active(tmp, id, DispatchStatus::NeedsUser).unwrap();
+    }
+
     /// Overwrite a ledger directly so a test can start from an arbitrary
     /// disposition without driving the full scheduler pipeline.
     fn put_ledger(tmp: &Path, ledger: &DispatchLedger) {
@@ -780,6 +998,140 @@ mod tests {
         // The migrated dispatch is terminal history — no active dispatch, and
         // no Attempt was created by reading it.
         assert!(ledger.active().is_none());
+    }
+
+    #[test]
+    fn ordinary_dispatch_schema_omits_default_resume_fields() {
+        let dispatch = Dispatch::new_queued("wi-1", 0, None, 1);
+        let value = serde_json::to_value(&dispatch).unwrap();
+        assert!(value.get("intent").is_none());
+        assert!(value.get("resume_of_dispatch_id").is_none());
+
+        let decoded: Dispatch = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.intent, DispatchIntent::Run);
+        assert_eq!(decoded.resume_of_dispatch_id, None);
+    }
+
+    #[test]
+    fn resume_preserves_history_binds_exact_attempt_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", Some(8)).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let first = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        assert_eq!(first.dispatches.len(), 2);
+        assert_eq!(first.dispatches[0].status, DispatchStatus::NeedsUser);
+        let resumed = first.active().unwrap();
+        assert_eq!(resumed.intent, DispatchIntent::ResumeAttempt);
+        assert_eq!(resumed.bound_attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(resumed.resume_of_dispatch_id.as_deref(), Some("dispatch-1"));
+        assert_eq!(resumed.priority, 8);
+
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", Some(11)).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-1", |item| {
+                item.attempts[0].status = AttemptStatus::Executing;
+                item.attempts[0].pause_kind = None;
+                item.attempts[0].tasks[0].status = TaskStatus::Planned;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching,
+            "receipt-loss replay recognizes its active dispatch after lifecycle advances"
+        );
+        let replayed = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        assert_eq!(replayed.dispatches.len(), 2);
+        assert_eq!(replayed.active().unwrap().priority, 11);
+    }
+
+    #[test]
+    fn resume_rejects_wrong_or_unsupported_attempt_without_mutating_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+        let before = fs::read(queue_file(dir.path(), "wi-1")).unwrap();
+
+        assert!(resume(dir.path(), "wi-1", "attempt-2", None).is_err());
+        assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+
+        let store = WorkModelStore::new(dir.path());
+        store
+            .mutate_work_item("wi-1", |item| {
+                item.attempts[0].pause_kind = Some(PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+        assert!(resume(dir.path(), "wi-1", "attempt-1", None).is_err());
+        assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_rejects_unrelated_active_and_contradictory_terminal_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+
+        for (id, status) in [
+            ("wi-live", DispatchStatus::Running),
+            ("wi-terminal", DispatchStatus::Failed),
+        ] {
+            write_planned_attempt(dir.path(), id, "attempt-1");
+            suspend_attempt(dir.path(), id, "attempt-1", PauseKind::WriterCompletion);
+            let mut dispatch = Dispatch::new_queued(id, 0, None, 1);
+            dispatch.status = status;
+            if status == DispatchStatus::Running {
+                dispatch.bound_attempt_id = Some("attempt-1".to_string());
+            }
+            put_ledger(
+                dir.path(),
+                &DispatchLedger {
+                    work_item_id: id.to_string(),
+                    dispatches: vec![dispatch],
+                },
+            );
+            let _live_lease = (status == DispatchStatus::Running)
+                .then(|| crate::lease::acquire(&dispatch_lease_path(dir.path(), id)).unwrap());
+            let before = fs::read(queue_file(dir.path(), id)).unwrap();
+
+            assert!(resume(dir.path(), id, "attempt-1", None).is_err());
+            assert_eq!(fs::read(queue_file(dir.path(), id)).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn claim_accepts_explicit_resume_and_repeated_pause_needs_new_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+        resume(dir.path(), "wi-1", "attempt-1", None).unwrap();
+
+        let token = claim(dir.path(), "wi-1", "attempt-1").unwrap().unwrap();
+        assert_eq!(token.bound_attempt_id, "attempt-1");
+        reconcile_active(dir.path(), "wi-1", DispatchStatus::NeedsUser).unwrap();
+
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 3);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::NeedsUser);
+        assert_eq!(
+            ledger.active().unwrap().resume_of_dispatch_id.as_deref(),
+            Some("dispatch-2")
+        );
     }
 
     #[test]

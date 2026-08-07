@@ -20237,7 +20237,11 @@ fn queue_add_rejects_suspended_attempt_and_pending_candidate() {
         .args(["queue", "add", "wi-susp"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("needs-user"));
+        .stderr(
+            predicate::str::contains("needs-user").and(predicate::str::contains(
+                "fluent queue resume wi-susp --attempt attempt-1",
+            )),
+        );
     assert!(
         !suspended
             .path()
@@ -20294,6 +20298,83 @@ fn queue_add_rejects_suspended_attempt_and_pending_candidate() {
             .join(".fluent/work/queue/wi-pend.json")
             .exists()
     );
+}
+
+#[test]
+fn queue_resume_records_exact_authorization_and_is_idempotent() {
+    use fluent::queue::{self, DispatchStatus};
+    use fluent::work_model::{AttemptStatus, PauseKind, TaskStatus, WorkItem, WorkModelStore};
+
+    let tmp = TempDir::new().unwrap();
+    let store = WorkModelStore::new(tmp.path());
+    let mut item = WorkItem::planned("wi-resume", "Resume");
+    item.add_initial_attempt("attempt-1").unwrap();
+    store.create_work_item(&item).unwrap();
+    queue::add(tmp.path(), "wi-resume", Some(2)).unwrap();
+    queue::claim(tmp.path(), "wi-resume", "attempt-1")
+        .unwrap()
+        .unwrap();
+    store
+        .mutate_work_item("wi-resume", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::WriterCompletion);
+            attempt.tasks[0].status = TaskStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    queue::reconcile_active(tmp.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "queue",
+            "resume",
+            "wi-resume",
+            "--attempt",
+            "attempt-1",
+            "--priority",
+            "7",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Queued resume of Attempt attempt-1 for Work Item wi-resume",
+        ));
+
+    let ledger = queue::read_ledger(tmp.path(), "wi-resume")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.dispatches.len(), 2);
+    assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+    let resume = ledger.active().unwrap();
+    assert_eq!(resume.bound_attempt_id.as_deref(), Some("attempt-1"));
+    assert_eq!(resume.resume_of_dispatch_id.as_deref(), Some("dispatch-1"));
+    assert_eq!(resume.priority, 7);
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "resume", "wi-resume", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is already queued"));
+    assert_eq!(
+        queue::read_ledger(tmp.path(), "wi-resume")
+            .unwrap()
+            .unwrap()
+            .dispatches
+            .len(),
+        2
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Execution is stopped"))
+        .stderr(predicate::str::contains("→ Next: fluent scheduler run"))
+        .stderr(predicate::str::contains("queue resume").not());
 }
 
 #[test]
@@ -20841,7 +20922,9 @@ fn status_reports_queued_work_without_live_scheduler() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Execution is stopped"))
-        .stdout(predicate::str::contains("fluent scheduler run"));
+        .stdout(predicate::str::contains("fluent scheduler run"))
+        .stderr(predicate::str::contains("→ Next: fluent scheduler run"))
+        .stderr(predicate::str::contains("fluent attempt run").not());
 }
 
 #[test]

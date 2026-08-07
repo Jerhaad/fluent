@@ -64,7 +64,7 @@ impl AttemptRunner for CliAttemptRunner {
         attempt_id: &str,
     ) -> Result<AttemptOutcome> {
         let fluent_bin = std::env::current_exe()?;
-        let run_status = attempt_run_command(
+        let _run_status = attempt_run_command(
             &fluent_bin,
             project_root,
             work_item_id,
@@ -73,11 +73,11 @@ impl AttemptRunner for CliAttemptRunner {
         )
         .status()?;
 
-        if run_status.success() {
-            classify_attempt_outcome(project_root, work_item_id, attempt_id)
-        } else {
-            Ok(AttemptOutcome::Failed)
-        }
+        // Durable Attempt state is authoritative even when the child exits
+        // non-zero. In particular, a resume can fail closed while preserving
+        // `needs-user`; recording that dispatch as `failed` would lose the
+        // scheduler's recoverable disposition.
+        classify_attempt_outcome(project_root, work_item_id, attempt_id)
     }
 }
 
@@ -698,6 +698,7 @@ pub(crate) mod test_support {
         });
         attempt.status = AttemptStatus::Complete;
         attempt.review_state = Some(AttemptReviewState::Passed);
+        attempt.pause_kind = None;
         item.create_or_get_merge_candidate(attempt_id).unwrap();
         store.write_work_item(&item).unwrap();
     }
@@ -707,7 +708,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::work_model::{MergeCandidateMergeStatus, TaskStatus, WorkItem};
+    use crate::work_model::{MergeCandidateMergeStatus, PauseKind, TaskStatus, WorkItem};
 
     fn add_queued(project_root: &Path, id: &str, priority: i64) {
         queue::add(project_root, id, Some(priority)).unwrap();
@@ -732,6 +733,23 @@ mod tests {
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["attempt", "run", "work-1", "attempt-1"]
+        );
+    }
+
+    #[test]
+    fn persisted_needs_user_is_authoritative_scheduler_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-paused", "Paused");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+        store.create_work_item(&item).unwrap();
+
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-paused", "attempt-1").unwrap(),
+            AttemptOutcome::NeedsUser
         );
     }
 
@@ -995,6 +1013,23 @@ mod tests {
         store.write_work_item(&item).unwrap();
     }
 
+    fn suspend_bound_attempt(project_root: &Path, work_item_id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(project_root);
+        store
+            .mutate_work_item(work_item_id, |item| {
+                let attempt = item
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap();
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn active_dispatch(project_root: &Path, work_item_id: &str) -> Dispatch {
         queue::read_ledger(project_root, work_item_id)
             .unwrap()
@@ -1139,6 +1174,80 @@ mod tests {
             DispatchStatus::CandidateReady
         );
         assert_eq!(store.read_work_item("wi-1").unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn explicit_resume_survives_restart_and_runs_exact_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+        queue::resume(dir.path(), "wi-resume", "attempt-1", Some(9)).unwrap();
+        // A coordinator restart reconciles durable state without consuming or
+        // replacing the queued resume authorization.
+        recover_and_reconcile(dir.path()).unwrap();
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        assert_eq!(resumed.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        dispatch_one(dir.path(), &resumed, &PassingRunner).unwrap();
+
+        let item = store.read_work_item("wi-resume").unwrap();
+        assert_eq!(item.attempts.len(), 1, "resume creates no new Attempt");
+        assert_eq!(item.attempts[0].id, "attempt-1");
+        assert_eq!(item.attempts[0].status, AttemptStatus::Complete);
+        assert_eq!(item.merge_candidates.len(), 1);
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+    }
+
+    #[test]
+    fn explicit_resume_can_return_to_needs_user_without_losing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+        queue::resume(dir.path(), "wi-resume", "attempt-1", None).unwrap();
+
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(
+            dir.path(),
+            &resumed,
+            &AttemptRecordingRunner::new(AttemptOutcome::NeedsUser),
+        )
+        .unwrap();
+
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert!(
+            ledger
+                .dispatches
+                .iter()
+                .all(|dispatch| dispatch.status == DispatchStatus::NeedsUser)
+        );
+        assert_eq!(store.read_work_item("wi-resume").unwrap().attempts.len(), 1);
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .unwrap_or_else(|| "-".to_string()),
         action: action_label_with_liveness(item, attempt, merge_candidate, project_root)
             .to_string(),
-        next_action: evidence_recovery_next_action(attempt),
+        next_action: attempt_recovery_next_action(attempt),
         metrics: work_metrics(item, project_root),
         compatibility_warnings: item.compatibility_warnings(),
         release: item
@@ -745,23 +745,28 @@ fn action_label_with_liveness(
     }
 }
 
-fn evidence_recovery_next_action(attempt: Option<&Attempt>) -> Option<String> {
+fn attempt_recovery_next_action(attempt: Option<&Attempt>) -> Option<String> {
     let attempt = attempt?;
-    let recovery = attempt.evidence_recoveries.last()?;
-    if attempt.status != AttemptStatus::NeedsUser
-        || recovery.state != crate::work_model::EvidenceRecoveryState::NeedsEvidence
-    {
-        return None;
+    if let Some(recovery) = attempt.evidence_recoveries.last().filter(|recovery| {
+        attempt.status == AttemptStatus::NeedsUser
+            && recovery.state == crate::work_model::EvidenceRecoveryState::NeedsEvidence
+    }) {
+        let artifacts = recovery
+            .targets
+            .iter()
+            .map(|target| format!(" --review-artifact {}", target.prior_review_artifact))
+            .collect::<String>();
+        return Some(format!(
+            "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path>{artifacts}",
+            attempt.work_item_id, attempt.id, recovery.candidate_commit
+        ));
     }
-    let artifacts = recovery
-        .targets
-        .iter()
-        .map(|target| format!(" --review-artifact {}", target.prior_review_artifact))
-        .collect::<String>();
-    Some(format!(
-        "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path>{artifacts}",
-        attempt.work_item_id, attempt.id, recovery.candidate_commit
-    ))
+    attempt.ensure_resume_ready().ok().map(|()| {
+        format!(
+            "fluent queue resume {} --attempt {}",
+            attempt.work_item_id, attempt.id
+        )
+    })
 }
 
 fn attempt_status_label(status: &AttemptStatus) -> &'static str {
@@ -1300,10 +1305,28 @@ mod tests {
         };
 
         assert_eq!(
-            evidence_recovery_next_action(Some(&attempt)).as_deref(),
+            attempt_recovery_next_action(Some(&attempt)).as_deref(),
             Some(
                 "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/review/review.md"
             )
+        );
+    }
+
+    #[test]
+    fn resumable_needs_user_status_names_exact_queue_resume_command() {
+        let mut item = WorkItem::planned("work-1", "Resume through scheduler");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::WriterCompletion);
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+
+        let row = summarize_work_item(&item, None);
+
+        assert_eq!(row.action, "needs-user");
+        assert_eq!(
+            row.next_action.as_deref(),
+            Some("fluent queue resume work-1 --attempt attempt-1")
         );
     }
 }
