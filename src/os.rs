@@ -8,6 +8,12 @@ use tempfile::NamedTempFile;
 use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 
+pub const HOST_SANDBOX_BLOCKED_CODE: &str = "FLUENT_HOST_SANDBOX_BLOCKED";
+pub const HOST_SANDBOX_RECOVERY_GUIDANCE: &str = "Run this Fluent command outside the enclosing \
+Codex or Claude Code sandbox through that agent's normal per-command approval flow, then retry \
+the same command. Fluent will still sandbox its workers; do not pass --no-sandbox or grant the \
+host agent full-session access to recover this boundary.";
+
 /// Rendered sandbox profile that cleans up on drop.
 pub struct SandboxProfile {
     _temp_file: NamedTempFile,
@@ -25,7 +31,12 @@ pub struct HostSandboxPreflightError {
 
 impl fmt::Display for HostSandboxPreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "host sandbox preflight failed: {}", self.message)
+        write!(
+            formatter,
+            "{HOST_SANDBOX_BLOCKED_CODE}: host sandbox preflight failed: {}\n\
+             {HOST_SANDBOX_RECOVERY_GUIDANCE}",
+            self.message,
+        )
     }
 }
 
@@ -62,6 +73,21 @@ pub fn preflight_profile(profile: &SandboxProfile) -> Result<()> {
         let _ = profile;
         Ok(())
     }
+}
+
+/// Verify that the enclosing host lets Fluent establish its own worker sandbox.
+///
+/// This probe applies Fluent's production common Seatbelt layer to a harmless
+/// process. Call it before provider authentication or durable execution state so
+/// an outer agent sandbox cannot masquerade as a provider login failure or claim
+/// work that the host cannot run.
+pub fn preflight_host_execution(project_root: &Path, resolver: &ContentResolver) -> Result<()> {
+    check_sandbox_prerequisite()?;
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let project_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let profile = render_profile_common_only(resolver, &home, &[project_root], &[])?;
+    preflight_profile(&profile)
 }
 
 /// Authenticate through the prepared Codex launcher inside the exact profile
@@ -582,6 +608,21 @@ mod tests {
     #[test]
     fn host_sandbox_preflight_uses_the_system_launcher() {
         assert_eq!(sandbox_exec_program(), "/usr/bin/sandbox-exec");
+    }
+
+    #[test]
+    fn host_sandbox_failure_explains_scoped_agent_recovery() {
+        let error = HostSandboxPreflightError {
+            message: "sandbox_apply: Operation not permitted".to_string(),
+        };
+        let rendered = error.to_string();
+
+        assert!(rendered.contains(HOST_SANDBOX_BLOCKED_CODE));
+        assert!(rendered.contains("outside the enclosing Codex or Claude Code sandbox"));
+        assert!(rendered.contains("normal per-command approval flow"));
+        assert!(rendered.contains("Fluent will still sandbox its workers"));
+        assert!(rendered.contains("do not pass --no-sandbox"));
+        assert!(rendered.contains("full-session access"));
     }
 
     #[test]

@@ -18,6 +18,9 @@ fn fluent_cmd() -> LoggedCommand {
     cmd.env_remove("FLUENT_TASK_KIND");
     cmd.env("FLUENT_NO_UPDATE_CHECK", "1");
     cmd.env("FLUENT_TEST_HERMETIC_PROVIDERS", "1");
+    // Integration fixtures exercise command routing rather than the caller's
+    // real enclosing Seatbelt state. Tests for the boundary override this.
+    cmd.env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass");
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
@@ -135,6 +138,7 @@ fn release_suite_process_guard_discovers_scoped_process_cwd() {
         ])
         .arg(&root)
         .arg(env!("CARGO_BIN_EXE_fluent"))
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .env("FLUENT_RELEASE_TEST_ROOTS", &root)
         .output()
         .unwrap();
@@ -2134,6 +2138,47 @@ fn configured_init_requires_repository_root_before_provider_preflight() {
     assert!(
         !nested.join(".fluent").exists(),
         "configured init must not initialize a nested directory"
+    );
+}
+
+#[test]
+fn configured_init_checks_host_sandbox_before_provider_or_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let provider_log = tmp.path().join("provider.log");
+    init_git_repo(tmp.path());
+    write_mock_codex(
+        &bin_dir,
+        "#!/bin/bash\nprintf 'called\\n' >> \"${PROVIDER_LOG:?}\"\nexit 0\n",
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .env("PROVIDER_LOG", &provider_log)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .args([
+            "init",
+            "--coder-profile",
+            "codex-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"))
+        .stderr(predicate::str::contains(
+            "outside the enclosing Codex or Claude Code sandbox",
+        ))
+        .stderr(predicate::str::contains("do not pass --no-sandbox"));
+
+    assert!(
+        !provider_log.exists(),
+        "host capability failure must stop before provider authentication"
+    );
+    assert!(
+        !tmp.path().join(".fluent").exists(),
+        "host capability failure must leave configured init uninitialized"
     );
 }
 
@@ -8113,6 +8158,7 @@ fn local_preview_walking_skeleton_closes_learning_flywheel() {
             .current_dir(&main_dir)
             .env("PATH", mock_path(&bin_dir))
             .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .env_remove("FLUENT_TASK_KIND")
             .args(["scheduler", "run", "--poll-seconds", "1"])
             .stdout(std::process::Stdio::piped())
@@ -11662,7 +11708,7 @@ exit 0
 }
 
 #[test]
-fn test_support_binary_controls_host_sandbox_preflight() {
+fn host_sandbox_gate_preserves_explicit_no_sandbox_attempts() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-test-support-host-sandbox");
@@ -11694,9 +11740,9 @@ fn test_support_binary_controls_host_sandbox_preflight() {
         ));
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["attempt", "run", "work-1", "attempt-1"])
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
         .env("PATH", mock_path(&bin_dir))
-        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
         .assert()
         .success();
     assert!(
@@ -20433,6 +20479,86 @@ fn queue_list_shows_priority_time_status_and_work_id() {
 // =========================================================================
 
 #[test]
+fn attempt_run_checks_host_sandbox_before_provider_or_state_change() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-host-boundary-attempt");
+    let provider_log = tmp.path().join("provider.log");
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        "#!/bin/bash\nprintf 'called\\n' >> \"${PROVIDER_LOG:?}\"\nexit 0\n",
+    );
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "host-boundary",
+            "--title",
+            "Host boundary",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "host-boundary", "attempt-1"])
+        .assert()
+        .success();
+    let before = work_item_value(&main_dir, "host-boundary");
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .env("PATH", mock_path(&bin_dir))
+        .env("PROVIDER_LOG", &provider_log)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .args(["attempt", "run", "host-boundary", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+
+    assert!(
+        !provider_log.exists(),
+        "host capability failure must stop before provider authentication"
+    );
+    assert_eq!(
+        work_item_value(&main_dir, "host-boundary"),
+        before,
+        "host capability failure must not reserve or pause an Attempt"
+    );
+}
+
+#[test]
+fn scheduler_checks_host_sandbox_before_claiming_queued_work() {
+    let tmp = TempDir::new().unwrap();
+    write_work_item_json(tmp.path(), "host-boundary", "Host boundary");
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "add", "host-boundary"])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .args(["scheduler", "run", "--poll-seconds", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+
+    assert_eq!(
+        latest_dispatch_status(tmp.path(), "host-boundary"),
+        "queued"
+    );
+    assert!(
+        !tmp.path()
+            .join(".fluent/work/attempts/host-boundary")
+            .exists(),
+        "scheduler host failure must not create an Attempt"
+    );
+}
+
+#[test]
 fn work_scheduler_run_exits_clean_on_sigterm_when_idle() {
     let tmp = TempDir::new().unwrap();
     fs::create_dir_all(tmp.path().join(".fluent/work/items")).unwrap();
@@ -20441,6 +20567,7 @@ fn work_scheduler_run_exits_clean_on_sigterm_when_idle() {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(tmp.path())
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .args(["scheduler", "run", "--poll-seconds", "1"])
             .stderr(std::process::Stdio::piped());
         OwnedFixtureProcess::spawn(&mut command)
@@ -20490,6 +20617,7 @@ exit 0
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .env(
                 "PATH",
                 format!(
@@ -20653,6 +20781,7 @@ exit 0
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .env(
                 "PATH",
                 format!(
@@ -20711,6 +20840,7 @@ fn second_scheduler_run_reuses_live_coordinator() {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .args(["scheduler", "run", "--poll-seconds", "5"])
             .stderr(std::process::Stdio::piped());
         OwnedFixtureProcess::spawn(&mut command)
@@ -20884,6 +21014,7 @@ fn idle_scheduler_shutdown_exits_immediately() {
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(tmp.path())
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .args(["scheduler", "run", "--poll-seconds", "30"])
             .stderr(std::process::Stdio::piped());
         OwnedFixtureProcess::spawn(&mut command)
@@ -20980,6 +21111,7 @@ exit 0
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .env("PATH", &path_env)
             .args(["scheduler", "run", "--poll-seconds", "1"])
             .stderr(std::process::Stdio::piped());
@@ -21006,6 +21138,7 @@ exit 0
         let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
         command
             .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
             .env("PATH", &path_env)
             .args(["scheduler", "run", "--poll-seconds", "1"])
             .stderr(std::process::Stdio::piped());

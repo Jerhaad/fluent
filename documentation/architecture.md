@@ -1963,6 +1963,24 @@ each sandbox from `common.sb` plus the selected coder's profile layer:
 `claude-code.sb` for Claude Code and `codex.sb` for Codex. Claude uses
 the Claude token refresh hook at session boundaries; Codex does not.
 
+An enclosing Codex or Claude Code process may already confine Fluent's shell
+command. macOS Seatbelt then rejects Fluent's nested production profile before
+a worker launches. `os::preflight_host_execution` applies the production common
+profile to `/usr/bin/true` as a side-effect-free capability probe. Configured
+initialization runs it after validating the repository root but before provider
+authentication or `.fluent/` mutation. A local Attempt runs it after resolving
+its local runtime but before provider readiness or Work-state mutation. A newly
+elected scheduler runs it before baseline preparation, polling, or queue claims;
+a process that merely finds and reuses a live coordinator performs no new probe.
+
+The typed failure starts with `FLUENT_HOST_SANDBOX_BLOCKED`. Its recovery keeps
+the two security boundaries distinct: the host agent approves only the same
+Fluent command outside its enclosing sandbox, while Fluent continues to apply
+its own worker sandbox. Recovery never substitutes Fluent's `--no-sandbox`
+option and never asks the user to weaken the host agent globally. This ordering
+also prevents an enclosing sandbox's denied Keychain access from being
+misclassified as a Claude login failure during configured initialization.
+
 ### Local (bare)
 
 `--no-sandbox` runs without Seatbelt sandboxing, Codex sandboxing, or

@@ -783,6 +783,13 @@ fn cmd_attempt(
                 other => bail!("Unknown runtime '{other}'. Available: local, fargate."),
             }
 
+            // Establish the enclosing host boundary before provider readiness,
+            // worktree creation, Task reservation, or any other durable Attempt
+            // transition. An explicit no-sandbox run keeps its existing route.
+            if !(no_sandbox || global_no_sandbox) {
+                os::preflight_host_execution(project_root, resolver)?;
+            }
+
             if guidance::guidance_enabled() {
                 eprintln!("{}", guidance::format_coder_plan(&coder_mapping));
             }
@@ -1806,6 +1813,8 @@ fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
     let configured_setup = fluent::setup::ConfiguredSetup::from_inputs(inputs)?;
     if let Some(setup) = configured_setup.as_ref() {
         require_git_repository_root(cwd)?;
+        let resolver = ContentResolver::new(Some(cwd));
+        os::preflight_host_execution(cwd, &resolver)?;
         fluent::setup::preflight_providers(&setup.mapping)?;
     }
     let fluent_dir = cwd.join(".fluent");

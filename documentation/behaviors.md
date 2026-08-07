@@ -52,6 +52,49 @@ WHEN an operator resumes an `interrupted` Attempt, THE SYSTEM SHALL replan each
 canceled Task once while preserving completed Tasks and prior artifacts.
 Test: src/work_attempt_loop.rs (cancel_local_attempt_stops_owned_group_and_replans_once)
 
+## Enclosing agent sandbox handoff
+
+### B1
+
+WHEN configured `fluent init` runs inside a host that cannot apply Fluent's
+macOS worker sandbox, THE SYSTEM SHALL stop before provider authentication or
+project mutation and report `FLUENT_HOST_SANDBOX_BLOCKED`.
+Test: tests/binary.rs (configured_init_checks_host_sandbox_before_provider_or_mutation)
+
+### B2
+
+WHEN a sandboxed local `fluent attempt run` cannot apply Fluent's worker
+sandbox, THE SYSTEM SHALL stop before provider authentication, Task reservation,
+worktree creation, or Attempt mutation.
+Test: tests/binary.rs (attempt_run_checks_host_sandbox_before_provider_or_state_change)
+
+### B3
+
+WHEN a newly elected local scheduler cannot apply Fluent's worker sandbox, THE
+SYSTEM SHALL stop before it prepares a baseline, polls, claims queued Work, or
+creates an Attempt.
+Test: tests/binary.rs (scheduler_checks_host_sandbox_before_claiming_queued_work)
+
+### B4
+
+IF the enclosing Codex or Claude Code sandbox blocks Fluent's worker sandbox,
+THEN THE SYSTEM SHALL direct the operator or host agent to rerun the same Fluent
+command through per-command approval outside the enclosing sandbox.
+Test: src/os.rs (host_sandbox_failure_explains_scoped_agent_recovery)
+
+### B5
+
+IF Fluent presents recovery for an enclosing agent sandbox, THEN THE SYSTEM
+SHALL state that Fluent's worker sandbox remains active for the retried command.
+Test: src/os.rs (host_sandbox_failure_explains_scoped_agent_recovery)
+
+### B6
+
+IF Fluent presents recovery for an enclosing agent sandbox, THEN THE SYSTEM
+SHALL NOT recommend Fluent's `--no-sandbox` option or full-session host-agent
+access.
+Test: src/os.rs (host_sandbox_failure_explains_scoped_agent_recovery)
+
 ## Autonomous Claude confinement
 
 ### B1

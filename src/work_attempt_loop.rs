@@ -1705,10 +1705,7 @@ fn run_learner_step(
                     Ok(())
                 })?;
                 *item = store.read_work_item(&work_item_id)?;
-                eprintln!(
-                    "  Warning: Learner host sandbox preflight failed; retry after restoring the host boundary: {}",
-                    host.message()
-                );
+                eprintln!("  Warning: {host}");
                 return Ok(());
             }
             return Err(error);

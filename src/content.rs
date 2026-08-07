@@ -966,9 +966,26 @@ Check item {{ITEM_ID}}.
             setup,
             &[
                 "After the user completes both choices, run one configured command",
-                "The command preflights each distinct provider before it initializes the\n   project",
+                "The command first verifies that its enclosing host can apply Fluent's worker\n   sandbox, then preflights each distinct provider before it initializes the\n   project",
             ],
         );
+    }
+
+    #[test]
+    fn bundled_fluent_skill_recovers_host_sandbox_without_disabling_fluent_sandbox() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let recovery = skill
+            .split_once("## Recover an enclosing agent sandbox")
+            .map(|(_, section)| section)
+            .expect("the bundled skill must explain enclosing sandbox recovery");
+        let recovery = recovery.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(recovery.contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+        assert!(recovery.contains("In Codex, request escalated execution for that command"));
+        assert!(recovery.contains("In Claude Code, retry that Bash command"));
+        assert!(recovery.contains("Fluent will still sandbox every worker"));
+        assert!(recovery.contains("Do not add Fluent's `--no-sandbox`"));
+        assert!(recovery.contains("do not switch the whole host-agent session to full access"));
     }
 
     #[test]

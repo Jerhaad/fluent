@@ -15,7 +15,7 @@ test_test_support_binary_consumes_host_preflight_control() {
   FLUENT_TEST_HOST_SANDBOX_PREFLIGHT=fail \
     FLUENT_BIN_OVERRIDE="$FLUENT_BIN_OVERRIDE" \
     cargo nextest run --features test-support --test binary \
-      test_support_binary_controls_host_sandbox_preflight
+      host_sandbox_gate_preserves_explicit_no_sandbox_attempts
 }
 
 printf 'test-host-sandbox-test-support\n\n'

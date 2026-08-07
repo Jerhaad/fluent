@@ -2537,10 +2537,9 @@ fn mark_task_failed_attempt_needs_user(
                 "Fluent",
                 "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
             ),
-            TaskFailure::HostSandbox(_) => notify_fn(
-                "Fluent",
-                "The enclosing macOS sandbox blocked Fluent's Seatbelt boundary. Restore it, then 'fluent attempt run' to retry the same Task.",
-            ),
+            TaskFailure::HostSandbox(_) => {
+                notify_fn("Fluent", crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE)
+            }
             TaskFailure::TesterHarness => notify_fn(
                 "Fluent",
                 "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
@@ -2648,7 +2647,8 @@ fn write_task_error_handoff(
              unwritable transcript path), then re-run `fluent attempt run` to retry.\n"
         ),
         TaskFailure::HostSandbox(diagnostic) => format!(
-            "# Attempt needs user input\n\nTask {task_id:?} could not start because the enclosing macOS sandbox blocked Fluent's production Seatbelt boundary:\n\n    {diagnostic}\n\nNo coder or Tester process was launched and this did not consume a retry or write round. Restore the enclosing sandbox capability, then run `fluent attempt run {work_item_id}` to resume this same Attempt.\n"
+            "# Attempt needs user input\n\nTask {task_id:?} could not start because the enclosing macOS sandbox blocked Fluent's production Seatbelt boundary:\n\n    {diagnostic}\n\nNo coder or Tester process was launched and this did not consume a retry or write round. {} Then run `fluent attempt run {work_item_id}` to resume this same Attempt.\n",
+            crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE
         ),
         TaskFailure::TesterHarness => format!(
             "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Repair the Tester configuration, extractor, sandbox, or result persistence, then retry this Attempt.\n"

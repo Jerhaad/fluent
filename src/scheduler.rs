@@ -143,6 +143,12 @@ pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -
             Ok(())
         }
         CoordinatorStart::Elected(lease) => {
+            // A newly elected coordinator must prove the host can apply Fluent's
+            // worker boundary before it prepares baselines, polls, or claims Work.
+            // A caller that merely reuses an existing coordinator performs no new
+            // execution and therefore does not need this process-local probe.
+            let resolver = crate::content::ContentResolver::new(Some(project_root));
+            crate::os::preflight_host_execution(project_root, &resolver)?;
             let capacity = resolve_capacity(project_root)?;
             let baseline_session = scheduler_baseline_session();
             crate::baseline_cache::prepare_scheduler_session(project_root, baseline_session)?;

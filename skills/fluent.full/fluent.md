@@ -125,6 +125,28 @@ Attempt execution and landing retain their existing separate boundaries.
 
 For a codebase, module, or area review (not building something new), capture enough context to create a Work Item and use the review-only flow in the delegated stages below.
 
+## Recover an enclosing agent sandbox
+
+Configured initialization and local execution may report
+`FLUENT_HOST_SANDBOX_BLOCKED` when this skill is running inside Codex or Claude
+Code and the enclosing agent sandbox prevents Fluent from applying its own
+macOS worker sandbox.
+
+When that code appears, rerun the exact same Fluent command through the host
+agent's scoped unsandboxed-command approval:
+
+- In Codex, request escalated execution for that command and explain that Fluent
+  needs to establish its own worker sandbox, access the selected provider's
+  credentials, and manage Git worktrees.
+- In Claude Code, retry that Bash command with its unsandboxed-command escape
+  hatch so the normal Claude Code permission flow asks for approval.
+
+Tell the user that the approval applies to the Fluent command, while Fluent will
+still sandbox every worker it launches. Do not add Fluent's `--no-sandbox`, do
+not switch the whole host-agent session to full access, and do not mistake this
+boundary error for a provider login failure. After approval, continue with the
+same command and the same Work Item or Attempt.
+
 ## Delegated execution
 
 `references/plan-execution.md` has already created the Work Item(s) with the approved planning files. From here, use the Work model for delegated execution:
@@ -378,8 +400,10 @@ When `.fluent/` does not exist:
    For `custom`, use `--coder-profile custom` and pass every `--write-*`,
    `--review-*`, and `--behavior-tests-*` value the user chose.
 
-5. The command preflights each distinct provider before it initializes the
-   project. If it reports a failure, name the failed provider and condition,
+5. The command first verifies that its enclosing host can apply Fluent's worker
+   sandbox, then preflights each distinct provider before it initializes the
+   project. Recover `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped host-agent
+   flow above. For a provider failure, name the failed provider and condition,
    then offer the user a retry or a different profile. A successful check only
    verifies the local command and authentication readiness; it does not promise
    future provider capacity.
