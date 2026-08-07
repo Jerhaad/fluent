@@ -5263,25 +5263,26 @@ Test: src/work_merge_executor.rs (baseline_preparation_failure_keeps_land_merged
 
 ### B1
 
-WHEN a completed Writer leaves an approved required-progress entry unchecked or
-without evidence, THE SYSTEM SHALL plan one Writer continuation before planning
-a Tester or reviewer.
-Test: src/work_attempt_loop.rs (unchecked_required_progress_plans_writer_before_tester_or_review)
+WHEN Fluent creates a matrix-backed Attempt with required Plan rows, THE SYSTEM
+SHALL materialize an unchecked host-owned required-progress projection before the
+first Writer launches.
+Test: src/work_attempt_loop.rs (new_attempt_materializes_required_progress_before_writer)
+Test: src/work_task_executor.rs (matrix_backed_writer_prompt_keeps_required_progress_host_owned)
 
 ### B2
 
-WHEN a completed Writer satisfies every approved required-progress entry, THE
-SYSTEM SHALL plan one review Task for each configured reviewer without planning
-the final Tester yet.
-Test: src/work_attempt_loop.rs (checked_required_progress_plans_review_round_without_tester)
+WHEN every Writer completion row is valid, THE SYSTEM SHALL replace only the
+required-progress section with exact immutable Plan text and matrix evidence
+references while preserving separate progress sections.
+Test: src/work_attempt_loop.rs (complete_matrix_repairs_writer_progress_before_review)
+Test: src/work_model.rs (completed_matrix_projects_exact_required_progress)
 
 ### B3
 
-IF required progress is malformed or rewrites the approved manifest, THEN THE
-SYSTEM SHALL pause the Attempt with an actionable diagnosis before planning a
-Tester or reviewer.
-Test: src/work_attempt_loop.rs (malformed_required_progress_pauses_before_tester_or_review)
-Test: src/work_attempt_loop.rs (rewritten_required_progress_pauses_before_tester_or_review)
+IF the immutable Plan progress contract and validated matrix Plan rows disagree,
+THEN THE SYSTEM SHALL pause before planning a Tester or reviewer.
+Test: src/work_model.rs (required_progress_projection_rejects_matrix_contract_disagreement)
+Test: src/work_attempt_loop.rs (matrix_progress_contract_disagreement_pauses_before_review)
 
 ### B4
 
@@ -5305,16 +5306,17 @@ Test: src/work_attempt_loop.rs (post_write_gate_retry_does_not_duplicate_review_
 
 ### B7
 
-WHEN required progress remains incomplete and the completed Writer did not create
-a candidate commit, THE SYSTEM SHALL preserve the candidate and pause the Attempt
-before planning another Writer, Tester, or reviewer.
+WHEN completion evidence remains incomplete and the completed Writer did not
+create a candidate commit, THE SYSTEM SHALL preserve the candidate and pause the
+Attempt before planning another Writer, Tester, or reviewer.
 Test: src/work_attempt_loop.rs (incomplete_no_change_writer_pauses_instead_of_continuing)
 
 ### B8
 
 WHEN two consecutive pre-review Writer continuations create commits without
-increasing the number of required entries checked with evidence, THE SYSTEM SHALL
-preserve the candidate and pause the Attempt before planning a Tester or reviewer.
+increasing the applicable matrix or legacy required-progress completion count,
+THE SYSTEM SHALL preserve the candidate and pause the Attempt before planning a
+Tester or reviewer.
 Test: src/work_attempt_loop.rs (second_stagnant_pre_review_continuation_pauses)
 
 ### B9
@@ -5348,9 +5350,9 @@ Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execu
 
 ### B12
 
-WHEN a pre-review Writer reduces the number of required entries checked with
-evidence, THE SYSTEM SHALL preserve the new candidate commit and pause before
-planning a Tester or reviewer.
+WHEN a pre-review Writer reduces the applicable matrix or legacy
+required-progress completion count, THE SYSTEM SHALL preserve the new candidate
+commit and pause before planning a Tester or reviewer.
 Test: src/work_attempt_loop.rs (regressed_required_progress_pauses_before_review)
 
 ### B13
@@ -5422,9 +5424,9 @@ Test: src/work_model.rs (writer_completion_matrix_reconciles_claims_and_correcti
 
 ### B20
 
-WHEN every required-progress entry and Writer completion row is satisfied, THE
-SYSTEM SHALL attach the matrix to every reviewer as an advisory coverage map and
-plan reviewers without planning the final Tester yet.
+WHEN every Writer completion row is satisfied and the host-owned required-progress
+projection reconciles, THE SYSTEM SHALL attach the matrix to every reviewer as an
+advisory coverage map and plan reviewers without planning the final Tester yet.
 Test: src/work_attempt_loop.rs (complete_writer_completion_matrix_reaches_review_and_is_attached)
 Test: src/work_task_executor.rs (work_review_prompt_renders_role_conditional_blocks)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix admits review and final Tester)
@@ -5440,8 +5442,12 @@ Test: src/work_attempt_loop.rs (incomplete_writer_completion_retry_does_not_dupl
 ### B22
 
 WHEN an older Attempt has no Writer completion contract, THE SYSTEM SHALL retain
-its existing required-progress and review-planning behavior.
+its Writer-owned required-progress validation and review-planning behavior,
+including rejection of malformed or rewritten required rows.
 Test: src/work_attempt_loop.rs (legacy_completed_writer_plans_reviews_without_progress_contract)
+Test: src/work_attempt_loop.rs (unchecked_required_progress_plans_writer_before_tester_or_review)
+Test: src/work_attempt_loop.rs (malformed_required_progress_pauses_before_tester_or_review)
+Test: src/work_attempt_loop.rs (rewritten_required_progress_pauses_before_tester_or_review)
 
 ### B23
 

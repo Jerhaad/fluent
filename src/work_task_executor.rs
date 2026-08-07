@@ -3204,10 +3204,10 @@ fn run_task_coder_with_coder(
             progress_dir.display()
         )
     })?;
-    // Materialize the authoritative `## Required completion` section BEFORE the
-    // first Writer launches, so a marked Attempt's current checklist reflects its
-    // immutable manifest and the Writer preserves and checks those stable ids.
-    // Idempotent and crash-safe: an existing section is left untouched.
+    // Materialize the host-owned `## Required completion` projection BEFORE the
+    // first Writer launches, so the Writer can use the immutable Plan order. The
+    // completed-Writer gate later replaces this section from validated matrix
+    // claims. Idempotent and crash-safe: an existing section is left untouched.
     if task.kind == TaskKind::Write {
         materialize_required_progress_before_writer(project_root, item, attempt_id)?;
         materialize_writer_completion_before_writer(project_root, item, attempt_id, task_id)?;
@@ -3600,11 +3600,24 @@ fn build_write_task_prompt_with_workspace(
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let has_writer_completion_matrix_value = if writer_completion_matrix_pathbuf.is_some() {
+    let has_writer_completion_matrix = writer_completion_matrix_pathbuf.is_some();
+    let has_writer_completion_matrix_value = if has_writer_completion_matrix {
         "yes"
     } else {
         ""
     };
+    let has_matrix_backed_required_progress_value =
+        if has_required_progress && has_writer_completion_matrix {
+            "yes"
+        } else {
+            ""
+        };
+    let has_legacy_required_progress_value =
+        if has_required_progress && !has_writer_completion_matrix {
+            "yes"
+        } else {
+            ""
+        };
     let has_prior_reviews = !prior_reviews.is_empty();
     let has_work_item_inputs = !work_item_inputs.is_empty();
     let planning = project_root
@@ -3707,6 +3720,14 @@ fn build_write_task_prompt_with_workspace(
             ("has_no_prior_reviews", has_no_prior_reviews_value),
             ("has_progress_md", has_progress_md_value),
             ("has_required_progress", has_required_progress_value),
+            (
+                "has_matrix_backed_required_progress",
+                has_matrix_backed_required_progress_value,
+            ),
+            (
+                "has_legacy_required_progress",
+                has_legacy_required_progress_value,
+            ),
             (
                 "writer_completion_matrix_path",
                 &writer_completion_matrix_path,
@@ -5182,10 +5203,10 @@ fn progress_md_path_for(project_root: &Path, work_item_id: &str, attempt_id: &st
 }
 
 /// Materialize an Attempt's immutable required-progress manifest into the
-/// authoritative `## Required completion` section of its progress file, atomically
-/// and idempotently, before the first Writer launches. An Attempt without a progress
-/// contract, or one whose section already exists, leaves the file untouched. This is
-/// the exact function the write route calls before launching the Writer coder.
+/// host-owned `## Required completion` projection, atomically and idempotently,
+/// before the first Writer launches. An Attempt without a progress contract, or one
+/// whose section already exists, leaves the file untouched. The completed-Writer
+/// gate later replaces this projection from validated matrix claims.
 pub(crate) fn materialize_required_progress_before_writer(
     project_root: &Path,
     item: &WorkItem,
@@ -13548,6 +13569,7 @@ mod tests {
         assert!(matrix_prompt.contains("as JSON arrays"));
         assert!(matrix_prompt.contains("[\"none: <specific reason>\"]"));
         assert!(matrix_prompt.contains("writer-completion.json"));
+        assert!(matrix_prompt.contains("do not edit the host-owned"));
         assert!(!matrix_prompt.contains("{{"));
 
         let context: serde_json::Value =
@@ -13673,6 +13695,7 @@ mod tests {
         assert!(prompt.contains(&progress.display().to_string()));
         assert!(prompt.contains("as JSON arrays"));
         assert!(prompt.contains("[\"none: <specific reason>\"]"));
+        assert!(prompt.contains("host-owned `## Required completion` projection"));
         assert!(!prompt.contains(large_output_marker));
         assert!(!prompt.contains("{{"));
 
@@ -13791,11 +13814,10 @@ mod tests {
     }
 
     #[test]
-    fn writer_prompts_preserve_required_progress_schema() {
-        // Review follow-up placement B1/B2: when a follow-up Writer receives a
-        // required-progress contract, the prompt keeps review work in a separate
-        // section and tells the Writer to migrate legacy rows with their nested
-        // notes. An Attempt without a contract omits the authoritative schema.
+    fn matrix_backed_writer_prompt_keeps_required_progress_host_owned() {
+        // A matrix-backed prompt keeps required progress read-only and puts review
+        // work in a separate mutable section. An Attempt without either contract
+        // omits the host-owned schema.
         let mut item = WorkItem {
             id: "work-1".to_string(),
             title: "Required progress".to_string(),
@@ -13844,12 +13866,12 @@ mod tests {
             "the prompt names the authoritative required-progress section; got:\n{prompt}"
         );
         assert!(
-            prompt.contains("preserve every stable id"),
-            "the prompt instructs preserving stable ids and requirements; got:\n{prompt}"
+            prompt.contains("read-only projection"),
+            "the prompt identifies the host-owned projection; got:\n{prompt}"
         );
         assert!(
-            prompt.contains("Evidence:"),
-            "the prompt instructs attaching concrete evidence; got:\n{prompt}"
+            prompt.contains("do not edit its checkboxes"),
+            "the prompt keeps required progress out of the Writer's edit surface; got:\n{prompt}"
         );
         assert!(
             prompt.contains("## Review follow-ups"),
@@ -13859,14 +13881,8 @@ mod tests {
             prompt.contains("outside `## Required completion`"),
             "the prompt keeps follow-ups outside the authoritative section; got:\n{prompt}"
         );
-        assert!(
-            prompt.contains("nested evidence and commit notes"),
-            "the prompt migrates legacy rows and their nested notes as a unit; got:\n{prompt}"
-        );
-        assert!(
-            prompt.contains("without re-creating or rewording"),
-            "the prompt preserves the required manifest while migrating legacy rows; got:\n{prompt}"
-        );
+        assert!(!prompt.contains("toggle `- [ ]` to `- [x]`"));
+        assert!(!prompt.contains("move each row"));
         assert!(prompt.contains("writer-completion.json"));
         assert!(prompt.contains("Writer completion matrix"));
         assert!(
@@ -13876,6 +13892,20 @@ mod tests {
         assert!(prompt.contains("\"applicable-constraints\": []"));
         assert!(prompt.contains("harness-native"));
         assert!(prompt.contains("does not replace the project's test selectors"));
+
+        let mut legacy_progress_item = item.clone();
+        legacy_progress_item.attempts[0].writer_completion_contract = None;
+        let legacy_progress_prompt = build_write_task_prompt_with_workspace(
+            &legacy_progress_item,
+            "attempt-1",
+            "attempt-1-write-1",
+            std::slice::from_ref(&review_path),
+            None,
+            Some(tmp.path()),
+        );
+        assert!(legacy_progress_prompt.contains("Preserve every stable id"));
+        assert!(legacy_progress_prompt.contains("appending concrete `Evidence:`"));
+        assert!(!legacy_progress_prompt.contains("read-only projection"));
 
         // An unmarked (legacy) follow-up still separates review findings, then
         // resumes its ordinary plan checklist without required-progress terms.

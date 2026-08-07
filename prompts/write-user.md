@@ -110,11 +110,13 @@ progress.md is a `- [ ]` to-do list that persists across rounds. Each item can h
     - [ ] Implement chunk dispatch
     - [ ] Write integration test
 
-{{#if has_required_progress}}
-progress.md contains an authoritative `## Required completion` section the Fluent materialized from the Plan's required rows. Each top-level entry is exactly `- [ ] <stable-id> — <requirement>` or, once satisfied, `- [x] <stable-id> — <requirement>; Evidence: <source/test>`. You MUST preserve every stable id and its requirement text exactly — never add, remove, reorder, or reword an entry. Mark an entry `- [x]` only by appending `; Evidence: <the source file or test that proves it>` once it is genuinely complete. Keep this section limited to the materialized stable manifest; record review work under a separate `## Review follow-ups` section outside `## Required completion`. Fluent checks this section immediately after your Writer completes. If an approved entry remains unchecked or lacks evidence, Fluent starts another Writer continuation without starting the Tester or reviewers. Malformed or rewritten entries pause for user repair. Only a fully reconciled section reaches Tester and review planning.
+{{#if has_matrix_backed_required_progress}}
+Fluent owns the `## Required completion` section in progress.md. It is a read-only projection of the Plan's required rows: use its order to choose work, but do not edit its checkboxes, requirement text, evidence, or nested content. Report completion only in `writer-completion.json`; after validating the matrix, Fluent replaces this section from the immutable Plan contract and points each completed row to its matrix evidence. Record review work under a separate `## Review follow-ups` section outside `## Required completion`.
 
-Each incomplete Writer run must create a candidate commit and must not reduce the number of entries checked with evidence. Fluent resumes the same provider session when possible and gives that continuation the unresolved progress, latest candidate change, and current findings. An incomplete no-change run, regressed checklist, or two consecutive pre-review continuations with no newly checked entry pauses for user inspection.
-
+Each incomplete Writer run must create a candidate commit and must not reduce the number of completed matrix rows. Fluent resumes the same provider session when possible and gives that continuation the unresolved progress, latest candidate change, and current findings. An incomplete no-change run, regressed matrix, or two consecutive pre-review continuations with no newly completed row pauses for user inspection.
+{{/if}}
+{{#if has_legacy_required_progress}}
+progress.md contains an authoritative `## Required completion` section Fluent materialized from the Plan's required rows. Preserve every stable id and its requirement text exactly. Mark an entry complete only by changing its checkbox and appending concrete `Evidence:`. Keep review work under a separate `## Review follow-ups` section.
 {{/if}}
 {{#if has_progress_md}}
 1. Read progress.md at {{progress_md_path}}.
@@ -123,9 +125,8 @@ Each incomplete Writer run must create a candidate commit and must not reduce th
 {{/if}}
 {{#if has_prior_reviews_with_required_progress}}
 2. Ensure progress.md has a separate `## Review follow-ups` section outside `## Required completion`.
-3. If `## Required completion` contains legacy top-level `Address review finding:` rows, move each row and all of its nested evidence and commit notes as a unit to `## Review follow-ups`, without re-creating or rewording any required manifest row. Preserve checked findings as historical records and keep unchecked findings unresolved.
-4. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
-5. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
+3. Collect every `- [ ]` finding from the prior review files. Under `## Review follow-ups`, add any missing finding as `- [ ] Address review finding: <title> (from <review-md-path>)`. Do not delete unresolved follow-ups. Address these before remaining required steps.
+4. Find the first unchecked review follow-up, or otherwise the first `- [ ]` required item — that is your next step.
 {{/if}}
 {{#if has_prior_reviews_without_required_progress}}
 2. Ensure progress.md has a `## Review follow-ups` section.
@@ -145,7 +146,7 @@ Work through every `- [ ]` item in progress.md, one at a time. For each item:
 1. Refer to sections related to this step in plan.md and behaviors.md.
 2. Find approach.md sections related to this step. Note any recommended names, file paths, structural ideas, and constraints.
 3. Consult the indexes and read expertise files relevant to this step (architecture, testing, docs, etc.), including any patterns they reference.
-4. Identify any tests the plan names for this step. Check the codebase for their presence; record missing tests in progress.md before making code changes.
+4. Identify any tests the plan names for this step. Check the codebase for their presence; record missing tests in the matrix evidence or a mutable progress section before making code changes.
 
 ### B. Implement test-first
 
@@ -163,7 +164,7 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 1. Review your diff: each change should be intentional and match plan, approach, and behaviors. Remove debug prints, unrelated edits, dead code, or commented-out blocks.
 2. Confirm the step's behaviors (from behaviors.md) are now observable.
 3. Confirm every approach.md constraint you noted is satisfied (grep, find, or project introspection).
-4. If your implementation diverged from plan, approach, or behaviors, record the divergence as a nested bullet under the current step in progress.md — never silently diverge.
+4. If your implementation diverged from plan, approach, or behaviors, record the divergence in the matrix evidence or a mutable progress section — never silently diverge or edit the host-owned required section.
 5. Update all documentation the step's change affects — READMEs, CHANGELOGs, API references, inline comments, user guides, etc.
 
 ### D. Commit and advance
@@ -183,10 +184,10 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
    ```
 
    `reason` and every `command` must be non-empty, and `verification` must contain at least one passing entry. Fluent deletes this file before every coder launch, so only evidence produced by this run can authorize no-change completion. Do not use this path when you changed the candidate, when verification did not pass, or when the workspace is dirty.
-3. In progress.md: toggle `- [ ]` to `- [x]` and add a nested bullet below it with the commit hash, or note the verified no-change result, plus anything the next round should know.
+3. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit or verified no-change evidence.
 {{else}}
 1. Make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
-2. In progress.md: toggle `- [ ]` to `- [x]` and add a nested bullet below it with the commit hash and anything the next round should know.
+2. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit evidence.
 {{/if}}
 Then move to the next `- [ ]` item.
 

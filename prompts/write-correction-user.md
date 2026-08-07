@@ -38,12 +38,15 @@ Create a candidate commit for each real correction and leave the workspace clean
 verification proves no candidate change is needed, write
 {{no_change_declaration_path}} with schema version 1, a non-empty `reason`, and a non-empty
 `verification` array whose entries each contain a non-empty `command` and `result: "pass"`.
-Do not use that declaration after changing the candidate. Update progress and the completion
-matrix only with concrete passing evidence.
+Do not use that declaration after changing the candidate.
 {{#if has_writer_completion_matrix}}
+Update mutable progress sections and the completion matrix only with concrete passing evidence.
 Preserve every host-owned matrix row. Keep `implementation-evidence`, `verification`, and
 `applicable-constraints` as JSON arrays, even when one value exists. Map each completed finding to
-its applicable behavior or Approach constraint, or to `["none: <specific reason>"]`.
+its applicable behavior or Approach constraint, or to `["none: <specific reason>"]`. Do not edit
+the host-owned `## Required completion` projection in progress.md.
+{{else}}
+Update progress only with concrete passing evidence.
 {{/if}}
 
 Finish with a concise verification summary containing each exact focused command, result, and

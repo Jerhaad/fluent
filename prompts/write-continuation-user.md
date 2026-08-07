@@ -24,7 +24,13 @@ Progress file: {{progress_md_path}}
 
 {{unresolved_progress}}
 
-Implement the unresolved work test-first. Use the test harness's native selectors to run focused checks for the correction; do not rerun the complete configured suite merely to duplicate Fluent's final Tester gate. Make at least one candidate commit and update only genuinely completed required-progress entries with concrete evidence. Do not start or simulate Tester, reviewer, Learner, landing, or Fluent orchestration work.
+Implement the unresolved work test-first. Use the test harness's native selectors to run focused checks for the correction; do not rerun the complete configured suite merely to duplicate Fluent's final Tester gate. Make at least one candidate commit.
+{{#if has_writer_completion_matrix}}
+Record completion and concrete evidence in the Writer completion matrix; do not edit the host-owned `## Required completion` projection in progress.md.
+{{else}}
+Update only genuinely completed required-progress entries with concrete evidence.
+{{/if}}
+Do not start or simulate Tester, reviewer, Learner, landing, or Fluent orchestration work.
 
 If the candidate-gate evidence reports only commit-metadata defects, repair those
 commit messages without changing the candidate tree. Do not append a commit to

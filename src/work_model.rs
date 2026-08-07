@@ -2246,8 +2246,8 @@ pub struct RequiredProgressEntry {
 
 /// The durable progress contract stamped on a new planned Attempt with required
 /// Plan rows: the schema version plus the immutable expected stable-id/requirement
-/// manifest. Once stamped it never changes, so deletion, duplication, insertion, or
-/// requirement rewriting in the current checklist cannot manufacture closure.
+/// manifest. Matrix-backed Attempts project it through the host; older Attempts
+/// reconcile it against their Writer-owned checklist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProgressContract {
     /// The progress-contract schema version this Attempt was marked with.
@@ -2900,6 +2900,111 @@ impl ProgressContract {
         }
         out
     }
+
+    /// Render completed required progress from the host-validated Writer matrix.
+    /// The immutable requirement text always comes from this contract; the
+    /// projection points at the matrix row instead of copying Writer-authored
+    /// evidence back into a second completion authority.
+    pub fn render_completed_required_progress_section(
+        &self,
+        matrix: &WriterCompletionMatrix,
+        matrix_path: &str,
+    ) -> Result<String, String> {
+        let plan_rows = matrix
+            .rows
+            .iter()
+            .filter(|row| row.kind == WriterCompletionRequirementKind::Plan)
+            .collect::<Vec<_>>();
+        if plan_rows.len() != self.required.len() {
+            return Err(format!(
+                "required-progress contract has {} rows but Writer completion matrix has {} Plan rows",
+                self.required.len(),
+                plan_rows.len()
+            ));
+        }
+
+        let mut out = format!("{REQUIRED_COMPLETION_HEADING}\n\n");
+        for entry in &self.required {
+            let matrix_id = format!("plan:{}", entry.id);
+            let matching = plan_rows
+                .iter()
+                .filter(|row| row.id == matrix_id)
+                .copied()
+                .collect::<Vec<_>>();
+            let [row] = matching.as_slice() else {
+                return Err(format!(
+                    "required-progress entry {:?} must map to exactly one Writer completion row {:?}",
+                    entry.id, matrix_id
+                ));
+            };
+            if row.requirement != entry.requirement {
+                return Err(format!(
+                    "required-progress entry {:?} disagrees with Writer completion row {:?}",
+                    entry.id, matrix_id
+                ));
+            }
+            if row.state != WriterCompletionState::Complete {
+                return Err(format!(
+                    "Writer completion row {:?} is not complete",
+                    matrix_id
+                ));
+            }
+            out.push_str(&format!(
+                "- [x] {} — {}; Evidence: {}#{}\n",
+                entry.id, entry.requirement, matrix_path, matrix_id
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Replace only the `## Required completion` section with a host-rendered
+    /// projection. Content before the section and every following `## ` section
+    /// remain outside the host-owned boundary.
+    pub fn project_completed_required_progress(
+        &self,
+        existing: &str,
+        matrix: &WriterCompletionMatrix,
+        matrix_path: &str,
+    ) -> Result<String, String> {
+        let replacement = self.render_completed_required_progress_section(matrix, matrix_path)?;
+        let Some((start, end)) = required_completion_section_range(existing) else {
+            return Ok(if existing.trim().is_empty() {
+                replacement
+            } else {
+                format!("{}\n\n{replacement}", existing.trim_end())
+            });
+        };
+
+        let mut projected = String::with_capacity(
+            existing.len() - (end - start) + replacement.len() + usize::from(end < existing.len()),
+        );
+        projected.push_str(&existing[..start]);
+        projected.push_str(&replacement);
+        if end < existing.len() {
+            projected.push('\n');
+            projected.push_str(&existing[end..]);
+        }
+        Ok(projected)
+    }
+}
+
+/// Return the byte range occupied by the required-completion section, including
+/// its heading and everything before the next level-two heading.
+fn required_completion_section_range(source: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if start.is_none() {
+            if trimmed == REQUIRED_COMPLETION_HEADING {
+                start = Some(offset);
+            }
+        } else if trimmed.starts_with("## ") {
+            return Some((start.expect("the section start is set"), offset));
+        }
+        offset += line.len();
+    }
+    start.map(|start| (start, source.len()))
 }
 
 /// One parsed top-level entry of the current `## Required completion` section.
@@ -3712,10 +3817,9 @@ impl Attempt {
 
     /// Materialize the authoritative `## Required completion` section into the
     /// current required-progress content when this Attempt carries a progress
-    /// contract and the section is not already present. Idempotent: an existing
-    /// section (from a prior materialization or a Writer's checkmarks) is preserved
-    /// untouched, so a crash-retry or a follow-up Writer never overwrites checked
-    /// entries. Returns the content to persist, or `None` when nothing must change.
+    /// contract and the section is not already present. Idempotent: setup preserves
+    /// an existing section; the completed-Writer gate separately owns matrix-backed
+    /// projection. Returns the content to persist, or `None` when nothing changes.
     pub fn materialize_required_progress(&self, existing: &str) -> Option<String> {
         let contract = self.progress_contract.as_ref()?;
         if existing.contains(REQUIRED_COMPLETION_HEADING) {
@@ -3730,8 +3834,9 @@ impl Attempt {
         Some(new_content)
     }
 
-    /// Reconcile the current required-progress content against this Attempt's
-    /// immutable manifest before a passing review may advance.
+    /// Reconcile Writer-owned required-progress content against this Attempt's
+    /// immutable manifest before a passing review may advance. Matrix-backed
+    /// Attempts call this only to verify the host-rendered projection.
     ///
     /// An unmarked (legacy) Attempt has no contract, so this is `Ok(())` without
     /// scanning any prose. For a marked Attempt it reads ONLY the `## Required
@@ -7515,6 +7620,114 @@ mod tests {
     }
 
     #[test]
+    fn completed_matrix_projects_exact_required_progress() {
+        let contract = ProgressContract {
+            version: PROGRESS_CONTRACT_VERSION,
+            required: vec![RequiredProgressEntry {
+                id: "step-1".to_string(),
+                requirement: "Preserve the approved punctuation.".to_string(),
+            }],
+        };
+        let matrix = WriterCompletionMatrix {
+            schema_version: WRITER_COMPLETION_CONTRACT_VERSION,
+            task_id: "attempt-1-write-1".to_string(),
+            rows: vec![WriterCompletionRow {
+                id: "plan:step-1".to_string(),
+                kind: WriterCompletionRequirementKind::Plan,
+                source: "plan.md#step-1".to_string(),
+                requirement: "Preserve the approved punctuation.".to_string(),
+                verification_refs: vec!["cargo test projection".to_string()],
+                state: WriterCompletionState::Complete,
+                implementation_evidence: vec!["src/work_model.rs".to_string()],
+                verification: vec![WriterVerificationClaim {
+                    command: "cargo test projection".to_string(),
+                    result: WriterVerificationResult::Pass,
+                }],
+                applicable_constraints: Vec::new(),
+            }],
+        };
+        let existing = "# Progress\n\n\
+                        ## Required completion\n\n\
+                        - [x] step-1 — Preserve the approved punctuation; Evidence: writer edit\n\
+                          - commit abc123\n\n\
+                        ## Review follow-ups\n\n\
+                        - [ ] Keep this finding\n";
+
+        let projected = contract
+            .project_completed_required_progress(
+                existing,
+                &matrix,
+                ".fluent/work/artifacts/work-1/attempt-1/write-1/writer-completion.json",
+            )
+            .unwrap();
+
+        assert!(projected.starts_with("# Progress\n\n"));
+        assert!(projected.ends_with("## Review follow-ups\n\n- [ ] Keep this finding\n"));
+        assert!(projected.contains(
+            "- [x] step-1 — Preserve the approved punctuation.; Evidence: \
+             .fluent/work/artifacts/work-1/attempt-1/write-1/writer-completion.json#plan:step-1"
+        ));
+        assert!(!projected.contains("writer edit"));
+        assert!(!projected.contains("commit abc123"));
+        assert_eq!(
+            contract
+                .project_completed_required_progress(
+                    &projected,
+                    &matrix,
+                    ".fluent/work/artifacts/work-1/attempt-1/write-1/writer-completion.json",
+                )
+                .unwrap(),
+            projected,
+            "replaying the host projection is idempotent"
+        );
+
+        let restored = contract
+            .project_completed_required_progress(
+                "# Progress\n\n## Review follow-ups\n\n- [ ] Keep this finding\n",
+                &matrix,
+                ".fluent/work/artifacts/work-1/attempt-1/write-1/writer-completion.json",
+            )
+            .unwrap();
+        assert!(restored.contains("## Required completion"));
+        assert!(restored.contains("## Review follow-ups\n\n- [ ] Keep this finding"));
+    }
+
+    #[test]
+    fn required_progress_projection_rejects_matrix_contract_disagreement() {
+        let contract = ProgressContract {
+            version: PROGRESS_CONTRACT_VERSION,
+            required: vec![RequiredProgressEntry {
+                id: "step-1".to_string(),
+                requirement: "Approved requirement.".to_string(),
+            }],
+        };
+        let matrix = WriterCompletionMatrix {
+            schema_version: WRITER_COMPLETION_CONTRACT_VERSION,
+            task_id: "attempt-1-write-1".to_string(),
+            rows: vec![WriterCompletionRow {
+                id: "plan:step-1".to_string(),
+                kind: WriterCompletionRequirementKind::Plan,
+                source: "plan.md#step-1".to_string(),
+                requirement: "Different requirement.".to_string(),
+                verification_refs: Vec::new(),
+                state: WriterCompletionState::Complete,
+                implementation_evidence: vec!["src/lib.rs".to_string()],
+                verification: vec![WriterVerificationClaim {
+                    command: "cargo test".to_string(),
+                    result: WriterVerificationResult::Pass,
+                }],
+                applicable_constraints: Vec::new(),
+            }],
+        };
+
+        let error = contract
+            .project_completed_required_progress("", &matrix, "writer-completion.json")
+            .unwrap_err();
+
+        assert!(error.contains("disagrees"));
+    }
+
+    #[test]
     fn writer_completion_contract_maps_approved_planning_inputs() {
         let context = PlanningContext {
             behaviors: Some(
@@ -8077,8 +8290,8 @@ mod tests {
     #[test]
     fn materialize_required_progress_is_idempotent_and_preserves_checkmarks() {
         // Required-progress production B1: the host materializes the section into
-        // empty progress content, but leaves an existing section untouched — so a
-        // crash-retry or a follow-up Writer never overwrites checked entries.
+        // empty progress content, but setup leaves an existing section untouched.
+        // The completed-Writer gate owns the later matrix-backed replacement.
         let contract = ProgressContract {
             version: PROGRESS_CONTRACT_VERSION,
             required: vec![RequiredProgressEntry {
@@ -8098,8 +8311,7 @@ mod tests {
         assert!(materialized.contains("## Required completion"));
         assert!(materialized.contains("- [ ] step-1 — Do the thing"));
 
-        // A follow-up Writer checked the item with evidence; re-materialization is a
-        // no-op that never rewrites the checkmark.
+        // Pre-existing content makes setup materialization a no-op.
         let checked = "## Required completion\n\n- [x] step-1 — Do the thing; Evidence: src/x.rs\n";
         assert!(
             attempt.materialize_required_progress(checked).is_none(),

@@ -166,30 +166,35 @@ state that proves Fluent accepted the canonical result: `HandoffPending`,
 `Succeeded`, or `Failed` with the typed `HandoffPublication` failure stage.
 Ordinary coder, transcript-pump, and evidence-persistence failures do not account
 for divergence. Existing TaskOutput and AttemptLearning JSON records without the
-optional fields keep their legacy shape. After each completed Writer, the
-Attempt loop reconciles both the current `## Required completion` section and the
-latest Task's `writer-completion.json` before it creates any Tester or reviewer
-Task. New code-producing Attempts stamp an immutable completion contract from
-approved behavior statements and their existing verification markers, Approach
-choices and execution guidance, and required Plan rows and Verification cells.
-Before each Writer launch the host materializes a bounded task-owned matrix from
-that contract. Planning claims from the prior Writer carry forward; open findings
-from the current review artifacts become pending rows identified by stable
-role-scoped finding identities. The Writer may fill only completion state,
-implementation evidence, passing focused commands, and finding-to-constraint
-mappings. It does not choose a second set of test-selector names.
+optional fields keep their legacy shape. New code-producing Attempts stamp an
+immutable completion contract from approved behavior statements and their existing
+verification markers, Approach choices and execution guidance, and required Plan
+rows and Verification cells. Before each Writer launch the host materializes a
+bounded task-owned `writer-completion.json` matrix from that contract and an
+unchecked `## Required completion` projection from the Plan. Planning claims from
+the prior Writer carry forward; open findings from the current review artifacts
+become pending rows identified by stable role-scoped finding identities. The
+Writer may fill only completion state, implementation evidence, passing focused
+commands, and finding-to-constraint mappings. It does not edit the host-owned
+required-progress projection or choose a second set of test-selector names.
 
-An unchecked progress entry or incomplete matrix row creates a pre-review Writer
-continuation only when the completed Writer created a candidate commit and neither
-completion count regressed. Missing or malformed matrices, immutable-field edits,
-unknown constraint references, and pending rows that carry completion claims pause
-for repair. A valid matrix is attached to every reviewer as an advisory coverage
-map; reviewers still inspect the candidate, and the final Tester remains the
-authoritative complete-suite gate. Attempts created before this contract retain
-their legacy progress and review path. Fluent records each host-derived Writer
-outcome, candidate commit, progress and matrix completion counts, provider session
-identity, and whether the run was initial, pre-review continuation, or post-review
-corrective work.
+After each completed Writer, the Attempt loop validates the latest Task's matrix
+before it creates any Tester or reviewer Task. An incomplete matrix creates a
+pre-review Writer continuation only when the Writer created a candidate commit and
+the completion count did not regress. Missing or malformed matrices,
+immutable-field edits, unknown constraint references, and pending rows that carry
+completion claims pause for repair. Once every row is valid, the host replaces only
+the required-completion section with exact requirement text from the immutable
+Plan contract and evidence links to the corresponding matrix rows. It preserves
+separate progress sections and verifies its own projection before planning review.
+A disagreement between the Plan and matrix contracts pauses rather than selecting
+one authority. The valid matrix is attached to every reviewer as an advisory
+coverage map; reviewers still inspect the candidate, and the final Tester remains
+the authoritative complete-suite gate. Attempts created before the matrix contract
+retain their Writer-owned required-progress gate and review path. Fluent records
+each host-derived Writer outcome, candidate commit, progress and matrix completion
+counts, provider session identity, and whether the run was initial, pre-review
+continuation, or post-review corrective work.
 
 After a reviewed corrective Writer completes, the host compares its candidate
 with the immediately preceding completed Writer commit. The Git name-status
