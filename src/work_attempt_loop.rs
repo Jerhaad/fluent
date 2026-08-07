@@ -6150,27 +6150,33 @@ mod tests {
     fn learner_normalization_notes_are_persisted() {
         let draft = LearnerDraftV1 {
             learning_summary: String::new(),
-            follow_ups: vec![FollowUpDraftV1 {
-                id: "fu-1".to_string(),
-                summary: "Consider tightening the retry cap".to_string(),
-                corrective: false,
-                evidence: vec![
-                    LearnerArtifactRef {
+            follow_ups: vec![
+                FollowUpDraftV1 {
+                    id: "fu-1".to_string(),
+                    summary: "Consider tightening the retry cap".to_string(),
+                    corrective: false,
+                    evidence: vec![LearnerArtifactRef {
                         path: "/absolute/eviction.log".to_string(),
                         digest: "sha256:abc".to_string(),
-                    },
-                    LearnerArtifactRef {
+                    }],
+                    ..Default::default()
+                },
+                FollowUpDraftV1 {
+                    id: "fu-2".to_string(),
+                    summary: "Consider checking retry telemetry".to_string(),
+                    corrective: false,
+                    evidence: vec![LearnerArtifactRef {
                         path: "notes.md".to_string(),
                         digest: "not-a-digest".to_string(),
-                    },
-                ],
-                ..Default::default()
-            }],
+                    }],
+                    ..Default::default()
+                },
+            ],
         };
         let (_normalized, notes) = crate::learner::normalize_draft(draft);
         assert!(
-            !notes.is_empty(),
-            "malformed optional evidence produces normalization notes"
+            notes.len() >= 2,
+            "ordered malformed optional evidence produces multiple normalization notes"
         );
 
         let run_dir = tempfile::tempdir().unwrap();
