@@ -5413,6 +5413,7 @@ Test: src/candidate_gate.rs (dirty_candidate_workspace_blocks_before_review)
 WHEN deterministic candidate checks run, THE SYSTEM SHALL resolve every
 approved `Test:` path and native test identifier without introducing aliases.
 Test: src/candidate_gate.rs (rejects_missing_test_paths_and_selectors_without_aliases)
+Test: src/candidate_gate.rs (validates_documented_double_colon_test_references)
 
 ### B27
 

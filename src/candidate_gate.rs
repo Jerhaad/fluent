@@ -369,6 +369,8 @@ fn parse_test_reference(reference: &str) -> std::result::Result<(String, Option<
         } else {
             (reference, None)
         }
+    } else if let Some((path, selector)) = reference.split_once("::") {
+        (path.trim(), Some(selector.trim().to_string()))
     } else {
         (reference, None)
     };
@@ -735,6 +737,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_supported_test_reference_forms() {
+        assert_eq!(
+            parse_test_reference("tests/example.rs::module::works").unwrap(),
+            (
+                "tests/example.rs".to_string(),
+                Some("module::works".to_string())
+            )
+        );
+        assert_eq!(
+            parse_test_reference("tests/example.rs (module::works)").unwrap(),
+            (
+                "tests/example.rs".to_string(),
+                Some("module::works".to_string())
+            )
+        );
+        assert_eq!(
+            parse_test_reference("tests/behaviors/example.sh").unwrap(),
+            ("tests/behaviors/example.sh".to_string(), None)
+        );
+        assert!(parse_test_reference("tests/example.rs::").is_err());
+    }
+
+    #[test]
     fn rejects_whitespace_errors_and_prohibited_commit_metadata() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
@@ -856,6 +881,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn validates_documented_double_colon_test_references() {
+        let fixture = Fixture::new();
+        let selector = "concurrent_registry_mutations_preserve_every_successful_change";
+        let candidate = fixture.commit(
+            "tests/scheduler_service.rs",
+            &format!("#[test]\nfn {selector}() {{}}\n"),
+            "Test concurrent registry unregistration",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{
+                "id": format!("fluent::scheduler_service${selector}"),
+                "test_harness": "cargo-nextest",
+                "status": "pass",
+                "duration_ms": 1,
+                "failure_excerpt": null
+            }],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract(&format!("tests/scheduler_service.rs::{selector}"));
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Passed
+        );
         assert_eq!(
             check(&evidence, "tester-reference-evidence").status,
             CandidateCheckStatus::Passed
