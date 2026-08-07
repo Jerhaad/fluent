@@ -6139,11 +6139,49 @@ fn read_work_item_or_not_found(store: &WorkModelStore, id: &str) -> Result<WorkI
 mod tests {
     use super::*;
     use crate::content::ContentResolver;
+    use crate::follow_up::{ArtifactRef as LearnerArtifactRef, FollowUpDraftV1, LearnerDraftV1};
     use crate::work_model::AttemptKind;
     use crate::work_model::WorkItemAbandonment;
     use crate::work_model::{
         Attempt, CoderMapping, LearningFailureKind, TaskArtifactArea, WorkspaceAccess,
     };
+
+    #[test]
+    fn learner_normalization_notes_are_persisted() {
+        let draft = LearnerDraftV1 {
+            learning_summary: String::new(),
+            follow_ups: vec![FollowUpDraftV1 {
+                id: "fu-1".to_string(),
+                summary: "Consider tightening the retry cap".to_string(),
+                corrective: false,
+                evidence: vec![
+                    LearnerArtifactRef {
+                        path: "/absolute/eviction.log".to_string(),
+                        digest: "sha256:abc".to_string(),
+                    },
+                    LearnerArtifactRef {
+                        path: "notes.md".to_string(),
+                        digest: "not-a-digest".to_string(),
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let (_normalized, notes) = crate::learner::normalize_draft(draft);
+        assert!(
+            !notes.is_empty(),
+            "malformed optional evidence produces normalization notes"
+        );
+
+        let run_dir = tempfile::tempdir().unwrap();
+        record_run_normalizations(run_dir.path(), &notes).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(run_dir.path().join("normalizations.txt")).unwrap(),
+            format!("{}\n", notes.join("\n")),
+            "the host-owned artifact preserves every note in order with a final newline"
+        );
+    }
 
     #[test]
     fn learner_preserves_typed_pump_failure() {
