@@ -5468,10 +5468,42 @@ Test: src/candidate_gate.rs (rejects_whitespace_errors_and_prohibited_commit_met
 ### B25a
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL require the workspace
-to have the exact candidate at HEAD, contain the base in its history, and be
-clean before review.
+to have the exact candidate at HEAD and be clean before review.
 Test: src/candidate_gate.rs (mismatched_candidate_head_blocks_with_persisted_identity_evidence)
 Test: src/candidate_gate.rs (dirty_candidate_workspace_blocks_before_review)
+
+### B25b
+
+IF a candidate has no admitted metadata rewrite, THEN THE SYSTEM SHALL require
+the task base to be an ancestor of the candidate before review.
+Test: src/candidate_gate.rs (blocks_non_ancestor_candidate_without_prior_gate)
+
+### B25c
+
+WHEN a corrective Writer returns a candidate after a rejected candidate gate,
+THE SYSTEM SHALL re-run deterministic checks across the complete candidate
+range from the original base so a later commit cannot hide an earlier defect.
+Test: src/candidate_gate.rs (continuation_rechecks_the_complete_candidate_range)
+Test: src/candidate_gate.rs (appended_commit_cannot_hide_prior_metadata_failure)
+
+### B25d
+
+IF the only prior candidate-gate failure was commit metadata and a corrective
+Writer replaces the rejected history, THEN THE SYSTEM SHALL admit the
+replacement only when both candidates descend from the same original base and
+have identical trees.
+Test: src/candidate_gate.rs (accepts_tree_identical_metadata_rewrite_from_legacy_gate)
+Test: src/candidate_gate.rs (blocks_metadata_rewrite_when_the_candidate_tree_changes)
+Test: src/candidate_gate.rs (blocks_history_rewrite_after_mixed_gate_failures)
+Test: src/work_attempt_loop.rs (metadata_only_history_repair_reaches_review)
+
+### B25e
+
+WHEN Fluent admits a tree-identical commit-metadata rewrite, THE SYSTEM SHALL
+persist the original base, rejected candidate, replacement candidate, shared
+tree, and prior gate path in the replacement gate evidence.
+Test: src/candidate_gate.rs (accepts_tree_identical_metadata_rewrite_from_legacy_gate)
+Test: src/work_attempt_loop.rs (metadata_only_history_repair_reaches_review)
 
 ### B26
 
@@ -5517,6 +5549,8 @@ IF a corrective Writer still fails deterministic checks, or the gate cannot
 establish trustworthy Git, Tester, or hook state, THEN THE SYSTEM SHALL pause
 with an actionable handoff instead of continuing indefinitely.
 Test: src/work_attempt_loop.rs (invalid_project_check_pauses_without_reviewer_or_tester)
+Test: src/candidate_gate.rs (malformed_prior_gate_blocks_history_rewrite)
+Test: src/candidate_gate.rs (blocks_non_ancestor_candidate_without_prior_gate)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (candidate gate blocks review and final Tester)
 
 ### B32

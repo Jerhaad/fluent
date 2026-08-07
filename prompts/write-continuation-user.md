@@ -26,6 +26,10 @@ Progress file: {{progress_md_path}}
 
 Implement the unresolved work test-first. Use the test harness's native selectors to run focused checks for the correction; do not rerun the complete configured suite merely to duplicate Fluent's final Tester gate. Make at least one candidate commit and update only genuinely completed required-progress entries with concrete evidence. Do not start or simulate Tester, reviewer, Learner, landing, or Fluent orchestration work.
 
+If the candidate-gate evidence reports only commit-metadata defects, repair those
+commit messages without changing the candidate tree. Do not append a commit to
+hide the rejected commits; Fluent rechecks the complete candidate range.
+
 {{#if has_writer_completion_matrix}}
 Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a row complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name the applicable behavior or approach row ID, or `["none: <specific reason>"]` when no approved constraint applies. Fluent checks the matrix before reviewers and the final Tester.
 {{/if}}

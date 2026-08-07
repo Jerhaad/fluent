@@ -4910,8 +4910,29 @@ fn gate_candidate_after_writer(
             crate::candidate_gate::CANDIDATE_GATE_FILE
         ),
     };
-    let evidence =
-        crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
+    let prior_candidate_gate_refs = task
+        .input_artifacts
+        .iter()
+        .filter(|input| {
+            input
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .collect::<Vec<_>>();
+    if prior_candidate_gate_refs.len() > 1 {
+        anyhow::bail!(
+            "Writer Task {:?} has multiple prior candidate gate artifacts",
+            task.id
+        );
+    }
+    let prior_candidate_gate_path = prior_candidate_gate_refs
+        .first()
+        .map(|input| {
+            crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &input.path)
+        })
+        .transpose()?;
+    let evidence = crate::candidate_gate::run_candidate_gate_with_prior(
+        crate::candidate_gate::CandidateGateRequest {
             project_root,
             workspace: &workspace,
             work_item_id: &item.id,
@@ -4925,7 +4946,9 @@ fn gate_candidate_after_writer(
                 .as_ref(),
             tester_results_path: None,
             artifact_path: &project_root.join(&artifact.path),
-        })?;
+        },
+        prior_candidate_gate_path.as_deref(),
+    )?;
     match evidence.disposition {
         crate::candidate_gate::CandidateGateDisposition::Passed => {
             if !item.attempts[attempt_index].artifacts.contains(&artifact) {
@@ -10371,6 +10394,109 @@ mod tests {
             evidence.disposition,
             crate::candidate_gate::CandidateGateDisposition::Rejected
         );
+    }
+
+    #[test]
+    fn metadata_only_history_repair_reaches_review() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\\n\\nExplain candidate",
+            ],
+            "create invalid candidate metadata",
+        )
+        .unwrap();
+        let rejected = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read rejected candidate",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[0].output.as_mut().unwrap().commit = rejected.clone();
+        store.write_work_item(&item).unwrap();
+
+        let first = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+
+        crate::git::run(
+            workspace.path(),
+            &["commit", "--amend", "-q", "-m", "Add candidate"],
+            "repair candidate metadata",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement candidate",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let original_output = item.attempts[0].tasks[0].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        assert_eq!(correction.kind, TaskKind::Write);
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(rejected.clone()),
+            commit: replacement.clone(),
+            ..original_output
+        });
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let final_gate = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == "attempt-1-write-2"
+                    && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&final_gate.path)).unwrap())
+                .unwrap();
+        let rewrite = evidence.metadata_rewrite.as_ref().unwrap();
+        assert_eq!(rewrite.rejected_candidate_commit, rejected);
+        assert_eq!(rewrite.replacement_candidate_commit, replacement);
+        for reviewer in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(reviewer.input_artifacts.contains(final_gate));
+            assert_eq!(
+                reviewer.review_context.as_ref().unwrap().candidate_commit,
+                replacement
+            );
+        }
     }
 
     #[test]

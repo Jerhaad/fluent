@@ -223,6 +223,17 @@ candidate defect becomes the sole input to one
 corrective Writer; a repeated rejection pauses. Unreadable Git or Tester evidence
 and a mutating check hook pause immediately.
 
+A corrective gate reads the preceding host-owned gate and checks the complete
+replacement from the original base; it never treats the rejected candidate as a
+new trusted base. Corrective history remains append-only except for one bounded
+case: when commit metadata was the preceding gate's only failure, the Writer may
+rewrite those commits. The host revalidates the prior gate, proves that both
+candidates descend from its original base, requires identical Git trees, runs
+every gate check again over the replacement, and records both commit identities,
+the shared tree, and the prior artifact path. A changed tree, another prior
+failure, malformed evidence, or an ordinary non-ancestor candidate blocks before
+review.
+
 The same gate invokes the project's existing `check-pre-merge` hook from the
 candidate workspace. This keeps formatting and architecture rules project-owned;
 for example, this repository's hook rejects the dashboard `app` importing

@@ -1,4 +1,6 @@
 //! Run cheap, host-owned checks before Fluent spends a model-review cycle.
+//! Recheck corrective candidates from their original base and admit a history
+//! rewrite only when it repairs metadata without changing the candidate tree.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,8 +9,9 @@ use std::path::Path;
 
 use crate::work_model::{WriterCompletionContract, WriterCompletionRequirementKind};
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 1;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 2;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
+const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -52,7 +55,20 @@ pub struct CandidateGateEvidence {
     pub candidate_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tester_results_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_rewrite: Option<CandidateMetadataRewriteEvidence>,
     pub checks: Vec<CandidateCheckEvidence>,
+}
+
+/// Host-verified provenance for a pre-review rewrite that changed only commit
+/// metadata while preserving the rejected candidate's exact tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateMetadataRewriteEvidence {
+    pub prior_gate_path: String,
+    pub original_base_commit: String,
+    pub rejected_candidate_commit: String,
+    pub replacement_candidate_commit: String,
+    pub candidate_tree: String,
 }
 
 pub struct CandidateGateRequest<'a> {
@@ -70,10 +86,18 @@ pub struct CandidateGateRequest<'a> {
 }
 
 pub fn run_candidate_gate(request: CandidateGateRequest<'_>) -> Result<CandidateGateEvidence> {
+    run_candidate_gate_with_prior(request, None)
+}
+
+pub(crate) fn run_candidate_gate_with_prior(
+    request: CandidateGateRequest<'_>,
+    prior_candidate_gate_path: Option<&Path>,
+) -> Result<CandidateGateEvidence> {
+    let identity = check_candidate_identity(&request, prior_candidate_gate_path)?;
     let mut checks = vec![
-        check_candidate_identity(&request)?,
-        check_whitespace(&request)?,
-        check_commit_metadata(&request)?,
+        identity.check,
+        check_whitespace(&request, &identity.effective_base_commit)?,
+        check_commit_metadata(&request, &identity.effective_base_commit)?,
     ];
     checks.extend(check_behavior_references(&request)?);
     checks.push(run_project_check(&request)?);
@@ -95,11 +119,12 @@ pub fn run_candidate_gate(request: CandidateGateRequest<'_>) -> Result<Candidate
         schema_version: CANDIDATE_GATE_SCHEMA_VERSION,
         phase: request.phase,
         disposition,
-        base_commit: request.base_commit.to_string(),
+        base_commit: identity.effective_base_commit,
         candidate_commit: request.candidate_commit.to_string(),
         tester_results_path: request
             .tester_results_path
             .map(|path| evidence_path(request.project_root, path)),
+        metadata_rewrite: identity.metadata_rewrite,
         checks,
     };
     let parent = request
@@ -122,63 +147,271 @@ pub fn run_candidate_gate(request: CandidateGateRequest<'_>) -> Result<Candidate
     Ok(evidence)
 }
 
-fn check_candidate_identity(request: &CandidateGateRequest<'_>) -> Result<CandidateCheckEvidence> {
+struct CandidateIdentityResolution {
+    check: CandidateCheckEvidence,
+    effective_base_commit: String,
+    metadata_rewrite: Option<CandidateMetadataRewriteEvidence>,
+}
+
+fn check_candidate_identity(
+    request: &CandidateGateRequest<'_>,
+    prior_candidate_gate_path: Option<&Path>,
+) -> Result<CandidateIdentityResolution> {
     let head = crate::git::run_stdout(
         request.workspace,
         &["rev-parse", "HEAD"],
         "resolve candidate gate HEAD",
     );
     let mut diagnostics = Vec::new();
-    let status = match head {
-        Ok(head) if head == request.candidate_commit => {
-            let ancestor = crate::git::run_raw(
-                request.workspace,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
+    let mut effective_base_commit = request.base_commit.to_string();
+    let mut metadata_rewrite = None;
+
+    match head {
+        Ok(head) if head == request.candidate_commit => {}
+        Ok(head) => diagnostics.push(format!(
+            "candidate workspace HEAD {head} does not match {}",
+            request.candidate_commit
+        )),
+        Err(error) => diagnostics.push(format!("candidate HEAD cannot be resolved: {error:#}")),
+    }
+
+    if diagnostics.is_empty() {
+        let worktree = crate::git::run_stdout(
+            request.workspace,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "verify candidate gate cleanliness",
+        )?;
+        if !worktree.is_empty() {
+            diagnostics.push(format!(
+                "candidate workspace is dirty before admission:\n{worktree}"
+            ));
+        }
+    }
+
+    if diagnostics.is_empty() {
+        match prior_candidate_gate_path {
+            Some(path) => match read_prior_writer_gate(path) {
+                Ok(prior) => {
+                    if let Err(reason) = validate_prior_writer_gate(&prior, request.base_commit) {
+                        diagnostics.push(reason);
+                    } else if !is_ancestor(
+                        request.workspace,
+                        &prior.base_commit,
+                        &prior.candidate_commit,
+                    )? {
+                        diagnostics.push(format!(
+                            "prior candidate {} does not descend from original base {}",
+                            prior.candidate_commit, prior.base_commit
+                        ));
+                    } else {
+                        effective_base_commit = prior.base_commit.clone();
+                        let current_descends_from_rejected = is_ancestor(
+                            request.workspace,
+                            request.base_commit,
+                            request.candidate_commit,
+                        )?;
+                        if !current_descends_from_rejected {
+                            match validate_metadata_only_rewrite(request, path, &prior)? {
+                                Ok(evidence) => metadata_rewrite = Some(evidence),
+                                Err(reason) => diagnostics.push(reason),
+                            }
+                        }
+                    }
+                }
+                Err(reason) => diagnostics.push(reason),
+            },
+            None => {
+                if !is_ancestor(
+                    request.workspace,
                     request.base_commit,
                     request.candidate_commit,
-                ],
-            )?;
-            if ancestor.status.success() {
-                let worktree = crate::git::run_stdout(
-                    request.workspace,
-                    &["status", "--porcelain", "--untracked-files=all"],
-                    "verify candidate gate cleanliness",
-                )?;
-                if worktree.is_empty() {
-                    CandidateCheckStatus::Passed
-                } else {
+                )? {
                     diagnostics.push(format!(
-                        "candidate workspace is dirty before admission:\n{worktree}"
+                        "base commit {} is not an ancestor of candidate {}",
+                        request.base_commit, request.candidate_commit
                     ));
-                    CandidateCheckStatus::Error
                 }
-            } else {
-                diagnostics.push(format!(
-                    "base commit {} is not an ancestor of candidate {}",
-                    request.base_commit, request.candidate_commit
-                ));
-                CandidateCheckStatus::Error
             }
         }
-        Ok(head) => {
-            diagnostics.push(format!(
-                "candidate workspace HEAD {head} does not match {}",
-                request.candidate_commit
-            ));
-            CandidateCheckStatus::Error
-        }
-        Err(error) => {
-            diagnostics.push(format!("candidate HEAD cannot be resolved: {error:#}"));
-            CandidateCheckStatus::Error
-        }
+    }
+
+    if diagnostics.is_empty()
+        && !is_ancestor(
+            request.workspace,
+            &effective_base_commit,
+            request.candidate_commit,
+        )?
+    {
+        diagnostics.push(format!(
+            "original base commit {effective_base_commit} is not an ancestor of candidate {}",
+            request.candidate_commit
+        ));
+    }
+
+    let status = if diagnostics.is_empty() {
+        CandidateCheckStatus::Passed
+    } else {
+        CandidateCheckStatus::Error
     };
-    Ok(check("candidate-identity", status, diagnostics))
+    Ok(CandidateIdentityResolution {
+        check: check("candidate-identity", status, diagnostics),
+        effective_base_commit,
+        metadata_rewrite,
+    })
 }
 
-fn check_whitespace(request: &CandidateGateRequest<'_>) -> Result<CandidateCheckEvidence> {
-    let range = format!("{}..{}", request.base_commit, request.candidate_commit);
+fn is_ancestor(workspace: &Path, base: &str, candidate: &str) -> Result<bool> {
+    Ok(
+        crate::git::run_raw(workspace, &["merge-base", "--is-ancestor", base, candidate])?
+            .status
+            .success(),
+    )
+}
+
+fn read_prior_writer_gate(path: &Path) -> std::result::Result<CandidateGateEvidence, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("prior candidate gate cannot be inspected: {error}"))?;
+    if metadata.len() > CANDIDATE_GATE_MAX_BYTES {
+        return Err(format!(
+            "prior candidate gate is {} bytes; maximum is {CANDIDATE_GATE_MAX_BYTES} bytes",
+            metadata.len()
+        ));
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("prior candidate gate cannot be read: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("prior candidate gate is malformed: {error}"))
+}
+
+fn validate_prior_writer_gate(
+    prior: &CandidateGateEvidence,
+    expected_candidate: &str,
+) -> std::result::Result<(), String> {
+    if prior.schema_version == 0 || prior.schema_version > CANDIDATE_GATE_SCHEMA_VERSION {
+        return Err(format!(
+            "prior candidate gate uses unsupported schema version {}",
+            prior.schema_version
+        ));
+    }
+    if prior.phase != CandidateGatePhase::Writer
+        || prior.disposition != CandidateGateDisposition::Rejected
+    {
+        return Err("prior candidate gate is not a rejected Writer gate".to_string());
+    }
+    if prior.candidate_commit != expected_candidate {
+        return Err(format!(
+            "prior candidate gate names candidate {}, expected {expected_candidate}",
+            prior.candidate_commit
+        ));
+    }
+    let expected_checks = [
+        "candidate-identity",
+        "whitespace",
+        "commit-metadata",
+        "behavior-references",
+        "tester-reference-evidence",
+        "project-check",
+    ];
+    for name in expected_checks {
+        if prior
+            .checks
+            .iter()
+            .filter(|check| check.name == name)
+            .count()
+            != 1
+        {
+            return Err(format!(
+                "prior candidate gate must contain exactly one {name} check"
+            ));
+        }
+    }
+    if prior.checks.len() != expected_checks.len() {
+        return Err("prior candidate gate contains unknown or duplicate checks".to_string());
+    }
+    if prior
+        .checks
+        .iter()
+        .any(|check| check.status == CandidateCheckStatus::Error)
+    {
+        return Err("prior candidate gate contains an untrustworthy check error".to_string());
+    }
+    if prior
+        .checks
+        .iter()
+        .find(|check| check.name == "candidate-identity")
+        .is_none_or(|check| check.status != CandidateCheckStatus::Passed)
+    {
+        return Err("prior candidate gate did not establish candidate identity".to_string());
+    }
+    Ok(())
+}
+
+fn validate_metadata_only_rewrite(
+    request: &CandidateGateRequest<'_>,
+    prior_gate_path: &Path,
+    prior: &CandidateGateEvidence,
+) -> Result<std::result::Result<CandidateMetadataRewriteEvidence, String>> {
+    let failed = prior
+        .checks
+        .iter()
+        .filter(|check| check.status == CandidateCheckStatus::Failed)
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>();
+    if failed != ["commit-metadata"] {
+        return Ok(Err(format!(
+            "candidate history changed after prior gate failures: {}",
+            if failed.is_empty() {
+                "none".to_string()
+            } else {
+                failed.join(", ")
+            }
+        )));
+    }
+    let rejected_tree = crate::git::run_stdout(
+        request.workspace,
+        &["rev-parse", &format!("{}^{{tree}}", prior.candidate_commit)],
+        "resolve rejected candidate tree",
+    );
+    let replacement_tree = crate::git::run_stdout(
+        request.workspace,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", request.candidate_commit),
+        ],
+        "resolve replacement candidate tree",
+    );
+    let (rejected_tree, replacement_tree) = match (rejected_tree, replacement_tree) {
+        (Ok(rejected), Ok(replacement)) => (rejected, replacement),
+        (Err(error), _) => {
+            return Ok(Err(format!(
+                "rejected candidate tree cannot be resolved: {error:#}"
+            )));
+        }
+        (_, Err(error)) => {
+            return Ok(Err(format!(
+                "replacement candidate tree cannot be resolved: {error:#}"
+            )));
+        }
+    };
+    if rejected_tree != replacement_tree {
+        return Ok(Err(format!(
+            "rewritten candidate tree {replacement_tree} does not match rejected tree {rejected_tree}"
+        )));
+    }
+    Ok(Ok(CandidateMetadataRewriteEvidence {
+        prior_gate_path: evidence_path(request.project_root, prior_gate_path),
+        original_base_commit: prior.base_commit.clone(),
+        rejected_candidate_commit: prior.candidate_commit.clone(),
+        replacement_candidate_commit: request.candidate_commit.to_string(),
+        candidate_tree: replacement_tree,
+    }))
+}
+
+fn check_whitespace(
+    request: &CandidateGateRequest<'_>,
+    base_commit: &str,
+) -> Result<CandidateCheckEvidence> {
+    let range = format!("{}..{}", base_commit, request.candidate_commit);
     let output = crate::git::run_raw(request.workspace, &["diff", "--check", &range])?;
     if output.status.success() {
         Ok(check(
@@ -195,8 +428,11 @@ fn check_whitespace(request: &CandidateGateRequest<'_>) -> Result<CandidateCheck
     }
 }
 
-fn check_commit_metadata(request: &CandidateGateRequest<'_>) -> Result<CandidateCheckEvidence> {
-    let range = format!("{}..{}", request.base_commit, request.candidate_commit);
+fn check_commit_metadata(
+    request: &CandidateGateRequest<'_>,
+    base_commit: &str,
+) -> Result<CandidateCheckEvidence> {
+    let range = format!("{}..{}", base_commit, request.candidate_commit);
     let output = crate::git::run_raw(
         request.workspace,
         &[
@@ -784,6 +1020,249 @@ mod tests {
         let parsed: CandidateGateEvidence =
             serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
         assert_eq!(parsed, evidence);
+    }
+
+    #[test]
+    fn accepts_tree_identical_metadata_rewrite_from_legacy_gate() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        let prior =
+            run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        assert_eq!(prior.disposition, CandidateGateDisposition::Rejected);
+        assert_eq!(
+            prior
+                .checks
+                .iter()
+                .filter(|check| check.status == CandidateCheckStatus::Failed)
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["commit-metadata"]
+        );
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&prior_artifact).unwrap()).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy.as_object_mut().unwrap().remove("metadata_rewrite");
+        fs::write(&prior_artifact, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate metadata",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(evidence.base_commit, fixture.base);
+        assert_eq!(
+            check(&evidence, "commit-metadata").status,
+            CandidateCheckStatus::Passed
+        );
+        let persisted: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&artifact).unwrap()).unwrap();
+        assert_eq!(persisted, evidence);
+        let rewrite = persisted.metadata_rewrite.unwrap();
+        assert_eq!(rewrite.original_base_commit, fixture.base);
+        assert_eq!(rewrite.rejected_candidate_commit, rejected);
+        assert_eq!(rewrite.replacement_candidate_commit, replacement);
+        assert_eq!(rewrite.prior_gate_path, prior_artifact.to_string_lossy());
+    }
+
+    #[test]
+    fn blocks_metadata_rewrite_when_the_candidate_tree_changes() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        fs::write(
+            fixture.root.path().join("src/lib.rs"),
+            "pub fn value() { 1 }\n",
+        )
+        .unwrap();
+        crate::git::run(fixture.root.path(), &["add", "src/lib.rs"], "stage rewrite").unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate and tree",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert!(evidence.metadata_rewrite.is_none());
+        assert!(
+            check(&evidence, "candidate-identity")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("does not match rejected tree"))
+        );
+    }
+
+    #[test]
+    fn blocks_history_rewrite_after_mixed_gate_failures() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {    \n}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate metadata",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        let diagnostics = check(&evidence, "candidate-identity")
+            .diagnostics
+            .join("\n");
+        assert!(diagnostics.contains("candidate history changed"));
+        assert!(diagnostics.contains("whitespace"));
+        assert!(diagnostics.contains("commit-metadata"));
+    }
+
+    #[test]
+    fn blocks_non_ancestor_candidate_without_prior_gate() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add bad value");
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate(request).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+    }
+
+    #[test]
+    fn malformed_prior_gate_blocks_history_rewrite() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add bad value");
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        fs::write(&prior_artifact, "{not-json\n").unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert!(
+            check(&evidence, "candidate-identity")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("malformed"))
+        );
+    }
+
+    #[test]
+    fn continuation_rechecks_the_complete_candidate_range() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit("src/lib.rs", "pub fn value() {    \n}\n", "Add value");
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        let replacement = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Clean value");
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(evidence.base_commit, fixture.base);
+        assert!(evidence.metadata_rewrite.is_none());
+    }
+
+    #[test]
+    fn appended_commit_cannot_hide_prior_metadata_failure() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        let replacement = fixture.commit("src/extra.rs", "pub fn extra() {}\n", "Add extra");
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        assert_eq!(evidence.base_commit, fixture.base);
+        assert_eq!(
+            check(&evidence, "commit-metadata").status,
+            CandidateCheckStatus::Failed
+        );
     }
 
     #[test]
