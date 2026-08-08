@@ -1270,10 +1270,7 @@ fn review_task_round_number(attempt_id: &str, task_id: &str) -> Option<usize> {
 }
 
 fn is_review_phase_task(task: &Task) -> bool {
-    matches!(
-        task.kind,
-        TaskKind::Review | TaskKind::BehaviorTests | TaskKind::Tester
-    )
+    matches!(task.kind, TaskKind::Review | TaskKind::Tester)
 }
 
 fn is_task_ready(task: &Task, all_tasks: &[Task]) -> bool {
@@ -1295,9 +1292,7 @@ fn has_open_review_round(tasks: &[Task]) -> bool {
     for task in tasks.iter().rev() {
         match task.kind {
             TaskKind::Write => return false,
-            TaskKind::Review | TaskKind::BehaviorTests | TaskKind::Tester
-                if task.status != TaskStatus::Complete =>
-            {
+            TaskKind::Review | TaskKind::Tester if task.status != TaskStatus::Complete => {
                 return true;
             }
             _ => {}

@@ -4710,13 +4710,15 @@ Test: src/coder.rs (coder_kind_serializes_pi_as_kebab_case)
 ### B1
 
 WHEN Fluent creates an Attempt and resolves the coder, model, and reasoning
-effort for a role (writer, reviewer, or behavior-tests),
+effort for a writer or reviewer role,
 THE SYSTEM SHALL take each from the first source that provides it: a
-global command-line `--coder`, `--model`, or `--effort` override or its
-`--write-*`, `--review-*`, or `--behavior-tests-*` per-role override, then an
-env var, then the project `.fluent/config.yaml`, then the user
+`--write-*` or `--review-*` command-line override, then a global command-line
+`--coder`, `--model`, or `--effort` override, then an env var, then the project
+`.fluent/config.yaml`, then the user
 `~/.config/fluent/config.yaml`.
 Test: src/work_model.rs (resolve_coder_mapping_precedence_flag_env_config)
+Test: src/work_model.rs (merge_cli_global_model_fills_unset_roles)
+Test: src/work_model.rs (merge_cli_per_role_effort_wins_over_global)
 
 ### B2
 
@@ -4742,43 +4744,47 @@ Test: src/coder.rs (codex_command_omits_model_when_unset)
 
 ### B1
 
-WHEN Fluent executes a Task within an Attempt,
-THE SYSTEM SHALL invoke the Coder mapped to that Task's kind in
-the Attempt's coder mapping.
+WHEN Fluent executes a Writer or reviewer Task within an Attempt,
+THE SYSTEM SHALL invoke the Coder from that role's mapping on the Attempt.
 Test: src/work_model.rs (coder_mapping_for_task_kind_returns_correct_pair)
+
+### B1a
+
+WHEN Fluent executes a Tester Task within an Attempt,
+THE SYSTEM SHALL run the deterministic Tester without spawning a Coder.
+Test: src/work_task_executor.rs (tester_task_invokes_subcommand_not_coder)
 
 ### B2
 
 WHEN Fluent creates an Attempt with `--coder X` or `FLUENT_CODER=X` set and no
-per-Task-kind mapping specified,
-THE SYSTEM SHALL set that Attempt's coder mapping so every Task
-kind uses Coder X.
-Test: src/work_model.rs (resolve_coder_mapping_fluent_coder_sets_all_task_kinds)
+per-role mapping specified,
+THE SYSTEM SHALL set both role mappings to Coder X.
+Test: src/work_model.rs (resolve_coder_mapping_fluent_coder_sets_both_roles)
 
 ### B3
 
 IF an Attempt is created with no coder configuration,
 THEN THE SYSTEM SHALL set the Attempt's coder mapping to the
 user-configured default mapping, falling back to Claude for every
-Task kind when no user default is configured.
+role when no user default is configured.
 Test: src/work_model.rs (resolve_coder_mapping_default_when_nothing_set)
 
 ### B4
 
 WHEN Fluent invokes a Coder for a Task,
 THE SYSTEM SHALL invoke the Coder with the model from the
-Attempt's coder mapping entry for that Task's kind.
+Attempt role mapping selected for that Task kind.
 Test: src/work_model.rs (resolve_coder_mapping_stores_resolved_model_at_creation)
 
 ### B5
 
-WHEN Fluent creates an Attempt and a Task kind's mapping entry
+WHEN Fluent creates an Attempt and a role mapping
 has no explicit model,
 THE SYSTEM SHALL resolve the model from the per-Coder environment
 variable (`FLUENT_CLAUDE_MODEL`, `FLUENT_CODEX_MODEL`,
 `FLUENT_PI_MODEL`) or the Coder's built-in default, and store
 the resolved model in the mapping entry.
-Test: src/work_model.rs (resolve_coder_mapping_per_task_cli_flag_wins)
+Test: src/work_model.rs (resolve_coder_mapping_per_role_cli_flag_wins)
 
 ### B6
 
@@ -6403,12 +6409,52 @@ Test: src/content.rs (bundled_fluent_skill_documents_local_preview_boundary)
 
 ### B1
 
-WHEN configured `fluent init` receives `codex-balanced`, `codex-stronger`, or a
-complete custom profile,
-THE SYSTEM SHALL resolve explicit coder, model, and effort values for writer,
-reviewer, and behavior-test roles and preflight every distinct provider before
-the first initialization mutation.
-Test: tests/binary.rs (coder_profile_preflight_checks_command_and_authentication)
+WHEN configured `fluent init` receives `codex-balanced` or `codex-stronger`,
+THE SYSTEM SHALL resolve the documented Codex model at medium effort for both
+writer and reviewer.
+Test: src/setup.rs (curated_profiles_resolve_exact_writer_and_reviewer_mappings)
+
+### B1a
+
+WHEN configured `fluent init` receives `claude-balanced`,
+THE SYSTEM SHALL resolve Claude's provider-default model at medium effort for
+both writer and reviewer.
+Test: src/setup.rs (curated_profiles_resolve_exact_writer_and_reviewer_mappings)
+
+### B1b
+
+WHEN configured `fluent init` receives a mixed-provider curated profile,
+THE SYSTEM SHALL assign the named writer and reviewer providers with their
+balanced model and effort settings.
+Test: src/setup.rs (curated_profiles_resolve_exact_writer_and_reviewer_mappings)
+
+### B1c
+
+WHEN configured `fluent init` receives explicit writer or reviewer fields with
+a curated profile,
+THE SYSTEM SHALL replace only the supplied profile fields.
+Test: src/setup.rs (curated_profile_accepts_explicit_role_overrides)
+
+### B1d
+
+WHEN configured `fluent init` receives `custom`,
+THE SYSTEM SHALL require coder, model, and effort values for both writer and
+reviewer.
+Test: src/setup.rs (configured_setup_rejects_incomplete_custom_flags)
+
+### B1e
+
+WHEN configured `fluent init` receives a complete `custom` profile,
+THE SYSTEM SHALL resolve the supplied writer and reviewer values.
+Test: src/setup.rs (complete_custom_profile_resolves_both_roles)
+
+### B1f
+
+WHEN configured `fluent init` resolves a coder profile,
+THE SYSTEM SHALL preflight every distinct selected provider before the first
+initialization mutation.
+Test: tests/binary.rs (mixed_coder_profile_preflights_both_providers)
+Test: tests/binary.rs (claude_writer_profiles_preflight_only_selected_providers)
 
 ### B2
 
@@ -6428,11 +6474,15 @@ Test: src/content.rs (bundled_fluent_skill_offers_preflight_retry_or_reselection
 ### B4
 
 WHEN configured initialization succeeds,
-THE SYSTEM SHALL atomically merge the complete three-role profile into project
-configuration while preserving unrelated keys, and SHALL add `follow-up.mode`
-only for `execute`.
-Test: tests/binary.rs (coder_profile_apply_merges_all_roles_and_preserves_unrelated_config,
-coder_profile_apply_execute_merges_profile_and_follow_up_mode)
+THE SYSTEM SHALL atomically merge the complete two-role profile into project
+configuration while preserving unrelated keys.
+Test: tests/binary.rs (coder_profile_apply_merges_both_roles_and_preserves_unrelated_config)
+
+### B4a
+
+WHERE configured initialization uses `execute`,
+THE SYSTEM SHALL add `follow-up.mode: execute` to project configuration.
+Test: tests/binary.rs (coder_profile_apply_execute_merges_profile_and_follow_up_mode)
 
 ### B5
 
@@ -6444,9 +6494,42 @@ Test: tests/binary.rs (coder_profile_apply_failure_never_leaves_partial_mapping)
 ### B6
 
 WHEN first-time coder-profile setup completes,
-THE SYSTEM SHALL show the saved three-role mapping and explain that new Attempts
-freeze the effective mapping unless explicit Attempt overrides are supplied.
+THE SYSTEM SHALL show the saved writer and reviewer mapping.
 Test: src/content.rs (bundled_fluent_skill_reports_saved_profile_and_attempt_boundary)
+
+### B6a
+
+WHEN first-time coder-profile setup completes,
+THE SYSTEM SHALL explain that new Attempts freeze the effective mapping unless
+explicit Attempt overrides are supplied.
+Test: src/content.rs (bundled_fluent_skill_reports_saved_profile_and_attempt_boundary)
+
+### B7
+
+IF coder configuration names the retired `behavior-tests` role,
+THEN THE SYSTEM SHALL reject it.
+Test: src/config.rs (rejects_retired_behavior_test_coder_config)
+Test: src/config.rs (configured_profile_rejects_retired_role_without_changing_config)
+Test: tests/binary.rs (attempt_create_rejects_retired_behavior_test_coder_config)
+
+### B7a
+
+IF a persisted coder mapping names the retired `behavior-tests` role,
+THEN THE SYSTEM SHALL reject it.
+Test: src/work_model.rs (coder_mapping_rejects_retired_behavior_test_role)
+
+### B7b
+
+IF a Task kind names the retired `behavior-tests` role,
+THEN THE SYSTEM SHALL reject it.
+Test: src/work_model.rs (task_kind_parses_generic_kinds)
+
+### B7c
+
+IF a command-line argument names the retired `behavior-tests` role,
+THEN THE SYSTEM SHALL reject it.
+Test: tests/binary.rs (init_rejects_retired_behavior_test_role_flag)
+Test: tests/binary.rs (run_commands_reject_retired_role_flags_before_project_lookup)
 
 ---
 

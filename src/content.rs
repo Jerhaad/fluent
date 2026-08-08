@@ -913,8 +913,8 @@ Check item {{ITEM_ID}}.
                 "Before running `fluent init`",
                 "(a) propose",
                 "(b) execute",
-                "Which coder profile should Fluent save",
-                "After the user completes both choices, run one configured command",
+                "Which coder setup should Fluent use",
+                "After all choices are complete, run one configured command",
                 "fluent init --coder-profile codex-balanced --follow-up-mode propose",
             ],
         );
@@ -930,9 +930,15 @@ Check item {{ITEM_ID}}.
             .map(|(_, section)| section)
             .expect("the bundled skill must have first-time setup guidance");
         assert!(
-            setup.contains("(a) codex-balanced")
-                && setup.contains("(b) codex-stronger")
-                && setup.contains("(c) custom")
+            setup.contains("(a) Codex only")
+                && setup.contains("(b) Claude only")
+                && setup.contains("(c) Mixed providers")
+                && setup.contains("(d) Custom")
+                && setup.contains("codex-balanced")
+                && setup.contains("codex-stronger")
+                && setup.contains("claude-balanced")
+                && setup.contains("codex-write-claude-review")
+                && setup.contains("claude-write-codex-review")
         );
     }
 
@@ -940,20 +946,21 @@ Check item {{ITEM_ID}}.
     fn bundled_fluent_skill_names_complete_curated_profiles() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         let setup = skill.split_once("## First-time project setup").unwrap().1;
-        assert!(setup.contains("Codex, gpt-5.6-terra, medium effort for the writer,\n       reviewers, and behavior-test coder"));
-        assert!(setup.contains("Codex, gpt-5.6-sol, medium effort for the writer,\n       reviewers, and behavior-test coder"));
+        assert!(setup.contains("codex-balanced — gpt-5.6-terra, medium"));
+        assert!(setup.contains("codex-stronger — gpt-5.6-sol, medium"));
+        assert!(setup.contains("Claude's default model at medium effort"));
     }
 
     #[test]
     fn bundled_fluent_skill_explains_roles_before_custom_profile() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         let setup = skill.split_once("## First-time project setup").unwrap().1;
+        let normalized = setup.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_ordered(
-            setup,
+            &normalized,
             &[
-                "If the user chooses `custom`, explain",
-                "the writer\n   implements the change",
-                "Ask separately for the\n   coder, model, and effort for each role",
+                "For `custom`, explain that the writer implements the change and tests",
+                "Ask separately for each role's coder, model, and effort",
             ],
         );
     }
@@ -966,11 +973,18 @@ Check item {{ITEM_ID}}.
         assert_ordered(
             &setup,
             &[
-                "After the user completes both choices, run one configured command",
-                "Configured init first checks Git can track durable project files",
-                "then checks the host sandbox and providers",
+                "After all choices are complete, run one configured command",
+                "Configured init checks durable Git paths, the host sandbox, and each distinct selected provider before mutation",
             ],
         );
+    }
+
+    #[test]
+    fn bundled_fluent_skill_allows_curated_profile_field_overrides() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        assert!(skill.contains(
+            "Explicit role\n   flags may also override individual values in a curated profile"
+        ));
     }
 
     #[test]
@@ -1038,8 +1052,10 @@ Check item {{ITEM_ID}}.
     fn bundled_fluent_skill_reports_saved_profile_and_attempt_boundary() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         assert!(
-            skill.contains("show the saved coder, model, and effort")
-                && skill.contains("every new Attempt stores\n   the effective mapping unless the user supplies explicit Attempt overrides"),
+            skill.contains("show the saved coder, model, and effort for both roles")
+                && skill.contains(
+                    "new Attempts store them unless the user supplies explicit overrides"
+                ),
             "setup must explain saved profile and Attempt freezing"
         );
     }

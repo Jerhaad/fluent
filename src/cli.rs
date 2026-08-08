@@ -144,7 +144,8 @@ pub enum Commands {
 
     /// Initialize .fluent/ directory
     Init {
-        /// Curated coder profile: codex-balanced, codex-stronger, or custom
+        /// Coder profile: codex-balanced, codex-stronger, claude-balanced,
+        /// codex-write-claude-review, claude-write-codex-review, or custom
         #[arg(long)]
         coder_profile: Option<String>,
 
@@ -164,12 +165,6 @@ pub enum Commands {
         review_model: Option<String>,
         #[arg(long)]
         review_effort: Option<String>,
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
     },
 
     /// Clean stale Work Item artifacts and registered worktrees
@@ -395,18 +390,6 @@ pub enum AttemptCommands {
         /// Effort for review Tasks
         #[arg(long)]
         review_effort: Option<String>,
-
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
     },
 
     /// List Attempts for a Work Item
@@ -482,18 +465,6 @@ pub enum AttemptCommands {
         /// Effort for review Tasks
         #[arg(long)]
         review_effort: Option<String>,
-
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
 
         /// Execution runtime: local (default) or fargate
         #[arg(long)]
@@ -732,18 +703,6 @@ pub enum TaskCommands {
         /// Effort for review Tasks
         #[arg(long)]
         review_effort: Option<String>,
-
-        /// Coder for behavior-tests Tasks: claude, codex, or pi
-        #[arg(long)]
-        behavior_tests_coder: Option<String>,
-
-        /// Model for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_model: Option<String>,
-
-        /// Effort for behavior-tests Tasks
-        #[arg(long)]
-        behavior_tests_effort: Option<String>,
 
         /// Extra args passed through to the agent
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

@@ -307,7 +307,7 @@ For codebase, module, or area review-only work, create a Work Item, run `fluent 
 ### Coder selection
 
 `fluent attempt run` prints the resolved coder, model, and effort for each role
-(writer, reviewer, behavior-tests) before the first round. Before launching an
+(writer and reviewer) before the first round. Before launching an
 expensive run, present this plan to the user and confirm. Override per-run with
 `--coder`, `--model`, `--effort`, or per-role variants (`--write-model`,
 `--review-effort`, etc.). Configure defaults in `.fluent/config.yaml` (project)
@@ -321,9 +321,10 @@ coders:
     effort: high
   reviewer:
     coder: claude
-  behavior-tests:
-    coder: claude
 ```
+
+The `behavior-tests` role and flags are retired. Remove them from existing
+configuration and scripts; Fluent rejects them instead of translating them.
 
 Set a shared provider ceiling only in the user config:
 
@@ -378,51 +379,49 @@ When `.fluent/` does not exist:
    (b) execute — corrective findings are authorized and queued automatically
    ```
 
-2. After the user chooses, ask:
+2. After the user chooses, ask which profile family to use, then wait:
 
    ```text
-   Which coder profile should Fluent save for this project?
+   Which coder setup should Fluent use?
 
-   (a) codex-balanced — Codex, gpt-5.6-terra, medium effort for the writer,
-       reviewers, and behavior-test coder
-       (recommended: balanced capability and speed)
-   (b) codex-stronger — Codex, gpt-5.6-sol, medium effort for the writer,
-       reviewers, and behavior-test coder
-       (stronger reasoning when the extra time is worthwhile)
-   (c) custom — choose a coder, model, and effort for each role
+   (a) Codex only — choose balanced or stronger next (recommended: balanced speed)
+   (b) Claude only — use claude-balanced
+   (c) Mixed providers — choose the writer provider next
+   (d) Custom — choose every writer and reviewer value
    ```
 
-3. If the user chooses `custom`, explain before collecting values: the writer
-   implements the change, reviewers evaluate it from independent perspectives,
-   and the behavior-test coder writes or updates tests. Ask separately for the
-   coder, model, and effort for each role.
+3. For Codex, ask `(a) codex-balanced — gpt-5.6-terra, medium` or
+   `(b) codex-stronger — gpt-5.6-sol, medium`. For mixed, ask
+   `(a) codex-write-claude-review` or `(b) claude-write-codex-review`. Wait for
+   that answer. `claude-balanced` uses Claude's default model at medium effort.
 
-4. After the user completes both choices, run one configured command. For a
-   curated choice, use the selected profile identifier:
+4. For `custom`, explain that the writer implements the change and tests while
+   reviewers evaluate both independently. Ask separately for each role's coder,
+   model, and effort.
+
+5. After all choices are complete, run one configured command:
 
    ```sh
    fluent init --coder-profile codex-balanced --follow-up-mode propose
    ```
 
-   For `custom`, use `--coder-profile custom` and pass every `--write-*`,
-   `--review-*`, and `--behavior-tests-*` value the user chose.
+   For `custom`, pass every `--write-*` and `--review-*` value. Explicit role
+   flags may also override individual values in a curated profile.
 
-5. Configured init first checks Git can track durable project files, then checks
-   the host sandbox and providers. For `FLUENT_INIT_DURABLE_PATH_IGNORED`, show the
-   reported source, line, pattern, and affected path, then ask the user to remove
-   or narrow the rule. Fluent's generated `.fluent/.gitignore` ignores runtime
-   state such as `.fluent/work/` while retaining Expertise, hooks, and Tester
-   configuration. Recover `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped
-   host-agent flow above. For provider failures, offer the user a retry or a different profile.
+6. Configured init checks durable Git paths, the host sandbox, and each distinct
+   selected provider before mutation. For `FLUENT_INIT_DURABLE_PATH_IGNORED`,
+   show its source, line, pattern, and affected path; ask the user to narrow the rule.
+   Fluent's generated `.fluent/.gitignore` excludes runtime state such as `.fluent/work/`
+   while retaining Expertise, hooks, and Tester configuration. Recover
+   `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped host-agent flow above. For
+   provider failures, offer the user a retry or a different profile.
    These readiness checks do not promise future provider capacity.
 
-6. After success, show the saved coder, model, and effort for the writer,
-   reviewers, and behavior-test coder. Explain that every new Attempt stores
-   the effective mapping unless the user supplies explicit Attempt overrides.
+7. After success, show the saved coder, model, and effort for both roles. Explain
+   that new Attempts store them unless the user supplies explicit overrides.
 
-`execute` authorizes and queues trusted corrective Work. It does not start
-execution. A human must separately run `fluent scheduler run`; any resulting
-ready Merge Candidate still requires human inspection and landing.
+`execute` authorizes and queues trusted corrective Work but does not start it.
+A human must run `fluent scheduler run`; a ready candidate still needs inspection and landing.
 
 ## Writer testing contract
 

@@ -61,12 +61,6 @@ pub fn format_coder_plan(mapping: &CoderMapping) -> String {
         &mapping.review.model,
         mapping.review.effort.as_deref(),
     ));
-    lines.push(role_line(
-        "behavior-tests",
-        mapping.behavior_tests.coder.as_str(),
-        &mapping.behavior_tests.model,
-        mapping.behavior_tests.effort.as_deref(),
-    ));
     lines.join("\n")
 }
 
@@ -642,11 +636,6 @@ mod tests {
                 model: "o3".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Pi,
-                model: "pi-model".to_string(),
-                effort: None,
-            },
         };
         let plan = format_coder_plan(&mapping);
         assert!(plan.contains("writer"));
@@ -655,8 +644,6 @@ mod tests {
         assert!(plan.contains("reviewer"));
         assert!(plan.contains("codex"));
         assert!(plan.contains("o3"));
-        assert!(plan.contains("behavior-tests"));
-        assert!(plan.contains("pi"));
         assert!(!plan.contains("effort="));
     }
 
@@ -672,11 +659,6 @@ mod tests {
                 effort: None,
             },
             review: CoderModelPair {
-                coder: CoderKind::Claude,
-                model: String::new(),
-                effort: None,
-            },
-            behavior_tests: CoderModelPair {
                 coder: CoderKind::Claude,
                 model: String::new(),
                 effort: None,
@@ -705,20 +687,11 @@ mod tests {
                 model: "model-r".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Claude,
-                model: "model-bt".to_string(),
-                effort: Some("low".to_string()),
-            },
         };
         let plan = format_coder_plan(&mapping);
         assert!(
             plan.contains("effort=high"),
             "writer effort should appear; got:\n{plan}"
-        );
-        assert!(
-            plan.contains("effort=low"),
-            "behavior-tests effort should appear; got:\n{plan}"
         );
         let reviewer_line = plan.lines().find(|l| l.contains("reviewer")).unwrap();
         assert!(

@@ -3246,13 +3246,12 @@ pub struct CoderModelPair {
     pub effort: Option<String>,
 }
 
-/// Per-Task-kind coder mapping stored on each Attempt.
+/// Writer and reviewer coder mapping stored on each Attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoderMapping {
     pub write: CoderModelPair,
     pub review: CoderModelPair,
-    #[serde(rename = "behavior-tests")]
-    pub behavior_tests: CoderModelPair,
 }
 
 impl Default for CoderMapping {
@@ -3264,8 +3263,7 @@ impl Default for CoderMapping {
         };
         Self {
             write: default_pair.clone(),
-            review: default_pair.clone(),
-            behavior_tests: default_pair,
+            review: default_pair,
         }
     }
 }
@@ -3275,7 +3273,6 @@ impl CoderMapping {
         match kind {
             TaskKind::Write => &self.write,
             TaskKind::Review => &self.review,
-            TaskKind::BehaviorTests => &self.behavior_tests,
             TaskKind::Tester => &self.write,
             _ => &self.write,
         }
@@ -3292,7 +3289,6 @@ impl CoderMapping {
             let coder = CoderKind::resolve(Some(coder))?;
             mapping.write.coder = coder;
             mapping.review.coder = coder;
-            mapping.behavior_tests.coder = coder;
         }
 
         let overlay_pair = |pair: &mut CoderModelPair,
@@ -3324,13 +3320,6 @@ impl CoderMapping {
             &inputs.review_model,
             &inputs.review_effort,
         )?;
-        overlay_pair(
-            &mut mapping.behavior_tests,
-            &inputs.behavior_tests_coder,
-            &inputs.behavior_tests_model,
-            &inputs.behavior_tests_effort,
-        )?;
-
         Ok(mapping)
     }
 }
@@ -3347,9 +3336,6 @@ pub struct CoderMappingInputs {
     pub review_coder: Option<String>,
     pub review_model: Option<String>,
     pub review_effort: Option<String>,
-    pub behavior_tests_coder: Option<String>,
-    pub behavior_tests_model: Option<String>,
-    pub behavior_tests_effort: Option<String>,
     pub global_coder: Option<String>,
 }
 
@@ -3362,9 +3348,6 @@ impl CoderMappingInputs {
             || self.review_coder.is_some()
             || self.review_model.is_some()
             || self.review_effort.is_some()
-            || self.behavior_tests_coder.is_some()
-            || self.behavior_tests_model.is_some()
-            || self.behavior_tests_effort.is_some()
             || self.global_coder.is_some()
     }
 
@@ -3376,9 +3359,6 @@ impl CoderMappingInputs {
             review_coder: std::env::var("FLUENT_REVIEW_CODER").ok(),
             review_model: std::env::var("FLUENT_REVIEW_MODEL").ok(),
             review_effort: std::env::var("FLUENT_REVIEW_EFFORT").ok(),
-            behavior_tests_coder: std::env::var("FLUENT_BEHAVIOR_TESTS_CODER").ok(),
-            behavior_tests_model: std::env::var("FLUENT_BEHAVIOR_TESTS_MODEL").ok(),
-            behavior_tests_effort: std::env::var("FLUENT_BEHAVIOR_TESTS_EFFORT").ok(),
             global_coder: std::env::var("FLUENT_CODER").ok(),
         }
     }
@@ -3393,9 +3373,6 @@ impl CoderMappingInputs {
             review_coder: other.review_coder.or(self.review_coder),
             review_model: other.review_model.or(self.review_model),
             review_effort: other.review_effort.or(self.review_effort),
-            behavior_tests_coder: other.behavior_tests_coder.or(self.behavior_tests_coder),
-            behavior_tests_model: other.behavior_tests_model.or(self.behavior_tests_model),
-            behavior_tests_effort: other.behavior_tests_effort.or(self.behavior_tests_effort),
             global_coder: other.global_coder.or(self.global_coder),
         }
     }
@@ -3409,21 +3386,16 @@ impl CoderMappingInputs {
         write_model: Option<String>,
         review_coder: Option<String>,
         review_model: Option<String>,
-        behavior_tests_coder: Option<String>,
-        behavior_tests_model: Option<String>,
         global_coder: Option<String>,
         global_model: Option<String>,
         write_effort: Option<String>,
         review_effort: Option<String>,
-        behavior_tests_effort: Option<String>,
         global_effort: Option<String>,
     ) -> Self {
         let has_write_model = write_model.is_some();
         let has_review_model = review_model.is_some();
-        let has_bt_model = behavior_tests_model.is_some();
         let has_write_effort = write_effort.is_some();
         let has_review_effort = review_effort.is_some();
-        let has_bt_effort = behavior_tests_effort.is_some();
 
         if write_coder.is_some() {
             self.write_coder = write_coder;
@@ -3437,12 +3409,6 @@ impl CoderMappingInputs {
         if review_model.is_some() {
             self.review_model = review_model;
         }
-        if behavior_tests_coder.is_some() {
-            self.behavior_tests_coder = behavior_tests_coder;
-        }
-        if behavior_tests_model.is_some() {
-            self.behavior_tests_model = behavior_tests_model;
-        }
         if global_coder.is_some() {
             self.global_coder = global_coder;
         }
@@ -3453,9 +3419,6 @@ impl CoderMappingInputs {
             if !has_review_model {
                 self.review_model = Some(m.clone());
             }
-            if !has_bt_model {
-                self.behavior_tests_model = Some(m.clone());
-            }
         }
         if has_write_effort {
             self.write_effort = write_effort;
@@ -3463,18 +3426,12 @@ impl CoderMappingInputs {
         if has_review_effort {
             self.review_effort = review_effort;
         }
-        if has_bt_effort {
-            self.behavior_tests_effort = behavior_tests_effort;
-        }
         if let Some(ref e) = global_effort {
             if !has_write_effort {
                 self.write_effort = Some(e.clone());
             }
             if !has_review_effort {
                 self.review_effort = Some(e.clone());
-            }
-            if !has_bt_effort {
-                self.behavior_tests_effort = Some(e.clone());
             }
         }
         self
@@ -3522,10 +3479,10 @@ pub fn overlay_attempt_coder_mapping(
     Ok(effective)
 }
 
-/// Resolve a fully-populated CoderMapping from CLI flags, env vars, and defaults.
+/// Resolve a fully populated writer/reviewer mapping from layered inputs.
 ///
-/// Precedence per Task kind:
-/// 1. Per-Task-kind CLI flag / env var
+/// Precedence per role:
+/// 1. Per-role CLI flag / env var
 /// 2. Global `FLUENT_CODER` / per-Coder model env var
 /// 3. Coder's built-in default
 pub fn resolve_coder_mapping(inputs: &CoderMappingInputs) -> Result<CoderMapping, anyhow::Error> {
@@ -3568,11 +3525,6 @@ pub fn resolve_coder_mapping(inputs: &CoderMappingInputs) -> Result<CoderMapping
             &inputs.review_coder,
             &inputs.review_model,
             &inputs.review_effort,
-        )?,
-        behavior_tests: resolve_pair(
-            &inputs.behavior_tests_coder,
-            &inputs.behavior_tests_model,
-            &inputs.behavior_tests_effort,
         )?,
     })
 }
@@ -4089,7 +4041,6 @@ impl Attempt {
             if self.status == AttemptStatus::Complete
                 && task.status != TaskStatus::Complete
                 && task.kind != TaskKind::Rebase
-                && task.kind != TaskKind::BehaviorTests
             {
                 return Err(WorkModelError::CompleteAttemptHasIncompleteTask {
                     attempt_id: self.id.clone(),
@@ -4573,7 +4524,6 @@ pub enum TaskKind {
     Report,
     Learn,
     Probe,
-    BehaviorTests,
     Tester,
 }
 
@@ -4587,7 +4537,6 @@ impl TaskKind {
             Self::Report => "report",
             Self::Learn => "learn",
             Self::Probe => "probe",
-            Self::BehaviorTests => "behavior-tests",
             Self::Tester => "tester",
         }
     }
@@ -4605,7 +4554,6 @@ impl FromStr for TaskKind {
             "report" => Ok(Self::Report),
             "learn" => Ok(Self::Learn),
             "probe" => Ok(Self::Probe),
-            "behavior-tests" => Ok(Self::BehaviorTests),
             "tester" => Ok(Self::Tester),
             other => Err(ParseTaskKindError(other.to_string())),
         }
@@ -9002,21 +8950,8 @@ random banner prose that must be ignored
         assert_eq!("report".parse::<TaskKind>().unwrap(), TaskKind::Report);
         assert_eq!("learn".parse::<TaskKind>().unwrap(), TaskKind::Learn);
         assert_eq!("probe".parse::<TaskKind>().unwrap(), TaskKind::Probe);
-        assert_eq!(
-            "behavior-tests".parse::<TaskKind>().unwrap(),
-            TaskKind::BehaviorTests
-        );
+        assert!("behavior-tests".parse::<TaskKind>().is_err());
         assert!("triage".parse::<TaskKind>().is_err());
-    }
-
-    #[test]
-    fn task_kind_behavior_tests_round_trips() {
-        let json = serde_json::to_string(&TaskKind::BehaviorTests).unwrap();
-        assert_eq!(json, r#""behavior-tests""#);
-        let kind: TaskKind = serde_json::from_str(&json).unwrap();
-        assert_eq!(kind, TaskKind::BehaviorTests);
-        assert_eq!(TaskKind::BehaviorTests.as_str(), "behavior-tests");
-        assert_eq!(format!("{}", TaskKind::BehaviorTests), "behavior-tests");
     }
 
     #[test]
@@ -9046,7 +8981,7 @@ random banner prose that must be ignored
             }),
             evidence_review_context: None,
             input_artifacts: Vec::new(),
-            depends_on: Some("attempt-1-behavior-tests".to_string()),
+            depends_on: Some("attempt-1-review-tests".to_string()),
             output: None,
             created_at: None,
             started_at: None,
@@ -9054,12 +8989,9 @@ random banner prose that must be ignored
         };
 
         let json = serde_json::to_string_pretty(&task).unwrap();
-        assert!(json.contains(r#""depends_on": "attempt-1-behavior-tests""#));
+        assert!(json.contains(r#""depends_on": "attempt-1-review-tests""#));
         let parsed: Task = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            parsed.depends_on.as_deref(),
-            Some("attempt-1-behavior-tests")
-        );
+        assert_eq!(parsed.depends_on.as_deref(), Some("attempt-1-review-tests"));
     }
 
     #[test]
@@ -12396,16 +12328,22 @@ random banner prose that must be ignored
                 model: "claude-opus-4-6".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Codex,
-                model: "o3".to_string(),
-                effort: None,
-            },
         };
         let json = serde_json::to_string(&mapping).unwrap();
-        assert!(json.contains("\"behavior-tests\""));
+        assert!(!json.contains("behavior-tests"));
         let parsed: CoderMapping = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, mapping);
+    }
+
+    #[test]
+    fn coder_mapping_rejects_retired_behavior_test_role() {
+        let json = r#"{
+            "write":{"coder":"claude","model":""},
+            "review":{"coder":"claude","model":""},
+            "behavior-tests":{"coder":"claude","model":""}
+        }"#;
+        let error = serde_json::from_str::<CoderMapping>(json).unwrap_err();
+        assert!(error.to_string().contains("behavior-tests"));
     }
 
     #[test]
@@ -12414,7 +12352,6 @@ random banner prose that must be ignored
         let record: Attempt = serde_json::from_str(json).unwrap();
         assert_eq!(record.coder_mapping.write.coder, CoderKind::Claude);
         assert_eq!(record.coder_mapping.review.coder, CoderKind::Claude);
-        assert_eq!(record.coder_mapping.behavior_tests.coder, CoderKind::Claude);
     }
 
     #[test]
@@ -12431,11 +12368,6 @@ random banner prose that must be ignored
                     effort: None,
                 },
                 review: CoderModelPair {
-                    coder: CoderKind::Claude,
-                    model: "claude-opus-4-6".to_string(),
-                    effort: None,
-                },
-                behavior_tests: CoderModelPair {
                     coder: CoderKind::Claude,
                     model: "claude-opus-4-6".to_string(),
                     effort: None,
@@ -12468,21 +12400,13 @@ random banner prose that must be ignored
                 model: "review-model".to_string(),
                 effort: None,
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Codex,
-                model: "bt-model".to_string(),
-                effort: None,
-            },
         };
         assert_eq!(mapping.for_task_kind(TaskKind::Write).coder, CoderKind::Pi);
         assert_eq!(
             mapping.for_task_kind(TaskKind::Review).coder,
             CoderKind::Claude
         );
-        assert_eq!(
-            mapping.for_task_kind(TaskKind::BehaviorTests).coder,
-            CoderKind::Codex
-        );
+        assert_eq!(mapping.for_task_kind(TaskKind::Tester).coder, CoderKind::Pi);
     }
 
     #[test]
@@ -12491,7 +12415,6 @@ random banner prose that must be ignored
         let mapping = resolve_coder_mapping(&inputs).unwrap();
         assert_eq!(mapping.write.coder, CoderKind::Claude);
         assert_eq!(mapping.review.coder, CoderKind::Claude);
-        assert_eq!(mapping.behavior_tests.coder, CoderKind::Claude);
         assert!(
             mapping.write.model.is_empty(),
             "model should be empty when nothing is configured"
@@ -12503,16 +12426,15 @@ random banner prose that must be ignored
         let config = CoderMappingInputs {
             write_model: Some("config-model".to_string()),
             review_model: Some("config-review-model".to_string()),
-            behavior_tests_model: Some("config-bt-model".to_string()),
             ..Default::default()
         };
         let env = CoderMappingInputs {
             review_model: Some("env-review-model".to_string()),
             ..Default::default()
         };
-        let inputs = config.merge(env).merge_cli(
-            None, None, None, None, None, None, None, None, None, None, None, None,
-        );
+        let inputs = config
+            .merge(env)
+            .merge_cli(None, None, None, None, None, None, None, None, None);
         let mapping = resolve_coder_mapping(&inputs).unwrap();
         assert_eq!(
             mapping.write.model, "config-model",
@@ -12522,11 +12444,6 @@ random banner prose that must be ignored
             mapping.review.model, "env-review-model",
             "env overrides config"
         );
-        assert_eq!(
-            mapping.behavior_tests.model, "config-bt-model",
-            "config model used when env is unset"
-        );
-
         let config2 = CoderMappingInputs {
             write_model: Some("config-model".to_string()),
             review_model: Some("config-review-model".to_string()),
@@ -12546,9 +12463,6 @@ random banner prose that must be ignored
             None,
             None,
             None,
-            None,
-            None,
-            None,
         );
         let mapping2 = resolve_coder_mapping(&inputs2).unwrap();
         assert_eq!(
@@ -12558,7 +12472,7 @@ random banner prose that must be ignored
     }
 
     #[test]
-    fn resolve_coder_mapping_fluent_coder_sets_all_task_kinds() {
+    fn resolve_coder_mapping_fluent_coder_sets_both_roles() {
         let inputs = CoderMappingInputs {
             global_coder: Some("pi".to_string()),
             ..Default::default()
@@ -12566,11 +12480,10 @@ random banner prose that must be ignored
         let mapping = resolve_coder_mapping(&inputs).unwrap();
         assert_eq!(mapping.write.coder, CoderKind::Pi);
         assert_eq!(mapping.review.coder, CoderKind::Pi);
-        assert_eq!(mapping.behavior_tests.coder, CoderKind::Pi);
     }
 
     #[test]
-    fn resolve_coder_mapping_per_task_cli_flag_wins() {
+    fn resolve_coder_mapping_per_role_cli_flag_wins() {
         let inputs = CoderMappingInputs {
             global_coder: Some("claude".to_string()),
             write_coder: Some("pi".to_string()),
@@ -12860,13 +12773,11 @@ random banner prose that must be ignored
         let inputs = CoderMappingInputs {
             write_model: Some("custom-write-model".to_string()),
             review_model: Some("custom-review-model".to_string()),
-            behavior_tests_model: Some("custom-bt-model".to_string()),
             ..Default::default()
         };
         let mapping = resolve_coder_mapping(&inputs).unwrap();
         assert_eq!(mapping.write.model, "custom-write-model");
         assert_eq!(mapping.review.model, "custom-review-model");
-        assert_eq!(mapping.behavior_tests.model, "custom-bt-model");
     }
 
     #[test]
@@ -12932,7 +12843,6 @@ random banner prose that must be ignored
         let mapping = resolve_coder_mapping(&inputs).unwrap();
         assert_eq!(mapping.write.effort.as_deref(), Some("high"));
         assert_eq!(mapping.review.effort.as_deref(), Some("medium"));
-        assert!(mapping.behavior_tests.effort.is_none());
     }
 
     #[test]
@@ -12941,7 +12851,6 @@ random banner prose that must be ignored
             write_coder: Some("claude".to_string()),
             write_model: Some("base-model".to_string()),
             review_model: Some("base-review".to_string()),
-            behavior_tests_effort: Some("low".to_string()),
             ..Default::default()
         };
         let overlay = CoderMappingInputs {
@@ -12970,15 +12879,6 @@ random banner prose that must be ignored
             Some("base-review"),
             "base field preserved when overlay is None"
         );
-        assert_eq!(
-            merged.behavior_tests_effort.as_deref(),
-            Some("low"),
-            "base effort preserved when overlay is None"
-        );
-        assert!(
-            merged.behavior_tests_coder.is_none(),
-            "both None remains None"
-        );
     }
 
     #[test]
@@ -12994,24 +12894,16 @@ random banner prose that must be ignored
                 model: "stored-review".to_string(),
                 effort: Some("medium".to_string()),
             },
-            behavior_tests: CoderModelPair {
-                coder: CoderKind::Claude,
-                model: "stored-behavior".to_string(),
-                effort: Some("low".to_string()),
-            },
         };
         let inputs = CoderMappingInputs::default().merge_cli(
             Some("pi".to_string()),
             None,
             None,
             Some("review-override".to_string()),
-            None,
-            None,
             Some("claude".to_string()),
             Some("global-override".to_string()),
             None,
             Some("max".to_string()),
-            None,
             None,
         );
 
@@ -13023,9 +12915,6 @@ random banner prose that must be ignored
         assert_eq!(overlaid.review.coder, CoderKind::Claude);
         assert_eq!(overlaid.review.model, "review-override");
         assert_eq!(overlaid.review.effort.as_deref(), Some("max"));
-        assert_eq!(overlaid.behavior_tests.coder, CoderKind::Claude);
-        assert_eq!(overlaid.behavior_tests.model, "global-override");
-        assert_eq!(overlaid.behavior_tests.effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -13046,9 +12935,6 @@ random banner prose that must be ignored
             None,
             None,
             Some("explicit-review-model".to_string()),
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -13086,10 +12972,7 @@ random banner prose that must be ignored
             None,
             None,
             None,
-            None,
-            None,
             Some("global-model".to_string()),
-            None,
             None,
             None,
             None,
@@ -13104,11 +12987,6 @@ random banner prose that must be ignored
             Some("global-model"),
             "global fills review when no per-role CLI flag"
         );
-        assert_eq!(
-            merged.behavior_tests_model.as_deref(),
-            Some("global-model"),
-            "global fills behavior-tests when no per-role CLI flag"
-        );
     }
 
     #[test]
@@ -13122,10 +13000,7 @@ random banner prose that must be ignored
             None,
             None,
             None,
-            None,
-            None,
             Some("per-role-review".to_string()),
-            None,
             Some("high".to_string()),
         );
         assert_eq!(
@@ -13137,11 +13012,6 @@ random banner prose that must be ignored
             merged.review_effort.as_deref(),
             Some("per-role-review"),
             "per-role CLI effort wins over global"
-        );
-        assert_eq!(
-            merged.behavior_tests_effort.as_deref(),
-            Some("high"),
-            "global fills behavior-tests effort when no per-role CLI flag"
         );
     }
 
@@ -13155,9 +13025,6 @@ random banner prose that must be ignored
             ("FLUENT_REVIEW_CODER", "review-c"),
             ("FLUENT_REVIEW_MODEL", "review-m"),
             ("FLUENT_REVIEW_EFFORT", "review-e"),
-            ("FLUENT_BEHAVIOR_TESTS_CODER", "bt-c"),
-            ("FLUENT_BEHAVIOR_TESTS_MODEL", "bt-m"),
-            ("FLUENT_BEHAVIOR_TESTS_EFFORT", "bt-e"),
             ("FLUENT_CODER", "global-c"),
         ];
         // SAFETY: test is serialized via #[serial_test::serial]; no other
@@ -13182,9 +13049,6 @@ random banner prose that must be ignored
         assert_eq!(inputs.review_coder.as_deref(), Some("review-c"));
         assert_eq!(inputs.review_model.as_deref(), Some("review-m"));
         assert_eq!(inputs.review_effort.as_deref(), Some("review-e"));
-        assert_eq!(inputs.behavior_tests_coder.as_deref(), Some("bt-c"));
-        assert_eq!(inputs.behavior_tests_model.as_deref(), Some("bt-m"));
-        assert_eq!(inputs.behavior_tests_effort.as_deref(), Some("bt-e"));
         assert_eq!(inputs.global_coder.as_deref(), Some("global-c"));
     }
 
@@ -13198,9 +13062,6 @@ random banner prose that must be ignored
             "FLUENT_REVIEW_CODER",
             "FLUENT_REVIEW_MODEL",
             "FLUENT_REVIEW_EFFORT",
-            "FLUENT_BEHAVIOR_TESTS_CODER",
-            "FLUENT_BEHAVIOR_TESTS_MODEL",
-            "FLUENT_BEHAVIOR_TESTS_EFFORT",
             "FLUENT_CODER",
         ];
         // SAFETY: test is serialized; no concurrent env var readers.
@@ -13217,9 +13078,6 @@ random banner prose that must be ignored
         assert!(inputs.review_coder.is_none());
         assert!(inputs.review_model.is_none());
         assert!(inputs.review_effort.is_none());
-        assert!(inputs.behavior_tests_coder.is_none());
-        assert!(inputs.behavior_tests_model.is_none());
-        assert!(inputs.behavior_tests_effort.is_none());
         assert!(inputs.global_coder.is_none());
     }
 
@@ -13233,10 +13091,7 @@ random banner prose that must be ignored
             None,
             None,
             None,
-            None,
-            None,
             Some("write-effort".to_string()),
-            None,
             None,
             Some("global-effort".to_string()),
         );

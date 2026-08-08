@@ -37,9 +37,6 @@ pub struct InitSetupInputs {
     pub review_coder: Option<String>,
     pub review_model: Option<String>,
     pub review_effort: Option<String>,
-    pub behavior_tests_coder: Option<String>,
-    pub behavior_tests_model: Option<String>,
-    pub behavior_tests_effort: Option<String>,
 }
 
 pub struct ConfiguredSetup {
@@ -57,9 +54,6 @@ impl ConfiguredSetup {
             &inputs.review_coder,
             &inputs.review_model,
             &inputs.review_effort,
-            &inputs.behavior_tests_coder,
-            &inputs.behavior_tests_model,
-            &inputs.behavior_tests_effort,
         ]
         .iter()
         .any(|value| value.is_some());
@@ -80,30 +74,37 @@ impl ConfiguredSetup {
             .coder_profile
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("configured init requires --coder-profile"))?;
+        let role_inputs = CoderMappingInputs {
+            write_coder: inputs.write_coder,
+            write_model: inputs.write_model,
+            write_effort: inputs.write_effort,
+            review_coder: inputs.review_coder,
+            review_model: inputs.review_model,
+            review_effort: inputs.review_effort,
+            global_coder: None,
+        };
         let mapping = match profile {
-            "codex-balanced" => {
-                if custom_present {
-                    bail!("--coder-profile codex-balanced does not accept custom role flags");
-                }
-                curated("gpt-5.6-terra")
+            "codex-balanced" => curated_codex("gpt-5.6-terra").overlay_run_inputs(&role_inputs)?,
+            "codex-stronger" => curated_codex("gpt-5.6-sol").overlay_run_inputs(&role_inputs)?,
+            "claude-balanced" => curated_claude().overlay_run_inputs(&role_inputs)?,
+            "codex-write-claude-review" => CoderMapping {
+                write: codex_pair("gpt-5.6-terra"),
+                review: claude_pair(),
             }
-            "codex-stronger" => {
-                if custom_present {
-                    bail!("--coder-profile codex-stronger does not accept custom role flags");
-                }
-                curated("gpt-5.6-sol")
+            .overlay_run_inputs(&role_inputs)?,
+            "claude-write-codex-review" => CoderMapping {
+                write: claude_pair(),
+                review: codex_pair("gpt-5.6-terra"),
             }
+            .overlay_run_inputs(&role_inputs)?,
             "custom" => {
                 let values = [
-                    (&inputs.write_coder, "--write-coder"),
-                    (&inputs.write_model, "--write-model"),
-                    (&inputs.write_effort, "--write-effort"),
-                    (&inputs.review_coder, "--review-coder"),
-                    (&inputs.review_model, "--review-model"),
-                    (&inputs.review_effort, "--review-effort"),
-                    (&inputs.behavior_tests_coder, "--behavior-tests-coder"),
-                    (&inputs.behavior_tests_model, "--behavior-tests-model"),
-                    (&inputs.behavior_tests_effort, "--behavior-tests-effort"),
+                    (&role_inputs.write_coder, "--write-coder"),
+                    (&role_inputs.write_model, "--write-model"),
+                    (&role_inputs.write_effort, "--write-effort"),
+                    (&role_inputs.review_coder, "--review-coder"),
+                    (&role_inputs.review_model, "--review-model"),
+                    (&role_inputs.review_effort, "--review-effort"),
                 ];
                 let missing = values
                     .iter()
@@ -112,21 +113,10 @@ impl ConfiguredSetup {
                 if !missing.is_empty() {
                     bail!("--coder-profile custom requires {}", missing.join(", "));
                 }
-                resolve_coder_mapping(&CoderMappingInputs {
-                    write_coder: inputs.write_coder,
-                    write_model: inputs.write_model,
-                    write_effort: inputs.write_effort,
-                    review_coder: inputs.review_coder,
-                    review_model: inputs.review_model,
-                    review_effort: inputs.review_effort,
-                    behavior_tests_coder: inputs.behavior_tests_coder,
-                    behavior_tests_model: inputs.behavior_tests_model,
-                    behavior_tests_effort: inputs.behavior_tests_effort,
-                    global_coder: None,
-                })?
+                resolve_coder_mapping(&role_inputs)?
             }
             other => bail!(
-                "unknown --coder-profile {other:?}; expected codex-balanced, codex-stronger, or custom"
+                "unknown --coder-profile {other:?}; expected codex-balanced, codex-stronger, claude-balanced, codex-write-claude-review, claude-write-codex-review, or custom"
             ),
         };
         Ok(Some(Self {
@@ -136,27 +126,42 @@ impl ConfiguredSetup {
     }
 }
 
-fn curated(model: &str) -> CoderMapping {
-    let pair = CoderModelPair {
+fn codex_pair(model: &str) -> CoderModelPair {
+    CoderModelPair {
         coder: CoderKind::Codex,
         model: model.to_string(),
         effort: Some("medium".to_string()),
-    };
+    }
+}
+
+fn claude_pair() -> CoderModelPair {
+    CoderModelPair {
+        coder: CoderKind::Claude,
+        model: String::new(),
+        effort: Some("medium".to_string()),
+    }
+}
+
+fn curated_codex(model: &str) -> CoderMapping {
+    let pair = codex_pair(model);
     CoderMapping {
         write: pair.clone(),
-        review: pair.clone(),
-        behavior_tests: pair,
+        review: pair,
+    }
+}
+
+fn curated_claude() -> CoderMapping {
+    let pair = claude_pair();
+    CoderMapping {
+        write: pair.clone(),
+        review: pair,
     }
 }
 
 /// Check selected providers without asking any model to generate output.
 pub fn preflight_providers(mapping: &CoderMapping) -> Result<()> {
     let mut providers = Vec::new();
-    for provider in [
-        mapping.write.coder,
-        mapping.review.coder,
-        mapping.behavior_tests.coder,
-    ] {
+    for provider in [mapping.write.coder, mapping.review.coder] {
         if !providers.contains(&provider) {
             providers.push(provider);
         }
@@ -205,8 +210,19 @@ use equally narrow runtime-only exclusions instead of ignoring all of .fluent/."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configured_profile(profile: &str) -> ConfiguredSetup {
+        ConfiguredSetup::from_inputs(InitSetupInputs {
+            coder_profile: Some(profile.into()),
+            follow_up_mode: Some("propose".into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap()
+    }
+
     #[test]
-    fn configured_profile_merges_all_roles_without_follow_up_for_propose() {
+    fn configured_profile_merges_both_roles_without_follow_up_for_propose() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join(".fluent")).unwrap();
         std::fs::write(
@@ -233,13 +249,45 @@ mod tests {
         .unwrap();
         assert_eq!(value["unrelated"], "retained");
         assert!(value.get("follow-up").is_none());
-        for role in ["writer", "reviewer", "behavior-tests"] {
+        for role in ["writer", "reviewer"] {
             assert_eq!(value["coders"][role]["model"], "gpt-5.6-terra");
         }
     }
 
     #[test]
-    fn configured_setup_rejects_incomplete_and_conflicting_flags() {
+    fn curated_profiles_resolve_exact_writer_and_reviewer_mappings() {
+        let codex_balanced = configured_profile("codex-balanced");
+        assert_eq!(codex_balanced.mapping.write.coder, CoderKind::Codex);
+        assert_eq!(codex_balanced.mapping.write.model, "gpt-5.6-terra");
+        assert_eq!(codex_balanced.mapping.review, codex_balanced.mapping.write);
+
+        let codex_stronger = configured_profile("codex-stronger");
+        assert_eq!(codex_stronger.mapping.write.model, "gpt-5.6-sol");
+        assert_eq!(codex_stronger.mapping.review, codex_stronger.mapping.write);
+
+        let claude_balanced = configured_profile("claude-balanced");
+        assert_eq!(claude_balanced.mapping.write.coder, CoderKind::Claude);
+        assert!(claude_balanced.mapping.write.model.is_empty());
+        assert_eq!(
+            claude_balanced.mapping.review,
+            claude_balanced.mapping.write
+        );
+
+        let codex_writer = configured_profile("codex-write-claude-review");
+        assert_eq!(codex_writer.mapping.write.coder, CoderKind::Codex);
+        assert_eq!(codex_writer.mapping.write.model, "gpt-5.6-terra");
+        assert_eq!(codex_writer.mapping.review.coder, CoderKind::Claude);
+        assert!(codex_writer.mapping.review.model.is_empty());
+
+        let claude_writer = configured_profile("claude-write-codex-review");
+        assert_eq!(claude_writer.mapping.write.coder, CoderKind::Claude);
+        assert!(claude_writer.mapping.write.model.is_empty());
+        assert_eq!(claude_writer.mapping.review.coder, CoderKind::Codex);
+        assert_eq!(claude_writer.mapping.review.model, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn configured_setup_rejects_incomplete_custom_flags() {
         let incomplete = ConfiguredSetup::from_inputs(InitSetupInputs {
             coder_profile: Some("custom".into()),
             follow_up_mode: Some("propose".into()),
@@ -247,12 +295,42 @@ mod tests {
             ..Default::default()
         });
         assert!(incomplete.is_err());
-        let conflicting = ConfiguredSetup::from_inputs(InitSetupInputs {
+    }
+
+    #[test]
+    fn complete_custom_profile_resolves_both_roles() {
+        let setup = ConfiguredSetup::from_inputs(InitSetupInputs {
+            coder_profile: Some("custom".into()),
+            follow_up_mode: Some("propose".into()),
+            write_coder: Some("claude".into()),
+            write_model: Some("write-model".into()),
+            write_effort: Some("high".into()),
+            review_coder: Some("codex".into()),
+            review_model: Some("review-model".into()),
+            review_effort: Some("medium".into()),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(setup.mapping.write.coder, CoderKind::Claude);
+        assert_eq!(setup.mapping.write.model, "write-model");
+        assert_eq!(setup.mapping.write.effort.as_deref(), Some("high"));
+        assert_eq!(setup.mapping.review.coder, CoderKind::Codex);
+        assert_eq!(setup.mapping.review.model, "review-model");
+        assert_eq!(setup.mapping.review.effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn curated_profile_accepts_explicit_role_overrides() {
+        let overlaid = ConfiguredSetup::from_inputs(InitSetupInputs {
             coder_profile: Some("codex-balanced".into()),
             follow_up_mode: Some("propose".into()),
-            write_coder: Some("codex".into()),
+            write_coder: Some("claude".into()),
             ..Default::default()
-        });
-        assert!(conflicting.is_err());
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(overlaid.mapping.write.coder, CoderKind::Claude);
+        assert_eq!(overlaid.mapping.write.model, "gpt-5.6-terra");
+        assert_eq!(overlaid.mapping.review.coder, CoderKind::Codex);
     }
 }

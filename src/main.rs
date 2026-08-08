@@ -181,9 +181,6 @@ fn main() -> Result<()> {
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
         }) => {
             cmd_init(
                 &cwd,
@@ -196,9 +193,6 @@ fn main() -> Result<()> {
                     review_coder,
                     review_model,
                     review_effort,
-                    behavior_tests_coder,
-                    behavior_tests_model,
-                    behavior_tests_effort,
                 },
             )?;
         }
@@ -525,6 +519,22 @@ fn resolve_run_coder_mapping(
     attempt.coder_mapping.overlay_run_inputs(cli_inputs)
 }
 
+fn reject_retired_behavior_test_args(extra_args: &[String]) -> Result<()> {
+    if extra_args.iter().any(|argument| {
+        argument == "--behavior-tests-coder"
+            || argument.starts_with("--behavior-tests-coder=")
+            || argument == "--behavior-tests-model"
+            || argument.starts_with("--behavior-tests-model=")
+            || argument == "--behavior-tests-effort"
+            || argument.starts_with("--behavior-tests-effort=")
+    }) {
+        bail!(
+            "the behavior-tests coder role is retired; configure writer and reviewer roles instead"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_attempt(
     project_root: &Path,
     command: AttemptCommands,
@@ -577,9 +587,6 @@ fn cmd_attempt(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
         } => {
             let mut item = match store.read_work_item(&work_item_id) {
                 Ok(item) => item,
@@ -594,20 +601,17 @@ fn cmd_attempt(
             item.add_initial_attempt(attempt_id.clone())?;
 
             let coder_mapping = work_model::resolve_coder_mapping(
-                &fluent::config::from_config(project_root)
+                &fluent::config::from_config(project_root)?
                     .merge(work_model::CoderMappingInputs::from_env())
                     .merge_cli(
                         write_coder,
                         write_model,
                         review_coder,
                         review_model,
-                        behavior_tests_coder,
-                        behavior_tests_model,
                         coder.or_else(|| global_coder.map(str::to_string)),
                         model,
                         write_effort,
                         review_effort,
-                        behavior_tests_effort,
                         effort,
                     ),
             )?;
@@ -698,12 +702,10 @@ fn cmd_attempt(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
             runtime,
             extra_args,
         } => {
+            reject_retired_behavior_test_args(&extra_args)?;
             // Reject execution while the Work Item is proposed, before resolving
             // an Attempt to run, so proposed Work reports that human
             // authorization is required rather than that it has no Attempts.
@@ -740,13 +742,10 @@ fn cmd_attempt(
                 write_model,
                 review_coder,
                 review_model,
-                behavior_tests_coder,
-                behavior_tests_model,
                 coder.or_else(|| global_coder.map(str::to_string)),
                 model,
                 write_effort,
                 review_effort,
-                behavior_tests_effort,
                 effort,
             );
             let coder_mapping =
@@ -1233,23 +1232,18 @@ fn cmd_task(
             review_coder,
             review_model,
             review_effort,
-            behavior_tests_coder,
-            behavior_tests_model,
-            behavior_tests_effort,
             extra_args,
         } => {
+            reject_retired_behavior_test_args(&extra_args)?;
             let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
                 write_coder,
                 write_model,
                 review_coder,
                 review_model,
-                behavior_tests_coder,
-                behavior_tests_model,
                 coder.or_else(|| global_coder.map(str::to_string)),
                 model,
                 write_effort,
                 review_effort,
-                behavior_tests_effort,
                 effort,
             );
             work_model::overlay_attempt_coder_mapping(
@@ -1814,6 +1808,7 @@ fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
     if let Some(setup) = configured_setup.as_ref() {
         require_git_repository_root(cwd)?;
         fluent::setup::preflight_durable_paths(cwd)?;
+        fluent::config::preflight_project_coder_config(cwd)?;
         let resolver = ContentResolver::new(Some(cwd));
         os::preflight_host_execution(cwd, &resolver)?;
         fluent::setup::preflight_providers(&setup.mapping)?;
@@ -1843,15 +1838,16 @@ fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
             fluent::config::apply_project_coder_profile(cwd, &setup.mapping, setup.follow_up_mode)
                 .context("first-time setup is incomplete")?;
         eprintln!("  Saved coder profile:");
-        for (role, pair) in [
-            ("writer", &saved.write),
-            ("reviewer", &saved.review),
-            ("behavior-test", &saved.behavior_tests),
-        ] {
+        for (role, pair) in [("writer", &saved.write), ("reviewer", &saved.review)] {
+            let model = if pair.model.is_empty() {
+                "provider default"
+            } else {
+                pair.model.as_str()
+            };
             eprintln!(
                 "    {role}: {} {} {}",
                 pair.coder.as_str(),
-                pair.model,
+                model,
                 pair.effort.as_deref().unwrap_or("default")
             );
         }
@@ -1954,7 +1950,7 @@ This section is the always-loaded summary and is enough to drive fluent on its o
   uninitialized project, use the full fluent skill to choose a follow-up mode and explicit
   coder profile before running configured `fluent init`. Bare `fluent init` remains available
   for compatible automation; the full skill passes the profile and follow-up flags, preflights
-  providers, and saves the three-role mapping atomically.
+  providers, and saves the writer/reviewer mapping atomically.
 
 ### Ask the user easy-to-answer questions
 
@@ -2479,7 +2475,6 @@ mod tests {
             coder_mapping: CoderMapping {
                 write: pair(CoderKind::Pi),
                 review: pair(CoderKind::Claude),
-                behavior_tests: pair(CoderKind::Codex),
             },
             tasks: vec![Task {
                 id: "a1-task-1".to_string(),
@@ -2514,15 +2509,11 @@ mod tests {
 
     #[test]
     fn resolve_paused_coder_routes_through_canonical_mapping() {
-        // A paused Tester task resolves to the write coder — the canonical
-        // `for_task_kind` mapping, not the behavior-tests slot.
+        // A paused Tester task resolves to the write coder through the
+        // canonical `for_task_kind` mapping.
         assert_eq!(
             resolve_paused_coder(&attempt_with_paused_task(TaskKind::Tester)).as_deref(),
             Some("pi")
-        );
-        assert_eq!(
-            resolve_paused_coder(&attempt_with_paused_task(TaskKind::BehaviorTests)).as_deref(),
-            Some("codex")
         );
         assert_eq!(
             resolve_paused_coder(&attempt_with_paused_task(TaskKind::Review)).as_deref(),

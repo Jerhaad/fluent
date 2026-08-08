@@ -913,11 +913,14 @@ visible without silently expanding release acceptance.
 
 For an uninitialized project, the bundled full skill detects the missing
 `.fluent/` directory and asks separately for a follow-up mode and coder profile.
-The curated `codex-balanced` profile saves Codex `gpt-5.6-terra` at medium
-effort, while `codex-stronger` saves Codex `gpt-5.6-sol` at medium effort;
-both apply to writer, reviewer, and behavior-test roles. A custom profile
-collects the explicit coder, model, and effort for each role. The skill invokes
-one configured `fluent init` command only after every choice is complete.
+The curated profiles configure two roles: writer and reviewer.
+`codex-balanced` uses Codex `gpt-5.6-terra` at medium effort for both;
+`codex-stronger` substitutes `gpt-5.6-sol`; and `claude-balanced` uses Claude's
+provider-default model at medium effort. `codex-write-claude-review` and
+`claude-write-codex-review` use the balanced settings for the named providers.
+Explicit `--write-*` and `--review-*` values overlay individual curated fields.
+A custom profile requires the coder, model, and effort for both roles. The skill
+invokes one configured `fluent init` command only after every choice is complete.
 
 Configured init validates the complete argument combination, confirms the Git
 repository root, and asks Git whether its effective ignore rules hide any
@@ -930,14 +933,16 @@ filesystem mutation. The diagnostic recommends Fluent's generated
 hooks, the project Dockerfile, and Tester contract files trackable.
 
 After that gate, configured init preflights the enclosing host and every
-distinct provider before it creates `.fluent/`, installs skills, seeds
+distinct selected provider before it creates `.fluent/`, installs skills, seeds
 instructions, or writes configuration. Readiness checks command availability
 and local authentication without a model inference, so they cannot reserve or
 guarantee future provider capacity. The configuration writer parses the
-existing YAML, updates only the three role mappings and (for execute)
+existing YAML, updates only the two role mappings and (for execute)
 `follow-up.mode`, then atomically replaces the file. It preserves unrelated
 keys and never leaves a partial role mapping. `propose` adds no follow-up
-mapping. Bare `fluent init` remains compatible with existing non-interactive
+mapping. Coder configuration and persisted coder mappings reject the retired
+`behavior-tests` key instead of discarding or translating it. Bare `fluent init`
+remains compatible with existing non-interactive
 callers and therefore retains the legacy implicit-default path.
 
 Execute mode authorizes and queues corrective Work; it still requires a
@@ -1444,9 +1449,8 @@ the core model.
 ```
 
 The `kind` field accepts `write`, `review`, `merge`, `report`,
-`learn`, `probe`, or `tester`. The value `behavior-tests` is accepted
-on read for backward compatibility with stored state but is not created
-by current code. `workspace_access.reads` may list any number of
+`learn`, `probe`, or `tester`. Any other value is rejected.
+`workspace_access.reads` may list any number of
 workspaces. `workspace_access.writes` may be empty or contain one
 workspace. A `review` task must keep `writes` empty; reviewers write
 findings and notes under a required `artifact_area`.
@@ -1870,10 +1874,9 @@ Claude is the creation-time default. When creating an Attempt, select a
 different Coder with `--coder codex`, `--coder pi`, or
 `FLUENT_CODER=<coder>`.
 
-Each Attempt stores a per-Task-kind **coder mapping** that determines
-which Coder and model run each Task kind (write, review). Tester Tasks
-bypass the coder mapping entirely — they run as a deterministic
-subprocess without a Coder. Configure with per-Task-kind flags like
+Each Attempt stores a writer/reviewer **coder mapping** that determines
+which Coder and model run those agent roles. Tester Tasks run as a deterministic
+subprocess without a Coder. Configure with per-role flags like
 `--write-coder pi --write-model qwen3-30b-a3b --review-coder claude`.
 At Attempt creation, per-role and global CLI flags take precedence over
 environment, project config, user config, and coder defaults. Fluent stores the
@@ -2469,9 +2472,8 @@ configuration file, the filesystem is the manifest.
 
 ### Tester
 
-`tester.rs` implements the deterministic Tester subcommand. Tester
-replaces the LLM-driven BehaviorTests Task with a subcommand that
-reads `.fluent/tester.yaml`, runs each declared command sequentially,
+`tester.rs` implements the deterministic Tester subcommand. It reads
+`.fluent/tester.yaml`, runs each declared command sequentially,
 invokes `.fluent/extract-tester-results` to normalize per-test
 output, and assembles `tester-results.json` — the canonical artifact
 all reviewers consume.

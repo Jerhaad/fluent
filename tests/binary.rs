@@ -2353,7 +2353,7 @@ fn configured_init_checks_host_sandbox_before_provider_or_mutation() {
 }
 
 #[test]
-fn coder_profile_apply_merges_all_roles_and_preserves_unrelated_config() {
+fn coder_profile_apply_merges_both_roles_and_preserves_unrelated_config() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     let codex_home = tmp.path().join("codex-home");
@@ -2387,11 +2387,99 @@ fn coder_profile_apply_merges_all_roles_and_preserves_unrelated_config() {
             .unwrap();
     assert_eq!(config["unrelated"], "retained");
     assert!(config.get("follow-up").is_none());
-    for role in ["writer", "reviewer", "behavior-tests"] {
+    for role in ["writer", "reviewer"] {
         assert_eq!(config["coders"][role]["coder"], "codex");
         assert_eq!(config["coders"][role]["model"], "gpt-5.6-terra");
         assert_eq!(config["coders"][role]["effort"], "medium");
     }
+    assert!(config["coders"].get("behavior-tests").is_none());
+}
+
+#[test]
+fn init_help_lists_profiles_and_excludes_retired_role_flags() {
+    fluent_cmd()
+        .args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude-balanced"))
+        .stdout(predicate::str::contains("codex-write-claude-review"))
+        .stdout(predicate::str::contains("claude-write-codex-review"))
+        .stdout(predicate::str::contains("--behavior-tests-").not());
+}
+
+#[test]
+fn init_rejects_retired_behavior_test_role_flag() {
+    fluent_cmd()
+        .args(["init", "--behavior-tests-coder", "claude"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn run_commands_reject_retired_role_flags_before_project_lookup() {
+    for args in [
+        vec![
+            "attempt",
+            "run",
+            "missing-work",
+            "attempt-1",
+            "--",
+            "--behavior-tests-model=legacy-model",
+        ],
+        vec![
+            "task",
+            "run",
+            "missing-work",
+            "attempt-1",
+            "task-1",
+            "--",
+            "--behavior-tests-effort",
+            "low",
+        ],
+    ] {
+        fluent_cmd()
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "behavior-tests coder role is retired",
+            ))
+            .stderr(predicate::str::contains("not found").not());
+    }
+}
+
+#[test]
+fn attempt_create_rejects_retired_behavior_test_coder_config() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fs::write(
+        main_dir.join(".fluent/config.yaml"),
+        "coders:\n  behavior-tests:\n    coder: claude\n",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "retired-role",
+            "--title",
+            "Retired role",
+        ])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "retired-role", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("parse coder config"))
+        .stderr(predicate::str::contains("behavior-tests"));
+
+    let work_item = work_item_value(&main_dir, "retired-role");
+    assert!(work_item["attempts"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -2425,7 +2513,7 @@ fn coder_profile_apply_propose_writes_only_coder_mapping() {
 }
 
 #[test]
-fn coder_profile_preflight_checks_command_and_authentication() {
+fn mixed_coder_profile_preflights_both_providers() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     let codex_home = tmp.path().join("codex-home");
@@ -2448,12 +2536,6 @@ fn coder_profile_preflight_checks_command_and_authentication() {
         "claude",
         "#!/bin/bash\nprintf 'claude %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":true}\\n'\n",
     );
-    write_mock_executable(
-        &bin_dir,
-        "pi",
-        "#!/bin/bash\n[ \"$#\" -gt 0 ] || { printf 'bare pi\\n' >> \"${PREFLIGHT_LOG:?}\"; exit 77; }\nprintf 'pi %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1\" = \"--version\" ]\n",
-    );
-
     fluent_cmd()
         .current_dir(tmp.path())
         .env("PATH", mock_path(&bin_dir))
@@ -2462,47 +2544,62 @@ fn coder_profile_preflight_checks_command_and_authentication() {
         .args([
             "init",
             "--coder-profile",
-            "custom",
+            "codex-write-claude-review",
             "--follow-up-mode",
             "propose",
-            "--write-coder",
-            "codex",
-            "--write-model",
-            "test-codex",
-            "--write-effort",
-            "medium",
-            "--review-coder",
-            "claude",
-            "--review-model",
-            "test-claude",
-            "--review-effort",
-            "high",
-            "--behavior-tests-coder",
-            "pi",
-            "--behavior-tests-model",
-            "test-pi",
-            "--behavior-tests-effort",
-            "low",
         ])
         .assert()
         .success();
     let calls = fs::read_to_string(log).unwrap();
     assert!(calls.contains("codex login status"));
     assert!(calls.contains("claude auth status --json"));
-    assert!(calls.contains("pi --version"));
-    assert!(!calls.contains("bare pi"));
-    let config: serde_yaml::Value =
-        serde_yaml::from_str(&fs::read_to_string(tmp.path().join(".fluent/config.yaml")).unwrap())
-            .unwrap();
-    assert_eq!(config["unrelated"], "retained");
-    for (role, coder, model, effort) in [
-        ("writer", "codex", "test-codex", "medium"),
-        ("reviewer", "claude", "test-claude", "high"),
-        ("behavior-tests", "pi", "test-pi", "low"),
+}
+
+#[test]
+fn claude_writer_profiles_preflight_only_selected_providers() {
+    for (profile, expect_codex) in [
+        ("claude-balanced", false),
+        ("claude-write-codex-review", true),
     ] {
-        assert_eq!(config["coders"][role]["coder"], coder);
-        assert_eq!(config["coders"][role]["model"], model);
-        assert_eq!(config["coders"][role]["effort"], effort);
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let codex_home = tmp.path().join("codex-home");
+        let log = tmp.path().join("providers.log");
+        init_git_repo(tmp.path());
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("auth.json"), "authenticated").unwrap();
+        write_mock_codex(
+            &bin_dir,
+            "#!/bin/bash\nprintf 'codex %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2\" = \"login status\" ]\n",
+        );
+        write_mock_executable(
+            &bin_dir,
+            "claude",
+            "#!/bin/bash\nprintf 'claude %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":true}\\n'\n",
+        );
+
+        fluent_cmd()
+            .current_dir(tmp.path())
+            .env("PATH", mock_path(&bin_dir))
+            .env("CODEX_HOME", &codex_home)
+            .env("PREFLIGHT_LOG", &log)
+            .args([
+                "init",
+                "--coder-profile",
+                profile,
+                "--follow-up-mode",
+                "propose",
+            ])
+            .assert()
+            .success();
+
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains("claude auth status --json"), "{profile}");
+        assert_eq!(
+            calls.contains("codex login status"),
+            expect_codex,
+            "{profile}"
+        );
     }
 }
 
@@ -2565,12 +2662,6 @@ fn coder_profile_preflight_rejects_unauthenticated_claude_status() {
             "test-claude",
             "--review-effort",
             "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "test-claude",
-            "--behavior-tests-effort",
-            "medium",
         ])
         .assert()
         .failure()
@@ -2610,12 +2701,6 @@ fn coder_profile_preflight_keeps_network_failure_out_of_login_recovery() {
             "--review-model",
             "test-claude",
             "--review-effort",
-            "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "test-claude",
-            "--behavior-tests-effort",
             "medium",
         ])
         .assert()
@@ -2659,12 +2744,6 @@ fn coder_profile_preflight_redacts_failed_claude_diagnostics() {
             "--review-model",
             "test-claude",
             "--review-effort",
-            "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "test-claude",
-            "--behavior-tests-effort",
             "medium",
         ])
         .assert()
@@ -2714,12 +2793,6 @@ fn coder_profile_preflight_distinguishes_blocked_keychain_from_logged_out() {
             "test-claude",
             "--review-effort",
             "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "test-claude",
-            "--behavior-tests-effort",
-            "medium",
         ])
         .assert()
         .failure()
@@ -2761,12 +2834,6 @@ fn coder_profile_preflight_warns_for_old_claude_parallel_auth() {
             "--review-model",
             "test-claude",
             "--review-effort",
-            "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "test-claude",
-            "--behavior-tests-effort",
             "medium",
         ])
         .assert()
@@ -2841,12 +2908,6 @@ fn coder_profile_preflight_reports_every_failed_provider_without_mutation() {
             "--review-model",
             "review-model",
             "--review-effort",
-            "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "behavior-model",
-            "--behavior-tests-effort",
             "medium",
         ])
         .output()
@@ -3043,7 +3104,8 @@ fn init_seeds_local_preview_operating_boundary() {
     assert!(managed.contains("explicit\n  coder profile before running configured `fluent init`"));
     assert!(managed.contains("Bare `fluent init` remains available"));
     assert!(
-        managed.contains("preflights\n  providers, and saves the three-role mapping atomically")
+        managed
+            .contains("preflights\n  providers, and saves the writer/reviewer mapping atomically")
     );
     assert!(!managed.contains("autonomous execute → review → land"));
     assert!(!managed.contains("policy allows autonomous merging"));
@@ -5985,7 +6047,7 @@ fn write_readiness_counting_learner_mock(bin_dir: &Path, provider: &str, learner
         provider,
         &format!(
             "#!/bin/bash\n{readiness}\n{}{}",
-            BEHAVIOR_TESTS_MOCK_PRELUDE
+            PROVIDER_READINESS_MOCK_PRELUDE
                 .strip_prefix("#!/bin/bash\n")
                 .unwrap(),
             learner_body
@@ -18828,7 +18890,7 @@ fn commit_file(repo: &Path, path: &str, content: &str, message: &str) {
     git::run(repo, &["commit", "-m", message], "commit").unwrap();
 }
 
-const BEHAVIOR_TESTS_MOCK_PRELUDE: &str = r##"#!/bin/bash
+const PROVIDER_READINESS_MOCK_PRELUDE: &str = r##"#!/bin/bash
 
 if [ "$1 $2 $3" = "auth status --json" ]; then
     printf '{"loggedIn":true}\n'
@@ -18840,49 +18902,13 @@ if [ "$1" = "--version" ]; then
     exit 0
 fi
 
-if [ "${FLUENT_TASK_KIND:-}" = "behavior-tests" ]; then
-    args_blob=""
-    for arg in "$@"; do
-        args_blob="$args_blob $arg"
-    done
-    results_path=$(printf '%s' "$args_blob" \
-        | grep -oE '/[^ ]*/behavior-tests-results\.json' \
-        | head -n 1)
-
-    if [ -z "$results_path" ]; then
-        echo "mock-prelude: could not extract behavior-tests-results.json path from prompt" >&2
-        exit 1
-    fi
-
-    ran_at=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '1970-01-01T00:00:00Z')
-    candidate_commit=$(git rev-parse HEAD 2>/dev/null || echo '0000000000000000000000000000000000000000')
-
-    mkdir -p "$(dirname "$results_path")" 2>/dev/null
-    cat > "$results_path" <<JSON
-{
-  "ran_at": "$ran_at",
-  "candidate_commit": "$candidate_commit",
-  "commands_run": [],
-  "summary": {
-    "behaviors_total": 0,
-    "tested_passing": 0,
-    "tested_failing": 0,
-    "untestable": 0,
-    "missing_test_ref": 0
-  },
-  "behaviors": []
-}
-JSON
-    exit 0
-fi
-
 "##;
 
 fn write_mock_claude(bin_dir: &Path, script: &str) {
     fs::create_dir_all(bin_dir).unwrap();
 
     let script_body = script.strip_prefix("#!/bin/bash\n").unwrap_or(script);
-    let combined = format!("{}{}", BEHAVIOR_TESTS_MOCK_PRELUDE, script_body);
+    let combined = format!("{}{}", PROVIDER_READINESS_MOCK_PRELUDE, script_body);
 
     let claude_path = bin_dir.join("claude");
     fs::write(&claude_path, &combined).unwrap();
@@ -25379,7 +25405,7 @@ fn attempt_coder_model_flags_override_config() {
         mapping["write"]["coder"], "codex",
         "config coder used when CLI does not override"
     );
-    // --effort (global) should apply to all roles.
+    // --effort (global) should apply to both roles.
     assert_eq!(
         mapping["write"]["effort"], "high",
         "CLI --effort should override config effort for write"
@@ -25388,10 +25414,7 @@ fn attempt_coder_model_flags_override_config() {
         mapping["review"]["effort"], "high",
         "CLI --effort should apply to review"
     );
-    assert_eq!(
-        mapping["behavior-tests"]["effort"], "high",
-        "CLI --effort should apply to behavior-tests"
-    );
+    assert!(mapping.get("behavior-tests").is_none());
 }
 
 fn create_attempt_with_distinct_coder_mapping(main_dir: &Path, work_item_id: &str) {
@@ -25425,12 +25448,6 @@ fn create_attempt_with_distinct_coder_mapping(main_dir: &Path, work_item_id: &st
             "stored-review-model",
             "--review-effort",
             "medium",
-            "--behavior-tests-coder",
-            "claude",
-            "--behavior-tests-model",
-            "stored-behavior-model",
-            "--behavior-tests-effort",
-            "low",
         ])
         .assert()
         .success();
@@ -25439,7 +25456,7 @@ fn create_attempt_with_distinct_coder_mapping(main_dir: &Path, work_item_id: &st
 fn replace_coder_config(main_dir: &Path) {
     fs::write(
         main_dir.join(".fluent/config.yaml"),
-        "coders:\n  writer:\n    coder: claude\n    model: config-write\n    effort: low\n  reviewer:\n    coder: claude\n    model: config-review\n    effort: low\n  behavior-tests:\n    coder: pi\n    model: config-behavior\n    effort: high\n",
+        "coders:\n  writer:\n    coder: claude\n    model: config-write\n    effort: low\n  reviewer:\n    coder: claude\n    model: config-review\n    effort: low\n",
     )
     .unwrap();
 }
@@ -25506,9 +25523,6 @@ fn run_with_changed_coder_environment(
         .env("FLUENT_REVIEW_CODER", "claude")
         .env("FLUENT_REVIEW_MODEL", "env-review")
         .env("FLUENT_REVIEW_EFFORT", "high")
-        .env("FLUENT_BEHAVIOR_TESTS_CODER", "codex")
-        .env("FLUENT_BEHAVIOR_TESTS_MODEL", "env-behavior")
-        .env("FLUENT_BEHAVIOR_TESTS_EFFORT", "medium")
         .output()
         .unwrap()
 }
@@ -25584,9 +25598,7 @@ fn attempt_run_overrides_only_explicit_coder_mapping_fields() {
     assert_eq!(mapping["review"]["coder"], "claude");
     assert_eq!(mapping["review"]["model"], "run-review-model");
     assert_eq!(mapping["review"]["effort"], "max");
-    assert_eq!(mapping["behavior-tests"]["coder"], "claude");
-    assert_eq!(mapping["behavior-tests"]["model"], "run-global-model");
-    assert_eq!(mapping["behavior-tests"]["effort"], "low");
+    assert!(mapping.get("behavior-tests").is_none());
     remove_sibling_worktrees(&main_dir, &token);
 }
 
@@ -26804,9 +26816,7 @@ fn task_run_overrides_only_explicit_coder_mapping_fields() {
     assert_eq!(mapping["review"]["coder"], "claude");
     assert_eq!(mapping["review"]["model"], "task-review-model");
     assert_eq!(mapping["review"]["effort"], "max");
-    assert_eq!(mapping["behavior-tests"]["coder"], "claude");
-    assert_eq!(mapping["behavior-tests"]["model"], "task-global-model");
-    assert_eq!(mapping["behavior-tests"]["effort"], "low");
+    assert!(mapping.get("behavior-tests").is_none());
     remove_sibling_worktrees(&main_dir, &token);
 }
 

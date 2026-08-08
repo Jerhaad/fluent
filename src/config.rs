@@ -100,6 +100,7 @@ pub fn apply_project_coder_profile(
     mapping: &CoderMapping,
     mode: FollowUpMode,
 ) -> Result<CoderMapping> {
+    preflight_project_coder_config(root)?;
     let path = root.join(".fluent/config.yaml");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -117,7 +118,6 @@ pub fn apply_project_coder_profile(
     let coders = mapping_at_mut(root_map, "coders")?;
     write_role(coders, "writer", &mapping.write)?;
     write_role(coders, "reviewer", &mapping.review)?;
-    write_role(coders, "behavior-tests", &mapping.behavior_tests)?;
     if mode == FollowUpMode::Execute {
         mapping_at_mut(root_map, "follow-up")?.insert("mode".into(), "execute".into());
     }
@@ -846,14 +846,12 @@ struct Config {
 }
 
 #[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct CoderConfig {
     #[serde(default)]
     writer: RoleConfig,
     #[serde(default)]
     reviewer: RoleConfig,
-    #[serde(default)]
-    behavior_tests: RoleConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -875,9 +873,23 @@ fn project_config_path(project_root: &Path) -> std::path::PathBuf {
     project_root.join(".fluent/config.yaml")
 }
 
-fn read_config(path: &Path) -> Option<Config> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_yaml::from_str(&contents).ok()
+/// Reject an unreadable or invalid project coder mapping before setup mutates
+/// the project or checks external providers.
+pub fn preflight_project_coder_config(project_root: &Path) -> Result<()> {
+    read_config(&project_config_path(project_root)).map(|_| ())
+}
+
+fn read_config(path: &Path) -> Result<Option<Config>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read coder config {}", path.display()));
+        }
+    };
+    serde_yaml::from_str(&contents)
+        .with_context(|| format!("parse coder config {}", path.display()))
+        .map(Some)
 }
 
 fn config_to_inputs(config: &Config) -> CoderMappingInputs {
@@ -886,30 +898,30 @@ fn config_to_inputs(config: &Config) -> CoderMappingInputs {
         write_model: config.coders.writer.model.clone(),
         review_coder: config.coders.reviewer.coder.clone(),
         review_model: config.coders.reviewer.model.clone(),
-        behavior_tests_coder: config.coders.behavior_tests.coder.clone(),
-        behavior_tests_model: config.coders.behavior_tests.model.clone(),
         global_coder: None,
         write_effort: config.coders.writer.effort.clone(),
         review_effort: config.coders.reviewer.effort.clone(),
-        behavior_tests_effort: config.coders.behavior_tests.effort.clone(),
     }
 }
 
 /// Read user (`~/.config/fluent/config.yaml`) then project
 /// (`.fluent/config.yaml`) config, layering project over user.
-pub fn from_config(project_root: &Path) -> CoderMappingInputs {
-    let user = user_config_path().and_then(|p| read_config(&p));
-    let project = read_config(&project_config_path(project_root));
+pub fn from_config(project_root: &Path) -> Result<CoderMappingInputs> {
+    let user = user_config_path()
+        .map(|path| read_config(&path))
+        .transpose()?
+        .flatten();
+    let project = read_config(&project_config_path(project_root))?;
 
     let base = user.as_ref().map(config_to_inputs).unwrap_or_default();
 
-    match project {
+    Ok(match project {
         Some(ref proj) => {
             let proj_inputs = config_to_inputs(proj);
             base.merge(proj_inputs)
         }
         None => base,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -942,8 +954,6 @@ coders:
   reviewer:
     coder: codex
     model: o3
-  behavior-tests:
-    coder: claude
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.coders.writer.coder.as_deref(), Some("claude"));
@@ -954,11 +964,6 @@ coders:
         assert_eq!(config.coders.writer.effort.as_deref(), Some("high"));
         assert_eq!(config.coders.reviewer.coder.as_deref(), Some("codex"));
         assert_eq!(config.coders.reviewer.model.as_deref(), Some("o3"));
-        assert_eq!(
-            config.coders.behavior_tests.coder.as_deref(),
-            Some("claude")
-        );
-        assert!(config.coders.behavior_tests.model.is_none());
     }
 
     #[test]
@@ -975,6 +980,32 @@ coders:
             Some("claude-sonnet-4-6")
         );
         assert!(config.coders.reviewer.coder.is_none());
+    }
+
+    #[test]
+    fn rejects_retired_behavior_test_coder_config() {
+        let yaml = "coders:\n  behavior-tests:\n    coder: claude\n";
+        let error = serde_yaml::from_str::<Config>(yaml).unwrap_err();
+        assert!(format!("{error:#}").contains("behavior-tests"));
+    }
+
+    #[test]
+    fn configured_profile_rejects_retired_role_without_changing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(".fluent")).unwrap();
+        let path = directory.path().join(".fluent/config.yaml");
+        let original = "coders:\n  behavior-tests:\n    coder: claude\n";
+        std::fs::write(&path, original).unwrap();
+
+        let error = apply_project_coder_profile(
+            directory.path(),
+            &CoderMapping::default(),
+            FollowUpMode::Propose,
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("behavior-tests"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
@@ -996,10 +1027,6 @@ coders:
   reviewer:
     coder: codex
     model: o3
-  behavior-tests:
-    coder: claude
-    model: claude-opus-4-6
-    effort: low
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         let inputs = config_to_inputs(&config);
@@ -1008,12 +1035,6 @@ coders:
         assert_eq!(inputs.write_effort.as_deref(), Some("high"));
         assert_eq!(inputs.review_coder.as_deref(), Some("codex"));
         assert_eq!(inputs.review_model.as_deref(), Some("o3"));
-        assert_eq!(inputs.behavior_tests_coder.as_deref(), Some("claude"));
-        assert_eq!(
-            inputs.behavior_tests_model.as_deref(),
-            Some("claude-opus-4-6")
-        );
-        assert_eq!(inputs.behavior_tests_effort.as_deref(), Some("low"));
     }
 
     #[test]
@@ -1027,14 +1048,14 @@ coders:
         )
         .unwrap();
 
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert_eq!(inputs.write_model.as_deref(), Some("custom-model"));
     }
 
     #[test]
     fn from_config_returns_empty_when_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert!(inputs.write_coder.is_none());
         assert!(inputs.write_model.is_none());
     }
@@ -1050,7 +1071,7 @@ coders:
         )
         .unwrap();
 
-        let inputs = from_config(dir.path());
+        let inputs = from_config(dir.path()).unwrap();
         assert_eq!(inputs.write_model.as_deref(), Some("project-model"));
     }
 
@@ -1436,7 +1457,6 @@ coders:
         assert_eq!(inputs.write_model.as_deref(), Some("o4-mini"));
         assert_eq!(inputs.review_coder.as_deref(), Some("claude"));
         assert!(inputs.review_model.is_none());
-        assert!(inputs.behavior_tests_coder.is_none());
     }
 
     #[test]

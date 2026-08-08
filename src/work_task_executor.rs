@@ -554,9 +554,6 @@ pub fn run_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
     let result = match task_kind {
         TaskKind::Write => run_write_task(config),
         TaskKind::Review => run_review_task(config),
-        TaskKind::BehaviorTests => {
-            bail!("BehaviorTests tasks are retired; use Tester tasks instead")
-        }
         TaskKind::Tester => run_tester_task(config),
         kind => bail!(
             "Task {:?} is kind {kind}; unsupported by task run",
@@ -13354,19 +13351,6 @@ mod tests {
                 ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester/tester-results.json"
             )
         );
-    }
-
-    #[test]
-    fn tester_task_does_not_spawn_coder_process() {
-        let item = review_item_with_final_tester();
-        let attempt = &item.attempts[0];
-        let tester_task = attempt
-            .tasks
-            .iter()
-            .find(|t| t.kind == TaskKind::Tester)
-            .expect("should have a Tester task");
-        assert_eq!(tester_task.kind, TaskKind::Tester);
-        assert_ne!(tester_task.kind, TaskKind::BehaviorTests);
     }
 
     #[test]
