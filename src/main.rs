@@ -2083,6 +2083,8 @@ fn cmd_skills_add(
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME not set; cannot locate agent skills directory"))?;
 
+    preflight_external_shim_handoffs(cwd, &home, force_global, force_project, agent.as_deref())?;
+
     let names = fluent::content::bundled_skill_names();
 
     // Always write the full skill to the fixed data directory so the shim
@@ -2096,9 +2098,12 @@ fn cmd_skills_add(
 
     for dir in &install_dirs {
         let (agent_name, scope) = install_identity(cwd, dir);
+        let lock_path = external_skill_lock_path(cwd, &home, dir);
         let outcomes = names
             .iter()
-            .map(|name| install_skill(name, dir, agent_name, scope))
+            .map(|name| {
+                install_skill_with_external_handoff(name, dir, agent_name, scope, Some(&lock_path))
+            })
             .collect::<Result<Vec<_>>>()?;
         if outcomes
             .iter()
@@ -2119,8 +2124,20 @@ fn cmd_skills_add(
         }
     }
 
+    // Scan bounded project and global roots for a Fluent-marked bootstrap shim
+    // beyond the selected install targets. This adopts an npx-installed
+    // canonical shim without creating any otherwise absent agent root.
+    let scan_dirs =
+        shim_scan_candidate_dirs(cwd, &home, force_global, force_project, agent.as_deref());
+    for dir in &scan_dirs {
+        if install_dirs.iter().any(|candidate| candidate == dir) {
+            continue;
+        }
+        replace_shim_if_present(cwd, &home, dir)?;
+    }
+
     let mut reported_dirs = install_dirs.clone();
-    for dir in fluent_installation_dirs(cwd, &home) {
+    for dir in fluent_installation_dirs(cwd, &home)? {
         if !reported_dirs.contains(&dir) {
             reported_dirs.push(dir);
         }
@@ -2143,24 +2160,21 @@ fn cmd_skills_add(
         );
     }
 
-    // Scan for shim-marked fluent installations in candidate directories
-    // beyond what we just installed to and replace them.
-    let scan_dirs = shim_scan_candidate_dirs(&home);
-    for dir in &scan_dirs {
-        if install_dirs.iter().any(|d| d == dir) {
-            continue;
-        }
-        replace_shim_if_present(dir)?;
-    }
-
     Ok(())
 }
 
-fn fluent_installation_dirs(cwd: &Path, home: &str) -> Vec<PathBuf> {
-    global_skill_roots(home)
+fn fluent_installation_dirs(cwd: &Path, home: &str) -> Result<Vec<PathBuf>> {
+    shim_candidate_roots(cwd, home)
         .into_iter()
-        .chain(std::iter::once(cwd.join(".claude/skills")))
         .filter(|dir| dir.join("fluent").is_dir())
+        .filter_map(|dir| {
+            let (agent, scope) = install_identity(cwd, &dir);
+            match skill_install::is_managed_bundled_skill("fluent", &dir, agent, scope) {
+                Ok(true) => Some(Ok(dir)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
         .collect()
 }
 
@@ -2175,11 +2189,93 @@ fn install_skill(skill: &str, dir: &Path, agent: &str, scope: &str) -> Result<In
     Ok(outcome)
 }
 
+fn install_skill_with_external_handoff(
+    skill: &str,
+    dir: &Path,
+    agent: &str,
+    scope: &str,
+    lock_path: Option<&Path>,
+) -> Result<InstallOutcome> {
+    let should_handoff = skill == "fluent" && is_sidecar_free_fluent_shim(dir)?;
+    let handoff = if should_handoff {
+        lock_path
+            .map(skill_install::prepare_external_skill_lock_handoff)
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    complete_external_skill_handoff(handoff, &dir.join(skill), || {
+        install_skill(skill, dir, agent, scope)
+    })
+}
+
+fn is_sidecar_free_fluent_shim(skills_dir: &Path) -> Result<bool> {
+    if !is_fluent_shim(skills_dir) {
+        return Ok(false);
+    }
+    let sidecar = skills_dir.join("fluent/.fluent-managed.json");
+    match fs::symlink_metadata(&sidecar) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to inspect {}", sidecar.display()))
+        }
+    }
+}
+
+fn complete_external_skill_handoff<F>(
+    handoff: Option<skill_install::ExternalSkillLockHandoff>,
+    managed_path: &Path,
+    install: F,
+) -> Result<InstallOutcome>
+where
+    F: FnOnce() -> Result<InstallOutcome>,
+{
+    if let Some(handoff) = handoff.as_ref() {
+        handoff.apply()?;
+    }
+
+    let result = install();
+    match result {
+        Ok(InstallOutcome::ReplacedShim) => {
+            if let Some(handoff) = handoff {
+                eprintln!(
+                    "Removed Fluent's bootstrap entry from {}; Fluent now manages {}",
+                    handoff.path().display(),
+                    managed_path.display()
+                );
+            }
+            Ok(InstallOutcome::ReplacedShim)
+        }
+        Ok(outcome) => {
+            if let Some(handoff) = handoff {
+                handoff.restore()?;
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if let Some(handoff) = handoff
+                && let Err(restore_error) = handoff.restore()
+            {
+                bail!("{error:#}; also failed to restore external skill lock: {restore_error:#}");
+            }
+            Err(error)
+        }
+    }
+}
+
 fn install_identity(cwd: &Path, dir: &Path) -> (&'static str, &'static str) {
     if dir == cwd.join(".claude/skills") {
         ("claude", "project")
+    } else if dir == cwd.join(".codex/skills") {
+        ("codex", "project")
+    } else if dir == cwd.join(".agents/skills") {
+        ("universal", "project")
     } else if dir.ends_with(".codex/skills") {
         ("codex", "global")
+    } else if dir.ends_with(".agents/skills") || dir.ends_with(".config/agents/skills") {
+        ("universal", "global")
     } else {
         ("claude", "global")
     }
@@ -2239,54 +2335,89 @@ fn all_agent_skill_dirs(home: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-const SHIM_MARKER: &str = "fluent-shim: true";
-
 fn is_fluent_shim(skills_dir: &Path) -> bool {
-    let skill_md = skills_dir.join("fluent/SKILL.md");
-    match fs::read_to_string(&skill_md) {
-        Ok(content) => content.contains(SHIM_MARKER),
-        Err(_) => false,
-    }
+    skill_install::is_fluent_shim(&skills_dir.join("fluent"))
 }
 
-fn replace_shim_if_present(skills_dir: &Path) -> Result<()> {
+fn replace_shim_if_present(cwd: &Path, home: &str, skills_dir: &Path) -> Result<()> {
     if !is_fluent_shim(skills_dir) {
         return Ok(());
     }
-    let agent = if skills_dir.ends_with(".codex/skills") {
-        "codex"
-    } else {
-        "claude"
-    };
-    let outcome = install_skill("fluent", skills_dir, agent, "global")?;
+    let (agent, scope) = install_identity(cwd, skills_dir);
+    let lock_path = external_skill_lock_path(cwd, home, skills_dir);
+    let outcome =
+        install_skill_with_external_handoff("fluent", skills_dir, agent, scope, Some(&lock_path))?;
     if outcome == InstallOutcome::ReplacedShim {
         eprintln!("Replaced fluent shim in {}", skills_dir.display());
     }
     Ok(())
 }
 
-/// Candidate directories where a fluent shim might have been installed by
-/// the `skills` CLI. These are the known per-agent skill directories.
-fn shim_scan_candidate_dirs(home: &str) -> Vec<PathBuf> {
-    let home = PathBuf::from(home);
-    let mut dirs = Vec::new();
+/// Candidate directories where the external `skills` CLI may install a shim.
+fn shim_candidate_roots(cwd: &Path, home: &str) -> Vec<PathBuf> {
+    let mut roots = project_shim_candidate_roots(cwd);
+    roots.extend(global_shim_candidate_roots(home));
+    roots
+}
 
-    // Claude Code per-agent directories
-    for agent in &["claude", "codex"] {
-        let dir = home.join(format!(".{agent}/skills"));
-        if dir.is_dir() {
-            dirs.push(dir);
+fn project_shim_candidate_roots(cwd: &Path) -> Vec<PathBuf> {
+    vec![
+        cwd.join(".agents/skills"),
+        cwd.join(".claude/skills"),
+        cwd.join(".codex/skills"),
+    ]
+}
+
+fn global_shim_candidate_roots(home: &str) -> Vec<PathBuf> {
+    let home = PathBuf::from(home);
+    vec![
+        home.join(".agents/skills"),
+        home.join(".config/agents/skills"),
+        home.join(".claude/skills"),
+        home.join(".codex/skills"),
+    ]
+}
+
+fn shim_scan_candidate_dirs(
+    cwd: &Path,
+    home: &str,
+    force_global: bool,
+    force_project: bool,
+    agent: Option<&str>,
+) -> Vec<PathBuf> {
+    let roots = if force_project {
+        project_shim_candidate_roots(cwd)
+    } else if force_global || agent.is_some() {
+        global_shim_candidate_roots(home)
+    } else {
+        shim_candidate_roots(cwd, home)
+    };
+    roots.into_iter().filter(|dir| dir.is_dir()).collect()
+}
+
+fn preflight_external_shim_handoffs(
+    cwd: &Path,
+    home: &str,
+    force_global: bool,
+    force_project: bool,
+    agent: Option<&str>,
+) -> Result<()> {
+    for dir in shim_scan_candidate_dirs(cwd, home, force_global, force_project, agent) {
+        if is_sidecar_free_fluent_shim(&dir)? {
+            let lock_path = external_skill_lock_path(cwd, home, &dir);
+            skill_install::prepare_external_skill_lock_handoff(&lock_path)?;
         }
     }
+    Ok(())
+}
 
-    // The main ~/.claude/skills is a global root, included for completeness
-    // but will be skipped if already in global_dirs.
-    let claude_skills = home.join(".claude/skills");
-    if claude_skills.is_dir() && !dirs.contains(&claude_skills) {
-        dirs.push(claude_skills);
+fn external_skill_lock_path(cwd: &Path, home: &str, skills_dir: &Path) -> PathBuf {
+    let (_, scope) = install_identity(cwd, skills_dir);
+    if scope == "project" {
+        cwd.join("skills-lock.json")
+    } else {
+        PathBuf::from(home).join(".agents/.skill-lock.json")
     }
-
-    dirs
 }
 
 fn cmd_skills_show(path_only: bool, name: &str) -> Result<()> {
@@ -2526,5 +2657,37 @@ mod tests {
         let mut attempt = attempt_with_paused_task(TaskKind::Write);
         attempt.tasks[0].status = TaskStatus::Complete;
         assert_eq!(resolve_paused_coder(&attempt), None);
+    }
+
+    #[test]
+    fn failed_shim_replacement_restores_external_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("skills-lock.json");
+        let original = serde_json::json!({
+            "version": 1,
+            "skills": {
+                "fluent": {
+                    "source": "mrinalwadhwa/fluent",
+                    "sourceType": "github",
+                    "skillPath": "skills/fluent/SKILL.md",
+                    "computedHash": "shim-hash"
+                }
+            }
+        });
+        fs::write(&lock_path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        let handoff = skill_install::prepare_external_skill_lock_handoff(&lock_path)
+            .unwrap()
+            .unwrap();
+
+        let result = complete_external_skill_handoff(
+            Some(handoff),
+            &tmp.path().join(".agents/skills/fluent"),
+            || bail!("injected install failure"),
+        );
+
+        assert!(result.is_err());
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(lock_path).unwrap()).unwrap();
+        assert_eq!(restored, original);
     }
 }

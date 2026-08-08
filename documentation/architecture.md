@@ -39,9 +39,18 @@ across releases, even when its earlier digest is unknown to the running
 binary. Any malformed or mismatched sidecar, changed file, missing file, or
 unlisted file withdraws that authority: Fluent preserves the directory and
 reports its path with cleanup guidance. Exact allowlisted pre-sidecar bundles
-and Fluent-marked shims remain bounded migration targets. The fixed data copy
-used by the bootstrap shim is host-owned hand-off data, not a managed
-agent-facing installation.
+and sidecar-free Fluent-marked shims remain bounded migration targets. The shim
+scan covers existing project `.agents/skills`, `.claude/skills`, and
+`.codex/skills` roots plus their supported global counterparts; it does not
+create otherwise absent roots. Explicit `--project` and `--global` scope the
+scan as well as the selected install targets. When a shim has a matching
+`skills` CLI lock entry, Fluent removes only that entry before adoption and
+restores it if bundle installation fails. Invalid or foreign lock entries stop
+the install before any mutation. This releases the external updater before
+Fluent records its own sidecar, preventing a later `npx skills update` from
+restoring the bootstrap.
+The fixed data copy used by the bootstrap shim is host-owned hand-off data, not
+a managed agent-facing installation.
 
 ## Workflow
 

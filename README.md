@@ -18,7 +18,21 @@ You use the factory through the Fluent [skill](https://agentskills.io/) in Codex
 npx skills add mrinalwadhwa/fluent --skill fluent  # currently macOS only
 ```
 
-Use the command above to install the Fluent skill. Start your coding agent in the project folder you want Fluent to work on, then ask it to use Fluent and describe what you want to explore, build, fix, or improve.
+Use the command above from the project where you want Fluent. The `skills` CLI
+creates a project skill directory (commonly `.agents/skills/fluent` for Codex,
+or the agent-specific `.codex/skills/fluent` and `.claude/skills/fluent` roots)
+and records the source in `skills-lock.json`. Review and commit those
+project-local files according to your repository's policy.
+
+The installed skill is a small bootstrap. On its first invocation,
+`fluent skills add` replaces that marked bootstrap with the full skill and a
+Fluent ownership sidecar. It also removes only Fluent's entry from
+`skills-lock.json`, so `npx skills update` cannot restore the bootstrap; other
+skills in the lock remain unchanged. Repeating the Fluent command leaves a
+current managed installation untouched.
+
+Start your coding agent in the project folder, then ask it to use Fluent and
+describe what you want to explore, build, fix, or improve.
 
 The first invocation sets up Fluent for that project and starts shaping the work with you. You can also invoke the skill explicitly: `$fluent` in Codex, `/fluent` in Claude Code, or `/skill:fluent` in Pi.
 

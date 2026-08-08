@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 const SCHEMA_VERSION: u32 = 1;
 const SIDECAR_NAME: &str = ".fluent-managed.json";
 const SHIM_MARKER: &str = "fluent-shim: true";
+const FLUENT_SOURCE: &str = "mrinalwadhwa/fluent";
+const FLUENT_SKILL_PATH: &str = "skills/fluent/SKILL.md";
 /// Exact digest of the bundled Fluent skill released immediately before
 /// provenance sidecars were introduced. Keep this bounded: an unlisted copy
 /// remains user-owned until the operator removes it.
@@ -34,6 +36,90 @@ struct ManagedSkill {
     files: Vec<String>,
 }
 
+/// A prepared handoff from the external `skills` CLI to Fluent ownership.
+/// The original bytes allow the caller to restore the lock when installation
+/// fails after the lock entry has been removed.
+pub struct ExternalSkillLockHandoff {
+    path: PathBuf,
+    original: Vec<u8>,
+    updated: Vec<u8>,
+}
+
+impl ExternalSkillLockHandoff {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn apply(&self) -> Result<()> {
+        crate::atomic_write::atomic_write(&self.path, &self.updated).with_context(|| {
+            format!(
+                "Failed to update external skill lock {}",
+                self.path.display()
+            )
+        })
+    }
+
+    pub fn restore(&self) -> Result<()> {
+        crate::atomic_write::atomic_write(&self.path, &self.original).with_context(|| {
+            format!(
+                "Failed to restore external skill lock {}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+/// Prepare removal of Fluent's bootstrap entry from a `skills` CLI lock.
+/// Unrelated skills and top-level metadata remain in the parsed document.
+pub fn prepare_external_skill_lock_handoff(
+    lock_path: &Path,
+) -> Result<Option<ExternalSkillLockHandoff>> {
+    let original = match fs::read(lock_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("Failed to read external skill lock {}", lock_path.display())
+            });
+        }
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&original).with_context(|| {
+        format!(
+            "Invalid external skill lock {}; Fluent preserved the bootstrap shim",
+            lock_path.display()
+        )
+    })?;
+    let Some(skills_value) = value.get_mut("skills") else {
+        return Ok(None);
+    };
+    let Some(skills) = skills_value.as_object_mut() else {
+        anyhow::bail!(
+            "Invalid external skill lock {}; Fluent preserved the bootstrap shim",
+            lock_path.display()
+        );
+    };
+    let Some(entry) = skills.get("fluent") else {
+        return Ok(None);
+    };
+    let matches_fluent = entry.get("source").and_then(serde_json::Value::as_str)
+        == Some(FLUENT_SOURCE)
+        && entry.get("skillPath").and_then(serde_json::Value::as_str) == Some(FLUENT_SKILL_PATH);
+    if !matches_fluent {
+        anyhow::bail!(
+            "external skill lock {} has a non-Fluent or unrecognized `fluent` entry; Fluent preserved the bootstrap shim",
+            lock_path.display()
+        );
+    }
+    skills.remove("fluent");
+    let mut updated = serde_json::to_vec_pretty(&value)?;
+    updated.push(b'\n');
+    Ok(Some(ExternalSkillLockHandoff {
+        path: lock_path.to_path_buf(),
+        original,
+        updated,
+    }))
+}
+
 /// Install one bundled skill without replacing an installation Fluent cannot own.
 pub fn install_bundled_skill(
     skill: &str,
@@ -48,6 +134,16 @@ pub fn install_bundled_skill(
         scope,
         KNOWN_PRIOR_FLUENT_BUNDLE_DIGESTS,
     )
+}
+
+/// Return whether Fluent owns a complete installation at this identity.
+pub fn is_managed_bundled_skill(
+    skill: &str,
+    skills_dir: &Path,
+    agent: &str,
+    scope: &str,
+) -> Result<bool> {
+    is_valid_managed(&skills_dir.join(skill), skill, agent, scope)
 }
 
 fn install_bundled_skill_with_legacy_digests(
@@ -388,9 +484,17 @@ fn is_safe_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn is_fluent_shim(skill_dir: &Path) -> bool {
+pub fn is_fluent_shim(skill_dir: &Path) -> bool {
     fs::read_to_string(skill_dir.join("SKILL.md"))
-        .map(|content| content.contains(SHIM_MARKER))
+        .map(|content| {
+            let mut lines = content.lines();
+            if lines.next().map(str::trim) != Some("---") {
+                return false;
+            }
+            lines
+                .take_while(|line| line.trim() != "---")
+                .any(|line| line.trim() == SHIM_MARKER)
+        })
         .unwrap_or(false)
 }
 
@@ -496,5 +600,82 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(after, before);
         }
+    }
+
+    #[test]
+    fn external_lock_handoff_removes_only_the_fluent_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("skills-lock.json");
+        let original = serde_json::json!({
+            "version": 1,
+            "metadata": {"keep": true},
+            "skills": {
+                "fluent": {
+                    "source": FLUENT_SOURCE,
+                    "sourceType": "github",
+                    "skillPath": FLUENT_SKILL_PATH,
+                    "computedHash": "shim-hash"
+                },
+                "other": {
+                    "source": "owner/other",
+                    "skillPath": "skills/other/SKILL.md"
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+
+        let handoff = prepare_external_skill_lock_handoff(&path)
+            .unwrap()
+            .expect("matching Fluent entry should prepare a handoff");
+        handoff.apply().unwrap();
+
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(updated["version"], original["version"]);
+        assert_eq!(updated["metadata"], original["metadata"]);
+        assert_eq!(updated["skills"]["other"], original["skills"]["other"]);
+        assert!(updated["skills"].get("fluent").is_none());
+
+        handoff.restore().unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn external_lock_handoff_preserves_unrecognized_or_invalid_locks() {
+        for contents in [
+            b"not json\n".as_slice(),
+            br#"{"version":1,"skills":[]}"#,
+            br#"{"version":1,"skills":{"fluent":{"source":"other/fluent","skillPath":"skills/fluent/SKILL.md"}}}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("skills-lock.json");
+            fs::write(&path, contents).unwrap();
+            let before = fs::read(&path).unwrap();
+
+            assert!(prepare_external_skill_lock_handoff(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn fluent_shim_marker_must_be_in_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("fluent");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fluent\n---\nDocumentation mentions fluent-shim: true.\n",
+        )
+        .unwrap();
+        assert!(!is_fluent_shim(&skill_dir));
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fluent\nfluent-shim: true\n---\nBootstrap.\n",
+        )
+        .unwrap();
+        assert!(is_fluent_shim(&skill_dir));
     }
 }

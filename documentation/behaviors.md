@@ -6567,6 +6567,7 @@ WHEN `fluent skills add` runs with `-g`/`--global`,
 THE SYSTEM SHALL scope the install to the global skill directories
 and SHALL NOT update any project-level installation.
 Test: tests/binary.rs (skills_add_global_flag_skips_project)
+Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
 
 ### B5
 
@@ -6574,6 +6575,7 @@ WHEN `fluent skills add` runs with `--project`,
 THE SYSTEM SHALL scope the install to the project skill directory
 and SHALL NOT install to global directories.
 Test: tests/binary.rs (skills_add_project_flag_targets_project)
+Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
 
 ### B6
 
@@ -6636,7 +6638,9 @@ WHEN Fluent finds a sidecar-free exact allowlisted pre-sidecar bundle or a
 sidecar-free Fluent-marked shim,
 THE SYSTEM SHALL replace it with a managed installation of the running bundle.
 Test: src/skill_install.rs (adopts_an_exact_allowlisted_bundle_and_rejects_a_near_match)
+Test: src/skill_install.rs (fluent_shim_marker_must_be_in_frontmatter)
 Test: tests/binary.rs (skills_add_replaces_stale_shim_installation)
+Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
 
 ### B14
 
@@ -6652,6 +6656,67 @@ WHEN `fluent skills add` installs bundled skills into a selected target that
 did not contain a Fluent shim,
 THE SYSTEM SHALL NOT report a Fluent shim replacement for that target.
 Test: tests/binary.rs (fluent_skills_install_writes_all_public_skills)
+
+### B16
+
+WHEN `fluent skills add` scans supported bootstrap roots beyond its selected
+install targets,
+THE SYSTEM SHALL NOT create an absent scanned root.
+Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
+Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
+
+### B17
+
+WHEN Fluent adopts a shim whose matching external lock contains a recognized
+Fluent bootstrap entry,
+THE SYSTEM SHALL remove the Fluent entry.
+Test: src/skill_install.rs (external_lock_handoff_removes_only_the_fluent_entry)
+Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
+Test: tests/binary.rs (skills_add_converges_global_canonical_roots_and_lock)
+
+### B17a
+
+WHEN Fluent removes its entry from an external skill lock,
+THE SYSTEM SHALL preserve every unrelated lock value.
+Test: src/skill_install.rs (external_lock_handoff_removes_only_the_fluent_entry)
+Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
+Test: tests/binary.rs (skills_add_converges_global_canonical_roots_and_lock)
+
+### B18
+
+IF a detected shim's external lock is malformed or attributes `fluent` to an
+unrecognized source or skill path,
+THEN THE SYSTEM SHALL reject the installation before mutating any data or agent
+skill directory.
+Test: src/skill_install.rs (external_lock_handoff_preserves_unrecognized_or_invalid_locks)
+Test: tests/binary.rs (skills_add_preserves_shim_when_external_lock_is_invalid)
+
+### B18a
+
+IF Fluent rejects an installation because its external lock is malformed or
+attributes `fluent` to an unrecognized source or skill path,
+THEN THE SYSTEM SHALL leave the detected shim and external lock unchanged.
+Test: tests/binary.rs (skills_add_preserves_shim_when_external_lock_is_invalid)
+
+### B19
+
+IF Fluent removes an external Fluent lock entry but cannot replace the shim,
+THEN THE SYSTEM SHALL restore the original external lock.
+Test: src/main.rs (failed_shim_replacement_restores_external_lock)
+
+### B20
+
+WHEN `fluent skills add` runs again after adopting one or more project bootstrap
+roots,
+THE SYSTEM SHALL leave the released external lock unchanged.
+Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
+
+### B20a
+
+WHEN `fluent skills add` discovers an unmarked or invalid Fluent directory
+outside its selected install targets,
+THE SYSTEM SHALL NOT report that directory as a managed Fluent installation.
+Test: tests/binary.rs (skills_add_does_not_report_user_owned_discovery_as_managed)
 
 ## Documentation review — commit conventions
 

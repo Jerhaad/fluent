@@ -34,6 +34,13 @@ Run the following to install the full fluent skill from the binary:
 fluent skills add
 ```
 
+The public `npx skills add` command may have created a project-local bootstrap
+under `.agents/skills`, `.claude/skills`, or `.codex/skills` and an entry in
+`skills-lock.json`. This command replaces only a Fluent-marked bootstrap,
+records Fluent ownership, and removes only Fluent's matching lock entry. It
+preserves other locked skills and any unrecognized or user-owned skill
+directory.
+
 ## Step 3 — Continue with the full skill
 
 Read the full fluent skill from the data directory the binary wrote to:

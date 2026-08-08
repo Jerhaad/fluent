@@ -23314,6 +23314,268 @@ fn skills_add_replaces_stale_shim_installation() {
 }
 
 #[test]
+fn skills_add_converges_project_bootstrap_roots_and_lock() {
+    for roots in [
+        vec![(".agents/skills", "universal")],
+        vec![(".claude/skills", "claude")],
+        vec![(".codex/skills", "codex")],
+        vec![
+            (".agents/skills", "universal"),
+            (".claude/skills", "claude"),
+        ],
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        for (root, _) in &roots {
+            let skill_dir = project.join(root).join("fluent");
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: fluent\nfluent-shim: true\n---\nbootstrap shim\n",
+            )
+            .unwrap();
+        }
+        let lock_path = project.join("skills-lock.json");
+        let original_lock = serde_json::json!({
+            "version": 1,
+            "metadata": {"keep": true},
+            "skills": {
+                "fluent": {
+                    "source": "mrinalwadhwa/fluent",
+                    "sourceType": "github",
+                    "skillPath": "skills/fluent/SKILL.md",
+                    "computedHash": "shim-hash"
+                },
+                "other": {
+                    "source": "owner/other",
+                    "skillPath": "skills/other/SKILL.md"
+                }
+            }
+        });
+        write_json_path(&lock_path, &original_lock);
+
+        let output = fluent_cmd()
+            .env("HOME", home.to_str().unwrap())
+            .current_dir(&project)
+            .args(["skills", "add"])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "skills add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for (root, expected_agent) in &roots {
+            let skill_dir = project.join(root).join("fluent");
+            let skill = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+            assert!(!skill.contains("fluent-shim: true"), "{root}");
+            let sidecar: serde_json::Value =
+                read_json_path(&skill_dir.join(".fluent-managed.json"));
+            assert_eq!(sidecar["agent"], *expected_agent, "{root}");
+            assert_eq!(sidecar["scope"], "project", "{root}");
+        }
+        if !roots.iter().any(|(root, _)| *root == ".codex/skills") {
+            assert!(!project.join(".codex/skills").exists());
+        }
+        let updated_lock: serde_json::Value = read_json_path(&lock_path);
+        assert_eq!(updated_lock["version"], original_lock["version"]);
+        assert_eq!(updated_lock["metadata"], original_lock["metadata"]);
+        assert_eq!(
+            updated_lock["skills"]["other"],
+            original_lock["skills"]["other"]
+        );
+        assert!(updated_lock["skills"].get("fluent").is_none());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&lock_path.display().to_string()));
+        assert!(stderr.contains("Fluent now manages"));
+
+        let before = roots
+            .iter()
+            .map(|(root, _)| complete_skill_snapshot(&project.join(root).join("fluent")))
+            .collect::<Vec<_>>();
+        fluent_cmd()
+            .env("HOME", home.to_str().unwrap())
+            .current_dir(&project)
+            .args(["skills", "add"])
+            .assert()
+            .success();
+        let after = roots
+            .iter()
+            .map(|(root, _)| complete_skill_snapshot(&project.join(root).join("fluent")))
+            .collect::<Vec<_>>();
+        assert_eq!(after, before, "reinstall must keep managed roots current");
+        assert_eq!(read_json_path(&lock_path), updated_lock);
+    }
+}
+
+#[test]
+fn skills_add_converges_global_canonical_roots_and_lock() {
+    for root in [".agents/skills", ".config/agents/skills"] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let skill_dir = home.join(root).join("fluent");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fluent\nfluent-shim: true\n---\nglobal bootstrap\n",
+        )
+        .unwrap();
+        let lock_path = home.join(".agents/.skill-lock.json");
+        let lock = serde_json::json!({
+            "version": 1,
+            "skills": {
+                "fluent": {
+                    "source": "mrinalwadhwa/fluent",
+                    "sourceType": "github",
+                    "skillPath": "skills/fluent/SKILL.md",
+                    "computedHash": "shim-hash"
+                },
+                "other": {"source": "owner/other", "skillPath": "skills/other/SKILL.md"}
+            }
+        });
+        fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        write_json_path(&lock_path, &lock);
+
+        fluent_cmd()
+            .env("HOME", home.to_str().unwrap())
+            .current_dir(&project)
+            .args(["skills", "add"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(lock_path.display().to_string()));
+
+        let content = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(!content.contains("fluent-shim: true"), "{root}");
+        let sidecar: serde_json::Value = read_json_path(&skill_dir.join(".fluent-managed.json"));
+        assert_eq!(sidecar["agent"], "universal", "{root}");
+        assert_eq!(sidecar["scope"], "global", "{root}");
+        let updated_lock: serde_json::Value = read_json_path(&lock_path);
+        assert!(updated_lock["skills"].get("fluent").is_none());
+        assert_eq!(updated_lock["skills"]["other"], lock["skills"]["other"]);
+    }
+}
+
+#[test]
+fn skills_add_preserves_shim_when_external_lock_is_invalid() {
+    for lock in [
+        b"not json\n".to_vec(),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "skills": {
+                "fluent": {
+                    "source": "someone-else/fluent",
+                    "skillPath": "skills/fluent/SKILL.md"
+                }
+            }
+        }))
+        .unwrap(),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        let skill_dir = project.join(".agents/skills/fluent");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: fluent\nfluent-shim: true\n---\nbootstrap shim\n",
+        )
+        .unwrap();
+        let lock_path = project.join("skills-lock.json");
+        fs::write(&lock_path, &lock).unwrap();
+        let shim_before = complete_skill_snapshot(&skill_dir);
+
+        let output = fluent_cmd()
+            .env("HOME", home.to_str().unwrap())
+            .current_dir(&project)
+            .args(["skills", "add"])
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(complete_skill_snapshot(&skill_dir), shim_before);
+        assert_eq!(fs::read(&lock_path).unwrap(), lock);
+        assert!(!home.join(".claude/skills/fluent").exists());
+        assert!(!home.join(".local/share/fluent/skills/fluent").exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("preserved the bootstrap shim"));
+    }
+}
+
+#[test]
+fn skills_add_explicit_scope_does_not_adopt_other_scope_shims() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("project");
+    let project_shim = project.join(".agents/skills/fluent");
+    fs::create_dir_all(&project_shim).unwrap();
+    fs::write(
+        project_shim.join("SKILL.md"),
+        "---\nname: fluent\nfluent-shim: true\n---\nproject shim\n",
+    )
+    .unwrap();
+    let project_before = complete_skill_snapshot(&project_shim);
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .args(["skills", "add", "--global"])
+        .assert()
+        .success();
+    assert_eq!(complete_skill_snapshot(&project_shim), project_before);
+
+    let global_shim = home.join(".agents/skills/fluent");
+    fs::create_dir_all(&global_shim).unwrap();
+    fs::write(
+        global_shim.join("SKILL.md"),
+        "---\nname: fluent\nfluent-shim: true\n---\nglobal shim\n",
+    )
+    .unwrap();
+    let global_before = complete_skill_snapshot(&global_shim);
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .args(["skills", "add", "--project"])
+        .assert()
+        .success();
+    assert_eq!(complete_skill_snapshot(&global_shim), global_before);
+}
+
+#[test]
+fn skills_add_does_not_report_user_owned_discovery_as_managed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("project");
+    let user_skill = project.join(".agents/skills/fluent");
+    fs::create_dir_all(&user_skill).unwrap();
+    fs::write(
+        user_skill.join("SKILL.md"),
+        "---\nname: fluent\n---\nUser-owned skill.\n",
+    )
+    .unwrap();
+
+    let output = fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .current_dir(&project)
+        .args(["skills", "add"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains(&format!("project {}", user_skill.display())));
+    assert!(!stderr.contains("may display both"));
+    assert_eq!(
+        fs::read_to_string(user_skill.join("SKILL.md")).unwrap(),
+        "---\nname: fluent\n---\nUser-owned skill.\n"
+    );
+}
+
+#[test]
 fn skills_add_reports_shim_replacement_only_for_its_target() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
