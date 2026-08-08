@@ -20574,6 +20574,51 @@ fn work_queue_list_format_includes_priority_queued_at_status_id() {
 }
 
 #[test]
+fn work_queue_show_prints_latest_terminal_dispatch_as_json() {
+    use fluent::queue::{self, DispatchStatus};
+
+    let tmp = TempDir::new().unwrap();
+    write_work_item_json(tmp.path(), "wi-show", "Show terminal dispatch");
+    queue::add(tmp.path(), "wi-show", Some(4)).unwrap();
+    let token = queue::claim(tmp.path(), "wi-show", "attempt-1")
+        .unwrap()
+        .unwrap();
+    queue::reconcile(tmp.path(), &token, DispatchStatus::NeedsUser).unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queue is empty"));
+
+    let output = fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "show", "wi-show"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["work_item_id"], "wi-show");
+    assert_eq!(shown["dispatch_id"], "dispatch-1");
+    assert_eq!(shown["status"], "needs-user");
+    assert_eq!(shown["bound_attempt_id"], "attempt-1");
+    assert_eq!(shown["priority"], 4);
+}
+
+#[test]
+fn work_queue_show_missing_dispatch_errors() {
+    let tmp = TempDir::new().unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "show", "wi-missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no queue dispatch"));
+}
+
+#[test]
 fn work_queue_remove_after_add_removes_entry() {
     let tmp = TempDir::new().unwrap();
     write_work_item_json(tmp.path(), "wi-rm", "Remove test");

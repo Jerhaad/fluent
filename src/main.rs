@@ -1311,6 +1311,10 @@ fn cmd_queue(project_root: &Path, command: QueueCommands) -> Result<()> {
                 }
             }
         }
+        QueueCommands::Show { work_item_id } => {
+            let dispatch = fluent::queue::show(project_root, &work_item_id)?;
+            println!("{}", serde_json::to_string_pretty(&dispatch)?);
+        }
         QueueCommands::Remove { work_item_id } => {
             fluent::queue::remove(project_root, &work_item_id)?;
             println!("Removed {work_item_id} from queue");

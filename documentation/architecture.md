@@ -1865,8 +1865,9 @@ removed, and unrelated lock values to remain. It then initializes with
 `propose` follow-up mode, writes the fixture Tester configuration, and commits
 the complete first-use state before creating the Work Item and planned Attempt.
 The harness submits that Attempt with `fluent queue add`, starts `fluent
-scheduler run` as a child, and polls `fluent queue list`. It terminates and
-reaps the child after a terminal dispatch or harness interruption.
+scheduler run` as a child, and polls `fluent queue show` for the Work Item's
+latest structured dispatch. It terminates and reaps the child after a terminal
+dispatch or harness interruption.
 `candidate-ready` still requires an independent `attempt show` check for a
 complete Attempt and succeeded Learner; the scheduler never lands the
 candidate.
@@ -2834,8 +2835,11 @@ acquires a Work-model lock while already holding the queue lock.
 
 `fluent queue list` prints each Work Item's active dispatch sorted by
 priority descending, then `queued_at` ascending, showing priority,
-queue time, execution status, and Work Item id. `fluent queue remove`
-records a `canceled` disposition on an unclaimed dispatch — the entry
+queue time, execution status, and Work Item id. `fluent queue show
+<work-item-id>` prints the latest dispatch as JSON regardless of whether it is
+active or terminal, preserving fields such as `bound_attempt_id` for exact
+handoffs. It fails when the Work Item has no dispatch history. `fluent queue
+remove` records a `canceled` disposition on an unclaimed dispatch — the entry
 leaves the active queue but the cancellation survives replayed automatic
 promotion. Removal is rejected while a dispatch has a live claim, and
 errors when the Work Item has no active dispatch.

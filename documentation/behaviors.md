@@ -4578,11 +4578,26 @@ status_reports_queued_work_without_live_scheduler)
 ### B3
 
 WHEN `fluent queue list` is invoked,
-THE SYSTEM SHALL print each queue entry on its own line, sorted
+THE SYSTEM SHALL print each active queue entry on its own line, sorted
 by `priority` descending then `queued_at` ascending, in the
 format `<priority> <queued_at> <status> <work-item-id>`.
 Test: src/queue.rs (list_sorts_by_priority_then_queue_time)
 Test: tests/binary.rs (work_queue_list_format_includes_priority_queued_at_status_id)
+
+### B3a
+
+WHEN `fluent queue show <work-item-id>` is invoked for a Work Item with dispatch
+history, THE SYSTEM SHALL print its latest dispatch as JSON, including its
+terminal status and bound Attempt when present.
+Test: src/queue.rs (show_returns_latest_terminal_dispatch_with_attempt_binding)
+Test: tests/binary.rs (work_queue_show_prints_latest_terminal_dispatch_as_json)
+
+### B3b
+
+IF `fluent queue show <work-item-id>` finds no dispatch history, THEN THE SYSTEM
+SHALL exit non-zero with a clear error.
+Test: src/queue.rs (show_reports_missing_dispatch)
+Test: tests/binary.rs (work_queue_show_missing_dispatch_errors)
 
 ### B4
 
@@ -4622,7 +4637,7 @@ THE SYSTEM SHALL update the queue entry's `status` to:
 - `failed` if the Attempt ends in a `failed` terminal state
 - `needs-user` if the Attempt ends in `needs-user`
 The dispatch SHALL NOT be deleted; the user inspects active work through
-`fluent queue list` and terminal history in the durable ledger.
+`fluent queue list` and the latest terminal history through `fluent queue show`.
 Test: src/scheduler.rs (concurrent_terminal_outcomes_are_independent,
 passing_attempt_becomes_candidate_ready_without_land)
 
@@ -6987,6 +7002,20 @@ Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses publi
 WHEN the harness executes the planned Attempt through the scheduler queue,
 THE SYSTEM SHALL NOT invoke `fluent attempt run` directly.
 Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+
+### B5c
+
+WHEN a scheduler-owned dispatch reaches terminal status while the harness is
+waiting, THE SYSTEM SHALL observe that status after the dispatch leaves the
+active queue.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (scheduler exit rereads terminal queue state)
+
+### B5d
+
+IF `fluent queue show` returns invalid JSON, THEN THE SYSTEM SHALL stop the run
+through its resumable failure path.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (malformed queue show preserves evidence and resumes)
 
 ### B6
 

@@ -743,6 +743,12 @@ pub enum QueueCommands {
     /// List queued Work Items
     List,
 
+    /// Show the latest dispatch for a Work Item as JSON
+    Show {
+        /// Work Item ID
+        work_item_id: String,
+    },
+
     /// Remove a Work Item from the queue
     Remove {
         /// Work Item ID

@@ -563,10 +563,10 @@ stop_scheduler() {
 
 read_queue_status() {
   local work_item_id="$1" logfile="$2" output
-  output="$(capture_fluent "$logfile" queue list)" || return 1
+  output="$(capture_fluent "$logfile" queue show "$work_item_id")" || return 1
   printf '%s\n' "$output" \
-    | awk -v id="$work_item_id" '$NF == id { print $(NF - 1); found = 1; exit }
-    END { if (!found) exit 1 }'
+    | jq -er --arg id "$work_item_id" \
+      'select(.work_item_id == $id) | .status | select(type == "string" and length > 0)'
 }
 
 run_scheduler_until_terminal() {

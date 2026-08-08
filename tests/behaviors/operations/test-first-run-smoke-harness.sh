@@ -71,6 +71,11 @@ queue_status() {
   [ -f "$QUEUE_STATUS_FILE" ] && cat "$QUEUE_STATUS_FILE" || printf 'none'
 }
 set_queue_status() { printf '%s\n' "$1" > "$QUEUE_STATUS_FILE"; }
+QUEUE_ATTEMPT_FILE="$STATE_DIR/queue-attempt"
+queue_attempt() {
+  [ -f "$QUEUE_ATTEMPT_FILE" ] && cat "$QUEUE_ATTEMPT_FILE" || printf 'none'
+}
+set_queue_attempt() { printf '%s\n' "$1" > "$QUEUE_ATTEMPT_FILE"; }
 
 produce_candidate() {
   if [ "$(stage)" != "ran" ]; then
@@ -96,6 +101,7 @@ JSON
 
 # When set, emit malformed JSON for these commands (exit 0) so the caller's
 # jq parse step fails rather than the command itself.
+# FAKE_QUEUE_SHOW_MALFORMED=1          — queue show returns invalid JSON
 # FAKE_ATTEMPT_SHOW_MALFORMED=1        — attempt show returns invalid JSON
 # FAKE_CANDIDATE_SHOW_MALFORMED=1      — merge-candidate show returns invalid JSON
 # FAKE_LANDED_SHOW_MALFORMED=1         — merge-candidate show returns invalid JSON
@@ -209,18 +215,53 @@ JSON
       add)
         [ "$(stage)" = "attempt" ] || reject "queue add out of order (stage=$(stage))"
         set_queue_status "queued"
+        set_queue_attempt "none"
         set_stage "queued"
         ;;
       list)
-        [ "$(queue_status)" != "none" ] || reject "queue is empty"
+        case "$(queue_status)" in
+          queued|claimed|running)
+            printf '0 2026-08-07T00:00:00Z %s clean-room-fixture\n' "$(queue_status)"
+            ;;
+          *)
+            printf 'Queue is empty\n'
+            ;;
+        esac
+        ;;
+      show)
+        [ "$3" = "clean-room-fixture" ] || reject "queue show must name the Work Item"
+        if [ "${FAKE_QUEUE_SHOW_MALFORMED:-0}" = "1" ]; then
+          printf '{bad json\n'
+          exit 0
+        fi
         visible_status="$(queue_status)"
-        if [ "${FAKE_QUEUE_STALE_ONCE_AFTER_TERMINAL:-0}" = "1" ] \
+        [ "$visible_status" != "none" ] || reject "no queue dispatch"
+        if [ "${FAKE_QUEUE_SHOW_STALE_ONCE_AFTER_TERMINAL:-0}" = "1" ] \
           && [ "$visible_status" = "candidate-ready" ] \
           && [ ! -f "$STATE_DIR/stale-queue-used" ]; then
           : > "$STATE_DIR/stale-queue-used"
           visible_status="queued"
         fi
-        printf '0 2026-08-07T00:00:00Z %s clean-room-fixture\n' "$visible_status"
+        if [ "$(queue_attempt)" = "none" ]; then
+          jq -n --arg status "$visible_status" '{
+            dispatch_id: "dispatch-1",
+            work_item_id: "clean-room-fixture",
+            queued_at: "2026-08-07T00:00:00Z",
+            priority: 0,
+            status: $status,
+            generation: 0
+          }'
+        else
+          jq -n --arg status "$visible_status" --arg attempt "$(queue_attempt)" '{
+            dispatch_id: "dispatch-1",
+            work_item_id: "clean-room-fixture",
+            queued_at: "2026-08-07T00:00:00Z",
+            priority: 0,
+            status: $status,
+            generation: 0,
+            bound_attempt_id: $attempt
+          }'
+        fi
         ;;
       resume)
         [ "$(queue_status)" = "needs-user" ] || reject "queue resume without pause"
@@ -228,6 +269,7 @@ JSON
           && [ "$4" = "--attempt" ] && [ "$5" = "attempt-1" ] \
           || reject "queue resume must bind attempt-1"
         set_queue_status "queued"
+        set_queue_attempt "attempt-1"
         set_stage "queued"
         ;;
       *) reject "unknown queue subcommand: $sub" ;;
@@ -237,6 +279,7 @@ JSON
     record "scheduler $2"
     [ "$2" = "run" ] || reject "unknown scheduler subcommand: $2"
     [ "$(queue_status)" = "queued" ] || reject "scheduler requires queued work"
+    set_queue_attempt "attempt-1"
     if [ "${FAKE_SCHEDULER_HANGS:-0}" = "1" ]; then
       set_queue_status "running"
       [ -z "${FAKE_SCHEDULER_PID_FILE:-}" ] \
@@ -900,8 +943,11 @@ test_run_uses_public_sequence_and_stops_before_land() {
   fi
   grep -Fxq 'scheduler run' "$FAKE_CMD_LOG" \
     || { printf '    FAIL: scheduler was not started\n'; rc=1; }
-  grep -Fxq 'queue list' "$FAKE_CMD_LOG" \
+  grep -Fxq 'queue show' "$FAKE_CMD_LOG" \
     || { printf '    FAIL: queue status was not observed\n'; rc=1; }
+  if grep -Fxq 'queue list' "$FAKE_CMD_LOG"; then
+    printf '    FAIL: harness parsed the active-only queue list\n'; rc=1
+  fi
   if grep -q '^attempt run$' "$FAKE_CMD_LOG"; then
     printf '    FAIL: harness ran the Attempt outside the scheduler\n'; rc=1
   fi
@@ -931,7 +977,7 @@ test_scheduler_exit_rereads_terminal_queue_state() {
   run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
   local rc=0
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
-    FAKE_QUEUE_STALE_ONCE_AFTER_TERMINAL=1 \
+    FAKE_QUEUE_SHOW_STALE_ONCE_AFTER_TERMINAL=1 \
     bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1 \
     || {
       printf '    FAIL: one stale queue read hid the terminal disposition\n'
@@ -950,8 +996,13 @@ test_scheduler_exit_rereads_terminal_queue_state() {
     }
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "ran" ] \
     || { printf '    FAIL: terminal queue reread did not reach ready\n'; rc=1; }
-  [ "$(grep -c '^queue list$' "$FAKE_CMD_LOG")" -ge 3 ] \
+  [ "$(grep -c '^queue show$' "$FAKE_CMD_LOG")" -ge 3 ] \
     || { printf '    FAIL: harness did not reread queue state\n'; rc=1; }
+  local listed
+  listed="$(cd "$ROOT/project/main" && HOME="$ROOT/home" \
+    FAKE_CMD_LOG="$FAKE_CMD_LOG" "$ROOT/bin/fluent" queue list)"
+  [ "$listed" = "Queue is empty" ] \
+    || { printf '    FAIL: fake queue list exposed terminal history\n'; rc=1; }
   return $rc
 }
 
@@ -1638,6 +1689,33 @@ test_malformed_attempt_show_routes_through_b5() {
   return $rc
 }
 
+test_malformed_queue_show_preserves_evidence_and_resumes() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_QUEUE_SHOW_MALFORMED=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: run should exit non-zero when queue show returns malformed JSON\n'; rc=1
+  fi
+  local out; out="$(cat "$WORK/run.out")"
+  [ -d "$ROOT/project/main/.git" ] \
+    || { printf '    FAIL: smoke root not preserved\n'; rc=1; }
+  assert_contains "$out" 'phase "run" failed' || rc=1
+  assert_contains "$out" "$ROOT/harness/logs/queue-status.log" || rc=1
+  assert_contains "$out" "run $ROOT" || rc=1
+  [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \
+    || { printf '    FAIL: malformed queue state advanced the safe phase\n'; rc=1; }
+
+  run_harness run "$ROOT" > "$WORK/resume.out" 2>&1 \
+    || { printf '    FAIL: resume did not reach a ready candidate\n'; rc=1; }
+  [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "ran" ] \
+    || { printf '    FAIL: resume did not reach the ready phase\n'; rc=1; }
+  return $rc
+}
+
 test_malformed_candidate_show_routes_through_b5() {
   new_workspace
   trap cleanup_workspace RETURN
@@ -2180,6 +2258,8 @@ run_test "prepare manifest mv failure is durable" \
   test_prepare_manifest_mv_failure_is_durable
 run_test "prepare marker rm failure is durable" \
   test_prepare_marker_rm_failure_is_durable
+run_test "malformed queue show preserves evidence and resumes" \
+  test_malformed_queue_show_preserves_evidence_and_resumes
 run_test "malformed attempt show routes through b5" \
   test_malformed_attempt_show_routes_through_b5
 run_test "malformed candidate show routes through b5" \

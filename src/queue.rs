@@ -365,7 +365,7 @@ fn write_ledger(project_root: &Path, ledger: &DispatchLedger) -> Result<()> {
 }
 
 // -------------------------------------------------------------------------
-// Queue commands: add, list, remove
+// Queue commands: add, show, list, remove
 // -------------------------------------------------------------------------
 
 /// Add an execution-ready, lifecycle-eligible Work Item to the queue.
@@ -555,6 +555,13 @@ pub fn list(project_root: &Path) -> Result<Vec<Dispatch>> {
     });
 
     Ok(dispatches)
+}
+
+/// Return the Work Item's latest dispatch, including terminal history.
+pub fn show(project_root: &Path, work_item_id: &str) -> Result<Dispatch> {
+    read_ledger(project_root, work_item_id)?
+        .and_then(|ledger| ledger.latest().cloned())
+        .ok_or_else(|| anyhow::anyhow!("Work Item {work_item_id:?} has no queue dispatch"))
 }
 
 /// Read every parseable ledger in the queue directory, skipping malformed
@@ -1457,6 +1464,41 @@ mod tests {
         let ids: Vec<&str> = entries.iter().map(|d| d.work_item_id.as_str()).collect();
         // Highest priority first, then oldest queue time.
         assert_eq!(ids, vec!["wi-b", "wi-c", "wi-a"]);
+    }
+
+    #[test]
+    fn show_returns_latest_terminal_dispatch_with_attempt_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let first = Dispatch {
+            status: DispatchStatus::Failed,
+            bound_attempt_id: Some("attempt-1".to_string()),
+            ..Dispatch::new_queued("wi-1", 0, None, 1)
+        };
+        let latest = Dispatch {
+            status: DispatchStatus::NeedsUser,
+            bound_attempt_id: Some("attempt-2".to_string()),
+            ..Dispatch::new_queued("wi-1", 0, None, 2)
+        };
+        put_ledger(
+            dir.path(),
+            &DispatchLedger {
+                work_item_id: "wi-1".to_string(),
+                dispatches: vec![first, latest.clone()],
+            },
+        );
+
+        assert_eq!(show(dir.path(), "wi-1").unwrap(), latest);
+        assert!(list(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn show_reports_missing_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+
+        let error = show(dir.path(), "wi-missing").unwrap_err().to_string();
+        assert!(error.contains("has no queue dispatch"));
     }
 
     #[test]
