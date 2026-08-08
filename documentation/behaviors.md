@@ -52,6 +52,14 @@ WHEN an operator resumes an `interrupted` Attempt, THE SYSTEM SHALL replan each
 canceled Task once while preserving completed Tasks and prior artifacts.
 Test: src/work_attempt_loop.rs (cancel_local_attempt_stops_owned_group_and_replans_once)
 
+### B4
+
+WHEN macOS reports `EPERM` while Fluent sweeps the process group of an observed
+exited coder leader, THE SYSTEM SHALL classify the group as already gone while
+still delivering `SIGKILL` when a live same-user descendant remains.
+Test: src/coder.rs (exited_macos_group_eperm_means_no_signalable_members)
+Test: src/coder.rs (natural_exit_sweeps_group_before_reaping)
+
 ## Enclosing agent sandbox handoff
 
 ### B1
@@ -8148,6 +8156,24 @@ WHERE a project-root `AGENTS.md` exists and an autonomous Reviewer runs from
 its artifact directory, THE SYSTEM SHALL grant that exact instruction file as
 read-only input without granting adjacent project files.
 Test: src/work_task_executor.rs (reviewer_project_instruction_grant_is_exact_and_optional)
+
+### B16
+
+WHEN the selected `codex` command is an official npm Node wrapper with a
+matching platform package, THE SYSTEM SHALL retain the wrapper for readiness
+checks and use the version-verified packaged native executable for autonomous
+Writer, Reviewer, Learner, and rebase work.
+Test: src/codex_worker.rs (resolved_launcher_retains_wrapper_and_uses_verified_native_for_execution)
+
+### B17
+
+IF an official npm Codex wrapper has no matching executable native package, its
+native package version differs from the wrapper package, or its native binary
+resolves outside the verified package, THEN THE SYSTEM SHALL fail preparation
+before reserving autonomous work.
+Test: src/codex_worker.rs (resolved_packaged_wrapper_rejects_missing_native_runtime)
+Test: src/codex_worker.rs (resolved_packaged_wrapper_rejects_mismatched_native_version)
+Test: src/codex_worker.rs (resolved_packaged_wrapper_rejects_native_symlink_escape)
 
 ## Reviewer build-cache bounds
 

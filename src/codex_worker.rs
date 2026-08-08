@@ -8,7 +8,17 @@ use std::process::Command;
 #[derive(Clone, Debug)]
 pub struct ResolvedCodexLauncher {
     executable: PathBuf,
+    execution_executable: PathBuf,
     readable_roots: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct CodexPlatformPackage {
+    dependency: &'static str,
+    directory: &'static str,
+    target_triple: &'static str,
+    version_suffix: &'static str,
+    binary_name: &'static str,
 }
 
 #[derive(Debug)]
@@ -141,19 +151,28 @@ impl ResolvedCodexLauncher {
             let mut readable_roots = Vec::new();
             if canonical_target != executable {
                 readable_roots.push(executable.clone());
-                readable_roots.push(match package_root {
-                    Some(package_root) => package_root,
-                    None => canonical_target,
+                readable_roots.push(match package_root.as_ref() {
+                    Some(package_root) => package_root.clone(),
+                    None => canonical_target.clone(),
                 });
-            } else if let Some(package_root) = package_root {
-                readable_roots.push(package_root);
+            } else if let Some(package_root) = package_root.as_ref() {
+                readable_roots.push(package_root.clone());
             } else {
                 readable_roots.push(executable.clone());
             }
+            let execution_executable = match package_root.as_ref() {
+                Some(package_root) if canonical_target == package_root.join("bin/codex.js") => {
+                    let native = resolve_packaged_native(package_root)?;
+                    readable_roots.push(native.readable_root);
+                    native.executable
+                }
+                _ => executable.clone(),
+            };
             readable_roots.sort();
             readable_roots.dedup();
             return Ok(Self {
                 executable,
+                execution_executable,
                 readable_roots,
             });
         }
@@ -168,9 +187,213 @@ impl ResolvedCodexLauncher {
         &self.executable
     }
 
+    /// The verified executable used for autonomous model work.
+    ///
+    /// Official npm installations expose a Node shim on `PATH`. Fluent keeps
+    /// that selected command for readiness checks, but launches the matching
+    /// packaged native binary for autonomous work so a redirected `HOME` does
+    /// not add the shim's extra process boundary inside Seatbelt.
+    pub fn execution_executable(&self) -> &Path {
+        &self.execution_executable
+    }
+
     pub fn readable_roots(&self) -> &[PathBuf] {
         &self.readable_roots
     }
+}
+
+struct ResolvedPackagedNative {
+    executable: PathBuf,
+    readable_root: PathBuf,
+}
+
+fn resolve_packaged_native(
+    package_root: &Path,
+) -> std::result::Result<ResolvedPackagedNative, CodexLauncherError> {
+    let platform = codex_platform_package().ok_or_else(|| CodexLauncherError {
+        message: "cannot resolve a native Codex executable for this platform".to_string(),
+    })?;
+    let core_manifest_path = package_root.join("package.json");
+    let core_manifest = read_package_manifest(&core_manifest_path)?;
+    let core_version = core_manifest
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CodexLauncherError {
+            message: format!(
+                "Codex package manifest {} has no version",
+                core_manifest_path.display()
+            ),
+        })?;
+    let expected_version = format!("{core_version}-{}", platform.version_suffix);
+    let expected_dependency = format!("npm:@openai/codex@{expected_version}");
+    let dependency = core_manifest
+        .get("optionalDependencies")
+        .and_then(|value| value.get(platform.dependency))
+        .and_then(serde_json::Value::as_str);
+
+    let package_candidates = [
+        package_root
+            .join("node_modules/@openai")
+            .join(platform.directory),
+        package_root
+            .parent()
+            .map(|parent| parent.join(platform.directory))
+            .unwrap_or_default(),
+    ];
+    for candidate in package_candidates {
+        let manifest_path = candidate.join("package.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        if dependency != Some(expected_dependency.as_str()) {
+            return Err(CodexLauncherError {
+                message: format!(
+                    "Codex package manifest {} does not pin {} to the expected native version",
+                    core_manifest_path.display(),
+                    platform.dependency
+                ),
+            });
+        }
+        let manifest = read_package_manifest(&manifest_path)?;
+        if manifest.get("name").and_then(serde_json::Value::as_str) != Some("@openai/codex")
+            || manifest.get("version").and_then(serde_json::Value::as_str)
+                != Some(expected_version.as_str())
+        {
+            return Err(CodexLauncherError {
+                message: format!(
+                    "native Codex package {} has an unexpected identity or version",
+                    candidate.display()
+                ),
+            });
+        }
+        let readable_root = fs::canonicalize(&candidate).map_err(|error| CodexLauncherError {
+            message: format!(
+                "cannot resolve native Codex package {}: {error}",
+                candidate.display()
+            ),
+        })?;
+        let executable = readable_root
+            .join("vendor")
+            .join(platform.target_triple)
+            .join("bin")
+            .join(platform.binary_name);
+        let executable = resolve_native_executable(&executable, &readable_root)?;
+        return Ok(ResolvedPackagedNative {
+            executable,
+            readable_root,
+        });
+    }
+
+    let bundled = package_root
+        .join("vendor")
+        .join(platform.target_triple)
+        .join("bin")
+        .join(platform.binary_name);
+    if bundled.is_file() {
+        let executable = resolve_native_executable(&bundled, package_root)?;
+        return Ok(ResolvedPackagedNative {
+            executable,
+            readable_root: package_root.to_path_buf(),
+        });
+    }
+
+    Err(CodexLauncherError {
+        message: format!(
+            "cannot resolve the native Codex executable paired with {}",
+            package_root.display()
+        ),
+    })
+}
+
+fn read_package_manifest(
+    path: &Path,
+) -> std::result::Result<serde_json::Value, CodexLauncherError> {
+    serde_json::from_slice(&fs::read(path).map_err(|error| CodexLauncherError {
+        message: format!(
+            "cannot read Codex package manifest {}: {error}",
+            path.display()
+        ),
+    })?)
+    .map_err(|error| CodexLauncherError {
+        message: format!(
+            "cannot parse Codex package manifest {}: {error}",
+            path.display()
+        ),
+    })
+}
+
+fn resolve_native_executable(
+    executable: &Path,
+    package_root: &Path,
+) -> std::result::Result<PathBuf, CodexLauncherError> {
+    let canonical = fs::canonicalize(executable).map_err(|error| CodexLauncherError {
+        message: format!(
+            "cannot resolve native Codex executable {}: {error}",
+            executable.display()
+        ),
+    })?;
+    if !canonical.starts_with(package_root) || !canonical.is_file() || !is_executable(&canonical) {
+        return Err(CodexLauncherError {
+            message: format!(
+                "native Codex executable {} is missing, outside its package, or not executable",
+                executable.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+fn codex_platform_package() -> Option<CodexPlatformPackage> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-darwin-arm64",
+        directory: "codex-darwin-arm64",
+        target_triple: "aarch64-apple-darwin",
+        version_suffix: "darwin-arm64",
+        binary_name: "codex",
+    });
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-darwin-x64",
+        directory: "codex-darwin-x64",
+        target_triple: "x86_64-apple-darwin",
+        version_suffix: "darwin-x64",
+        binary_name: "codex",
+    });
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-linux-arm64",
+        directory: "codex-linux-arm64",
+        target_triple: "aarch64-unknown-linux-musl",
+        version_suffix: "linux-arm64",
+        binary_name: "codex",
+    });
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-linux-x64",
+        directory: "codex-linux-x64",
+        target_triple: "x86_64-unknown-linux-musl",
+        version_suffix: "linux-x64",
+        binary_name: "codex",
+    });
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-win32-arm64",
+        directory: "codex-win32-arm64",
+        target_triple: "aarch64-pc-windows-msvc",
+        version_suffix: "win32-arm64",
+        binary_name: "codex.exe",
+    });
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    return Some(CodexPlatformPackage {
+        dependency: "@openai/codex-win32-x64",
+        directory: "codex-win32-x64",
+        target_triple: "x86_64-pc-windows-msvc",
+        version_suffix: "win32-x64",
+        binary_name: "codex.exe",
+    });
+    #[allow(unreachable_code)]
+    None
 }
 
 fn canonical_package_root(
@@ -758,6 +981,7 @@ fn test_launcher() -> ResolvedCodexLauncher {
     let executable = env::current_exe().expect("test executable path");
     ResolvedCodexLauncher {
         readable_roots: vec![executable.clone()],
+        execution_executable: executable.clone(),
         executable,
     }
 }
@@ -811,30 +1035,143 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    #[test]
-    fn resolved_launcher_retains_absolute_symlink_and_package_root() {
+    fn install_packaged_wrapper(
+        fixture: &tempfile::TempDir,
+        native_version: Option<&str>,
+    ) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let fixture = tempfile::tempdir().unwrap();
+        let platform = codex_platform_package().expect("supported test platform");
         let bin = fixture.path().join("bin");
         let package = fixture.path().join("lib/node_modules/@openai/codex");
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(package.join("bin")).unwrap();
-        fs::write(package.join("package.json"), r#"{"name":"@openai/codex"}"#).unwrap();
+        fs::write(
+            package.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "version": "1.2.3",
+                "optionalDependencies": {
+                    platform.dependency: format!(
+                        "npm:@openai/codex@1.2.3-{}",
+                        platform.version_suffix
+                    )
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let target = package.join("bin/codex.js");
-        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(&target, "#!/usr/bin/env node\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
         let lexical = bin.join("codex");
         symlink(&target, &lexical).unwrap();
+
+        let native_package = package
+            .join("node_modules/@openai")
+            .join(platform.directory);
+        let native = native_package
+            .join("vendor")
+            .join(platform.target_triple)
+            .join("bin")
+            .join(platform.binary_name);
+        if let Some(version) = native_version {
+            fs::create_dir_all(native.parent().unwrap()).unwrap();
+            fs::write(
+                native_package.join("package.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "@openai/codex",
+                    "version": version
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(&native, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&native, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (bin, lexical, package, native)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_launcher_retains_wrapper_and_uses_verified_native_for_execution() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (bin, _lexical, package, native) =
+            install_packaged_wrapper(&fixture, Some("1.2.3-test-platform"));
+        let platform = codex_platform_package().unwrap();
+        let expected_version = format!("1.2.3-{}", platform.version_suffix);
+        fs::write(
+            package
+                .join("node_modules/@openai")
+                .join(platform.directory)
+                .join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "version": expected_version
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let launcher = ResolvedCodexLauncher::resolve_from_path(&bin).unwrap();
 
         let lexical = fs::canonicalize(&bin).unwrap().join("codex");
         assert_eq!(launcher.executable(), lexical);
         assert_eq!(
-            launcher.readable_roots(),
-            &[lexical, fs::canonicalize(package).unwrap()]
+            launcher.execution_executable(),
+            fs::canonicalize(native).unwrap()
         );
+        assert!(launcher.readable_roots().contains(&lexical));
+        assert!(
+            launcher
+                .readable_roots()
+                .contains(&fs::canonicalize(package).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_packaged_wrapper_rejects_missing_native_runtime() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (bin, _, _, _) = install_packaged_wrapper(&fixture, None);
+
+        let error = ResolvedCodexLauncher::resolve_from_path(&bin).unwrap_err();
+
+        assert!(
+            error.to_string().contains("native Codex executable"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_packaged_wrapper_rejects_mismatched_native_version() {
+        let fixture = tempfile::tempdir().unwrap();
+        let (bin, _, _, _) = install_packaged_wrapper(&fixture, Some("9.9.9-wrong"));
+
+        let error = ResolvedCodexLauncher::resolve_from_path(&bin).unwrap_err();
+
+        assert!(error.to_string().contains("version"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_packaged_wrapper_rejects_native_symlink_escape() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let platform = codex_platform_package().unwrap();
+        let expected_version = format!("1.2.3-{}", platform.version_suffix);
+        let (bin, _, _, native) = install_packaged_wrapper(&fixture, Some(&expected_version));
+        fs::remove_file(&native).unwrap();
+        let outside = fixture.path().join("outside-native");
+        fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&outside, &native).unwrap();
+
+        let error = ResolvedCodexLauncher::resolve_from_path(&bin).unwrap_err();
+
+        assert!(error.to_string().contains("outside its package"), "{error}");
     }
 
     #[cfg(unix)]
@@ -855,6 +1192,7 @@ mod tests {
 
         let executable = fs::canonicalize(executable).unwrap();
         assert_eq!(launcher.executable(), executable);
+        assert_eq!(launcher.execution_executable(), executable);
         assert_eq!(
             launcher.readable_roots(),
             &[fs::canonicalize(package).unwrap()]

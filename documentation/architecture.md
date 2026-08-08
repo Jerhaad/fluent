@@ -536,6 +536,12 @@ contains the owner, leader, process group, heartbeat, and terminal state. `fluen
 attempt cancel <work-item-id> <attempt-id>` validates both the identity lock and
 process group before signaling, confirms the group has stopped, and records an
 `interrupted` pause. Resuming replans only canceled `NeedsUser` Tasks.
+Natural completion observes the leader without reaping it, sweeps its process
+group, and then reaps exactly once. On macOS, `killpg` returns `EPERM` when an
+exited, still-waitable leader is the group's only remaining member; Fluent maps
+only that observed-exited case to already gone. A live same-user descendant
+remains signalable, so the group signal succeeds and retains the ordinary
+descendant-sweep path.
 
 At a legitimate failed-review Writer-round cap, an operator may run `fluent
 attempt extend <work-item-id> <attempt-id> --additional-write-rounds N`, where N
@@ -2316,14 +2322,18 @@ automatic token refresh using the task's IAM identity.
 
 Autonomous Codex launches cross a provider-specific boundary in
 `codex_worker`. The boundary resolves the effective interactive `CODEX_HOME`,
-selects one absolute `codex` launcher from `PATH`, derives its bounded package
-read closure, stages only supported authentication into a mode-private
-temporary home, and runs `codex login status` through that launcher before
-useful work starts. The preflight runs from the system temp directory instead
-of inheriting an arbitrary project directory that the production profile may
-not grant. The launch keeps that prepared capability alive through sandbox
-construction and process completion, then removes the temporary home by RAII
-cleanup.
+selects one absolute `codex` command from `PATH`, and derives its bounded
+package read closure. For an official npm Node wrapper, the boundary verifies
+that the platform package identity and version match the wrapper package and
+retains its packaged native executable for autonomous model work. A missing or
+mismatched native package fails preparation. Standalone native commands remain
+their own execution target. Fluent stages only supported authentication into a
+mode-private temporary home and runs `codex login status` through the selected
+command before useful work starts. The preflight runs from the system temp
+directory instead of inheriting an arbitrary project directory that the
+production profile may not grant. The launch keeps that prepared capability
+alive through sandbox construction and process completion, then removes the
+temporary home by RAII cleanup.
 
 The same pre-reservation boundary resolves `codex.skill-roots` from user and
 project configuration. User configuration may name absolute external roots;
@@ -2343,9 +2353,11 @@ temporary worker home. The Seatbelt profile receives the staged home as its
 only writable Codex-state root plus read-only access to the resolved launcher's
 package closure; it does not receive the interactive home or the launcher's
 enclosing operator home. Writer, Reviewer, Learner, and rebase routes execute
-the retained absolute launcher instead of searching `PATH` again. Interactive
-Codex deliberately remains outside this boundary and retains user
-configuration, hooks, and home access.
+the retained autonomous execution target instead of searching `PATH` again.
+This avoids adding the npm Node shim's process boundary inside Seatbelt when a
+host tool supplies an isolated `HOME`. Interactive Codex deliberately remains
+outside this boundary and retains the selected command, user configuration,
+hooks, and home access.
 
 Writers, Learners, and rebase workers run from a candidate worktree, where
 Codex can discover the applicable `AGENTS.md` normally. Reviewers run from a

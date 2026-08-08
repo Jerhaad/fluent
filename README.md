@@ -36,6 +36,12 @@ describe what you want to explore, build, fix, or improve.
 
 The first invocation sets up Fluent for that project and starts shaping the work with you. You can also invoke the skill explicitly: `$fluent` in Codex, `/fluent` in Claude Code, or `/skill:fluent` in Pi.
 
+For autonomous Codex work, Fluent accepts a standalone `codex` executable or
+an official npm installation whose platform-native package is paired with that
+wrapper version. An incomplete or mismatched npm installation is rejected
+before work starts; reinstall that Codex version rather than weakening Fluent's
+sandbox.
+
 ### Upgrade
 
 Run `fluent update` to install the latest binary. Starting with v0.1.5, Fluent

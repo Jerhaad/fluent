@@ -3138,7 +3138,7 @@ fn run_task_coder_with_optional_coder(
                 sandbox,
                 model,
                 effort,
-                codex_worker.map(|worker| worker.launcher().executable()),
+                codex_worker.map(|worker| worker.launcher().execution_executable()),
             ),
         },
     )
@@ -3352,7 +3352,7 @@ fn run_task_coder_with_coder(
     clear_no_change_declaration(project_root, task)?;
     let coder = make_coder(
         sandbox,
-        codex_worker.map(|worker| worker.launcher().executable()),
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
     );
     // Use the capture config the caller resolved once per logical role run, so every
     // outer retry threads the SAME immutable config — a config change or a concurrent
@@ -4902,7 +4902,7 @@ fn run_learner_with_coder_with_provider_readiness(
 
     let coder = make_coder(
         sandbox,
-        codex_worker.map(|worker| worker.launcher().executable()),
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
     );
     // Persist the coder's supervision report at the Learner artifact boundary, then
     // take its terminal outcome, so a group-sweep diagnostic is durable rather than
@@ -5635,7 +5635,7 @@ fn run_review_coder(
                 sandbox,
                 model,
                 effort,
-                codex_worker.map(|worker| worker.launcher().executable()),
+                codex_worker.map(|worker| worker.launcher().execution_executable()),
             ),
         },
     )
@@ -5743,7 +5743,7 @@ fn run_review_coder_with_coder(
     let transcript_path = artifact_dir.join("transcript.jsonl");
     let coder = make_coder(
         sandbox,
-        codex_worker.map(|worker| worker.launcher().executable()),
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
     );
     let launch_env = codex_worker
         .map(|worker| vec![worker.launch_env()])

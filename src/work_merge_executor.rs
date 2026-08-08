@@ -2245,7 +2245,7 @@ fn run_reserved_rebase(
 
     let coder = make_coder(
         sandbox,
-        codex_worker.map(|worker| worker.launcher().executable()),
+        codex_worker.map(|worker| worker.launcher().execution_executable()),
     );
     // Persist the coder's supervision report in the rebase artifact directory, then
     // take its terminal outcome, so a group-sweep diagnostic is durable rather than

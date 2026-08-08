@@ -1498,6 +1498,27 @@ fn terminate_process_group(leader: u32) -> GroupSweep {
     }
 }
 
+/// Classify the one macOS result that means an exited, still-waitable group
+/// leader has no signalable members. macOS returns `EPERM` rather than `ESRCH`
+/// when `killpg` sees only that zombie leader. If any live same-user descendant
+/// remains, the signal is deliverable and `killpg` returns success, so that path
+/// stays a real delivered sweep. Every other error remains unconfirmed.
+fn classify_group_sweep_after_observation(
+    observation: ExitObservation,
+    sweep: GroupSweep,
+) -> GroupSweep {
+    #[cfg(target_os = "macos")]
+    if observation == ExitObservation::Exited
+        && matches!(
+            &sweep,
+            GroupSweep::Failed(error) if error.errno == Some(libc::EPERM)
+        )
+    {
+        return GroupSweep::AlreadyGone;
+    }
+    sweep
+}
+
 #[cfg(not(unix))]
 fn terminate_process_group(_leader: u32) -> GroupSweep {
     GroupSweep::Delivered
@@ -1586,7 +1607,7 @@ trait LeaderProcess: Send {
     fn wait_exit(&mut self) -> ExitObservation;
     /// SIGKILL the leader's whole process group, returning a structured sweep result
     /// that retains the OS error on a genuine failure.
-    fn signal_group(&mut self) -> GroupSweep;
+    fn signal_group(&mut self, observation: ExitObservation) -> GroupSweep;
     /// SIGKILL the direct leader — the fallback when a verified group signal fails.
     /// `Err` retains the operation and OS error.
     fn kill_leader(&mut self) -> Result<(), ProcessOpError>;
@@ -1660,8 +1681,8 @@ impl LeaderProcess for SystemLeader {
         }
     }
 
-    fn signal_group(&mut self) -> GroupSweep {
-        terminate_process_group(self.id)
+    fn signal_group(&mut self, observation: ExitObservation) -> GroupSweep {
+        classify_group_sweep_after_observation(observation, terminate_process_group(self.id))
     }
 
     fn kill_leader(&mut self) -> Result<(), ProcessOpError> {
@@ -1891,7 +1912,7 @@ impl ManagedChild {
             // whose descendant may still hold stdout open.
             return Err(CleanupError::IdentityLost { id });
         }
-        let sweep = self.leader.signal_group();
+        let sweep = self.leader.signal_group(observed);
         let swept = sweep.swept();
         self.outcome.group_signal = Some(sweep);
         if !swept {
@@ -3139,7 +3160,7 @@ mod pump_supervision_tests {
             self.calls.lock().unwrap().push("wait_exit");
             ExitObservation::Exited
         }
-        fn signal_group(&mut self) -> GroupSweep {
+        fn signal_group(&mut self, _observation: ExitObservation) -> GroupSweep {
             self.calls.lock().unwrap().push("signal_group");
             if self.group_settles {
                 GroupSweep::Delivered
@@ -3172,6 +3193,26 @@ mod pump_supervision_tests {
                 )
             })
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_macos_group_eperm_means_no_signalable_members() {
+        let failed = || {
+            GroupSweep::Failed(ProcessOpError::from_io(
+                "kill process group",
+                &std::io::Error::from_raw_os_error(libc::EPERM),
+            ))
+        };
+
+        assert!(matches!(
+            classify_group_sweep_after_observation(ExitObservation::Exited, failed()),
+            GroupSweep::AlreadyGone
+        ));
+        assert!(matches!(
+            classify_group_sweep_after_observation(ExitObservation::Running, failed()),
+            GroupSweep::Failed(_)
+        ));
     }
 
     #[test]
