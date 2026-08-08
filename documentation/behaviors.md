@@ -6003,8 +6003,10 @@ Test: tests/binary.rs (update_without_checksum_asset_preserves_binary)
 
 WHEN the release script runs from a clean commit equal to `origin/main`, the
 version tag is unused, and every release gate passes, THE SYSTEM SHALL publish
-the signed platform binary and its SHA-256 file at that exact commit.
-Test: tests/behaviors/operations/test-release-script.sh (publishes checksum at exact commit after gates)
+distinct signed binaries for `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, with one matching SHA-256 file for each binary, at that
+exact commit.
+Test: tests/behaviors/operations/test-release-script.sh (publishes both Mac architectures at exact commit after gates)
 
 ### B9
 
@@ -6014,6 +6016,16 @@ THEN THE SYSTEM SHALL publish no release.
 Test: tests/behaviors/operations/test-release-script.sh (rejects dirty or unsynchronized source)
 Test: tests/behaviors/operations/test-release-script.sh (rejects reused tag or failed release gate)
 Test: tests/behaviors/operations/test-release-script.sh (rejects missing release notes)
+
+### B10
+
+IF either supported macOS target cannot be built, does not contain its requested
+architecture, cannot be signed, or cannot be checksummed, THEN THE SYSTEM SHALL
+stop before creating the GitHub release.
+Test: tests/behaviors/operations/test-release-script.sh (rejects failed target build before publication)
+Test: tests/behaviors/operations/test-release-script.sh (rejects failed target signature before publication)
+Test: tests/behaviors/operations/test-release-script.sh (rejects wrong target architecture before publication)
+Test: tests/behaviors/operations/test-release-script.sh (rejects failed target checksum before publication)
 
 ## Project initialization
 
@@ -6675,9 +6687,8 @@ Test: tests/behaviors/operations/test-install-script.sh (installs a runnable bin
 
 ### B2
 
-IF the platform has no published release asset,
-THEN THE SYSTEM SHALL report the platform is unsupported and exit
-without installing.
+IF the operating-system and architecture pair is unsupported, THEN THE SYSTEM
+SHALL report the platform is unsupported and exit without installing.
 Test: tests/behaviors/operations/test-install-script.sh (unsupported platform)
 
 ### B3
@@ -6707,6 +6718,24 @@ Test: tests/behaviors/operations/test-install-script.sh (download failure)
 IF the downloaded release binary does not match its published SHA-256 checksum,
 THEN THE SYSTEM SHALL fail installation and preserve any installed binary.
 Test: tests/behaviors/operations/test-install-script.sh (checksum mismatch preserves installed binary)
+
+### B7
+
+WHEN the install script runs on Apple Silicon macOS, THE SYSTEM SHALL download
+the `fluent-aarch64-apple-darwin` binary and its matching checksum.
+Test: tests/behaviors/operations/test-install-script.sh (Apple Silicon selects aarch64 asset)
+
+### B8
+
+WHEN the install script runs on Intel macOS, THE SYSTEM SHALL download the
+`fluent-x86_64-apple-darwin` binary and its matching checksum.
+Test: tests/behaviors/operations/test-install-script.sh (Intel selects x86_64 asset)
+
+### B9
+
+IF a release omits the binary for the current supported Mac architecture, THEN
+THE SYSTEM SHALL fail installation and preserve any installed binary.
+Test: tests/behaviors/operations/test-install-script.sh (missing Intel asset preserves installed binary)
 
 ---
 

@@ -20,21 +20,60 @@ ASSET_NAME="fluent-${ASSET_TRIPLE}"
 setup_fixture_release() {
   local tmp="$1"
   local version="${2:-0.99.0}"
+  local asset_triple="${3:-$ASSET_TRIPLE}"
+  local asset_name="fluent-${asset_triple}"
   local tag="v${version}"
   local releases_dir="$tmp/releases"
   local download_dir="$releases_dir/download/${tag}"
   mkdir -p "$download_dir"
 
-  printf '#!/bin/sh\nprintf "fluent %s (abc1234)\\n"\n' "$version" \
-    > "$download_dir/$ASSET_NAME"
-  chmod +x "$download_dir/$ASSET_NAME"
+  printf '#!/bin/sh\nprintf "fluent %s %s (abc1234)\\n"\n' \
+    "$version" "$asset_triple" > "$download_dir/$asset_name"
+  chmod +x "$download_dir/$asset_name"
   local digest
-  digest="$(shasum -a 256 "$download_dir/$ASSET_NAME" | awk '{print $1}')"
-  printf '%s  %s\n' "$digest" "$ASSET_NAME" \
-    > "$download_dir/${ASSET_NAME}.sha256"
+  digest="$(shasum -a 256 "$download_dir/$asset_name" | awk '{print $1}')"
+  printf '%s  %s\n' "$digest" "$asset_name" \
+    > "$download_dir/${asset_name}.sha256"
 
   local latest_file="$releases_dir/latest"
   printf '%s\n' "$tag" > "$latest_file"
+}
+
+write_fake_uname() {
+  local fake_bin="$1"
+  local os="$2"
+  local arch="$3"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/uname" <<EOF
+#!/bin/sh
+case "\${1-}" in
+  -s) printf '%s\\n' '$os' ;;
+  -m) printf '%s\\n' '$arch' ;;
+  *) exit 2 ;;
+esac
+EOF
+  chmod +x "$fake_bin/uname"
+}
+
+assert_installs_mac_architecture() {
+  local tmp="$1"
+  local machine_arch="$2"
+  local expected_triple="$3"
+  local fake_bin="$tmp/fake-bin"
+  local install_dir="$tmp/home/.local/bin"
+
+  setup_fixture_release "$tmp" "0.99.0" "aarch64-apple-darwin"
+  setup_fixture_release "$tmp" "0.99.0" "x86_64-apple-darwin"
+  write_fake_uname "$fake_bin" "Darwin" "$machine_arch"
+  mkdir -p "$install_dir"
+
+  PATH="$fake_bin:$PATH" \
+  FLUENT_INSTALL_BASE_URL="file://$tmp/releases" \
+  HOME="$tmp/home" \
+    bash "$INSTALL_SCRIPT" --install-path "$install_dir" --no-modify-path \
+    > "$tmp/stdout.txt" 2>&1
+
+  "$install_dir/fluent" | grep -Fq "$expected_triple"
 }
 
 test_installs_runnable_binary() {
@@ -68,6 +107,53 @@ test_installs_runnable_binary() {
     printf '    FAIL: binary should run and report version; got: %s\n' "$output"
     return 1
   fi
+}
+
+test_apple_silicon_selects_aarch64_asset() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  assert_installs_mac_architecture "$tmp" "arm64" "aarch64-apple-darwin"
+}
+
+test_intel_selects_x86_64_asset() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  assert_installs_mac_architecture "$tmp" "x86_64" "x86_64-apple-darwin"
+}
+
+test_missing_intel_asset_preserves_installed_binary() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  setup_fixture_release "$tmp" "0.99.0" "aarch64-apple-darwin"
+  local fake_bin="$tmp/fake-bin"
+  write_fake_uname "$fake_bin" "Darwin" "x86_64"
+
+  local install_dir="$tmp/home/.local/bin"
+  mkdir -p "$install_dir"
+  printf 'existing\n' > "$install_dir/fluent"
+
+  local rc=0
+  PATH="$fake_bin:$PATH" \
+  FLUENT_INSTALL_BASE_URL="file://$tmp/releases" \
+  HOME="$tmp/home" \
+    bash "$INSTALL_SCRIPT" --install-path "$install_dir" --no-modify-path \
+    > "$tmp/stdout.txt" 2>&1 || rc=$?
+
+  [ "$rc" -ne 0 ] || {
+    printf '    FAIL: missing Intel asset should fail\n'
+    return 1
+  }
+  [ "$(cat "$install_dir/fluent")" = "existing" ] || {
+    printf '    FAIL: missing Intel asset replaced the installed binary\n'
+    return 1
+  }
+  grep -Fq 'download failed' "$tmp/stdout.txt"
 }
 
 test_unsupported_platform() {
@@ -260,6 +346,11 @@ test_checksum_mismatch_preserves_installed_binary() {
 printf 'test-install-script\n\n'
 
 run_test "installs a runnable binary" test_installs_runnable_binary
+run_test "Apple Silicon selects aarch64 asset" \
+  test_apple_silicon_selects_aarch64_asset
+run_test "Intel selects x86_64 asset" test_intel_selects_x86_64_asset
+run_test "missing Intel asset preserves installed binary" \
+  test_missing_intel_asset_preserves_installed_binary
 run_test "unsupported platform" test_unsupported_platform
 run_test "modifies PATH" test_modifies_path
 run_test "no-modify-path warns" test_no_modify_path_warns

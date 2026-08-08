@@ -1752,13 +1752,22 @@ verifies the checksum, and atomically replaces the binary via POSIX
 rename. After replacement, the updater shells out to the new binary's
 `skills` command so skills are always in sync with the binary.
 
-`scripts/release.sh` publishes the binary, checksum, and committed
-`documentation/releases/<tag>.md` notes only from a clean `origin/main` commit
-with a new tag, after formatting, compilation, and the exact configured Tester
-commands pass. It refuses publication when the version-specific notes are
-missing and passes the committed file to GitHub with `--notes-file`.
-`tools/install.sh` applies the same checksum gate before replacing an existing
-installation.
+`scripts/release.sh` runs on either supported macOS architecture and builds
+both `aarch64-apple-darwin` and `x86_64-apple-darwin`. The release host must
+have both Rust targets installed with `rustup target add
+aarch64-apple-darwin x86_64-apple-darwin`. The script verifies each staged
+binary's Mach-O architecture with `lipo`, applies and verifies an ad-hoc
+signature, then computes a separate SHA-256 file. It calls `gh release create`
+once with both binaries and both checksums, so a build, architecture, signature,
+checksum, or release-gate failure stops before publication.
+
+Publication also requires a clean `origin/main` commit, a new tag, and committed
+`documentation/releases/<tag>.md` notes. Formatting, compilation, and the exact
+configured Tester commands must pass. The script passes the committed notes to
+GitHub with `--notes-file`. `tools/install.sh` maps Apple Silicon to
+`aarch64-apple-darwin` and Intel to `x86_64-apple-darwin`, downloads that
+architecture's binary and checksum, and applies the checksum gate before
+replacing an existing installation.
 
 On every command except `fluent update`, Fluent runs a cached update
 check: it queries the release source at most once per 24 hours, caches
