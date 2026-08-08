@@ -1799,26 +1799,29 @@ both the query and the nudge. Offline check failures are silent.
 
 ## Clean-room first-run smoke
 
-`scripts/first-run-smoke.sh` is an operator-run release gate that exercises
-Fluent's public first-run journey — install, initialize, create a small Work
-Item, run its Attempt through the Learner, inspect the ready Merge Candidate,
-and land it — inside a fresh repository and an isolated home. It proves a new
-user can complete the released workflow without hidden local state. It is not
-part of the normal test suite: the automated shell test drives it with local
-doubles only, while this script performs the real, model-backed run.
+`scripts/first-run-smoke.sh` is an operator-run release gate that exercises a
+candidate binary from first-use skill handoff through scheduler execution,
+Learner completion, Merge Candidate inspection, and explicit landing inside a
+fresh repository and isolated home. `prepare` seeds the exact marked bootstrap
+and external lock shape produced by the public skill installer; the separate
+live release matrix runs the networked `npx skills add` and coding-agent
+conversation themselves. The automated shell suite drives the harness with
+local stateful doubles, while a release operator uses the same phases with the
+candidate binary and real providers.
 
 The harness runs in three explicit, resumable phases. Every path is quoted, so
 the smoke root may live anywhere, including a path containing spaces:
 
 ```sh
 # 1. Prepare a self-contained smoke root (isolated home, Git repository,
-#    deterministic failing fixture, planning inputs, manifest, evidence).
-#    Supply an existing authenticated Codex home for the model-backed run.
+#    deterministic failing fixture, skill bootstrap, planning inputs,
+#    schema-v2 manifest, and evidence). Select the provider mix explicitly.
 scripts/first-run-smoke.sh prepare /path/to/smoke-root \
+  --coder-profile codex-balanced \
   --codex-home /path/to/authenticated/codex-home
 
-# 2. Install/select Fluent, initialize, create and run the Work Item, and stop
-#    at a ready Merge Candidate. Prints the exact inspection and land commands.
+# 2. Install/select Fluent, hand off the bootstrap, initialize, queue the Work
+#    Item, run the scheduler, and stop at a ready Merge Candidate.
 scripts/first-run-smoke.sh run /path/to/smoke-root
 
 # 3. After you inspect and accept the candidate, land it, verify the fixture
@@ -1830,7 +1833,11 @@ Choose any empty (or not-yet-existing) directory as the smoke root; `prepare`
 refuses a nonempty directory unless it already holds a compatible harness
 manifest or an incomplete-prepare marker left by an earlier interrupted
 `prepare`, so both re-running `prepare` on a finished root and resuming one that
-failed mid-seed are safe. A relative `--installer` or `--binary` override is
+failed mid-seed are safe. Schema-v1 manifests are rejected rather than migrated
+because this operator harness was not released with a compatibility contract.
+A completed root also rejects a different requested coder profile instead of
+silently changing the recorded provider matrix row.
+A relative `--installer` or `--binary` override is
 resolved to an absolute path during `prepare`, so `run` selects the same
 boundary even when invoked from a different working directory. The harness
 creates and preserves its isolated `HOME`, repository at
@@ -1840,14 +1847,29 @@ An operator-supplied Codex authentication home remains outside the root and is
 only referenced; the harness never copies it there. The harness never deletes
 the root, on success or failure.
 
-**Codex authentication.** For a model-backed Codex smoke, pass an existing
+**Coder profile and authentication.** `prepare` requires one curated profile:
+`codex-balanced`, `codex-stronger`, `claude-balanced`,
+`codex-write-claude-review`, or `claude-write-codex-review`. It records the
+choice in the manifest, and `run` passes that exact value to configured
+initialization. For a profile that uses Codex, pass an existing
 authenticated Codex home with `prepare --codex-home`. The harness records that
 absolute path in its manifest and sets it as `CODEX_HOME` for Fluent commands;
 it does not copy credentials into the smoke root, logs, evidence, or fixture
-repository. The smoke `HOME` remains isolated under the root. The `run` phase
-initializes Fluent with the `codex-balanced` coder profile and `propose`
-follow-up mode, then writes the fixture Tester configuration and commits all
-initialization changes before creating the Attempt.
+repository. Claude credentials continue through Fluent's host-owned Keychain
+path. The smoke `HOME` remains isolated under the root.
+
+**Skill and scheduler boundaries.** Before initialization, `run` invokes
+`fluent skills add` exactly as the bootstrap instructs. It requires the marked
+project skill to become a sidecar-managed full skill, Fluent's lock entry to be
+removed, and unrelated lock values to remain. It then initializes with
+`propose` follow-up mode, writes the fixture Tester configuration, and commits
+the complete first-use state before creating the Work Item and planned Attempt.
+The harness submits that Attempt with `fluent queue add`, starts `fluent
+scheduler run` as a child, and polls `fluent queue list`. It terminates and
+reaps the child after a terminal dispatch or harness interruption.
+`candidate-ready` still requires an independent `attempt show` check for a
+complete Attempt and succeeded Learner; the scheduler never lands the
+candidate.
 
 **Install boundary.** By default `prepare` records the public installer at
 `https://fluent.computer/install`, and `run` invokes it under the isolated
@@ -1856,8 +1878,10 @@ pre-release validation, override the boundary without changing the phase
 contract:
 
 ```sh
-scripts/first-run-smoke.sh prepare /path/to/smoke-root --installer ./tools/install.sh
-scripts/first-run-smoke.sh prepare /path/to/smoke-root --binary ./target/release/fluent
+scripts/first-run-smoke.sh prepare /path/to/smoke-root \
+  --coder-profile claude-balanced --installer ./tools/install.sh
+scripts/first-run-smoke.sh prepare /path/to/smoke-root \
+  --coder-profile codex-write-claude-review --binary ./target/release/fluent
 ```
 
 **Failure and resume.** If any phase fails, the harness exits non-zero,
@@ -1872,7 +1896,10 @@ after a successful merge is safe: the phase inspects the durable candidate state
 and skips the merge when it has already happened, finishing only the outstanding
 verification. Landing is gated on a succeeded Learner, so `run` stops with a
 truthful nonterminal state rather than handing off a candidate whose Learner has
-not yet succeeded.
+not yet succeeded. When the scheduler records `needs-user`, a later `run`
+issues `fluent queue resume` for the manifest's exact Attempt before starting
+the scheduler again; it never creates a replacement Attempt or replays
+completed initialization.
 
 ## Agents
 

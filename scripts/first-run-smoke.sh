@@ -2,15 +2,17 @@
 #
 # first-run-smoke.sh — operator harness for Fluent's clean-room first-run gate.
 #
-# Exercises Fluent's public first-run journey inside a fresh repository and an
-# isolated home: install or select Fluent, initialize the repository, create a
-# small deterministic Work Item, run its Attempt through the Learner, inspect
-# the ready Merge Candidate, and land it only after an explicit second command.
+# Exercises a candidate Fluent binary inside a fresh repository and isolated
+# home: install or select Fluent, adopt a public-shaped skill bootstrap,
+# initialize the repository, queue a small deterministic Work Item, run it
+# through the scheduler and Learner, inspect the ready Merge Candidate, and land
+# it only after an explicit second command.
 #
 # The harness runs in explicit, resumable phases so an operator can inspect
 # evidence at every safety boundary:
 #
-#   first-run-smoke.sh prepare <root> [--installer <url|path>] [--binary <path>]
+#   first-run-smoke.sh prepare <root> --coder-profile <profile>
+#                              [--installer <url|path>] [--binary <path>]
 #                              [--codex-home <path>]
 #   first-run-smoke.sh run     <root>
 #   first-run-smoke.sh land    <root>
@@ -24,10 +26,13 @@ set -euo pipefail
 
 if [[ "${TRACE-0}" == "1" ]]; then set -o xtrace; fi
 
-readonly SCHEMA_VERSION=1
+readonly SCHEMA_VERSION=2
 readonly WORK_ITEM_ID="clean-room-fixture"
 readonly ATTEMPT_ID="attempt-1"
 readonly DEFAULT_INSTALLER="https://fluent.computer/install"
+readonly SCHEDULER_TIMEOUT_SECONDS=7200
+readonly SCHEDULER_EXIT_GRACE_SECONDS=5
+readonly QUEUE_POLL_SECONDS="${FLUENT_SMOKE_QUEUE_POLL_SECONDS:-1}"
 
 # Absolute path to this script, for the resume commands the harness prints.
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -227,13 +232,65 @@ Set greeting.txt to a single line reading "hello" so ./check.sh passes.
 INSTRUCTIONS
 }
 
+# Model the project files produced by the public `npx skills add` command. The
+# separate live release matrix runs that networked command through real coding
+# agents; this deterministic fixture lets the local harness prove that the
+# selected Fluent binary adopts the marked bootstrap and releases only Fluent's
+# external lock entry.
+seed_skill_bootstrap() {
+  local project="$1" skill_dir="$1/.agents/skills/fluent"
+  mkdir -p "$skill_dir"
+  cat > "$skill_dir/SKILL.md" <<'SKILL'
+---
+name: fluent
+description: Install and continue with Fluent.
+fluent-shim: true
+---
+
+# Fluent bootstrap
+
+Run `fluent skills add`, then continue from the full managed skill.
+SKILL
+  cat > "$project/skills-lock.json" <<'LOCK'
+{
+  "version": 1,
+  "metadata": {"fixture": "keep"},
+  "skills": {
+    "fluent": {
+      "source": "mrinalwadhwa/fluent",
+      "sourceType": "github",
+      "skillPath": "skills/fluent/SKILL.md",
+      "computedHash": "clean-room-bootstrap"
+    },
+    "other": {
+      "source": "owner/other",
+      "skillPath": "skills/other/SKILL.md"
+    }
+  }
+}
+LOCK
+}
+
+validate_coder_profile() {
+  case "$1" in
+    codex-balanced|codex-stronger|claude-balanced|codex-write-claude-review|claude-write-codex-review)
+      return 0
+      ;;
+    *)
+      die "unsupported coder profile: $1"
+      ;;
+  esac
+}
+
 phase_prepare() {
   local root="" installer="$DEFAULT_INSTALLER" binary="" codex_home=""
+  local coder_profile=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --installer) installer="${2-}"; shift 2 ;;
       --binary)    binary="${2-}"; shift 2 ;;
       --codex-home) codex_home="${2-}"; shift 2 ;;
+      --coder-profile) coder_profile="${2-}"; shift 2 ;;
       --*)         die "unknown prepare option: $1" ;;
       *)
         [ -z "$root" ] || die "prepare takes a single smoke root"
@@ -241,6 +298,8 @@ phase_prepare() {
     esac
   done
   [ -n "$root" ] || die "prepare requires a smoke root path"
+  [ -n "$coder_profile" ] || die "prepare requires --coder-profile"
+  validate_coder_profile "$coder_profile"
   root="$(absolute_path "$root")"
 
   if [ -n "$codex_home" ]; then
@@ -265,6 +324,10 @@ phase_prepare() {
       [ "$existing" = "$SCHEMA_VERSION" ] \
         || die "existing smoke root has incompatible schema $existing"
       verify_manifest_root "$root"
+      local existing_profile
+      existing_profile="$(manifest_get "$root" '.coder_profile')"
+      [ "$existing_profile" = "$coder_profile" ] \
+        || die "existing smoke root uses coder profile $existing_profile, not $coder_profile"
       info "Reusing existing smoke root: $root"
       return 0
     elif [ -n "$(ls -A -- "$root" 2>/dev/null)" ]; then
@@ -324,6 +387,8 @@ phase_prepare() {
     || fail_phase "$root" "prepare" "$prepare_log" "prepare"
   { seed_planning_inputs "$(workitem_dir "$root")"; } >> "$prepare_log" 2>&1 \
     || fail_phase "$root" "prepare" "$prepare_log" "prepare"
+  { seed_skill_bootstrap "$(project_dir "$root")"; } >> "$prepare_log" 2>&1 \
+    || fail_phase "$root" "prepare" "$prepare_log" "prepare"
 
   # Record the resolved binary path now for a prebuilt override; the installer
   # path selects the same location during run.
@@ -345,6 +410,7 @@ phase_prepare() {
       --arg boundary "$install_boundary" \
       --arg bin "$fluent_bin" \
       --arg codex_home "$codex_home" \
+      --arg coder_profile "$coder_profile" \
       --arg wi "$WORK_ITEM_ID" \
       --arg attempt "$ATTEMPT_ID" \
       '{
@@ -355,6 +421,7 @@ phase_prepare() {
         install_boundary: $boundary,
         fluent_bin: $bin,
         codex_home: $codex_home,
+        coder_profile: $coder_profile,
         work_item_id: $wi,
         attempt_id: $attempt,
         merge_candidate_id: null,
@@ -377,6 +444,7 @@ phase_prepare() {
   info "  repository:     $(project_dir "$root")"
   info "  evidence:       $(evidence_dir "$root")"
   info "  install source: $install_boundary"
+  info "  coder profile:  $coder_profile"
   info ""
   info "Next: $(shq "$SELF") run $(shq "$root")"
 }
@@ -390,6 +458,37 @@ RUN_PROJECT=""
 RUN_HOME=""
 RUN_BIN=""
 RUN_CODEX_HOME=""
+SCHEDULER_TERMINAL_STATUS=""
+SCHEDULER_PID=""
+SCHEDULER_LOG=""
+
+cleanup_scheduler() {
+  local pid="$SCHEDULER_PID" rc=0
+  [ -n "$pid" ] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>> "${SCHEDULER_LOG:-/dev/null}" || true
+  fi
+  wait "$pid" 2>> "${SCHEDULER_LOG:-/dev/null}" || rc=$?
+  if [ -n "$SCHEDULER_LOG" ]; then
+    printf 'scheduler exit: %s\n' "$rc" >> "$SCHEDULER_LOG"
+  fi
+  SCHEDULER_PID=""
+  SCHEDULER_LOG=""
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 143 ]
+}
+
+handle_scheduler_signal() {
+  local signal="$1" status=1
+  case "$signal" in
+    INT) status=130 ;;
+    TERM) status=143 ;;
+  esac
+  cleanup_scheduler || true
+  exit "$status"
+}
+
+trap 'handle_scheduler_signal INT' INT
+trap 'handle_scheduler_signal TERM' TERM
 
 # Rank the completed run-setup stages so a resumed run skips public commands it
 # has already run. init, work-item create, and attempt create are not idempotent
@@ -398,9 +497,11 @@ RUN_CODEX_HOME=""
 run_stage_rank() {
   case "$1" in
     installed) printf '1' ;;
-    init)      printf '2' ;;
-    work-item) printf '3' ;;
-    attempt)   printf '4' ;;
+    skills)    printf '2' ;;
+    init)      printf '3' ;;
+    work-item) printf '4' ;;
+    attempt)   printf '5' ;;
+    queued)    printf '6' ;;
     *)         printf '0' ;;
   esac
 }
@@ -434,6 +535,93 @@ capture_fluent() {
   fi
   printf '$ fluent %s\n%s\nexit: %s\n' "$*" "$out" "$rc" >> "$logfile"
   [ "$rc" -eq 0 ] && printf '%s' "$out"
+  return "$rc"
+}
+
+start_scheduler() {
+  local logfile="$1"
+  printf '$ fluent scheduler run --poll-seconds 1\n' >> "$logfile"
+  if [ -n "$RUN_CODEX_HOME" ]; then
+    ( cd "$RUN_PROJECT" && exec env HOME="$RUN_HOME" CODEX_HOME="$RUN_CODEX_HOME" \
+      "$RUN_BIN" scheduler run --poll-seconds 1 ) >> "$logfile" 2>&1 &
+  else
+    ( cd "$RUN_PROJECT" && exec env HOME="$RUN_HOME" \
+      "$RUN_BIN" scheduler run --poll-seconds 1 ) >> "$logfile" 2>&1 &
+  fi
+  SCHEDULER_PID="$!"
+  SCHEDULER_LOG="$logfile"
+}
+
+stop_scheduler() {
+  local pid="$1" logfile="$2"
+  [ "$pid" = "$SCHEDULER_PID" ] || {
+    printf 'error: scheduler pid changed before cleanup\n' >> "$logfile"
+    return 1
+  }
+  cleanup_scheduler
+}
+
+read_queue_status() {
+  local work_item_id="$1" logfile="$2" output
+  output="$(capture_fluent "$logfile" queue list)" || return 1
+  printf '%s\n' "$output" \
+    | awk -v id="$work_item_id" '$NF == id { print $(NF - 1); found = 1; exit }
+    END { if (!found) exit 1 }'
+}
+
+run_scheduler_until_terminal() {
+  local work_item_id="$1" scheduler_log="$2" queue_log="$3"
+  local pid status="" started now rc=0
+  local scheduler_stopped=0 scheduler_stopped_at=0
+  started="$(date +%s)"
+  start_scheduler "$scheduler_log"
+  pid="$SCHEDULER_PID"
+
+  while :; do
+    status="$(read_queue_status "$work_item_id" "$queue_log")" || {
+      rc=1
+      break
+    }
+    case "$status" in
+      candidate-ready|needs-user|failed|blocked|canceled)
+        break
+        ;;
+    esac
+    if [ "$scheduler_stopped" -eq 0 ] && ! kill -0 "$pid" 2>/dev/null; then
+      # Reap first so the scheduler can no longer publish another update. Queue
+      # reads may still briefly expose the prior value, so allow a short,
+      # bounded convergence window before classifying the exit as premature.
+      stop_scheduler "$pid" "$scheduler_log" || {
+        rc=1
+        break
+      }
+      scheduler_stopped=1
+      scheduler_stopped_at="$(date +%s)"
+    fi
+    now="$(date +%s)"
+    if [ "$scheduler_stopped" -eq 1 ] \
+      && [ "$((now - scheduler_stopped_at))" -ge "$SCHEDULER_EXIT_GRACE_SECONDS" ]; then
+      printf 'error: scheduler exited before queue terminal state (%s)\n' "$status" \
+        >> "$scheduler_log"
+      rc=1
+      break
+    fi
+    if [ "$((now - started))" -ge "$SCHEDULER_TIMEOUT_SECONDS" ]; then
+      printf 'error: scheduler timed out with queue status %s\n' "$status" \
+        >> "$scheduler_log"
+      rc=1
+      break
+    fi
+    sleep "$QUEUE_POLL_SECONDS" || {
+      rc=1
+      break
+    }
+  done
+
+  if [ "$scheduler_stopped" -eq 0 ]; then
+    stop_scheduler "$pid" "$scheduler_log" || rc=1
+  fi
+  SCHEDULER_TERMINAL_STATUS="$status"
   return "$rc"
 }
 
@@ -500,6 +688,26 @@ select_fluent() {
   fi
 }
 
+verify_skill_handoff() {
+  local project="$1" logfile="$2"
+  local skill_dir="$project/.agents/skills/fluent"
+  local lock="$project/skills-lock.json"
+  [ -f "$skill_dir/.fluent-managed.json" ] || {
+    printf 'error: Fluent did not record ownership at %s\n' "$skill_dir" >> "$logfile"
+    return 1
+  }
+  jq -e '.schema_version == 1 and .agent == "universal" and
+    .scope == "project" and .skill == "fluent"' \
+    "$skill_dir/.fluent-managed.json" > /dev/null 2>> "$logfile" || return 1
+  if grep -Fq 'fluent-shim: true' "$skill_dir/SKILL.md"; then
+    printf 'error: Fluent left the bootstrap marker at %s\n' "$skill_dir" >> "$logfile"
+    return 1
+  fi
+  jq -e '.skills.fluent == null' "$lock" > /dev/null 2>> "$logfile" || return 1
+  jq -e '.metadata.fixture == "keep" and .skills.other.source == "owner/other"' \
+    "$lock" > /dev/null 2>> "$logfile" || return 1
+}
+
 phase_run() {
   local root="${1-}"
   [ -n "$root" ] || die "run requires a smoke root path"
@@ -509,10 +717,12 @@ phase_run() {
     || die "smoke root has an incompatible manifest schema"
   verify_manifest_root "$root"
 
-  local safe_phase wi cand
+  local safe_phase wi cand coder_profile
   safe_phase="$(manifest_get "$root" '.safe_phase')"
   wi="$(manifest_get "$root" '.work_item_id')"
   cand="${ATTEMPT_ID}-merge-candidate"
+  coder_profile="$(manifest_get "$root" '.coder_profile')"
+  validate_coder_profile "$coder_profile"
 
   RUN_PROJECT="$(project_dir "$root")"
   RUN_HOME="$(home_dir "$root")"
@@ -546,11 +756,21 @@ phase_run() {
     checkpoint "$root" "run" "$manifest_log" "run_stage" "installed"
   fi
 
-  # init -> Work Item -> Attempt (public first-run commands), each checkpointed.
+  if [ "$done_rank" -lt "$(run_stage_rank skills)" ]; then
+    begin_log "$logs/skills.log" "skill bootstrap"
+    run_fluent "$logs/skills.log" skills add \
+      || fail_phase "$root" "run" "$logs/skills.log" "run"
+    verify_skill_handoff "$RUN_PROJECT" "$logs/skills.log" \
+      || fail_phase "$root" "run" "$logs/skills.log" "run"
+    checkpoint "$root" "run" "$manifest_log" "run_stage" "skills"
+  fi
+
+  # init -> Work Item -> planned Attempt -> queue (public first-run commands),
+  # each checkpointed before the scheduler owns execution.
   if [ "$done_rank" -lt "$(run_stage_rank init)" ]; then
     begin_log "$logs/init.log" "init"
     run_fluent "$logs/init.log" init \
-      --coder-profile codex-balanced \
+      --coder-profile "$coder_profile" \
       --follow-up-mode propose \
       || fail_phase "$root" "run" "$logs/init.log" "run"
     install_tester_config "$RUN_PROJECT" >> "$logs/init.log" 2>&1 \
@@ -576,38 +796,75 @@ phase_run() {
     checkpoint "$root" "run" "$manifest_log" "run_stage" "attempt"
   fi
 
-  # Advance the Attempt until its Learner has succeeded. A Merge Candidate can
-  # exist before the Learner runs, but landing requires a succeeded Learner, so
-  # readiness is gated on the stored Attempt learning state — not merely on the
-  # candidate record.
-  local attempt_log="$logs/attempt-run.log"
-  local attempt_show_log="$logs/attempt-show.log"
-  begin_log "$attempt_log" "attempt run"
-  begin_log "$attempt_show_log" "attempt show"
-  local learning="" attempt_status=""
-  for _ in 1 2 3 4 5 6 7 8; do
-    run_fluent "$attempt_log" attempt run "$wi" "$ATTEMPT_ID" \
-      || fail_phase "$root" "run" "$attempt_log" "run"
-    capture_fluent "$attempt_show_log" attempt show "$wi" "$ATTEMPT_ID" \
-      > "$logs/attempt.json" 2>/dev/null \
-      || fail_phase "$root" "run" "$attempt_show_log" "run"
-    learning="$(jq -r '.learning.status // "none"' "$logs/attempt.json" 2>>"$attempt_show_log")" \
-      || fail_phase "$root" "run" "$attempt_show_log" "run"
-    attempt_status="$(jq -r '.status // "none"' "$logs/attempt.json" 2>>"$attempt_show_log")" \
-      || fail_phase "$root" "run" "$attempt_show_log" "run"
-    case "$learning" in
-      succeeded) break ;;
-      failed) fail_phase "$root" "run" "$attempt_show_log" "run" ;;
-    esac
-    case "$attempt_status" in
-      needs-user|failed) fail_phase "$root" "run" "$attempt_show_log" "run" ;;
-    esac
-  done
+  if [ "$done_rank" -lt "$(run_stage_rank queued)" ]; then
+    run_fluent "$logs/queue-add.log" queue add "$wi" \
+      || fail_phase "$root" "run" "$logs/queue-add.log" "run"
+    checkpoint "$root" "run" "$manifest_log" "run_stage" "queued"
+  fi
 
-  # The Learner never reached a succeeded state within the retry budget: a
-  # truthful nonterminal state that must not be handed off as ready.
-  [ "$learning" = "succeeded" ] \
+  local queue_log="$logs/queue-status.log"
+  local queue_status=""
+  begin_log "$queue_log" "queue status"
+  queue_status="$(read_queue_status "$wi" "$queue_log")" \
+    || fail_phase "$root" "run" "$queue_log" "run"
+  if [ "$queue_status" = "needs-user" ]; then
+    run_fluent "$logs/queue-resume.log" queue resume "$wi" --attempt "$ATTEMPT_ID" \
+      || fail_phase "$root" "run" "$logs/queue-resume.log" "run"
+    queue_status="queued"
+  fi
+
+  case "$queue_status" in
+    candidate-ready)
+      SCHEDULER_TERMINAL_STATUS="$queue_status"
+      ;;
+    queued|claimed|running)
+      begin_log "$logs/scheduler.log" "scheduler"
+      run_scheduler_until_terminal "$wi" "$logs/scheduler.log" "$queue_log" \
+        || fail_phase "$root" "run" "$logs/scheduler.log" "run"
+      ;;
+    failed|blocked|canceled)
+      printf 'queue reached terminal status: %s\n' "$queue_status" >> "$queue_log"
+      fail_phase "$root" "run" "$queue_log" "run"
+      ;;
+    *)
+      printf 'unexpected queue status: %s\n' "$queue_status" >> "$queue_log"
+      fail_phase "$root" "run" "$queue_log" "run"
+      ;;
+  esac
+
+  case "$SCHEDULER_TERMINAL_STATUS" in
+    candidate-ready)
+      ;;
+    needs-user)
+      printf 'Resolve the provider or host condition, then rerun the harness.\n' \
+        >> "$queue_log"
+      printf 'The next run will queue: fluent queue resume %s --attempt %s\n' \
+        "$wi" "$ATTEMPT_ID" >> "$queue_log"
+      fail_phase "$root" "run" "$queue_log" "run"
+      ;;
+    *)
+      printf 'queue reached terminal status: %s\n' "$SCHEDULER_TERMINAL_STATUS" \
+        >> "$queue_log"
+      fail_phase "$root" "run" "$queue_log" "run"
+      ;;
+  esac
+
+  # Queue readiness is necessary but not sufficient evidence for landing. Read
+  # the stored Attempt and require the Learner handoff before showing the
+  # candidate.
+  local attempt_show_log="$logs/attempt-show.log"
+  begin_log "$attempt_show_log" "attempt show"
+  capture_fluent "$attempt_show_log" attempt show "$wi" "$ATTEMPT_ID" \
+    > "$logs/attempt.json" 2>/dev/null \
     || fail_phase "$root" "run" "$attempt_show_log" "run"
+  local learning attempt_status
+  learning="$(jq -r '.learning.status // "none"' "$logs/attempt.json" 2>>"$attempt_show_log")" \
+    || fail_phase "$root" "run" "$attempt_show_log" "run"
+  attempt_status="$(jq -r '.status // "none"' "$logs/attempt.json" 2>>"$attempt_show_log")" \
+    || fail_phase "$root" "run" "$attempt_show_log" "run"
+  if [ "$learning" != "succeeded" ] || [ "$attempt_status" != "complete" ]; then
+    fail_phase "$root" "run" "$attempt_show_log" "run"
+  fi
 
   # Confirm the succeeded Attempt exposes a pending Merge Candidate to inspect.
   local show_log="$logs/candidate-show.log"
@@ -758,8 +1015,9 @@ usage() {
 usage: first-run-smoke.sh <phase> <root> [options]
 
 phases:
-  prepare <root> [--installer <url|path>] [--binary <path>]
-                  [--codex-home <path>]
+  prepare <root> --coder-profile <profile>
+                 [--installer <url|path>] [--binary <path>]
+                 [--codex-home <path>]
   run     <root>
   land    <root>
 USAGE

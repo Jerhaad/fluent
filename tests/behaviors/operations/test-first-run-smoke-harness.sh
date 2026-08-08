@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # test-first-run-smoke-harness - Verify the clean-room first-run smoke harness.
 #
-# The harness orchestrates Fluent's public first-run journey. These cases drive
-# it entirely with local stateful doubles: a fake installer and a fake Fluent
-# binary that records commands, enforces order, and emits controlled state. No
-# case starts a model, changes the operator's home, or reaches the network.
+# The harness models Fluent's first-run journey from public-shaped bootstrap
+# output onward. These cases drive it entirely with local stateful doubles: a
+# fake installer and a fake Fluent binary that records commands, enforces order,
+# and emits controlled state. No case starts a model, changes the operator's
+# home, or reaches the network.
 
 set -euo pipefail
+
+export FLUENT_SMOKE_QUEUE_POLL_SECONDS=0.01
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
@@ -21,7 +24,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 
 # Write a stateful fake Fluent binary into <bin>/fluent. It records every
 # invocation to $FAKE_CMD_LOG, rejects out-of-order commands, and drives the
-# fixture repository so that `attempt run` produces a ready Merge Candidate and
+# fixture repository so the scheduler produces a ready Merge Candidate and
 # `merge-candidate land` merges it into main.
 write_fake_fluent() {
   local bin_path="$1"
@@ -37,21 +40,57 @@ STAGE_FILE="$STATE_DIR/stage"
 stage() { cat "$STAGE_FILE"; }
 set_stage() { printf '%s\n' "$1" > "$STAGE_FILE"; }
 
-# Count `attempt run` invocations so the Learner can succeed only after a
-# configurable number of runs, modelling a candidate that exists before the
-# Learner has succeeded.
+# Record whether the fake scheduler produced a candidate. The Attempt response
+# can still model an inconsistent candidate-ready dispatch whose Learner did
+# not succeed, so the harness's independent readiness check is exercised.
 RUNS_FILE="$STATE_DIR/runs"
 [ -f "$RUNS_FILE" ] || printf '0\n' > "$RUNS_FILE"
 runs() { cat "$RUNS_FILE"; }
-# The Learner reports "succeeded" once this many `attempt run` calls have
-# happened; 0 means never (it stays in-progress forever).
-LEARNER_SUCCEED_AT="${FAKE_LEARNER_SUCCEED_AT:-1}"
+# Set to 0 to leave the Learner in progress after scheduler completion.
+LEARNER_SUCCEEDS="${FAKE_LEARNER_SUCCEEDS:-1}"
 learning_status() {
-  local n; n="$(runs)"
-  if [ "$LEARNER_SUCCEED_AT" -ne 0 ] && [ "$n" -ge "$LEARNER_SUCCEED_AT" ]; then
+  if [ "$LEARNER_SUCCEEDS" = "1" ]; then
     printf 'succeeded'
   else
     printf 'in-progress'
+  fi
+}
+
+attempt_status() {
+  if [ -n "${FAKE_ATTEMPT_STATUS:-}" ]; then
+    printf '%s' "$FAKE_ATTEMPT_STATUS"
+  elif [ "$(learning_status)" = "succeeded" ]; then
+    printf 'complete'
+  else
+    printf 'executing'
+  fi
+}
+
+QUEUE_STATUS_FILE="$STATE_DIR/queue-status"
+queue_status() {
+  [ -f "$QUEUE_STATUS_FILE" ] && cat "$QUEUE_STATUS_FILE" || printf 'none'
+}
+set_queue_status() { printf '%s\n' "$1" > "$QUEUE_STATUS_FILE"; }
+
+produce_candidate() {
+  if [ "$(stage)" != "ran" ]; then
+    git checkout -q -b smoke-candidate
+    printf 'hello\n' > greeting.txt
+    git add greeting.txt
+    git commit -q -m "Make greeting say hello"
+    CANDIDATE_COMMIT="$(git rev-parse HEAD)"
+    git checkout -q main
+    mkdir -p .fluent/work/merge-candidates
+    cat > ".fluent/work/merge-candidates/${CANDIDATE_ID}.json" <<JSON
+{
+  "id": "${CANDIDATE_ID}",
+  "candidate_commit": "${CANDIDATE_COMMIT}",
+  "candidate_branch": "smoke-candidate",
+  "merge_state": { "status": "pending", "merged_commit": null }
+}
+JSON
+    printf '1\n' > "$RUNS_FILE"
+    set_stage "ran"
   fi
 }
 
@@ -82,13 +121,51 @@ case "${1:-}" in
   --version|version)
     printf 'fluent 0.0.0-fake\n'
     ;;
+  skills)
+    record "skills $2"
+    [ "$2" = "add" ] || reject "unknown skills subcommand: $2"
+    case "$(stage)" in installed|skills) ;; *) reject "skills add out of order (stage=$(stage))" ;; esac
+    if [ "${FAKE_SKILLS_ADD_FAILS:-0}" = "1" ]; then
+      reject "simulated skill handoff failure"
+    fi
+    skill_dir="$PWD/.agents/skills/fluent"
+    [ -f "$skill_dir/SKILL.md" ] || reject "missing bootstrap shim"
+    if ! grep -Fq 'fluent-shim: true' "$skill_dir/SKILL.md" \
+      && [ ! -f "$skill_dir/.fluent-managed.json" ]; then
+      reject "missing shim marker or ownership sidecar"
+    fi
+    cat > "$skill_dir/SKILL.md" <<'FULL_SKILL'
+---
+name: fluent
+description: Full managed Fluent skill.
+---
+
+# Fluent
+FULL_SKILL
+    cat > "$skill_dir/.fluent-managed.json" <<'SIDECAR'
+{"schema_version":1,"agent":"universal","scope":"project","skill":"fluent"}
+SIDECAR
+    if [ "${FAKE_SKILLS_BAD_SIDECAR:-0}" = "1" ]; then
+      jq '.agent = "wrong"' "$skill_dir/.fluent-managed.json" \
+        > "$skill_dir/.fluent-managed.json.tmp"
+      mv "$skill_dir/.fluent-managed.json.tmp" "$skill_dir/.fluent-managed.json"
+    fi
+    lock_tmp="$(mktemp)"
+    jq 'del(.skills.fluent)' skills-lock.json > "$lock_tmp"
+    mv "$lock_tmp" skills-lock.json
+    set_stage "skills"
+    ;;
   init)
     record "init $*"
     [ "$#" = 5 ] \
-      && [ "$2" = "--coder-profile" ] && [ "$3" = "codex-balanced" ] \
+      && [ "$2" = "--coder-profile" ] \
       && [ "$4" = "--follow-up-mode" ] && [ "$5" = "propose" ] \
-      || reject "init must configure the Codex profile and follow-up mode"
-    case "$(stage)" in installed|init) ;; *) reject "init out of order (stage=$(stage))" ;; esac
+      || reject "init must configure a coder profile and follow-up mode"
+    case "$3" in
+      codex-balanced|codex-stronger|claude-balanced|codex-write-claude-review|claude-write-codex-review) ;;
+      *) reject "unsupported coder profile: $3" ;;
+    esac
+    case "$(stage)" in skills|init) ;; *) reject "init out of order (stage=$(stage))" ;; esac
     mkdir -p .fluent/work
     printf '# Fluent instructions\n' > AGENTS.md
     set_stage "init"
@@ -106,33 +183,6 @@ case "${1:-}" in
         [ "$(stage)" = "work-item" ] || reject "attempt create out of order"
         set_stage "attempt"
         ;;
-      run)
-        case "$(stage)" in attempt|ran) ;; *) reject "attempt run out of order (stage=$(stage))" ;; esac
-        if [ "${FAKE_ATTEMPT_RUN_FAILS:-0}" = "1" ]; then
-          reject "simulated attempt run failure"
-        fi
-        printf '%s\n' "$(( $(runs) + 1 ))" > "$RUNS_FILE"
-        # The first run produces the fix on a candidate branch, leaving main
-        # untouched. The candidate exists before the Learner has succeeded.
-        if [ "$(stage)" = "attempt" ]; then
-          git checkout -q -b smoke-candidate
-          printf 'hello\n' > greeting.txt
-          git add greeting.txt
-          git commit -q -m "Make greeting say hello"
-          CANDIDATE_COMMIT="$(git rev-parse HEAD)"
-          git checkout -q main
-          mkdir -p .fluent/work/merge-candidates
-          cat > ".fluent/work/merge-candidates/${CANDIDATE_ID}.json" <<JSON
-{
-  "id": "${CANDIDATE_ID}",
-  "candidate_commit": "${CANDIDATE_COMMIT}",
-  "candidate_branch": "smoke-candidate",
-  "merge_state": { "status": "pending", "merged_commit": null }
-}
-JSON
-          set_stage "ran"
-        fi
-        ;;
       show)
         if [ "${FAKE_ATTEMPT_SHOW_MALFORMED:-0}" = "1" ]; then
           printf '{bad json\n'
@@ -140,8 +190,7 @@ JSON
         fi
         # Expose the stored Attempt as JSON, including its Learner state.
         LEARN="$(learning_status)"
-        ASTATUS="executing"
-        [ "$LEARN" = "succeeded" ] && ASTATUS="complete"
+        ASTATUS="$(attempt_status)"
         cat <<JSON
 {
   "id": "attempt-1",
@@ -152,6 +201,62 @@ JSON
         ;;
       *) reject "unknown attempt subcommand: $sub" ;;
     esac
+    ;;
+  queue)
+    sub="$2"
+    record "queue $sub"
+    case "$sub" in
+      add)
+        [ "$(stage)" = "attempt" ] || reject "queue add out of order (stage=$(stage))"
+        set_queue_status "queued"
+        set_stage "queued"
+        ;;
+      list)
+        [ "$(queue_status)" != "none" ] || reject "queue is empty"
+        visible_status="$(queue_status)"
+        if [ "${FAKE_QUEUE_STALE_ONCE_AFTER_TERMINAL:-0}" = "1" ] \
+          && [ "$visible_status" = "candidate-ready" ] \
+          && [ ! -f "$STATE_DIR/stale-queue-used" ]; then
+          : > "$STATE_DIR/stale-queue-used"
+          visible_status="queued"
+        fi
+        printf '0 2026-08-07T00:00:00Z %s clean-room-fixture\n' "$visible_status"
+        ;;
+      resume)
+        [ "$(queue_status)" = "needs-user" ] || reject "queue resume without pause"
+        [ "$3" = "clean-room-fixture" ] \
+          && [ "$4" = "--attempt" ] && [ "$5" = "attempt-1" ] \
+          || reject "queue resume must bind attempt-1"
+        set_queue_status "queued"
+        set_stage "queued"
+        ;;
+      *) reject "unknown queue subcommand: $sub" ;;
+    esac
+    ;;
+  scheduler)
+    record "scheduler $2"
+    [ "$2" = "run" ] || reject "unknown scheduler subcommand: $2"
+    [ "$(queue_status)" = "queued" ] || reject "scheduler requires queued work"
+    if [ "${FAKE_SCHEDULER_HANGS:-0}" = "1" ]; then
+      set_queue_status "running"
+      [ -z "${FAKE_SCHEDULER_PID_FILE:-}" ] \
+        || printf '%s\n' "$$" > "$FAKE_SCHEDULER_PID_FILE"
+      trap 'exit 0' INT TERM
+      while :; do sleep 0.05; done
+    fi
+    if [ "${FAKE_SCHEDULER_NEEDS_USER_ONCE:-0}" = "1" ] \
+      && [ ! -f "$STATE_DIR/provider-pause-used" ]; then
+      : > "$STATE_DIR/provider-pause-used"
+      set_queue_status "needs-user"
+      set_stage "needs-user"
+      exit 0
+    fi
+    if [ "${FAKE_SCHEDULER_FAILS:-0}" = "1" ]; then
+      set_queue_status "failed"
+      exit 0
+    fi
+    produce_candidate
+    set_queue_status "candidate-ready"
     ;;
   merge-candidate)
     sub="$2"
@@ -413,6 +518,15 @@ cleanup_workspace() {
 
 # Run the harness with an isolated HOME and the fake command log wired in.
 run_harness() {
+  if [ "${1-}" = "prepare" ]; then
+    local arg has_profile=0
+    for arg in "$@"; do
+      [ "$arg" = "--coder-profile" ] && has_profile=1
+    done
+    if [ "$has_profile" -eq 0 ]; then
+      set -- "$@" --coder-profile codex-balanced
+    fi
+  fi
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" bash "$HARNESS" "$@"
 }
 
@@ -466,6 +580,24 @@ test_prepare_is_isolated() {
   # The manifest records the prepared safe phase.
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \
     || { printf '    FAIL: safe_phase not prepared\n'; rc=1; }
+  [ "$(jq -r '.schema_version' "$ROOT/harness/manifest.json")" = "2" ] \
+    || { printf '    FAIL: manifest schema is not version 2\n'; rc=1; }
+  [ "$(jq -r '.coder_profile' "$ROOT/harness/manifest.json")" = "codex-balanced" ] \
+    || { printf '    FAIL: manifest did not record the coder profile\n'; rc=1; }
+  [ -f "$ROOT/project/main/.agents/skills/fluent/SKILL.md" ] \
+    || { printf '    FAIL: prepare did not seed the public-style bootstrap\n'; rc=1; }
+  jq -e '.skills.fluent == {
+      "source": "mrinalwadhwa/fluent",
+      "sourceType": "github",
+      "skillPath": "skills/fluent/SKILL.md",
+      "computedHash": "clean-room-bootstrap"
+    } and .metadata == {"fixture": "keep"} and
+    .skills.other == {
+      "source": "owner/other",
+      "skillPath": "skills/other/SKILL.md"
+    }' \
+    "$ROOT/project/main/skills-lock.json" > /dev/null \
+    || { printf '    FAIL: prepare did not seed the exact external lock\n'; rc=1; }
 
   # The operator's home is untouched.
   [ "$(cat "$REAL_HOME/sentinel")" = "untouched" ] \
@@ -500,6 +632,81 @@ test_prepare_leaves_fluent_uninitialized_and_records_codex_home() {
   return $rc
 }
 
+test_prepare_requires_a_supported_profile() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    > "$WORK/missing.out" 2>&1; then
+    printf '    FAIL: prepare accepted a missing coder profile\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/missing.out")" 'prepare requires --coder-profile' || rc=1
+  [ ! -e "$ROOT" ] \
+    || { printf '    FAIL: missing profile mutated the smoke root\n'; rc=1; }
+
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile custom \
+      --binary "$FAKE_FLUENT_SRC" > "$WORK/invalid.out" 2>&1; then
+    printf '    FAIL: prepare accepted an unsupported coder profile\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/invalid.out")" 'unsupported coder profile: custom' || rc=1
+  [ ! -e "$ROOT" ] \
+    || { printf '    FAIL: invalid profile mutated the smoke root\n'; rc=1; }
+  return $rc
+}
+
+test_prepare_records_every_curated_profile() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  local rc=0 profile profile_root
+  for profile in codex-balanced codex-stronger claude-balanced \
+    codex-write-claude-review claude-write-codex-review; do
+    profile_root="$WORK/smoke-$profile"
+    HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+      bash "$HARNESS" prepare "$profile_root" --coder-profile "$profile" \
+        --binary "$FAKE_FLUENT_SRC" > "$WORK/prepare-$profile.out" 2>&1 \
+      || { printf '    FAIL: prepare rejected %s\n' "$profile"; rc=1; continue; }
+    [ "$(jq -r '.coder_profile' "$profile_root/harness/manifest.json")" = "$profile" ] \
+      || { printf '    FAIL: manifest did not record %s\n' "$profile"; rc=1; }
+  done
+
+  profile_root="$WORK/smoke-claude-balanced"
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    bash "$HARNESS" prepare "$profile_root" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" > "$WORK/profile-change.out" 2>&1; then
+    printf '    FAIL: prepare changed an existing root profile\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/profile-change.out")" \
+    'uses coder profile claude-balanced, not codex-balanced' || rc=1
+  [ "$(jq -r '.coder_profile' "$profile_root/harness/manifest.json")" = "claude-balanced" ] \
+    || { printf '    FAIL: rejected profile change mutated the manifest\n'; rc=1; }
+
+  local tampered_root="$WORK/smoke-codex-stronger" tampered_manifest tmp
+  tampered_manifest="$tampered_root/harness/manifest.json"
+  tmp="$(mktemp "$tampered_manifest.XXXXXX")"
+  jq '.coder_profile = "custom"' "$tampered_manifest" > "$tmp"
+  mv "$tmp" "$tampered_manifest"
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    bash "$HARNESS" run "$tampered_root" > "$WORK/tampered-profile.out" 2>&1; then
+    printf '    FAIL: run accepted a tampered coder profile\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/tampered-profile.out")" \
+    'unsupported coder profile: custom' || rc=1
+  [ ! -s "$FAKE_CMD_LOG" ] \
+    || { printf '    FAIL: tampered profile invoked Fluent\n'; rc=1; }
+
+  HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    bash "$HARNESS" run "$profile_root" > "$WORK/claude-run.out" 2>&1 \
+    || { printf '    FAIL: recorded Claude profile did not run\n'; rc=1; }
+  grep -Fxq 'init init --coder-profile claude-balanced --follow-up-mode propose' \
+    "$FAKE_CMD_LOG" \
+    || { printf '    FAIL: run did not use the recorded Claude profile\n'; rc=1; }
+  return $rc
+}
+
 test_run_configures_init_and_commits_before_attempt() {
   new_workspace
   trap cleanup_workspace RETURN
@@ -523,6 +730,21 @@ test_run_configures_init_and_commits_before_attempt() {
     || { printf '    FAIL: attempt started from a dirty checkout\n'; rc=1; }
   git -C "$ROOT/project/main" log --format=%s | grep -Fxq 'Initialize Fluent smoke fixture' \
     || { printf '    FAIL: initialization changes were not committed\n'; rc=1; }
+  [ -f "$ROOT/project/main/.agents/skills/fluent/.fluent-managed.json" ] \
+    || { printf '    FAIL: run did not adopt the bootstrap skill\n'; rc=1; }
+  jq -e '.schema_version == 1 and .agent == "universal" and
+    .scope == "project" and .skill == "fluent"' \
+    "$ROOT/project/main/.agents/skills/fluent/.fluent-managed.json" > /dev/null \
+    || { printf '    FAIL: run recorded incorrect skill ownership\n'; rc=1; }
+  if grep -Fq 'fluent-shim: true' \
+    "$ROOT/project/main/.agents/skills/fluent/SKILL.md"; then
+    printf '    FAIL: run left the bootstrap marker installed\n'; rc=1
+  fi
+  jq -e '.skills.fluent == null and .metadata.fixture == "keep" and
+    .skills.other.source == "owner/other"' "$ROOT/project/main/skills-lock.json" \
+    > /dev/null || { printf '    FAIL: run did not preserve the external lock\n'; rc=1; }
+  grep -Fxq 'skills add' "$FAKE_CMD_LOG" \
+    || { printf '    FAIL: run did not invoke the skill handoff\n'; rc=1; }
   local recorded_codex_home
   recorded_codex_home="$(cd "$codex_home" && pwd -P)"
   [ -s "$codex_home_log" ] \
@@ -535,6 +757,77 @@ test_run_configures_init_and_commits_before_attempt() {
   if grep -R -Fq -- 'secret credential' "$ROOT"; then
     printf '    FAIL: run copied Codex credentials into the smoke root\n'; rc=1
   fi
+  return $rc
+}
+
+test_skill_handoff_failure_preserves_evidence_and_resumes() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SKILLS_ADD_FAILS=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: run accepted a failed skill handoff\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/run.out")" "$ROOT/harness/logs/skills.log" || rc=1
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "installed" ] \
+    || { printf '    FAIL: failed handoff advanced the run checkpoint\n'; rc=1; }
+  grep -Fq 'fluent-shim: true' "$ROOT/project/main/.agents/skills/fluent/SKILL.md" \
+    || { printf '    FAIL: failed handoff changed the bootstrap\n'; rc=1; }
+  jq -e '.skills.fluent.source == "mrinalwadhwa/fluent"' \
+    "$ROOT/project/main/skills-lock.json" > /dev/null \
+    || { printf '    FAIL: failed handoff changed the lock\n'; rc=1; }
+
+  run_harness run "$ROOT" > "$WORK/resume.out" 2>&1 \
+    || { printf '    FAIL: skill handoff resume did not reach ready\n'; rc=1; }
+  [ "$(grep -c '^skills add$' "$FAKE_CMD_LOG")" -eq 2 ] \
+    || { printf '    FAIL: resume did not retry only the skill handoff\n'; rc=1; }
+  [ "$(grep -c '^init init ' "$FAKE_CMD_LOG")" -eq 1 ] \
+    || { printf '    FAIL: skill retry duplicated initialization\n'; rc=1; }
+  return $rc
+}
+
+test_skill_handoff_rejects_wrong_ownership_and_resumes() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SKILLS_BAD_SIDECAR=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: run accepted the wrong skill ownership sidecar\n'; rc=1
+  fi
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "installed" ] \
+    || { printf '    FAIL: invalid ownership advanced the checkpoint\n'; rc=1; }
+  assert_contains "$(cat "$WORK/run.out")" "$ROOT/harness/logs/skills.log" || rc=1
+
+  run_harness run "$ROOT" > "$WORK/resume.out" 2>&1 \
+    || { printf '    FAIL: corrected ownership handoff did not resume\n'; rc=1; }
+  jq -e '.agent == "universal" and .scope == "project" and .skill == "fluent"' \
+    "$ROOT/project/main/.agents/skills/fluent/.fluent-managed.json" > /dev/null \
+    || { printf '    FAIL: resume did not repair skill ownership\n'; rc=1; }
+  [ "$(grep -c '^skills add$' "$FAKE_CMD_LOG")" -eq 2 ] \
+    || { printf '    FAIL: ownership recovery did not retry the handoff once\n'; rc=1; }
+  return $rc
+}
+
+test_schema_one_manifest_is_rejected_without_migration() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local manifest="$ROOT/harness/manifest.json" tmp rc=0
+  tmp="$(mktemp "$manifest.XXXXXX")"
+  jq '.schema_version = 1' "$manifest" > "$tmp"
+  mv "$tmp" "$manifest"
+
+  if run_harness run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: run migrated an old smoke manifest\n'; rc=1
+  fi
+  assert_contains "$(cat "$WORK/run.out")" 'incompatible manifest schema' || rc=1
+  [ ! -s "$FAKE_CMD_LOG" ] \
+    || { printf '    FAIL: old manifest invoked Fluent before rejection\n'; rc=1; }
   return $rc
 }
 
@@ -562,7 +855,8 @@ test_prepare_encodes_json_significant_root() {
   # heredoc manifest would emit invalid JSON here and break the later jq reads.
   local quoted_root="$WORK/say \"hi\"/smoke"
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
-    bash "$HARNESS" prepare "$quoted_root" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$quoted_root" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > /dev/null 2>&1
 
   local rc=0 mpath="$quoted_root/harness/manifest.json"
@@ -589,13 +883,27 @@ test_run_uses_public_sequence_and_stops_before_land() {
   run_harness run "$ROOT" > "$WORK/run.out" 2>&1
 
   local rc=0
-  # The recorded commands follow the public first-run sequence. `attempt show`
-  # gates readiness on the stored Learner state before the candidate is shown.
-  local expected
-  expected="$(printf 'init init --coder-profile codex-balanced --follow-up-mode propose\nwork-item create\nattempt create\nattempt run\nattempt show\nmerge-candidate show\n')"
-  if [ "$(cat "$FAKE_CMD_LOG")" != "$expected" ]; then
-    printf '    FAIL: unexpected command sequence:\n%s\n' "$(cat "$FAKE_CMD_LOG")"
+  # Setup stays ordered even though queue polling and the scheduler run
+  # concurrently. The scheduler, not the harness, owns Attempt execution.
+  local skills_line init_line work_line attempt_line queue_line
+  skills_line="$(grep -n '^skills add$' "$FAKE_CMD_LOG" | cut -d: -f1)"
+  init_line="$(grep -n '^init init --coder-profile codex-balanced --follow-up-mode propose$' "$FAKE_CMD_LOG" | cut -d: -f1)"
+  work_line="$(grep -n '^work-item create$' "$FAKE_CMD_LOG" | cut -d: -f1)"
+  attempt_line="$(grep -n '^attempt create$' "$FAKE_CMD_LOG" | cut -d: -f1)"
+  queue_line="$(grep -n '^queue add$' "$FAKE_CMD_LOG" | cut -d: -f1)"
+  if [ -z "$skills_line" ] || [ -z "$init_line" ] || [ -z "$work_line" ] \
+    || [ -z "$attempt_line" ] || [ -z "$queue_line" ] \
+    || [ "$skills_line" -ge "$init_line" ] || [ "$init_line" -ge "$work_line" ] \
+    || [ "$work_line" -ge "$attempt_line" ] || [ "$attempt_line" -ge "$queue_line" ]; then
+    printf '    FAIL: setup commands are missing or out of order:\n%s\n' "$(cat "$FAKE_CMD_LOG")"
     rc=1
+  fi
+  grep -Fxq 'scheduler run' "$FAKE_CMD_LOG" \
+    || { printf '    FAIL: scheduler was not started\n'; rc=1; }
+  grep -Fxq 'queue list' "$FAKE_CMD_LOG" \
+    || { printf '    FAIL: queue status was not observed\n'; rc=1; }
+  if grep -q '^attempt run$' "$FAKE_CMD_LOG"; then
+    printf '    FAIL: harness ran the Attempt outside the scheduler\n'; rc=1
   fi
   # run never lands.
   if grep -q 'merge-candidate land' "$FAKE_CMD_LOG"; then
@@ -616,6 +924,109 @@ test_run_uses_public_sequence_and_stops_before_land() {
   return $rc
 }
 
+test_scheduler_exit_rereads_terminal_queue_state() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local rc=0
+  HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
+    FAKE_QUEUE_STALE_ONCE_AFTER_TERMINAL=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1 \
+    || {
+      printf '    FAIL: one stale queue read hid the terminal disposition\n'
+      printf '    harness output:\n'
+      sed 's/^/      /' "$WORK/run.out"
+      printf '    scheduler log:\n'
+      sed 's/^/      /' "$ROOT/harness/logs/scheduler.log"
+      printf '    queue log:\n'
+      sed 's/^/      /' "$ROOT/harness/logs/queue-status.log"
+      printf '    fake command log:\n'
+      sed 's/^/      /' "$FAKE_CMD_LOG"
+      printf '    fake stage and queue state:\n'
+      sed 's/^/      /' "$ROOT/bin/.fake-state/stage" \
+        "$ROOT/bin/.fake-state/queue-status"
+      rc=1
+    }
+  [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "ran" ] \
+    || { printf '    FAIL: terminal queue reread did not reach ready\n'; rc=1; }
+  [ "$(grep -c '^queue list$' "$FAKE_CMD_LOG")" -ge 3 ] \
+    || { printf '    FAIL: harness did not reread queue state\n'; rc=1; }
+  return $rc
+}
+
+test_scheduler_failed_terminal_preserves_evidence() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SCHEDULER_FAILS=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: failed scheduler dispatch reached ready\n'; rc=1
+  fi
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "queued" ] \
+    || { printf '    FAIL: failed dispatch lost the queue checkpoint\n'; rc=1; }
+  [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \
+    || { printf '    FAIL: failed dispatch advanced the safe phase\n'; rc=1; }
+  grep -Fq 'queue reached terminal status: failed' \
+    "$ROOT/harness/logs/queue-status.log" \
+    || { printf '    FAIL: failed terminal status was not retained\n'; rc=1; }
+  [ ! -e "$ROOT/project/main/.fluent/work/merge-candidates/attempt-1-merge-candidate.json" ] \
+    || { printf '    FAIL: failed dispatch produced a candidate\n'; rc=1; }
+
+  local before after
+  before="$(grep -c '^scheduler run$' "$FAKE_CMD_LOG" || true)"
+  if run_harness run "$ROOT" > "$WORK/resume.out" 2>&1; then
+    printf '    FAIL: rerunning a failed terminal dispatch reached ready\n'; rc=1
+  fi
+  after="$(grep -c '^scheduler run$' "$FAKE_CMD_LOG" || true)"
+  [ "$after" -eq "$before" ] \
+    || { printf '    FAIL: terminal failure restarted the scheduler\n'; rc=1; }
+  return $rc
+}
+
+test_interruption_reaps_scheduler_child() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local pid_file="$WORK/scheduler.pid" harness_pid child_pid="" rc=0
+  HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SCHEDULER_HANGS=1 \
+    FAKE_SCHEDULER_PID_FILE="$pid_file" \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1 &
+  harness_pid="$!"
+
+  local _
+  for _ in $(seq 1 200); do
+    [ -s "$pid_file" ] && break
+    sleep 0.01
+  done
+  if [ ! -s "$pid_file" ]; then
+    printf '    FAIL: hanging scheduler did not publish its pid\n'; rc=1
+    kill -TERM "$harness_pid" 2>/dev/null || true
+    wait "$harness_pid" 2>/dev/null || true
+    return $rc
+  fi
+  child_pid="$(cat "$pid_file")"
+
+  kill -TERM "$harness_pid"
+  if wait "$harness_pid"; then
+    printf '    FAIL: interrupted harness exited successfully\n'; rc=1
+  fi
+  for _ in $(seq 1 100); do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    printf '    FAIL: scheduler child survived harness interruption\n'; rc=1
+    kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+  grep -Fq 'scheduler exit:' "$ROOT/harness/logs/scheduler.log" \
+    || { printf '    FAIL: interruption did not record scheduler cleanup\n'; rc=1; }
+  return $rc
+}
+
 test_run_waits_for_learner_success() {
   new_workspace
   trap cleanup_workspace RETURN
@@ -623,9 +1034,9 @@ test_run_waits_for_learner_success() {
   run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
 
   local rc=0
-  # The candidate is produced on the first attempt run, but the Learner never
-  # reaches "succeeded". The harness must not hand off a ready candidate.
-  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_LEARNER_SUCCEED_AT=0 \
+  # The scheduler reports candidate-ready, but the stored Learner never reaches
+  # "succeeded". The harness must not hand off the candidate.
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_LEARNER_SUCCEEDS=0 \
     bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
     printf '    FAIL: run handed off before the Learner succeeded\n'; rc=1
   fi
@@ -646,24 +1057,55 @@ test_run_waits_for_learner_success() {
   return $rc
 }
 
-test_run_reaches_ready_after_delayed_learner() {
+test_run_waits_for_complete_attempt() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  local rc=0
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_ATTEMPT_STATUS=executing \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: run handed off an incomplete Attempt\n'; rc=1
+  fi
+  [ "$(jq -r '.learning.status' "$ROOT/harness/logs/attempt.json")" = "succeeded" ] \
+    || { printf '    FAIL: fixture did not isolate Attempt completion\n'; rc=1; }
+  [ "$(jq -r '.status' "$ROOT/harness/logs/attempt.json")" = "executing" ] \
+    || { printf '    FAIL: fixture did not record an incomplete Attempt\n'; rc=1; }
+  if grep -q 'ready Merge Candidate' "$WORK/run.out"; then
+    printf '    FAIL: incomplete Attempt received a ready handoff\n'; rc=1
+  fi
+  [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \
+    || { printf '    FAIL: incomplete Attempt advanced the safe phase\n'; rc=1; }
+  return $rc
+}
+
+test_run_resumes_same_attempt_after_scheduler_pause() {
   new_workspace
   trap cleanup_workspace RETURN
 
   run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
 
   local rc=0
-  # The Learner succeeds only on the second run: the candidate exists first.
-  HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_LEARNER_SUCCEED_AT=2 \
-    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1 \
-    || { printf '    FAIL: run did not reach a ready candidate\n'; rc=1; }
-  # The harness advanced the Attempt more than once before handing off.
-  if [ "$(grep -c '^attempt run$' "$FAKE_CMD_LOG")" -lt 2 ]; then
-    printf '    FAIL: harness handed off on the first candidate\n'; rc=1
+  # The first scheduler run pauses at needs-user and preserves the exact
+  # planned Attempt for an explicit queue resume.
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SCHEDULER_NEEDS_USER_ONCE=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
+    printf '    FAIL: paused scheduler run should require a resume\n'; rc=1
   fi
-  # It then reached the ready state.
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "queued" ] \
+    || { printf '    FAIL: queue checkpoint was not preserved\n'; rc=1; }
+  assert_contains "$(cat "$ROOT/harness/logs/queue-status.log")" \
+    'fluent queue resume clean-room-fixture --attempt attempt-1' || rc=1
+
+  HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SCHEDULER_NEEDS_USER_ONCE=1 \
+    bash "$HARNESS" run "$ROOT" > "$WORK/resume.out" 2>&1 \
+    || { printf '    FAIL: resumed scheduler run did not reach ready\n'; rc=1; }
+  [ "$(grep -c '^queue resume$' "$FAKE_CMD_LOG")" -eq 1 ] \
+    || { printf '    FAIL: exact queue resume was not issued once\n'; rc=1; }
+  [ "$(grep -c '^scheduler run$' "$FAKE_CMD_LOG")" -eq 2 ] \
+    || { printf '    FAIL: scheduler did not run once before and after pause\n'; rc=1; }
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "ran" ] \
-    || { printf '    FAIL: safe_phase not ran after delayed Learner\n'; rc=1; }
+    || { printf '    FAIL: scheduler resume did not reach the ready phase\n'; rc=1; }
   return $rc
 }
 
@@ -690,7 +1132,8 @@ test_ready_handoff_quotes_paths_with_spaces() {
   # A valid smoke root whose path contains a space.
   local spaced_root="$WORK/first run/smoke"
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
-    bash "$HARNESS" prepare "$spaced_root" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+    bash "$HARNESS" prepare "$spaced_root" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
     bash "$HARNESS" run "$spaced_root" > "$WORK/run.out" 2>&1
 
@@ -809,8 +1252,8 @@ test_failure_preserves_evidence_and_resume() {
   run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
 
   local rc=0
-  # Force the Attempt run to fail mid-phase.
-  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_ATTEMPT_RUN_FAILS=1 \
+  # Pause the scheduler-owned Attempt at a recoverable provider boundary.
+  if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" FAKE_SCHEDULER_NEEDS_USER_ONCE=1 \
     bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
     printf '    FAIL: run should exit non-zero when a phase fails\n'; rc=1
   fi
@@ -825,10 +1268,10 @@ test_failure_preserves_evidence_and_resume() {
   # The safe phase stays at prepared so resume repeats run, not land.
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \
     || { printf '    FAIL: safe_phase advanced past the failure\n'; rc=1; }
-  # init, the Work Item, and the Attempt were created before the failure, so the
-  # harness checkpointed them and must not replay them on resume.
-  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "attempt" ] \
-    || { printf '    FAIL: run_stage not checkpointed at attempt\n'; rc=1; }
+  # Setup and queue submission completed before the pause, so resume must not
+  # replay them.
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "queued" ] \
+    || { printf '    FAIL: run_stage not checkpointed at queued\n'; rc=1; }
 
   # Clear the injected failure and execute the exact printed resume command. It
   # must reach a ready candidate by reusing the existing Work Item and Attempt,
@@ -841,6 +1284,10 @@ test_failure_preserves_evidence_and_resume() {
     || { printf '    FAIL: resume replayed work-item create\n'; rc=1; }
   [ "$(grep -c '^attempt create$' "$FAKE_CMD_LOG")" -eq 1 ] \
     || { printf '    FAIL: resume replayed attempt create\n'; rc=1; }
+  [ "$(grep -c '^queue add$' "$FAKE_CMD_LOG")" -eq 1 ] \
+    || { printf '    FAIL: resume replayed queue add\n'; rc=1; }
+  [ "$(grep -c '^queue resume$' "$FAKE_CMD_LOG")" -eq 1 ] \
+    || { printf '    FAIL: resume did not authorize the exact Attempt\n'; rc=1; }
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "ran" ] \
     || { printf '    FAIL: resume did not reach the ready phase\n'; rc=1; }
   assert_contains "$(cat "$WORK/resume.out")" "ready Merge Candidate" || rc=1
@@ -860,7 +1307,7 @@ test_run_resume_after_init_commit_does_not_duplicate_work_state() {
     bash "$HARNESS" run "$ROOT" > "$WORK/run.out" 2>&1; then
     printf '    FAIL: run should fail at the init checkpoint\n'; rc=1
   fi
-  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "installed" ] \
+  [ "$(jq -r '.run_stage' "$ROOT/harness/manifest.json")" = "skills" ] \
     || { printf '    FAIL: init checkpoint advanced despite its write failure\n'; rc=1; }
   [ "$(git -C "$ROOT/project/main" log --format=%s | grep -Fc 'Initialize Fluent smoke fixture')" -eq 1 ] \
     || { printf '    FAIL: init did not commit exactly once before the checkpoint failure\n'; rc=1; }
@@ -920,7 +1367,8 @@ test_prepare_failure_preserves_evidence_and_resume() {
 
   local rc=0
   if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$trap_bin:$PATH" \
-    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > "$WORK/prepare.out" 2>&1; then
     printf '    FAIL: prepare should exit non-zero when seeding fails\n'; rc=1
   fi
@@ -969,7 +1417,8 @@ test_prepare_directory_failure_preserves_evidence_and_resume() {
   local rc=0
   if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$trap_bin:$PATH" \
     FAILING_MKDIR_MATCH="$ROOT/home" \
-    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > "$WORK/prepare.out" 2>&1; then
     printf '    FAIL: prepare should exit non-zero when directory setup fails\n'; rc=1
   fi
@@ -1027,7 +1476,8 @@ JQ
 
   local rc=0
   if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$crash_bin:$PATH" \
-    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > "$WORK/prepare.out" 2>&1; then
     printf '    FAIL: prepare should exit non-zero when initial manifest write fails\n'; rc=1
   fi
@@ -1074,7 +1524,8 @@ test_prepare_manifest_mv_failure_is_durable() {
   local rc=0
   if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$trap_bin:$PATH" \
     FAILING_MV_DEST="$ROOT/harness/manifest.json" \
-    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > "$WORK/prepare.out" 2>&1; then
     printf '    FAIL: prepare should exit non-zero when manifest rename fails\n'; rc=1
   fi
@@ -1121,7 +1572,8 @@ test_prepare_marker_rm_failure_is_durable() {
   local rc=0
   if HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$trap_bin:$PATH" \
     FAILING_RM_TARGET="$ROOT/harness/.prepare-incomplete" \
-    bash "$HARNESS" prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" \
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --binary "$FAKE_FLUENT_SRC" \
     > "$WORK/prepare.out" 2>&1; then
     printf '    FAIL: prepare should exit non-zero when marker removal fails\n'; rc=1
   fi
@@ -1444,7 +1896,8 @@ test_relative_installer_override_is_durable() {
 
   local rc=0
   ( cd "$WORK" && HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" \
-      bash "$HARNESS" prepare "$ROOT" --installer ./tools/install.sh ) \
+      bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+        --installer ./tools/install.sh ) \
     > /dev/null 2>&1 || { printf '    FAIL: prepare failed\n'; rc=1; }
   # prepare resolved the relative override to an absolute boundary in the manifest.
   local boundary
@@ -1566,7 +2019,8 @@ test_automated_test_uses_only_local_doubles() {
   local rc=0
   # Drive the full journey with the local doubles on PATH.
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$tripwire_bin:$PATH" \
-    bash "$HARNESS" prepare "$ROOT" --installer "$installer" > /dev/null 2>&1 || rc=1
+    bash "$HARNESS" prepare "$ROOT" --coder-profile codex-balanced \
+      --installer "$installer" > /dev/null 2>&1 || rc=1
   HOME="$REAL_HOME" FAKE_CMD_LOG="$FAKE_CMD_LOG" PATH="$tripwire_bin:$PATH" \
     INSTALLER_HOME_LOG="$INSTALLER_HOME_LOG" \
     bash "$HARNESS" run "$ROOT" > /dev/null 2>&1 || rc=1
@@ -1677,16 +2131,33 @@ printf 'test-first-run-smoke-harness\n\n'
 run_test "prepare is isolated" test_prepare_is_isolated
 run_test "prepare leaves Fluent uninitialized and records Codex home" \
   test_prepare_leaves_fluent_uninitialized_and_records_codex_home
+run_test "prepare requires a supported profile" \
+  test_prepare_requires_a_supported_profile
+run_test "prepare records every curated profile" \
+  test_prepare_records_every_curated_profile
 run_test "run configures init and commits before attempt" \
   test_run_configures_init_and_commits_before_attempt
+run_test "skill handoff failure preserves evidence and resumes" \
+  test_skill_handoff_failure_preserves_evidence_and_resumes
+run_test "skill handoff rejects wrong ownership and resumes" \
+  test_skill_handoff_rejects_wrong_ownership_and_resumes
+run_test "schema one manifest is rejected without migration" \
+  test_schema_one_manifest_is_rejected_without_migration
 run_test "prepare rejects nonempty root" test_prepare_rejects_nonempty_root
 run_test "prepare encodes json significant root" \
   test_prepare_encodes_json_significant_root
 run_test "run uses public sequence and stops before land" \
   test_run_uses_public_sequence_and_stops_before_land
+run_test "scheduler exit rereads terminal queue state" \
+  test_scheduler_exit_rereads_terminal_queue_state
+run_test "scheduler failed terminal preserves evidence" \
+  test_scheduler_failed_terminal_preserves_evidence
+run_test "interruption reaps scheduler child" \
+  test_interruption_reaps_scheduler_child
 run_test "run waits for learner success" test_run_waits_for_learner_success
-run_test "run reaches ready after delayed learner" \
-  test_run_reaches_ready_after_delayed_learner
+run_test "run waits for complete attempt" test_run_waits_for_complete_attempt
+run_test "run resumes same attempt after scheduler pause" \
+  test_run_resumes_same_attempt_after_scheduler_pause
 run_test "ready handoff is actionable" test_ready_handoff_is_actionable
 run_test "ready handoff quotes paths with spaces" \
   test_ready_handoff_quotes_paths_with_spaces

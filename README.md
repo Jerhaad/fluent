@@ -133,6 +133,15 @@ Before starting review work, run `fluent tester check` to validate the Tester an
 
 ### Release-test containment
 
+Before publishing a candidate release, use `scripts/first-run-smoke.sh` with an
+explicit curated coder profile to exercise its managed skill handoff,
+configured initialization, scheduler queue, Learner gate, and pending Merge
+Candidate. The script stops before landing and retains its isolated home,
+repository, logs, and evidence during `run`; an explicit `land` phase is
+available only after inspection. Its seeded bootstrap models the files produced
+by `npx skills add`; the live release matrix must separately run the real
+public skill command and first coding-agent conversation.
+
 Fluent's declared release suites run nested provider routes through the
 fixture-controlled executables in `tests/fixtures/provider-doubles`. The
 `FLUENT_TEST_HERMETIC_PROVIDERS` test marker makes the provider boundary remove

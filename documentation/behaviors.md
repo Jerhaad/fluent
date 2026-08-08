@@ -6887,6 +6887,206 @@ Test: tests/behaviors/operations/test-install-script.sh (missing Intel asset pre
 
 ---
 
+## Clean-room first-use harness
+
+### B1
+
+IF `first-run-smoke.sh prepare` receives no curated coder profile or an
+unsupported profile,
+THEN THE SYSTEM SHALL reject the request before creating the smoke root.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare requires a supported profile)
+
+### B2
+
+WHEN `first-run-smoke.sh prepare` accepts a curated coder profile,
+THE SYSTEM SHALL record that exact profile in the manifest.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare records every curated profile)
+
+### B2a
+
+WHEN `first-run-smoke.sh prepare` completes,
+THE SYSTEM SHALL record a schema-v2 manifest.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare is isolated)
+
+### B2b
+
+IF `first-run-smoke.sh prepare` targets a completed smoke root with another
+recorded coder profile,
+THEN THE SYSTEM SHALL reject the request without changing the manifest.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare records every curated profile)
+
+### B2c
+
+IF `first-run-smoke.sh run` reads an unsupported coder profile from a schema-v2
+manifest,
+THEN THE SYSTEM SHALL reject it before invoking Fluent.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare records every curated profile)
+
+### B3
+
+WHEN `first-run-smoke.sh prepare` creates the fixture repository,
+THE SYSTEM SHALL seed a marked project Fluent bootstrap.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare is isolated)
+
+### B3a
+
+WHEN `first-run-smoke.sh prepare` seeds the project Fluent bootstrap,
+THE SYSTEM SHALL seed a matching Fluent entry in the external lock.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare is isolated)
+
+### B3b
+
+WHEN `first-run-smoke.sh prepare` seeds the external skill lock,
+THE SYSTEM SHALL include an unrelated fixture skill entry.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (prepare is isolated)
+
+### B4
+
+WHEN `first-run-smoke.sh run` reaches the skill-bootstrap checkpoint,
+THE SYSTEM SHALL require the candidate binary to replace the marked bootstrap
+before initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (skill handoff rejects wrong ownership and resumes)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (skill handoff failure preserves evidence and resumes)
+
+### B4a
+
+WHEN the candidate binary replaces the clean-room bootstrap,
+THE SYSTEM SHALL require a matching Fluent ownership sidecar before initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (skill handoff rejects wrong ownership and resumes)
+
+### B4b
+
+WHEN the candidate binary replaces the clean-room bootstrap,
+THE SYSTEM SHALL require Fluent's external lock entry to be absent before
+initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+
+### B4c
+
+WHEN the candidate binary releases Fluent's external lock entry,
+THE SYSTEM SHALL require every unrelated fixture lock value to remain before
+initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+
+### B5
+
+WHEN the fixture Work Item and planned Attempt exist,
+THE SYSTEM SHALL add the Work Item to the queue.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+
+### B5a
+
+WHEN the harness observes the planned Attempt waiting for scheduler dispatch,
+THE SYSTEM SHALL start `fluent scheduler run`.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+
+### B5b
+
+WHEN the harness executes the planned Attempt through the scheduler queue,
+THE SYSTEM SHALL NOT invoke `fluent attempt run` directly.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+
+### B6
+
+WHEN the scheduler-owned dispatch reaches a terminal queue status,
+THE SYSTEM SHALL leave no harness-started scheduler process running.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (scheduler exit rereads terminal queue state)
+
+### B6a
+
+WHEN the harness is interrupted while its scheduler child is running,
+THE SYSTEM SHALL leave no harness-started scheduler process running.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (interruption reaps scheduler child)
+
+### B6b
+
+WHEN the scheduler-owned dispatch reaches `candidate-ready`,
+THE SYSTEM SHALL NOT land its Merge Candidate during `run`.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run uses public sequence and stops before land)
+
+### B7
+
+WHEN a scheduler-owned dispatch stops at `needs-user` and the operator reruns
+the harness after resolving the cause,
+THE SYSTEM SHALL queue one resume for the manifest's exact Attempt.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run resumes same attempt after scheduler pause)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (failure preserves evidence and resume)
+
+### B7a
+
+WHEN the harness resumes a scheduler-owned dispatch,
+THE SYSTEM SHALL NOT repeat configured initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (failure preserves evidence and resume)
+
+### B7b
+
+WHEN the harness resumes a scheduler-owned dispatch,
+THE SYSTEM SHALL NOT recreate the Work Item.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (failure preserves evidence and resume)
+
+### B7c
+
+WHEN the harness resumes a scheduler-owned dispatch,
+THE SYSTEM SHALL NOT recreate the Attempt.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (failure preserves evidence and resume)
+
+### B7d
+
+WHEN the harness resumes a scheduler-owned dispatch,
+THE SYSTEM SHALL NOT repeat the original queue dispatch.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (failure preserves evidence and resume)
+
+### B8
+
+WHEN the queue reports `candidate-ready`,
+THE SYSTEM SHALL require the stored Attempt to be complete before presenting
+candidate inspection and explicit landing commands.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run waits for complete attempt)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (ready handoff is actionable)
+
+### B8a
+
+WHEN the queue reports `candidate-ready`,
+THE SYSTEM SHALL require the stored Learner to have succeeded before presenting
+candidate inspection and explicit landing commands.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run waits for learner success)
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (ready handoff is actionable)
+
+### B9
+
+IF a prepared smoke root contains a schema-v1 manifest,
+THEN THE SYSTEM SHALL reject it.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (schema one manifest is rejected without migration)
+
+### B9a
+
+IF a prepared smoke root contains a schema-v1 manifest,
+THEN THE SYSTEM SHALL NOT invoke Fluent.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (schema one manifest is rejected without migration)
+
+### B9b
+
+IF a prepared smoke root contains a schema-v1 manifest,
+THEN THE SYSTEM SHALL NOT migrate the manifest.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (schema one manifest is rejected without migration)
+
+### B10
+
+WHEN the automated clean-room harness suite runs,
+THE SYSTEM SHALL NOT invoke a network client.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (automated test uses only local doubles)
+
+### B10a
+
+WHEN the automated clean-room harness suite runs,
+THE SYSTEM SHALL NOT invoke a coding agent.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (automated test uses only local doubles)
+
+---
+
 ## Project model seeding
 
 ### B1
