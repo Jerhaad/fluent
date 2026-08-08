@@ -4,6 +4,28 @@ use crate::coder::CoderKind;
 use crate::config::FollowUpMode;
 use crate::work_model::{CoderMapping, CoderMappingInputs, CoderModelPair, resolve_coder_mapping};
 
+pub const FLUENT_GITIGNORE: &str = "\
+# Fluent working state: everything here is ignored by default.
+# Durable content is re-included below.
+/*
+!/.gitignore
+!/expertise/
+!/hooks/
+!/Dockerfile
+!/tester.yaml
+!/extract-tester-results
+";
+
+const DURABLE_FLUENT_PATHS: &[&str] = &[
+    ".fluent/expertise/INDEX.md",
+    ".fluent/hooks/prepare-pre-review",
+    ".fluent/hooks/check-pre-merge",
+    ".fluent/hooks/fix-pre-merge",
+    ".fluent/Dockerfile",
+    ".fluent/tester.yaml",
+    ".fluent/extract-tester-results",
+];
+
 /// CLI-only values for deterministic configured first-time setup.
 #[derive(Debug, Default)]
 pub struct InitSetupInputs {
@@ -154,6 +176,30 @@ pub fn preflight_providers(mapping: &CoderMapping) -> Result<()> {
             failures.join("\n  ")
         )
     }
+}
+
+/// Reject configured setup when Git would hide required project-owned state.
+pub fn preflight_durable_paths(cwd: &std::path::Path) -> Result<()> {
+    let ignored = crate::git::ignored_paths(cwd, DURABLE_FLUENT_PATHS)?;
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    let conflicts = ignored
+        .iter()
+        .map(|rule| {
+            format!(
+                "  {}: {}:{} pattern {:?}",
+                rule.path, rule.source, rule.line, rule.pattern
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "FLUENT_INIT_DURABLE_PATH_IGNORED: Git ignore rules hide required Fluent project state:\n{conflicts}\n\
+Remove or narrow the listed rules before retrying this command. Let Fluent's\n\
+generated .fluent/.gitignore ignore runtime state such as .fluent/work/, or\n\
+use equally narrow runtime-only exclusions instead of ignoring all of .fluent/."
+    )
 }
 
 #[cfg(test)]

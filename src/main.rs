@@ -1813,6 +1813,7 @@ fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
     let configured_setup = fluent::setup::ConfiguredSetup::from_inputs(inputs)?;
     if let Some(setup) = configured_setup.as_ref() {
         require_git_repository_root(cwd)?;
+        fluent::setup::preflight_durable_paths(cwd)?;
         let resolver = ContentResolver::new(Some(cwd));
         os::preflight_host_execution(cwd, &resolver)?;
         fluent::setup::preflight_providers(&setup.mapping)?;
@@ -2407,22 +2408,10 @@ fn current_ref(project_root: &Path) -> Result<String> {
     }
 }
 
-const FLUENT_GITIGNORE: &str = "\
-# Fluent working state: everything here is ignored by default.
-# Durable content is re-included below.
-/*
-!/.gitignore
-!/expertise/
-!/hooks/
-!/Dockerfile
-!/tester.yaml
-!/extract-tester-results
-";
-
 fn write_gitignore_if_absent(fluent_dir: &Path) -> Result<()> {
     let gitignore = fluent_dir.join(".gitignore");
     if !gitignore.exists() {
-        fs::write(&gitignore, FLUENT_GITIGNORE)?;
+        fs::write(&gitignore, fluent::setup::FLUENT_GITIGNORE)?;
     }
     Ok(())
 }

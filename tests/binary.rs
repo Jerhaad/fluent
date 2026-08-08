@@ -2142,6 +2142,176 @@ fn configured_init_requires_repository_root_before_provider_preflight() {
 }
 
 #[test]
+fn configured_init_rejects_broad_fluent_ignore_before_side_effects() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let bin_dir = tmp.path().join("bin");
+    let provider_log = tmp.path().join("provider.log");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(home.join(".claude/skills/existing-empty")).unwrap();
+    fs::create_dir_all(home.join(".codex/skills/existing-empty")).unwrap();
+    fs::create_dir_all(home.join(".local/share/fluent/skills/existing-empty")).unwrap();
+    fs::write(home.join("sentinel"), "home before init\n").unwrap();
+    init_git_repo(&project);
+    fs::write(project.join(".gitignore"), ".fluent/\n").unwrap();
+    write_mock_codex(
+        &bin_dir,
+        "#!/bin/bash\nprintf 'called\\n' >> \"${PROVIDER_LOG:?}\"\nexit 0\n",
+    );
+    let project_before = snapshot_tree(&project);
+    let home_before = snapshot_tree(&home);
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("PATH", mock_path(&bin_dir))
+        .env("PROVIDER_LOG", &provider_log)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .args([
+            "init",
+            "--coder-profile",
+            "codex-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FLUENT_INIT_DURABLE_PATH_IGNORED"))
+        .stderr(predicate::str::contains(
+            ".fluent/tester.yaml: .gitignore:1 pattern \".fluent/\"",
+        ))
+        .stderr(predicate::str::contains(".fluent/work/"));
+
+    assert!(!provider_log.exists(), "provider preflight must not run");
+    assert_eq!(snapshot_tree(&project), project_before);
+    assert_eq!(snapshot_tree(&home), home_before);
+}
+
+#[test]
+fn configured_init_reports_all_git_ignore_sources() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let global_config = tmp.path().join("global.gitconfig");
+    let global_excludes = tmp.path().join("global-ignore");
+    fs::create_dir_all(project.join(".fluent")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    init_git_repo(&project);
+    fs::write(project.join(".gitignore"), ".fluent/tester.yaml\n").unwrap();
+    fs::write(
+        project.join(".git/info/exclude"),
+        ".fluent/hooks/check-pre-merge\n",
+    )
+    .unwrap();
+    fs::write(project.join(".fluent/.gitignore"), "Dockerfile\n").unwrap();
+    fs::write(&global_excludes, ".fluent/expertise/INDEX.md\n").unwrap();
+    fs::write(
+        &global_config,
+        format!("[core]\n\texcludesFile = {}\n", global_excludes.display()),
+    )
+    .unwrap();
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .args([
+            "init",
+            "--coder-profile",
+            "codex-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for expected in [
+        ".fluent/tester.yaml: .gitignore:1 pattern \".fluent/tester.yaml\"",
+        ".fluent/hooks/check-pre-merge: .git/info/exclude:1 pattern \".fluent/hooks/check-pre-merge\"",
+        ".fluent/Dockerfile: .fluent/.gitignore:1 pattern \"Dockerfile\"",
+        &format!(
+            ".fluent/expertise/INDEX.md: {}:1 pattern \".fluent/expertise/INDEX.md\"",
+            global_excludes.display()
+        ),
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing {expected:?} in {stderr}"
+        );
+    }
+}
+
+#[test]
+fn configured_init_accepts_negated_durable_paths_and_runtime_only_ignores() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let bin_dir = tmp.path().join("bin");
+    let codex_home = home.join("codex-home");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(codex_home.join("auth.json"), "authenticated").unwrap();
+    init_git_repo(&project);
+    fs::write(
+        project.join(".gitignore"),
+        ".fluent/*\n\
+         !.fluent/expertise/\n\
+         !.fluent/hooks/\n\
+         !.fluent/Dockerfile\n\
+         !.fluent/tester.yaml\n\
+         !.fluent/extract-tester-results\n\
+         .fluent/work/\n",
+    )
+    .unwrap();
+    write_mock_codex(&bin_dir, "#!/bin/bash\n[ \"$1 $2\" = \"login status\" ]\n");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "codex-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .success();
+
+    assert!(project.join(".fluent/config.yaml").is_file());
+    for path in [
+        ".fluent/expertise/INDEX.md",
+        ".fluent/hooks/prepare-pre-review",
+        ".fluent/hooks/check-pre-merge",
+        ".fluent/hooks/fix-pre-merge",
+        ".fluent/Dockerfile",
+        ".fluent/tester.yaml",
+        ".fluent/extract-tester-results",
+    ] {
+        let output = Command::new("git")
+            .current_dir(&project)
+            .args(["check-ignore", "--no-index", "--", path])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{path} must remain trackable");
+    }
+    let runtime = Command::new("git")
+        .current_dir(&project)
+        .args(["check-ignore", "--no-index", "--", ".fluent/work/item.json"])
+        .output()
+        .unwrap();
+    assert!(
+        runtime.status.success(),
+        "runtime Work state must stay ignored"
+    );
+}
+
+#[test]
 fn configured_init_checks_host_sandbox_before_provider_or_mutation() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
@@ -18800,6 +18970,55 @@ fn mock_path(bin_dir: &Path) -> String {
         provider_double_path().display(),
         std::env::var("PATH").unwrap()
     )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SnapshotEntry {
+    path: PathBuf,
+    kind: &'static str,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_tree(root: &Path) -> Vec<SnapshotEntry> {
+    fn walk(root: &Path, directory: &Path, entries: &mut Vec<SnapshotEntry>) {
+        let mut children = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for path in children {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.file_type().is_symlink() {
+                entries.push(SnapshotEntry {
+                    path: relative,
+                    kind: "symlink",
+                    bytes: fs::read_link(&path)
+                        .unwrap()
+                        .to_string_lossy()
+                        .as_bytes()
+                        .to_vec(),
+                });
+            } else if metadata.is_dir() {
+                entries.push(SnapshotEntry {
+                    path: relative,
+                    kind: "directory",
+                    bytes: Vec::new(),
+                });
+                walk(root, &path, entries);
+            } else {
+                entries.push(SnapshotEntry {
+                    path: relative,
+                    kind: "file",
+                    bytes: fs::read(&path).unwrap(),
+                });
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries);
+    entries
 }
 
 fn write_post_merge_review_queue_entry(

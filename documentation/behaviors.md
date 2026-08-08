@@ -6083,6 +6083,41 @@ agent-instruction files whose bytes that invocation changed.
 Test: tests/binary.rs (init_distinguishes_preexisting_dirt_from_instruction_changes)
 Test: tests/binary.rs (init_does_not_claim_unchanged_dirty_instruction_file)
 
+### B10
+
+WHEN configured `fluent init` runs at a Git repository root, THE SYSTEM SHALL
+verify that Git can track the required Expertise, hook, Dockerfile, Tester
+configuration, and Tester extractor paths before host-sandbox or provider
+preflight and before any project or agent-skill mutation.
+Test: tests/binary.rs (configured_init_rejects_broad_fluent_ignore_before_side_effects)
+
+### B11
+
+IF an effective repository, nested, `.git/info/exclude`, or global ignore rule
+hides a required durable Fluent path, THEN THE SYSTEM SHALL reject configured
+initialization with `FLUENT_INIT_DURABLE_PATH_IGNORED`.
+Test: tests/binary.rs (configured_init_reports_all_git_ignore_sources)
+
+### B12
+
+IF configured initialization rejects an effective ignore rule, THEN THE SYSTEM
+SHALL report the affected path plus the rule's source, line, and pattern.
+Test: tests/binary.rs (configured_init_reports_all_git_ignore_sources)
+
+### B13
+
+IF an effective negation makes every required durable Fluent path trackable, THEN
+THE SYSTEM SHALL accept the ignore configuration and continue configured
+initialization.
+Test: tests/binary.rs (configured_init_accepts_negated_durable_paths_and_runtime_only_ignores)
+
+### B14
+
+IF configured initialization rejects an ignore conflict, THEN THE SYSTEM SHALL
+recommend Fluent's generated `.fluent/.gitignore` or equally narrow exclusions
+such as `.fluent/work/` instead of a broad `.fluent/` ignore.
+Test: tests/binary.rs (configured_init_rejects_broad_fluent_ignore_before_side_effects)
+
 ---
 
 ## Init seeds operator craft

@@ -962,13 +962,26 @@ Check item {{ITEM_ID}}.
     fn bundled_fluent_skill_orders_profile_preflight_before_init() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         let setup = skill.split_once("## First-time project setup").unwrap().1;
+        let setup = setup.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_ordered(
-            setup,
+            &setup,
             &[
                 "After the user completes both choices, run one configured command",
-                "The command first verifies that its enclosing host can apply Fluent's worker\n   sandbox, then preflights each distinct provider before it initializes the\n   project",
+                "Configured init first checks Git can track durable project files",
+                "then checks the host sandbox and providers",
             ],
         );
+    }
+
+    #[test]
+    fn bundled_fluent_skill_recovers_ignored_durable_paths() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let setup = skill.split_once("## First-time project setup").unwrap().1;
+
+        assert!(setup.contains("FLUENT_INIT_DURABLE_PATH_IGNORED"));
+        assert!(setup.contains("source, line, pattern, and affected path"));
+        assert!(setup.contains("generated `.fluent/.gitignore`"));
+        assert!(setup.contains("`.fluent/work/`"));
     }
 
     #[test]
@@ -997,7 +1010,8 @@ Check item {{ITEM_ID}}.
     #[test]
     fn bundled_fluent_skill_bounds_provider_preflight_claim() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
-        assert!(skill.contains("does not promise\n   future provider capacity"));
+        let normalized = skill.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("do not promise future provider capacity"));
     }
 
     #[test]

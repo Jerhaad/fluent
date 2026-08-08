@@ -407,13 +407,14 @@ When `.fluent/` does not exist:
    For `custom`, use `--coder-profile custom` and pass every `--write-*`,
    `--review-*`, and `--behavior-tests-*` value the user chose.
 
-5. The command first verifies that its enclosing host can apply Fluent's worker
-   sandbox, then preflights each distinct provider before it initializes the
-   project. Recover `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped host-agent
-   flow above. For a provider failure, name the failed provider and condition,
-   then offer the user a retry or a different profile. A successful check only
-   verifies the local command and authentication readiness; it does not promise
-   future provider capacity.
+5. Configured init first checks Git can track durable project files, then checks
+   the host sandbox and providers. For `FLUENT_INIT_DURABLE_PATH_IGNORED`, show the
+   reported source, line, pattern, and affected path, then ask the user to remove
+   or narrow the rule. Fluent's generated `.fluent/.gitignore` ignores runtime
+   state such as `.fluent/work/` while retaining Expertise, hooks, and Tester
+   configuration. Recover `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped
+   host-agent flow above. For provider failures, offer the user a retry or a different profile.
+   These readiness checks do not promise future provider capacity.
 
 6. After success, show the saved coder, model, and effort for the writer,
    reviewers, and behavior-test coder. Explain that every new Attempt stores

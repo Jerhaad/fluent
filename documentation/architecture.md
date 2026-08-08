@@ -919,16 +919,26 @@ both apply to writer, reviewer, and behavior-test roles. A custom profile
 collects the explicit coder, model, and effort for each role. The skill invokes
 one configured `fluent init` command only after every choice is complete.
 
-Configured init validates the complete argument combination and preflights every
+Configured init validates the complete argument combination, confirms the Git
+repository root, and asks Git whether its effective ignore rules hide any
+required durable Fluent path. `setup.rs` owns the durable path contract;
+`git.rs` obtains source, line, pattern, and path records from `git check-ignore`
+without reproducing Git's repository, nested, info-exclude, global, or negation
+precedence. A conflict fails before the host-sandbox check, provider access, or
+filesystem mutation. The diagnostic recommends Fluent's generated
+`.fluent/.gitignore`, which ignores runtime state while keeping Expertise,
+hooks, the project Dockerfile, and Tester contract files trackable.
+
+After that gate, configured init preflights the enclosing host and every
 distinct provider before it creates `.fluent/`, installs skills, seeds
 instructions, or writes configuration. Readiness checks command availability
 and local authentication without a model inference, so they cannot reserve or
-guarantee future provider capacity. The configuration writer parses the existing
-YAML, updates only the three role mappings and (for execute) `follow-up.mode`,
-then atomically replaces the file. It preserves unrelated keys and never leaves
-a partial role mapping. `propose` adds no follow-up mapping. Bare `fluent init`
-remains compatible with existing non-interactive callers and therefore retains
-the legacy implicit-default path.
+guarantee future provider capacity. The configuration writer parses the
+existing YAML, updates only the three role mappings and (for execute)
+`follow-up.mode`, then atomically replaces the file. It preserves unrelated
+keys and never leaves a partial role mapping. `propose` adds no follow-up
+mapping. Bare `fluent init` remains compatible with existing non-interactive
+callers and therefore retains the legacy implicit-default path.
 
 Execute mode authorizes and queues corrective Work; it still requires a
 separately started scheduler and human candidate landing.
@@ -2321,7 +2331,7 @@ fluent/main/
     fargate.rs               ← Fargate launch, watch, stop, and pull for Work execution
     fargate_bootstrap.rs     ← JIT Fargate setup (CFN, base + project image builds)
     follow_up.rs             ← Land-gated follow-up materialization: pending operation, journal, corrective host gate, derived Work intake
-    git.rs                   ← Git command and source-cleanliness helpers
+    git.rs                   ← Git commands, ignore decisions, and source-cleanliness helpers
     guidance.rs              ← Render concrete next-action commands
     hooks.rs                 ← Project hook execution (.fluent/hooks/<name>)
     keep_awake.rs            ← macOS idle-sleep prevention toggle
@@ -2571,14 +2581,15 @@ editor, passphrase, or credential prompt:
   `GIT_TERMINAL_PROMPT=0`
 - Config overrides: `-c commit.gpgsign=false`, `-c core.editor=true`
 
-Three public functions cover the call-site patterns in the codebase:
-`run` (check exit status), `run_stdout` (return trimmed stdout), and
-`run_raw` (return raw `Output` for caller inspection). On failure,
-`run` and `run_stdout` surface the subcommand, exit code, working
-directory, and captured stderr so failures are debuggable without
-re-running.
+The wrappers cover checked commands, trimmed or raw output, and byte input on
+stdin. The crate-private `ignored_paths` uses the same command boundary and parses
+`git check-ignore -z -v --no-index --stdin` into effective positive ignore
+matches. Git also emits the winning negation in verbose mode; the parser drops
+those records because they prove the path is trackable. On failure, the checked
+wrappers surface the subcommand, exit code, working directory, and captured
+stderr so failures are debuggable without re-running.
 
-All three public functions retry git lock errors transparently.
+`run`, `run_stdout`, and `run_raw` retry git lock errors transparently.
 When a git invocation exits non-zero with stderr matching a known
 lock-error pattern (`could not lock`, `lock failed`,
 `: File exists` against a `.lock`/`index`/`HEAD` path, or
