@@ -625,7 +625,7 @@ run_scheduler_until_terminal() {
   return "$rc"
 }
 
-install_tester_config() {
+install_tester_contract() {
   local project="$1"
   mkdir -p "$project/.fluent"
   cat > "$project/.fluent/tester.yaml" <<'TESTER'
@@ -633,6 +633,40 @@ commands:
   - command: ./check.sh
     test_harness: shell-harness
 TESTER
+  cat > "$project/.fluent/extract-tester-results" <<'EXTRACTOR'
+#!/usr/bin/env sh
+set -eu
+
+artifact_dir="${1:?usage: extract-tester-results <artifact-dir>}"
+jq '
+  if type != "array" then
+    error("expected command evidence array")
+  elif length == 0 then
+    []
+  elif length == 1
+    and .[0].command == "./check.sh"
+    and .[0].test_harness == "shell-harness"
+    and (.[0].exit_code | type) == "number"
+    and (.[0].duration_ms | type) == "number"
+  then
+    [.[0] | {
+      id: "first-run-smoke/greeting",
+      test_harness,
+      status: (if .exit_code == 0 then "pass" else "fail" end),
+      duration_ms,
+      failure_excerpt: (
+        if .exit_code == 0
+        then null
+        else "greeting.txt has no line exactly equal to hello"
+        end
+      )
+    }]
+  else
+    error("expected one ./check.sh shell-harness command")
+  end
+' "$artifact_dir/commands.json"
+EXTRACTOR
+  chmod +x "$project/.fluent/extract-tester-results"
 }
 
 commit_initialization() {
@@ -773,7 +807,7 @@ phase_run() {
       --coder-profile "$coder_profile" \
       --follow-up-mode propose \
       || fail_phase "$root" "run" "$logs/init.log" "run"
-    install_tester_config "$RUN_PROJECT" >> "$logs/init.log" 2>&1 \
+    install_tester_contract "$RUN_PROJECT" >> "$logs/init.log" 2>&1 \
       || fail_phase "$root" "run" "$logs/init.log" "run"
     commit_initialization "$RUN_PROJECT" >> "$logs/init.log" 2>&1 \
       || fail_phase "$root" "run" "$logs/init.log" "run"

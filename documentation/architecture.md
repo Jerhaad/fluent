@@ -1862,8 +1862,12 @@ path. The smoke `HOME` remains isolated under the root.
 `fluent skills add` exactly as the bootstrap instructs. It requires the marked
 project skill to become a sidecar-managed full skill, Fluent's lock entry to be
 removed, and unrelated lock values to remain. It then initializes with
-`propose` follow-up mode, writes the fixture Tester configuration, and commits
-the complete first-use state before creating the Work Item and planned Attempt.
+`propose` follow-up mode, writes the fixture Tester configuration and executable
+extractor, and commits the complete first-use state before creating the Work
+Item and planned Attempt. The fixture extractor maps `./check.sh` to the stable
+`first-run-smoke/greeting` id, so the seeded failure and corrected pass compare
+as two observations of the same test. It returns an empty array for Tester's
+empty structural probe and rejects other command shapes.
 The harness submits that Attempt with `fluent queue add`, starts `fluent
 scheduler run` as a child, and polls `fluent queue show` for the Work Item's
 latest structured dispatch. It terminates and reaps the child after a terminal

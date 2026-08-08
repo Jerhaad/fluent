@@ -6985,6 +6985,33 @@ THE SYSTEM SHALL require every unrelated fixture lock value to remain before
 initialization.
 Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
 
+### B4d
+
+WHEN `first-run-smoke.sh run` commits initialized fixture state, THE SYSTEM SHALL
+include an executable Tester extractor with the Tester configuration before it
+creates the Work Item.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+
+### B4e
+
+WHEN the fixture Tester extractor receives the result of `./check.sh`, THE
+SYSTEM SHALL report one `first-run-smoke/greeting` test whose status is `fail`
+for a nonzero exit and `pass` for a zero exit.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (tester extractor normalizes fixture contract)
+
+### B4f
+
+WHEN Fluent validates the fixture Tester contract with no command results, THE
+SYSTEM SHALL return an empty test array.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (tester extractor normalizes fixture contract)
+
+### B4g
+
+IF the fixture Tester extractor receives malformed evidence or a command other
+than the declared fixture check, THEN THE SYSTEM SHALL exit nonzero without
+emitting normalized test evidence.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (tester extractor normalizes fixture contract)
+
 ### B5
 
 WHEN the fixture Work Item and planned Attempt exist,

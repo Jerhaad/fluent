@@ -139,8 +139,10 @@ configured initialization, scheduler queue, Learner gate, and pending Merge
 Candidate. The script stops before landing and retains its isolated home,
 repository, logs, and evidence during `run`; an explicit `land` phase is
 available only after inspection. Its seeded bootstrap models the files produced
-by `npx skills add`; the live release matrix must separately run the real
-public skill command and first coding-agent conversation.
+by `npx skills add`. During `run`, the fixture commits both Tester contract
+files and records its initially failing check as the baseline for the Writer's
+correction. The live release matrix must separately run the real public skill
+command and first coding-agent conversation.
 
 Fluent's declared release suites run nested provider routes through the
 fixture-controlled executables in `tests/fixtures/provider-doubles`. The

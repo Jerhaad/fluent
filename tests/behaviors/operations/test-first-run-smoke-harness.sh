@@ -767,6 +767,11 @@ test_run_configures_init_and_commits_before_attempt() {
     || { printf '    FAIL: run did not configure fluent init\n'; rc=1; }
   [ -f "$ROOT/project/main/.fluent/tester.yaml" ] \
     || { printf '    FAIL: run did not install tester configuration\n'; rc=1; }
+  [ -x "$ROOT/project/main/.fluent/extract-tester-results" ] \
+    || { printf '    FAIL: run did not install an executable tester extractor\n'; rc=1; }
+  git -C "$ROOT/project/main" ls-files --error-unmatch \
+    .fluent/extract-tester-results > /dev/null 2>&1 \
+    || { printf '    FAIL: run did not commit the tester extractor\n'; rc=1; }
   [ -f "$ROOT/project/main/AGENTS.md" ] \
     || { printf '    FAIL: configured init did not generate instructions\n'; rc=1; }
   [ -z "$(git -C "$ROOT/project/main" status --porcelain)" ] \
@@ -799,6 +804,74 @@ test_run_configures_init_and_commits_before_attempt() {
   fi
   if grep -R -Fq -- 'secret credential' "$ROOT"; then
     printf '    FAIL: run copied Codex credentials into the smoke root\n'; rc=1
+  fi
+  return $rc
+}
+
+test_tester_extractor_normalizes_fixture_contract() {
+  new_workspace
+  trap cleanup_workspace RETURN
+
+  run_harness prepare "$ROOT" --binary "$FAKE_FLUENT_SRC" > /dev/null 2>&1
+  run_harness run "$ROOT" > /dev/null 2>&1
+
+  local rc=0 artifact="$WORK/tester-artifact"
+  local extractor="$ROOT/project/main/.fluent/extract-tester-results"
+  mkdir -p "$artifact"
+
+  jq -n '[{
+    command: "./check.sh",
+    test_harness: "shell-harness",
+    exit_code: 1,
+    duration_ms: 12,
+    stdout_log: "commands/0-stdout.log",
+    stderr_log: "commands/0-stderr.log"
+  }]' > "$artifact/commands.json"
+  "$extractor" "$artifact" > "$artifact/baseline.json" \
+    || { printf '    FAIL: extractor rejected the baseline failure\n'; rc=1; }
+  jq -e '. == [{
+    "id": "first-run-smoke/greeting",
+    "test_harness": "shell-harness",
+    "status": "fail",
+    "duration_ms": 12,
+    "failure_excerpt": "greeting.txt has no line exactly equal to hello"
+  }]' "$artifact/baseline.json" > /dev/null \
+    || { printf '    FAIL: extractor misreported the baseline failure\n'; rc=1; }
+
+  jq '.[0].exit_code = 0 | .[0].duration_ms = 7' \
+    "$artifact/commands.json" > "$artifact/final-commands.json"
+  mv "$artifact/final-commands.json" "$artifact/commands.json"
+  "$extractor" "$artifact" > "$artifact/final.json" \
+    || { printf '    FAIL: extractor rejected the final pass\n'; rc=1; }
+  jq -e '.[0].id == "first-run-smoke/greeting" and
+    .[0].status == "pass" and .[0].duration_ms == 7 and
+    .[0].failure_excerpt == null' "$artifact/final.json" > /dev/null \
+    || { printf '    FAIL: extractor misreported the final pass\n'; rc=1; }
+
+  printf '[]\n' > "$artifact/commands.json"
+  "$extractor" "$artifact" > "$artifact/empty.json" \
+    || { printf '    FAIL: extractor rejected the empty structural probe\n'; rc=1; }
+  jq -e '. == []' "$artifact/empty.json" > /dev/null \
+    || { printf '    FAIL: extractor invented a structural-probe result\n'; rc=1; }
+
+  printf '{}\n' > "$artifact/commands.json"
+  if "$extractor" "$artifact" > "$artifact/wrong-type.out" 2>&1; then
+    printf '    FAIL: extractor accepted non-array command evidence\n'; rc=1
+  fi
+
+  printf '{bad json\n' > "$artifact/commands.json"
+  if "$extractor" "$artifact" > "$artifact/malformed.out" 2>&1; then
+    printf '    FAIL: extractor accepted malformed command evidence\n'; rc=1
+  fi
+
+  jq -n '[{
+    command: "./other-check.sh",
+    test_harness: "shell-harness",
+    exit_code: 0,
+    duration_ms: 1
+  }]' > "$artifact/commands.json"
+  if "$extractor" "$artifact" > "$artifact/unexpected.out" 2>&1; then
+    printf '    FAIL: extractor accepted an unexpected command shape\n'; rc=1
   fi
   return $rc
 }
@@ -2215,6 +2288,8 @@ run_test "prepare records every curated profile" \
   test_prepare_records_every_curated_profile
 run_test "run configures init and commits before attempt" \
   test_run_configures_init_and_commits_before_attempt
+run_test "tester extractor normalizes fixture contract" \
+  test_tester_extractor_normalizes_fixture_contract
 run_test "skill handoff failure preserves evidence and resumes" \
   test_skill_handoff_failure_preserves_evidence_and_resumes
 run_test "skill handoff rejects wrong ownership and resumes" \
