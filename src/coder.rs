@@ -2245,7 +2245,7 @@ fn ensure_not_expired_with_refresh() -> Result<(), crate::claude_auth::AuthError
         eprintln!("  Token expired — refreshing credentials before launch.");
         crate::credential::refresh_credentials().map_err(|error| {
             crate::claude_auth::AuthError::RefreshFailed {
-                reason: error.to_string(),
+                failure: error.probe_failure(),
             }
         })?;
         if let Err(err) = crate::claude_auth::ensure_not_expired() {
@@ -2450,7 +2450,7 @@ pub fn transcript_indicates_rate_limit(transcript_path: &Path) -> bool {
 fn real_credential_refresh() -> Result<(), crate::claude_auth::AuthError> {
     crate::credential::refresh_credentials().map_err(|error| {
         crate::claude_auth::AuthError::RefreshFailed {
-            reason: error.to_string(),
+            failure: error.probe_failure(),
         }
     })
 }
@@ -5405,7 +5405,10 @@ exit 1"#
             &|_, _| {},
             &|| {
                 Err(crate::claude_auth::AuthError::RefreshFailed {
-                    reason: "refresh timeout".to_string(),
+                    failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                        crate::claude_diagnostics::ClaudeProbeFailureKind::Timeout,
+                        "refresh timeout",
+                    ),
                 })
             },
         );

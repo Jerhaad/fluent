@@ -1350,10 +1350,19 @@ deadline (30 seconds by default and must be positive). The probe owns a process
 group; on deadline expiry, Fluent attempts to terminate and reap the owned group,
 including its descendants. A verified sweep returns a timeout, while an
 unconfirmed sweep returns a cleanup failure that retains its diagnostic. Fluent
-rereads the Keychain only after a successful zero exit. A timeout, cleanup
-failure, or nonzero exit becomes a typed authentication failure, so the existing
-same-Attempt `needs-user` pause directs the operator to `claude /login` without
-consuming a Writer round.
+captures command output in temporary files so a full pipe cannot deadlock the
+probe, reads a bounded prefix after failure, redacts credential-shaped values,
+and rereads the Keychain only after a successful zero exit.
+
+`claude_diagnostics.rs` classifies readiness and refresh failures as
+authentication, host credential boundary, rate limit, network, provider
+availability, timeout, or unknown. Each category has a stable
+`FLUENT_CLAUDE_*` code and a specific repair. Only authentication evidence
+names `claude /login`. A configured `fluent init` failure tells the user to
+retry the same initialization command; a Task failure records a resumable
+same-Attempt pause and names `fluent attempt run`. This keeps a provider outage
+or an enclosing sandbox's denied Keychain access from masquerading as a bad
+login.
 
 The coder returns a typed `AuthError` (via `anyhow::Error::new`) instead of a plain
 string `bail!`, so callers can recover the type via
@@ -2229,6 +2238,10 @@ managed home is retained even when the scheduler starts an Attempt with
 credential on the host and passes it through the inherited environment. A
 structured `authentication_failed` transcript is a typed authentication pause,
 not a generic coder failure, so it does not consume repeated Writer launches.
+Configured Claude readiness also runs `claude --version` after authentication
+succeeds. Versions older than 2.1.211 produce a non-blocking warning because
+that release contains Claude Code's parallel session token-renewal fix. Missing
+or unparseable version output does not turn successful readiness into failure.
 
 ### Fargate runtime
 

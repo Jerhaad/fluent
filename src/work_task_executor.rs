@@ -1504,8 +1504,9 @@ fn is_resumable_task_failure(error: &anyhow::Error) -> bool {
         classify_task_failure(error),
         TaskFailure::Auth(_)
             | TaskFailure::TranscriptPump(_)
+            | TaskFailure::HostSandbox(_)
             | TaskFailure::TesterHarness
-            | TaskFailure::ProviderUnavailable
+            | TaskFailure::ProviderUnavailable(_)
     )
 }
 
@@ -2372,6 +2373,11 @@ fn should_retry_coder_error(result: &Result<()>) -> bool {
         && !is_transcript_pump_error(result)
         && !is_supervision_sidecar_error(result)
         && !is_host_sandbox_preflight_error(result)
+        && !result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<crate::provider_readiness::ProviderReadinessError>()
+                .is_some_and(|readiness| readiness.claude_failure().is_some())
+        })
         && !result
             .as_ref()
             .err()
@@ -2399,7 +2405,7 @@ enum TaskFailure {
     HostSandbox(String),
     /// Tester configuration, sandbox, extraction, or result persistence failed.
     TesterHarness,
-    ProviderUnavailable,
+    ProviderUnavailable(String),
     /// Any other persistent failure (generic coder error at the retry cap, a
     /// tester error, and the like).
     Generic,
@@ -2408,16 +2414,36 @@ enum TaskFailure {
 /// Classify a terminal coder error for durable persistence and resume.
 fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
     if error.is::<crate::provider_evidence::ProviderUnavailableError>() {
-        TaskFailure::ProviderUnavailable
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to resume the same Task.",
+            error
+        ))
     } else if let Some(auth) = error.downcast_ref::<crate::claude_auth::AuthError>() {
-        TaskFailure::Auth(auth.user_message())
+        match auth.probe_failure() {
+            Some(failure) if failure.is_host_boundary() => {
+                TaskFailure::HostSandbox(failure.summary("credential refresh"))
+            }
+            _ if auth.is_authentication_error() => TaskFailure::Auth(auth.user_message()),
+            _ => TaskFailure::ProviderUnavailable(auth.user_message()),
+        }
     } else if let Some(auth) = error.downcast_ref::<crate::codex_worker::CodexAuthError>() {
         TaskFailure::Auth(auth.to_string())
     } else if let Some(readiness) =
         error.downcast_ref::<crate::provider_readiness::ProviderReadinessError>()
-        && readiness.is_authentication_error()
     {
-        TaskFailure::Auth(readiness.to_string())
+        if let Some(failure) = readiness.claude_failure() {
+            if failure.is_authentication() {
+                TaskFailure::Auth(failure.task_user_message("readiness"))
+            } else if failure.is_host_boundary() {
+                TaskFailure::HostSandbox(failure.summary("readiness"))
+            } else {
+                TaskFailure::ProviderUnavailable(failure.task_user_message("readiness"))
+            }
+        } else if readiness.is_authentication_error() {
+            TaskFailure::Auth(readiness.to_string())
+        } else {
+            TaskFailure::Generic
+        }
     } else if let Some(pump) = error.downcast_ref::<crate::transcript_pump::TranscriptPumpError>() {
         TaskFailure::TranscriptPump(pump.message().to_string())
     } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
@@ -2442,6 +2468,9 @@ fn provider_pause_error(
             if error.is::<crate::transcript_pump::TranscriptPumpError>()
                 || error.is::<crate::coder::SupervisionSidecarError>()
                 || error.is::<crate::os::HostSandboxPreflightError>()
+                || error.is::<crate::claude_auth::AuthError>()
+                || error.is::<crate::codex_worker::CodexAuthError>()
+                || error.is::<crate::provider_readiness::ProviderReadinessError>()
             {
                 return Err(error);
             }
@@ -2496,7 +2525,7 @@ fn mark_task_failed_attempt_needs_user(
             | TaskFailure::TranscriptPump(_)
             | TaskFailure::HostSandbox(_)
             | TaskFailure::TesterHarness => TaskStatus::NeedsUser,
-            TaskFailure::ProviderUnavailable => TaskStatus::NeedsUser,
+            TaskFailure::ProviderUnavailable(_) => TaskStatus::NeedsUser,
             TaskFailure::Generic => TaskStatus::Failed,
         };
         crate::work_model::set_task_terminal(
@@ -2508,7 +2537,9 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::TranscriptPump(_) => crate::work_model::PauseKind::TranscriptPump,
             TaskFailure::HostSandbox(_) => crate::work_model::PauseKind::HostSandbox,
             TaskFailure::TesterHarness => crate::work_model::PauseKind::TesterHarness,
-            TaskFailure::ProviderUnavailable => crate::work_model::PauseKind::ProviderUnavailable,
+            TaskFailure::ProviderUnavailable(_) => {
+                crate::work_model::PauseKind::ProviderUnavailable
+            }
             TaskFailure::Generic => crate::work_model::PauseKind::RoundCap,
         };
         // Route through the precedence boundary so a resumable pause cannot mask
@@ -2525,14 +2556,7 @@ fn mark_task_failed_attempt_needs_user(
     // handoff or notification. A later effect failure cannot undo the pause.
     if transitioned {
         match failure {
-            TaskFailure::Auth(message) => {
-                let message = if message.contains("codex login") {
-                    message.as_str()
-                } else {
-                    "Claude authentication needs attention. Run 'claude /login' to re-authenticate, then 'fluent attempt run'."
-                };
-                notify_fn("Fluent", message)
-            }
+            TaskFailure::Auth(message) => notify_fn("Fluent", message),
             TaskFailure::TranscriptPump(_) => notify_fn(
                 "Fluent",
                 "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
@@ -2544,10 +2568,7 @@ fn mark_task_failed_attempt_needs_user(
                 "Fluent",
                 "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
             ),
-            TaskFailure::ProviderUnavailable => notify_fn(
-                "Fluent",
-                "Provider capacity is unavailable before model progress. Run 'fluent attempt run' to retry the same Task.",
-            ),
+            TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
             TaskFailure::Generic => {}
         }
 
@@ -2653,8 +2674,8 @@ fn write_task_error_handoff(
         TaskFailure::TesterHarness => format!(
             "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Repair the Tester configuration, extractor, sandbox, or result persistence, then retry this Attempt.\n"
         ),
-        TaskFailure::ProviderUnavailable => format!(
-            "# Provider unavailable\n\nTask {task_id:?} exhausted provider retries before the model used tools or produced tokens. Run `fluent attempt run` to retry this same Task.\n"
+        TaskFailure::ProviderUnavailable(message) => format!(
+            "# Provider unavailable\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
         ),
         TaskFailure::Generic => format!(
             "# Attempt needs user input\n\nTask {task_id:?} failed after {} retries. \
@@ -7353,6 +7374,83 @@ mod tests {
     }
 
     #[test]
+    fn claude_network_refresh_failure_uses_provider_pause_without_login() {
+        let result = Err(anyhow::Error::new(
+            crate::claude_auth::AuthError::RefreshFailed {
+                failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                    "connection refused",
+                ),
+            },
+        ));
+
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("Restore network access") && !message.contains("/login")
+        ));
+        assert!(!should_retry_coder_error(&result));
+    }
+
+    #[test]
+    fn claude_network_readiness_failure_pauses_without_generic_retries() {
+        let result = Err(anyhow::Error::new(
+            crate::provider_readiness::ProviderReadinessError::Claude(
+                crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                    "connection refused",
+                ),
+            ),
+        ));
+
+        assert!(!should_retry_coder_error(&result));
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("Restore network access") && !message.contains("/login")
+        ));
+    }
+
+    #[test]
+    fn claude_keychain_refresh_failure_uses_host_boundary_pause() {
+        let error = anyhow::Error::new(crate::claude_auth::AuthError::RefreshFailed {
+            failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                crate::claude_diagnostics::ClaudeProbeFailureKind::HostBoundary,
+                "securityd: Operation not permitted",
+            ),
+        });
+
+        assert!(matches!(
+            classify_task_failure(&error),
+            TaskFailure::HostSandbox(message)
+                if message.contains("FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED")
+                    && !message.contains("/login")
+        ));
+        assert!(is_resumable_task_failure(&error));
+    }
+
+    #[test]
+    fn claude_keychain_pause_handoff_names_host_recovery_and_same_attempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            &TaskFailure::HostSandbox(
+                "FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED: Claude credential refresh failed."
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(handoff.contains("per-command approval"), "{handoff}");
+        assert!(handoff.contains("fluent attempt run work-1"), "{handoff}");
+        assert!(!handoff.contains("/login"), "{handoff}");
+    }
+
+    #[test]
     fn transcript_pump_failure_takes_precedence_over_prior_auth_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
@@ -7464,7 +7562,10 @@ mod tests {
             "work-1",
             "attempt-1",
             &task_id,
-            &TaskFailure::ProviderUnavailable,
+            &TaskFailure::ProviderUnavailable(
+                "Provider capacity is unavailable before model progress. Run 'fluent attempt run' to retry the same Task."
+                    .to_string(),
+            ),
             &|_, _| {},
         )
         .unwrap();
@@ -15518,7 +15619,9 @@ mod tests {
             "work-1",
             "attempt-1",
             "attempt-1-write-1",
-            &TaskFailure::Auth("Auth token expired".to_string()),
+            &TaskFailure::Auth(
+                crate::claude_auth::AuthError::Expired { expires_at: 0 }.user_message(),
+            ),
             &notify,
         )
         .unwrap();

@@ -2404,10 +2404,207 @@ fn coder_profile_preflight_rejects_unauthenticated_claude_status() {
         ])
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "claude: authentication is unavailable",
-        ));
+        .stderr(predicates::str::contains("FLUENT_CLAUDE_AUTH_REQUIRED"))
+        .stderr(predicates::str::contains("claude /login"));
     assert!(!tmp.path().join(".fluent").exists());
+}
+
+#[test]
+fn coder_profile_preflight_keeps_network_failure_out_of_login_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf 'connection refused while reaching api.anthropic.com\\n' >&2\nexit 1\n",
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "test-claude",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "test-claude",
+            "--review-effort",
+            "medium",
+            "--behavior-tests-coder",
+            "claude",
+            "--behavior-tests-model",
+            "test-claude",
+            "--behavior-tests-effort",
+            "medium",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "FLUENT_CLAUDE_NETWORK_UNAVAILABLE",
+        ))
+        .stderr(predicates::str::contains("Restore network access"))
+        .stderr(predicates::str::contains("/login").not());
+    assert!(!tmp.path().join(".fluent").exists());
+}
+
+#[test]
+fn coder_profile_preflight_redacts_failed_claude_diagnostics() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf 'service unavailable token=sk-ant-secret-value\\n' >&2\nexit 1\n",
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "test-claude",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "test-claude",
+            "--review-effort",
+            "medium",
+            "--behavior-tests-coder",
+            "claude",
+            "--behavior-tests-model",
+            "test-claude",
+            "--behavior-tests-effort",
+            "medium",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "FLUENT_CLAUDE_PROVIDER_UNAVAILABLE",
+        ))
+        .stderr(predicates::str::contains("[REDACTED]"))
+        .stderr(predicates::str::contains("sk-ant-secret-value").not())
+        .stderr(predicates::str::contains("/login").not());
+}
+
+#[test]
+fn coder_profile_preflight_distinguishes_blocked_keychain_from_logged_out() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":false}\\n'\n",
+    );
+    write_mock_executable(
+        &bin_dir,
+        "security",
+        "#!/bin/bash\nprintf 'securityd: Operation not permitted while reading Keychain access\\n' >&2\nexit 1\n",
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "test-claude",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "test-claude",
+            "--review-effort",
+            "medium",
+            "--behavior-tests-coder",
+            "claude",
+            "--behavior-tests-model",
+            "test-claude",
+            "--behavior-tests-effort",
+            "medium",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED",
+        ))
+        .stderr(predicates::str::contains("per-command approval"))
+        .stderr(predicates::str::contains("/login").not());
+}
+
+#[test]
+fn coder_profile_preflight_warns_for_old_claude_parallel_auth() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        "#!/bin/bash\nif [ \"$1 $2 $3\" = \"auth status --json\" ]; then printf '{\"loggedIn\":true}\\n'; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then printf '2.1.191 (Claude Code)\\n'; exit 0; fi\nexit 1\n",
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "test-claude",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "test-claude",
+            "--review-effort",
+            "medium",
+            "--behavior-tests-coder",
+            "claude",
+            "--behavior-tests-model",
+            "test-claude",
+            "--behavior-tests-effort",
+            "medium",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "Claude Code 2.1.191 predates 2.1.211",
+        ))
+        .stderr(predicates::str::contains("parallel session token renewal"));
 }
 
 #[test]
@@ -2487,10 +2684,8 @@ fn coder_profile_preflight_reports_every_failed_provider_without_mutation() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("claude: authentication is unavailable"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("FLUENT_CLAUDE_PROBE_FAILED"), "{stderr}");
+    assert!(!stderr.contains("/login"), "{stderr}");
     assert!(
         stderr.contains("pi: command readiness check failed"),
         "{stderr}"
@@ -5179,9 +5374,18 @@ exit 0
     let status = wait_with_timeout(&mut child, std::time::Duration::from_secs(60))
         .expect("writer must complete instead of blocking on the saturated console");
     let _ = drain_stdout.join();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child
+        .child
+        .as_mut()
+        .and_then(|process| process.stderr.take())
+    {
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut stderr);
+    }
     assert!(
         status.success(),
-        "writer should complete despite sustained previews on an unread console"
+        "writer should complete despite sustained previews on an unread console: {}",
+        String::from_utf8_lossy(&stderr)
     );
 
     let transcript =
@@ -5199,10 +5403,11 @@ exit 0
         "the last record of the sustained flood must be captured"
     );
 
-    // The post-coder Attempt transition ran: the task committed its output.
+    // The post-coder Attempt transition ran after the coder committed its output.
+    let writer_workspace = tmp.path().join("work-6-work-1-attempt-1");
     assert!(
-        main_dir.join("task-output.txt").exists(),
-        "the writer must reach its post-coder work, not stall on the console"
+        writer_workspace.join("task-output.txt").exists(),
+        "the writer must commit output in its workspace before Fluent completes the Task"
     );
 
     // The pump status is byte-truthful: capture completed, every record counted,
@@ -14673,7 +14878,7 @@ printf 'Verdict: pass\n' > review.md
 }
 
 #[test]
-fn refresh_timeout_preserves_auth_paused_attempt() {
+fn refresh_timeout_preserves_provider_paused_attempt() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     create_completed_work_attempt(&tmp, &main_dir);
@@ -14717,12 +14922,13 @@ exit 1
         .env("FLUENT_CLAUDE_REFRESH_DEADLINE_SECS", "1")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("timed out"));
+        .stderr(predicate::str::contains("FLUENT_CLAUDE_PROBE_TIMEOUT"))
+        .stderr(predicate::str::contains("claude /login").not());
 
     let value = read_work_show_json(&main_dir, "work-1");
     let attempt = &value["attempts"][0];
     assert_eq!(attempt["status"], "needs-user");
-    assert_eq!(attempt["pause_kind"], "auth");
+    assert_eq!(attempt["pause_kind"], "provider-unavailable");
     assert_eq!(
         attempt["tasks"]
             .as_array()
@@ -18456,6 +18662,11 @@ const BEHAVIOR_TESTS_MOCK_PRELUDE: &str = r##"#!/bin/bash
 
 if [ "$1 $2 $3" = "auth status --json" ]; then
     printf '{"loggedIn":true}\n'
+    exit 0
+fi
+
+if [ "$1" = "--version" ]; then
+    printf '2.1.211 (Claude Code)\n'
     exit 0
 fi
 
@@ -25316,9 +25527,8 @@ fn claude_readiness_failure_pauses_planned_task_before_reservation() {
         .env("PATH", mock_path(&bin_dir))
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "claude: authentication is unavailable",
-        ));
+        .stderr(predicates::str::contains("FLUENT_CLAUDE_AUTH_REQUIRED"))
+        .stderr(predicates::str::contains("claude /login"));
 
     let item = work_item_value(&main_dir, "claude-auth");
     let attempt = &item["attempts"][0];

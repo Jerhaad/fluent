@@ -3,6 +3,7 @@ pub mod auto_merge;
 pub(crate) mod baseline_cache;
 pub mod candidate_gate;
 pub mod claude_auth;
+pub mod claude_diagnostics;
 pub mod cleanup;
 pub mod cli;
 pub mod coder;

@@ -1001,6 +1001,26 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn bundled_fluent_skill_distinguishes_claude_readiness_recovery() {
+        let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
+        let recovery = skill
+            .split_once("### Recover Claude readiness failures")
+            .map(|(_, section)| section)
+            .expect("the bundled skill must explain Claude readiness recovery");
+        let recovery = recovery
+            .split_once("### Coder selection")
+            .map(|(section, _)| section)
+            .unwrap_or(recovery);
+
+        assert!(recovery.contains("FLUENT_CLAUDE_AUTH_REQUIRED"));
+        assert!(recovery.contains("FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED"));
+        assert!(recovery.contains("do not substitute login"));
+        assert!(recovery.contains("Retry the same `fluent init` command"));
+        assert!(recovery.contains("resume an existing Task"));
+        assert!(recovery.contains("older than 2.1.211"));
+    }
+
+    #[test]
     fn bundled_fluent_skill_reports_saved_profile_and_attempt_boundary() {
         let skill = bundled_skill_content("fluent/SKILL.md").unwrap();
         assert!(

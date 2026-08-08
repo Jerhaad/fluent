@@ -3722,6 +3722,77 @@ Test: src/work_task_executor.rs (only_managed_home_claude_launches_need_the_unsa
 Test: src/work_task_executor.rs (claude_writer_launch_uses_managed_home)
 Test: src/credential.rs (claude_credential_bridge_reads_oauth_for_managed_home_launch)
 
+## Claude readiness diagnosis
+
+### B1
+
+WHEN configured initialization checks Claude readiness,
+THE SYSTEM SHALL check the local command and authentication status without
+sending a model prompt.
+Test: tests/binary.rs (coder_profile_preflight_does_not_invoke_model)
+
+### B2
+
+IF any configured provider fails readiness during initialization,
+THEN THE SYSTEM SHALL preserve the uninitialized project unchanged.
+Test: tests/binary.rs (coder_profile_preflight_failure_preserves_uninitialized_project)
+
+### B3
+
+IF a Claude readiness or credential-refresh command fails,
+THEN THE SYSTEM SHALL report a stable category code that distinguishes
+authentication, host credential boundary, rate limit, network, provider
+availability, timeout, and unknown failures.
+Test: src/claude_diagnostics.rs (classifies_auth_rate_network_provider_and_host_failures)
+Test: src/claude_diagnostics.rs (category_codes_are_stable)
+Test: tests/binary.rs (coder_profile_preflight_keeps_network_failure_out_of_login_recovery)
+
+### B4
+
+WHEN Fluent reports a Claude command diagnostic,
+THE SYSTEM SHALL redact structured and free-text credential values before
+storing or printing it.
+Test: src/claude_diagnostics.rs (diagnostic_redacts_structured_and_free_text_secrets)
+Test: tests/binary.rs (coder_profile_preflight_redacts_failed_claude_diagnostics)
+
+### B5
+
+WHEN Fluent stores or prints a Claude command diagnostic,
+THE SYSTEM SHALL limit it to 512 characters, including its truncation marker.
+Test: src/claude_diagnostics.rs (diagnostic_is_bounded_on_unicode_boundaries)
+
+### B6
+
+WHEN Claude reports that no user is logged in,
+THE SYSTEM SHALL prescribe `claude /login` only when the available evidence
+indicates authentication.
+Test: src/claude_diagnostics.rs (authentication_is_the_only_recovery_that_names_login)
+Test: tests/binary.rs (coder_profile_preflight_rejects_unauthenticated_claude_status)
+
+### B7
+
+IF Claude cannot report an active login because the enclosing host blocked
+credential access,
+THEN THE SYSTEM SHALL prescribe the scoped host-agent approval flow and SHALL
+NOT prescribe login.
+Test: tests/binary.rs (coder_profile_preflight_distinguishes_blocked_keychain_from_logged_out)
+
+### B8
+
+WHEN Claude authentication readiness succeeds and `claude --version` reports a
+version older than 2.1.211,
+THE SYSTEM SHALL warn that the installed version predates the parallel session
+token-renewal fix and SHALL continue initialization.
+Test: src/provider_readiness.rs (old_claude_version_warns_but_current_version_does_not)
+Test: tests/binary.rs (coder_profile_preflight_warns_for_old_claude_parallel_auth)
+
+### B9
+
+IF Claude authentication readiness succeeds but Fluent cannot parse the
+installed Claude Code version,
+THEN THE SYSTEM SHALL continue without a version warning.
+Test: src/provider_readiness.rs (unknown_claude_version_does_not_block_readiness)
+
 ## Claude auth token expiry detection
 
 ### B1
@@ -3784,8 +3855,9 @@ coder process exit non-zero AND the transcript reports either a most-recent
 THE SYSTEM SHALL attempt `credential::refresh_credentials()` once
 and re-run the coder session only after the refresh probe succeeds and Fluent
 rereads the credential store. If the probe times out or exits unsuccessfully,
-THE SYSTEM SHALL return `AuthError::RefreshFailed` so the existing Attempt
-pauses for authentication recovery. If the re-run still fails authentication,
+THE SYSTEM SHALL return `AuthError::RefreshFailed` with classified diagnostic
+evidence so the existing Attempt pauses for the matching recovery. If the
+re-run still fails authentication,
 THE SYSTEM SHALL return `AuthError::Rejected { request_id }` for a 401 or
 `AuthError::NotLoggedIn` for `authentication_failed`, so the caller pauses with
 a recovery message. The rejected variant copies `result.request_id` when present.
@@ -3809,12 +3881,15 @@ Untestable: Structural ordering verified by code inspection — `classify_transc
 ### B8
 
 WHEN the user-facing error message is constructed for `AuthError::Expired`,
-`AuthError::Rejected`, `AuthError::NotLoggedIn`, or `AuthError::RefreshFailed`,
-THE SYSTEM SHALL name the recovery action explicitly, mentioning
-`claude /login` and `fluent attempt run` in the message.
+`AuthError::Rejected`, or `AuthError::NotLoggedIn`,
+THE SYSTEM SHALL name `claude /login` and `fluent attempt run`. WHEN it is
+constructed for `AuthError::RefreshFailed`, THE SYSTEM SHALL name
+`claude /login` only for authentication evidence and SHALL name the matching
+non-authentication repair plus `fluent attempt run` otherwise.
 Test: src/claude_auth.rs (tests::auth_error_expired_user_message_names_login_action)
 Test: src/claude_auth.rs (tests::auth_error_rejected_user_message_names_login_action)
 Test: src/claude_auth.rs (tests::auth_handoff_names_attempt_run_recovery)
+Test: src/claude_auth.rs (tests::non_auth_refresh_failure_does_not_name_login)
 
 ### B9
 
@@ -3839,7 +3914,7 @@ expiry check finds the token expired,
 THE SYSTEM SHALL attempt `credential::refresh_credentials()` once
 and re-run the coder session only after the probe succeeds and Fluent rereads
 credentials. If the probe times out or exits unsuccessfully, THE SYSTEM SHALL
-pause the existing Attempt for authentication recovery before a Writer round is
+pause the existing Attempt for the classified recovery before a Writer round is
 consumed.
 Test: src/coder.rs (coder_retries_once_after_credential_refresh_on_401)
 
@@ -3854,18 +3929,20 @@ Test: src/credential.rs (refresh_probe_honors_configured_deadline)
 
 IF the refresh probe exceeds its deadline,
 THEN THE SYSTEM SHALL attempt to terminate and reap its owned process group. If
-Fluent confirms the sweep, it SHALL return a typed timeout authentication
-failure that preserves the same Attempt for recovery; otherwise it SHALL return
+Fluent confirms the sweep, it SHALL return a typed timeout failure that
+preserves the same Attempt for recovery; otherwise it SHALL return
 a typed cleanup failure that retains the unconfirmed-sweep diagnostic.
 Test: src/credential.rs (refresh_probe_timeout_terminates_process_tree)
-Test: tests/binary.rs (refresh_timeout_preserves_auth_paused_attempt)
+Test: tests/binary.rs (refresh_timeout_preserves_provider_paused_attempt)
 
 ### B4
 
 IF the refresh probe exits unsuccessfully,
-THEN THE SYSTEM SHALL report refresh failure and SHALL NOT reread credentials as
-though refresh had succeeded.
+THEN THE SYSTEM SHALL capture bounded output without blocking on a full pipe,
+redact credential values, report the classified refresh failure, and SHALL NOT
+reread credentials as though refresh had succeeded.
 Test: src/credential.rs (refresh_probe_nonzero_exit_is_failure)
+Test: src/credential.rs (refresh_probe_retains_bounded_sanitized_diagnostic)
 
 ### B5
 

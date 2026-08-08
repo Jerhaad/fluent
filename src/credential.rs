@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::{Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,11 @@ pub enum CredentialRefreshError {
     Spawn(String),
     Timeout(Duration),
     Cleanup(String),
-    Failed(i32),
+    Reread(String),
+    Failed {
+        status: i32,
+        failure: crate::claude_diagnostics::ClaudeProbeFailure,
+    },
 }
 
 impl std::fmt::Display for CredentialRefreshError {
@@ -47,15 +52,59 @@ impl std::fmt::Display for CredentialRefreshError {
                 f,
                 "could not terminate Claude credential refresh: {message}"
             ),
-            Self::Failed(status) => write!(
+            Self::Reread(message) => {
+                write!(
+                    f,
+                    "could not reread Claude credentials after refresh: {message}"
+                )
+            }
+            Self::Failed { status, failure } => write!(
                 f,
-                "Claude credential refresh probe exited unsuccessfully with status {status}"
+                "Claude credential refresh probe exited with status {status}: {}: {}",
+                failure.code(),
+                failure.diagnostic()
             ),
         }
     }
 }
 
 impl std::error::Error for CredentialRefreshError {}
+
+impl CredentialRefreshError {
+    pub fn probe_failure(&self) -> crate::claude_diagnostics::ClaudeProbeFailure {
+        use crate::claude_diagnostics::{ClaudeProbeFailure, ClaudeProbeFailureKind};
+        match self {
+            Self::Failed { failure, .. } => failure.clone(),
+            Self::Timeout(deadline) => ClaudeProbeFailure::new(
+                ClaudeProbeFailureKind::Timeout,
+                format!(
+                    "probe exceeded its {} second deadline",
+                    deadline.as_secs_f64()
+                ),
+            ),
+            Self::Cleanup(message) => {
+                let classified = ClaudeProbeFailure::from_output(&[], message.as_bytes());
+                if classified.kind() == ClaudeProbeFailureKind::Unknown {
+                    ClaudeProbeFailure::new(ClaudeProbeFailureKind::Unknown, message)
+                } else {
+                    classified
+                }
+            }
+            Self::Spawn(message) => ClaudeProbeFailure::new(
+                ClaudeProbeFailureKind::Unknown,
+                format!("could not start the probe: {message}"),
+            ),
+            Self::Reread(message) => ClaudeProbeFailure::new(
+                ClaudeProbeFailureKind::Unknown,
+                format!("could not reread credentials after refresh: {message}"),
+            ),
+            Self::InvalidDeadline(value) => ClaudeProbeFailure::new(
+                ClaudeProbeFailureKind::Unknown,
+                format!("invalid {CLAUDE_REFRESH_DEADLINE_ENV} value {value:?}"),
+            ),
+        }
+    }
+}
 
 /// Safety: We only call set_env_var from the main thread when no child
 /// processes are running — both during initial setup and between sessions.
@@ -96,7 +145,7 @@ pub fn inject_claude_credentials() -> Result<()> {
 /// token refresh, then re-reads credentials from Keychain after a successful exit.
 /// Called between sessions in sandboxed mode because the sandbox blocks
 /// Keychain access — the agent cannot refresh tokens itself.
-pub fn refresh_credentials() -> Result<()> {
+pub fn refresh_credentials() -> std::result::Result<(), CredentialRefreshError> {
     if hermetic_provider_test_mode() {
         return Ok(());
     }
@@ -110,12 +159,12 @@ fn refresh_credentials_with<F>(
     command: Command,
     deadline: Duration,
     reread_oauth_token: F,
-) -> Result<()>
+) -> std::result::Result<(), CredentialRefreshError>
 where
     F: FnOnce() -> Result<()>,
 {
     run_refresh_probe(command, deadline)?;
-    reread_oauth_token()
+    reread_oauth_token().map_err(|error| CredentialRefreshError::Reread(error.to_string()))
 }
 
 fn configured_refresh_deadline() -> std::result::Result<Duration, CredentialRefreshError> {
@@ -149,10 +198,7 @@ fn configured_refresh_deadline_from(
 
 fn refresh_probe_command() -> Command {
     let mut command = Command::new("claude");
-    command
-        .args(["--safe-mode", "-p", "ok"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    command.args(["--safe-mode", "-p", "ok"]);
     command
 }
 
@@ -177,6 +223,17 @@ where
         std::process::Child,
     ) -> std::result::Result<crate::coder::GroupSweepDisposition, String>,
 {
+    let mut stdout = tempfile::NamedTempFile::new()
+        .map_err(|error| CredentialRefreshError::Spawn(error.to_string()))?;
+    let mut stderr = tempfile::NamedTempFile::new()
+        .map_err(|error| CredentialRefreshError::Spawn(error.to_string()))?;
+    command
+        .stdout(Stdio::from(stdout.reopen().map_err(|error| {
+            CredentialRefreshError::Spawn(error.to_string())
+        })?))
+        .stderr(Stdio::from(stderr.reopen().map_err(|error| {
+            CredentialRefreshError::Spawn(error.to_string())
+        })?));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -194,7 +251,14 @@ where
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
             Ok(Some(status)) => {
-                return Err(CredentialRefreshError::Failed(status.code().unwrap_or(1)));
+                let stdout = read_bounded_probe_output(&mut stdout)?;
+                let stderr = read_bounded_probe_output(&mut stderr)?;
+                return Err(CredentialRefreshError::Failed {
+                    status: status.code().unwrap_or(1),
+                    failure: crate::claude_diagnostics::ClaudeProbeFailure::from_output(
+                        &stdout, &stderr,
+                    ),
+                });
             }
             Ok(None) if started.elapsed() >= deadline => {
                 let disposition = cleanup(child).map_err(CredentialRefreshError::Cleanup)?;
@@ -209,6 +273,21 @@ where
             Err(error) => return Err(CredentialRefreshError::Spawn(error.to_string())),
         }
     }
+}
+
+fn read_bounded_probe_output(
+    file: &mut tempfile::NamedTempFile,
+) -> std::result::Result<Vec<u8>, CredentialRefreshError> {
+    const CAPTURE_LIMIT_BYTES: u64 = 16 * 1024;
+    file.as_file_mut()
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| CredentialRefreshError::Spawn(error.to_string()))?;
+    let mut output = Vec::new();
+    file.as_file_mut()
+        .take(CAPTURE_LIMIT_BYTES)
+        .read_to_end(&mut output)
+        .map_err(|error| CredentialRefreshError::Spawn(error.to_string()))?;
+    Ok(output)
 }
 
 /// Read the OAuth token from Keychain via `security find-generic-password`.
@@ -478,12 +557,36 @@ mod tests {
     #[test]
     fn refresh_probe_nonzero_exit_is_failure() {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exit 23"]);
+        command.args(["-c", "printf 'HTTP 429 rate limit' >&2; exit 23"]);
 
+        let error = run_refresh_probe(command, Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(
+            error,
+            CredentialRefreshError::Failed {
+                status: 23,
+                ref failure,
+            } if failure.kind() == crate::claude_diagnostics::ClaudeProbeFailureKind::RateLimit
+        ));
+    }
+
+    #[test]
+    fn refresh_probe_retains_bounded_sanitized_diagnostic() {
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'HTTP 401 token=sk-ant-this-must-not-leak %0600d' 0 >&2; exit 1",
+        ]);
+
+        let error = run_refresh_probe(command, Duration::from_secs(1)).unwrap_err();
+        let CredentialRefreshError::Failed { failure, .. } = error else {
+            panic!("expected failed probe");
+        };
         assert_eq!(
-            run_refresh_probe(command, Duration::from_secs(1)).unwrap_err(),
-            CredentialRefreshError::Failed(23)
+            failure.kind(),
+            crate::claude_diagnostics::ClaudeProbeFailureKind::Authentication
         );
+        assert!(!failure.diagnostic().contains("sk-ant-this-must-not-leak"));
+        assert!(failure.diagnostic().chars().count() < 530);
     }
 
     #[test]

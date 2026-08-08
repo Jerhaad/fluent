@@ -10,10 +10,16 @@ const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub enum AuthError {
-    Expired { expires_at: i64 },
-    Rejected { request_id: Option<String> },
+    Expired {
+        expires_at: i64,
+    },
+    Rejected {
+        request_id: Option<String>,
+    },
     NotLoggedIn,
-    RefreshFailed { reason: String },
+    RefreshFailed {
+        failure: crate::claude_diagnostics::ClaudeProbeFailure,
+    },
 }
 
 impl std::fmt::Display for AuthError {
@@ -30,13 +36,25 @@ impl AuthError {
             AuthError::Expired { .. } => "Claude auth token expired.",
             AuthError::Rejected { .. } => "Claude auth token rejected (HTTP 401).",
             AuthError::NotLoggedIn => "Claude is not logged in.",
-            AuthError::RefreshFailed { reason } => {
-                return format!(
-                    "Claude credential refresh failed: {reason}. Run 'claude /login' to re-authenticate, then 'fluent attempt run'."
-                );
+            AuthError::RefreshFailed { failure } => {
+                return failure.task_user_message("credential refresh");
             }
         };
         format!("{prefix} Run 'claude /login' to re-authenticate, then 'fluent attempt run'.")
+    }
+
+    pub fn is_authentication_error(&self) -> bool {
+        match self {
+            Self::RefreshFailed { failure } => failure.is_authentication(),
+            Self::Expired { .. } | Self::Rejected { .. } | Self::NotLoggedIn => true,
+        }
+    }
+
+    pub fn probe_failure(&self) -> Option<&crate::claude_diagnostics::ClaudeProbeFailure> {
+        match self {
+            Self::RefreshFailed { failure } => Some(failure),
+            _ => None,
+        }
     }
 }
 
@@ -206,6 +224,20 @@ mod tests {
                 "should name resume command: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn non_auth_refresh_failure_does_not_name_login() {
+        let err = AuthError::RefreshFailed {
+            failure: crate::claude_diagnostics::ClaudeProbeFailure::new(
+                crate::claude_diagnostics::ClaudeProbeFailureKind::Network,
+                "connection refused",
+            ),
+        };
+        let message = err.user_message();
+        assert!(!err.is_authentication_error());
+        assert!(!message.contains("/login"));
+        assert!(message.contains("Restore network access"));
     }
 
     // -- KeychainEnvelope deserialization tests --

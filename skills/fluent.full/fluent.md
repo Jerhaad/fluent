@@ -293,6 +293,13 @@ Autonomous Claude Writers use an Attempt-scoped managed home. Their sandbox
 blocks the operator's persistent Claude project and memory tree; do not copy
 memory or session state from `~/.claude/projects` into a Work Item manually.
 
+### Recover Claude readiness failures
+
+Claude readiness errors use a stable `FLUENT_CLAUDE_*` code and a redacted diagnostic.
+Run `claude /login` only for `FLUENT_CLAUDE_AUTH_REQUIRED`; use the scoped host-agent recovery above for `FLUENT_CLAUDE_HOST_CREDENTIAL_BLOCKED`.
+For rate-limit, network, provider, timeout, or unknown codes, repair the named condition; do not substitute login.
+Retry the same `fluent init` command, or resume an existing Task with `fluent attempt run <work-item-id> [attempt-id]` without consuming a Writer round. Upgrade versions older than 2.1.211 before parallel runs; the warning does not block a serial run.
+
 For unrelated work that can proceed in parallel, create independent Work Items.
 
 For codebase, module, or area review-only work, create a Work Item, run `fluent review codebase <work-item-id> <attempt-id>`, then `fluent attempt run <work-item-id> <attempt-id>`.
