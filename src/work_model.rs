@@ -3676,7 +3676,9 @@ impl Attempt {
             | Some(PauseKind::TesterHarness)
             | Some(PauseKind::ProviderUnavailable)
             | Some(PauseKind::Interrupted)
-            | Some(PauseKind::WriterCompletion) => Ok(()),
+            | Some(PauseKind::WriterCompletion)
+            | Some(PauseKind::CandidateGate) => Ok(()),
+            Some(PauseKind::Uncertain) if self.is_legacy_candidate_gate_pause() => Ok(()),
             Some(PauseKind::Uncertain) if self.is_legacy_writer_completion_pause() => Ok(()),
             Some(PauseKind::Uncertain) => Err(ineligible(
                 "Attempt is paused with uncertain reviews. Resolve the uncertain verdicts and re-run; resuming this pause kind is not yet supported."
@@ -3717,6 +3719,24 @@ impl Attempt {
             && self.artifacts.iter().any(|artifact| {
                 artifact.producer_id == "required-progress"
                     && artifact.path.ends_with("/writer-completion-needs-user.md")
+            })
+    }
+
+    pub(crate) fn is_candidate_gate_pause(&self) -> bool {
+        self.pause_kind == Some(PauseKind::CandidateGate) || self.is_legacy_candidate_gate_pause()
+    }
+
+    fn is_legacy_candidate_gate_pause(&self) -> bool {
+        self.pause_kind == Some(PauseKind::Uncertain)
+            && self.review_state == Some(AttemptReviewState::NotReviewed)
+            && self.artifacts.iter().any(|artifact| {
+                artifact.producer_id == "candidate-gate"
+                    && artifact.path.ends_with("/candidate-gate-needs-user.md")
+            })
+            && self.artifacts.iter().any(|artifact| {
+                artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
             })
     }
 
@@ -4220,6 +4240,10 @@ pub enum PauseKind {
     /// Host-owned required-progress or Writer completion evidence needs repair.
     /// Re-running re-evaluates the completed Writer before any review starts.
     WriterCompletion,
+    /// Host-owned candidate checks rejected the candidate repeatedly or could
+    /// not verify it. Explicit recovery either plans one corrective Writer for
+    /// a rejected gate or rechecks an environment-blocked gate.
+    CandidateGate,
     RoundCap,
     /// A transcript-pump infrastructure failure (capture, status persistence, or
     /// transcript phase preservation) stopped the coder. The console transport,
@@ -4251,6 +4275,7 @@ impl PauseKind {
             Self::Auth => "auth",
             Self::Uncertain => "uncertain",
             Self::WriterCompletion => "writer-completion",
+            Self::CandidateGate => "candidate-gate",
             Self::RoundCap => "round-cap",
             Self::TranscriptPump => "transcript-pump",
             Self::HostSandbox => "host-sandbox",
@@ -4285,6 +4310,7 @@ impl<'de> Deserialize<'de> for PauseKind {
             "auth" => Self::Auth,
             "uncertain" => Self::Uncertain,
             "writer-completion" => Self::WriterCompletion,
+            "candidate-gate" => Self::CandidateGate,
             "round-cap" => Self::RoundCap,
             "transcript-pump" => Self::TranscriptPump,
             "host-sandbox" => Self::HostSandbox,
@@ -5023,7 +5049,8 @@ fn attempt_state_rank(status: &AttemptStatus, pause: &Option<PauseKind>) -> u8 {
             | Some(PauseKind::TranscriptPump)
             | Some(PauseKind::HostSandbox)
             | Some(PauseKind::TesterHarness)
-            | Some(PauseKind::WriterCompletion) => 3,
+            | Some(PauseKind::WriterCompletion)
+            | Some(PauseKind::CandidateGate) => 3,
             Some(PauseKind::ProviderUnavailable) | Some(PauseKind::Interrupted) => 3,
             // RoundCap, Uncertain, or an unclassified pause is non-resumable.
             _ => 4,
@@ -12585,6 +12612,7 @@ random banner prose that must be ignored
             "host-sandbox",
             "tester-harness",
             "writer-completion",
+            "candidate-gate",
             "future-pause",
         ] {
             let parsed: PauseKind = serde_json::from_str(&format!("\"{value}\"")).unwrap();
@@ -12598,6 +12626,37 @@ random banner prose that must be ignored
             serde_json::from_str::<PauseKind>("\"future-pause\"").unwrap(),
             PauseKind::Unknown("future-pause".to_string())
         );
+    }
+
+    #[test]
+    fn candidate_gate_and_legacy_gate_pauses_are_resumable() {
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::CandidateGate),
+            review_state: Some(AttemptReviewState::NotReviewed),
+            ..Attempt::default()
+        };
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.pause_kind = Some(PauseKind::Uncertain);
+        attempt.artifacts = vec![
+            ArtifactRef {
+                producer_id: "attempt-1-write-2".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-2/candidate-gate.json".to_string(),
+            },
+            ArtifactRef {
+                producer_id: "candidate-gate".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gate-needs-user.md".to_string(),
+            },
+        ];
+        assert!(attempt.is_candidate_gate_pause());
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.review_state = Some(AttemptReviewState::Uncertain);
+        assert!(!attempt.is_candidate_gate_pause());
+        assert!(attempt.ensure_resume_ready().is_err());
     }
 
     #[test]

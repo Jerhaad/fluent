@@ -917,7 +917,7 @@ fn with_matching_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work_model::{PauseKind, TaskStatus};
+    use crate::work_model::{ArtifactRef, AttemptReviewState, PauseKind, TaskStatus};
 
     fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
@@ -1083,6 +1083,49 @@ mod tests {
             .unwrap();
         assert!(resume(dir.path(), "wi-1", "attempt-1", None).is_err());
         assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_accepts_typed_and_legacy_candidate_gate_pauses() {
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            setup_project(dir.path());
+            write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+            let store = WorkModelStore::new(dir.path());
+            store
+                .mutate_work_item("wi-1", |item| {
+                    let attempt = &mut item.attempts[0];
+                    attempt.pause_kind = Some(if legacy {
+                        PauseKind::Uncertain
+                    } else {
+                        PauseKind::CandidateGate
+                    });
+                    attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                    attempt.artifacts = vec![
+                        ArtifactRef {
+                            producer_id: "attempt-1-write-1".to_string(),
+                            path: ".fluent/work/artifacts/wi-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+                        },
+                        ArtifactRef {
+                            producer_id: "candidate-gate".to_string(),
+                            path: ".fluent/work/artifacts/wi-1/attempt-1/candidate-gate-needs-user.md".to_string(),
+                        },
+                    ];
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(
+                resume(dir.path(), "wi-1", "attempt-1", None).unwrap(),
+                ResumeDispatchOutcome::Created
+            );
+            let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+            assert_eq!(ledger.dispatches.len(), 2);
+            assert_eq!(
+                ledger.active().unwrap().intent,
+                DispatchIntent::ResumeAttempt
+            );
+        }
     }
 
     #[test]

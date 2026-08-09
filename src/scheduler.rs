@@ -1220,6 +1220,43 @@ mod tests {
     }
 
     #[test]
+    fn candidate_gate_resume_runs_the_same_attempt_through_scheduler() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume candidate gate");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-resume", "attempt-1");
+        store
+            .mutate_work_item("wi-resume", |item| {
+                item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+        queue::resume(dir.path(), "wi-resume", "attempt-1", None).unwrap();
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(dir.path(), &resumed, &PassingRunner).unwrap();
+
+        let item = store.read_work_item("wi-resume").unwrap();
+        assert_eq!(item.attempts.len(), 1);
+        assert_eq!(item.attempts[0].id, "attempt-1");
+        assert_eq!(item.attempts[0].status, AttemptStatus::Complete);
+        let ledger = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+    }
+
+    #[test]
     fn explicit_resume_can_return_to_needs_user_without_losing_history() {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path());

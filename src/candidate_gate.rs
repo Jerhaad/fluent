@@ -268,7 +268,9 @@ fn is_ancestor(workspace: &Path, base: &str, candidate: &str) -> Result<bool> {
     )
 }
 
-fn read_prior_writer_gate(path: &Path) -> std::result::Result<CandidateGateEvidence, String> {
+pub(crate) fn read_prior_writer_gate(
+    path: &Path,
+) -> std::result::Result<CandidateGateEvidence, String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("prior candidate gate cannot be inspected: {error}"))?;
     if metadata.len() > CANDIDATE_GATE_MAX_BYTES {

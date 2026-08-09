@@ -1329,4 +1329,22 @@ mod tests {
             Some("fluent queue resume work-1 --attempt attempt-1")
         );
     }
+
+    #[test]
+    fn candidate_gate_status_names_exact_queue_resume_command() {
+        let mut item = WorkItem::planned("work-1", "Resume candidate correction");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::CandidateGate);
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+
+        let row = summarize_work_item(&item, None);
+
+        assert_eq!(row.action, "needs-user");
+        assert_eq!(
+            row.next_action.as_deref(),
+            Some("fluent queue resume work-1 --attempt attempt-1")
+        );
+    }
 }

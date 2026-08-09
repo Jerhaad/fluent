@@ -20925,6 +20925,61 @@ fn queue_resume_records_exact_authorization_and_is_idempotent() {
 }
 
 #[test]
+fn candidate_gate_pause_reports_and_accepts_exact_queue_resume() {
+    use fluent::queue::{self, DispatchStatus};
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, PauseKind, WorkItem, WorkModelStore,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let store = WorkModelStore::new(tmp.path());
+    let mut item = WorkItem::planned("wi-gate", "Resume candidate gate");
+    item.add_initial_attempt("attempt-1").unwrap();
+    store.create_work_item(&item).unwrap();
+    queue::add(tmp.path(), "wi-gate", Some(2)).unwrap();
+    queue::claim(tmp.path(), "wi-gate", "attempt-1")
+        .unwrap()
+        .unwrap();
+    store
+        .mutate_work_item("wi-gate", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::CandidateGate);
+            attempt.review_state = Some(AttemptReviewState::NotReviewed);
+            Ok(())
+        })
+        .unwrap();
+    queue::reconcile_active(tmp.path(), "wi-gate", DispatchStatus::NeedsUser).unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["work-item", "show", "wi-gate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"pause_kind\": \"candidate-gate\"",
+        ))
+        .stderr(predicate::str::contains(
+            "fluent queue resume wi-gate --attempt attempt-1",
+        ));
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["queue", "resume", "wi-gate", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Queued resume of Attempt attempt-1 for Work Item wi-gate",
+        ));
+    let ledger = queue::read_ledger(tmp.path(), "wi-gate").unwrap().unwrap();
+    assert_eq!(ledger.dispatches.len(), 2);
+    assert_eq!(
+        ledger.active().unwrap().bound_attempt_id.as_deref(),
+        Some("attempt-1")
+    );
+}
+
+#[test]
 fn queue_add_allows_planned_attempt_after_older_suspension() {
     use fluent::work_model::{AttemptStatus, TaskStatus, WorkItem, WorkModelStore};
 

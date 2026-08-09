@@ -136,6 +136,7 @@ FLUENT_BIN_OVERRIDE="$REVIEW_ARTIFACT_DIR/target/debug/fluent" \
 | Work Task run completes review Tasks from durable artifacts while preserving verdict boundaries | `binary.rs`, `test-work-task-run.sh` |
 | Work Attempt run advances planned Tasks, plans reviews, and interprets review outcomes | `binary.rs`, `test-work-attempt-loop.sh` |
 | Work Attempt run creates follow-up writes or needs-user handoffs at review boundaries | `binary.rs`, `test-work-attempt-loop.sh` |
+| Repeated candidate-gate rejection pauses, and explicit recovery admits one correction on the same Attempt | `binary.rs`, `test-work-attempt-loop.sh` |
 | Merge Candidate inspection prints stored candidate JSON without changing state | `binary.rs`, `test-work-merge-candidate.sh` |
 | Work merge executes ready Merge Candidates only after validating candidate ownership, provenance, source branch, target safety, checks, and reviewers | `binary.rs`, `test-work-merge-candidate.sh` |
 | Work merge rejects invalid stored candidate provenance without rewriting state | `binary.rs`, `test-work-merge-candidate.sh` |

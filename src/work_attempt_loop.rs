@@ -286,6 +286,8 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .iter()
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        let candidate_gate_pause =
+            attempt.status == AttemptStatus::NeedsUser && attempt.is_candidate_gate_pause();
 
         // Earlier versions recorded an exhausted provider outage as a RoundCap.
         // Recover only the narrow, durable review-only shape before the normal
@@ -310,7 +312,14 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
 
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
-                if attempt.pause_kind == Some(PauseKind::RoundCap) {
+                if candidate_gate_pause {
+                    reopen_candidate_gate_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                } else if attempt.pause_kind == Some(PauseKind::RoundCap) {
                     reopen_approved_round_cap_attempt(
                         config.project_root,
                         config.store,
@@ -971,6 +980,134 @@ fn reopen_resumable_attempt(
         Ok(())
     })?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CandidateGateResume {
+    Recheck,
+    PlannedWriter { task_id: String },
+}
+
+/// Recover one explicitly approved candidate-gate pause. A rejected candidate
+/// receives one new Writer task with the exact gate evidence. A blocked gate
+/// simply reopens so the host rechecks the unchanged candidate after the
+/// operator repairs its environment.
+fn reopen_candidate_gate_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<CandidateGateResume> {
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    attempt.ensure_resume_ready()?;
+    if !attempt.is_candidate_gate_pause() {
+        bail!("Attempt {attempt_id:?} is not paused at a candidate gate");
+    }
+    let latest_writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("candidate-gate pause has no completed Writer Task"))?;
+    let output = latest_writer
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("candidate-gate Writer has no candidate output"))?;
+    let gate = attempt
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| {
+            artifact.producer_id == latest_writer.id
+                && artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "candidate-gate pause has no gate evidence for {:?}",
+                latest_writer.id
+            )
+        })?;
+    let gate_path =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &gate.path)?;
+    let evidence = crate::candidate_gate::read_prior_writer_gate(&gate_path)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    if evidence.schema_version == 0
+        || evidence.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || evidence.phase != crate::candidate_gate::CandidateGatePhase::Writer
+        || evidence.candidate_commit != output.commit
+    {
+        bail!(
+            "candidate-gate evidence does not match the latest Writer candidate {}",
+            output.commit
+        );
+    }
+    if evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Passed {
+        bail!("candidate-gate pause points at passing evidence");
+    }
+
+    let latest_writer_id = latest_writer.id.clone();
+    let latest_commit = output.commit.clone();
+    let disposition = evidence.disposition;
+    let outcome = store.mutate_work_item(work_item_id, |fresh| {
+        let attempt_index = fresh
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        {
+            let current = &fresh.attempts[attempt_index];
+            current.ensure_resume_ready()?;
+            if !current.is_candidate_gate_pause() {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "the candidate-gate pause changed before recovery".to_string(),
+                });
+            }
+            let current_writer = current
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref().map(|output| (task, output)));
+            if !current_writer.is_some_and(|(task, output)| {
+                task.id == latest_writer_id && output.commit == latest_commit
+            }) || !current.artifacts.contains(&gate)
+            {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "the candidate-gate frontier changed before recovery".to_string(),
+                });
+            }
+        }
+
+        match disposition {
+            crate::candidate_gate::CandidateGateDisposition::Rejected => {
+                let task_id = fresh.add_next_write_round(attempt_id, vec![gate.clone()])?;
+                let attempt = &mut fresh.attempts[attempt_index];
+                attempt.pause_kind = None;
+                attempt.completed_at = None;
+                Ok(CandidateGateResume::PlannedWriter { task_id })
+            }
+            crate::candidate_gate::CandidateGateDisposition::Blocked => {
+                crate::work_model::reopen_attempt(&mut fresh.attempts[attempt_index]);
+                Ok(CandidateGateResume::Recheck)
+            }
+            crate::candidate_gate::CandidateGateDisposition::Passed => {
+                unreachable!("passing evidence was rejected before mutation")
+            }
+        }
+    })?;
+    Ok(outcome)
 }
 
 fn reopen_approved_round_cap_attempt(
@@ -4946,7 +5083,7 @@ fn pause_candidate_gate_before_reviews(
         0,
     );
     item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
-    item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
+    item.attempts[attempt_index].pause_kind = Some(PauseKind::CandidateGate);
     item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
     if !item.attempts[attempt_index].artifacts.contains(artifact) {
         item.attempts[attempt_index]
@@ -5010,7 +5147,7 @@ fn write_candidate_gate_handoff(
     fs::write(
         &path,
         format!(
-            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n"
+            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\nAfter resolving the reported condition, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
         ),
     )?;
     Ok(relative_path)
@@ -10579,6 +10716,223 @@ mod tests {
         assert_eq!(
             evidence.disposition,
             crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+    }
+
+    fn pause_after_second_candidate_rejection(
+        project_root: &Path,
+        store: &WorkModelStore,
+        workspace: &Path,
+    ) -> WorkAttemptRunOutcome {
+        let first = plan_after_completed_writer(
+            project_root,
+            store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+
+        fs::write(workspace.join("src/second.rs"), "pub fn second() {}\n").unwrap();
+        crate::git::run(workspace, &["add", "src/second.rs"], "stage correction").unwrap();
+        crate::git::run(
+            workspace,
+            &["commit", "-q", "-m", "Extend candidate"],
+            "commit correction",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace, &["rev-parse", "HEAD"], "read correction").unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let prior = item.attempts[0].tasks[0].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(prior.commit.clone()),
+            commit: candidate,
+            ..prior
+        });
+        store.write_work_item(&item).unwrap();
+
+        plan_after_completed_writer(
+            project_root,
+            store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repeated_candidate_rejection_pauses_for_explicit_bounded_resume() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+
+        let outcome =
+            pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("the second rejection must pause")
+        };
+        let paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            paused.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert_eq!(
+            paused.attempts[0].review_state,
+            Some(AttemptReviewState::NotReviewed)
+        );
+        assert!(
+            paused.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !is_review_phase_task(task))
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("fluent queue resume work-1 --attempt attempt-1"));
+        assert!(handoff.contains("fluent attempt run work-1 attempt-1"));
+
+        let resumed =
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+        assert_eq!(
+            resumed,
+            CandidateGateResume::PlannedWriter {
+                task_id: "attempt-1-write-3".to_string()
+            }
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert!(reopened.attempts[0].pause_kind.is_none());
+        let writer = reopened.attempts[0].tasks.last().unwrap();
+        assert_eq!(writer.id, "attempt-1-write-3");
+        assert_eq!(writer.status, TaskStatus::Planned);
+        assert_eq!(writer.workspace_access.writes.len(), 1);
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+        );
+    }
+
+    #[test]
+    fn legacy_uncertain_candidate_gate_pause_normalizes_on_resume() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+        pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].pause_kind = Some(PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::PlannedWriter { .. }
+        ));
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert_eq!(resumed.attempts[0].tasks.len(), 3);
+        assert!(resumed.attempts[0].pause_kind.is_none());
+    }
+
+    #[test]
+    fn another_rejected_recovery_pauses_again_without_looping() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+        pause_after_second_candidate_rejection(project.path(), &store, workspace.path());
+        reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+
+        fs::write(workspace.path().join("src/third.rs"), "pub fn third() {}\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/third.rs"],
+            "stage resumed correction",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Extend candidate again"],
+            "commit resumed correction",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read resumed correction",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let prior = item.attempts[0].tasks[1].output.clone().unwrap();
+        let correction = item.attempts[0].tasks.last_mut().unwrap();
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            base_commit: Some(prior.commit.clone()),
+            commit: candidate,
+            ..prior
+        });
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            paused.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert_eq!(
+            paused.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            3,
+            "another Writer needs a new explicit resume"
+        );
+    }
+
+    #[test]
+    fn blocked_candidate_gate_rechecks_without_planning_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "pub fn value() {}\n",
+            Some("#!/bin/sh\nprintf dirty > hook-output.txt\n"),
+        );
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        assert_eq!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::Recheck
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            reopened.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
         );
     }
 

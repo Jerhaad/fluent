@@ -3439,18 +3439,38 @@ fn writer_coder_session<'a>(
     item.attempts
         .iter()
         .find(|attempt| attempt.id == attempt_id)
-        .and_then(|attempt| attempt.writer_runs.last())
-        .filter(|run| {
-            matches!(
-                run.outcome,
-                crate::work_model::WriterOutcome::Complete
-                    | crate::work_model::WriterOutcome::Continue
-            ) && run.provider == coder_kind.as_str()
-        })
+        .and_then(|attempt| resumable_writer_run(attempt, coder_kind))
         .and_then(|run| run.session_id.as_deref())
         .filter(|session_id| !session_id.trim().is_empty())
         .map(crate::coder::CoderSession::Resume)
         .unwrap_or(crate::coder::CoderSession::FreshPersistent)
+}
+
+fn resumable_writer_run(
+    attempt: &crate::work_model::Attempt,
+    coder_kind: CoderKind,
+) -> Option<&crate::work_model::WriterRun> {
+    let run = attempt.writer_runs.last()?;
+    let candidate_gate_correction = run.outcome == crate::work_model::WriterOutcome::Blocked
+        && attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Planned)
+            .is_some_and(|task| {
+                task.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id == run.task_id
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                })
+            });
+    (run.provider == coder_kind.as_str()
+        && (matches!(
+            run.outcome,
+            crate::work_model::WriterOutcome::Complete | crate::work_model::WriterOutcome::Continue
+        ) || candidate_gate_correction))
+        .then_some(run)
 }
 
 fn writer_coder_session_with_codex_snapshot<'a>(
@@ -3478,15 +3498,10 @@ fn previous_writer_codex_session_snapshot(
     else {
         return Ok(None);
     };
-    let Some(run) = attempt.writer_runs.last().filter(|run| {
-        matches!(
-            run.outcome,
-            crate::work_model::WriterOutcome::Complete | crate::work_model::WriterOutcome::Continue
-        ) && run.provider == CoderKind::Codex.as_str()
-            && run
-                .session_id
-                .as_deref()
-                .is_some_and(|id| !id.trim().is_empty())
+    let Some(run) = resumable_writer_run(attempt, CoderKind::Codex).filter(|run| {
+        run.session_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
     }) else {
         return Ok(None);
     };
@@ -8546,6 +8561,52 @@ mod tests {
                 completed_matrix: 1,
                 candidate_commit: "commit-1".to_string(),
             });
+
+        assert_eq!(
+            writer_coder_session(&item, "attempt-1", CoderKind::Codex),
+            crate::coder::CoderSession::Resume("writer-thread-1")
+        );
+    }
+
+    #[test]
+    fn candidate_gate_correction_resumes_the_blocked_writer_session() {
+        let mut item = WorkItem {
+            id: "work-1".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "commit-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-1".to_string(),
+                outcome: crate::work_model::WriterOutcome::Blocked,
+                kind: crate::work_model::WriterRunKind::PreReviewContinuation,
+                provider: "codex".to_string(),
+                session_id: Some("writer-thread-1".to_string()),
+                continuation: 1,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: "commit-1".to_string(),
+            });
+        item.add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "attempt-1-write-1".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+            }],
+        )
+        .unwrap();
 
         assert_eq!(
             writer_coder_session(&item, "attempt-1", CoderKind::Codex),

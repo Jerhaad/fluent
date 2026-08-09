@@ -104,12 +104,20 @@ case "\$PWD" in
       mkdir -p documentation
       output_path="documentation/loop-output-\$count.txt"
     fi
-    if [ "${write_mode}" = "bad-whitespace" ]; then
+    if [ "${write_mode}" = "repair-whitespace" ]; then
+      for path in loop-output-*.txt; do
+        number="\${path#loop-output-}"
+        number="\${number%.txt}"
+        printf 'loop output %s\n' "\$number" > "\$path"
+        git add "\$path"
+      done
+    elif [ "${write_mode}" = "bad-whitespace" ]; then
       printf 'loop output %s    \n' "\$count" > "\$output_path"
+      git add "\$output_path"
     else
       printf 'loop output %s\n' "\$count" > "\$output_path"
+      git add "\$output_path"
     fi
-    git add "\$output_path"
     git commit -m "Add loop output \$count" > /dev/null 2>&1
     matrix_path="\$(printf '%s' "\$*" | grep -oE '/[^[:space:]]*writer-completion\.json' | head -1 || true)"
     if [ -n "\$matrix_path" ] && [ -f "\$matrix_path" ] && [ "${matrix_mode}" = "complete" ]; then
@@ -436,7 +444,33 @@ test_candidate_gate_blocks_review_and_final_tester() {
   [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "tester")] | length')" = "0" ] || RESULT=1
   [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "write")] | length')" = "2" ] || RESULT=1
   [ "$(json_value '.attempts[0].writer_runs[-1].outcome')" = "blocked" ] || RESULT=1
+  [ "$(json_value '.attempts[0].pause_kind')" = "candidate-gate" ] || RESULT=1
   [ -f .fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-2/candidate-gate.json ] || RESULT=1
+  return $RESULT
+}
+
+test_candidate_gate_resume_runs_one_correction() {
+  setup_test_project
+  trap cleanup_test_project RETURN
+  write_mock_claude pass bad-whitespace
+
+  RESULT=0
+  run_attempt_loop > "$TEST_DIR/paused-stdout" || RESULT=1
+  [ "$(json_value '.attempts[0].status')" = "needs-user" ] || RESULT=1
+  [ "$(json_value '.attempts[0].pause_kind')" = "candidate-gate" ] || RESULT=1
+  [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "write")] | length')" = "2" ] || RESULT=1
+  assert_contains "$(cat .fluent/work/artifacts/work-1/attempt-1/candidate-gate-needs-user.md)" \
+    "fluent queue resume work-1 --attempt attempt-1" || RESULT=1
+
+  write_mock_claude pass repair-whitespace
+  run_attempt_loop > "$TEST_DIR/resumed-stdout" || RESULT=1
+  assert_contains "$(cat "$TEST_DIR/resumed-stdout")" \
+    "Completed Task attempt-1-write-3" || RESULT=1
+  assert_contains "$(cat "$TEST_DIR/resumed-stdout")" \
+    "Merge Candidate attempt-1-merge-candidate is ready" || RESULT=1
+  [ "$(json_value '.attempts[0].status')" = "complete" ] || RESULT=1
+  [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "write")] | length')" = "3" ] || RESULT=1
+  [ "$(json_value '.merge_candidates | length')" = "1" ] || RESULT=1
   return $RESULT
 }
 
@@ -496,6 +530,7 @@ run_test "attempt loop marks missing verdict needs-user" test_attempt_loop_marks
 run_test "attempt loop stops after Task executor failure" test_attempt_loop_stops_after_task_executor_failure
 run_test "completion matrix blocks review and final Tester" test_completion_matrix_blocks_review_and_final_tester
 run_test "candidate gate blocks review and final Tester" test_candidate_gate_blocks_review_and_final_tester
+run_test "candidate gate resumes one explicit correction" test_candidate_gate_resume_runs_one_correction
 run_test "completion matrix admits review and final Tester" test_completion_matrix_admits_review_and_final_tester
 run_test "attempt loop preserves invalid state and completes Learning" test_attempt_loop_invalid_request_preserves_state_and_completes_learning
 

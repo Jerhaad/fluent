@@ -25,6 +25,12 @@ stale bound id from impersonating human authorization. Tests must prove the
 public command, preserved history, exact binding, no extra Attempt, restart,
 another `needs-user` outcome, and fail-closed mismatch cases.
 
+Apply the same boundary to a `candidate-gate` pause. When gate evidence says
+the candidate was rejected, one explicit resume may plan one corrective Writer
+on the same workspace and provider session. When the gate was blocked by the
+host environment, resume rechecks the unchanged candidate instead. If either
+path reaches `needs-user` again, require another explicit resume dispatch.
+
 Related: [[needs-user-not-terminal-for-cleanup]],
 [[next-action-guidance-is-an-executable-interface]],
 [[backward-compatible-serde-fields]], [[route-tests-drive-real-launch-wiring]]

@@ -135,6 +135,9 @@ pub fn after_attempt_run(
             Some(PauseKind::TranscriptPump) => Some(format!(
                 "\n→ Next: fix the transcript/console transport (see {handoff_path}), then fluent attempt run <work-item-id> to retry"
             )),
+            Some(PauseKind::CandidateGate) => Some(format!(
+                "\n→ Next: read the candidate-gate handoff {handoff_path}, then run fluent queue resume {work_item_id} --attempt <attempt-id> and fluent scheduler run; use fluent attempt run {work_item_id} <attempt-id> for foreground recovery"
+            )),
             _ => Some(format!(
                 "\n→ Next: read the handoff {handoff_path}, then fluent attempt run <work-item-id>"
             )),
@@ -335,6 +338,22 @@ mod tests {
         assert!(hint.contains("handoff"));
         assert!(hint.contains("needs-user.md"));
         assert!(hint.contains("attempt run"));
+    }
+
+    #[test]
+    fn candidate_gate_guidance_names_scheduler_and_foreground_recovery() {
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gate-needs-user.md"
+                .to_string(),
+        };
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::CandidateGate),
+            ..AttemptRunContext::default()
+        };
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+        assert!(hint.contains("fluent queue resume work-1 --attempt <attempt-id>"));
+        assert!(hint.contains("fluent scheduler run"));
+        assert!(hint.contains("fluent attempt run work-1 <attempt-id>"));
     }
 
     #[test]
