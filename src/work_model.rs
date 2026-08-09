@@ -3651,22 +3651,25 @@ impl Attempt {
             attempt_id: self.id.clone(),
             reason,
         };
+        let failed_candidate_gate_correction = self.is_failed_candidate_gate_correction();
 
-        if self.status != AttemptStatus::NeedsUser {
+        if self.status != AttemptStatus::NeedsUser && !failed_candidate_gate_correction {
             return Err(ineligible(format!(
                 "Attempt is {} and is not paused at needs-user",
                 self.status.as_str()
             )));
         }
-        if self
-            .tasks
-            .iter()
-            .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Executing))
-        {
+        if self.tasks.iter().any(|task| {
+            task.status == TaskStatus::Executing
+                || (task.status == TaskStatus::Failed && !failed_candidate_gate_correction)
+        }) {
             return Err(ineligible(
                 "Attempt paused on recoverable infrastructure or completion evidence but also has a hard-failed or still-running Task; resolve it before re-running."
                     .to_string(),
             ));
+        }
+        if failed_candidate_gate_correction {
+            return Ok(());
         }
 
         match self.pause_kind.as_ref() {
@@ -3723,7 +3726,45 @@ impl Attempt {
     }
 
     pub(crate) fn is_candidate_gate_pause(&self) -> bool {
-        self.pause_kind == Some(PauseKind::CandidateGate) || self.is_legacy_candidate_gate_pause()
+        self.pause_kind == Some(PauseKind::CandidateGate)
+            || self.is_legacy_candidate_gate_pause()
+            || self.is_failed_candidate_gate_correction()
+    }
+
+    /// Return whether an older binary hard-failed the exact corrective Writer
+    /// that a candidate-gate resume had planned. This narrow shape is safe to
+    /// retry because the Task has no output, is the final Task, and still names
+    /// the rejected gate produced by an earlier completed Writer.
+    pub(crate) fn is_failed_candidate_gate_correction(&self) -> bool {
+        if self.status != AttemptStatus::Failed
+            || self.pause_kind.is_some()
+            || self.review_state != Some(AttemptReviewState::Failed)
+        {
+            return false;
+        }
+        let Some(failed) = self.tasks.last() else {
+            return false;
+        };
+        self.tasks[..self.tasks.len() - 1].iter().all(|task| {
+            !matches!(
+                task.status,
+                TaskStatus::Failed | TaskStatus::Executing | TaskStatus::NeedsUser
+            )
+        }) && failed.kind == TaskKind::Write
+            && failed.status == TaskStatus::Failed
+            && failed.output.is_none()
+            && failed.input_artifacts.iter().any(|artifact| {
+                artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                    && self.artifacts.contains(artifact)
+                    && self.tasks.iter().any(|task| {
+                        task.id == artifact.producer_id
+                            && task.kind == TaskKind::Write
+                            && task.status == TaskStatus::Complete
+                            && task.output.is_some()
+                    })
+            })
     }
 
     fn is_legacy_candidate_gate_pause(&self) -> bool {
@@ -12656,6 +12697,46 @@ random banner prose that must be ignored
 
         attempt.review_state = Some(AttemptReviewState::Uncertain);
         assert!(!attempt.is_candidate_gate_pause());
+        assert!(attempt.ensure_resume_ready().is_err());
+    }
+
+    #[test]
+    fn failed_candidate_gate_correction_is_narrowly_resumable() {
+        let mut item = WorkItem::planned("work-1", "Retry failed gate correction");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let first = &mut item.attempts[0].tasks[0];
+        first.status = TaskStatus::Complete;
+        first.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "attempt-1-write-1".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+            }],
+        )
+        .unwrap();
+        let gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+        item.attempts[0].artifacts.push(gate);
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::Failed;
+        attempt.pause_kind = None;
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.tasks[1].status = TaskStatus::Failed;
+
+        assert!(attempt.is_failed_candidate_gate_correction());
+        assert!(attempt.is_candidate_gate_pause());
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.tasks[1].input_artifacts.clear();
+        assert!(!attempt.is_failed_candidate_gate_correction());
         assert!(attempt.ensure_resume_ready().is_err());
     }
 

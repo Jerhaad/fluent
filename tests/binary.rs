@@ -15881,9 +15881,16 @@ fn work_task_run_rejects_success_without_commits() {
         .stderr(predicate::str::contains("no committed Task output"));
 
     let value = read_work_show_json(&main_dir, "work-1");
-    assert_eq!(value["attempts"][0]["status"], "failed");
-    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "failed");
+    assert_eq!(value["attempts"][0]["status"], "needs-user");
+    assert_eq!(value["attempts"][0]["pause_kind"], "writer-completion");
+    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "needs-user");
     assert!(value["attempts"][0]["tasks"][0].get("output").is_none());
+    let handoff = fs::read_to_string(
+        main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user-attempt-1-write-1.md"),
+    )
+    .unwrap();
+    assert!(handoff.contains("no committed Task output"));
+    assert!(handoff.contains("resume this same Attempt"));
 }
 
 fn plan_followup_writer(main_dir: &Path) {
@@ -16356,8 +16363,16 @@ exit 0
         .stderr(predicate::str::contains("no committed Task output"));
 
     let value = read_work_show_json(&main_dir, "work-1");
-    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "failed");
+    assert_eq!(value["attempts"][0]["status"], "needs-user");
+    assert_eq!(value["attempts"][0]["pause_kind"], "writer-completion");
+    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "needs-user");
     assert!(value["attempts"][0]["tasks"][0].get("output").is_none());
+    let handoff = fs::read_to_string(
+        main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user-attempt-1-write-1.md"),
+    )
+    .unwrap();
+    assert!(handoff.contains("no committed Task output"));
+    assert!(handoff.contains("resume this same Attempt"));
 }
 
 #[test]
@@ -16438,8 +16453,20 @@ fn followup_writer_rejects_missing_or_invalid_no_change_declaration() {
             .iter()
             .find(|task| task["id"] == "attempt-1-write-2")
             .unwrap();
-        assert_eq!(writer["status"], "failed", "case {case}");
+        assert_eq!(value["attempts"][0]["status"], "needs-user", "case {case}");
+        assert_eq!(
+            value["attempts"][0]["pause_kind"], "writer-completion",
+            "case {case}"
+        );
+        assert_eq!(writer["status"], "needs-user", "case {case}");
         assert!(writer.get("output").is_none(), "case {case}");
+        let handoff = fs::read_to_string(
+            main_dir
+                .join(".fluent/work/artifacts/work-1/attempt-1/needs-user-attempt-1-write-2.md"),
+        )
+        .unwrap();
+        assert!(handoff.contains("no-change"), "case {case}");
+        assert!(handoff.contains("resume this same Attempt"), "case {case}");
     }
 }
 
@@ -16657,9 +16684,16 @@ fn work_task_run_rejects_reused_workspace_without_new_commit() {
         .stderr(predicate::str::contains("no committed Task output"));
 
     let value = read_work_show_json(&main_dir, "work-1");
-    assert_eq!(value["attempts"][0]["status"], "failed");
-    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "failed");
+    assert_eq!(value["attempts"][0]["status"], "needs-user");
+    assert_eq!(value["attempts"][0]["pause_kind"], "writer-completion");
+    assert_eq!(value["attempts"][0]["tasks"][0]["status"], "needs-user");
     assert!(value["attempts"][0]["tasks"][0].get("output").is_none());
+    let handoff = fs::read_to_string(
+        main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user-attempt-1-write-1.md"),
+    )
+    .unwrap();
+    assert!(handoff.contains("no committed Task output"));
+    assert!(handoff.contains("resume this same Attempt"));
 }
 
 #[test]

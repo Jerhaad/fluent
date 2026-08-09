@@ -665,6 +665,9 @@ fn action_label_with_liveness(
     }
 
     if let Some(attempt) = attempt {
+        if attempt.is_failed_candidate_gate_correction() {
+            return "needs-user";
+        }
         if attempt.status == AttemptStatus::NeedsUser
             && attempt.evidence_recoveries.last().is_some_and(|recovery| {
                 recovery.state == crate::work_model::EvidenceRecoveryState::NeedsEvidence
@@ -804,8 +807,8 @@ fn merge_status_label(status: &MergeCandidateMergeStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::work_model::{
-        AttemptLearning, LearningFailureKind, MergeCandidateMergeState, TaskOutput, WorkItem,
-        WorkspaceAccess, WorkspaceRef,
+        ArtifactRef, AttemptLearning, LearningFailureKind, MergeCandidateMergeState, TaskOutput,
+        WorkItem, WorkspaceAccess, WorkspaceRef,
     };
 
     fn passed_attempt_with_candidate(learning: Option<AttemptLearning>) -> (WorkItem, String) {
@@ -1338,6 +1341,46 @@ mod tests {
         attempt.status = AttemptStatus::NeedsUser;
         attempt.pause_kind = Some(crate::work_model::PauseKind::CandidateGate);
         attempt.review_state = Some(AttemptReviewState::NotReviewed);
+
+        let row = summarize_work_item(&item, None);
+
+        assert_eq!(row.action, "needs-user");
+        assert_eq!(
+            row.next_action.as_deref(),
+            Some("fluent queue resume work-1 --attempt attempt-1")
+        );
+    }
+
+    #[test]
+    fn failed_candidate_gate_correction_reports_needs_user_recovery() {
+        let mut item = WorkItem::planned("work-1", "Retry failed candidate correction");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let first = &mut item.attempts[0].tasks[0];
+        first.status = TaskStatus::Complete;
+        first.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "attempt-1-write-1".to_string(),
+                path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+            }],
+        )
+        .unwrap();
+        let gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+        item.attempts[0].artifacts.push(gate);
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::Failed;
+        attempt.pause_kind = None;
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.tasks[1].status = TaskStatus::Failed;
 
         let row = summarize_work_item(&item, None);
 

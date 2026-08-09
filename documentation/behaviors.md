@@ -1166,7 +1166,10 @@ IF the write Task coder exits successfully but the writable workspace has
 no committed Task output produced by that run and does not qualify as a verified
 follow-up no-change output,
 THEN THE SYSTEM SHALL leave the Task incomplete and report that there is
-no committed Task output or name the valid declaration required. Initial
+no committed Task output or name the valid declaration required. The Task and
+Attempt SHALL pause at a resumable Writer-completion boundary when the clean
+workspace has no committed output and completion fails on missing or invalid
+no-change evidence, so one explicit resume retries that same Task. Initial
 Writers, malformed or empty declarations, stale retry declarations, dirty
 workspaces, and HEADs that differ from the previous completed Writer commit do
 not qualify. A persisted no-change output whose verified and current commits
@@ -1182,6 +1185,7 @@ Test: tests/binary.rs (followup_writer_clears_stale_no_change_declaration_before
 Test: tests/binary.rs (corrective_writer_commit_ignores_no_change_declaration)
 Test: tests/behaviors/operations/test-work-task-run.sh (success without new commit fails with guidance)
 Test: src/work_model.rs (no_change_commit_divergence_requires_successful_capture_learning)
+Test: src/work_task_executor.rs (invalid_writer_completion_evidence_pauses_the_same_task)
 
 ### B53
 
@@ -5730,9 +5734,12 @@ Test: src/candidate_gate.rs (a_project_check_that_mutates_the_candidate_blocks_a
 ### B30
 
 IF a Writer candidate fails deterministic checks, THEN THE SYSTEM SHALL return
-the structured gate evidence to one corrective Writer without planning a
-reviewer or final Tester.
+the structured gate evidence as current findings to one corrective Writer
+without planning a reviewer or final Tester. The findings SHALL remain
+available when the artifact's absolute path is too long to include in full or
+the Writer cannot enumerate its parent directory.
 Test: src/work_attempt_loop.rs (deterministic_candidate_failure_returns_to_writer_before_review)
+Test: src/work_task_executor.rs (execution_context_surfaces_candidate_gate_diagnostics_from_long_paths)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (candidate gate blocks review and final Tester)
 
 ### B31
@@ -5744,6 +5751,17 @@ Test: src/work_attempt_loop.rs (invalid_project_check_pauses_without_reviewer_or
 Test: src/candidate_gate.rs (malformed_prior_gate_blocks_history_rewrite)
 Test: src/candidate_gate.rs (blocks_non_ancestor_candidate_without_prior_gate)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (candidate gate blocks review and final Tester)
+
+### B31a
+
+WHEN the user explicitly resumes a repeated rejected candidate gate, THE SYSTEM
+SHALL preserve the same Attempt, candidate workspace, and provider session and
+admit exactly one more corrective Writer. IF an older binary hard-failed that
+already-planned corrective Writer before it produced output, THE SYSTEM SHALL
+replan that same Task only when its attached gate evidence still belongs to an
+earlier completed Writer; every other failed Attempt remains terminal.
+Test: src/work_attempt_loop.rs (failed_candidate_gate_correction_retries_the_same_writer_task)
+Test: src/queue.rs (resume_accepts_legacy_failed_candidate_gate_correction_dispatch)
 
 ### B32
 

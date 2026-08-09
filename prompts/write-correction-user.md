@@ -36,8 +36,20 @@ operator's Cargo home or rerun the complete configured suite. Fluent owns the on
 
 Create a candidate commit for each real correction and leave the workspace clean. If focused
 verification proves no candidate change is needed, write
-{{no_change_declaration_path}} with schema version 1, a non-empty `reason`, and a non-empty
-`verification` array whose entries each contain a non-empty `command` and `result: "pass"`.
+{{no_change_declaration_path}} with this exact shape:
+
+```json
+{
+  "schema_version": 1,
+  "reason": "Why no correction was necessary",
+  "verification": [
+    {"command": "the command you ran", "result": "pass"}
+  ]
+}
+```
+
+Keep `reason` and every `command` non-empty, and include at least one passing
+`verification` entry.
 Do not use that declaration after changing the candidate.
 {{#if has_writer_completion_matrix}}
 Update mutable progress sections and the completion matrix only with concrete passing evidence.

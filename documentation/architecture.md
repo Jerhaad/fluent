@@ -160,7 +160,12 @@ must leave the workspace clean at that exact commit and write a fresh
 one or more passing command entries. Fluent removes only that declaration before
 each coder launch, including retries, so evidence from an earlier launch cannot
 authorize completion. Initial Writers and follow-up Writers without valid fresh
-evidence still require a new commit.
+evidence still require a new commit. When a successful coder run has neither a
+commit nor valid fresh no-change evidence, Fluent pauses the same Writer Task at
+the Writer-completion boundary when the workspace is clean, and writes the
+validation diagnostic into its needs-user handoff. Explicit recovery replans
+that Task instead of converting
+the evidence error into a terminal Attempt.
 
 `TaskOutput.commit` names the current candidate for both paths, while
 `TaskOutput.base_commit` keeps the commit a no-change Writer verified. Those
@@ -234,8 +239,16 @@ approved behavior references against committed test files and native test
 identifiers. It stores the results under the Attempt's `candidate-gates/`
 artifacts, separate from the Writer's private artifact directory. A first
 candidate defect becomes the sole input to one
-corrective Writer; a repeated rejection pauses. Unreadable Git or Tester evidence
-and a mutating check hook pause immediately.
+corrective Writer. Failed check diagnostics are also promoted into the
+Writer's authoritative current findings, so the correction does not depend on
+enumerating the gate artifact's parent directory or retaining an unbounded path
+in the context index. A repeated rejection pauses. Explicit recovery preserves
+the Attempt, workspace, and provider session while admitting one correction at
+a time. It also narrowly repairs an older binary's terminal failed-correction
+shape by replanning only the same output-free Writer whose attached gate was
+produced by an earlier completed Writer; unrelated failed Attempts stay
+terminal. Unreadable Git or Tester evidence and a mutating check hook pause
+immediately.
 
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a

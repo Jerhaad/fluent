@@ -407,7 +407,7 @@ pub fn add(project_root: &Path, id: &str, priority: Option<i64>) -> Result<()> {
     Ok(())
 }
 
-/// Explicitly authorize the scheduler to resume one exact needs-user Attempt.
+/// Explicitly authorize the scheduler to resume one exact suspended Attempt.
 ///
 /// A new resume dispatch preserves the earlier terminal dispatch as history
 /// and carries both the authorization intent and Attempt binding before any
@@ -425,6 +425,11 @@ pub fn resume(
     let store = WorkModelStore::new(project_root);
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
+    let failed_candidate_gate_correction = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(crate::work_model::Attempt::is_failed_candidate_gate_correction);
 
     let _lock = lock_queue(project_root)?;
     let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
@@ -450,9 +455,11 @@ pub fn resume(
 
     let resume_of_dispatch_id = match ledger.latest() {
         Some(previous) => {
-            if previous.status != DispatchStatus::NeedsUser {
+            if previous.status != DispatchStatus::NeedsUser
+                && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
+            {
                 bail!(
-                    "Work Item {id:?} latest dispatch {:?} is {}, not needs-user",
+                    "Work Item {id:?} latest dispatch {:?} is {}, not a resumable suspension",
                     previous.dispatch_id,
                     previous.status
                 );
@@ -463,7 +470,7 @@ pub fn resume(
                 .is_some_and(|bound| bound != attempt_id)
             {
                 bail!(
-                    "Work Item {id:?} latest needs-user dispatch is bound to Attempt {:?}, not {attempt_id:?}",
+                    "Work Item {id:?} latest resumable dispatch is bound to Attempt {:?}, not {attempt_id:?}",
                     previous.bound_attempt_id.as_deref().unwrap_or_default()
                 );
             }
@@ -917,7 +924,7 @@ fn with_matching_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work_model::{ArtifactRef, AttemptReviewState, PauseKind, TaskStatus};
+    use crate::work_model::{ArtifactRef, AttemptReviewState, PauseKind, TaskOutput, TaskStatus};
 
     fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
@@ -1126,6 +1133,62 @@ mod tests {
                 DispatchIntent::ResumeAttempt
             );
         }
+    }
+
+    #[test]
+    fn resume_accepts_legacy_failed_candidate_gate_correction_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-1", "Retry gate correction");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let first = &mut item.attempts[0].tasks[0];
+        first.status = TaskStatus::Complete;
+        first.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "attempt-1-write-1".to_string(),
+                path: ".fluent/work/artifacts/wi-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json".to_string(),
+            }],
+        )
+        .unwrap();
+        let gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+        item.attempts[0].artifacts.push(gate);
+        store.create_work_item(&item).unwrap();
+        add(dir.path(), "wi-1", Some(0)).unwrap();
+        claim(dir.path(), "wi-1", "attempt-1").unwrap().unwrap();
+        store
+            .mutate_work_item("wi-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::Failed;
+                attempt.pause_kind = None;
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                attempt.tasks[1].status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+        reconcile_active(dir.path(), "wi-1", DispatchStatus::Failed).unwrap();
+
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::Failed);
+        assert_eq!(
+            ledger.active().unwrap().resume_of_dispatch_id.as_deref(),
+            Some("dispatch-1")
+        );
     }
 
     #[test]

@@ -906,11 +906,14 @@ fn run_write_task_with_coder(
         match validate_followup_no_change(&config, &workspace_path) {
             Ok(no_change) => Some(no_change),
             Err(error) => {
-                mark_task_failed(
+                mark_task_failed_attempt_needs_user(
                     config.store,
+                    config.project_root,
                     config.work_item_id,
                     config.attempt_id,
                     config.task_id,
+                    &TaskFailure::WriterCompletion(error.to_string()),
+                    &crate::notify::notify,
                 )?;
                 return Err(error);
             }
@@ -2402,6 +2405,10 @@ enum TaskFailure {
     HostSandbox(String),
     /// Tester configuration, sandbox, extraction, or result persistence failed.
     TesterHarness,
+    /// The Writer returned without a commit and its required no-change evidence
+    /// was missing or malformed. Resume retries the same Writer Task after the
+    /// operator inspects the completion failure.
+    WriterCompletion(String),
     ProviderUnavailable(String),
     /// Any other persistent failure (generic coder error at the retry cap, a
     /// tester error, and the like).
@@ -2521,7 +2528,8 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::Auth(_)
             | TaskFailure::TranscriptPump(_)
             | TaskFailure::HostSandbox(_)
-            | TaskFailure::TesterHarness => TaskStatus::NeedsUser,
+            | TaskFailure::TesterHarness
+            | TaskFailure::WriterCompletion(_) => TaskStatus::NeedsUser,
             TaskFailure::ProviderUnavailable(_) => TaskStatus::NeedsUser,
             TaskFailure::Generic => TaskStatus::Failed,
         };
@@ -2534,6 +2542,7 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::TranscriptPump(_) => crate::work_model::PauseKind::TranscriptPump,
             TaskFailure::HostSandbox(_) => crate::work_model::PauseKind::HostSandbox,
             TaskFailure::TesterHarness => crate::work_model::PauseKind::TesterHarness,
+            TaskFailure::WriterCompletion(_) => crate::work_model::PauseKind::WriterCompletion,
             TaskFailure::ProviderUnavailable(_) => {
                 crate::work_model::PauseKind::ProviderUnavailable
             }
@@ -2564,6 +2573,10 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::TesterHarness => notify_fn(
                 "Fluent",
                 "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
+            ),
+            TaskFailure::WriterCompletion(_) => notify_fn(
+                "Fluent",
+                "Writer completion evidence is missing or invalid. Inspect the handoff, then resume the same Writer Task.",
             ),
             TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
             TaskFailure::Generic => {}
@@ -2670,6 +2683,9 @@ fn write_task_error_handoff(
         ),
         TaskFailure::TesterHarness => format!(
             "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Repair the Tester configuration, extractor, sandbox, or result persistence, then retry this Attempt.\n"
+        ),
+        TaskFailure::WriterCompletion(diagnostic) => format!(
+            "# Writer completion needs repair\n\nWriter Task {task_id:?} returned without a commit, but its no-change evidence was not valid:\n\n    {diagnostic}\n\nInspect the candidate and resume this same Attempt to retry the Writer Task.\n"
         ),
         TaskFailure::ProviderUnavailable(message) => format!(
             "# Provider unavailable\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
@@ -4180,6 +4196,39 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
                     title: truncate_utf8(&title, 400),
                     artifact: truncate_utf8(&path.display().to_string(), 240),
                 });
+        }
+    }
+    for path in input_artifacts.iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE)
+    }) {
+        let Ok(gate) = crate::candidate_gate::read_prior_writer_gate(path) else {
+            continue;
+        };
+        for check in gate.checks.iter().filter(|check| {
+            matches!(
+                check.status,
+                crate::candidate_gate::CandidateCheckStatus::Failed
+                    | crate::candidate_gate::CandidateCheckStatus::Error
+            )
+        }) {
+            let titles = if check.diagnostics.is_empty() {
+                vec![format!("{} candidate check did not pass", check.name)]
+            } else {
+                check.diagnostics.clone()
+            };
+            for title in titles {
+                let role = "candidate-gate".to_string();
+                let identity = crate::review::finding_identity(&role, &title);
+                findings.entry((role.clone(), identity.clone())).or_insert(
+                    ExecutionContextFinding {
+                        role: role.clone(),
+                        identity,
+                        title: truncate_utf8(&title, 400),
+                        artifact: truncate_utf8(&path.display().to_string(), 240),
+                    },
+                );
+            }
         }
     }
     findings.into_values().collect()
@@ -7460,6 +7509,42 @@ mod tests {
         assert!(handoff.contains("per-command approval"), "{handoff}");
         assert!(handoff.contains("fluent attempt run work-1"), "{handoff}");
         assert!(!handoff.contains("/login"), "{handoff}");
+    }
+
+    #[test]
+    fn invalid_writer_completion_evidence_pauses_the_same_task() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Retry Writer completion");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            &TaskFailure::WriterCompletion("no-change.json must use schema_version 1".to_string()),
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::WriterCompletion)
+        );
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        let handoff = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.producer_id == "attempt-1-write-1")
+            .unwrap();
+        let source = fs::read_to_string(tmp.path().join(&handoff.path)).unwrap();
+        assert!(source.contains("schema_version 1"));
+        assert!(stored.attempts[0].ensure_resume_ready().is_ok());
     }
 
     #[test]
@@ -13008,6 +13093,62 @@ mod tests {
     }
 
     #[test]
+    fn execution_context_surfaces_candidate_gate_diagnostics_from_long_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("artifact");
+        let gate_path = tmp
+            .path()
+            .join("candidate-gate-artifacts".repeat(4))
+            .join("attempt-artifacts".repeat(4))
+            .join(crate::candidate_gate::CANDIDATE_GATE_FILE);
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".to_string(),
+            candidate_commit: "candidate".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "behavior-references".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![
+                    "behaviors.md#b1 references missing committed test path AppTests/RateLimitTests.swift"
+                        .to_string(),
+                ],
+                log_path: None,
+            }],
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "candidate",
+            Some("base"),
+            &[],
+            std::slice::from_ref(&gate_path),
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(context.current_findings[0].role, "candidate-gate");
+        assert_eq!(
+            context.current_findings[0].title,
+            "behaviors.md#b1 references missing committed test path AppTests/RateLimitTests.swift"
+        );
+        assert!(
+            gate_path.display().to_string().len() > 240,
+            "the regression fixture must exceed the historical path limit"
+        );
+    }
+
+    #[test]
     fn execution_context_is_bounded_and_preserves_authoritative_core() {
         let tmp = tempfile::tempdir_in("target").unwrap();
         let workspace = tmp.path().join("workspace");
@@ -13842,6 +13983,7 @@ mod tests {
         assert!(prompt.contains("as JSON arrays"));
         assert!(prompt.contains("[\"none: <specific reason>\"]"));
         assert!(prompt.contains("host-owned `## Required completion` projection"));
+        assert!(prompt.contains("\"schema_version\": 1"));
         assert!(!prompt.contains(large_output_marker));
         assert!(!prompt.contains("{{"));
 
