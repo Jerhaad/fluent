@@ -165,6 +165,42 @@ Test: src/work_task_executor.rs (failed_tester_no_change_accepts_exact_attached_
 Test: src/work_task_executor.rs (failed_tester_no_change_rejects_duplicate_and_extra_artifact_paths)
 Test: src/work_task_executor.rs (failed_tester_correction_prompt_requires_digest_bound_inspection)
 
+### B4
+
+IF a corrective Writer preserves the candidate after receiving failed final
+Tester command evidence, THEN THE SYSTEM SHALL rerun only the commands whose
+prior exit codes were nonzero before launching another Reviewer.
+Test: src/work_attempt_loop.rs (unchanged_failed_tester_correction_plans_recheck_before_reviews)
+Test: src/work_task_executor.rs (failed_command_recheck_executes_only_the_bound_subset)
+
+### B5
+
+IF a failed-command recheck reports another command, structured-test, or process
+settlement failure, THEN THE SYSTEM SHALL return its durable result and relevant
+command logs directly to a corrective Writer or the existing round-cap pause.
+Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
+Test: src/work_attempt_loop.rs (repeated_failed_command_respects_existing_round_cap)
+Test: src/work_attempt_loop.rs (structured_failure_in_recheck_returns_to_writer)
+
+### B6
+
+IF a failed-command recheck fails, THEN THE SYSTEM SHALL NOT launch a
+Reviewer or any unselected Tester command.
+Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
+Test: src/work_task_executor.rs (failed_command_recheck_executes_only_the_bound_subset)
+
+### B7
+
+WHEN every selected failed-command recheck passes, THE SYSTEM SHALL continue to
+the normal Reviewer round.
+Test: src/work_attempt_loop.rs (passing_failed_command_recheck_allows_normal_reviews)
+
+### B8
+
+WHEN Reviewers pass after a failed-command recheck, THE SYSTEM SHALL run the
+complete configured final Tester before Learning.
+Test: src/work_attempt_loop.rs (reviews_after_passing_recheck_still_plan_full_final_tester)
+
 ## Persisted status accounting
 
 ### B1

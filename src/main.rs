@@ -846,6 +846,11 @@ fn cmd_attempt(
                             "Planned final canonical Tester Task {task_id} for Attempt {attempt_id}"
                         );
                     }
+                    WorkAttemptRunOutcome::PlannedFailedCommandRecheck { task_id } => {
+                        println!(
+                            "Planned failed-command Tester recheck {task_id} for Attempt {attempt_id}"
+                        );
+                    }
                     WorkAttemptRunOutcome::MergeCandidateReady { candidate_id } => {
                         println!(
                             "Attempt {attempt_id} reviews and Learner passed; Merge Candidate \

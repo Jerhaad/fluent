@@ -1835,7 +1835,19 @@ fn run_tester_task_with_settlement_preparer(
     // Parse the Tester configuration without creating a settlement directory.
     // The immutable plan crosses the reservation boundary so the later sandbox
     // grants exactly the paths authorized for this Task start.
-    let tester_plan = crate::tester::plan(&candidate_workspace)?;
+    let recheck = plan_failed_command_recheck(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        &plan.task,
+        review_context,
+        &candidate_workspace,
+    )?;
+    let tester_plan = match &recheck {
+        Some(recheck) => recheck.plan.clone(),
+        None => crate::tester::plan(&candidate_workspace)?,
+    };
 
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here.
@@ -1864,7 +1876,21 @@ fn run_tester_task_with_settlement_preparer(
         &reservation.receipt,
         || {
             fs::create_dir_all(&artifact_dir)?;
-            prepare_settlement(&artifact_dir, &tester_plan)
+            let settlement = prepare_settlement(&artifact_dir, &tester_plan)?;
+            if let Some(recheck) = &recheck {
+                let manifest = crate::tester::FailedCommandRecheckManifest {
+                    schema_version: crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION,
+                    candidate_commit: review_context.candidate_commit.clone(),
+                    source_results: recheck.source_results.clone(),
+                    failed_command_indexes: recheck.failed_command_indexes.clone(),
+                };
+                let bytes = serde_json::to_vec_pretty(&manifest)?;
+                crate::atomic_write::atomic_write(
+                    &artifact_dir.join("failed-command-recheck.json"),
+                    &bytes,
+                )?;
+            }
+            Ok(settlement)
         },
     ) {
         Ok(settlement) => settlement,
@@ -1965,12 +1991,14 @@ fn run_tester_task_with_settlement_preparer(
         return Err(error);
     }
 
-    if let Err(error) = crate::baseline_cache::record_final_tester_seed(
-        &candidate_workspace,
-        &artifact_dir,
-        config.no_sandbox,
-    ) {
-        eprintln!("  Warning: final Tester baseline seed was not recorded: {error:#}");
+    if recheck.is_none() {
+        if let Err(error) = crate::baseline_cache::record_final_tester_seed(
+            &candidate_workspace,
+            &artifact_dir,
+            config.no_sandbox,
+        ) {
+            eprintln!("  Warning: final Tester baseline seed was not recorded: {error:#}");
+        }
     }
 
     if !results_path.is_file() {
@@ -1992,6 +2020,105 @@ fn run_tester_task_with_settlement_preparer(
             Err(error)
         }
     }
+}
+
+struct FailedCommandRecheckPlan {
+    plan: crate::tester::TesterPlan,
+    source_results: String,
+    failed_command_indexes: Vec<usize>,
+}
+
+fn plan_failed_command_recheck(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task: &Task,
+    review_context: &crate::work_model::ReviewContext,
+    candidate_workspace: &Path,
+) -> Result<Option<FailedCommandRecheckPlan>> {
+    if !task.is_failed_command_recheck() {
+        return Ok(None);
+    }
+    let [source] = task.input_artifacts.as_slice() else {
+        bail!(
+            "failed-command recheck Task {:?} must attach exactly one source Tester result",
+            task.id
+        );
+    };
+    if task.depends_on.as_deref() != Some(source.producer_id.as_str())
+        || !source.path.ends_with("/tester-results.json")
+    {
+        bail!(
+            "failed-command recheck Task {:?} is not bound to its source Tester result",
+            task.id
+        );
+    }
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let source_task = attempt
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == source.producer_id)
+        .filter(|candidate| {
+            candidate.kind == TaskKind::Tester
+                && candidate.status == TaskStatus::Complete
+                && !candidate.is_failed_command_recheck()
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed-command recheck Task {:?} has no completed source Tester {:?}",
+                task.id,
+                source.producer_id
+            )
+        })?;
+    let expected_source = source_task
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    let source_candidate = source_task
+        .review_context
+        .as_ref()
+        .map(|context| context.candidate_commit.as_str());
+    if expected_source.as_deref() != Some(source.path.as_str())
+        || source_candidate != Some(review_context.candidate_commit.as_str())
+    {
+        bail!(
+            "failed-command recheck Task {:?} source Tester context does not match its candidate and result",
+            task.id
+        );
+    }
+    let source_path = resolve_input_artifact_path(project_root, &source.path)?;
+    let bytes = fs::read(&source_path).with_context(|| {
+        format!(
+            "read failed-command recheck source {}",
+            source_path.display()
+        )
+    })?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse failed-command recheck source {}",
+                source_path.display()
+            )
+        })?;
+    if results.candidate_commit.as_deref() != Some(review_context.candidate_commit.as_str()) {
+        bail!(
+            "failed-command recheck source is not bound to candidate {}",
+            review_context.candidate_commit
+        );
+    }
+    let (plan, failed_command_indexes) =
+        crate::tester::plan_failed_commands(candidate_workspace, &results)?;
+    Ok(Some(FailedCommandRecheckPlan {
+        plan,
+        source_results: source.path.clone(),
+        failed_command_indexes,
+    }))
 }
 
 /// Settle an unlaunched or failed Tester through the recoverable pause boundary.
@@ -5648,38 +5775,20 @@ fn is_correction_artifact(path: &Path) -> bool {
         name == "review.md"
             || name == "tester-results.json"
             || name == crate::candidate_gate::CANDIDATE_GATE_FILE
-    }) || is_tester_command_log(path)
-}
-
-fn is_tester_command_log(path: &Path) -> bool {
-    if !path
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "commands")
-    {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    ["-stdout.log", "-stderr.log"].iter().any(|suffix| {
-        name.strip_suffix(suffix).is_some_and(|index| {
-            !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    })
+    }) || crate::tester::is_command_log_path(path)
 }
 
 fn is_failed_tester_evidence_artifact(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
         name == "tester-results.json" || name == crate::candidate_gate::CANDIDATE_GATE_FILE
-    }) || is_tester_command_log(path)
+    }) || crate::tester::is_command_log_path(path)
 }
 
 fn required_failed_tester_inspection_inputs(task: &Task) -> Vec<&ArtifactRef> {
     if !task
         .input_artifacts
         .iter()
-        .any(|artifact| is_tester_command_log(Path::new(&artifact.path)))
+        .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
     {
         return Vec::new();
     }
@@ -11505,6 +11614,127 @@ mod tests {
         let mut item = review_item();
         item.add_final_tester_task("attempt-1").unwrap();
         item
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_command_recheck_executes_only_the_bound_subset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = WorkModelStore::new(&project_root);
+        let mut item = review_item_with_final_tester();
+        let source = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        crate::work_model::set_task_terminal(source, TaskStatus::Complete);
+        let source_id = source.id.clone();
+        let source_results = ArtifactRef {
+            producer_id: source_id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                source.artifact_area.as_ref().unwrap().path
+            ),
+        };
+        let source_dir = project_root.join(&source.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&source_dir).unwrap();
+
+        let first = tmp.path().join("first-ran");
+        let second = tmp.path().join("second-ran");
+        let third = tmp.path().join("third-ran");
+        let commands = [
+            format!("printf first > {}", first.display()),
+            format!("printf second > {}; exit 7", second.display()),
+            format!("printf third > {}", third.display()),
+        ];
+        let source_json = serde_json::json!({
+            "candidate_commit": "abc123",
+            "commands": [
+                {"command": commands[0], "test_harness": "shell", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                {"command": commands[1], "test_harness": "shell", "exit_code": 7, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"},
+                {"command": commands[2], "test_harness": "shell", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/2-stdout.log", "stderr_log": "commands/2-stderr.log"}
+            ],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(
+            source_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&source_json).unwrap(),
+        )
+        .unwrap();
+        let recheck_id = item
+            .add_failed_command_recheck_task("attempt-1", source_results)
+            .unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == recheck_id)
+            .unwrap();
+        let candidate = resolve_workspace_path(
+            &project_root,
+            &recheck
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(candidate.join(".fluent")).unwrap();
+        fs::write(
+            candidate.join(".fluent/tester.yaml"),
+            format!(
+                "commands:\n  - command: '{}'\n    test_harness: shell\n  - command: '{}'\n    test_harness: shell\n  - command: '{}'\n    test_harness: shell\n",
+                commands[0], commands[1], commands[2]
+            ),
+        )
+        .unwrap();
+        let extractor = candidate.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let resolver = ContentResolver::new(Some(&project_root));
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &recheck_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+
+        assert!(!first.exists());
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert!(!third.exists());
+        let artifact = project_root.join(work_artifact_path("work-1", "attempt-1", &recheck_id));
+        let results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(artifact.join("tester-results.json")).unwrap())
+                .unwrap();
+        assert_eq!(results.commands.len(), 1);
+        assert_eq!(results.commands[0].command, commands[1]);
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(artifact.join("failed-command-recheck.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["failed_command_indexes"], serde_json::json!([1]));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == recheck_id)
+                .unwrap()
+                .status,
+            TaskStatus::Complete
+        );
     }
 
     fn review_item_with_role(role: &str) -> WorkItem {

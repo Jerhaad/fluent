@@ -34,6 +34,13 @@ fresh no-change declaration to bind every attached gate, structured result, and
 command log by exact path and SHA-256 digest. Validate that set before launching
 reviewers, and direct the Writer to inspect candidate-owned `.fluent/tester.yaml`
 path and cache choices rather than assuming every sandbox failure is external.
+That digest proves inspection, not recovery. If the Writer preserves the
+candidate, rerun only the previously nonzero commands through the host-owned
+Tester boundary before reviewers. Bind the subset to the source result, current
+candidate, and unchanged command indexes, strings, and harnesses. Persist the
+recheck manifest, result, and logs. Route another command, structured-test, or
+process-settlement failure straight back to correction; a passing subset may
+admit review but never substitutes for the complete final Tester.
 
 When you declare a `Test:` reference, either land the backing test passing in the
 same candidate, or — if the test is intentionally dropped — remove/replace the

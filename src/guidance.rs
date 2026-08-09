@@ -150,7 +150,8 @@ pub fn after_attempt_run(
         }
         WorkAttemptRunOutcome::RanTask { .. }
         | WorkAttemptRunOutcome::PlannedReviews { .. }
-        | WorkAttemptRunOutcome::PlannedFinalTester { .. } => None,
+        | WorkAttemptRunOutcome::PlannedFinalTester { .. }
+        | WorkAttemptRunOutcome::PlannedFailedCommandRecheck { .. } => None,
     }
 }
 

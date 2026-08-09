@@ -173,6 +173,18 @@ writes the validation diagnostic into its needs-user handoff. Explicit recovery
 replans that Task instead of converting
 the evidence error into a terminal Attempt.
 
+Digest-bound inspection admits the Writer's no-change claim but does not make
+that claim independent evidence that the failed command now works. Before such
+an unchanged candidate can re-enter review, the Attempt loop plans a serial
+Tester Task with role `failed-command-recheck`. Its only input names the prior
+host-owned `tester-results.json`, and its dependency names that completed source
+Tester. The executor derives the exact nonzero command indexes from that result,
+requires the same indexes, commands, and harnesses in the candidate's current
+`.fluent/tester.yaml`, and runs only that immutable subset through the ordinary
+Tester sandbox. It persists `failed-command-recheck.json`, structured results,
+and command logs in the Task artifact area. This Task does not participate in
+the parallel review phase and does not seed the landed-baseline cache.
+
 `TaskOutput.commit` names the current candidate for both paths, while
 `TaskOutput.base_commit` keeps the commit a no-change Writer verified. Those
 identities initially match. A no-change output also stores typed `no_change`
@@ -607,6 +619,13 @@ it cannot derive at least one role, it falls back to the full Work
 reviewer set. After a completed reviewer round it interprets review
 artifacts with the review subsystem verdict parser. A failed or uncertain
 review returns directly to a Writer without spending a canonical Tester run.
+When a corrective Writer returns an accepted no-change declaration over failed
+final-Tester command evidence, Fluent first runs the failed-command recheck
+described above. Another command, structured-test, or process-settlement failure
+returns the recheck manifest, result, and relevant logs directly to the next
+Writer; the existing write-round budget decides whether to continue or pause at
+round cap. A passing subset admits the normal Reviewer round but never replaces
+the complete post-review Tester.
 When all reviews pass, Fluent plans one final Tester and checks its
 `tester-results.json` — only failures the
 Work Item introduced (tests failing now that were not failing in the

@@ -25,6 +25,18 @@ pub struct TesterResults {
     pub error: Option<TesterError>,
 }
 
+pub const FAILED_COMMAND_RECHECK_SCHEMA_VERSION: u32 = 1;
+
+/// Host-owned identity that maps one subset run back to the failed commands in
+/// its source final-Tester result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedCommandRecheckManifest {
+    pub schema_version: u32,
+    pub candidate_commit: String,
+    pub source_results: String,
+    pub failed_command_indexes: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
     pub command: String,
@@ -146,6 +158,63 @@ impl TesterSandbox {
     pub(crate) fn settlement_directory(&self, index: usize) -> Option<PathBuf> {
         self.settlement_directories.get(index).cloned().flatten()
     }
+}
+
+/// Build the immutable Tester plan for only the commands that failed in a
+/// prior final-Tester result. The current candidate configuration remains the
+/// execution authority: every selected command must still occupy the same
+/// index with the same command and harness before Fluent can recheck it.
+pub fn plan_failed_commands(
+    candidate_workspace: &Path,
+    source_results: &TesterResults,
+) -> Result<(TesterPlan, Vec<usize>)> {
+    let current = read_tester_config(&candidate_workspace.join(TESTER_YAML_PATH))?;
+    let failed_indexes = source_results
+        .commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| (command.exit_code != 0).then_some(index))
+        .collect::<Vec<_>>();
+    if failed_indexes.is_empty() {
+        anyhow::bail!("failed-command recheck source has no nonzero command exits");
+    }
+
+    let mut commands = Vec::with_capacity(failed_indexes.len());
+    for index in &failed_indexes {
+        let source = &source_results.commands[*index];
+        let configured = current.commands.get(*index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed-command recheck source index {index} is absent from current {TESTER_YAML_PATH}"
+            )
+        })?;
+        if configured.command != source.command || configured.test_harness != source.test_harness {
+            anyhow::bail!(
+                "failed-command recheck source index {index} no longer matches current {TESTER_YAML_PATH}"
+            );
+        }
+        commands.push(configured.clone());
+    }
+
+    Ok((TesterPlan { commands }, failed_indexes))
+}
+
+/// Return whether a path uses the host-owned Tester command-log spelling.
+pub(crate) fn is_command_log_path(path: &Path) -> bool {
+    if !path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "commands")
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    ["-stdout.log", "-stderr.log"].iter().any(|suffix| {
+        name.strip_suffix(suffix).is_some_and(|index| {
+            !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
 }
 
 fn tester_writable_roots(candidate: &Path, artifact: &Path, home: &Path) -> Vec<PathBuf> {
@@ -1257,6 +1326,78 @@ mod tests {
         assert!(planned.is_file());
         assert!(!changed.exists());
         assert!(sandbox.settlement_directory(0).unwrap().is_dir());
+    }
+
+    #[test]
+    fn failed_command_plan_selects_only_matching_nonzero_commands() {
+        let workspace = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: first\n    test_harness: shell\n  - command: second\n    test_harness: shell\n  - command: third\n    test_harness: cargo\n",
+        );
+        let source = TesterResults {
+            candidate_commit: Some("candidate".to_string()),
+            commands: vec![
+                command_result("first", "shell", 0),
+                command_result("second", "shell", 65),
+                command_result("third", "cargo", 1),
+            ],
+            tests: Vec::new(),
+            summary: Summary {
+                total: 0,
+                pass: 0,
+                fail: 0,
+                skipped: 0,
+            },
+            error: None,
+        };
+
+        let (plan, indexes) = plan_failed_commands(workspace.path(), &source).unwrap();
+
+        assert_eq!(indexes, vec![1, 2]);
+        assert_eq!(plan.commands.len(), 2);
+        assert_eq!(plan.commands[0].command, "second");
+        assert_eq!(plan.commands[1].command, "third");
+    }
+
+    #[test]
+    fn failed_command_plan_rejects_current_config_drift() {
+        let workspace = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: changed\n    test_harness: shell\n",
+        );
+        let source = TesterResults {
+            candidate_commit: Some("candidate".to_string()),
+            commands: vec![command_result("original", "shell", 1)],
+            tests: Vec::new(),
+            summary: Summary {
+                total: 0,
+                pass: 0,
+                fail: 0,
+                skipped: 0,
+            },
+            error: None,
+        };
+
+        let error = plan_failed_commands(workspace.path(), &source)
+            .expect_err("changed command must invalidate the targeted recheck");
+
+        assert!(error.to_string().contains("no longer matches"));
+    }
+
+    fn command_result(command: &str, harness: &str, exit_code: i32) -> CommandResult {
+        CommandResult {
+            command: command.to_string(),
+            test_harness: harness.to_string(),
+            exit_code,
+            duration_ms: 1,
+            stdout_log: "stdout.log".to_string(),
+            stderr_log: "stderr.log".to_string(),
+            process_settlement: None,
+        }
     }
 
     #[test]

@@ -28,6 +28,24 @@ pub const WORK_PROGRESS_DIR: &str = ".fluent/work/progress";
 pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
+pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
+
+fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
+    let source = Path::new(path);
+    if source.as_os_str().is_empty() || source.is_absolute() {
+        return false;
+    }
+    let mut rebuilt = PathBuf::new();
+    for component in source.components() {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        rebuilt.push(part);
+    }
+    rebuilt.as_os_str() == source.as_os_str()
+        && rebuilt.starts_with(WORK_ARTIFACTS_DIR)
+        && rebuilt.file_name().is_some_and(|name| name == filename)
+}
 
 pub fn work_item_input_path(work_item_id: &str, index: usize, filename: &str) -> String {
     format!("{WORK_ARTIFACTS_DIR}/{work_item_id}/inputs/{index:04}-{filename}")
@@ -1131,6 +1149,84 @@ impl WorkItem {
         attempt.review_state = Some(AttemptReviewState::NotReviewed);
         self.validate()?;
         Ok(tester_id)
+    }
+
+    /// Plan a serial host-owned Tester that reruns only the failed commands
+    /// named by one prior final-Tester result. The executor derives and validates
+    /// the exact command indexes from the attached structured result.
+    pub fn add_failed_command_recheck_task(
+        &mut self,
+        attempt_id: &str,
+        source_results: ArtifactRef,
+    ) -> Result<String, WorkModelError> {
+        self.ensure_not_abandoned()?;
+        let Some(attempt) = self
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Err(WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            });
+        };
+        let Some(write_output) = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .cloned()
+        else {
+            return Err(WorkModelError::AttemptMissingCompletedWriteTask {
+                attempt_id: attempt_id.to_string(),
+            });
+        };
+        let sequence = attempt
+            .tasks
+            .iter()
+            .filter(|task| task.is_failed_command_recheck())
+            .count()
+            + 1;
+        let task_id = format!("{attempt_id}-tester-recheck-{sequence}");
+        validate_id("task", &task_id)?;
+        if attempt.tasks.iter().any(|task| task.id == task_id) {
+            return Err(WorkModelError::TaskAlreadyExists { id: task_id });
+        }
+        let candidate = WorkspaceRef {
+            id: write_output.workspace_id.clone(),
+            path: write_output.workspace_path.clone(),
+        };
+        attempt.tasks.push(Task {
+            id: task_id.clone(),
+            kind: TaskKind::Tester,
+            status: TaskStatus::Planned,
+            role: FAILED_COMMAND_RECHECK_ROLE.to_string(),
+            instructions: None,
+            work_item_id: self.id.clone(),
+            attempt_id: Some(attempt_id.to_string()),
+            workspace_access: WorkspaceAccess::read_only(vec![candidate]),
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path(&self.id, attempt_id, &task_id),
+            }),
+            review_context: Some(ReviewContext {
+                candidate_workspace_id: write_output.workspace_id,
+                candidate_workspace_path: write_output.workspace_path,
+                source_branch: write_output.source_branch,
+                candidate_commit: write_output.commit,
+                base_commit: None,
+            }),
+            evidence_review_context: None,
+            input_artifacts: vec![source_results.clone()],
+            depends_on: Some(source_results.producer_id),
+            output: None,
+            created_at: Some(now_iso8601()),
+            started_at: None,
+            completed_at: None,
+        });
+        attempt.status = AttemptStatus::Reviewing;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        self.validate()?;
+        Ok(task_id)
     }
 
     pub fn add_next_write_round(
@@ -4503,6 +4599,10 @@ pub struct EvidenceReviewContext {
 }
 
 impl Task {
+    pub fn is_failed_command_recheck(&self) -> bool {
+        self.kind == TaskKind::Tester && self.role == FAILED_COMMAND_RECHECK_ROLE
+    }
+
     pub fn validate(&self) -> Result<(), WorkModelError> {
         self.workspace_access.validate()?;
         if self.status == TaskStatus::Complete {
@@ -4586,6 +4686,32 @@ impl Task {
             });
             if !candidate_is_readable {
                 return Err(WorkModelError::ReviewTaskContextCandidateNotReadable {
+                    task_id: self.id.clone(),
+                });
+            }
+        }
+        if self.role == FAILED_COMMAND_RECHECK_ROLE {
+            let candidate_is_readable = self.review_context.as_ref().is_some_and(|context| {
+                self.workspace_access.reads.iter().any(|workspace| {
+                    workspace.id == context.candidate_workspace_id
+                        && workspace.path == context.candidate_workspace_path
+                })
+            });
+            let source_is_bound = self
+                .input_artifacts
+                .as_slice()
+                .first()
+                .is_some_and(|source| {
+                    self.input_artifacts.len() == 1
+                        && is_canonical_work_artifact_file(&source.path, "tester-results.json")
+                        && self.depends_on.as_deref() == Some(source.producer_id.as_str())
+                });
+            if self.kind != TaskKind::Tester
+                || self.artifact_area.is_none()
+                || !candidate_is_readable
+                || !source_is_bound
+            {
+                return Err(WorkModelError::InvalidFailedCommandRecheckTask {
                     task_id: self.id.clone(),
                 });
             }
@@ -5349,6 +5475,9 @@ pub enum WorkModelError {
     InvalidTaskNoChangeOutput {
         task_id: String,
     },
+    InvalidFailedCommandRecheckTask {
+        task_id: String,
+    },
     CompleteAttemptHasIncompleteTask {
         attempt_id: String,
         task_id: String,
@@ -5581,6 +5710,12 @@ impl fmt::Display for WorkModelError {
             }
             Self::InvalidTaskNoChangeOutput { task_id } => {
                 write!(f, "task {task_id} has invalid no-change output")
+            }
+            Self::InvalidFailedCommandRecheckTask { task_id } => {
+                write!(
+                    f,
+                    "task {task_id} has invalid failed-command recheck context"
+                )
             }
             Self::CompleteAttemptHasIncompleteTask {
                 attempt_id,
@@ -9302,6 +9437,68 @@ random banner prose that must be ignored
             Some("commit-initial")
         );
         assert!(tester.depends_on.is_none());
+    }
+
+    #[test]
+    fn failed_command_recheck_is_serial_and_bound_to_source_evidence() {
+        let mut work_item = work_item_with_completed_write("work-1");
+        work_item
+            .add_next_review_tasks("attempt-1", &["tests"])
+            .unwrap();
+        for task in work_item.attempts[0]
+            .tasks
+            .iter_mut()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            set_task_terminal(task, TaskStatus::Complete);
+        }
+        let source_id = work_item.add_final_tester_task("attempt-1").unwrap();
+        let source = work_item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == source_id)
+            .unwrap();
+        set_task_terminal(source, TaskStatus::Complete);
+        let source_results = ArtifactRef {
+            producer_id: source_id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                work_artifact_path("work-1", "attempt-1", &source_id)
+            ),
+        };
+
+        let recheck_id = work_item
+            .add_failed_command_recheck_task("attempt-1", source_results.clone())
+            .unwrap();
+
+        let recheck = work_item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == recheck_id)
+            .unwrap();
+        assert_eq!(recheck.role, FAILED_COMMAND_RECHECK_ROLE);
+        assert_eq!(recheck.depends_on.as_deref(), Some(source_id.as_str()));
+        assert_eq!(recheck.input_artifacts, vec![source_results]);
+        assert_eq!(
+            recheck
+                .review_context
+                .as_ref()
+                .map(|context| context.candidate_commit.as_str()),
+            Some("commit-initial")
+        );
+        assert_eq!(recheck.status, TaskStatus::Planned);
+
+        let mut malformed = work_item.clone();
+        let recheck = malformed.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == recheck_id)
+            .unwrap();
+        recheck.input_artifacts[0].path = "../tester-results.json".to_string();
+        assert!(matches!(
+            malformed.validate(),
+            Err(WorkModelError::InvalidFailedCommandRecheckTask { .. })
+        ));
     }
 
     #[test]
