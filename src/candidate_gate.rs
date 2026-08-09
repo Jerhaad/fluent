@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::work_model::{WriterCompletionContract, WriterCompletionRequirementKind};
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 2;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 3;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 
@@ -17,6 +17,7 @@ const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 #[serde(rename_all = "kebab-case")]
 pub enum CandidateGatePhase {
     Writer,
+    FinalTester,
     Learner,
 }
 
@@ -295,10 +296,12 @@ fn validate_prior_writer_gate(
             prior.schema_version
         ));
     }
-    if prior.phase != CandidateGatePhase::Writer
-        || prior.disposition != CandidateGateDisposition::Rejected
+    if !matches!(
+        prior.phase,
+        CandidateGatePhase::Writer | CandidateGatePhase::FinalTester
+    ) || prior.disposition != CandidateGateDisposition::Rejected
     {
-        return Err("prior candidate gate is not a rejected Writer gate".to_string());
+        return Err("prior candidate gate is not a rejected correction gate".to_string());
     }
     if prior.candidate_commit != expected_candidate {
         return Err(format!(
@@ -682,7 +685,7 @@ fn check_tester_evidence(
             ));
         }
     }
-    let mut diagnostics = Vec::new();
+    let mut missing_references = Vec::new();
     for reference in references {
         let matched = results.tests.iter().any(|test| {
             if test.status != "pass" {
@@ -701,7 +704,7 @@ fn check_tester_evidence(
             }
         });
         if !matched {
-            diagnostics.push(format!(
+            missing_references.push(format!(
                 "no passing Tester result matches {}",
                 reference
                     .selector
@@ -709,6 +712,30 @@ fn check_tester_evidence(
                     .unwrap_or(reference.path.as_str())
             ));
         }
+    }
+    let mut diagnostics = Vec::new();
+    if !missing_references.is_empty() {
+        let artifact_dir = path.parent().unwrap_or(path);
+        for (index, command) in results
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.exit_code != 0)
+        {
+            diagnostics.push(format!(
+                "Tester command {index} exited {}: {}",
+                command.exit_code, command.command
+            ));
+            diagnostics.push(format!(
+                "Tester command {index} stdout log: {}",
+                artifact_dir.join(&command.stdout_log).display()
+            ));
+            diagnostics.push(format!(
+                "Tester command {index} stderr log: {}",
+                artifact_dir.join(&command.stderr_log).display()
+            ));
+        }
+        diagnostics.extend(missing_references);
     }
     let status = if diagnostics.is_empty() {
         CandidateCheckStatus::Passed
@@ -1365,6 +1392,68 @@ mod tests {
         assert_eq!(
             check(&evidence, "tester-reference-evidence").status,
             CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn missing_test_reference_reports_failed_tester_command_evidence() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/dashboard.rs",
+            "#[test]\nfn preserves_selection() {}\n",
+            "Add dashboard test",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "cargo nextest run --test dashboard",
+                "test_harness": "cargo-nextest",
+                "exit_code": 101,
+                "duration_ms": 1,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("tests/dashboard.rs (preserves_selection)");
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        let tester_check = check(&evidence, "tester-reference-evidence");
+        assert_eq!(tester_check.status, CandidateCheckStatus::Failed);
+        assert_eq!(
+            tester_check.diagnostics,
+            vec![
+                "Tester command 0 exited 101: cargo nextest run --test dashboard".to_string(),
+                format!(
+                    "Tester command 0 stdout log: {}",
+                    fixture
+                        .artifacts
+                        .path()
+                        .join("commands/0-stdout.log")
+                        .display()
+                ),
+                format!(
+                    "Tester command 0 stderr log: {}",
+                    fixture
+                        .artifacts
+                        .path()
+                        .join("commands/0-stderr.log")
+                        .display()
+                ),
+                "no passing Tester result matches preserves_selection".to_string(),
+            ]
         );
     }
 

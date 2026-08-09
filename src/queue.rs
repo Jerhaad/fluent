@@ -430,6 +430,12 @@ pub fn resume(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .is_some_and(crate::work_model::Attempt::is_failed_candidate_gate_correction);
+    let legacy_learner_tester_evidence =
+        crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+            project_root,
+            &item,
+            attempt_id,
+        )?;
 
     let _lock = lock_queue(project_root)?;
     let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
@@ -451,12 +457,23 @@ pub fn resume(
         );
     }
 
-    ensure_resume_eligible(&item, id, attempt_id)?;
+    ensure_resume_eligible(
+        project_root,
+        &item,
+        id,
+        attempt_id,
+        legacy_learner_tester_evidence,
+    )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
         Some(previous) => {
             if previous.status != DispatchStatus::NeedsUser
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
+                && !(legacy_learner_tester_evidence
+                    && matches!(
+                        previous.status,
+                        DispatchStatus::CandidateReady | DispatchStatus::Blocked
+                    ))
             {
                 bail!(
                     "Work Item {id:?} latest dispatch {:?} is {}, not a resumable suspension",
@@ -668,7 +685,13 @@ fn ensure_lifecycle_eligible(item: &WorkItem, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_resume_eligible(item: &WorkItem, id: &str, attempt_id: &str) -> Result<()> {
+fn ensure_resume_eligible(
+    project_root: &Path,
+    item: &WorkItem,
+    id: &str,
+    attempt_id: &str,
+    known_legacy_learner_tester_evidence: bool,
+) -> Result<()> {
     item.ensure_not_abandoned()?;
     item.ensure_execution_ready()?;
     let attempt = item
@@ -681,7 +704,15 @@ fn ensure_resume_eligible(item: &WorkItem, id: &str, attempt_id: &str) -> Result
             attempt.id
         );
     }
-    attempt.ensure_resume_ready()?;
+    if !known_legacy_learner_tester_evidence
+        && !crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+            project_root,
+            item,
+            attempt_id,
+        )?
+    {
+        attempt.ensure_resume_ready()?;
+    }
     Ok(())
 }
 
@@ -745,7 +776,13 @@ pub fn claim(
                     active.dispatch_id
                 );
             }
-            ensure_resume_eligible(&item, work_item_id, persisted_attempt_id)?;
+            ensure_resume_eligible(
+                project_root,
+                &item,
+                work_item_id,
+                persisted_attempt_id,
+                false,
+            )?;
         }
     }
     if let Some(persisted) = active.bound_attempt_id.as_deref() {

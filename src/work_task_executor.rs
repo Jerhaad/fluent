@@ -101,6 +101,14 @@ struct NoChangeDeclaration {
     schema_version: u32,
     reason: String,
     verification: Vec<NoChangeVerification>,
+    #[serde(default)]
+    inspected_artifacts: Vec<NoChangeInspectedArtifact>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NoChangeInspectedArtifact {
+    path: String,
+    digest: String,
 }
 
 /// A Task start lost the precedence race: a peer already took the Attempt
@@ -1091,6 +1099,12 @@ fn validate_followup_no_change(
             declaration_path.display()
         );
     }
+    validate_failed_tester_no_change_inspection(
+        config.project_root,
+        task,
+        &declaration.inspected_artifacts,
+        &declaration_path,
+    )?;
     debug_assert!(
         declaration
             .verification
@@ -3942,6 +3956,13 @@ fn build_reviewed_correction_prompt(
         .flatten()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+    let correction_artifacts_list = prior_reviews_block(correction_artifacts, "  ");
+    let failed_tester_inspection_inputs = required_failed_tester_inspection_inputs(task);
+    let failed_tester_inspection_list = failed_tester_inspection_inputs
+        .iter()
+        .map(|artifact| format!("  - {}", artifact.path))
+        .collect::<Vec<_>>()
+        .join("\n");
     let planning = compute_planning_paths(item, project_root);
     let template = ContentResolver::new(Some(workspace_path))
         .resolve_content("prompts/write-correction-user.md")
@@ -3973,6 +3994,19 @@ fn build_reviewed_correction_prompt(
             (
                 "execution_context_path",
                 &context_path.display().to_string(),
+            ),
+            ("correction_artifacts_list", &correction_artifacts_list),
+            (
+                "has_failed_tester_inspection",
+                if failed_tester_inspection_inputs.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            (
+                "failed_tester_inspection_list",
+                &failed_tester_inspection_list,
             ),
             ("artifact_dir", &artifact_dir.display().to_string()),
             (
@@ -5614,7 +5648,126 @@ fn is_correction_artifact(path: &Path) -> bool {
         name == "review.md"
             || name == "tester-results.json"
             || name == crate::candidate_gate::CANDIDATE_GATE_FILE
+    }) || is_tester_command_log(path)
+}
+
+fn is_tester_command_log(path: &Path) -> bool {
+    if !path
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "commands")
+    {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    ["-stdout.log", "-stderr.log"].iter().any(|suffix| {
+        name.strip_suffix(suffix).is_some_and(|index| {
+            !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+        })
     })
+}
+
+fn is_failed_tester_evidence_artifact(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "tester-results.json" || name == crate::candidate_gate::CANDIDATE_GATE_FILE
+    }) || is_tester_command_log(path)
+}
+
+fn required_failed_tester_inspection_inputs(task: &Task) -> Vec<&ArtifactRef> {
+    if !task
+        .input_artifacts
+        .iter()
+        .any(|artifact| is_tester_command_log(Path::new(&artifact.path)))
+    {
+        return Vec::new();
+    }
+    task.input_artifacts
+        .iter()
+        .filter(|artifact| is_failed_tester_evidence_artifact(Path::new(&artifact.path)))
+        .collect()
+}
+
+fn validate_failed_tester_no_change_inspection(
+    project_root: &Path,
+    task: &Task,
+    inspected_artifacts: &[NoChangeInspectedArtifact],
+    declaration_path: &Path,
+) -> Result<()> {
+    let required = required_failed_tester_inspection_inputs(task);
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let mut expected_paths = BTreeSet::new();
+    for artifact in &required {
+        if !expected_paths.insert(artifact.path.as_str()) {
+            bail!(
+                "Task {:?} has duplicate failed Tester correction input {}",
+                task.id,
+                artifact.path
+            );
+        }
+    }
+
+    let mut declared = BTreeMap::new();
+    for artifact in inspected_artifacts {
+        if declared
+            .insert(artifact.path.as_str(), artifact.digest.as_str())
+            .is_some()
+        {
+            bail!(
+                "Task {:?} produced no commit; {} contains duplicate inspected_artifacts path {}",
+                task.id,
+                declaration_path.display(),
+                artifact.path
+            );
+        }
+    }
+
+    for artifact in required {
+        let Some(declared_digest) = declared.get(artifact.path.as_str()) else {
+            bail!(
+                "Task {:?} produced no commit after failed Tester evidence; {} must declare the inspected SHA-256 digest for {}",
+                task.id,
+                declaration_path.display(),
+                artifact.path
+            );
+        };
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let bytes = fs::read(&path).with_context(|| {
+            format!(
+                "read failed Tester correction artifact for no-change validation: {}",
+                path.display()
+            )
+        })?;
+        let expected_digest = crate::follow_up::content_digest(&bytes);
+        if *declared_digest != expected_digest {
+            bail!(
+                "Task {:?} produced no commit after failed Tester evidence; {} declares digest {} for {}, but the attached bytes are {}",
+                task.id,
+                declaration_path.display(),
+                declared_digest,
+                artifact.path,
+                expected_digest
+            );
+        }
+    }
+
+    if let Some(unexpected) = declared
+        .keys()
+        .find(|path| !expected_paths.contains(**path))
+    {
+        bail!(
+            "Task {:?} produced no commit after failed Tester evidence; {} declares unexpected inspected_artifacts path {}",
+            task.id,
+            declaration_path.display(),
+            unexpected
+        );
+    }
+
+    Ok(())
 }
 
 fn readable_input_artifacts_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
@@ -5639,10 +5792,10 @@ fn work_item_inputs_only(item: &WorkItem, project_root: &Path) -> Vec<PathBuf> {
 }
 
 fn input_artifact_readable_roots(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
-    input_artifacts
-        .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .collect()
+    // Every prompt names the complete artifact path. Grant that exact file, not
+    // its parent directory: a correction may expose one failed command log
+    // without making sibling Tester artifacts readable.
+    input_artifacts.to_vec()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10577,6 +10730,7 @@ mod tests {
         prompt_named_input: bool,
         profile_granted_read: bool,
         profile_granted_write: bool,
+        profile_granted_sibling_read: bool,
         sandbox_probe_succeeded: Option<bool>,
     }
 
@@ -10608,10 +10762,15 @@ mod tests {
             _extra_env: &[(String, String)],
             _capture: Option<&crate::coder::TranscriptCapture<'_>>,
         ) -> Result<i32> {
-            let input_dir = self.input_path.parent().unwrap().canonicalize().unwrap();
+            let input_path = self.input_path.canonicalize().unwrap();
+            let sibling_path = input_path.parent().unwrap().join("sibling.txt");
             let profile = fs::read_to_string(&self.profile_path).unwrap();
-            let read_rule = format!("(allow file-read*  (subpath \"{}\"))", input_dir.display());
-            let write_rule = format!("(allow file-write* (subpath \"{}\"))", input_dir.display());
+            let read_rule = format!("(allow file-read*  (subpath \"{}\"))", input_path.display());
+            let write_rule = format!("(allow file-write* (subpath \"{}\"))", input_path.display());
+            let sibling_read_rule = format!(
+                "(allow file-read*  (subpath \"{}\"))",
+                sibling_path.display()
+            );
             let sandbox_usable = std::process::Command::new("/usr/bin/sandbox-exec")
                 .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
                 .output()
@@ -10624,10 +10783,11 @@ mod tests {
                     .args([
                         "/bin/sh",
                         "-c",
-                        "value=$(/bin/cat \"$1\") || exit 10; [ \"$value\" = authoritative ] || exit 11; if /bin/echo mutated > \"$1\"; then exit 12; fi",
+                        "value=$(/bin/cat \"$1\") || exit 10; [ \"$value\" = authoritative ] || exit 11; if /bin/echo mutated > \"$1\"; then exit 12; fi; if /bin/cat \"$2\" >/dev/null 2>&1; then exit 13; fi",
                         "writer-input-probe",
                     ])
                     .arg(&self.input_path)
+                    .arg(&sibling_path)
                     .output()
                     .map(|output| output.status.success())
                     .unwrap_or(false)
@@ -10638,6 +10798,7 @@ mod tests {
                     && prompt.contains("0000-input.txt"),
                 profile_granted_read: profile.contains(&read_rule),
                 profile_granted_write: profile.contains(&write_rule),
+                profile_granted_sibling_read: profile.contains(&sibling_read_rule),
                 sandbox_probe_succeeded,
             };
             Ok(0)
@@ -10679,6 +10840,11 @@ mod tests {
         let input_path = project_root.join(".fluent/work/artifacts/work-1/inputs/0000-input.txt");
         fs::create_dir_all(input_path.parent().unwrap()).unwrap();
         fs::write(&input_path, "authoritative\n").unwrap();
+        fs::write(
+            input_path.parent().unwrap().join("sibling.txt"),
+            "private\n",
+        )
+        .unwrap();
         let mut item = WorkItem {
             id: "work-1".to_string(),
             title: "Use authoritative input".to_string(),
@@ -10727,6 +10893,7 @@ mod tests {
         assert!(observation.prompt_named_input);
         assert!(observation.profile_granted_read);
         assert!(!observation.profile_granted_write);
+        assert!(!observation.profile_granted_sibling_read);
         if let Some(succeeded) = observation.sandbox_probe_succeeded {
             assert!(
                 succeeded,
@@ -11368,6 +11535,164 @@ mod tests {
         });
         item.add_review_tasks("attempt-1", &[role]).unwrap();
         item
+    }
+
+    fn failed_tester_inspection_fixture()
+    -> (tempfile::TempDir, Task, Vec<NoChangeInspectedArtifact>) {
+        let project = tempfile::TempDir::new().unwrap();
+        let relative_paths = [
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/tester-results.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stdout.log",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stderr.log",
+        ];
+        let mut refs = Vec::new();
+        let mut inspected = Vec::new();
+        for (index, relative) in relative_paths.iter().enumerate() {
+            let path = project.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = format!("failed Tester evidence {index}\n").into_bytes();
+            fs::write(&path, &bytes).unwrap();
+            refs.push(ArtifactRef {
+                producer_id: if index == 0 {
+                    "candidate-gate".to_string()
+                } else {
+                    "attempt-1-tester-1".to_string()
+                },
+                path: relative.to_string(),
+            });
+            inspected.push(NoChangeInspectedArtifact {
+                path: relative.to_string(),
+                digest: crate::follow_up::content_digest(&bytes),
+            });
+        }
+        let mut item = review_item();
+        let task_id = item.add_next_write_round("attempt-1", refs).unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .clone();
+        (project, task, inspected)
+    }
+
+    #[test]
+    fn failed_tester_no_change_requires_every_attached_artifact_digest() {
+        let (project, task, inspected) = failed_tester_inspection_fixture();
+        let declaration = project.path().join("no-change.json");
+
+        let error = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected[..inspected.len() - 1],
+            &declaration,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must declare the inspected SHA-256 digest")
+        );
+        assert!(error.to_string().contains("0-stderr.log"));
+    }
+
+    #[test]
+    fn failed_tester_no_change_rejects_stale_artifact_digest() {
+        let (project, task, mut inspected) = failed_tester_inspection_fixture();
+        inspected[2].digest = "sha256:stale".to_string();
+
+        let error = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &project.path().join("no-change.json"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("declares digest sha256:stale"));
+        assert!(error.to_string().contains("0-stdout.log"));
+    }
+
+    #[test]
+    fn failed_tester_no_change_accepts_exact_attached_artifact_digests() {
+        let (project, task, inspected) = failed_tester_inspection_fixture();
+
+        validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &project.path().join("no-change.json"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_tester_no_change_rejects_duplicate_and_extra_artifact_paths() {
+        let (project, task, mut inspected) = failed_tester_inspection_fixture();
+        inspected.push(NoChangeInspectedArtifact {
+            path: inspected[0].path.clone(),
+            digest: inspected[0].digest.clone(),
+        });
+        let declaration = project.path().join("no-change.json");
+
+        let duplicate = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &declaration,
+        )
+        .unwrap_err();
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate inspected_artifacts path")
+        );
+
+        inspected.pop();
+        inspected.push(NoChangeInspectedArtifact {
+            path: ".fluent/work/artifacts/work-1/attempt-1/private-note.txt".to_string(),
+            digest: "sha256:unused".to_string(),
+        });
+        let extra = validate_failed_tester_no_change_inspection(
+            project.path(),
+            &task,
+            &inspected,
+            &declaration,
+        )
+        .unwrap_err();
+        assert!(
+            extra
+                .to_string()
+                .contains("unexpected inspected_artifacts path")
+        );
+    }
+
+    #[test]
+    fn review_only_no_change_does_not_require_artifact_digests() {
+        let mut item = review_item();
+        let review = ArtifactRef {
+            producer_id: "attempt-1-review-tests".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md"
+                .to_string(),
+        };
+        let task_id = item
+            .add_next_write_round("attempt-1", vec![review])
+            .unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+
+        validate_failed_tester_no_change_inspection(
+            Path::new("unused"),
+            task,
+            &[],
+            Path::new("no-change.json"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -14000,6 +14325,89 @@ mod tests {
     }
 
     #[test]
+    fn failed_tester_correction_prompt_requires_digest_bound_inspection() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize failed Tester correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Fluent Test"],
+            "configure failed Tester correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "fluent@example.test"],
+            "configure failed Tester correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(workspace.path(), &["add", "."], "stage correction fixture").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
+
+        let relative_paths = [
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/tester-results.json",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stdout.log",
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-1/commands/0-stderr.log",
+        ];
+        let mut refs = Vec::new();
+        let mut resolved = Vec::new();
+        for relative in relative_paths {
+            let path = project.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "evidence\n").unwrap();
+            refs.push(ArtifactRef {
+                producer_id: "attempt-1-tester-1".to_string(),
+                path: relative.to_string(),
+            });
+            resolved.push(path);
+        }
+        let mut item = review_item();
+        let task_id = item.add_next_write_round("attempt-1", refs).unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &resolved,
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+
+        for path in &resolved {
+            assert!(
+                prompt.contains(&path.display().to_string()),
+                "prompt must name the complete correction artifact path {}",
+                path.display()
+            );
+        }
+        for relative in relative_paths {
+            assert!(
+                prompt.contains(relative),
+                "prompt must name the exact declaration path {relative}"
+            );
+        }
+        assert!(prompt.contains("Read every artifact below"));
+        assert!(prompt.contains("candidate's `.fluent/tester.yaml`"));
+        assert!(prompt.contains("is candidate-owned"));
+        assert!(prompt.contains("\"inspected_artifacts\""));
+        assert!(prompt.contains("Compute each digest from the artifact itself"));
+        assert!(!prompt.contains("{{"));
+    }
+
+    #[test]
     fn execution_context_never_silently_omits_current_findings() {
         let project = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
@@ -14417,6 +14825,9 @@ mod tests {
             PathBuf::from("candidate-gates/write-2/candidate-gate.json"),
             PathBuf::from("review/review.md"),
             PathBuf::from("tester/tester-results.json"),
+            PathBuf::from("tester/commands/0-stdout.log"),
+            PathBuf::from("tester/commands/0-stderr.log"),
+            PathBuf::from("tester/commands/commands.json"),
             PathBuf::from("work-1/inputs/0000-user-evidence.jsonl"),
         ];
 
@@ -14425,7 +14836,9 @@ mod tests {
             vec![
                 artifacts[2].clone(),
                 artifacts[3].clone(),
-                artifacts[4].clone()
+                artifacts[4].clone(),
+                artifacts[5].clone(),
+                artifacts[6].clone(),
             ]
         );
         assert_eq!(
@@ -14435,7 +14848,21 @@ mod tests {
                 artifacts[3].clone(),
                 artifacts[4].clone(),
                 artifacts[5].clone(),
+                artifacts[6].clone(),
+                artifacts[8].clone(),
             ]
+        );
+        assert_eq!(
+            input_artifact_readable_roots(&readable_input_artifacts_only(&artifacts)),
+            vec![
+                artifacts[2].clone(),
+                artifacts[3].clone(),
+                artifacts[4].clone(),
+                artifacts[5].clone(),
+                artifacts[6].clone(),
+                artifacts[8].clone(),
+            ],
+            "sandbox grants remain exact files rather than parent directories"
         );
     }
 
@@ -14468,17 +14895,33 @@ mod tests {
     fn write_task_prompt_lists_candidate_gate_for_correction() {
         let tmp = tempfile::TempDir::new().unwrap();
         let gate_path = tmp.path().join("candidate-gate.json");
+        let tester_results_path = tmp.path().join("tester-results.json");
+        let commands_dir = tmp.path().join("commands");
+        let stdout_path = commands_dir.join("0-stdout.log");
+        let stderr_path = commands_dir.join("0-stderr.log");
+        fs::create_dir_all(&commands_dir).unwrap();
         fs::write(&gate_path, "{\"disposition\":\"rejected\"}\n").unwrap();
+        fs::write(&tester_results_path, "{}\n").unwrap();
+        fs::write(&stdout_path, "stdout\n").unwrap();
+        fs::write(&stderr_path, "stderr\n").unwrap();
 
         let prompt = build_write_task_prompt(
             &review_item(),
             "attempt-1",
             "attempt-1-write-1",
-            std::slice::from_ref(&gate_path),
+            &[
+                gate_path.clone(),
+                tester_results_path.clone(),
+                stdout_path.clone(),
+                stderr_path.clone(),
+            ],
         );
 
         assert!(prompt.contains("Read each prior correction artifact"));
         assert!(prompt.contains(&gate_path.display().to_string()));
+        assert!(prompt.contains(&tester_results_path.display().to_string()));
+        assert!(prompt.contains(&stdout_path.display().to_string()));
+        assert!(prompt.contains(&stderr_path.display().to_string()));
     }
 
     #[test]

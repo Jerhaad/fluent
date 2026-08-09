@@ -22,6 +22,19 @@ A declared reference with no backing definition therefore blocks before review,
 and a defined reference without passing final evidence blocks before Learning,
 even when many unrelated tests are green.
 
+If the missing identity coincides with a nonzero Tester command, the next Writer
+needs the harness failure, not just the missing selector. Attach the rejected
+gate, the exact `tester-results.json`, and only that command's deterministic
+`commands/<index>-stdout.log` and `commands/<index>-stderr.log` files. Grant
+those files individually as read-only sandbox inputs and bind all of their bytes
+to any round-cap approval. Never trust a persisted result to choose a sandbox
+path or grant its parent Tester directory. Availability is not inspection: if a
+Writer wants to preserve the candidate after failed Tester evidence, require its
+fresh no-change declaration to bind every attached gate, structured result, and
+command log by exact path and SHA-256 digest. Validate that set before launching
+reviewers, and direct the Writer to inspect candidate-owned `.fluent/tester.yaml`
+path and cache choices rather than assuming every sandbox failure is external.
+
 When you declare a `Test:` reference, either land the backing test passing in the
 same candidate, or — if the test is intentionally dropped — remove/replace the
 reference and add an `Untestable:` justification. Do not leave a dangling

@@ -24,6 +24,7 @@ pub mod keep_awake;
 pub mod land_lock;
 pub mod learner;
 pub mod lease;
+pub(crate) mod lifecycle_recovery;
 pub mod lineage_lock;
 pub mod notify;
 pub mod os;

@@ -157,14 +157,20 @@ a new commit produced after Fluent bound the workspace for that Task run. A
 follow-up Writer may instead preserve the previous completed Writer commit. It
 must leave the workspace clean at that exact commit and write a fresh
 `no-change.json` in its Task artifact area with schema version 1, a reason, and
-one or more passing command entries. Fluent removes only that declaration before
-each coder launch, including retries, so evidence from an earlier launch cannot
-authorize completion. Initial Writers and follow-up Writers without valid fresh
-evidence still require a new commit. When a successful coder run has neither a
-commit nor valid fresh no-change evidence, Fluent pauses the same Writer Task at
-the Writer-completion boundary when the workspace is clean, and writes the
-validation diagnostic into its needs-user handoff. Explicit recovery replans
-that Task instead of converting
+one or more passing command entries. When the correction inputs contain failed
+final-Tester command logs, the declaration must additionally bind every attached
+candidate gate, structured Tester result, stdout log, and stderr log by exact
+project-relative path and SHA-256 digest. The host recomputes those digests and
+rejects omissions, extras, duplicates, or stale bytes before any reviewer or
+Tester reruns. Other corrective no-change paths retain the schema-version-1
+contract without this conditional field. Fluent removes only that declaration
+before each coder launch, including retries, so evidence from an earlier launch
+cannot authorize completion. Initial Writers and follow-up Writers without valid
+fresh evidence still require a new commit. When a successful coder run has
+neither a commit nor valid fresh no-change evidence, Fluent pauses the same
+Writer Task at the Writer-completion boundary when the workspace is clean, and
+writes the validation diagnostic into its needs-user handoff. Explicit recovery
+replans that Task instead of converting
 the evidence error into a terminal Attempt.
 
 `TaskOutput.commit` names the current candidate for both paths, while
@@ -268,11 +274,36 @@ for example, this repository's hook rejects the dashboard `app` importing
 The gate snapshots HEAD and worktree status around the hook, so a check may report
 but never repair. The later landing check remains an independent final safeguard.
 
-After the final Tester, the gate matches each `Test:` reference to its passing
-structured result. Rust selectors match the harness test ID; shell selectors use
-the script path because that is the shell harness's native test identity. A
-capture Learner runs the gate after canonicalizing expertise but before publishing
-its handoff. Rejection rolls the Learner transaction back to the reviewed Writer
+After the final Tester, the host runs a final-Tester candidate gate before it
+creates a Merge Candidate or launches the Learner. The gate matches each `Test:`
+reference to its passing structured result. Rust selectors match the harness
+test ID; shell selectors use the script path because that is the shell harness's
+native test identity. Missing evidence starts a corrective Writer round and
+invalidates the superseded review and Tester frontier. When missing evidence
+coincides with failed Tester commands, the gate records every failed command,
+its exit code, and its durable stdout and stderr paths so the Writer can inspect
+the harness failure instead of renaming a test blindly. The correction Task
+attaches the gate, the exact structured Tester result, and only the stdout and
+stderr files for nonzero commands. Those files receive individual read-only
+sandbox grants; their parent directories and sibling Tester artifacts remain
+unreadable. Fluent accepts only the Tester's deterministic `commands/<index>`
+log names, so persisted result content cannot choose a broader sandbox path. The
+corrective prompt names every current artifact with its untruncated path and
+requires the Writer to inspect the failed logs and candidate-owned
+`.fluent/tester.yaml` before treating a harness, path, or cache failure as
+external. If the Writer concludes that no candidate change is needed, its fresh
+declaration must prove access to every attached final-Tester evidence file with
+the current SHA-256 digest; the host validates that exact set before it can
+launch another review wave. A legacy recovery recognizes only a generic Learner
+failure whose retained gate proves this exact
+frozen-evidence gap; it retracts the pending candidate that never passed Learner
+advancement and resumes the same Attempt at that Writer boundary. Other Learner
+failures retain their existing recovery disposition.
+
+A capture Learner runs a separate gate after canonicalizing expertise but before
+publishing its handoff. That gate checks the Learner-owned delta while reusing
+the already-admitted final Tester evidence. Rejection rolls the Learner
+transaction back to the reviewed Writer
 commit and leaves Learning failed and retryable. A no-expertise Learner checks the
 unchanged reviewed candidate before it publishes its handoff.
 
@@ -556,13 +587,17 @@ only that observed-exited case to already gone. A live same-user descendant
 remains signalable, so the group signal succeeds and retains the ordinary
 descendant-sweep path.
 
-At a legitimate failed-review Writer-round cap, an operator may run `fluent
+At a legitimate failed-correction Writer-round cap, an operator may run `fluent
 attempt extend <work-item-id> <attempt-id> --additional-write-rounds N`, where N
 is one through three. Under the land lock, Fluent verifies a clean registered
 candidate worktree, exact candidate commit, exhausted current cap, and the exact
-SHA-256-bound failed-review bytes. The append-only approval does no code work.
-Resume revalidates that frontier before reopening the same Attempt; any changed
-candidate or review content fails closed.
+SHA-256-bound failed correction bytes. The correction frontier includes failed
+review output and, for a rejected final-Tester gate, the gate, structured Tester
+result, and attached failed-command logs. The extension path advertised by
+either round-cap handoff is therefore executable without approving mutable or
+unreadable evidence. The append-only approval does no code work. Resume
+revalidates that frontier before reopening the same Attempt; any changed
+candidate or correction content fails closed.
 
 After the
 initial write output completes it plans review Tasks for the full Work
@@ -2397,6 +2432,7 @@ fluent/main/
     main.rs                  ← CLI dispatch (clap)
     lib.rs                   ← public API for tests
     auto_merge.rs            ← Auto-merge watcher for merge-ready Work Items
+    candidate_gate.rs        ← Host-owned candidate admission and evidence
     tester.rs                ← Tester subcommand (deterministic test runner)
     claude_auth.rs           ← Claude OAuth authentication
     cleanup.rs               ← Cleanup of terminal Work state
@@ -2413,6 +2449,7 @@ fluent/main/
     guidance.rs              ← Render concrete next-action commands
     hooks.rs                 ← Project hook execution (.fluent/hooks/<name>)
     keep_awake.rs            ← macOS idle-sleep prevention toggle
+    lifecycle_recovery.rs    ← Exact classifiers for supported persisted lifecycle migrations
     lineage_lock.rs          ← Root-lineage serialization for corrective Work charges
     notify.rs                ← Push notification delivery
     observations.rs          ← Observation CRUD and lifecycle
@@ -2905,11 +2942,19 @@ via `fluent attempt run <id> <attempt-id>`.
 
 For a resume dispatch, the Attempt binding is already durable at enqueue time.
 Claim verifies that the persisted binding still names the current supported
-needs-user Attempt and then launches that same Attempt; `ensure_bound_attempt`
-therefore finds it instead of allocating another one. Coordinator restart leaves
-an unclaimed resume queued. A resumed Attempt that pauses again terminalizes
-only the new dispatch at `needs-user`, preserving every earlier dispatch and
-requiring another explicit resume command.
+needs-user Attempt and then launches that same Attempt; the one migration
+exception accepts an older complete Attempt only when its retained generic
+Learner failure, pending unreviewed candidate, completion contract, final Tester
+results, and rejected Learner gate jointly prove the former missing
+test-reference defect. The durable Learning run counter identifies that gate;
+empty later directories preallocated for bounded retries are ignored, while any
+later directory containing evidence blocks the migration. That exact recovery
+may follow the older false `candidate-ready` dispatch or its newly classified
+`blocked` equivalent.
+`ensure_bound_attempt` therefore finds the same Attempt instead of allocating
+another one. Coordinator restart leaves an unclaimed resume queued. A resumed
+Attempt that pauses again terminalizes only the new dispatch at `needs-user`,
+preserving every earlier dispatch and requiring another explicit resume command.
 
 Before each poll, `recover_and_reconcile` reads model state first and
 then applies a generation-checked queue update, so recovery never nests
@@ -2921,11 +2966,13 @@ interrupted claim with no bound Attempt returns to `queued` and creates
 at most one Attempt on the next claim.
 
 When an Attempt terminates, the coordinator reconciles the dispatch and
-releases its claim: a passing Merge Candidate sets `candidate-ready` and
-leaves the candidate pending, `failed` and `needs-user` set the matching
-state, an unclaimed Work Item that became abandoned is set `canceled`
-with no Attempt, and a missing, malformed, or non-executable reference is
-set `blocked` with the reason. Other in-flight dispatches are unaffected.
+releases its claim. It sets `candidate-ready` only when the Attempt's pending
+Merge Candidate passes the shared Learner advancement gate. `failed` and
+`needs-user` mirror those Attempt states; a complete Attempt with a
+Learner-unapproved candidate is `blocked`. An unclaimed Work Item that became
+abandoned is `canceled` with no Attempt, and a missing, malformed, or
+non-executable reference is `blocked` with the reason. Other in-flight
+dispatches are unaffected.
 The scheduler never invokes merge logic — landing remains the job of an
 explicit land command or the separately authorized `fluent auto-merge
 --all`, which runs as a sibling process.

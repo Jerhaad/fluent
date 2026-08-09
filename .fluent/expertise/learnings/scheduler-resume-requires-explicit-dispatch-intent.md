@@ -44,6 +44,20 @@ input names gate evidence produced by an earlier completed Writer, and that
 same evidence remains attached to the Attempt. Replan that Task in place. Keep
 every other failed Attempt and failed dispatch non-resumable.
 
+One older lifecycle wrote a generic Learner failure after its retained Learner
+gate found missing final Tester references, then incorrectly projected the
+complete Attempt as `candidate-ready`. Accept an explicit resume from that
+historical `candidate-ready` state, or from its corrected `blocked` projection,
+only when the latest Learner run gate, final Tester results, completion contract,
+pending unreviewed candidate, and generic failure all match that exact defect.
+Use the durable Learning run counter to locate the gate: capture mode may
+preallocate later empty run directories, but any later directory containing
+evidence makes the compatibility state ambiguous and non-resumable.
+The same read-only compatibility predicate must gate both enqueue and claim.
+Execution then normalizes the evidence to the post-Tester gate and changes the
+Work model in one fresh lock-held mutation. Every other complete Attempt remains
+non-resumable through the queue.
+
 Related: [[needs-user-not-terminal-for-cleanup]],
 [[next-action-guidance-is-an-executable-interface]],
 [[backward-compatible-serde-fields]], [[route-tests-drive-real-launch-wiring]]

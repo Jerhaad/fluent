@@ -1293,6 +1293,51 @@ impl WorkItem {
         Ok(candidate_id)
     }
 
+    /// Retract a pending candidate that never crossed Learning so the same
+    /// Attempt can return to a corrective Writer. Landed, reviewed, failed, or
+    /// Learner-approved candidates remain immutable at this boundary.
+    pub(crate) fn retract_unready_merge_candidate_for_correction(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<bool, WorkModelError> {
+        let Some(index) = self
+            .merge_candidates
+            .iter()
+            .position(|candidate| candidate.attempt_id == attempt_id)
+        else {
+            return Ok(false);
+        };
+        let candidate = &self.merge_candidates[index];
+        if candidate.merge_state.status != MergeCandidateMergeStatus::Pending
+            || candidate.merge_review_state != MergeReviewState::Pending
+        {
+            return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                candidate_id: candidate.id.clone(),
+                reason: "the candidate is no longer pending and unreviewed".to_string(),
+            });
+        }
+        let attempt = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if attempt
+            .learning
+            .as_ref()
+            .is_some_and(|learning| !learning.is_failed())
+        {
+            return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                candidate_id: candidate.id.clone(),
+                reason: "the candidate has already advanced into accepted Learning".to_string(),
+            });
+        }
+        self.merge_candidates.remove(index);
+        self.validate()?;
+        Ok(true)
+    }
+
     pub fn abandon(
         &mut self,
         reason: Option<String>,
@@ -3529,7 +3574,10 @@ pub fn resolve_coder_mapping(inputs: &CoderMappingInputs) -> Result<CoderMapping
     })
 }
 
-/// One failed review artifact bound to the exact bytes an operator approved.
+/// One failed correction artifact bound to the exact bytes an operator approved.
+///
+/// The serialized type name is retained because existing extensions used it for
+/// reviewer output; current frontiers may also bind a rejected final-Tester gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundCapReviewArtifact {
     pub artifact: ArtifactRef,
@@ -5202,6 +5250,9 @@ pub enum WorkModelError {
     AttemptEvidenceRecoveryConflict {
         attempt_id: String,
     },
+    LegacyLifecycleRecoveryConflict {
+        attempt_id: String,
+    },
     TaskNotFound {
         id: String,
     },
@@ -5242,6 +5293,10 @@ pub enum WorkModelError {
     MergeCandidateProvenanceMismatch {
         candidate_id: String,
         field: &'static str,
+    },
+    MergeCandidateCorrectionIneligible {
+        candidate_id: String,
+        reason: String,
     },
     WorkItemAbandoned {
         work_item_id: String,
@@ -5368,6 +5423,10 @@ impl fmt::Display for WorkModelError {
                     "Attempt {attempt_id:?} already has an active evidence recovery"
                 )
             }
+            Self::LegacyLifecycleRecoveryConflict { attempt_id } => write!(
+                f,
+                "Attempt {attempt_id:?} changed while legacy lifecycle recovery was being prepared"
+            ),
             Self::TaskNotFound { id } => {
                 write!(f, "Task {id:?} not found")
             }
@@ -5437,6 +5496,13 @@ impl fmt::Display for WorkModelError {
                     "Merge Candidate {candidate_id:?} {field} does not match the latest completed write Task"
                 )
             }
+            Self::MergeCandidateCorrectionIneligible {
+                candidate_id,
+                reason,
+            } => write!(
+                f,
+                "Merge Candidate {candidate_id:?} cannot return to correction: {reason}"
+            ),
             Self::WorkItemAbandoned { work_item_id } => {
                 write!(f, "Work Item {work_item_id:?} is abandoned")
             }
@@ -10206,6 +10272,87 @@ random banner prose that must be ignored
 
         assert_eq!(first, "attempt-1-merge-candidate");
         assert_eq!(second, first);
+        assert_eq!(work_item.merge_candidates.len(), 1);
+    }
+
+    #[test]
+    fn only_pending_unreviewed_merge_candidate_can_return_to_correction() {
+        let mut work_item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Return rejected evidence to the Writer".to_string(),
+            attempts: vec![Attempt {
+                id: "attempt-1".to_string(),
+                work_item_id: "work-1".to_string(),
+                kind: AttemptKind::Write,
+                status: AttemptStatus::Complete,
+                coder_mapping: CoderMapping::default(),
+                tasks: vec![completed_write_task("attempt-1-write-1", "original")],
+                review_state: Some(AttemptReviewState::Passed),
+                learning: Some(AttemptLearning::failed(1, "missing Tester evidence")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        work_item
+            .create_or_get_merge_candidate("attempt-1")
+            .unwrap();
+
+        let mut reviewed = work_item.clone();
+        reviewed.merge_candidates[0].merge_review_state = MergeReviewState::Passed;
+        assert!(matches!(
+            reviewed.retract_unready_merge_candidate_for_correction("attempt-1"),
+            Err(WorkModelError::MergeCandidateCorrectionIneligible { .. })
+        ));
+        let mut merged = work_item.clone();
+        merged.merge_candidates[0].merge_state.status = MergeCandidateMergeStatus::Merged;
+        assert!(matches!(
+            merged.retract_unready_merge_candidate_for_correction("attempt-1"),
+            Err(WorkModelError::MergeCandidateCorrectionIneligible { .. })
+        ));
+
+        assert!(
+            work_item
+                .retract_unready_merge_candidate_for_correction("attempt-1")
+                .unwrap()
+        );
+        assert!(work_item.merge_candidates.is_empty());
+    }
+
+    #[test]
+    fn learner_approved_merge_candidate_cannot_return_to_correction() {
+        let mut work_item = WorkItem {
+            id: "work-1".to_string(),
+            title: "Preserve Learner approval".to_string(),
+            attempts: vec![Attempt {
+                id: "attempt-1".to_string(),
+                work_item_id: "work-1".to_string(),
+                kind: AttemptKind::Write,
+                status: AttemptStatus::Complete,
+                coder_mapping: CoderMapping::default(),
+                tasks: vec![completed_write_task("attempt-1-write-1", "original")],
+                review_state: Some(AttemptReviewState::Passed),
+                learning: Some(AttemptLearning::succeeded(
+                    1,
+                    crate::follow_up::ArtifactRef {
+                        path: "handoff.json".to_string(),
+                        digest: "sha256:x".to_string(),
+                    },
+                )),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        work_item
+            .create_or_get_merge_candidate("attempt-1")
+            .unwrap();
+
+        let error = work_item
+            .retract_unready_merge_candidate_for_correction("attempt-1")
+            .expect_err("Learner approval makes the candidate immutable");
+        assert!(matches!(
+            error,
+            WorkModelError::MergeCandidateCorrectionIneligible { .. }
+        ));
         assert_eq!(work_item.merge_candidates.len(), 1);
     }
 

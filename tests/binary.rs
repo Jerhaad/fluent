@@ -20959,6 +20959,187 @@ fn queue_resume_records_exact_authorization_and_is_idempotent() {
 }
 
 #[test]
+fn queue_resume_requires_exact_legacy_learner_evidence() {
+    use fluent::candidate_gate::{
+        CANDIDATE_GATE_FILE, CandidateCheckEvidence, CandidateCheckStatus,
+        CandidateGateDisposition, CandidateGateEvidence, CandidateGatePhase,
+    };
+    use fluent::queue::{self, DispatchStatus};
+    use fluent::work_model::{
+        AttemptLearning, AttemptReviewState, AttemptStatus, LearningFailureKind, TaskOutput,
+        TaskStatus, WRITER_COMPLETION_CONTRACT_VERSION, WorkItem, WorkModelStore,
+        WriterCompletionContract, WriterCompletionRequirement, WriterCompletionRequirementKind,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let store = WorkModelStore::new(tmp.path());
+    let mut item = WorkItem::planned("wi-legacy-evidence", "Recover Tester evidence");
+    item.add_initial_attempt("attempt-1").unwrap();
+    let writer = &mut item.attempts[0].tasks[0];
+    writer.status = TaskStatus::Complete;
+    writer.output = Some(TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: "../candidate".to_string(),
+        source_branch: "main".to_string(),
+        base_commit: Some("abc123".to_string()),
+        commit: "abc123".to_string(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    item.attempts[0].writer_completion_contract = Some(WriterCompletionContract {
+        version: WRITER_COMPLETION_CONTRACT_VERSION,
+        requirements: vec![WriterCompletionRequirement {
+            id: "behavior:b1".to_string(),
+            kind: WriterCompletionRequirementKind::Behavior,
+            source: "behaviors.md#b1".to_string(),
+            requirement: "Preserve behavior".to_string(),
+            verification_refs: vec!["tests/behavior.rs::required_behavior".to_string()],
+        }],
+    });
+    item.add_final_tester_task("attempt-1").unwrap();
+    item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.role == "tester")
+        .unwrap()
+        .status = TaskStatus::Complete;
+    store.create_work_item(&item).unwrap();
+
+    queue::add(tmp.path(), "wi-legacy-evidence", None).unwrap();
+    let token = queue::claim(tmp.path(), "wi-legacy-evidence", "attempt-1")
+        .unwrap()
+        .unwrap();
+    let token = queue::mark_running(tmp.path(), &token).unwrap();
+    store
+        .mutate_work_item("wi-legacy-evidence", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::Complete;
+            attempt.review_state = Some(AttemptReviewState::Passed);
+            attempt.learning = Some(AttemptLearning::failed_with_kind(
+                1,
+                "Learner candidate gate rejected abc123",
+                LearningFailureKind::Generic,
+            ));
+            item.create_or_get_merge_candidate("attempt-1")?;
+            Ok(())
+        })
+        .unwrap();
+
+    let item = store.read_work_item("wi-legacy-evidence").unwrap();
+    let tester = item.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.role == "tester")
+        .unwrap();
+    let tester_results_path = tmp
+        .path()
+        .join(&tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    fs::create_dir_all(tester_results_path.parent().unwrap()).unwrap();
+    fs::write(&tester_results_path, "{}\n").unwrap();
+    let tester_results_relative = tester_results_path
+        .strip_prefix(tmp.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let gate_path = tmp
+        .path()
+        .join(fluent::learner::handoff_dir_rel(
+            "wi-legacy-evidence",
+            "attempt-1",
+        ))
+        .join("runs/run-1")
+        .join(CANDIDATE_GATE_FILE);
+    fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+    let runs_dir = gate_path.parent().unwrap().parent().unwrap();
+    fs::create_dir_all(runs_dir.join("run-2")).unwrap();
+    fs::create_dir_all(runs_dir.join("run-3")).unwrap();
+    let checks = [
+        ("candidate-identity", CandidateCheckStatus::Passed),
+        ("whitespace", CandidateCheckStatus::Passed),
+        ("commit-metadata", CandidateCheckStatus::Passed),
+        ("behavior-references", CandidateCheckStatus::Passed),
+        ("tester-reference-evidence", CandidateCheckStatus::Failed),
+        ("project-check", CandidateCheckStatus::Skipped),
+    ]
+    .into_iter()
+    .map(|(name, status)| CandidateCheckEvidence {
+        name: name.to_string(),
+        status,
+        diagnostics: (name == "tester-reference-evidence")
+            .then(|| vec!["no passing Tester result matches required_behavior".to_string()])
+            .unwrap_or_default(),
+        log_path: None,
+    })
+    .collect();
+    let exact_evidence = CandidateGateEvidence {
+        schema_version: 2,
+        phase: CandidateGatePhase::Learner,
+        disposition: CandidateGateDisposition::Rejected,
+        base_commit: "abc123".to_string(),
+        candidate_commit: "learner123".to_string(),
+        tester_results_path: Some(tester_results_relative),
+        metadata_rewrite: None,
+        checks,
+    };
+    let mut incomplete_evidence = exact_evidence.clone();
+    incomplete_evidence
+        .checks
+        .retain(|check| check.name != "project-check");
+    fs::write(
+        &gate_path,
+        serde_json::to_vec_pretty(&incomplete_evidence).unwrap(),
+    )
+    .unwrap();
+    queue::reconcile(tmp.path(), &token, DispatchStatus::CandidateReady).unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "queue",
+            "resume",
+            "wi-legacy-evidence",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .failure();
+    let ledger = queue::read_ledger(tmp.path(), "wi-legacy-evidence")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.dispatches.len(), 1);
+    assert_eq!(ledger.dispatches[0].status, DispatchStatus::CandidateReady);
+
+    fs::write(
+        &gate_path,
+        serde_json::to_vec_pretty(&exact_evidence).unwrap(),
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "queue",
+            "resume",
+            "wi-legacy-evidence",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Queued resume of Attempt attempt-1 for Work Item wi-legacy-evidence",
+        ));
+    let ledger = queue::read_ledger(tmp.path(), "wi-legacy-evidence")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.dispatches[0].status, DispatchStatus::CandidateReady);
+    assert_eq!(
+        ledger.active().unwrap().bound_attempt_id.as_deref(),
+        Some("attempt-1")
+    );
+}
+
+#[test]
 fn candidate_gate_pause_reports_and_accepts_exact_queue_resume() {
     use fluent::queue::{self, DispatchStatus};
     use fluent::work_model::{
@@ -21237,7 +21418,7 @@ exit 0
         let entry: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&queue_entry_path).unwrap()).unwrap();
         let s = latest_status(&entry);
-        if s == "candidate-ready" || s == "failed" {
+        if matches!(s.as_str(), "candidate-ready" | "failed" | "blocked") {
             break;
         }
         assert!(
@@ -21258,7 +21439,7 @@ exit 0
         serde_json::from_str(&fs::read_to_string(&queue_entry_path).unwrap()).unwrap();
     let status = latest_status(&after);
     assert!(
-        status == "candidate-ready" || status == "failed",
+        matches!(status.as_str(), "candidate-ready" | "failed" | "blocked"),
         "queue entry should be terminal after scheduler runs, got: {status}"
     );
 }
@@ -21693,7 +21874,7 @@ exit 0
 
     let is_terminal = |id: &str| {
         let s = latest_dispatch_status(project, id);
-        s == "candidate-ready" || s == "failed"
+        matches!(s.as_str(), "candidate-ready" | "failed" | "blocked")
     };
 
     // First coordinator: processes one Work Item, then is stopped.
@@ -27373,6 +27554,6 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "failed-review bytes no longer match the approval",
+            "failed-correction bytes no longer match the approval",
         ));
 }

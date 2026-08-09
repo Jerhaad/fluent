@@ -120,17 +120,50 @@ Test: src/os.rs (autonomous_claude_profile_confines_memory_writes_to_worker_home
 
 WHEN an operator approves one to three additional Writer rounds for a legitimate
 `round-cap` pause, THE SYSTEM SHALL append an approval bound to the candidate
-commit and SHA-256 digests of the current failed-review artifacts without
+commit and SHA-256 digests of the current failed correction artifacts without
 planning or running a Writer.
 Test: tests/binary.rs (attempt_extend_binds_candidate_and_failed_review_bytes)
 Test: src/work_model.rs (round_cap_extension_is_bounded_idempotent_and_digest_bound)
+Test: src/work_attempt_loop.rs (final_tester_gate_round_cap_frontier_binds_all_correction_bytes)
 
 ### B2
 
-IF the candidate, failed-review set, or failed-review bytes change after a
+IF the candidate, failed correction set, or failed correction bytes change after a
 round-cap approval, THEN THE SYSTEM SHALL reject resume without changing the
 Attempt frontier.
 Test: tests/binary.rs (attempt_extend_binds_candidate_and_failed_review_bytes)
+Test: src/work_attempt_loop.rs (final_tester_gate_round_cap_frontier_binds_all_correction_bytes)
+
+## Actionable final Tester evidence
+
+### B1
+
+IF a required test reference has no passing result while any Tester command
+failed, THEN THE SYSTEM SHALL include each failed command, exit code, and durable
+stdout and stderr log paths in the corrective evidence sent to the next Writer.
+Test: src/candidate_gate.rs (missing_test_reference_reports_failed_tester_command_evidence)
+
+### B2
+
+IF final Tester evidence returns to a corrective Writer, THEN THE SYSTEM SHALL
+grant read-only access to the exact gate, structured Tester result, and failed
+command logs while leaving sibling Tester artifacts inaccessible.
+Test: src/work_attempt_loop.rs (failed_final_tester_logs_are_exact_writer_correction_inputs)
+Test: src/work_attempt_loop.rs (final_tester_correction_rejects_noncanonical_log_path)
+Test: src/work_task_executor.rs (writer_launch_names_and_confines_preserved_work_item_input)
+
+### B3
+
+IF a corrective Writer declares no candidate change after receiving failed final
+Tester command evidence, THEN THE SYSTEM SHALL require its fresh no-change
+declaration to name every attached gate, structured result, stdout log, and
+stderr log with the SHA-256 digest of the current bytes, and SHALL reject missing,
+extra, duplicate, or stale inspection evidence before review or Tester execution.
+Test: src/work_task_executor.rs (failed_tester_no_change_requires_every_attached_artifact_digest)
+Test: src/work_task_executor.rs (failed_tester_no_change_rejects_stale_artifact_digest)
+Test: src/work_task_executor.rs (failed_tester_no_change_accepts_exact_attached_artifact_digests)
+Test: src/work_task_executor.rs (failed_tester_no_change_rejects_duplicate_and_extra_artifact_paths)
+Test: src/work_task_executor.rs (failed_tester_correction_prompt_requires_digest_bound_inspection)
 
 ## Persisted status accounting
 
@@ -4645,13 +4678,18 @@ scheduler_runs_four_work_items_concurrently_by_default)
 
 WHEN the running Attempt terminates,
 THE SYSTEM SHALL update the queue entry's `status` to:
+
 - `candidate-ready` if the Attempt completes with a passing Merge Candidate
 - `failed` if the Attempt ends in a `failed` terminal state
 - `needs-user` if the Attempt ends in `needs-user`
+- `blocked` if the Attempt is complete but its Merge Candidate has not passed
+  Learner advancement
+
 The dispatch SHALL NOT be deleted; the user inspects active work through
 `fluent queue list` and the latest terminal history through `fluent queue show`.
 Test: src/scheduler.rs (concurrent_terminal_outcomes_are_independent,
-passing_attempt_becomes_candidate_ready_without_land)
+passing_attempt_becomes_candidate_ready_without_land,
+complete_attempt_without_succeeded_learner_is_blocked)
 
 ### B3
 
@@ -5716,6 +5754,58 @@ matching passing Rust test identity or shell-script identity for every approved
 Test: src/candidate_gate.rs (validates_test_references_against_passing_structured_tester_evidence)
 Test: src/candidate_gate.rs (validates_nextest_integration_test_references)
 Test: src/candidate_gate.rs (shell_evidence_uses_the_harness_native_script_identity)
+
+### B27a
+
+WHEN the final Tester has completed and ordinary baseline comparison would
+otherwise pass, THE SYSTEM SHALL validate every approved `Test:` reference
+against that exact Tester's passing structured results before creating a Merge
+Candidate or launching the Learner.
+Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+
+### B27b
+
+IF the post-Tester candidate gate rejects frozen-candidate evidence, THEN THE
+SYSTEM SHALL route that gate artifact to the corrective Writer frontier.
+Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+
+### B27c
+
+IF the post-Tester candidate gate rejects frozen-candidate evidence, THEN THE
+SYSTEM SHALL NOT create a Merge Candidate or launch the Learner for that
+evidence.
+Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+
+### B27d
+
+WHEN Fluent reads an older complete Attempt whose generic Learner failure points
+to rejected gate evidence with missing Tester references, THE SYSTEM SHALL
+return that same Attempt to a corrective Writer with normalized post-Tester gate
+evidence.
+Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt)
+
+### B27e
+
+WHEN Fluent returns that exact older Attempt to its corrective Writer, THE
+SYSTEM SHALL remove its unreviewed, unlanded, Learner-unapproved Merge Candidate
+from pending land.
+Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt)
+
+### B27f
+
+IF a generic Learner failure does not carry the exact retained evidence for the
+older missing test-reference defect, THEN THE SYSTEM SHALL preserve its
+existing Learner recovery disposition.
+Test: src/work_attempt_loop.rs (unrelated_generic_learner_failure_keeps_its_existing_recovery)
+Test: src/work_attempt_loop.rs (legacy_evidence_recovery_rejects_nonempty_unrecorded_run)
+
+### B27g
+
+WHEN an operator explicitly queues the exact legacy Attempt for resume after an
+older false `candidate-ready` or corrected `blocked` dispatch, THE SYSTEM SHALL
+queue that same Attempt for the corrective recovery.
+Test: src/work_attempt_loop.rs (legacy_evidence_recovery_can_resume_false_ready_and_blocked_dispatches)
+Test: tests/binary.rs (queue_resume_requires_exact_legacy_learner_evidence)
 
 ### B28
 

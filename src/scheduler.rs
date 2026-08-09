@@ -27,17 +27,19 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// The terminal outcome of running a bound Attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
-    Complete,
+    CandidateReady,
     Failed,
     NeedsUser,
+    Blocked,
 }
 
 impl AttemptOutcome {
     fn to_dispatch_status(self) -> DispatchStatus {
         match self {
-            Self::Complete => DispatchStatus::CandidateReady,
+            Self::CandidateReady => DispatchStatus::CandidateReady,
             Self::Failed => DispatchStatus::Failed,
             Self::NeedsUser => DispatchStatus::NeedsUser,
+            Self::Blocked => DispatchStatus::Blocked,
         }
     }
 }
@@ -110,7 +112,9 @@ fn attempt_run_command(
     command
 }
 
-/// Classify a bound Attempt's terminal outcome from its persisted status.
+/// Classify a bound Attempt's terminal outcome from its persisted lifecycle.
+/// Completion alone is insufficient: `candidate-ready` means the pending Merge
+/// Candidate can pass the same Learner advancement gate used by landing.
 pub fn classify_attempt_outcome(
     project_root: &Path,
     work_item_id: &str,
@@ -118,17 +122,34 @@ pub fn classify_attempt_outcome(
 ) -> Result<AttemptOutcome> {
     let store = WorkModelStore::new(project_root);
     let item = store.read_work_item(work_item_id)?;
-    let outcome = item
+    Ok(classify_persisted_attempt(&item, attempt_id))
+}
+
+fn classify_persisted_attempt(
+    item: &crate::work_model::WorkItem,
+    attempt_id: &str,
+) -> AttemptOutcome {
+    let Some(attempt) = item
         .attempts
         .iter()
         .find(|attempt| attempt.id == attempt_id)
-        .map(|attempt| match attempt.status {
-            AttemptStatus::Failed => AttemptOutcome::Failed,
-            AttemptStatus::NeedsUser => AttemptOutcome::NeedsUser,
-            _ => AttemptOutcome::Complete,
-        })
-        .unwrap_or(AttemptOutcome::Failed);
-    Ok(outcome)
+    else {
+        return AttemptOutcome::Failed;
+    };
+    match attempt.status {
+        AttemptStatus::Failed => AttemptOutcome::Failed,
+        AttemptStatus::NeedsUser => AttemptOutcome::NeedsUser,
+        AttemptStatus::Complete => item
+            .merge_candidates
+            .iter()
+            .find(|candidate| candidate.attempt_id == attempt_id)
+            .filter(|candidate| candidate.validate_advancement(item).is_ok())
+            .map(|_| AttemptOutcome::CandidateReady)
+            .unwrap_or(AttemptOutcome::Blocked),
+        AttemptStatus::Planned | AttemptStatus::Executing | AttemptStatus::Reviewing => {
+            AttemptOutcome::Blocked
+        }
+    }
 }
 
 /// Elect one coordinator per project and, when elected, run its capacity-limited
@@ -424,7 +445,9 @@ fn bound_attempt_terminal_status(
         return Ok(BoundAttemptState::Unbound);
     };
     Ok(match attempt.status {
-        AttemptStatus::Complete => BoundAttemptState::Terminal(DispatchStatus::CandidateReady),
+        AttemptStatus::Complete => BoundAttemptState::Terminal(
+            classify_persisted_attempt(&item, attempt_id).to_dispatch_status(),
+        ),
         AttemptStatus::Failed => BoundAttemptState::Terminal(DispatchStatus::Failed),
         AttemptStatus::NeedsUser => BoundAttemptState::Terminal(DispatchStatus::NeedsUser),
         _ => BoundAttemptState::Nonterminal,
@@ -640,7 +663,8 @@ pub(crate) mod test_support {
     }
 
     /// A runner that drives the bound Attempt to a passing Merge Candidate
-    /// before returning `Complete`, so reconcile can produce `candidate-ready`.
+    /// before returning `CandidateReady`, so reconcile can produce
+    /// `candidate-ready`.
     pub struct PassingRunner;
 
     impl AttemptRunner for PassingRunner {
@@ -651,7 +675,7 @@ pub(crate) mod test_support {
             attempt_id: &str,
         ) -> Result<AttemptOutcome> {
             make_attempt_pass_with_candidate(project_root, work_item_id, attempt_id);
-            Ok(AttemptOutcome::Complete)
+            Ok(AttemptOutcome::CandidateReady)
         }
     }
 
@@ -705,6 +729,13 @@ pub(crate) mod test_support {
         attempt.status = AttemptStatus::Complete;
         attempt.review_state = Some(AttemptReviewState::Passed);
         attempt.pause_kind = None;
+        attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: "handoff.json".to_string(),
+                digest: "sha256:test".to_string(),
+            },
+        ));
         item.create_or_get_merge_candidate(attempt_id).unwrap();
         store.write_work_item(&item).unwrap();
     }
@@ -757,6 +788,36 @@ mod tests {
             classify_attempt_outcome(dir.path(), "wi-paused", "attempt-1").unwrap(),
             AttemptOutcome::NeedsUser
         );
+    }
+
+    #[test]
+    fn complete_attempt_without_succeeded_learner_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-unlearned");
+        let store = WorkModelStore::new(dir.path());
+        let mut item = store.read_work_item("wi-unlearned").unwrap();
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.write_work_item(&item).unwrap();
+        make_attempt_pass_with_candidate(dir.path(), "wi-unlearned", "attempt-1");
+        store
+            .mutate_work_item("wi-unlearned", |item| {
+                item.attempts[0].learning = Some(crate::work_model::AttemptLearning::failed(
+                    1,
+                    "Learner candidate gate rejected the candidate",
+                ));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-unlearned", "attempt-1").unwrap(),
+            AttemptOutcome::Blocked
+        );
+        assert!(matches!(
+            bound_attempt_terminal_status(dir.path(), "wi-unlearned", Some("attempt-1")).unwrap(),
+            BoundAttemptState::Terminal(DispatchStatus::Blocked)
+        ));
     }
 
     #[test]
@@ -1075,7 +1136,7 @@ mod tests {
         assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
 
         // A subsequent dispatch advances that same Attempt, creating no new one.
-        let runner = AttemptRecordingRunner::new(AttemptOutcome::Complete);
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::CandidateReady);
         dispatch_one(dir.path(), &active, &runner).unwrap();
         assert_eq!(runner.attempts.lock().unwrap().as_slice(), ["attempt-1"]);
         let store = WorkModelStore::new(dir.path());
@@ -1122,7 +1183,7 @@ mod tests {
         assert_eq!(active.bound_attempt_id, None, "binding is cleared");
 
         // The next claim creates exactly one Attempt.
-        let runner = AttemptRecordingRunner::new(AttemptOutcome::Complete);
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::CandidateReady);
         dispatch_one(dir.path(), &active, &runner).unwrap();
         let store = WorkModelStore::new(dir.path());
         assert_eq!(store.read_work_item("wi-1").unwrap().attempts.len(), 1);
@@ -1399,7 +1460,7 @@ mod tests {
             dir.path(),
             1,
             4,
-            &MockRunner::new(AttemptOutcome::Complete),
+            &MockRunner::new(AttemptOutcome::CandidateReady),
             &shutdown,
         )
         .unwrap();
@@ -1418,7 +1479,7 @@ mod tests {
         impl AttemptRunner for SlowRunner {
             fn run(&self, _p: &Path, _wi: &str, _a: &str) -> Result<AttemptOutcome> {
                 std::thread::sleep(Duration::from_millis(300));
-                Ok(AttemptOutcome::Complete)
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 
@@ -1476,7 +1537,7 @@ mod tests {
                     1,
                     "exactly one bound Attempt exists at launch"
                 );
-                Ok(AttemptOutcome::Complete)
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 
@@ -1505,7 +1566,7 @@ mod tests {
                     DispatchStatus::Running,
                     "dispatch is running during launch"
                 );
-                Ok(AttemptOutcome::Complete)
+                Ok(AttemptOutcome::CandidateReady)
             }
         }
 
