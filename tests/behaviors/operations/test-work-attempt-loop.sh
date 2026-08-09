@@ -15,6 +15,7 @@ setup_test_project() {
   local planning_mode="${1:-legacy}"
   TEST_DIR="$(mktemp -d -t fluent-work-attempt-loop-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   git init -b main > /dev/null 2>&1
   git config commit.gpgsign false
@@ -72,6 +73,7 @@ write_mock_claude() {
   printf '0\n' > "$write_count_file"
   cat > "${TEST_DIR}/bin/claude" <<MOCK_SCRIPT
 #!/usr/bin/env bash
+trap 'status=\$?; fluent-test-review-inspection claude "\$status" "\$@" || exit \$?; exit "\$status"' EXIT
 if [ "\$1 \$2 \$3" = "auth status --json" ]; then
   printf '{"loggedIn":true}\n'
   exit 0

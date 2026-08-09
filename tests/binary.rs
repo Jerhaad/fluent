@@ -14883,6 +14883,51 @@ exit 0
 }
 
 #[test]
+fn work_task_run_rejects_passing_review_without_inspection_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    create_completed_work_attempt(&tmp, &main_dir);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["review", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let bin_dir = tmp.path().join("bin-review");
+    write_mock_claude(
+        &bin_dir,
+        "#!/bin/bash\nprintf 'Verdict: pass\\n\\n## Findings\\n' > review.md\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"pass\"}}\\n'\nexit 0\n",
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-tests",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_SKIP_MOCK_REVIEW_INSPECTION", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "did not write readable inspection evidence",
+        ));
+
+    let value = read_work_show_json(&main_dir, "work-1");
+    let review_task = value["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "attempt-1-review-tests")
+        .unwrap();
+    assert_eq!(review_task["status"], "failed");
+}
+
+#[test]
 fn work_task_run_persistent_coder_error_pauses_attempt_at_needs_user() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
@@ -18925,6 +18970,40 @@ fn commit_file(repo: &Path, path: &str, content: &str, message: &str) {
 }
 
 const PROVIDER_READINESS_MOCK_PRELUDE: &str = r##"#!/bin/bash
+
+write_mock_review_inspection() {
+    status="$?"
+    prompt=''
+    for arg in "$@"; do
+        case "$arg" in
+            *'"candidate-commit"'*) prompt="$arg" ;;
+        esac
+    done
+    if [ -n "$prompt" ] && [ "$status" -eq 0 ] && [ "${FLUENT_TEST_SKIP_MOCK_REVIEW_INSPECTION:-0}" != 1 ] && [ -f review.md ] && grep -qi '^Verdict: pass' review.md && [ ! -f review-inspection.json ]; then
+        candidate="$(printf '%s\n' "$prompt" | sed -n 's/^- Workspace: //p' | head -1)"
+        if [ -z "$candidate" ]; then
+            candidate="$(printf '%s\n' "$prompt" | sed -n 's/^Review the codebase at \(.*\)\.$/\1/p' | head -1)"
+        fi
+        commit="$(printf '%s\n' "$prompt" | sed -n 's/^[[:space:]]*"candidate-commit": "\([^"]*\)",$/\1/p' | head -1)"
+        role="$(printf '%s\n' "$prompt" | sed -n 's/^[[:space:]]*"role": "\([^"]*\)",$/\1/p' | head -1)"
+        inspected="$(git -C "$candidate" ls-tree -r --name-only "$commit" | head -1)"
+        absolute="$candidate/$inspected"
+        jq -n \
+            --arg commit "$commit" \
+            --arg role "$role" \
+            --arg path "$inspected" \
+            '{"schema-version": 1, "candidate-commit": $commit, role: $role, inspections: [{path: $path, summary: "Synthetic reviewer inspected this tracked candidate file."}]}' \
+            > review-inspection.json
+        jq -cn \
+            --arg absolute "$absolute" \
+            '{type: "assistant", message: {content: [{type: "tool_use", id: "mock-review-read", name: "Read", input: {file_path: $absolute}}]}}'
+        jq -cn \
+            '{type: "user", message: {content: [{type: "tool_result", tool_use_id: "mock-review-read", content: "synthetic source"}]}}'
+    fi
+    return "$status"
+}
+
+trap 'write_mock_review_inspection "$@"' EXIT
 
 if [ "$1 $2 $3" = "auth status --json" ]; then
     printf '{"loggedIn":true}\n'
@@ -26659,7 +26738,22 @@ fn autonomous_codex_reviewer_uses_and_removes_worker_home() {
     let (source_home, bin_dir, invocation_log) = prepare_codex_worker_home_fixture(
         &tmp,
         "reviewer",
-        "printf 'Verdict: pass\\n\\nCodex review.\\n' > review.md",
+        r##"PROMPT="${!#}"
+candidate="$(printf '%s\n' "$PROMPT" | sed -n 's/^- Workspace: //p' | head -1)"
+commit="$(printf '%s\n' "$PROMPT" | sed -n 's/^[[:space:]]*"candidate-commit": "\([^"]*\)",$/\1/p' | head -1)"
+role="$(printf '%s\n' "$PROMPT" | sed -n 's/^[[:space:]]*"role": "\([^"]*\)",$/\1/p' | head -1)"
+inspected="$(git -C "$candidate" ls-tree -r --name-only "$commit" | head -1)"
+absolute="$candidate/$inspected"
+printf 'Verdict: pass\n\nCodex review.\n' > review.md
+jq -n \
+  --arg commit "$commit" \
+  --arg role "$role" \
+  --arg path "$inspected" \
+  '{"schema-version": 1, "candidate-commit": $commit, role: $role, inspections: [{path: $path, summary: "Synthetic Codex reviewer inspected this tracked candidate file."}]}' \
+  > review-inspection.json
+jq -cn \
+  --arg absolute "$absolute" \
+  '{type: "item.completed", item: {type: "command_execution", status: "completed", exit_code: 0, command: ("sed -n 1,40p " + $absolute)}}'"##,
     );
 
     let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");

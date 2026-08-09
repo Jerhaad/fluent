@@ -5523,6 +5523,56 @@ THEN THE SYSTEM SHALL leave the candidate merged and retry preparation when the
 same land command is invoked again.
 Test: src/work_merge_executor.rs (baseline_preparation_failure_keeps_land_merged_and_retry_recovers)
 
+## Reviewer inspection evidence
+
+### B1
+
+WHEN a Review Task reports `Verdict: pass`, THE SYSTEM SHALL require durable
+evidence that binds the Review Task role and exact candidate commit to at least
+one tracked candidate file and a nonempty explanation of what the role checked.
+Test: src/work_task_executor.rs (passing_review_completes_with_candidate_bound_inspection_artifact)
+Test: src/review_inspection.rs (accepts_candidate_bound_file_inspection)
+
+### B2
+
+WHEN Fluent validates evidence for a passing review, THE SYSTEM SHALL accept it
+only when the review run contains a successful inspection that names the
+candidate path to at least one declared file.
+Test: src/review_inspection.rs (accepts_recovered_codex_inspection)
+Test: src/review_inspection.rs (accepts_successful_claude_inspection)
+Test: src/review_inspection.rs (accepts_successful_pi_inspection)
+
+### B3
+
+IF a passing review omits inspection evidence, binds it to the wrong candidate
+or role, names an invalid or untracked path, leaves its explanation empty, or
+has no successful inspection for a declared file, THEN THE SYSTEM
+SHALL reject the Review Task as failed and SHALL NOT accept the passing verdict.
+Test: src/review_inspection.rs (rejects_candidate_mismatch)
+Test: src/review_inspection.rs (rejects_role_mismatch)
+Test: src/review_inspection.rs (rejects_wrong_schema_version)
+Test: src/review_inspection.rs (rejects_empty_inspection_list)
+Test: src/review_inspection.rs (rejects_missing_empty_or_noncanonical_inspections)
+Test: src/review_inspection.rs (rejects_duplicate_inspection_paths)
+Test: src/review_inspection.rs (rejects_transcript_without_tool_inspection)
+Test: src/review_inspection.rs (rejects_failed_only_codex_inspection)
+Test: src/review_inspection.rs (rejects_failed_only_pi_inspection)
+Test: src/work_task_executor.rs (passing_review_without_successful_inspection_fails_closed)
+Test: tests/binary.rs (work_task_run_rejects_passing_review_without_inspection_evidence)
+
+### B4
+
+WHEN an earlier reviewer inspection fails but a later inspection succeeds and
+names a declared candidate file, THE SYSTEM SHALL accept otherwise valid
+passing inspection evidence.
+Test: src/review_inspection.rs (accepts_recovered_codex_inspection)
+
+### B5
+
+WHEN a Review Task reports `Verdict: fail` or `Verdict: uncertain`, THE SYSTEM
+SHALL complete the Task without requiring passing-review inspection evidence.
+Test: src/work_task_executor.rs (nonpassing_review_does_not_require_inspection_artifact)
+
 ## Pre-review completion gate
 
 ### B1

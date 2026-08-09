@@ -401,9 +401,17 @@ review context names the candidate workspace, source branch, and
 candidate commit and includes a shell-quoted `git -C <workspace> diff
 <range>` command so a reviewer can inspect the scoped diff without
 rediscovering the author Task. Running a review Task requires
-`review.md` in that artifact area; the Task can complete even when that
-artifact says `Verdict: fail` or `Verdict: uncertain` because verdict
-acceptance belongs to later review or merge policy.
+`review.md` in that artifact area. A passing report additionally requires
+`review-inspection.json`, which binds the Review Task role and exact candidate
+commit to at least one canonical repository-relative tracked file and explains
+what that role checked. The host verifies each path through Git and requires a
+successful Codex command event, Claude tool-result pair, or Pi tool-execution
+pair that names the declared file's absolute candidate path. Provider console
+noise and failed tool events do not count; a later successful tool result can
+supply the required evidence. Fluent records both artifacts before
+completing a passing Review Task. A `fail` or `uncertain` report still completes
+with `review.md` alone
+because verdict acceptance belongs to later review or merge policy.
 `fluent review codebase <work-item-id> <attempt-id>` appends a
 review-only Attempt for full-codebase review of the current source
 checkout. Review-only Attempts contain review Tasks only, read the source

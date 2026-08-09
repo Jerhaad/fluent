@@ -14,6 +14,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 setup_test_project() {
   TEST_DIR="$(mktemp -d -t fluent-work-status-dashboard-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   git init -b main > /dev/null 2>&1
   git config commit.gpgsign false
@@ -128,6 +129,7 @@ create_planned_work_item() {
 write_mock_claude() {
   cat > "${TEST_DIR}/bin/claude" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection claude "$status" "$@" || exit $?; exit "$status"' EXIT
 if [ "$1 $2 $3" = "auth status --json" ]; then
   printf '{"loggedIn":true}\n'
   exit 0
@@ -141,7 +143,7 @@ if printf '%s' "$*" | grep -q 'follow-up draft as JSON'; then
   exit 0
 fi
 case "$PWD" in
-  */work-12-work-visible-attempt-visible|*/work-11-work-action-attempt-action)
+  */work-*-work-visible-attempt-visible|*/work-*-work-action-attempt-action)
     printf 'status dashboard output\n' > status-dashboard-output.txt
     git add status-dashboard-output.txt
     git commit -m "Add status dashboard output" > /dev/null 2>&1
@@ -158,12 +160,13 @@ MOCK_SCRIPT
 write_uncertain_mock_claude() {
   cat > "${TEST_DIR}/bin/claude" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection claude "$status" "$@" || exit $?; exit "$status"' EXIT
 if [ "$1 $2 $3" = "auth status --json" ]; then
   printf '{"loggedIn":true}\n'
   exit 0
 fi
 case "$PWD" in
-  */work-15-work-needs-user-attempt-needs-user)
+  */work-*-work-needs-user-attempt-needs-user)
     printf 'status dashboard uncertain output\n' > status-dashboard-uncertain.txt
     git add status-dashboard-uncertain.txt
     git commit -m "Add status dashboard uncertain output" > /dev/null 2>&1
@@ -181,9 +184,12 @@ create_merge_ready_work_item() {
   write_mock_claude
   "$FLUENT_BIN" work-item create work-action --title "Actionable Work" > /dev/null
   "$FLUENT_BIN" attempt create work-action attempt-action > /dev/null
-  PATH="${TEST_DIR}/bin:$PATH" \
+  if ! PATH="${TEST_DIR}/bin:$PATH" \
     "$FLUENT_BIN" attempt run work-action attempt-action --no-sandbox \
-      > "$TEST_DIR/attempt-run-stdout" 2> "$TEST_DIR/attempt-run-stderr"
+      > "$TEST_DIR/attempt-run-stdout" 2> "$TEST_DIR/attempt-run-stderr"; then
+    cat "$TEST_DIR/attempt-run-stderr" >&2
+    return 1
+  fi
 }
 
 create_needs_user_work_item() {

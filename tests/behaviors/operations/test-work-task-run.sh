@@ -14,6 +14,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 setup_test_project() {
   TEST_DIR="$(mktemp -d -t fluent-work-task-run-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   git init -b main > /dev/null 2>&1
   git config commit.gpgsign false
@@ -63,6 +64,7 @@ physical_workspace_path() {
 write_mock_codex() {
   cat > "${MOCK_BIN}/codex" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection codex "$status" "$@" || exit $?; exit "$status"' EXIT
 if [[ "$*" == *"login status"* ]]; then
   exit 0
 fi
@@ -418,7 +420,8 @@ test_review_task_with_fail_verdict_completes() {
   run_review_task review-fail > "$TEST_DIR/stdout" 2> "$TEST_DIR/stderr" || RESULT=1
   PROMPT="$(cat "$TEST_DIR/coder-prompt.log")"
   assert_contains "$PROMPT" "Review changes for this Work Item" || RESULT=1
-  assert_contains "$PROMPT" "Workspace: $(workspace_path)" || RESULT=1
+  EXPECTED_WORKSPACE="$(cd "$(workspace_path)" && pwd -P)"
+  assert_contains "$PROMPT" "Workspace: $EXPECTED_WORKSPACE" || RESULT=1
   assert_contains "$PROMPT" ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests" || RESULT=1
   REVIEW_CWD="$(tail -n 1 "$TEST_DIR/coder-cwd.log")"
   EXPECTED_ARTIFACT_CWD="$(cd .fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests && pwd -P)"

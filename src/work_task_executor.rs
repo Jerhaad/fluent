@@ -1226,6 +1226,8 @@ fn run_review_task_with_coder(
     // candidate fails byte-identically before the reservation.
     let artifact_dir = resolve_managed_artifact_area_path(config.project_root, &artifact_area)?;
     let review_path = artifact_dir.join("review.md");
+    let review_inspection_path =
+        artifact_dir.join(crate::review_inspection::REVIEW_INSPECTION_FILE);
     let input_artifacts =
         resolve_input_artifact_paths(config.project_root, &plan.task.input_artifacts)?;
     ReviewReadableWorkspaces::preflight(
@@ -1241,6 +1243,13 @@ fn run_review_task_with_coder(
             "Review Task {:?} artifact path exists but is not a file: {}",
             config.task_id,
             review_path.display()
+        );
+    }
+    if review_inspection_path.exists() && !review_inspection_path.is_file() {
+        bail!(
+            "Review Task {:?} inspection artifact path exists but is not a file: {}",
+            config.task_id,
+            review_inspection_path.display()
         );
     }
 
@@ -1334,6 +1343,9 @@ fn run_review_task_with_coder(
             if review_path.is_file() {
                 fs::remove_file(&review_path)?;
             }
+            if review_inspection_path.is_file() {
+                fs::remove_file(&review_inspection_path)?;
+            }
             let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
             materialize_planning_files(&item, config.project_root)?;
             materialize_general_expertise(config.project_root)?;
@@ -1374,6 +1386,12 @@ fn run_review_task_with_coder(
         }
     };
     let readable_workspace_paths = readable_workspaces.paths();
+    let candidate_workspace = workspace_reads
+        .iter()
+        .zip(readable_workspace_paths.iter())
+        .find(|(workspace, _)| workspace.id == review_context.candidate_workspace_id)
+        .map(|(_, path)| path.clone())
+        .expect("validated Review Task candidate workspace must resolve");
 
     if let (Some(candidate_path), Some(cache_dir)) = (
         readable_workspace_paths.first(),
@@ -1467,6 +1485,11 @@ fn run_review_task_with_coder(
         run_result,
         cleanup_result,
         &review_path,
+        &review_inspection_path,
+        &transcript,
+        &candidate_workspace,
+        &candidate_commit,
+        &role,
         &crate::notify::notify,
     );
     if let Err(error) = record_review_artifact_usage(&artifact_dir, cache_reporter) {
@@ -1565,6 +1588,11 @@ fn finalize_review_outcome(
     run_result: Result<()>,
     cleanup_result: Result<()>,
     review_path: &Path,
+    review_inspection_path: &Path,
+    transcript_path: &Path,
+    candidate_workspace: &Path,
+    candidate_commit: &str,
+    role: &str,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<WorkTaskRunResult> {
     // A resumable typed primary (transcript-pump/auth) wins over a cleanup failure:
@@ -1669,7 +1697,25 @@ fn finalize_review_outcome(
     // Route every post-reservation completion failure — completion read/find and the
     // terminal write — through one durable terminal boundary. The completion helper
     // takes and releases the store lock itself, so terminalization never deadlocks.
-    match complete_review_task(config, review_path) {
+    let completion = (|| {
+        let review_source = fs::read_to_string(review_path)
+            .with_context(|| format!("reading Review Task report {}", review_path.display()))?;
+        let inspection_artifact =
+            if crate::review::extract_verdict(&review_source) == crate::review::Verdict::Pass {
+                crate::review_inspection::validate(
+                    review_inspection_path,
+                    candidate_workspace,
+                    transcript_path,
+                    candidate_commit,
+                    role,
+                )?;
+                Some(review_inspection_path)
+            } else {
+                None
+            };
+        complete_review_task(config, review_path, inspection_artifact)
+    })();
+    match completion {
         Ok(result) => Ok(result),
         Err(error) => {
             if let Err(state_error) = lock_mark_task_failed(
@@ -1694,6 +1740,7 @@ fn finalize_review_outcome(
 fn complete_review_task(
     config: &WorkTaskRunConfig<'_>,
     review_path: &Path,
+    review_inspection_path: Option<&Path>,
 ) -> Result<WorkTaskRunResult> {
     {
         let _lock = config
@@ -1713,6 +1760,14 @@ fn complete_review_task(
                 producer_id: config.task_id.to_string(),
                 path: path_for_model(config.project_root, review_path),
             });
+        if let Some(path) = review_inspection_path {
+            completed_item.attempts[attempt_index]
+                .artifacts
+                .push(ArtifactRef {
+                    producer_id: config.task_id.to_string(),
+                    path: path_for_model(config.project_root, path),
+                });
+        }
         let all_complete = completed_item.attempts[attempt_index]
             .tasks
             .iter()
@@ -6165,6 +6220,7 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
         );
         render_review_diff_command(candidate_workspace, &review_range)
     };
+    let candidate_workspace_display = candidate_workspace.display().to_string();
 
     let reviewer_prior_reviews = prior_reviews_only(input.input_artifacts);
     let evidence_context = task.evidence_review_context.as_ref();
@@ -6204,6 +6260,11 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
     };
 
     let review_path_display = input.review_path.display().to_string();
+    let review_inspection_path_display = input
+        .artifact_dir
+        .join(crate::review_inspection::REVIEW_INSPECTION_FILE)
+        .display()
+        .to_string();
     let artifact_dir_display = input.artifact_dir.display().to_string();
 
     let planning = compute_planning_paths(input.item, input.project_root);
@@ -6371,10 +6432,7 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
             ("is_review_architecture", is_review_architecture_value),
             ("is_review_documentation", is_review_documentation_value),
             ("work_item_inputs_list", &work_item_inputs_list),
-            (
-                "candidate_workspace_path",
-                &review_context.candidate_workspace_path,
-            ),
+            ("candidate_workspace_path", &candidate_workspace_display),
             ("source_branch", &review_context.source_branch),
             ("candidate_commit", &review_context.candidate_commit),
             ("evidence_review_context", evidence_review_context),
@@ -6392,6 +6450,7 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
             ("has_writer_completion_matrix", has_writer_completion_matrix),
             ("progress_md_path", &reviewer_progress_md_path),
             ("review_path", &review_path_display),
+            ("review_inspection_path", &review_inspection_path_display),
             ("artifact_dir", &artifact_dir_display),
             ("reviewer_cache_dir", &reviewer_cache_dir),
             ("execution_context_path", &execution_context_path),
@@ -9634,6 +9693,11 @@ mod tests {
             pump_primary,
             cleanup_failure,
             &tmp.path().join("does-not-exist-review.md"),
+            &tmp.path().join("does-not-exist-review-inspection.json"),
+            &tmp.path().join("does-not-exist-transcript.jsonl"),
+            &tmp.path().join("candidate-workspace"),
+            "abc123",
+            "architecture",
             &|_, _| {},
         )
         .expect_err("a composite coder+cleanup failure must return an error");
@@ -11425,6 +11489,244 @@ mod tests {
             b"coder mutation",
             "the failed restore left the coder's tracked mutation, not the baseline"
         );
+    }
+
+    struct ReviewCompletionFixture {
+        _tmp: tempfile::TempDir,
+        project_root: PathBuf,
+        store: WorkModelStore,
+        candidate_commit: String,
+        artifact_dir: PathBuf,
+    }
+
+    impl ReviewCompletionFixture {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let project_root = tmp.path().join("project");
+            fs::create_dir_all(project_root.join("src")).unwrap();
+            git::run(
+                &project_root,
+                &["init", "-q", "-b", "main"],
+                "initialize fixture",
+            )
+            .unwrap();
+            fs::write(project_root.join("src/lib.rs"), "pub fn reviewed() {}\n").unwrap();
+            git::run(&project_root, &["add", "src/lib.rs"], "stage fixture").unwrap();
+            git::run(
+                &project_root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ],
+                "commit fixture",
+            )
+            .unwrap();
+            let candidate_commit =
+                git::run_stdout(&project_root, &["rev-parse", "HEAD"], "read HEAD").unwrap();
+
+            let artifact_area =
+                work_artifact_path("work-1", "attempt-1", "attempt-1-review-architecture");
+            let artifact_dir = project_root.join(&artifact_area);
+            fs::create_dir_all(&artifact_dir).unwrap();
+            let mut item = WorkItem {
+                id: "work-1".to_string(),
+                title: "Review inspection fixture".to_string(),
+                ..Default::default()
+            };
+            item.add_initial_attempt("attempt-1").unwrap();
+            let task = &mut item.attempts[0].tasks[0];
+            task.id = "attempt-1-review-architecture".to_string();
+            task.kind = TaskKind::Review;
+            task.role = "architecture".to_string();
+            task.status = TaskStatus::Executing;
+            task.workspace_access.writes.clear();
+            task.workspace_access.reads = vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: ".".to_string(),
+            }];
+            task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                path: artifact_area,
+            });
+            task.review_context = Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: ".".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: candidate_commit.clone(),
+                base_commit: None,
+            });
+            task.output = None;
+            item.attempts[0].status = AttemptStatus::Reviewing;
+            let store = WorkModelStore::new(&project_root);
+            store.create_work_item(&item).unwrap();
+
+            Self {
+                _tmp: tmp,
+                project_root,
+                store,
+                candidate_commit,
+                artifact_dir,
+            }
+        }
+
+        fn config<'a>(&'a self, resolver: &'a ContentResolver) -> WorkTaskRunConfig<'a> {
+            WorkTaskRunConfig {
+                project_root: &self.project_root,
+                store: &self.store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: "attempt-1-review-architecture",
+                resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            }
+        }
+
+        fn write_valid_passing_artifacts(&self) {
+            fs::write(
+                self.artifact_dir.join("review.md"),
+                "Verdict: pass\n\n## Findings\n",
+            )
+            .unwrap();
+            fs::write(
+                self.artifact_dir
+                    .join(crate::review_inspection::REVIEW_INSPECTION_FILE),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema-version": 1,
+                    "candidate-commit": self.candidate_commit,
+                    "role": "architecture",
+                    "inspections": [{
+                        "path": "src/lib.rs",
+                        "summary": "Checked the public module boundary."
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                self.artifact_dir.join("transcript.jsonl"),
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"sed -n 1,40p {}\"}}}}\n",
+                    self.project_root.join("src/lib.rs").display()
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn passing_review_completes_with_candidate_bound_inspection_artifact() {
+        let fixture = ReviewCompletionFixture::new();
+        fixture.write_valid_passing_artifacts();
+        let review_path = fixture.artifact_dir.join("review.md");
+        let inspection_path = fixture
+            .artifact_dir
+            .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+        let resolver = ContentResolver::new(Some(&fixture.project_root));
+        finalize_review_outcome(
+            &fixture.config(&resolver),
+            Ok(()),
+            Ok(()),
+            &review_path,
+            &inspection_path,
+            &fixture.artifact_dir.join("transcript.jsonl"),
+            &fixture.project_root,
+            &fixture.candidate_commit,
+            "architecture",
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+        let paths: Vec<_> = stored.attempts[0]
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        assert!(paths.iter().any(|path| path.ends_with("/review.md")));
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("/review-inspection.json"))
+        );
+    }
+
+    #[test]
+    fn passing_review_without_successful_inspection_fails_closed() {
+        let fixture = ReviewCompletionFixture::new();
+        fixture.write_valid_passing_artifacts();
+        fs::write(
+            fixture.artifact_dir.join("transcript.jsonl"),
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\"}}\n",
+        )
+        .unwrap();
+        let review_path = fixture.artifact_dir.join("review.md");
+        let inspection_path = fixture
+            .artifact_dir
+            .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+        let resolver = ContentResolver::new(Some(&fixture.project_root));
+        let error = finalize_review_outcome(
+            &fixture.config(&resolver),
+            Ok(()),
+            Ok(()),
+            &review_path,
+            &inspection_path,
+            &fixture.artifact_dir.join("transcript.jsonl"),
+            &fixture.project_root,
+            &fixture.candidate_commit,
+            "architecture",
+            &|_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("no successful provider tool result")
+        );
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn nonpassing_review_does_not_require_inspection_artifact() {
+        for verdict in ["fail", "uncertain"] {
+            let fixture = ReviewCompletionFixture::new();
+            let review_path = fixture.artifact_dir.join("review.md");
+            fs::write(&review_path, format!("Verdict: {verdict}\n\n## Findings\n")).unwrap();
+            let inspection_path = fixture
+                .artifact_dir
+                .join(crate::review_inspection::REVIEW_INSPECTION_FILE);
+
+            let resolver = ContentResolver::new(Some(&fixture.project_root));
+            finalize_review_outcome(
+                &fixture.config(&resolver),
+                Ok(()),
+                Ok(()),
+                &review_path,
+                &inspection_path,
+                &fixture.artifact_dir.join("transcript.jsonl"),
+                &fixture.project_root,
+                &fixture.candidate_commit,
+                "architecture",
+                &|_, _| {},
+            )
+            .unwrap();
+
+            let stored = fixture.store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Complete);
+            assert_eq!(stored.attempts[0].artifacts.len(), 1);
+            assert!(stored.attempts[0].artifacts[0].path.ends_with("/review.md"));
+        }
     }
 
     #[test]
@@ -13891,6 +14193,26 @@ mod tests {
                 "main...abc123".to_string(),
             ],
         );
+        assert!(
+            prompts.review_prompt.contains(
+                &tmp.path()
+                    .join("review-inspection.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("\"candidate-commit\": \"abc123\"")
+        );
+        assert!(prompts.review_prompt.contains("\"role\": \"tests\""));
+        assert!(
+            prompts
+                .review_prompt
+                .contains(&workspace.display().to_string())
+        );
+        assert!(!prompts.review_prompt.contains("{{"));
     }
 
     fn post_merge_review_item(base_commit: Option<String>) -> WorkItem {

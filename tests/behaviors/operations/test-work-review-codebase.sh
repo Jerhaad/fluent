@@ -14,6 +14,7 @@ LOG_DIR="${PROJECT_DIR}/tests/output/$(basename "$0" .sh)"
 setup_test_project() {
   TEST_DIR="$(mktemp -d -t fluent-work-review-codebase-XXXXXX)"
   mkdir -p "$TEST_DIR/project" "$TEST_DIR/bin"
+  install_review_inspection_provider_helper "$TEST_DIR/bin"
   cd "$TEST_DIR/project"
   git init -b main > /dev/null 2>&1
   git config commit.gpgsign false
@@ -35,6 +36,7 @@ write_mock_claude() {
   local verdict="$1"
   cat > "${TEST_DIR}/bin/claude" <<MOCK_SCRIPT
 #!/usr/bin/env bash
+trap 'status=\$?; fluent-test-review-inspection claude "\$status" "\$@" || exit \$?; exit "\$status"' EXIT
 if [ "\$1 \$2 \$3" = "auth status --json" ]; then
   printf '{"loggedIn":true}\n'
   exit 0
@@ -53,6 +55,7 @@ MOCK_SCRIPT
 write_dirty_mock_claude() {
   cat > "${TEST_DIR}/bin/claude" <<'MOCK_SCRIPT'
 #!/usr/bin/env bash
+trap 'status=$?; fluent-test-review-inspection claude "$status" "$@" || exit $?; exit "$status"' EXIT
 if [ "$1 $2 $3" = "auth status --json" ]; then
   printf '{"loggedIn":true}\n'
   exit 0

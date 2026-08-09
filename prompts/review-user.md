@@ -129,7 +129,34 @@ failed review at {{evidence_prior_review_path}} for commit
 
 If you found nothing, still write the file with `Verdict: pass` and an empty `## Findings` section.
 
-The Task completes when the review report exists at {{review_path}}.
+For a passing verdict, also write candidate-bound inspection evidence to
+{{review_inspection_path}}. Use this exact JSON shape:
+
+```json
+{
+  "schema-version": 1,
+  "candidate-commit": "{{candidate_commit}}",
+  "role": "{{role}}",
+  "inspections": [
+    {
+      "path": "path/to/tracked-candidate-file",
+      "summary": "What this role checked in that file"
+    }
+  ]
+}
+```
+
+Each path must be a canonical repository-relative file path tracked by candidate
+commit {{candidate_commit}}. Include at least one file. When no changed file is
+specific to your role, inspect a tracked candidate file that lets you establish
+that no role-specific change is required and explain that conclusion in
+`summary`. At least one successful provider tool call must name the absolute path
+to one declared file; use the workspace path above rather than relying only on a
+relative working directory. Do not write this artifact for a fail or uncertain
+verdict.
+
+The Task completes when the review report exists at {{review_path}} and a
+passing report has valid inspection evidence at {{review_inspection_path}}.
 
 ## Rules during review
 
