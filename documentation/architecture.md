@@ -406,9 +406,12 @@ rediscovering the author Task. Running a review Task requires
 commit to at least one canonical repository-relative tracked file and explains
 what that role checked. The host verifies each path through Git and requires a
 successful Codex command event, Claude tool-result pair, or Pi tool-execution
-pair that names the declared file's absolute candidate path. Provider console
-noise and failed tool events do not count; a later successful tool result can
-supply the required evidence. Fluent records both artifacts before
+pair that identifies the candidate workspace and declared file in the same
+event. The event may name the joined absolute file path or keep the workspace
+and repository-relative path separate, as Git `commit:path` inspection does.
+Workspace-only, path-only, cross-event, provider console, and failed-tool
+evidence does not count; a later successful tool result can supply the required
+evidence. Fluent records both artifacts before
 completing a passing Review Task. A `fail` or `uncertain` report still completes
 with `review.md` alone
 because verdict acceptance belongs to later review or merge policy.

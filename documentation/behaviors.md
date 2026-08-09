@@ -5536,11 +5536,15 @@ Test: src/review_inspection.rs (accepts_candidate_bound_file_inspection)
 ### B2
 
 WHEN Fluent validates evidence for a passing review, THE SYSTEM SHALL accept it
-only when the review run contains a successful inspection that names the
-candidate path to at least one declared file.
+only when one successful inspection identifies both the exact candidate
+workspace and at least one declared file, either as a joined absolute path or as
+workspace and repository-relative path values in that inspection.
 Test: src/review_inspection.rs (accepts_recovered_codex_inspection)
+Test: src/review_inspection.rs (accepts_successful_codex_git_object_inspection)
 Test: src/review_inspection.rs (accepts_successful_claude_inspection)
+Test: src/review_inspection.rs (accepts_successful_claude_split_workspace_and_path_inspection)
 Test: src/review_inspection.rs (accepts_successful_pi_inspection)
+Test: src/review_inspection.rs (accepts_successful_pi_split_workspace_and_path_inspection)
 
 ### B3
 
@@ -5557,6 +5561,7 @@ Test: src/review_inspection.rs (rejects_duplicate_inspection_paths)
 Test: src/review_inspection.rs (rejects_transcript_without_tool_inspection)
 Test: src/review_inspection.rs (rejects_failed_only_codex_inspection)
 Test: src/review_inspection.rs (rejects_failed_only_pi_inspection)
+Test: src/review_inspection.rs (rejects_workspace_only_path_only_and_cross_event_evidence)
 Test: src/work_task_executor.rs (passing_review_without_successful_inspection_fails_closed)
 Test: tests/binary.rs (work_task_run_rejects_passing_review_without_inspection_evidence)
 

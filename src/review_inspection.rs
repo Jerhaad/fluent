@@ -73,7 +73,7 @@ pub(crate) fn validate(
     }
 
     let mut unique_paths = BTreeSet::new();
-    let mut absolute_paths = Vec::new();
+    let mut inspected_paths = Vec::new();
     for item in &inspection.inspections {
         let path = canonical_relative_path(&item.path)?;
         if item.summary.trim().is_empty() {
@@ -86,11 +86,18 @@ pub(crate) fn validate(
             bail!("review inspection repeats candidate path {:?}", item.path);
         }
         require_file_at_commit(candidate_workspace, expected_candidate_commit, &path)?;
-        absolute_paths.push(candidate_workspace.join(path).display().to_string());
+        inspected_paths.push((
+            item.path.clone(),
+            candidate_workspace.join(path).display().to_string(),
+        ));
     }
-    if !transcript_records_successful_inspection(transcript_path, &absolute_paths)? {
+    if !transcript_records_successful_inspection(
+        transcript_path,
+        &candidate_workspace.display().to_string(),
+        &inspected_paths,
+    )? {
         bail!(
-            "passing review has no successful provider tool result that names a declared inspected candidate file"
+            "passing review has no successful provider tool result that identifies the candidate workspace and a declared inspected file"
         );
     }
 
@@ -99,7 +106,8 @@ pub(crate) fn validate(
 
 fn transcript_records_successful_inspection(
     transcript_path: &Path,
-    absolute_paths: &[String],
+    candidate_workspace: &str,
+    inspected_paths: &[(String, String)],
 ) -> Result<bool> {
     let source = fs::read_to_string(transcript_path).with_context(|| {
         format!(
@@ -137,7 +145,7 @@ fn transcript_records_successful_inspection(
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                 );
-                if absolute_paths.iter().any(|path| evidence.contains(path)) {
+                if text_names_any_candidate_path(&evidence, candidate_workspace, inspected_paths) {
                     return Ok(true);
                 }
             }
@@ -167,7 +175,7 @@ fn transcript_records_successful_inspection(
                 let Some(input) = claude_tool_inputs.get(tool_use_id) else {
                     continue;
                 };
-                if value_names_any_path(input, absolute_paths) {
+                if value_names_any_candidate_path(input, candidate_workspace, inspected_paths) {
                     return Ok(true);
                 }
             }
@@ -189,7 +197,7 @@ fn transcript_records_successful_inspection(
             let Some(input) = pi_tool_inputs.get(tool_call_id) else {
                 continue;
             };
-            if value_names_any_path(input, absolute_paths) {
+            if value_names_any_candidate_path(input, candidate_workspace, inspected_paths) {
                 return Ok(true);
             }
         }
@@ -198,19 +206,51 @@ fn transcript_records_successful_inspection(
     Ok(false)
 }
 
-fn value_names_any_path(value: &serde_json::Value, absolute_paths: &[String]) -> bool {
+fn text_names_any_candidate_path(
+    source: &str,
+    candidate_workspace: &str,
+    inspected_paths: &[(String, String)],
+) -> bool {
+    inspected_paths.iter().any(|(relative, absolute)| {
+        text_names_path(source, absolute)
+            || (text_names_path(source, candidate_workspace) && text_names_path(source, relative))
+    })
+}
+
+fn value_names_any_candidate_path(
+    value: &serde_json::Value,
+    candidate_workspace: &str,
+    inspected_paths: &[(String, String)],
+) -> bool {
+    inspected_paths.iter().any(|(relative, absolute)| {
+        value_names_path(value, absolute)
+            || (value_names_path(value, candidate_workspace) && value_names_path(value, relative))
+    })
+}
+
+fn value_names_path(value: &serde_json::Value, path: &str) -> bool {
     match value {
-        serde_json::Value::String(source) => {
-            absolute_paths.iter().any(|path| source.contains(path))
+        serde_json::Value::String(source) => text_names_path(source, path),
+        serde_json::Value::Array(values) => {
+            values.iter().any(|value| value_names_path(value, path))
         }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| value_names_any_path(value, absolute_paths)),
-        serde_json::Value::Object(values) => values
-            .values()
-            .any(|value| value_names_any_path(value, absolute_paths)),
+        serde_json::Value::Object(values) => {
+            values.values().any(|value| value_names_path(value, path))
+        }
         _ => false,
     }
+}
+
+fn text_names_path(source: &str, path: &str) -> bool {
+    source.match_indices(path).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + path.len()..].chars().next();
+        !before.is_some_and(is_path_continuation) && !after.is_some_and(is_path_continuation)
+    })
+}
+
+fn is_path_continuation(value: char) -> bool {
+    value.is_alphanumeric() || matches!(value, '_' | '-' | '.' | '/' | '\\')
 }
 
 fn canonical_relative_path(source: &str) -> Result<PathBuf> {
@@ -361,6 +401,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(validated.inspections[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn accepts_successful_codex_git_object_inspection() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "architecture",
+            "src/lib.rs",
+            "Checked the public module boundary at the candidate commit.",
+        );
+        let transcript = workspace.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git -C '{}' show '{}:src/lib.rs'\"}}}}\n",
+                workspace.path().display(),
+                commit,
+            ),
+        )
+        .unwrap();
+
+        validate(
+            &artifact,
+            workspace.path(),
+            &transcript,
+            &commit,
+            "architecture",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -561,6 +632,65 @@ mod tests {
     }
 
     #[test]
+    fn rejects_workspace_only_path_only_and_cross_event_evidence() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "architecture",
+            "src/lib.rs",
+            "Checked the public module boundary.",
+        );
+        let workspace_path = workspace.path().display();
+
+        for (label, source) in [
+            (
+                "workspace only",
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git -C '{workspace_path}' status\"}}}}\n"
+                ),
+            ),
+            (
+                "relative path only",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"sed -n 1,40p src/lib.rs\"}}\n".to_string(),
+            ),
+            (
+                "wrong workspace",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git -C /definitely/not/the/candidate show HEAD:src/lib.rs\"}}\n".to_string(),
+            ),
+            (
+                "declared path prefix only",
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git -C '{workspace_path}' show HEAD:src/lib.rs.bak\"}}}}\n"
+                ),
+            ),
+            (
+                "split across events",
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git -C '{workspace_path}' status\"}}}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"sed -n 1,40p src/lib.rs\"}}}}\n"
+                ),
+            ),
+        ] {
+            let transcript = workspace.path().join(format!("{label}.jsonl"));
+            fs::write(&transcript, source).unwrap();
+            let error = validate(
+                &artifact,
+                workspace.path(),
+                &transcript,
+                &commit,
+                "architecture",
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("identifies the candidate workspace"),
+                "{label}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_failed_only_codex_inspection() {
         let (workspace, commit) = committed_workspace();
         let artifact = write_inspection(
@@ -639,6 +769,28 @@ mod tests {
     }
 
     #[test]
+    fn accepts_successful_claude_split_workspace_and_path_inspection() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "skills",
+            "src/lib.rs",
+            "Confirmed that the change introduces no agent-skill surface.",
+        );
+        let transcript = workspace.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Read\",\"input\":{{\"cwd\":\"{}\",\"file_path\":\"src/lib.rs\"}}}}]}}}}\n{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"source\"}}]}}}}\n",
+                workspace.path().display()
+            ),
+        )
+        .unwrap();
+        validate(&artifact, workspace.path(), &transcript, &commit, "skills").unwrap();
+    }
+
+    #[test]
     fn rejects_failed_only_pi_inspection() {
         let (workspace, commit) = committed_workspace();
         let artifact = write_inspection(
@@ -688,6 +840,28 @@ mod tests {
             &transcript,
             format!(
                 "{start}{{\"type\":\"tool_execution_end\",\"toolCallId\":\"tool-1\",\"toolName\":\"read\",\"result\":{{}},\"isError\":false}}\n"
+            ),
+        )
+        .unwrap();
+        validate(&artifact, workspace.path(), &transcript, &commit, "tests").unwrap();
+    }
+
+    #[test]
+    fn accepts_successful_pi_split_workspace_and_path_inspection() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "tests",
+            "src/lib.rs",
+            "Checked the candidate's test surface.",
+        );
+        let transcript = workspace.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"tool_execution_start\",\"toolCallId\":\"tool-1\",\"toolName\":\"read\",\"args\":{{\"cwd\":\"{}\",\"path\":\"src/lib.rs\"}}}}\n{{\"type\":\"tool_execution_end\",\"toolCallId\":\"tool-1\",\"toolName\":\"read\",\"result\":{{}},\"isError\":false}}\n",
+                workspace.path().display()
             ),
         )
         .unwrap();
