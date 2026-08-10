@@ -619,6 +619,12 @@ test_prepare_is_isolated() {
   if ( cd "$ROOT/project/main" && ./check.sh ) 2>/dev/null; then
     printf '    FAIL: fixture test should fail before the fix\n'; rc=1
   fi
+  grep -Fxq '# Test identity: first-run-smoke/greeting' \
+    "$ROOT/project/main/check.sh" \
+    || { printf '    FAIL: fixture test does not declare its structured identity\n'; rc=1; }
+  grep -Fxq 'Test: check.sh (first-run-smoke/greeting)' \
+    "$ROOT/harness/workitem/behaviors.md" \
+    || { printf '    FAIL: fixture behavior does not reference its structured test\n'; rc=1; }
 
   # The manifest records the prepared safe phase.
   [ "$(jq -r '.safe_phase' "$ROOT/harness/manifest.json")" = "prepared" ] \

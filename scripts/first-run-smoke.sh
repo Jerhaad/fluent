@@ -183,9 +183,10 @@ seed_fixture_repo() {
 
   printf 'TODO\n' > "$project/greeting.txt"
 
-  cat > "$project/check.sh" <<'CHECK'
+cat > "$project/check.sh" <<'CHECK'
 #!/usr/bin/env sh
 # Fixture test: the greeting must say hello.
+# Test identity: first-run-smoke/greeting
 grep -q '^hello$' greeting.txt
 CHECK
   chmod +x "$project/check.sh"
@@ -213,6 +214,7 @@ BRIEF
 # Behaviors
 
 WHEN the fixture test runs, THE SYSTEM SHALL find "hello" in greeting.txt.
+Test: check.sh (first-run-smoke/greeting)
 BEHAVIORS
 
   cat > "$dir/approach.md" <<'APPROACH'

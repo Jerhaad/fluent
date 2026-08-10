@@ -94,10 +94,11 @@ pub(crate) fn validate(
     if !transcript_records_successful_inspection(
         transcript_path,
         &candidate_workspace.display().to_string(),
+        expected_candidate_commit,
         &inspected_paths,
     )? {
         bail!(
-            "passing review has no successful provider tool result that identifies the candidate workspace and a declared inspected file"
+            "passing review has no successful provider tool result that identifies the candidate and a declared inspected file"
         );
     }
 
@@ -107,6 +108,7 @@ pub(crate) fn validate(
 fn transcript_records_successful_inspection(
     transcript_path: &Path,
     candidate_workspace: &str,
+    candidate_commit: &str,
     inspected_paths: &[(String, String)],
 ) -> Result<bool> {
     let source = fs::read_to_string(transcript_path).with_context(|| {
@@ -145,7 +147,12 @@ fn transcript_records_successful_inspection(
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                 );
-                if text_names_any_candidate_path(&evidence, candidate_workspace, inspected_paths) {
+                if text_names_any_candidate_path(
+                    &evidence,
+                    candidate_workspace,
+                    candidate_commit,
+                    inspected_paths,
+                ) {
                     return Ok(true);
                 }
             }
@@ -175,7 +182,12 @@ fn transcript_records_successful_inspection(
                 let Some(input) = claude_tool_inputs.get(tool_use_id) else {
                     continue;
                 };
-                if value_names_any_candidate_path(input, candidate_workspace, inspected_paths) {
+                if value_names_any_candidate_path(
+                    input,
+                    candidate_workspace,
+                    candidate_commit,
+                    inspected_paths,
+                ) {
                     return Ok(true);
                 }
             }
@@ -197,7 +209,12 @@ fn transcript_records_successful_inspection(
             let Some(input) = pi_tool_inputs.get(tool_call_id) else {
                 continue;
             };
-            if value_names_any_candidate_path(input, candidate_workspace, inspected_paths) {
+            if value_names_any_candidate_path(
+                input,
+                candidate_workspace,
+                candidate_commit,
+                inspected_paths,
+            ) {
                 return Ok(true);
             }
         }
@@ -209,22 +226,26 @@ fn transcript_records_successful_inspection(
 fn text_names_any_candidate_path(
     source: &str,
     candidate_workspace: &str,
+    candidate_commit: &str,
     inspected_paths: &[(String, String)],
 ) -> bool {
     inspected_paths.iter().any(|(relative, absolute)| {
         text_names_path(source, absolute)
             || (text_names_path(source, candidate_workspace) && text_names_path(source, relative))
+            || (text_names_path(source, candidate_commit) && text_names_path(source, relative))
     })
 }
 
 fn value_names_any_candidate_path(
     value: &serde_json::Value,
     candidate_workspace: &str,
+    candidate_commit: &str,
     inspected_paths: &[(String, String)],
 ) -> bool {
     inspected_paths.iter().any(|(relative, absolute)| {
         value_names_path(value, absolute)
             || (value_names_path(value, candidate_workspace) && value_names_path(value, relative))
+            || (value_names_path(value, candidate_commit) && value_names_path(value, relative))
     })
 }
 
@@ -435,6 +456,29 @@ mod tests {
     }
 
     #[test]
+    fn accepts_successful_codex_commit_object_inspection_without_workspace() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "skills",
+            "src/lib.rs",
+            "Checked the exact candidate object and found no skill surface.",
+        );
+        let transcript = workspace.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git show '{}:src/lib.rs'\"}}}}\n",
+                commit,
+            ),
+        )
+        .unwrap();
+
+        validate(&artifact, workspace.path(), &transcript, &commit, "skills").unwrap();
+    }
+
+    #[test]
     fn rejects_candidate_mismatch() {
         let (workspace, commit) = committed_workspace();
         let artifact = write_inspection(
@@ -632,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workspace_only_path_only_and_cross_event_evidence() {
+    fn rejects_partial_wrong_and_cross_event_candidate_evidence() {
         let (workspace, commit) = committed_workspace();
         let artifact = write_inspection(
             workspace.path(),
@@ -653,6 +697,16 @@ mod tests {
             (
                 "relative path only",
                 "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"sed -n 1,40p src/lib.rs\"}}\n".to_string(),
+            ),
+            (
+                "commit only",
+                format!(
+                    "{{\"type\":\"item.completed\",\"item\":{{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git show --stat {commit}\"}}}}\n"
+                ),
+            ),
+            (
+                "wrong commit",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\",\"exit_code\":0,\"command\":\"git show 0000000000000000000000000000000000000000:src/lib.rs\"}}\n".to_string(),
             ),
             (
                 "wrong workspace",
@@ -684,7 +738,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("identifies the candidate workspace"),
+                    .contains("identifies the candidate"),
                 "{label}: {error:#}"
             );
         }
@@ -784,6 +838,27 @@ mod tests {
             format!(
                 "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Read\",\"input\":{{\"cwd\":\"{}\",\"file_path\":\"src/lib.rs\"}}}}]}}}}\n{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"source\"}}]}}}}\n",
                 workspace.path().display()
+            ),
+        )
+        .unwrap();
+        validate(&artifact, workspace.path(), &transcript, &commit, "skills").unwrap();
+    }
+
+    #[test]
+    fn accepts_successful_claude_split_commit_and_path_inspection() {
+        let (workspace, commit) = committed_workspace();
+        let artifact = write_inspection(
+            workspace.path(),
+            &commit,
+            "skills",
+            "src/lib.rs",
+            "Checked the exact candidate object and found no skill surface.",
+        );
+        let transcript = workspace.path().join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"tool-1\",\"name\":\"Read\",\"input\":{{\"commit\":\"{commit}\",\"file_path\":\"src/lib.rs\"}}}}]}}}}\n{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"tool-1\",\"content\":\"source\"}}]}}}}\n"
             ),
         )
         .unwrap();

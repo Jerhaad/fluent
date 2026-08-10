@@ -150,12 +150,12 @@ Each path must be a canonical repository-relative file path tracked by candidate
 commit {{candidate_commit}}. Include at least one file. When no changed file is
 specific to your role, inspect a tracked candidate file that lets you establish
 that no role-specific change is required and explain that conclusion in
-`summary`. At least one successful provider tool call must identify both the
-candidate workspace above and one declared file in the same call. It may use the
-file's joined absolute path, or the workspace plus its repository-relative path
-(for example, a Git `commit:path` read). A relative path without the candidate
-workspace is insufficient. Do not write this artifact for a fail or uncertain
-verdict.
+`summary`. At least one successful provider tool call must identify the exact
+candidate and one declared file in the same call. It may use the file's joined
+absolute path, the candidate workspace plus its repository-relative path, or
+candidate commit {{candidate_commit}} plus its repository-relative path (for
+example, a Git `commit:path` read). A workspace, commit, or relative path alone
+is insufficient. Do not write this artifact for a fail or uncertain verdict.
 
 The Task completes when the review report exists at {{review_path}} and a
 passing report has valid inspection evidence at {{review_inspection_path}}.
