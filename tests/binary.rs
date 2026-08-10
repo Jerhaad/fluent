@@ -12130,9 +12130,9 @@ exit 0
         .args([
             "attempt",
             "run",
+            "--tester-no-sandbox",
             "work-1",
             "attempt-1",
-            "--tester-no-sandbox",
         ])
         .env("PATH", mock_path(&bin_dir))
         .env("FLUENT_MAX_TASK_RETRIES", "0")
@@ -12143,6 +12143,13 @@ exit 0
         resumed.status.success(),
         "repairing the Tester must resume the same Attempt: stdout={} stderr={}",
         String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&resumed.stderr).contains(
+            "Tester recovery   disabling Fluent's sandbox for exact Task attempt-1-tester"
+        ),
+        "the scheduler child capability must reach the exact Tester executor: stderr={}",
         String::from_utf8_lossy(&resumed.stderr)
     );
     assert_eq!(

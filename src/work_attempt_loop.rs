@@ -304,6 +304,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 config.attempt_id
             );
         }
+        eprintln!("  Tester recovery   approved exact paused Task {}", task.id);
         Some(task.id.clone())
     } else {
         None
@@ -597,12 +598,12 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .iter()
             .find(|task| task.status == TaskStatus::Planned && is_task_ready(task, &attempt.tasks))
         {
-            if is_review_phase_task(task) && supports_parallel_review_phase(attempt) {
+            if task.kind == TaskKind::Review && supports_parallel_review_phase(attempt) {
                 let planned_review_ids: Vec<String> = attempt
                     .tasks
                     .iter()
                     .filter(|t| {
-                        is_review_phase_task(t)
+                        t.kind == TaskKind::Review
                             && t.status == TaskStatus::Planned
                             && is_task_ready(t, &attempt.tasks)
                     })
@@ -612,6 +613,17 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 continue;
             }
 
+            let task_no_sandbox = task_uses_no_sandbox(
+                config.no_sandbox,
+                tester_no_sandbox_task_id.as_deref(),
+                &task.id,
+            );
+            if tester_no_sandbox_task_id.as_deref() == Some(task.id.as_str()) {
+                eprintln!(
+                    "  Tester recovery   disabling Fluent's sandbox for exact Task {}",
+                    task.id
+                );
+            }
             let result = work_task_executor::run_task(WorkTaskRunConfig {
                 project_root: config.project_root,
                 store: config.store,
@@ -620,11 +632,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 task_id: &task.id,
                 resolver: config.resolver,
                 extra_args: config.extra_args,
-                no_sandbox: task_uses_no_sandbox(
-                    config.no_sandbox,
-                    tester_no_sandbox_task_id.as_deref(),
-                    &task.id,
-                ),
+                no_sandbox: task_no_sandbox,
                 store_lock: None,
             })?;
             outcomes.push(WorkAttemptRunOutcome::RanTask {

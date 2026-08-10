@@ -937,3 +937,37 @@ pub enum FargateCommands {
         keep_s3: bool,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_tester_recovery(args: &[&str]) -> (bool, Vec<String>) {
+        let cli = Cli::try_parse_from(args).expect("Tester recovery command should parse");
+        match cli.command {
+            Some(Commands::Attempt {
+                command:
+                    AttemptCommands::Run {
+                        tester_no_sandbox,
+                        extra_args,
+                        ..
+                    },
+            }) => (tester_no_sandbox, extra_args),
+            _ => panic!("expected attempt run"),
+        }
+    }
+
+    #[test]
+    fn tester_recovery_capability_must_precede_trailing_attempt_arguments() {
+        let (approved, extra_args) = parsed_tester_recovery(&[
+            "fluent",
+            "attempt",
+            "run",
+            "--tester-no-sandbox",
+            "work-1",
+            "attempt-1",
+        ]);
+        assert!(approved);
+        assert!(extra_args.is_empty());
+    }
+}

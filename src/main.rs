@@ -788,6 +788,9 @@ fn cmd_attempt(
                 eprintln!("{}", guidance::format_coder_plan(&coder_mapping));
             }
 
+            if tester_no_sandbox {
+                eprintln!("  Tester recovery   validating exact paused Tester capability");
+            }
             let result = work_attempt_loop::run_attempt(WorkAttemptRunConfig {
                 project_root,
                 store: &store,

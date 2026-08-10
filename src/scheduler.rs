@@ -68,6 +68,11 @@ impl AttemptRunner for CliAttemptRunner {
         tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome> {
         let fluent_bin = std::env::current_exe()?;
+        if tester_no_sandbox {
+            eprintln!(
+                "[scheduler] approving one unsandboxed retry of the paused Tester for {attempt_id}"
+            );
+        }
         let _run_status = attempt_run_command(
             &fluent_bin,
             project_root,
@@ -108,7 +113,7 @@ fn attempt_run_command(
     let mut command = Command::new(fluent_bin);
     command
         .current_dir(project_root)
-        .args(["attempt", "run", work_item_id, attempt_id])
+        .args(["attempt", "run"])
         .env(
             crate::baseline_cache::BASELINE_SESSION_ENV,
             baseline_session,
@@ -116,6 +121,7 @@ fn attempt_run_command(
     if tester_no_sandbox {
         command.arg("--tester-no-sandbox");
     }
+    command.args([work_item_id, attempt_id]);
     command
 }
 
@@ -806,9 +812,9 @@ mod tests {
             [
                 "attempt",
                 "run",
+                "--tester-no-sandbox",
                 "work-1",
-                "attempt-1",
-                "--tester-no-sandbox"
+                "attempt-1"
             ]
         );
     }
