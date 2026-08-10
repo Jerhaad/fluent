@@ -3867,11 +3867,12 @@ Test: src/claude_diagnostics.rs (diagnostic_is_bounded_on_unicode_boundaries)
 
 ### B6
 
-WHEN Claude reports that no user is logged in,
+WHEN `claude auth status --json` returns valid JSON reporting that no user is
+logged in, regardless of the command's exit status,
 THE SYSTEM SHALL prescribe `claude /login` only when the available evidence
 indicates authentication.
 Test: src/claude_diagnostics.rs (authentication_is_the_only_recovery_that_names_login)
-Test: tests/binary.rs (coder_profile_preflight_rejects_unauthenticated_claude_status)
+Test: tests/binary.rs (coder_profile_preflight_treats_nonzero_logged_out_status_as_authentication)
 
 ### B7
 
@@ -3879,7 +3880,7 @@ IF Claude cannot report an active login because the enclosing host blocked
 credential access,
 THEN THE SYSTEM SHALL prescribe the scoped host-agent approval flow and SHALL
 NOT prescribe login.
-Test: tests/binary.rs (coder_profile_preflight_distinguishes_blocked_keychain_from_logged_out)
+Test: tests/binary.rs (coder_profile_preflight_treats_nonzero_logged_out_status_as_blocked_keychain)
 
 ### B8
 

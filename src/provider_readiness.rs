@@ -103,14 +103,8 @@ impl ProviderReadiness {
                             ),
                         )
                     })?;
-                if !output.status.success() {
-                    return Err(ProviderReadinessError::Claude(
-                        crate::claude_diagnostics::ClaudeProbeFailure::from_output(
-                            &output.stdout,
-                            &output.stderr,
-                        ),
-                    ));
-                }
+                // Claude exits with status 1 for a valid logged-out response.
+                // Decode structured status before classifying diagnostic text.
                 let status: ClaudeAuthStatus = serde_json::from_slice(&output.stdout).map_err(
                     |error| {
                         let output_failure =

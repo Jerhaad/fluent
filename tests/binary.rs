@@ -2631,14 +2631,19 @@ fn coder_profile_preflight_does_not_invoke_model() {
 }
 
 #[test]
-fn coder_profile_preflight_rejects_unauthenticated_claude_status() {
+fn coder_profile_preflight_treats_nonzero_logged_out_status_as_authentication() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     init_git_repo(tmp.path());
     write_mock_executable(
         &bin_dir,
         "claude",
-        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":false}\\n'\n",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":false}\\n'\nexit 1\n",
+    );
+    write_mock_executable(
+        &bin_dir,
+        "security",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"find-generic-password -s Claude Code-credentials\" ]\n",
     );
 
     fluent_cmd()
@@ -2757,14 +2762,14 @@ fn coder_profile_preflight_redacts_failed_claude_diagnostics() {
 }
 
 #[test]
-fn coder_profile_preflight_distinguishes_blocked_keychain_from_logged_out() {
+fn coder_profile_preflight_treats_nonzero_logged_out_status_as_blocked_keychain() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     init_git_repo(tmp.path());
     write_mock_executable(
         &bin_dir,
         "claude",
-        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":false}\\n'\n",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":false}\\n'\nexit 1\n",
     );
     write_mock_executable(
         &bin_dir,
@@ -2880,7 +2885,7 @@ fn coder_profile_preflight_reports_every_failed_provider_without_mutation() {
     write_mock_executable(
         &bin_dir,
         "claude",
-        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ]\nexit 1\n",
+        "#!/bin/bash\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf 'unexpected auth output\\n'\nexit 1\n",
     );
     write_mock_executable(
         &bin_dir,
@@ -2916,6 +2921,7 @@ fn coder_profile_preflight_reports_every_failed_provider_without_mutation() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("FLUENT_CLAUDE_PROBE_FAILED"), "{stderr}");
+    assert!(stderr.contains("returned invalid JSON"), "{stderr}");
     assert!(!stderr.contains("/login"), "{stderr}");
     assert!(
         stderr.contains("pi: command readiness check failed"),

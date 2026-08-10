@@ -1498,7 +1498,11 @@ names `claude /login`. A configured `fluent init` failure tells the user to
 retry the same initialization command; a Task failure records a resumable
 same-Attempt pause and names `fluent attempt run`. This keeps a provider outage
 or an enclosing sandbox's denied Keychain access from masquerading as a bad
-login.
+login. Readiness treats valid `claude auth status --json` output as the
+authoritative status even when the command exits nonzero because Claude can
+return a logged-out JSON status with exit code 1. For a logged-out status,
+Fluent probes the Claude Code Keychain entry to distinguish an inaccessible
+host credential boundary from an actual logout.
 
 The coder returns a typed `AuthError` (via `anyhow::Error::new`) instead of a plain
 string `bail!`, so callers can recover the type via
