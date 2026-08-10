@@ -12010,6 +12010,7 @@ fn tester_recovery_reruns_same_tester_without_writer() {
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-tester-recovery");
     let writer_counter = tmp.path().join("writer-count");
+    let boundary_log = tmp.path().join("tester-recovery-boundary.log");
     write_mock_claude(
         &bin_dir,
         &format!(
@@ -12043,7 +12044,6 @@ exit 0
             counter = writer_counter.display()
         ),
     );
-
     fs::write(
         main_dir.join(".fluent/extract-tester-results"),
         "#!/bin/sh\necho not-json\n",
@@ -12096,6 +12096,7 @@ exit 0
     );
     assert_eq!(paused["attempts"][0]["pause_kind"], "tester-harness");
     assert_eq!(fs::read_to_string(&writer_counter).unwrap().trim(), "1");
+    write_mock_sandbox_exec(&bin_dir);
 
     let candidate_workspace = main_dir.join(
         paused["attempts"][0]["tasks"]
@@ -12126,9 +12127,16 @@ exit 0
     .unwrap();
     let resumed = fluent_cmd()
         .current_dir(&main_dir)
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args([
+            "attempt",
+            "run",
+            "work-1",
+            "attempt-1",
+            "--tester-no-sandbox",
+        ])
         .env("PATH", mock_path(&bin_dir))
         .env("FLUENT_MAX_TASK_RETRIES", "0")
+        .env("FLUENT_TEST_TESTER_BOUNDARY_LOG", &boundary_log)
         .output()
         .unwrap();
     assert!(
@@ -12141,6 +12149,11 @@ exit 0
         fs::read_to_string(&writer_counter).unwrap().trim(),
         "1",
         "resuming a Tester harness pause must not rerun the completed Writer"
+    );
+    assert_eq!(
+        fs::read_to_string(&boundary_log).unwrap(),
+        "run_with_sandbox_profile sandboxed=false\n",
+        "the internal recovery capability applies to the paused Tester boundary"
     );
 }
 
@@ -12224,8 +12237,10 @@ fn tester_nested_sandbox_diagnosis_does_not_rewrite_project() {
         .args(["tester", "check", "--no-sandbox"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Disable SwiftPM's inner sandbox"))
-        .stderr(predicate::str::contains("project-local cache paths"));
+        .stderr(predicate::str::contains(
+            "Xcode's embedded SwiftPM could not create its manifest sandbox",
+        ))
+        .stderr(predicate::str::contains("fluent tester check --no-sandbox"));
     assert_eq!(
         fs::read(main_dir.join(".fluent/tester.yaml")).unwrap(),
         tester_before
@@ -20984,6 +20999,29 @@ fn queue_resume_records_exact_authorization_and_is_idempotent() {
         })
         .unwrap();
     queue::reconcile_active(tmp.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "queue",
+            "resume",
+            "wi-resume",
+            "--attempt",
+            "attempt-1",
+            "--no-sandbox",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("paused at tester-harness"));
+    assert_eq!(
+        queue::read_ledger(tmp.path(), "wi-resume")
+            .unwrap()
+            .unwrap()
+            .dispatches
+            .len(),
+        1,
+        "a rejected no-sandbox approval must not mutate the queue"
+    );
 
     fluent_cmd()
         .current_dir(tmp.path())

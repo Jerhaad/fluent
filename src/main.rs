@@ -687,6 +687,7 @@ fn cmd_attempt(
             work_item_id,
             attempt_id,
             no_sandbox,
+            tester_no_sandbox,
             coder,
             model,
             effort,
@@ -795,6 +796,7 @@ fn cmd_attempt(
                 resolver,
                 extra_args: &extra_args,
                 no_sandbox: no_sandbox || global_no_sandbox,
+                tester_no_sandbox,
                 coder_mapping_inputs: cli_inputs.has_run_overrides().then_some(&cli_inputs),
             })?;
             // Resolve the runtime context the guidance hints need — why the
@@ -1286,8 +1288,15 @@ fn cmd_queue(project_root: &Path, command: QueueCommands) -> Result<()> {
             work_item_id,
             attempt,
             priority,
+            no_sandbox,
         } => {
-            let outcome = fluent::queue::resume(project_root, &work_item_id, &attempt, priority)?;
+            let outcome = fluent::queue::resume_with_tester_no_sandbox(
+                project_root,
+                &work_item_id,
+                &attempt,
+                priority,
+                no_sandbox,
+            )?;
             match outcome {
                 fluent::queue::ResumeDispatchOutcome::Created => {
                     println!("Queued resume of Attempt {attempt} for Work Item {work_item_id}")

@@ -196,6 +196,10 @@ pub struct WorkAttemptRunConfig<'a> {
     pub resolver: &'a ContentResolver,
     pub extra_args: &'a [String],
     pub no_sandbox: bool,
+    /// One internal scheduler recovery capability. It is accepted only for an
+    /// Attempt currently paused at `tester-harness` and applies only to that
+    /// exact `NeedsUser` Tester Task.
+    pub tester_no_sandbox: bool,
     /// Explicit CLI mapping fields for this invocation. Overlay them on the
     /// freshly locked Attempt mapping under the land lock.
     pub coder_mapping_inputs: Option<&'a CoderMappingInputs>,
@@ -268,7 +272,42 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
 }
 
 fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunResult> {
-    read_work_item_or_not_found(config.store, config.work_item_id)?.ensure_mutation_compatible()?;
+    let initial_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
+    initial_item.ensure_mutation_compatible()?;
+    let tester_no_sandbox_task_id = if config.tester_no_sandbox {
+        let attempt = initial_item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == config.attempt_id)
+            .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::TesterHarness)
+        {
+            bail!(
+                "Tester no-sandbox recovery requires Attempt {:?} to be paused at tester-harness",
+                config.attempt_id
+            );
+        }
+        let mut tasks = attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::NeedsUser);
+        let task = tasks.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Attempt {:?} has no paused Tester Task for no-sandbox recovery",
+                config.attempt_id
+            )
+        })?;
+        if tasks.next().is_some() {
+            bail!(
+                "Attempt {:?} has more than one paused Tester Task; refusing ambiguous no-sandbox recovery",
+                config.attempt_id
+            );
+        }
+        Some(task.id.clone())
+    } else {
+        None
+    };
     if let Some(inputs) = config.coder_mapping_inputs {
         let _land_lock =
             crate::land_lock::acquire(&crate::land_lock::lock_path(config.project_root))?;
@@ -581,7 +620,11 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 task_id: &task.id,
                 resolver: config.resolver,
                 extra_args: config.extra_args,
-                no_sandbox: config.no_sandbox,
+                no_sandbox: task_uses_no_sandbox(
+                    config.no_sandbox,
+                    tester_no_sandbox_task_id.as_deref(),
+                    &task.id,
+                ),
                 store_lock: None,
             })?;
             outcomes.push(WorkAttemptRunOutcome::RanTask {
@@ -720,6 +763,14 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             config.attempt_id
         );
     }
+}
+
+fn task_uses_no_sandbox(
+    all_tasks_no_sandbox: bool,
+    approved_tester_task_id: Option<&str>,
+    task_id: &str,
+) -> bool {
+    all_tasks_no_sandbox || approved_tester_task_id == Some(task_id)
 }
 
 /// Run the Learner with the run-level configuration, mapping a per-run
@@ -7062,6 +7113,25 @@ mod tests {
     };
 
     #[test]
+    fn tester_only_no_sandbox_capability_does_not_apply_to_other_tasks() {
+        assert!(task_uses_no_sandbox(
+            false,
+            Some("attempt-1-tester-8"),
+            "attempt-1-tester-8"
+        ));
+        assert!(!task_uses_no_sandbox(
+            false,
+            Some("attempt-1-tester-8"),
+            "attempt-1-review-tests-9"
+        ));
+        assert!(task_uses_no_sandbox(
+            true,
+            Some("attempt-1-tester-8"),
+            "attempt-1-review-tests-9"
+        ));
+    }
+
+    #[test]
     fn learner_normalization_notes_are_persisted() {
         let draft = LearnerDraftV1 {
             learning_summary: String::new(),
@@ -7759,6 +7829,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         }) {
@@ -10982,6 +11053,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: Some(&run_coder),
         })
@@ -14817,6 +14889,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15034,6 +15107,7 @@ mod tests {
                 resolver: &resolver,
                 extra_args: &[],
                 no_sandbox: true,
+                tester_no_sandbox: false,
                 coder_mapping_inputs: None,
                 learner_run_coder: None,
             })
@@ -15181,6 +15255,7 @@ mod tests {
                 resolver: &resolver,
                 extra_args: &[],
                 no_sandbox: true,
+                tester_no_sandbox: false,
                 coder_mapping_inputs: None,
                 learner_run_coder: None,
             })
@@ -15253,6 +15328,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15297,6 +15373,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15331,6 +15408,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15360,6 +15438,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15392,6 +15471,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -15676,6 +15756,7 @@ mod tests {
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
+            tester_no_sandbox: false,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })

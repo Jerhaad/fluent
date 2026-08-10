@@ -620,7 +620,7 @@ fn run_with_prepared_sandbox_profile_and_collector(
             .is_some_and(|stderr| is_nested_swiftpm_sandbox_failure(&result.command, &stderr))
     }) {
         let details = format!(
-            "The Tester sandbox already confines `{}`. Disable SwiftPM's inner sandbox (for example, pass --disable-sandbox) and configure writable project-local cache paths before retrying. Fluent did not modify .fluent/tester.yaml or project scripts.",
+            "Xcode's embedded SwiftPM could not create its manifest sandbox inside Fluent's Tester sandbox while running `{}`. Fluent kept its sandbox enabled and did not modify .fluent/tester.yaml or project scripts. For a trusted direct check from a host shell that is not itself sandboxed, rerun `fluent tester check --no-sandbox`; a queued Work Attempt provides an exact one-run recovery command in its needs-user handoff.",
             result.command
         );
         eprintln!("  Tester guidance: {details}");
@@ -992,6 +992,17 @@ fn is_nested_swiftpm_sandbox_failure(command: &str, stderr: &str) -> bool {
     (command.contains("swift") || stderr.contains("swift package manager"))
         && stderr.contains("sandbox-exec")
         && (stderr.contains("sandbox_apply") || stderr.contains("operation not permitted"))
+}
+
+/// Whether persisted Tester evidence identifies Xcode/SwiftPM's unsupported
+/// nested sandbox boundary. This is advisory classification for the recovery
+/// handoff; unreadable evidence remains a generic Tester-harness failure.
+pub fn is_nested_swiftpm_harness_error(artifact_dir: &Path) -> bool {
+    fs::read(artifact_dir.join("tester-results.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<TesterResults>(&bytes).ok())
+        .and_then(|results| results.error)
+        .is_some_and(|error| error.kind == "nested_swiftpm_sandbox")
 }
 
 fn write_results(artifact_dir: &Path, results: &TesterResults) -> Result<()> {
@@ -1697,6 +1708,17 @@ mod tests {
             "cargo test",
             "sandbox-exec: sandbox_apply: Operation not permitted"
         ));
+
+        let artifact = TempDir::new().unwrap();
+        persist_harness_error(
+            artifact.path(),
+            "nested_swiftpm_sandbox",
+            "nested sandbox".to_string(),
+            "details".to_string(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(is_nested_swiftpm_harness_error(artifact.path()));
     }
 
     #[test]

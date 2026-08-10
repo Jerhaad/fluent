@@ -1543,6 +1543,7 @@ fn is_resumable_task_failure(error: &anyhow::Error) -> bool {
             | TaskFailure::TranscriptPump(_)
             | TaskFailure::HostSandbox(_)
             | TaskFailure::TesterHarness
+            | TaskFailure::TesterNestedSwiftPmSandbox
             | TaskFailure::ProviderUnavailable(_)
     )
 }
@@ -1979,7 +1980,7 @@ fn run_tester_task_with_settlement_preparer(
     ) {
         Ok(sandbox) => sandbox,
         Err(error) => {
-            settle_tester_harness_failure(&config)?;
+            settle_tester_harness_failure(&config, false)?;
             return Err(error);
         }
     };
@@ -2029,12 +2030,15 @@ fn run_tester_task_with_settlement_preparer(
         Ok(crate::tester::TesterOutcome::Passed | crate::tester::TesterOutcome::TestFailures) => {}
         Ok(crate::tester::TesterOutcome::HarnessError) => {
             let error = anyhow::anyhow!("Tester harness could not produce trustworthy evidence");
-            settle_tester_harness_failure(&config)?;
+            settle_tester_harness_failure(
+                &config,
+                crate::tester::is_nested_swiftpm_harness_error(&artifact_dir),
+            )?;
             return Err(error);
         }
         Err(error) => {
             eprintln!("  Tester error: {error:#}");
-            settle_tester_harness_failure(&config)?;
+            settle_tester_harness_failure(&config, false)?;
             return Err(error);
         }
     }
@@ -2042,7 +2046,7 @@ fn run_tester_task_with_settlement_preparer(
     if let Err(error) =
         crate::tester::bind_candidate_commit(&artifact_dir, &review_context.candidate_commit)
     {
-        settle_tester_harness_failure(&config)?;
+        settle_tester_harness_failure(&config, false)?;
         return Err(error);
     }
 
@@ -2057,7 +2061,7 @@ fn run_tester_task_with_settlement_preparer(
     }
 
     if !results_path.is_file() {
-        settle_tester_harness_failure(&config)?;
+        settle_tester_harness_failure(&config, false)?;
         bail!(
             "Tester Task {:?} completed without writing {}",
             config.task_id,
@@ -2071,7 +2075,7 @@ fn run_tester_task_with_settlement_preparer(
     match complete_tester_task(&config, &results_path) {
         Ok(result) => Ok(result),
         Err(error) => {
-            settle_tester_harness_failure(&config)?;
+            settle_tester_harness_failure(&config, false)?;
             Err(error)
         }
     }
@@ -2179,7 +2183,15 @@ fn plan_failed_command_recheck(
 /// Settle an unlaunched or failed Tester through the recoverable pause boundary.
 /// If that persistence fails, record a hard Task failure so this reservation is
 /// never left executing.
-fn settle_tester_harness_failure(config: &WorkTaskRunConfig<'_>) -> Result<()> {
+fn settle_tester_harness_failure(
+    config: &WorkTaskRunConfig<'_>,
+    nested_swiftpm_sandbox: bool,
+) -> Result<()> {
+    let failure = if nested_swiftpm_sandbox {
+        TaskFailure::TesterNestedSwiftPmSandbox
+    } else {
+        TaskFailure::TesterHarness
+    };
     if let Err(pause_error) = lock_mark_task_failed_attempt_needs_user(
         config.store,
         config.store_lock,
@@ -2187,7 +2199,7 @@ fn settle_tester_harness_failure(config: &WorkTaskRunConfig<'_>) -> Result<()> {
         config.work_item_id,
         config.attempt_id,
         config.task_id,
-        &TaskFailure::TesterHarness,
+        &failure,
         &crate::notify::notify,
     ) {
         lock_mark_task_failed(
@@ -2601,6 +2613,10 @@ enum TaskFailure {
     HostSandbox(String),
     /// Tester configuration, sandbox, extraction, or result persistence failed.
     TesterHarness,
+    /// Xcode's embedded SwiftPM could not create its manifest sandbox inside
+    /// Fluent's outer Tester sandbox. An explicit one-dispatch approval may
+    /// retry the same Tester Task without the outer sandbox.
+    TesterNestedSwiftPmSandbox,
     /// The Writer returned without a commit and its required no-change evidence
     /// was missing or malformed. Resume retries the same Writer Task after the
     /// operator inspects the completion failure.
@@ -2725,6 +2741,7 @@ fn mark_task_failed_attempt_needs_user(
             | TaskFailure::TranscriptPump(_)
             | TaskFailure::HostSandbox(_)
             | TaskFailure::TesterHarness
+            | TaskFailure::TesterNestedSwiftPmSandbox
             | TaskFailure::WriterCompletion(_) => TaskStatus::NeedsUser,
             TaskFailure::ProviderUnavailable(_) => TaskStatus::NeedsUser,
             TaskFailure::Generic => TaskStatus::Failed,
@@ -2737,7 +2754,9 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::Auth(_) => crate::work_model::PauseKind::Auth,
             TaskFailure::TranscriptPump(_) => crate::work_model::PauseKind::TranscriptPump,
             TaskFailure::HostSandbox(_) => crate::work_model::PauseKind::HostSandbox,
-            TaskFailure::TesterHarness => crate::work_model::PauseKind::TesterHarness,
+            TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox => {
+                crate::work_model::PauseKind::TesterHarness
+            }
             TaskFailure::WriterCompletion(_) => crate::work_model::PauseKind::WriterCompletion,
             TaskFailure::ProviderUnavailable(_) => {
                 crate::work_model::PauseKind::ProviderUnavailable
@@ -2769,6 +2788,12 @@ fn mark_task_failed_attempt_needs_user(
             TaskFailure::TesterHarness => notify_fn(
                 "Fluent",
                 "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
+            ),
+            TaskFailure::TesterNestedSwiftPmSandbox => notify_fn(
+                "Fluent",
+                &format!(
+                    "Xcode's embedded SwiftPM cannot create its sandbox inside Fluent's Tester sandbox. To trust and retry this exact Tester Task without Fluent's outer sandbox, run 'fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox', then run or reuse 'fluent scheduler run' from a host shell that is not itself sandboxed."
+                ),
             ),
             TaskFailure::WriterCompletion(_) => notify_fn(
                 "Fluent",
@@ -2880,6 +2905,9 @@ fn write_task_error_handoff(
         TaskFailure::TesterHarness => format!(
             "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Repair the Tester configuration, extractor, sandbox, or result persistence, then retry this Attempt.\n"
         ),
+        TaskFailure::TesterNestedSwiftPmSandbox => format!(
+            "# Tester needs explicit sandbox approval\n\nTester Task {task_id:?} could not produce trustworthy evidence because Xcode's embedded SwiftPM cannot create its manifest sandbox inside Fluent's Tester sandbox. Fluent kept its sandbox enabled and did not modify the project.\n\nIf you trust this candidate, approve one exact scheduler recovery with:\n\n    fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox\n\nThen run or reuse `fluent scheduler run` from a host shell that is not itself sandboxed. Fluent will retry this same Tester Task without its outer Tester sandbox; the candidate's test commands will run with the scheduler process's host permissions. Any enclosing agent sandbox still applies and can reproduce the same Xcode failure. The approval is recorded on this resume dispatch only.\n"
+        ),
         TaskFailure::WriterCompletion(diagnostic) => format!(
             "# Writer completion needs repair\n\nWriter Task {task_id:?} returned without a commit, but its no-change evidence was not valid:\n\n    {diagnostic}\n\nInspect the candidate and resume this same Attempt to retry the Writer Task.\n"
         ),
@@ -2922,7 +2950,10 @@ fn lock_mark_task_failed_attempt_needs_user(
         .ok()
         .as_deref()
         == Some("fail")
-        && matches!(failure, TaskFailure::TesterHarness)
+        && matches!(
+            failure,
+            TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox
+        )
     {
         bail!("test-injected Tester pause persistence failure");
     }
@@ -7866,6 +7897,30 @@ mod tests {
         assert!(handoff.contains("per-command approval"), "{handoff}");
         assert!(handoff.contains("fluent attempt run work-1"), "{handoff}");
         assert!(!handoff.contains("/login"), "{handoff}");
+    }
+
+    #[test]
+    fn nested_swiftpm_handoff_names_exact_one_dispatch_approval() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterNestedSwiftPmSandbox,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(
+            handoff.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+            "{handoff}"
+        );
+        assert!(handoff.contains("same Tester Task"), "{handoff}");
+        assert!(handoff.contains("host permissions"), "{handoff}");
+        assert!(handoff.contains("host shell"), "{handoff}");
+        assert!(handoff.contains("enclosing agent sandbox"), "{handoff}");
+        assert!(handoff.contains("resume dispatch only"), "{handoff}");
     }
 
     #[test]

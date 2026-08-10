@@ -52,6 +52,7 @@ pub trait AttemptRunner: Send + Sync {
         project_root: &Path,
         work_item_id: &str,
         attempt_id: &str,
+        tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome>;
 }
 
@@ -64,6 +65,7 @@ impl AttemptRunner for CliAttemptRunner {
         project_root: &Path,
         work_item_id: &str,
         attempt_id: &str,
+        tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome> {
         let fluent_bin = std::env::current_exe()?;
         let _run_status = attempt_run_command(
@@ -72,6 +74,7 @@ impl AttemptRunner for CliAttemptRunner {
             work_item_id,
             attempt_id,
             scheduler_baseline_session(),
+            tester_no_sandbox,
         )
         .status()?;
 
@@ -100,6 +103,7 @@ fn attempt_run_command(
     work_item_id: &str,
     attempt_id: &str,
     baseline_session: &str,
+    tester_no_sandbox: bool,
 ) -> Command {
     let mut command = Command::new(fluent_bin);
     command
@@ -109,6 +113,9 @@ fn attempt_run_command(
             crate::baseline_cache::BASELINE_SESSION_ENV,
             baseline_session,
         );
+    if tester_no_sandbox {
+        command.arg("--tester-no-sandbox");
+    }
     command
 }
 
@@ -505,7 +512,12 @@ fn run_claimed(
     let token = queue::mark_running(project_root, &token)?;
     eprintln!("[scheduler] starting {work_item_id}");
 
-    let outcome = runner.run(project_root, &work_item_id, &token.bound_attempt_id)?;
+    let outcome = runner.run(
+        project_root,
+        &work_item_id,
+        &token.bound_attempt_id,
+        token.tester_no_sandbox,
+    )?;
 
     let status = outcome.to_dispatch_status();
     queue::reconcile(project_root, &token, status)?;
@@ -656,6 +668,7 @@ pub(crate) mod test_support {
             _project_root: &Path,
             work_item_id: &str,
             _attempt_id: &str,
+            _tester_no_sandbox: bool,
         ) -> Result<AttemptOutcome> {
             self.invocations
                 .lock()
@@ -676,6 +689,7 @@ pub(crate) mod test_support {
             project_root: &Path,
             work_item_id: &str,
             attempt_id: &str,
+            _tester_no_sandbox: bool,
         ) -> Result<AttemptOutcome> {
             make_attempt_pass_with_candidate(project_root, work_item_id, attempt_id);
             Ok(AttemptOutcome::CandidateReady)
@@ -762,6 +776,7 @@ mod tests {
             "work-1",
             "attempt-1",
             "scheduler-session-1",
+            false,
         );
         let session = command
             .get_envs()
@@ -773,6 +788,28 @@ mod tests {
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["attempt", "run", "work-1", "attempt-1"]
+        );
+    }
+
+    #[test]
+    fn scheduler_child_uses_tester_only_capability_for_approved_recovery() {
+        let approved = attempt_run_command(
+            Path::new("/tmp/fluent"),
+            Path::new("/tmp/project"),
+            "work-1",
+            "attempt-1",
+            "scheduler-session-1",
+            true,
+        );
+        assert_eq!(
+            approved.get_args().collect::<Vec<_>>(),
+            [
+                "attempt",
+                "run",
+                "work-1",
+                "attempt-1",
+                "--tester-no-sandbox"
+            ]
         );
     }
 
@@ -1109,18 +1146,30 @@ mod tests {
     struct AttemptRecordingRunner {
         outcome: AttemptOutcome,
         attempts: std::sync::Mutex<Vec<String>>,
+        tester_no_sandbox: std::sync::Mutex<Vec<bool>>,
     }
     impl AttemptRecordingRunner {
         fn new(outcome: AttemptOutcome) -> Self {
             Self {
                 outcome,
                 attempts: std::sync::Mutex::new(Vec::new()),
+                tester_no_sandbox: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     impl AttemptRunner for AttemptRecordingRunner {
-        fn run(&self, _p: &Path, _wi: &str, attempt_id: &str) -> Result<AttemptOutcome> {
+        fn run(
+            &self,
+            _p: &Path,
+            _wi: &str,
+            attempt_id: &str,
+            tester_no_sandbox: bool,
+        ) -> Result<AttemptOutcome> {
             self.attempts.lock().unwrap().push(attempt_id.to_string());
+            self.tester_no_sandbox
+                .lock()
+                .unwrap()
+                .push(tester_no_sandbox);
             Ok(self.outcome)
         }
     }
@@ -1438,6 +1487,47 @@ mod tests {
     }
 
     #[test]
+    fn tester_recovery_dispatch_forwards_one_run_no_sandbox_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume", "Resume Tester");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        add_queued(dir.path(), "wi-resume", 0);
+        queue::claim(dir.path(), "wi-resume", "attempt-1")
+            .unwrap()
+            .unwrap();
+        store
+            .mutate_work_item("wi-resume", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::TesterHarness);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-resume", DispatchStatus::NeedsUser).unwrap();
+        queue::resume_with_tester_no_sandbox(dir.path(), "wi-resume", "attempt-1", None, true)
+            .unwrap();
+
+        let runner = AttemptRecordingRunner::new(AttemptOutcome::NeedsUser);
+        let resumed = active_dispatch(dir.path(), "wi-resume");
+        dispatch_one(dir.path(), &resumed, &runner).unwrap();
+
+        assert_eq!(runner.attempts.lock().unwrap().as_slice(), ["attempt-1"]);
+        assert_eq!(runner.tester_no_sandbox.lock().unwrap().as_slice(), [true]);
+        let terminal = queue::read_ledger(dir.path(), "wi-resume")
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.latest().unwrap().status, DispatchStatus::NeedsUser);
+        assert!(
+            terminal.latest().unwrap().tester_no_sandbox,
+            "the terminal dispatch retains the approval as audit evidence"
+        );
+    }
+
+    #[test]
     fn abandoned_queued_work_is_canceled_before_attempt() {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path());
@@ -1560,7 +1650,13 @@ mod tests {
         // A runner that lingers so shutdown arrives while its Attempt is live.
         struct SlowRunner;
         impl AttemptRunner for SlowRunner {
-            fn run(&self, _p: &Path, _wi: &str, _a: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                _wi: &str,
+                _a: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 std::thread::sleep(Duration::from_millis(300));
                 Ok(AttemptOutcome::CandidateReady)
             }
@@ -1615,7 +1711,13 @@ mod tests {
             root: std::path::PathBuf,
         }
         impl AttemptRunner for InspectRunner {
-            fn run(&self, _p: &Path, wi: &str, attempt_id: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                wi: &str,
+                attempt_id: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 let ledger = queue::read_ledger(&self.root, wi).unwrap().unwrap();
                 let active = ledger.active().unwrap();
                 assert_eq!(active.bound_attempt_id.as_deref(), Some(attempt_id));
@@ -1663,7 +1765,13 @@ mod tests {
             root: std::path::PathBuf,
         }
         impl AttemptRunner for RunningCheckRunner {
-            fn run(&self, _p: &Path, wi: &str, _a: &str) -> Result<AttemptOutcome> {
+            fn run(
+                &self,
+                _p: &Path,
+                wi: &str,
+                _a: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
                 let ledger = queue::read_ledger(&self.root, wi).unwrap().unwrap();
                 assert_eq!(
                     ledger.active().unwrap().status,

@@ -4656,6 +4656,53 @@ Test: src/work_status.rs (resumable_needs_user_status_names_exact_queue_resume_c
 Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent,
 status_reports_queued_work_without_live_scheduler)
 
+### B2g
+
+WHEN `fluent queue resume <work-item-id> --attempt <attempt-id> --no-sandbox`
+names the current Attempt paused at `tester-harness`, THE SYSTEM SHALL append a
+resume dispatch that durably records the exact Attempt binding and one Tester
+no-sandbox approval. The terminal dispatch SHALL retain that approval as audit
+evidence.
+Test: src/queue.rs (tester_no_sandbox_approval_is_durable_and_idempotent)
+Test: src/scheduler.rs (tester_recovery_dispatch_forwards_one_run_no_sandbox_approval)
+
+### B2h
+
+IF `fluent queue resume ... --no-sandbox` names an Attempt not paused at
+`tester-harness`, or an ordinary run dispatch carries Tester no-sandbox
+approval, THEN THE SYSTEM SHALL reject it without changing or claiming the
+queue entry.
+Test: src/queue.rs (tester_no_sandbox_resume_rejects_non_tester_pause_without_mutation,
+tester_no_sandbox_claim_revalidates_the_tester_pause,
+claim_rejects_no_sandbox_approval_on_ordinary_dispatch)
+Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent)
+
+### B2i
+
+WHEN the scheduler runs an approved Tester no-sandbox resume dispatch, THE
+SYSTEM SHALL retry only the exact paused Tester Task without Fluent's Tester
+sandbox while preserving completed Writer Tasks.
+Test: src/scheduler.rs (scheduler_child_uses_tester_only_capability_for_approved_recovery,
+tester_recovery_dispatch_forwards_one_run_no_sandbox_approval)
+Test: tests/binary.rs (tester_recovery_reruns_same_tester_without_writer)
+
+### B2j
+
+WHILE an approved Tester no-sandbox resume is advancing the Attempt, THE SYSTEM
+SHALL keep every other Work Task on its ordinary sandbox policy.
+Test: src/work_attempt_loop.rs (tester_only_no_sandbox_capability_does_not_apply_to_other_tasks)
+
+### B2k
+
+WHEN a production Tester pauses because Xcode's embedded SwiftPM cannot create
+its manifest sandbox inside Fluent's Tester sandbox, THE SYSTEM SHALL keep the
+default sandbox enabled, SHALL NOT rewrite project configuration, and SHALL
+write a needs-user handoff naming the exact `fluent queue resume ...
+--no-sandbox` command and the resulting host-permission boundary.
+Test: src/tester.rs (tester_diagnoses_nested_swiftpm_sandbox_failure)
+Test: src/work_task_executor.rs (nested_swiftpm_handoff_names_exact_one_dispatch_approval)
+Test: tests/binary.rs (tester_nested_sandbox_diagnosis_does_not_rewrite_project)
+
 ### B3
 
 WHEN `fluent queue list` is invoked,

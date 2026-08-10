@@ -506,6 +506,21 @@ result extractor. Nested Fluent processes created by the repository test suite
 therefore cannot join, publish to, or recursively capture the outer scheduler's
 baseline session.
 
+Xcode's embedded SwiftPM manifest sandbox cannot apply inside Fluent's
+restrictive outer Tester Seatbelt profile. Fluent does not weaken that profile
+automatically: even a minimally restricted outer profile can block the inner
+`sandbox_apply`, while permitting arbitrary child profiles would let a project
+command escape the outer policy. A production occurrence is therefore persisted
+as a `tester-harness` pause with an exact recovery handoff. If the user trusts
+the candidate, `fluent queue resume <work-item-id> --attempt <attempt-id>
+--no-sandbox` records one dispatch-scoped approval. The scheduler translates it
+to an internal Tester-only Attempt capability, which is validated against the
+single `NeedsUser` Tester Task before the Attempt is reopened and consumed only
+when that Task launches. Completed Writers are not rerun, and later Writers,
+reviewers, Testers, and the Learner retain the ordinary sandbox policy. The
+scheduler must itself run from a host boundary that permits the Xcode child
+sandbox; an enclosing agent sandbox still applies.
+
 For a Tester that runs as a Work Task, Fluent reads and validates its
 configuration without creating paths, then durably reserves the Task before it
 creates the Task artifact area or any guarded process-settlement directory.
@@ -2913,6 +2928,15 @@ active is idempotent; a later needs-user outcome requires a new explicit
 authorization. Mismatched Attempts, unsupported pause kinds, unrelated active
 dispatches, and contradictory terminal history fail without queue mutation.
 Legacy dispatches omit the new fields and deserialize as ordinary run intent.
+
+For the narrow Xcode/SwiftPM recovery, the same command accepts `--no-sandbox`
+only while the exact current Attempt is paused at `tester-harness`. Its new
+dispatch records `tester_no_sandbox: true`; ordinary and legacy dispatches omit
+that default-false field. Admission and claim both revalidate the pause and
+intent, and a repeated resume must match the stored approval. The terminal
+dispatch retains the value for audit, while any later pause requires a new
+explicit resume. This flag never maps to the broad public `attempt run
+--no-sandbox` policy.
 
 Automatic promotion enqueues through `ensure_dispatch`, which reconciles
 or creates one origin-bound dispatch without reviving terminal history. A

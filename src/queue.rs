@@ -91,6 +91,10 @@ impl DispatchIntent {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One dispatch of a Work Item onto the queue: a single trip from `queued`
 /// through a bound Attempt to a terminal disposition.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -130,6 +134,10 @@ pub struct Dispatch {
     /// Reason a dispatch was blocked, when `status` is `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// One-dispatch approval to rerun a Tester-harness recovery without the
+    /// Fluent Tester sandbox. Only explicit resume admission may set this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tester_no_sandbox: bool,
 }
 
 impl Dispatch {
@@ -152,6 +160,7 @@ impl Dispatch {
             origin_operation_id,
             resume_of_dispatch_id: None,
             blocked_reason: None,
+            tester_no_sandbox: false,
         }
     }
 
@@ -160,6 +169,7 @@ impl Dispatch {
         attempt_id: &str,
         priority: i64,
         resume_of_dispatch_id: Option<String>,
+        tester_no_sandbox: bool,
         sequence: u64,
     ) -> Self {
         Self {
@@ -175,6 +185,7 @@ impl Dispatch {
             origin_operation_id: None,
             resume_of_dispatch_id,
             blocked_reason: None,
+            tester_no_sandbox,
         }
     }
 }
@@ -189,6 +200,7 @@ pub struct DispatchToken {
     pub generation: u64,
     pub bound_attempt_id: String,
     pub priority: i64,
+    pub tester_no_sandbox: bool,
 }
 
 /// Result of reconciling an automatic enqueue intent with the durable ledger.
@@ -349,6 +361,7 @@ fn parse_ledger(content: &str) -> Result<DispatchLedger> {
             origin_operation_id: None,
             resume_of_dispatch_id: None,
             blocked_reason: None,
+            tester_no_sandbox: false,
         };
         Ok(DispatchLedger {
             work_item_id: legacy.work_item_id,
@@ -419,6 +432,18 @@ pub fn resume(
     attempt_id: &str,
     priority: Option<i64>,
 ) -> Result<ResumeDispatchOutcome> {
+    resume_with_tester_no_sandbox(project_root, id, attempt_id, priority, false)
+}
+
+/// Explicitly authorize one scheduler recovery, optionally approving the
+/// already-paused Tester Task to run without Fluent's outer Tester sandbox.
+pub fn resume_with_tester_no_sandbox(
+    project_root: &Path,
+    id: &str,
+    attempt_id: &str,
+    priority: Option<i64>,
+    tester_no_sandbox: bool,
+) -> Result<ResumeDispatchOutcome> {
     if !work_item_exists(project_root, id) {
         bail!("Work Item {id:?} not found");
     }
@@ -444,6 +469,12 @@ pub fn resume(
         if active.intent == DispatchIntent::ResumeAttempt
             && active.bound_attempt_id.as_deref() == Some(attempt_id)
         {
+            if active.tester_no_sandbox != tester_no_sandbox {
+                bail!(
+                    "resume of Attempt {attempt_id:?} is already queued with tester_no_sandbox={}; remove it before changing that approval",
+                    active.tester_no_sandbox
+                );
+            }
             if let Some(priority) = priority {
                 active.priority = priority;
                 write_ledger(project_root, &ledger)?;
@@ -457,6 +488,7 @@ pub fn resume(
         );
     }
 
+    ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
     ensure_resume_eligible(
         project_root,
         &item,
@@ -502,6 +534,7 @@ pub fn resume(
         attempt_id,
         priority.unwrap_or(0),
         resume_of_dispatch_id,
+        tester_no_sandbox,
         sequence,
     ));
     write_ledger(project_root, &ledger)?;
@@ -716,6 +749,30 @@ fn ensure_resume_eligible(
     Ok(())
 }
 
+fn ensure_tester_no_sandbox_eligible(
+    item: &WorkItem,
+    id: &str,
+    attempt_id: &str,
+    tester_no_sandbox: bool,
+) -> Result<()> {
+    if !tester_no_sandbox {
+        return Ok(());
+    }
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found for Work Item {id:?}"))?;
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind.as_ref() != Some(&crate::work_model::PauseKind::TesterHarness)
+    {
+        bail!(
+            "--no-sandbox is allowed only when Attempt {attempt_id:?} is paused at tester-harness"
+        );
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------------------
 // Generation-checked claim / launch / reconcile
 // -------------------------------------------------------------------------
@@ -762,7 +819,15 @@ pub fn claim(
     }
 
     match active.intent {
-        DispatchIntent::Run => ensure_lifecycle_eligible(&item, work_item_id)?,
+        DispatchIntent::Run => {
+            if active.tester_no_sandbox {
+                bail!(
+                    "run dispatch {:?} cannot carry Tester no-sandbox approval",
+                    active.dispatch_id
+                );
+            }
+            ensure_lifecycle_eligible(&item, work_item_id)?;
+        }
         DispatchIntent::ResumeAttempt => {
             let persisted_attempt_id = active.bound_attempt_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -782,6 +847,12 @@ pub fn claim(
                 work_item_id,
                 persisted_attempt_id,
                 false,
+            )?;
+            ensure_tester_no_sandbox_eligible(
+                &item,
+                work_item_id,
+                persisted_attempt_id,
+                active.tester_no_sandbox,
             )?;
         }
     }
@@ -811,6 +882,7 @@ pub fn claim(
         generation: active.generation,
         bound_attempt_id: persisted_attempt_id,
         priority: active.priority,
+        tester_no_sandbox: active.tester_no_sandbox,
     };
     write_ledger(project_root, &ledger)?;
     Ok(Some(token))
@@ -953,6 +1025,12 @@ fn with_matching_active(
             active.generation
         );
     }
+    if active.tester_no_sandbox != token.tester_no_sandbox {
+        bail!(
+            "dispatch {:?} Tester no-sandbox approval changed under token",
+            token.dispatch_id
+        );
+    }
     mutate(active)?;
     write_ledger(project_root, &ledger)?;
     Ok(())
@@ -1025,6 +1103,11 @@ mod tests {
         reconcile_active(tmp, id, DispatchStatus::NeedsUser).unwrap();
     }
 
+    fn write_tester_suspension(tmp: &Path, id: &str, attempt_id: &str) {
+        write_scheduler_suspension(tmp, id, attempt_id);
+        suspend_attempt(tmp, id, attempt_id, PauseKind::TesterHarness);
+    }
+
     /// Overwrite a ledger directly so a test can start from an arbitrary
     /// disposition without driving the full scheduler pipeline.
     fn put_ledger(tmp: &Path, ledger: &DispatchLedger) {
@@ -1057,10 +1140,104 @@ mod tests {
         let value = serde_json::to_value(&dispatch).unwrap();
         assert!(value.get("intent").is_none());
         assert!(value.get("resume_of_dispatch_id").is_none());
+        assert!(value.get("tester_no_sandbox").is_none());
 
         let decoded: Dispatch = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.intent, DispatchIntent::Run);
         assert_eq!(decoded.resume_of_dispatch_id, None);
+        assert!(!decoded.tester_no_sandbox);
+    }
+
+    #[test]
+    fn tester_no_sandbox_resume_rejects_non_tester_pause_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+        let before = fs::read(queue_file(dir.path(), "wi-1")).unwrap();
+
+        let error =
+            resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", None, true).unwrap_err();
+        assert!(error.to_string().contains("paused at tester-harness"));
+        assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn tester_no_sandbox_approval_is_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_tester_suspension(dir.path(), "wi-1", "attempt-1");
+
+        assert_eq!(
+            resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", Some(6), true).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        let resumed = ledger.active().unwrap();
+        assert!(resumed.tester_no_sandbox);
+        assert_eq!(
+            serde_json::to_value(resumed).unwrap()["tester_no_sandbox"],
+            true
+        );
+
+        assert_eq!(
+            resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", None, true).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
+        let mismatch = resume(dir.path(), "wi-1", "attempt-1", None).unwrap_err();
+        assert!(mismatch.to_string().contains("already queued"));
+    }
+
+    #[test]
+    fn tester_no_sandbox_claim_revalidates_the_tester_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_tester_suspension(dir.path(), "wi-1", "attempt-1");
+        resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", None, true).unwrap();
+
+        suspend_attempt(dir.path(), "wi-1", "attempt-1", PauseKind::WriterCompletion);
+        let error = claim(dir.path(), "wi-1", "attempt-1").unwrap_err();
+        assert!(error.to_string().contains("paused at tester-harness"));
+        assert_eq!(
+            read_ledger(dir.path(), "wi-1")
+                .unwrap()
+                .unwrap()
+                .active()
+                .unwrap()
+                .status,
+            DispatchStatus::Queued
+        );
+
+        suspend_attempt(dir.path(), "wi-1", "attempt-1", PauseKind::TesterHarness);
+        let token = claim(dir.path(), "wi-1", "attempt-1").unwrap().unwrap();
+        assert!(token.tester_no_sandbox);
+    }
+
+    #[test]
+    fn claim_rejects_no_sandbox_approval_on_ordinary_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-1", "attempt-1");
+        add(dir.path(), "wi-1", None).unwrap();
+
+        let mut ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        ledger.active_mut().unwrap().tester_no_sandbox = true;
+        put_ledger(dir.path(), &ledger);
+
+        let error = claim(dir.path(), "wi-1", "attempt-1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot carry Tester no-sandbox approval")
+        );
+        assert_eq!(
+            read_ledger(dir.path(), "wi-1")
+                .unwrap()
+                .unwrap()
+                .active()
+                .unwrap()
+                .status,
+            DispatchStatus::Queued
+        );
     }
 
     #[test]

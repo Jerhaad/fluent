@@ -430,6 +430,10 @@ pub enum AttemptCommands {
         #[arg(long)]
         no_sandbox: bool,
 
+        /// Retry only the paused Tester Task without Fluent's Tester sandbox
+        #[arg(long, hide = true)]
+        tester_no_sandbox: bool,
+
         /// Coding agent to launch: claude, codex, or pi
         #[arg(long)]
         coder: Option<String>,
@@ -738,6 +742,10 @@ pub enum QueueCommands {
         /// Numeric priority (higher = sooner; default 0)
         #[arg(long)]
         priority: Option<i64>,
+
+        /// Approve this tester-harness recovery without Fluent's Tester sandbox
+        #[arg(long)]
+        no_sandbox: bool,
     },
 
     /// List queued Work Items
