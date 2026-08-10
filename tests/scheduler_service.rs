@@ -198,6 +198,11 @@ fn executable_is_staged_atomically_and_returns_build_identity() {
     let exe = make_fake_exe(src.path());
 
     let build = scheduler_service::stage_executable(&exe, home.path()).unwrap();
+    assert_eq!(
+        scheduler_service::executable_build_identity(&exe).unwrap(),
+        build,
+        "foreground and managed scheduler paths must share build identity"
+    );
     assert!(!build.version.is_empty(), "version must be non-empty");
     assert_eq!(build.hash.len(), 64, "SHA-256 hash must be 64 hex chars");
 

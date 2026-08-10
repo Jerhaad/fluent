@@ -137,6 +137,15 @@ After every Reviewer passes, the Tester runs once as the authoritative final gat
 
 Before starting review work, run `fluent tester check` to validate the Tester and run it through the same boundary that a Tester Task uses. If this standalone preflight reports a harness problem, repair the declared configuration, extractor, or sandbox setup and rerun `fluent tester check`. If a production Tester Task pauses an existing Attempt for a harness problem, repair it, then use the exact `fluent queue resume <work-item-id> --attempt <attempt-id>` command reported by `fluent status` to return scheduler-owned work to the queue, or use `fluent attempt run <work-item-id> [<attempt-id>]` to recover it directly in the foreground. Fluent retries the same Tester without repeating a completed Writer. For a SwiftPM nested-sandbox diagnostic, disable SwiftPM's inner sandbox and configure writable project-local cache paths. Fluent never rewrites project test configuration or scripts.
 
+Use `fluent scheduler status` to see which Fluent build owns the current
+project's queue. After installing a different build, run `fluent scheduler stop`
+to stop new claims and wait for running Work to finish, then start the installed
+build with `fluent scheduler run`. Fluent rejects silent reuse across different
+executable hashes and never uses the displayed process id to stop a coordinator.
+A coordinator started by an older Fluent release has no instance metadata; stop
+that process from the terminal or process supervisor that launched it before
+starting the new build. Fluent fails closed instead of guessing a process id.
+
 ### Release-test containment
 
 Before publishing a candidate release, use `scripts/first-run-smoke.sh` with an

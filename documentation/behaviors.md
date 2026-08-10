@@ -4839,6 +4839,76 @@ SHALL NOT be deleted automatically.
 Test: src/queue.rs (scheduler_warns_and_preserves_malformed_entry,
 scheduler_skips_malformed_entry_without_stalling)
 
+### B8
+
+WHEN `fluent scheduler status` is invoked with no live project coordinator,
+THE SYSTEM SHALL report that the scheduler is stopped without changing
+scheduler state.
+Test: src/scheduler.rs (stopped_status_does_not_create_scheduler_state)
+Test: tests/binary.rs (scheduler_status_and_stop_use_exact_live_instance)
+
+### B9
+
+WHEN `fluent scheduler status` is invoked with a live project coordinator,
+THE SYSTEM SHALL report its instance, running or draining state, start time,
+display-only process id, Fluent version, and executable SHA-256 without changing
+scheduler state.
+Test: src/scheduler.rs (status_reads_live_identity_without_mutation)
+Test: tests/binary.rs (scheduler_status_and_stop_use_exact_live_instance)
+
+### B10
+
+WHEN `fluent scheduler run` finds a running coordinator with the same version
+and executable SHA-256, THE SYSTEM SHALL reuse it and name that build.
+Test: src/scheduler.rs (same_build_reuse_reports_the_elected_identity)
+Test: tests/binary.rs (second_scheduler_run_reuses_live_coordinator)
+
+### B11
+
+IF `fluent scheduler run` finds a coordinator that is already draining, THEN
+THE SYSTEM SHALL reject reuse and tell the operator to wait before running the
+scheduler again.
+Test: src/scheduler.rs (run_does_not_reuse_a_draining_coordinator)
+
+### B12
+
+IF `fluent scheduler run` finds a live coordinator with a different version or
+executable SHA-256, THEN THE SYSTEM SHALL reject reuse and direct the operator to
+run `fluent scheduler stop` followed by `fluent scheduler run`.
+Test: src/scheduler.rs (different_build_reuse_requires_explicit_stop_then_run)
+
+### B13
+
+WHEN `fluent scheduler stop` targets a live identified coordinator, THE SYSTEM
+SHALL change that coordinator to `draining` and stop it from claiming new Work.
+Test: src/scheduler.rs (matching_stop_request_publishes_draining_before_exit,
+shutdown_stops_claiming_and_preserves_unclaimed_work)
+Test: tests/binary.rs (scheduler_status_and_stop_use_exact_live_instance)
+
+### B14
+
+WHILE the coordinator targeted by `fluent scheduler stop` has running Work, THE
+SYSTEM SHALL let that Work finish before releasing the coordinator lease and
+reporting the stopped instance.
+Test: src/scheduler.rs (durable_stop_request_drains_and_releases_exact_coordinator,
+graceful_shutdown_drains_claimed_work)
+Test: tests/binary.rs (scheduler_status_and_stop_use_exact_live_instance)
+
+### B15
+
+IF a live coordinator has missing, malformed, unsupported, or lease-mismatched
+identity metadata, THEN THE SYSTEM SHALL reject status, reuse, and durable stop
+requests without signaling the recorded process id.
+Test: src/scheduler.rs (live_coordinator_with_malformed_metadata_fails_closed,
+live_legacy_coordinator_without_metadata_fails_closed,
+metadata_from_an_earlier_lease_fails_closed)
+
+### B16
+
+IF a durable stop request names an earlier coordinator instance, THEN THE SYSTEM
+SHALL keep the replacement coordinator running.
+Test: src/scheduler.rs (stale_stop_request_cannot_stop_replacement_instance)
+
 ## Scheduler cross-cutting
 
 ### B1

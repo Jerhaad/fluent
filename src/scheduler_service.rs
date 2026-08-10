@@ -242,15 +242,28 @@ pub struct BuildIdentity {
     pub hash: String,
 }
 
+/// Compute the immutable build identity of an executable without staging it.
+pub fn executable_build_identity(executable: &Path) -> Result<BuildIdentity> {
+    let bytes = fs::read(executable)
+        .with_context(|| format!("read executable {}", executable.display()))?;
+    Ok(build_identity_for_bytes(&bytes))
+}
+
+fn build_identity_for_bytes(bytes: &[u8]) -> BuildIdentity {
+    use sha2::{Digest, Sha256};
+    BuildIdentity {
+        version: crate::version::version_tag(),
+        hash: format!("{:x}", Sha256::digest(&bytes)),
+    }
+}
+
 /// Copy the source executable to the managed service path atomically. Returns
 /// the build identity of the staged binary. An interrupted copy leaves no
 /// partial target because it writes through a temp file.
 pub fn stage_executable(source_exe: &Path, home_dir: &Path) -> Result<BuildIdentity> {
-    use sha2::{Digest, Sha256};
     let bytes = fs::read(source_exe)
         .with_context(|| format!("read source executable {}", source_exe.display()))?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
-    let version = crate::version::version_tag();
+    let build = build_identity_for_bytes(&bytes);
     let dest = managed_executable_path(home_dir);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
@@ -261,7 +274,7 @@ pub fn stage_executable(source_exe: &Path, home_dir: &Path) -> Result<BuildIdent
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dest, fs::Permissions::from_mode(0o700))?;
     }
-    Ok(BuildIdentity { version, hash })
+    Ok(build)
 }
 
 /// Record the desired build identity (what we intend the service to run).
@@ -921,7 +934,7 @@ pub fn validate_executor_request(
 // Utilities
 // ─────────────────────────────────────────────────
 
-fn generate_random_hex(n_bytes: usize) -> Result<String> {
+pub(crate) fn generate_random_hex(n_bytes: usize) -> Result<String> {
     let mut buf = vec![0u8; n_bytes];
     let mut f = fs::File::open("/dev/urandom").context("open /dev/urandom")?;
     f.read_exact(&mut buf).context("read random bytes")?;

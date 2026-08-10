@@ -1390,6 +1390,34 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
             let runner = fluent::scheduler::CliAttemptRunner;
             fluent::scheduler::run(project_root, poll, &runner)?;
         }
+        SchedulerCommands::Status => match fluent::scheduler::status(project_root)? {
+            fluent::scheduler::SchedulerStatus::Stopped => {
+                println!("Scheduler: stopped");
+            }
+            fluent::scheduler::SchedulerStatus::Running(metadata) => {
+                println!(
+                    "Scheduler: {}",
+                    match metadata.state {
+                        fluent::scheduler::CoordinatorState::Running => "running",
+                        fluent::scheduler::CoordinatorState::Draining => "draining",
+                    }
+                );
+                println!("Instance:  {}", metadata.instance_id);
+                println!(
+                    "Build:     {} ({})",
+                    metadata.build.version, metadata.build.hash
+                );
+                println!("Started:   {}", metadata.started_at);
+                println!("PID:       {} (display only)", metadata.pid);
+            }
+        },
+        SchedulerCommands::Stop => {
+            let stopped = fluent::scheduler::stop(project_root)?;
+            println!(
+                "Stopped scheduler {} running {} ({})",
+                stopped.instance_id, stopped.build.version, stopped.build.hash
+            );
+        }
     }
     Ok(())
 }

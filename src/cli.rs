@@ -799,12 +799,16 @@ pub enum TesterCommands {
 
 #[derive(Subcommand)]
 pub enum SchedulerCommands {
-    /// Poll the queue and run Work Items sequentially
+    /// Poll the queue and run Work Items up to configured capacity
     Run {
         /// Seconds between queue polls when idle (default 30)
         #[arg(long)]
         poll_seconds: Option<u64>,
     },
+    /// Show the elected coordinator and its exact Fluent build
+    Status,
+    /// Stop new claims, drain running Work, and stop the elected coordinator
+    Stop,
 }
 
 // ---------------------------------------------------------------------------

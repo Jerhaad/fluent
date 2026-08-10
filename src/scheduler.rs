@@ -8,8 +8,10 @@
 //! Candidate stays pending for an explicit land or the separately authorized
 //! auto-merge policy.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -20,9 +22,12 @@ use rustix::fs::{FlockOperation, flock};
 
 use crate::lease::{self, TaskLease};
 use crate::queue::{self, Dispatch, DispatchStatus, DispatchToken};
+use crate::scheduler_service::BuildIdentity;
 use crate::work_model::{AttemptStatus, WorkModelStore};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+const COORDINATOR_METADATA_SCHEMA: u32 = 1;
+const STOP_REQUEST_SCHEMA: u32 = 1;
 
 /// The terminal outcome of running a bound Attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,14 +174,20 @@ fn classify_persisted_attempt(
 /// worker pool. A start that finds another live coordinator reports reuse and
 /// returns successfully without claiming Work.
 pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -> Result<()> {
+    SHUTDOWN.store(false, Ordering::Release);
     install_signal_handler();
+    let executable = std::env::current_exe().context("resolve current Fluent executable")?;
+    let build = crate::scheduler_service::executable_build_identity(&executable)?;
 
-    match start_or_reuse(project_root)? {
-        CoordinatorStart::Reused => {
-            eprintln!("[scheduler] reusing live coordinator for this project");
+    match start_or_reuse(project_root, &build)? {
+        CoordinatorStart::Reused(metadata) => {
+            eprintln!(
+                "[scheduler] reusing live coordinator {} running {} ({})",
+                metadata.instance_id, metadata.build.version, metadata.build.hash
+            );
             Ok(())
         }
-        CoordinatorStart::Elected(lease) => {
+        CoordinatorStart::Elected(mut lease) => {
             // A newly elected coordinator must prove the host can apply Fluent's
             // worker boundary before it prepares baselines, polls, or claims Work.
             // A caller that merely reuses an existing coordinator performs no new
@@ -186,7 +197,14 @@ pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -
             let capacity = resolve_capacity(project_root)?;
             let baseline_session = scheduler_baseline_session();
             crate::baseline_cache::prepare_scheduler_session(project_root, baseline_session)?;
-            let result = run_coordinator(project_root, poll_seconds, capacity, runner, &SHUTDOWN);
+            let result = run_coordinator_controlled(
+                project_root,
+                poll_seconds,
+                capacity,
+                runner,
+                &SHUTDOWN,
+                Some(&mut lease),
+            );
             let cleanup =
                 crate::baseline_cache::finish_scheduler_session(project_root, baseline_session);
             drop(lease);
@@ -199,6 +217,7 @@ pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -
 /// newly claimed dispatches, launching each on its own worker thread. Running
 /// Work is never interrupted; once `shutdown` is set the coordinator stops
 /// claiming, and the scope drains live workers before returning.
+#[cfg(test)]
 fn run_coordinator(
     project_root: &Path,
     poll_seconds: u64,
@@ -206,12 +225,23 @@ fn run_coordinator(
     runner: &dyn AttemptRunner,
     shutdown: &AtomicBool,
 ) -> Result<()> {
+    run_coordinator_controlled(project_root, poll_seconds, capacity, runner, shutdown, None)
+}
+
+fn run_coordinator_controlled(
+    project_root: &Path,
+    poll_seconds: u64,
+    capacity: usize,
+    runner: &dyn AttemptRunner,
+    shutdown: &AtomicBool,
+    mut coordinator: Option<&mut CoordinatorLease>,
+) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
         let mut workers: Vec<std::thread::ScopedJoinHandle<()>> = Vec::new();
         loop {
             workers.retain(|handle| !handle.is_finished());
 
-            if is_shutdown(shutdown) {
+            if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
                 break;
             }
 
@@ -228,16 +258,26 @@ fn run_coordinator(
                 spawned = true;
             }
 
-            if is_shutdown(shutdown) {
+            if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
                 break;
             }
 
             if spawned {
                 // Re-evaluate promptly so freed capacity refills without waiting
                 // a full poll interval.
-                sleep_until_shutdown(Duration::from_millis(50), shutdown);
+                sleep_until_shutdown(
+                    project_root,
+                    Duration::from_millis(50),
+                    shutdown,
+                    coordinator.as_deref_mut(),
+                )?;
             } else {
-                sleep_until_shutdown(Duration::from_secs(poll_seconds), shutdown);
+                sleep_until_shutdown(
+                    project_root,
+                    Duration::from_secs(poll_seconds),
+                    shutdown,
+                    coordinator.as_deref_mut(),
+                )?;
             }
         }
         // The scope join drains any live workers, recording their outcomes.
@@ -539,30 +579,325 @@ fn run_claimed(
 /// live coordinator already owns the project.
 pub enum CoordinatorStart {
     Elected(CoordinatorLease),
-    Reused,
+    Reused(CoordinatorMetadata),
 }
 
 /// The lifetime lease of an elected coordinator. Held for the coordinator's run
 /// and released when it exits, so the next start can be elected.
 pub struct CoordinatorLease {
-    _file: File,
+    file: File,
+    project_root: PathBuf,
+    metadata: CoordinatorMetadata,
+}
+
+/// Durable identity and lifecycle state for one elected coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatorMetadata {
+    pub schema: u32,
+    pub instance_id: String,
+    /// Display-only process identifier. Fluent never signals this PID.
+    pub pid: u32,
+    pub started_at: String,
+    pub state: CoordinatorState,
+    pub build: BuildIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoordinatorState {
+    Running,
+    Draining,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopRequest {
+    schema: u32,
+    instance_id: String,
+    requested_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerStatus {
+    Stopped,
+    Running(CoordinatorMetadata),
 }
 
 fn coordinator_lock_path(project_root: &Path) -> PathBuf {
     project_root.join(".fluent/work/scheduler/coordinator.lock")
 }
 
+fn coordinator_metadata_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/scheduler/coordinator.json")
+}
+
+fn stop_request_path(project_root: &Path) -> PathBuf {
+    project_root.join(".fluent/work/scheduler/stop-request.json")
+}
+
 /// Try to become the project's coordinator. Elects this process when the
 /// coordinator lease is free; otherwise reports reuse of the live coordinator.
-pub fn start_or_reuse(project_root: &Path) -> Result<CoordinatorStart> {
+pub fn start_or_reuse(project_root: &Path, build: &BuildIdentity) -> Result<CoordinatorStart> {
     let path = coordinator_lock_path(project_root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new().create(true).write(true).open(&path)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(CoordinatorStart::Elected(CoordinatorLease { _file: file })),
-        Err(_) => Ok(CoordinatorStart::Reused),
+    loop {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                let metadata = CoordinatorMetadata {
+                    schema: COORDINATOR_METADATA_SCHEMA,
+                    instance_id: crate::scheduler_service::generate_random_hex(16)?,
+                    pid: std::process::id(),
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    state: CoordinatorState::Running,
+                    build: build.clone(),
+                };
+                publish_lock_identity(&mut file, &metadata.instance_id)?;
+                write_coordinator_metadata(project_root, &metadata)?;
+                return Ok(CoordinatorStart::Elected(CoordinatorLease {
+                    file,
+                    project_root: project_root.to_path_buf(),
+                    metadata,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let Some(metadata) = read_live_coordinator_metadata(project_root)? else {
+                    // The owner exited after this start lost election. Retry the
+                    // lease instead of misclassifying its cleanup gap as legacy.
+                    continue;
+                };
+                if metadata.state == CoordinatorState::Draining {
+                    bail!(
+                        "scheduler coordinator {} is draining; wait for `fluent scheduler stop` to finish, then run `fluent scheduler run`",
+                        metadata.instance_id
+                    );
+                }
+                if metadata.build != *build {
+                    bail!(
+                        "a live scheduler coordinator is running {} ({}), but this Fluent build is {} ({}); run `fluent scheduler stop`, then `fluent scheduler run`",
+                        metadata.build.version,
+                        metadata.build.hash,
+                        build.version,
+                        build.hash
+                    );
+                }
+                return Ok(CoordinatorStart::Reused(metadata));
+            }
+            Err(error) => return Err(error).context("elect scheduler coordinator"),
+        }
+    }
+}
+
+impl CoordinatorLease {
+    fn mark_draining(&mut self) -> Result<()> {
+        if self.metadata.state == CoordinatorState::Draining {
+            return Ok(());
+        }
+        self.metadata.state = CoordinatorState::Draining;
+        write_coordinator_metadata(&self.project_root, &self.metadata)
+    }
+}
+
+impl Drop for CoordinatorLease {
+    fn drop(&mut self) {
+        remove_if_instance_matches(
+            &coordinator_metadata_path(&self.project_root),
+            &self.metadata.instance_id,
+        );
+        remove_if_instance_matches(
+            &stop_request_path(&self.project_root),
+            &self.metadata.instance_id,
+        );
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
+fn write_coordinator_metadata(project_root: &Path, metadata: &CoordinatorMetadata) -> Result<()> {
+    let path = coordinator_metadata_path(project_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(metadata)?)
+        .with_context(|| format!("write scheduler coordinator metadata {}", path.display()))
+}
+
+fn publish_lock_identity(file: &mut File, instance_id: &str) -> Result<()> {
+    file.set_len(0)
+        .context("clear scheduler coordinator identity")?;
+    file.seek(SeekFrom::Start(0))
+        .context("seek scheduler coordinator identity")?;
+    file.write_all(instance_id.as_bytes())
+        .context("write scheduler coordinator identity")?;
+    file.sync_data()
+        .context("sync scheduler coordinator identity")
+}
+
+fn read_lock_identity(project_root: &Path) -> Result<Option<String>> {
+    let path = coordinator_lock_path(project_root);
+    let value = fs::read_to_string(&path)
+        .with_context(|| format!("read scheduler coordinator identity {}", path.display()))?;
+    let value = value.trim();
+    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(Some(value.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_coordinator_metadata(project_root: &Path) -> Result<Option<CoordinatorMetadata>> {
+    let path = coordinator_metadata_path(project_root);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let metadata: CoordinatorMetadata =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!("parse scheduler coordinator metadata {}", path.display())
+                })?;
+            if metadata.schema != COORDINATOR_METADATA_SCHEMA || metadata.instance_id.is_empty() {
+                bail!(
+                    "unsupported scheduler coordinator metadata in {}",
+                    path.display()
+                );
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("read scheduler coordinator metadata {}", path.display())),
+    }
+}
+
+fn read_live_coordinator_metadata(project_root: &Path) -> Result<Option<CoordinatorMetadata>> {
+    // Election acquires the lease before it can publish metadata. Give that
+    // bounded startup window time to complete, then treat absence as a legacy
+    // or malformed live coordinator and fail closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let problem = match (
+            read_lock_identity(project_root),
+            read_coordinator_metadata(project_root),
+        ) {
+            (Ok(Some(lock_id)), Ok(Some(metadata))) if metadata.instance_id == lock_id => {
+                return Ok(Some(metadata));
+            }
+            (Ok(Some(lock_id)), Ok(Some(metadata))) => format!(
+                "metadata instance {} does not match lease instance {lock_id}",
+                metadata.instance_id
+            ),
+            (Err(error), _) | (_, Err(error)) => format!("{error:#}"),
+            _ => "identity metadata is missing".to_string(),
+        };
+        if !coordinator_is_live(project_root) {
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "a live scheduler coordinator has no valid identity metadata ({problem}); stop its owning process manually before starting another coordinator",
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_stop_request(project_root: &Path) -> Result<Option<StopRequest>> {
+    let path = stop_request_path(project_root);
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let request: StopRequest = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse scheduler stop request {}", path.display()))?;
+            if request.schema != STOP_REQUEST_SCHEMA || request.instance_id.is_empty() {
+                bail!("unsupported scheduler stop request in {}", path.display());
+            }
+            Ok(Some(request))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("read scheduler stop request {}", path.display()))
+        }
+    }
+}
+
+fn remove_if_instance_matches(path: &Path, instance_id: &str) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    let matches = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("instance_id")?.as_str().map(str::to_owned))
+        .is_some_and(|stored| stored == instance_id);
+    if matches {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Read the current coordinator without changing scheduler state.
+pub fn status(project_root: &Path) -> Result<SchedulerStatus> {
+    if !coordinator_is_live(project_root) {
+        return Ok(SchedulerStatus::Stopped);
+    }
+    match read_live_coordinator_metadata(project_root)? {
+        Some(metadata) => Ok(SchedulerStatus::Running(metadata)),
+        None => Ok(SchedulerStatus::Stopped),
+    }
+}
+
+/// Ask the exact live coordinator to stop claiming, drain workers, and exit.
+pub fn stop(project_root: &Path) -> Result<CoordinatorMetadata> {
+    let target = match status(project_root)? {
+        SchedulerStatus::Stopped => bail!("scheduler coordinator is not running"),
+        SchedulerStatus::Running(metadata) => metadata,
+    };
+    let request = StopRequest {
+        schema: STOP_REQUEST_SCHEMA,
+        instance_id: target.instance_id.clone(),
+        requested_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let path = stop_request_path(project_root);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&request)?)
+        .with_context(|| format!("write scheduler stop request {}", path.display()))?;
+
+    // Revalidate after publication. A replacement instance ignores this request.
+    match status(project_root)? {
+        SchedulerStatus::Stopped => {
+            remove_if_instance_matches(&path, &target.instance_id);
+            return Ok(target);
+        }
+        SchedulerStatus::Running(current) if current.instance_id != target.instance_id => {
+            remove_if_instance_matches(&path, &target.instance_id);
+            bail!(
+                "scheduler coordinator changed while requesting stop; instance {} is now running",
+                current.instance_id
+            );
+        }
+        SchedulerStatus::Running(_) => {}
+    }
+
+    loop {
+        if !coordinator_is_live(project_root) {
+            remove_if_instance_matches(&path, &target.instance_id);
+            return Ok(target);
+        }
+        match read_coordinator_metadata(project_root) {
+            Ok(Some(current)) if current.instance_id == target.instance_id => {}
+            Ok(Some(current)) => {
+                remove_if_instance_matches(&path, &target.instance_id);
+                bail!(
+                    "scheduler coordinator changed while draining; instance {} is now running",
+                    current.instance_id
+                )
+            }
+            // The elected process removes metadata immediately before releasing
+            // its lease. Let that short cleanup window finish.
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -622,20 +957,57 @@ fn is_shutdown(shutdown: &AtomicBool) -> bool {
     shutdown.load(Ordering::Acquire)
 }
 
+fn shutdown_requested(
+    project_root: &Path,
+    shutdown: &AtomicBool,
+    coordinator: Option<&mut CoordinatorLease>,
+) -> Result<bool> {
+    if is_shutdown(shutdown) {
+        if let Some(coordinator) = coordinator {
+            coordinator.mark_draining()?;
+        }
+        return Ok(true);
+    }
+    let Some(coordinator) = coordinator else {
+        return Ok(false);
+    };
+    match read_stop_request(project_root) {
+        Ok(Some(request)) if request.instance_id == coordinator.metadata.instance_id => {
+            coordinator.mark_draining()?;
+            Ok(true)
+        }
+        Ok(Some(request)) => {
+            remove_if_instance_matches(&stop_request_path(project_root), &request.instance_id);
+            Ok(false)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => {
+            eprintln!("[scheduler] ignoring invalid stop request: {error:#}");
+            Ok(false)
+        }
+    }
+}
+
 /// Sleep up to `duration`, checking the shutdown signal each second so a
 /// SIGTERM or SIGINT stops an idle coordinator without waiting the full poll
 /// interval.
-fn sleep_until_shutdown(duration: Duration, shutdown: &AtomicBool) {
+fn sleep_until_shutdown(
+    project_root: &Path,
+    duration: Duration,
+    shutdown: &AtomicBool,
+    mut coordinator: Option<&mut CoordinatorLease>,
+) -> Result<()> {
     let one_second = Duration::from_secs(1);
     let mut remaining = duration;
     while remaining > Duration::ZERO {
-        if is_shutdown(shutdown) {
-            return;
+        if shutdown_requested(project_root, shutdown, coordinator.as_deref_mut())? {
+            return Ok(());
         }
         let sleep_for = remaining.min(one_second);
         std::thread::sleep(sleep_for);
         remaining = remaining.saturating_sub(sleep_for);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -704,6 +1076,13 @@ pub(crate) mod test_support {
 
     pub fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
+    }
+
+    pub fn test_build(hash: &str) -> BuildIdentity {
+        BuildIdentity {
+            version: "0.1.5 test".to_string(),
+            hash: hash.to_string(),
+        }
     }
 
     pub fn write_ready_work_item(tmp: &Path, id: &str) {
@@ -1088,6 +1467,7 @@ mod tests {
 
         let elected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let build = test_build("same-build");
 
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
@@ -1095,9 +1475,10 @@ mod tests {
                 let root = root.clone();
                 let elected = elected.clone();
                 let barrier = barrier.clone();
+                let build = build.clone();
                 handles.push(scope.spawn(move || {
                     barrier.wait();
-                    let start = start_or_reuse(&root).unwrap();
+                    let start = start_or_reuse(&root, &build).unwrap();
                     match start {
                         CoordinatorStart::Elected(lease) => {
                             elected.fetch_add(1, Ordering::SeqCst);
@@ -1106,7 +1487,9 @@ mod tests {
                             std::thread::sleep(Duration::from_millis(100));
                             drop(lease);
                         }
-                        CoordinatorStart::Reused => {}
+                        CoordinatorStart::Reused(metadata) => {
+                            assert_eq!(metadata.build, build);
+                        }
                     }
                 }));
             }
@@ -1117,6 +1500,289 @@ mod tests {
             1,
             "exactly one coordinator is elected among concurrent starts"
         );
+    }
+
+    #[test]
+    fn same_build_reuse_reports_the_elected_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        let reused = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Reused(metadata) => metadata,
+            CoordinatorStart::Elected(_) => panic!("live coordinator must be reused"),
+        };
+        assert_eq!(reused.instance_id, elected.metadata.instance_id);
+        assert_eq!(reused.build, build);
+        assert_eq!(reused.state, CoordinatorState::Running);
+    }
+
+    #[test]
+    fn status_reads_live_identity_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let metadata_path = coordinator_metadata_path(dir.path());
+        let lock_path = coordinator_lock_path(dir.path());
+        let metadata_before = fs::read(&metadata_path).unwrap();
+        let lock_before = fs::read(&lock_path).unwrap();
+
+        assert_eq!(
+            status(dir.path()).unwrap(),
+            SchedulerStatus::Running(elected.metadata.clone())
+        );
+        assert_eq!(fs::read(metadata_path).unwrap(), metadata_before);
+        assert_eq!(fs::read(lock_path).unwrap(), lock_before);
+        assert!(!stop_request_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn stopped_status_does_not_create_scheduler_state() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let scheduler_dir = dir.path().join(".fluent/work/scheduler");
+
+        assert_eq!(status(dir.path()).unwrap(), SchedulerStatus::Stopped);
+        assert!(!scheduler_dir.exists());
+    }
+
+    #[test]
+    fn different_build_reuse_requires_explicit_stop_then_run() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let _elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        let error = match start_or_reuse(dir.path(), &test_build("build-b")) {
+            Ok(_) => panic!("different build must not reuse"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("build-a"));
+        assert!(message.contains("build-b"));
+        assert!(message.contains("`fluent scheduler stop`, then `fluent scheduler run`"));
+    }
+
+    #[test]
+    fn run_does_not_reuse_a_draining_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let build = test_build("build-a");
+        let mut elected = match start_or_reuse(dir.path(), &build).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        elected.mark_draining().unwrap();
+
+        let error = match start_or_reuse(dir.path(), &build) {
+            Ok(_) => panic!("draining coordinator must not be reused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is draining"));
+        assert!(error.to_string().contains("`fluent scheduler run`"));
+    }
+
+    #[test]
+    fn live_coordinator_with_malformed_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        fs::write(coordinator_metadata_path(dir.path()), b"not json").unwrap();
+
+        assert!(status(dir.path()).is_err());
+        assert!(start_or_reuse(dir.path(), &test_build("build-a")).is_err());
+    }
+
+    #[test]
+    fn live_legacy_coordinator_without_metadata_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+
+        let error = match start_or_reuse(dir.path(), &test_build("build-a")) {
+            Ok(_) => panic!("legacy coordinator must not be reused"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("stop its owning process manually")
+        );
+    }
+
+    #[test]
+    fn metadata_from_an_earlier_lease_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let path = coordinator_lock_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock(&lock, FlockOperation::LockExclusive).unwrap();
+        publish_lock_identity(&mut lock, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        write_coordinator_metadata(
+            dir.path(),
+            &CoordinatorMetadata {
+                schema: COORDINATOR_METADATA_SCHEMA,
+                instance_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                pid: 42,
+                started_at: "2026-08-10T00:00:00Z".to_string(),
+                state: CoordinatorState::Running,
+                build: test_build("stale"),
+            },
+        )
+        .unwrap();
+
+        let error = status(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("does not match lease instance"));
+    }
+
+    #[test]
+    fn matching_stop_request_publishes_draining_before_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let mut elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let request = StopRequest {
+            schema: STOP_REQUEST_SCHEMA,
+            instance_id: elected.metadata.instance_id.clone(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+        };
+        crate::atomic_write::atomic_write(
+            &stop_request_path(dir.path()),
+            &serde_json::to_vec_pretty(&request).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            shutdown_requested(dir.path(), &AtomicBool::new(false), Some(&mut elected)).unwrap()
+        );
+        assert_eq!(
+            read_coordinator_metadata(dir.path())
+                .unwrap()
+                .unwrap()
+                .state,
+            CoordinatorState::Draining
+        );
+    }
+
+    #[test]
+    fn stale_stop_request_cannot_stop_replacement_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        fs::create_dir_all(dir.path().join(".fluent/work/scheduler")).unwrap();
+        let stale = StopRequest {
+            schema: STOP_REQUEST_SCHEMA,
+            instance_id: "departed-instance".to_string(),
+            requested_at: chrono::Utc::now().to_rfc3339(),
+        };
+        fs::write(
+            stop_request_path(dir.path()),
+            serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+        let mut elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+
+        assert!(
+            !shutdown_requested(dir.path(), &AtomicBool::new(false), Some(&mut elected)).unwrap()
+        );
+        assert_eq!(elected.metadata.state, CoordinatorState::Running);
+        assert!(!stop_request_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn durable_stop_request_drains_and_releases_exact_coordinator() {
+        struct SlowRunner;
+        impl AttemptRunner for SlowRunner {
+            fn run(
+                &self,
+                _project_root: &Path,
+                _work_item_id: &str,
+                _attempt_id: &str,
+                _tester_no_sandbox: bool,
+            ) -> Result<AttemptOutcome> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(AttemptOutcome::Failed)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-drain");
+        add_queued(dir.path(), "wi-drain", 0);
+        let elected = match start_or_reuse(dir.path(), &test_build("build-a")).unwrap() {
+            CoordinatorStart::Elected(lease) => lease,
+            CoordinatorStart::Reused(_) => panic!("first start must elect"),
+        };
+        let target_id = elected.metadata.instance_id.clone();
+        let shutdown = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut elected = elected;
+                run_coordinator_controlled(
+                    dir.path(),
+                    30,
+                    4,
+                    &SlowRunner,
+                    &shutdown,
+                    Some(&mut elected),
+                )
+                .unwrap();
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while latest_status(dir.path(), "wi-drain") != DispatchStatus::Running {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "scheduled Work did not start"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let stopped = stop(dir.path()).unwrap();
+            assert_eq!(stopped.instance_id, target_id);
+        });
+
+        assert_eq!(
+            latest_status(dir.path(), "wi-drain"),
+            DispatchStatus::Failed
+        );
+        assert_eq!(status(dir.path()).unwrap(), SchedulerStatus::Stopped);
+        assert!(!coordinator_metadata_path(dir.path()).exists());
+        assert!(!stop_request_path(dir.path()).exists());
     }
 
     #[test]

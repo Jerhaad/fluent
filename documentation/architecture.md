@@ -2983,9 +2983,27 @@ on disk for operator inspection.
 ### Local scheduler coordinator
 
 `fluent scheduler run` elects a single coordinator per project using a
-lifetime `flock` lease. A start that finds another live coordinator
-reports reuse and returns successfully without claiming Work; when
-several starts race, exactly one wins and the rest reuse it.
+lifetime `flock` lease. Immediately after election, the coordinator atomically
+writes `coordinator.json` beside the lease. This schema-versioned record contains
+a random instance id, display-only process id, start time, `running` or
+`draining` state, and the immutable Fluent build identity: version plus the
+SHA-256 of the current executable. The locked file contains the same instance
+id, so a reader accepts metadata only when it belongs to the current lease.
+Contending starts wait through the bounded lease-to-metadata publication window.
+A start reuses a live coordinator only when it is running and both build fields
+match, and names the reused build. A draining coordinator tells the caller to
+wait before starting again. A different build is rejected with the exact
+`fluent scheduler stop` then `fluent scheduler run` recovery. Missing,
+malformed, unsupported, or lease-mismatched metadata on a live lease fails
+closed; the process id is never a signaling authority.
+
+`fluent scheduler status` reads the lease and metadata without changing either.
+`fluent scheduler stop` reads the live metadata, atomically writes a stop request
+bound to that instance id, and revalidates the instance after publication. The
+coordinator recognizes only its own request. A replacement therefore ignores a
+request left by an earlier instance, and a stop command reports a replacement
+race instead of claiming it stopped the project. There is no automatic restart
+and Fluent never sends a signal to the metadata's process id.
 
 The elected coordinator runs an in-process worker pool
 (`thread::scope`). On each poll it fills free capacity up to the project's
@@ -3053,9 +3071,11 @@ The scheduler never invokes merge logic — landing remains the job of an
 explicit land command or the separately authorized `fluent auto-merge
 --all`, which runs as a sibling process.
 
-On SIGTERM or SIGINT the coordinator stops claiming new Work, preserves
-unclaimed Work as `queued`, and drains live children — letting them
-finish and recording their outcomes — before exiting. With no live
+On an instance-bound stop request, SIGTERM, or SIGINT the coordinator changes
+its metadata to `draining`, stops claiming new Work, preserves unclaimed Work as
+`queued`, and drains live children — letting them finish and recording their
+outcomes — before exiting. It then removes metadata and its matching stop
+request while it still owns the lease and releases the lease. With no live
 Attempts it exits without waiting for the polling interval.
 
 When queued Work exists but no live coordinator can claim it, the Work

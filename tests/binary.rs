@@ -21756,6 +21756,66 @@ fn second_scheduler_run_reuses_live_coordinator() {
 }
 
 #[test]
+fn scheduler_status_and_stop_use_exact_live_instance() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path();
+    fs::create_dir_all(project.join(".fluent/work/items")).unwrap();
+
+    let mut coordinator = {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+        command
+            .current_dir(project)
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .args(["scheduler", "run", "--poll-seconds", "30"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        OwnedFixtureProcess::spawn(&mut command)
+    };
+
+    let metadata_path = project.join(".fluent/work/scheduler/coordinator.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !metadata_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "coordinator did not publish metadata"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    let instance = metadata["instance_id"].as_str().unwrap().to_string();
+    let hash = metadata["build"]["hash"].as_str().unwrap().to_string();
+
+    fluent_cmd()
+        .current_dir(project)
+        .args(["scheduler", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scheduler: running"))
+        .stdout(predicate::str::contains(&instance))
+        .stdout(predicate::str::contains(&hash))
+        .stdout(predicate::str::contains("PID:").and(predicate::str::contains("display only")));
+
+    fluent_cmd()
+        .current_dir(project)
+        .args(["scheduler", "stop"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&instance));
+    assert!(
+        coordinator.wait().unwrap().success(),
+        "coordinator should exit after its bound stop request"
+    );
+
+    fluent_cmd()
+        .current_dir(project)
+        .args(["scheduler", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scheduler: stopped"));
+}
+
+#[test]
 fn failed_scheduled_work_requeues_as_new_attempt_without_losing_history() {
     use fluent::queue::{self, DispatchStatus};
     use fluent::work_model::{AttemptStatus, WorkItem, WorkModelStore};
