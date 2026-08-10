@@ -367,6 +367,16 @@ bodies. Corrective Writers save complete command output under their task
 artifact's `commands/` directory and inspect concise summaries or relevant
 failure excerpts in the model conversation.
 
+The generated context also turns every nonzero configured Tester command in an
+attached `tester-results.json` into a current finding. The finding names the
+command, exit code, and exact stdout and stderr logs, while its stable identity
+uses the command index and command text rather than round-specific artifact
+paths. After the Writer returns a corrected candidate, the tests reviewer alone
+receives that structured result and its failed-command logs. If an unchanged
+candidate first passes a failed-command recheck, the recheck result replaces the
+older failure for review; later unrelated correction rounds do not inherit stale
+Tester evidence.
+
 Every Writer persists `writer-context-usage.json` beside its transcript. The
 sidecar records prompt kind and bytes, execution-context and transcript bytes,
 input, cached-input, uncached-input, and output tokens, plus warnings when cached

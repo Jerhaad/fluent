@@ -17,7 +17,7 @@ Current correction artifacts (complete, untruncated paths):
 {{correction_artifacts_list}}
 
 Read the current context first. It contains the exact candidate and base commits, changed files,
-every unresolved progress entry, every current review finding, concise passing evidence, and
+every unresolved progress entry, every current finding, concise passing evidence, and
 managed paths to the full historical artifacts. For review findings, read a specific historical
 artifact or a focused diff only when its summary does not provide enough detail. Do not bulk-print planning files,
 expertise, source trees, prior transcripts, or complete test output into the model conversation.

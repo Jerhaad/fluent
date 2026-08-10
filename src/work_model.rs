@@ -984,6 +984,8 @@ impl WorkItem {
             });
         };
         let review_input_artifacts = review_input_artifacts_by_role(attempt, &latest_write);
+        let tester_correction_artifacts =
+            tester_correction_artifacts_for_tests_review(attempt, &latest_write);
 
         let candidate = WorkspaceRef {
             id: write_output.workspace_id.clone(),
@@ -1009,6 +1011,13 @@ impl WorkItem {
             {
                 if !task_input_artifacts.contains(&artifact) {
                     task_input_artifacts.push(artifact);
+                }
+            }
+            if *role == "tests" {
+                for artifact in &tester_correction_artifacts {
+                    if !task_input_artifacts.contains(artifact) {
+                        task_input_artifacts.push(artifact.clone());
+                    }
                 }
             }
             for artifact in attempt.artifacts.iter().filter(|artifact| {
@@ -7491,6 +7500,56 @@ fn review_input_artifacts_by_role(
     artifacts_by_role
 }
 
+/// Return the Tester evidence that explains the latest correction to the tests
+/// reviewer. A passing failed-command recheck supersedes the original failure;
+/// otherwise only Tester artifacts attached directly to the latest Writer carry
+/// forward. This prevents an older failure from leaking through later rounds.
+fn tester_correction_artifacts_for_tests_review(
+    attempt: &Attempt,
+    latest_write: &Task,
+) -> Vec<ArtifactRef> {
+    let Some(latest_write_index) = attempt
+        .tasks
+        .iter()
+        .position(|task| task.id == latest_write.id)
+    else {
+        return Vec::new();
+    };
+
+    if let Some(recheck) = attempt.tasks[latest_write_index + 1..]
+        .iter()
+        .rev()
+        .find(|task| task.is_failed_command_recheck() && task.status == TaskStatus::Complete)
+    {
+        return recheck
+            .artifact_area
+            .as_ref()
+            .map(|area| {
+                vec![ArtifactRef {
+                    producer_id: recheck.id.clone(),
+                    path: format!("{}/tester-results.json", area.path),
+                }]
+            })
+            .unwrap_or_default();
+    }
+
+    let tester_producers = attempt.tasks[..latest_write_index]
+        .iter()
+        .filter(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .map(|task| task.id.as_str())
+        .collect::<HashSet<_>>();
+    latest_write
+        .input_artifacts
+        .iter()
+        .filter(|artifact| tester_producers.contains(artifact.producer_id.as_str()))
+        .filter(|artifact| {
+            artifact.path.ends_with("/tester-results.json")
+                || crate::tester::is_command_log_path(Path::new(&artifact.path))
+        })
+        .cloned()
+        .collect()
+}
+
 fn review_role_order(role: &str) -> usize {
     match role {
         "documentation" => 0,
@@ -9358,6 +9417,193 @@ random banner prose that must be ignored
                 task.role
             );
         }
+    }
+
+    #[test]
+    fn tests_reviewer_receives_latest_tester_correction_evidence() {
+        let mut item = work_item_with_completed_write("work-1");
+        let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester_id)
+            .unwrap();
+        set_task_terminal(tester, TaskStatus::Complete);
+        let tester_area = tester.artifact_area.as_ref().unwrap().path.clone();
+        let evidence = vec![
+            ArtifactRef {
+                producer_id: tester_id.clone(),
+                path: format!("{tester_area}/tester-results.json"),
+            },
+            ArtifactRef {
+                producer_id: tester_id.clone(),
+                path: format!("{tester_area}/commands/0-stdout.log"),
+            },
+            ArtifactRef {
+                producer_id: tester_id.clone(),
+                path: format!("{tester_area}/commands/0-stderr.log"),
+            },
+        ];
+        let writer_id = item
+            .add_next_write_round("attempt-1", evidence.clone())
+            .unwrap();
+        let writer = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == writer_id)
+            .unwrap();
+        set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: "corrected".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        item.add_next_review_tasks("attempt-1", &["documentation", "tests"])
+            .unwrap();
+        let tests = item.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap();
+        let documentation = item.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "documentation")
+            .unwrap();
+        assert!(
+            evidence
+                .iter()
+                .all(|artifact| tests.input_artifacts.contains(artifact))
+        );
+        assert!(
+            evidence
+                .iter()
+                .all(|artifact| !documentation.input_artifacts.contains(artifact))
+        );
+        let tests_review_id = tests.id.clone();
+
+        for review in item.attempts[0]
+            .tasks
+            .iter_mut()
+            .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Planned)
+        {
+            set_task_terminal(review, TaskStatus::Complete);
+        }
+        let later_writer_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: tests_review_id.clone(),
+                    path: format!(
+                        "{}/review.md",
+                        work_artifact_path("work-1", "attempt-1", &tests_review_id)
+                    ),
+                }],
+            )
+            .unwrap();
+        let later_writer = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == later_writer_id)
+            .unwrap();
+        set_task_terminal(later_writer, TaskStatus::Complete);
+        later_writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: "later-correction".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        let later_tests = item.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap();
+        assert!(
+            evidence
+                .iter()
+                .all(|artifact| !later_tests.input_artifacts.contains(artifact))
+        );
+    }
+
+    #[test]
+    fn passing_recheck_supersedes_failed_tester_review_evidence() {
+        let mut item = work_item_with_completed_write("work-1");
+        let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester_id)
+            .unwrap();
+        set_task_terminal(tester, TaskStatus::Complete);
+        let tester_area = tester.artifact_area.as_ref().unwrap().path.clone();
+        let source_results = ArtifactRef {
+            producer_id: tester_id.clone(),
+            path: format!("{tester_area}/tester-results.json"),
+        };
+        let failed_log = ArtifactRef {
+            producer_id: tester_id,
+            path: format!("{tester_area}/commands/0-stderr.log"),
+        };
+        let writer_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![source_results.clone(), failed_log.clone()],
+            )
+            .unwrap();
+        let writer = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == writer_id)
+            .unwrap();
+        set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: "commit-initial".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let recheck_id = item
+            .add_failed_command_recheck_task("attempt-1", source_results.clone())
+            .unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == recheck_id)
+            .unwrap();
+        set_task_terminal(recheck, TaskStatus::Complete);
+        let recheck_results = ArtifactRef {
+            producer_id: recheck_id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                recheck.artifact_area.as_ref().unwrap().path
+            ),
+        };
+
+        item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        let tests = item.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap();
+        assert!(tests.input_artifacts.contains(&recheck_results));
+        assert!(!tests.input_artifacts.contains(&source_results));
+        assert!(!tests.input_artifacts.contains(&failed_log));
     }
 
     #[test]

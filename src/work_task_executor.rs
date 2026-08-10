@@ -4514,6 +4514,51 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
             }
         }
     }
+    for path in input_artifacts.iter().filter(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "tester-results.json")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name.to_string_lossy().contains("-tester"))
+    }) {
+        let Ok(source) = fs::read(path) else {
+            continue;
+        };
+        let Ok(results) = serde_json::from_slice::<crate::tester::TesterResults>(&source) else {
+            continue;
+        };
+        let Some(artifact_dir) = path.parent() else {
+            continue;
+        };
+        for (index, command) in results
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.exit_code != 0)
+        {
+            let role = "tester".to_string();
+            let stable_title = format!("configured command {index}: {}", command.command);
+            let identity = crate::review::finding_identity(&role, &stable_title);
+            let stdout = artifact_dir.join(&command.stdout_log);
+            let stderr = artifact_dir.join(&command.stderr_log);
+            let title = format!(
+                "Configured Tester command {index} `{}` failed with exit code {}; stdout: {}; stderr: {}",
+                command.command,
+                command.exit_code,
+                stdout.display(),
+                stderr.display()
+            );
+            findings
+                .entry((role.clone(), identity.clone()))
+                .or_insert(ExecutionContextFinding {
+                    role: role.clone(),
+                    identity,
+                    title,
+                    artifact: truncate_utf8(&path.display().to_string(), 240),
+                });
+        }
+    }
     findings.into_values().collect()
 }
 
@@ -6414,6 +6459,30 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
     } else {
         "yes"
     };
+    let tester_correction_evidence = input
+        .input_artifacts
+        .iter()
+        .filter(|path| {
+            let tester_results = path
+                .file_name()
+                .is_some_and(|name| name == "tester-results.json")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name.to_string_lossy().contains("-tester"));
+            tester_results || crate::tester::is_command_log_path(path)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let tester_correction_evidence_list = render_path_list(&tester_correction_evidence);
+    let has_tester_correction_evidence = if task.role == "tests"
+        && task.depends_on.is_none()
+        && !tester_correction_evidence.is_empty()
+    {
+        "yes"
+    } else {
+        ""
+    };
     let reviewer_progress_md_path =
         progress_md_path_for(input.project_root, &input.item.id, input.attempt_id)
             .display()
@@ -6515,6 +6584,14 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
                 &writer_completion_matrix_path,
             ),
             ("has_writer_completion_matrix", has_writer_completion_matrix),
+            (
+                "has_tester_correction_evidence",
+                has_tester_correction_evidence,
+            ),
+            (
+                "tester_correction_evidence_list",
+                &tester_correction_evidence_list,
+            ),
             ("progress_md_path", &reviewer_progress_md_path),
             ("review_path", &review_path_display),
             ("review_inspection_path", &review_inspection_path_display),
@@ -14038,6 +14115,171 @@ mod tests {
         assert_eq!(context.executed_commands, ["cargo nextest run"]);
         assert_eq!(context.historical_artifacts.len(), 4);
         assert_eq!(context.omitted.current_findings, 0);
+    }
+
+    #[test]
+    fn execution_context_surfaces_each_failed_tester_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("writer-artifact");
+        let tester_dir = tmp.path().join("attempt-1-tester-8");
+        let tester_results = tester_dir.join("tester-results.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/1-stdout.log"), "first stdout").unwrap();
+        fs::write(tester_dir.join("commands/1-stderr.log"), "first stderr").unwrap();
+        fs::write(tester_dir.join("commands/2-stdout.log"), "second stdout").unwrap();
+        fs::write(tester_dir.join("commands/2-stderr.log"), "second stderr").unwrap();
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "abc123",
+                "commands": [
+                    {"command": "cargo fmt --check", "test_harness": "cargo", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"},
+                    {"command": "make test", "test_harness": "shell", "exit_code": 2, "duration_ms": 3, "stdout_log": "commands/2-stdout.log", "stderr_log": "commands/2-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context_path = write_execution_context(
+            &artifact,
+            &workspace,
+            "abc123",
+            Some("base123"),
+            &[],
+            std::slice::from_ref(&tester_results),
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(context.current_findings.len(), 2);
+        assert!(context.current_findings.iter().all(|finding| {
+            finding.role == "tester" && finding.identity.starts_with("sha256:")
+        }));
+        assert!(context.current_findings.iter().any(|finding| {
+            finding.title.contains("`cargo test --lib`")
+                && finding.title.contains("exit code 101")
+                && finding.title.contains(
+                    &tester_dir
+                        .join("commands/1-stdout.log")
+                        .display()
+                        .to_string(),
+                )
+                && finding.title.contains(
+                    &tester_dir
+                        .join("commands/1-stderr.log")
+                        .display()
+                        .to_string(),
+                )
+        }));
+        assert!(context.current_findings.iter().any(|finding| {
+            finding.title.contains("`make test`") && finding.title.contains("exit code 2")
+        }));
+        assert!(
+            context
+                .current_findings
+                .iter()
+                .all(|finding| !finding.title.contains("cargo fmt --check"))
+        );
+    }
+
+    #[test]
+    fn tests_reviewer_prompt_indexes_failed_tester_correction_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let workspace = project_root.join("candidate");
+        let tester_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
+        let tester_results = tester_dir.join("tester-results.json");
+        let artifact_dir =
+            project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "stdout").unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), "stderr").unwrap();
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "prior123",
+                "commands": [{"command": "make test", "test_harness": "shell", "exit_code": 2, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let item = corrective_review_item("tests");
+        let inputs = vec![
+            tester_results.clone(),
+            tester_dir.join("commands/0-stdout.log"),
+            tester_dir.join("commands/0-stderr.log"),
+        ];
+
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-tests",
+            project_root,
+            artifact_dir: &artifact_dir,
+            review_path: &artifact_dir.join("review.md"),
+            readable_workspaces: std::slice::from_ref(&workspace),
+            input_artifacts: &inputs,
+            review_only: false,
+        })
+        .unwrap();
+        let context: ExecutionContextV1 = serde_json::from_str(
+            &fs::read_to_string(artifact_dir.join("execution-context.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(context.current_findings.len(), 1);
+        assert_eq!(
+            context.current_findings[0].artifact,
+            tester_results.display().to_string()
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("failed configured Tester command")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains(&tester_results.display().to_string())
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &tester_dir
+                    .join("commands/0-stdout.log")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &tester_dir
+                    .join("commands/0-stderr.log")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(
+            prompts.review_prompt.contains(
+                &artifact_dir
+                    .join("execution-context.json")
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(!prompts.review_prompt.contains("{{"));
     }
 
     #[test]

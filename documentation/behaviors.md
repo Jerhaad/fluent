@@ -201,6 +201,29 @@ WHEN Reviewers pass after a failed-command recheck, THE SYSTEM SHALL run the
 complete configured final Tester before Learning.
 Test: src/work_attempt_loop.rs (reviews_after_passing_recheck_still_plan_full_final_tester)
 
+### B9
+
+IF a configured final Tester command fails, THEN THE SYSTEM SHALL present each
+failed command as a current correction finding with its exit code and durable
+stdout and stderr log paths.
+Test: src/work_task_executor.rs (execution_context_surfaces_each_failed_tester_command)
+Test: src/work_attempt_loop.rs (failed_configured_tester_command_returns_exact_evidence_to_writer)
+
+### B10
+
+WHEN a candidate corrected after a failed Tester command reaches tests review,
+THE SYSTEM SHALL give the tests reviewer the latest structured Tester result and
+failed command logs.
+Test: src/work_model.rs (tests_reviewer_receives_latest_tester_correction_evidence)
+Test: src/work_attempt_loop.rs (real_corrective_commit_sends_failed_tester_evidence_to_tests_review)
+
+### B11
+
+WHEN a failed-command recheck passes before tests review, THE SYSTEM SHALL
+replace the prior failed Tester evidence with the passing recheck result.
+Test: src/work_model.rs (passing_recheck_supersedes_failed_tester_review_evidence)
+Test: src/work_attempt_loop.rs (passing_failed_command_recheck_allows_normal_reviews)
+
 ## Persisted status accounting
 
 ### B1

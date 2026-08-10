@@ -50,6 +50,10 @@ failed review at {{evidence_prior_review_path}} for commit
 {{#if has_work_item_inputs}}
 - Read each preserved Work Item input. These immutable files are authoritative review inputs: {{work_item_inputs_list}}
 {{/if}}
+{{#if has_tester_correction_evidence}}
+- Read the latest Tester correction evidence at these complete paths:
+{{tester_correction_evidence_list}}
+{{/if}}
 
 ## Phase 2 — Inspect the candidate
 
@@ -66,6 +70,10 @@ failed review at {{evidence_prior_review_path}} for commit
 1. Read the review-{{role}} skill at {{skill_path}} and apply it to evaluate the candidate.
 2. Identify findings — concerns the Writer should address.
 {{#if is_review_tests}}
+   - Treat each failed configured Tester command in the generated context as the finding that caused
+     this correction. Inspect its structured result and named logs, then verify whether the current
+     candidate addresses it. A result bound to the prior candidate explains the correction; it is
+     not passing evidence for the current commit.
    - Verify `Untestable:` justifications from progress.md rather than accepting them at face value. Reasons like "trivial delegation" or "framework guarantee" are fair; "hard to set up" usually isn't.
    - Each behavior in behaviors.md should have at least one test that verifies it. Flag behaviors without a verifying test.
    - Do not rerun the full suite. If the Tester evidence omits one result needed to decide a concrete finding, you may run one named missing evidence check. Use the shared candidate cache with `CARGO_TARGET_DIR="{{reviewer_cache_dir}}/target"` for Cargo. Record the exact command and result in review.md.

@@ -4926,6 +4926,22 @@ fn tester_errored(tester_results_path: &Path) -> bool {
     results.error.is_some()
 }
 
+fn failed_tester_commands(tester_results_path: &Path) -> usize {
+    let content = match fs::read_to_string(tester_results_path) {
+        Ok(content) => content,
+        Err(_) => return 0,
+    };
+    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
+        Ok(results) => results,
+        Err(_) => return 0,
+    };
+    results
+        .commands
+        .iter()
+        .filter(|command| command.exit_code != 0)
+        .count()
+}
+
 fn baseline_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
     let work_item_id = &attempt.work_item_id;
     let attempt_id = &attempt.id;
@@ -5128,6 +5144,24 @@ fn final_tester_correction_artifacts(
     gate: &ArtifactRef,
     tester_results_path: &Path,
 ) -> Result<Vec<ArtifactRef>> {
+    let mut artifacts = vec![gate.clone()];
+    artifacts.extend(failed_tester_command_artifacts(
+        project_root,
+        attempt,
+        tester_results_path,
+    )?);
+    Ok(artifacts)
+}
+
+/// Return the exact structured result and logs for each nonzero configured
+/// command in the latest final Tester. The result remains attached when every
+/// command passed so final-Tester candidate-gate corrections retain their
+/// structured evidence.
+fn failed_tester_command_artifacts(
+    project_root: &Path,
+    attempt: &Attempt,
+    tester_results_path: &Path,
+) -> Result<Vec<ArtifactRef>> {
     let last_write_index = attempt
         .tasks
         .iter()
@@ -5176,13 +5210,10 @@ fn final_tester_correction_artifacts(
         );
     }
 
-    let mut artifacts = vec![
-        gate.clone(),
-        ArtifactRef {
-            producer_id: tester.id.clone(),
-            path: format!("{}/tester-results.json", area.path),
-        },
-    ];
+    let mut artifacts = vec![ArtifactRef {
+        producer_id: tester.id.clone(),
+        path: format!("{}/tester-results.json", area.path),
+    }];
     for (index, command) in results
         .commands
         .iter()
@@ -6665,6 +6696,11 @@ fn interpret_reviews(
         .filter(|_| tester_gate_applicable)
         .map(|p| !p.is_file() || tester_errored(p))
         .unwrap_or(false);
+    let tester_failed_command_count = tester_result_path
+        .as_ref()
+        .filter(|_| tester_gate_applicable)
+        .map(|path| failed_tester_commands(path))
+        .unwrap_or(0);
 
     if tester_gate_applicable && tester_fail_count == 0 && !tester_has_error {
         if let Some((artifact, evidence)) = gate_candidate_after_final_tester(
@@ -6700,10 +6736,25 @@ fn interpret_reviews(
         }
     }
 
-    let has_failures = !failed.is_empty() || tester_fail_count > 0 || tester_has_error;
+    let has_failures = !failed.is_empty()
+        || tester_fail_count > 0
+        || tester_has_error
+        || tester_failed_command_count > 0;
 
     if has_failures {
-        if tester_fail_count > 0 || tester_has_error {
+        if tester_failed_command_count > 0 {
+            if let Some(ref path) = tester_result_path {
+                for artifact in failed_tester_command_artifacts(
+                    project_root,
+                    &item.attempts[attempt_index],
+                    path,
+                )? {
+                    if !failed.contains(&artifact) {
+                        failed.push(artifact);
+                    }
+                }
+            }
+        } else if tester_fail_count > 0 || tester_has_error {
             if let Some(ref path) = tester_result_path {
                 if let Ok(relative) = path.strip_prefix(project_root) {
                     failed.push(ArtifactRef {
@@ -8976,6 +9027,82 @@ mod tests {
         assert_eq!(stored.merge_candidates[0].candidate_commit, "abc123");
     }
 
+    #[test]
+    fn failed_configured_tester_command_returns_exact_evidence_to_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tester_json = r#"{
+            "candidate_commit": "abc123",
+            "commands": [{
+                "command": "xcodebuild test",
+                "test_harness": "xcodebuild",
+                "exit_code": 70,
+                "duration_ms": 10,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [
+                {"id": "test_a", "test_harness": "xcodebuild", "status": "pass", "duration_ms": 10, "failure_excerpt": null}
+            ],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        }"#;
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(tester_json));
+        let tester_dir = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester",
+        ));
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "build output").unwrap();
+        fs::write(
+            tester_dir.join("commands/0-stderr.log"),
+            "test host missing",
+        )
+        .unwrap();
+
+        let outcome = interpret_reviews(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("a failed configured Tester command must return to the Writer")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(stored.merge_candidates.is_empty());
+        let writer = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let paths = writer
+            .input_artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 3);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("/tester-results.json"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("/commands/0-stdout.log"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.ends_with("/commands/0-stderr.log"))
+        );
+    }
+
     fn final_tester_evidence_fixture(
         project_root: &Path,
     ) -> (WorkModelStore, tempfile::TempDir, String) {
@@ -9513,7 +9640,7 @@ mod tests {
     }
 
     #[test]
-    fn real_corrective_commit_bypasses_failed_command_recheck() {
+    fn real_corrective_commit_sends_failed_tester_evidence_to_tests_review() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, workspace, candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
@@ -9574,6 +9701,30 @@ mod tests {
                 .iter()
                 .all(|task| { task.role != crate::work_model::FAILED_COMMAND_RECHECK_ROLE })
         );
+        let tests_review = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap();
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/tester-results.json"))
+        );
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/commands/0-stdout.log"))
+        );
+        assert!(
+            tests_review
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.path.ends_with("/commands/0-stderr.log"))
+        );
     }
 
     #[test]
@@ -9612,12 +9763,29 @@ mod tests {
             WorkAttemptRunOutcome::PlannedReviews { .. }
         ));
         let stored = store.read_work_item("work-1").unwrap();
-        assert!(
-            stored.attempts[0]
-                .tasks
-                .iter()
-                .any(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Planned)
-        );
+        let recheck = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let tests_review = stored.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.kind == TaskKind::Review
+                    && task.role == "tests"
+                    && task.status == TaskStatus::Planned
+            })
+            .unwrap();
+        assert!(tests_review.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id == recheck.id && artifact.path.ends_with("/tester-results.json")
+        }));
+        assert!(!tests_review.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id != recheck.id
+                && (artifact.path.ends_with("/tester-results.json")
+                    || crate::tester::is_command_log_path(Path::new(&artifact.path)))
+        }));
     }
 
     #[test]
