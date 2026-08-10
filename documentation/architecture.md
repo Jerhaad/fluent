@@ -2971,6 +2971,15 @@ confirm it still acts on the dispatch it claimed. Each worker holds a
 whole-Attempt lease for the life of the dispatch, and drives execution
 via `fluent attempt run <id> <attempt-id>`.
 
+If the bound Attempt does not exist yet, `ensure_bound_attempt` resolves coder
+inputs from user configuration, the human-facing project's
+`.fluent/config.yaml`, and supported `FLUENT_*` environment overrides through
+the same creation-time path as `fluent attempt create`. It snapshots the fully
+resolved writer and reviewer mapping while adding the Attempt, before the coder
+plan is printed or a baseline starts. If the Attempt already exists, including
+for a resume dispatch, this step returns without reading current coder
+configuration or changing the persisted mapping.
+
 For a resume dispatch, the Attempt binding is already durable at enqueue time.
 Claim verifies that the persisted binding still names the current supported
 needs-user Attempt and then launches that same Attempt; the one migration

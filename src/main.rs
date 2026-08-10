@@ -598,26 +598,20 @@ fn cmd_attempt(
                 Err(error) => return Err(error.into()),
             };
             let attempt_id = attempt_id.unwrap_or_else(|| item.next_attempt_id());
-            item.add_initial_attempt(attempt_id.clone())?;
-
             let coder_mapping = work_model::resolve_coder_mapping(
-                &fluent::config::from_config(project_root)?
-                    .merge(work_model::CoderMappingInputs::from_env())
-                    .merge_cli(
-                        write_coder,
-                        write_model,
-                        review_coder,
-                        review_model,
-                        coder.or_else(|| global_coder.map(str::to_string)),
-                        model,
-                        write_effort,
-                        review_effort,
-                        effort,
-                    ),
+                &fluent::config::attempt_creation_inputs(project_root)?.merge_cli(
+                    write_coder,
+                    write_model,
+                    review_coder,
+                    review_model,
+                    coder.or_else(|| global_coder.map(str::to_string)),
+                    model,
+                    write_effort,
+                    review_effort,
+                    effort,
+                ),
             )?;
-            if let Some(attempt) = item.attempts.iter_mut().find(|a| a.id == attempt_id) {
-                attempt.coder_mapping = coder_mapping;
-            }
+            item.add_initial_attempt_with_coder_mapping(attempt_id.clone(), coder_mapping)?;
 
             store.write_work_item(&item)?;
             println!("Created Attempt {attempt_id} for Work Item {work_item_id}");

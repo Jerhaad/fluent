@@ -4895,6 +4895,25 @@ record so it can be inspected via `fluent work-item show <work-item-id>`.
 Test: src/work_model.rs (coder_mapping_round_trips_json)
 Test: src/work_model.rs (attempt_with_coder_mapping_round_trips)
 
+### B7
+
+WHEN the scheduler claims queued Work that has no existing Attempt,
+THE SYSTEM SHALL create that Attempt with the same writer and reviewer mapping
+that `fluent attempt create` would resolve from the current configuration and
+supported environment overrides.
+Test: src/scheduler.rs (scheduler_created_attempt_snapshots_project_coder_mapping)
+Test: src/scheduler.rs (claim_persists_bound_attempt_before_launch)
+Test: src/config.rs (attempt_creation_inputs_layer_environment_over_project_config)
+
+### B8
+
+WHEN the scheduler claims or resumes a dispatch already bound to an existing
+Attempt,
+THE SYSTEM SHALL preserve that Attempt's stored coder mapping even when current
+project configuration differs.
+Test: src/scheduler.rs (scheduler_preserves_existing_attempt_coder_mapping)
+Test: src/scheduler.rs (explicit_resume_survives_restart_and_runs_exact_attempt)
+
 ## Attempt coder mapping continuity
 
 ### B1

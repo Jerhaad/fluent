@@ -579,7 +579,10 @@ fn ensure_bound_attempt(project_root: &Path, work_item_id: &str, attempt_id: &st
     if item.attempts.iter().any(|a| a.id == attempt_id) {
         return Ok(());
     }
-    item.add_initial_attempt(attempt_id)?;
+    let coder_mapping = crate::work_model::resolve_coder_mapping(
+        &crate::config::attempt_creation_inputs(project_root)?,
+    )?;
+    item.add_initial_attempt_with_coder_mapping(attempt_id, coder_mapping)?;
     store.write_work_item(&item)?;
     Ok(())
 }
@@ -788,6 +791,66 @@ mod tests {
             classify_attempt_outcome(dir.path(), "wi-paused", "attempt-1").unwrap(),
             AttemptOutcome::NeedsUser
         );
+    }
+
+    #[test]
+    fn scheduler_created_attempt_snapshots_project_coder_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-profile");
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: gpt-write\n    effort: medium\n  reviewer:\n    coder: claude\n    model: claude-review\n    effort: high\n",
+        )
+        .unwrap();
+
+        ensure_bound_attempt(dir.path(), "wi-profile", "attempt-1").unwrap();
+
+        let item = WorkModelStore::new(dir.path())
+            .read_work_item("wi-profile")
+            .unwrap();
+        let mapping = &item.attempts[0].coder_mapping;
+        assert_eq!(mapping.write.coder, crate::coder::CoderKind::Codex);
+        assert_eq!(mapping.write.model, "gpt-write");
+        assert_eq!(mapping.write.effort.as_deref(), Some("medium"));
+        assert_eq!(mapping.review.coder, crate::coder::CoderKind::Claude);
+        assert_eq!(mapping.review.model, "claude-review");
+        assert_eq!(mapping.review.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn scheduler_preserves_existing_attempt_coder_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        let store = WorkModelStore::new(dir.path());
+        let mut item = WorkItem::planned("wi-resume-profile", "Resume profile");
+        let persisted = crate::work_model::CoderMapping {
+            write: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Pi,
+                model: "persisted-write".to_string(),
+                effort: Some("high".to_string()),
+            },
+            review: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Codex,
+                model: "persisted-review".to_string(),
+                effort: Some("medium".to_string()),
+            },
+        };
+        item.add_initial_attempt_with_coder_mapping("attempt-1", persisted.clone())
+            .unwrap();
+        store.create_work_item(&item).unwrap();
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: claude\n  reviewer:\n    coder: claude\n",
+        )
+        .unwrap();
+
+        ensure_bound_attempt(dir.path(), "wi-resume-profile", "attempt-1").unwrap();
+
+        let item = store.read_work_item("wi-resume-profile").unwrap();
+        assert_eq!(item.attempts[0].coder_mapping, persisted);
     }
 
     #[test]
@@ -1249,8 +1312,27 @@ mod tests {
         setup_project(dir.path());
         let store = WorkModelStore::new(dir.path());
         let mut item = WorkItem::planned("wi-resume", "Resume");
-        item.add_initial_attempt("attempt-1").unwrap();
+        let persisted_mapping = crate::work_model::CoderMapping {
+            write: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Codex,
+                model: "persisted-write".to_string(),
+                effort: Some("medium".to_string()),
+            },
+            review: crate::work_model::CoderModelPair {
+                coder: crate::coder::CoderKind::Pi,
+                model: "persisted-review".to_string(),
+                effort: Some("high".to_string()),
+            },
+        };
+        item.add_initial_attempt_with_coder_mapping("attempt-1", persisted_mapping.clone())
+            .unwrap();
         store.create_work_item(&item).unwrap();
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: claude\n  reviewer:\n    coder: claude\n",
+        )
+        .unwrap();
         add_queued(dir.path(), "wi-resume", 0);
         queue::claim(dir.path(), "wi-resume", "attempt-1")
             .unwrap()
@@ -1271,6 +1353,7 @@ mod tests {
         assert_eq!(item.attempts.len(), 1, "resume creates no new Attempt");
         assert_eq!(item.attempts[0].id, "attempt-1");
         assert_eq!(item.attempts[0].status, AttemptStatus::Complete);
+        assert_eq!(item.attempts[0].coder_mapping, persisted_mapping);
         assert_eq!(item.merge_candidates.len(), 1);
         let ledger = queue::read_ledger(dir.path(), "wi-resume")
             .unwrap()
@@ -1518,6 +1601,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         setup_project(dir.path());
         write_ready_work_item(dir.path(), "wi-1");
+        std::fs::create_dir_all(dir.path().join(".fluent")).unwrap();
+        std::fs::write(
+            dir.path().join(".fluent/config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: scheduled-write\n  reviewer:\n    coder: pi\n    model: scheduled-review\n",
+        )
+        .unwrap();
         add_queued(dir.path(), "wi-1", 1);
 
         // A runner that inspects the ledger and Work model at launch time:
@@ -1537,6 +1626,21 @@ mod tests {
                     1,
                     "exactly one bound Attempt exists at launch"
                 );
+                let attempt = item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap();
+                assert_eq!(
+                    attempt.coder_mapping.write.coder,
+                    crate::coder::CoderKind::Codex
+                );
+                assert_eq!(attempt.coder_mapping.write.model, "scheduled-write");
+                assert_eq!(
+                    attempt.coder_mapping.review.coder,
+                    crate::coder::CoderKind::Pi
+                );
+                assert_eq!(attempt.coder_mapping.review.model, "scheduled-review");
                 Ok(AttemptOutcome::CandidateReady)
             }
         }

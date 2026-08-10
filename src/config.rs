@@ -924,6 +924,23 @@ pub fn from_config(project_root: &Path) -> Result<CoderMappingInputs> {
     })
 }
 
+/// Resolve the configuration and environment layers used when a new Attempt
+/// snapshots its coder mapping. Existing Attempts must keep their persisted
+/// mapping and must not call this again when they resume.
+pub fn attempt_creation_inputs(project_root: &Path) -> Result<CoderMappingInputs> {
+    attempt_creation_inputs_with_environment(project_root, CoderMappingInputs::from_env())
+}
+
+/// Resolve creation inputs with an explicit environment layer. Production
+/// passes the supported `FLUENT_*` variables; tests pass a deterministic layer
+/// without mutating process-global environment state.
+fn attempt_creation_inputs_with_environment(
+    project_root: &Path,
+    environment: CoderMappingInputs,
+) -> Result<CoderMappingInputs> {
+    Ok(from_config(project_root)?.merge(environment))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1058,6 +1075,33 @@ coders:
         let inputs = from_config(dir.path()).unwrap();
         assert!(inputs.write_coder.is_none());
         assert!(inputs.write_model.is_none());
+    }
+
+    #[test]
+    fn attempt_creation_inputs_layer_environment_over_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".fluent");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.yaml"),
+            "coders:\n  writer:\n    coder: codex\n    model: project-write\n  reviewer:\n    coder: claude\n    model: project-review\n",
+        )
+        .unwrap();
+
+        let inputs = attempt_creation_inputs_with_environment(
+            dir.path(),
+            CoderMappingInputs {
+                review_coder: Some("codex".to_string()),
+                review_model: Some("environment-review".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(inputs.write_coder.as_deref(), Some("codex"));
+        assert_eq!(inputs.write_model.as_deref(), Some("project-write"));
+        assert_eq!(inputs.review_coder.as_deref(), Some("codex"));
+        assert_eq!(inputs.review_model.as_deref(), Some("environment-review"));
     }
 
     #[test]

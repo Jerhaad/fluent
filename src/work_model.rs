@@ -580,6 +580,16 @@ impl WorkItem {
         &mut self,
         attempt_id: impl Into<String>,
     ) -> Result<(), WorkModelError> {
+        self.add_initial_attempt_with_coder_mapping(attempt_id, CoderMapping::default())
+    }
+
+    /// Add one initial write Attempt and snapshot the resolved coder mapping
+    /// that must remain authoritative for every later run and resume.
+    pub fn add_initial_attempt_with_coder_mapping(
+        &mut self,
+        attempt_id: impl Into<String>,
+        coder_mapping: CoderMapping,
+    ) -> Result<(), WorkModelError> {
         self.ensure_not_abandoned()?;
         self.ensure_execution_ready()?;
         let attempt_id = attempt_id.into();
@@ -611,7 +621,7 @@ impl WorkItem {
             work_item_id: self.id.clone(),
             kind: AttemptKind::Write,
             status: AttemptStatus::Planned,
-            coder_mapping: CoderMapping::default(),
+            coder_mapping,
             tasks: vec![Task {
                 id: task_id,
                 kind: TaskKind::Write,
