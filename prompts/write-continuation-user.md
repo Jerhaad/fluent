@@ -37,7 +37,11 @@ commit messages without changing the candidate tree. Do not append a commit to
 hide the rejected commits; Fluent rechecks the complete candidate range.
 
 {{#if has_writer_completion_matrix}}
-Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a row complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name the applicable behavior or approach row ID, or `["none: <specific reason>"]` when no approved constraint applies. Fluent checks the matrix before reviewers and the final Tester.
+Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a row complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name an applicable Behavior, Approach, or required Plan row ID, or `["none: <specific reason>"]` when no approved constraint applies. These are the exact allowed IDs for this Attempt:
+
+{{writer_completion_allowed_constraints}}
+
+Fluent checks the matrix before reviewers and the final Tester.
 {{/if}}
 
 In your final response, include a concise `Verification` section with each exact command, its pass/fail result, and what it covered. State which canonical commands you intentionally left to Fluent's final Tester. This summary is advisory review input; Fluent's final Tester artifact is the authoritative full-suite evidence.

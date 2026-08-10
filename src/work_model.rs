@@ -2488,6 +2488,19 @@ impl WriterCompletionContract {
             })
         }
     }
+
+    /// Return every immutable planning row a corrective finding may cite.
+    pub fn applicable_constraint_ids(&self) -> impl Iterator<Item = &str> {
+        self.requirements.iter().filter_map(|entry| {
+            matches!(
+                entry.kind,
+                WriterCompletionRequirementKind::Behavior
+                    | WriterCompletionRequirementKind::Approach
+                    | WriterCompletionRequirementKind::Plan
+            )
+            .then_some(entry.id.as_str())
+        })
+    }
 }
 
 fn completion_slug(value: &str) -> String {
@@ -2901,16 +2914,7 @@ impl WriterCompletionMatrix {
             ));
         }
         let allowed_constraints = contract
-            .requirements
-            .iter()
-            .filter(|entry| {
-                matches!(
-                    entry.kind,
-                    WriterCompletionRequirementKind::Behavior
-                        | WriterCompletionRequirementKind::Approach
-                )
-            })
-            .map(|entry| entry.id.as_str())
+            .applicable_constraint_ids()
             .collect::<std::collections::HashSet<_>>();
         let mut complete = 0usize;
         let mut incomplete_reason = None;
@@ -2981,7 +2985,7 @@ impl WriterCompletionMatrix {
                 if row.applicable_constraints.is_empty() {
                     incomplete_reason.get_or_insert_with(|| {
                         format!(
-                            "Writer completion finding {:?} lacks an applicable behavior or approach constraint",
+                            "Writer completion finding {:?} lacks an applicable behavior, approach, or required Plan constraint",
                             row.id
                         )
                     });
@@ -8124,13 +8128,22 @@ mod tests {
     fn writer_completion_matrix_reconciles_claims_and_corrective_findings() {
         let contract = WriterCompletionContract {
             version: WRITER_COMPLETION_CONTRACT_VERSION,
-            requirements: vec![WriterCompletionRequirement {
-                id: "behavior:dashboard:b1".to_string(),
-                kind: WriterCompletionRequirementKind::Behavior,
-                source: "behaviors.md#dashboard:b1".to_string(),
-                requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
-                verification_refs: vec!["tests/dashboard.rs (preserves_selection)".to_string()],
-            }],
+            requirements: vec![
+                WriterCompletionRequirement {
+                    id: "behavior:dashboard:b1".to_string(),
+                    kind: WriterCompletionRequirementKind::Behavior,
+                    source: "behaviors.md#dashboard:b1".to_string(),
+                    requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
+                    verification_refs: vec!["tests/dashboard.rs (preserves_selection)".to_string()],
+                },
+                WriterCompletionRequirement {
+                    id: "plan:step-2".to_string(),
+                    kind: WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-2".to_string(),
+                    requirement: "Keep Retry and Dismiss session-owned.".to_string(),
+                    verification_refs: vec!["cargo test hud_actions".to_string()],
+                },
+            ],
         };
         let findings = vec![WriterCompletionFinding {
             id: "finding:tests:stable-id".to_string(),
@@ -8141,7 +8154,11 @@ mod tests {
         let mut matrix =
             WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-2", &findings, None)
                 .unwrap();
-        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(matrix.rows.len(), 3);
+        assert_eq!(
+            contract.applicable_constraint_ids().collect::<Vec<_>>(),
+            vec!["behavior:dashboard:b1", "plan:step-2"]
+        );
         assert!(
             !matrix
                 .status_against(&contract, "attempt-1-write-2", &findings)
@@ -8163,9 +8180,11 @@ mod tests {
                 .unwrap()
                 .incomplete_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("applicable behavior or approach"))
+                .is_some_and(
+                    |reason| reason.contains("applicable behavior, approach, or required Plan")
+                )
         );
-        matrix.rows[1].applicable_constraints = vec!["behavior:dashboard:b1".to_string()];
+        matrix.rows[2].applicable_constraints = vec!["plan:step-2".to_string()];
         assert!(
             matrix
                 .status_against(&contract, "attempt-1-write-2", &findings)
@@ -8188,11 +8207,11 @@ mod tests {
             missing
                 .status_against(&contract, "attempt-1-write-2", &findings)
                 .unwrap_err()
-                .contains("expected 2")
+                .contains("expected 3")
         );
 
         let mut unknown_constraint = matrix.clone();
-        unknown_constraint.rows[1].applicable_constraints = vec!["behavior:unknown:b9".to_string()];
+        unknown_constraint.rows[2].applicable_constraints = vec!["behavior:unknown:b9".to_string()];
         assert!(
             unknown_constraint
                 .status_against(&contract, "attempt-1-write-2", &findings)

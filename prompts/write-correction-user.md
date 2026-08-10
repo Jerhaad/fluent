@@ -90,8 +90,12 @@ Do not use that declaration after changing the candidate.
 Update mutable progress sections and the completion matrix only with concrete passing evidence.
 Preserve every host-owned matrix row. Keep `implementation-evidence`, `verification`, and
 `applicable-constraints` as JSON arrays, even when one value exists. Map each completed finding to
-its applicable behavior or Approach constraint, or to `["none: <specific reason>"]`. Do not edit
-the host-owned `## Required completion` projection in progress.md.
+its applicable Behavior, Approach, or required Plan constraint, or to `["none: <specific reason>"]`.
+These are the exact allowed IDs for this Attempt:
+
+{{writer_completion_allowed_constraints}}
+
+Do not edit the host-owned `## Required completion` projection in progress.md.
 {{else}}
 Update progress only with concrete passing evidence.
 {{/if}}

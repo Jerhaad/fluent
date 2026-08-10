@@ -95,7 +95,9 @@ The row identity, kind, source, requirement, and verification references are imm
     ],
     "applicable-constraints": []
 
-For each review-finding row, list the applicable behavior or approach row IDs in `applicable-constraints`; when none applies, use `["none: <specific reason>"]`.
+For each review-finding row, list applicable Behavior, Approach, or required Plan row IDs in `applicable-constraints`; when none applies, use `["none: <specific reason>"]`. These are the exact allowed IDs for this Attempt:
+
+{{writer_completion_allowed_constraints}}
 
 Fluent validates this matrix before starting reviewers. Pending or evidence-less rows return to Writer work without spending a review or final-Tester cycle. Structural edits or contradictory claims pause for repair. The matrix is advisory evidence for reviewers; it does not replace the project's test selectors or Fluent's final Tester.
 {{/if}}

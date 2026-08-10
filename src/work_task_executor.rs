@@ -3851,6 +3851,8 @@ fn build_write_task_prompt_with_workspace(
     } else {
         ""
     };
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
     let has_matrix_backed_required_progress_value =
         if has_required_progress && has_writer_completion_matrix {
             "yes"
@@ -3981,6 +3983,10 @@ fn build_write_task_prompt_with_workspace(
                 "has_writer_completion_matrix",
                 has_writer_completion_matrix_value,
             ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
+            ),
             ("general_expertise_index", &general_expertise_index),
             ("project_expertise_index", &project_expertise_index),
             (
@@ -4049,6 +4055,8 @@ fn build_writer_continuation_prompt(
     } else {
         ""
     };
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
     let planning = compute_planning_paths(item, project_root);
     let brief_path = planning.brief();
     let behaviors_path = planning.behaviors();
@@ -4072,6 +4080,10 @@ fn build_writer_continuation_prompt(
             (
                 "has_writer_completion_matrix",
                 has_writer_completion_matrix_value,
+            ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
             ),
             ("brief_path", &brief_path),
             ("behaviors_path", &behaviors_path),
@@ -4138,6 +4150,8 @@ fn build_reviewed_correction_prompt(
         .flatten()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+    let writer_completion_allowed_constraints =
+        writer_completion_allowed_constraints(item, attempt_id);
     let correction_artifacts_list = prior_reviews_block(correction_artifacts, "  ");
     let failed_tester_inspection_inputs = required_failed_tester_inspection_inputs(task);
     let failed_tester_inspection_list = failed_tester_inspection_inputs
@@ -4172,6 +4186,10 @@ fn build_reviewed_correction_prompt(
                 } else {
                     ""
                 },
+            ),
+            (
+                "writer_completion_allowed_constraints",
+                &writer_completion_allowed_constraints,
             ),
             (
                 "execution_context_path",
@@ -4218,6 +4236,24 @@ fn build_reviewed_correction_prompt(
         );
     }
     Ok(prompt)
+}
+
+fn writer_completion_allowed_constraints(item: &WorkItem, attempt_id: &str) -> String {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| attempt.writer_completion_contract.as_ref())
+        .map(|contract| {
+            contract
+                .applicable_constraint_ids()
+                .map(|id| format!("- `{id}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_else(|| {
+            "- No planning constraint IDs are available; use `none: <specific reason>`.".to_string()
+        })
 }
 
 fn writer_context_base_commit(
@@ -14717,7 +14753,13 @@ mod tests {
         item.attempts[0].writer_completion_contract =
             Some(crate::work_model::WriterCompletionContract {
                 version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
-                requirements: Vec::new(),
+                requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    id: "plan:step-2".to_string(),
+                    kind: crate::work_model::WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-2".to_string(),
+                    requirement: "Keep the controls session-owned.".to_string(),
+                    verification_refs: Vec::new(),
+                }],
             });
         let matrix_prompt = build_writer_continuation_prompt(
             &item,
@@ -14732,6 +14774,8 @@ mod tests {
         assert!(matrix_prompt.contains("Preserve every host-owned row field"));
         assert!(matrix_prompt.contains("as JSON arrays"));
         assert!(matrix_prompt.contains("[\"none: <specific reason>\"]"));
+        assert!(matrix_prompt.contains("exact allowed IDs"));
+        assert!(matrix_prompt.contains("- `plan:step-2`"));
         assert!(matrix_prompt.contains("writer-completion.json"));
         assert!(matrix_prompt.contains("do not edit the host-owned"));
         assert!(!matrix_prompt.contains("{{"));
@@ -14829,7 +14873,13 @@ mod tests {
         item.attempts[0].writer_completion_contract =
             Some(crate::work_model::WriterCompletionContract {
                 version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
-                requirements: Vec::new(),
+                requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    id: "plan:step-2".to_string(),
+                    kind: crate::work_model::WriterCompletionRequirementKind::Plan,
+                    source: "plan.md#step-2".to_string(),
+                    requirement: "Keep the controls session-owned.".to_string(),
+                    verification_refs: Vec::new(),
+                }],
             });
         let progress = progress_md_path_for(project.path(), "work-1", "attempt-1");
         fs::create_dir_all(progress.parent().unwrap()).unwrap();
@@ -14859,6 +14909,8 @@ mod tests {
         assert!(prompt.contains(&progress.display().to_string()));
         assert!(prompt.contains("as JSON arrays"));
         assert!(prompt.contains("[\"none: <specific reason>\"]"));
+        assert!(prompt.contains("exact allowed IDs"));
+        assert!(prompt.contains("- `plan:step-2`"));
         assert!(prompt.contains("host-owned `## Required completion` projection"));
         assert!(prompt.contains("\"schema_version\": 1"));
         assert!(!prompt.contains(large_output_marker));
@@ -15138,6 +15190,8 @@ mod tests {
         );
         assert!(prompt.contains("\"verification\": ["));
         assert!(prompt.contains("\"applicable-constraints\": []"));
+        assert!(prompt.contains("exact allowed IDs"));
+        assert!(prompt.contains("- `plan:step-1`"));
         assert!(prompt.contains("harness-native"));
         assert!(prompt.contains("does not replace the project's test selectors"));
 

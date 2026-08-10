@@ -5739,17 +5739,20 @@ WHEN Fluent launches an initial or corrective Writer, THE SYSTEM SHALL
 materialize a bounded task-owned `writer-completion.json` matrix before launch,
 carry forward completed planning claims from the preceding Writer, and add every
 currently open review finding as a pending row without inventing test-selector
-names.
+names. THE SYSTEM SHALL enumerate in the Writer instructions every Behavior,
+Approach, and required Plan row ID that a finding may cite.
 Test: src/work_task_executor.rs (corrective_writer_matrix_carries_planning_rows_and_adds_open_findings)
+Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execution_context)
+Test: src/work_task_executor.rs (reviewed_correction_prompt_is_bounded_and_references_full_artifacts_by_path)
 Test: src/work_model.rs (writer_completion_matrix_refuses_unbounded_context)
 
 ### B18
 
 WHEN a completed Writer leaves any matrix row pending, without implementation
 evidence, without a passing focused verification claim, or, for a finding,
-without an applicable behavior or approach reference or a specific
-not-applicable reason, THE SYSTEM SHALL plan one Writer continuation before any
-reviewer or final Tester.
+without an applicable Behavior, Approach, or required Plan reference or a
+specific not-applicable reason, THE SYSTEM SHALL plan one Writer continuation
+before any reviewer or final Tester.
 Test: src/work_attempt_loop.rs (incomplete_writer_completion_matrix_returns_to_writer_before_review)
 Test: src/work_model.rs (writer_completion_matrix_reconciles_claims_and_corrective_findings)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix blocks review and final Tester)
