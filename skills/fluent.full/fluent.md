@@ -220,7 +220,10 @@ The round outcome determines what happens next:
 - A Writer-round cap reached — inspect the candidate and failed reviews. If the
   frontier is legitimate, approve one to three more rounds with `fluent attempt
   extend <work-item-id> <attempt-id> --additional-write-rounds N`, then resume.
-  Fluent binds the approval to the candidate and exact review bytes.
+  Fluent binds the approval to the candidate and exact review bytes. A scoped
+  Writer produced by an evidence-targeted `code-change` review already counts
+  in the effective cap, so the extension starts from the Writer frontier shown
+  in the handoff.
 - An incomplete Writer without a new candidate commit, regressed progress or
   matrix completion, or two consecutive pre-review continuations with no newly
   completed requirement — Attempt records `needs-user` before Tester and review.

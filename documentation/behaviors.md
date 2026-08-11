@@ -157,6 +157,14 @@ Test: src/work_attempt_loop.rs (failed_final_tester_without_gate_rejects_malform
 Test: src/work_attempt_loop.rs (missing_final_tester_results_without_gate_is_not_a_round_cap_frontier)
 Test: src/work_attempt_loop.rs (final_tester_gate_round_cap_frontier_binds_all_correction_bytes)
 
+### B5
+
+WHEN one or more evidence-targeted `code-change` reviews produce scoped Writers
+and the Attempt later pauses at `round-cap`, THE SYSTEM SHALL accept a bounded
+extension from the actual Writer frontier.
+Test: src/work_model.rs (evidence_code_changes_advance_the_effective_write_cap)
+Test: tests/binary.rs (attempt_extend_counts_repeated_evidence_corrections)
+
 ## Actionable final Tester evidence
 
 ### B1
@@ -336,6 +344,10 @@ Test: src/work_attempt_loop.rs (evidence_needed_review_pauses_without_writer_rou
 WHEN an evidence-targeted reviewer fails with `Disposition: code-change`, THE
 SYSTEM SHALL resume the ordinary Writer path with that finding.
 Test: src/work_attempt_loop.rs (code_change_evidence_review_plans_ordinary_writer)
+
+The evidence-backed Writer allowance applies only after the targeted review
+records `code-change` and its finding becomes a Writer input. Reviewing,
+`evidence-needed`, and completed recovery records do not increase the cap.
 
 ### B11
 

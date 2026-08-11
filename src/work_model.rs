@@ -3710,6 +3710,9 @@ pub struct RoundCapExtension {
     pub old_cap: usize,
     pub new_cap: usize,
     pub additional_write_rounds: usize,
+    /// Evidence-backed Writer allowances already included in `new_cap`.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub evidence_write_rounds: usize,
     pub candidate_commit: String,
     pub failed_reviews: Vec<RoundCapReviewArtifact>,
     pub approved_at: String,
@@ -3980,10 +3983,38 @@ impl Attempt {
     }
 
     pub fn effective_write_round_cap(&self, base_cap: usize) -> usize {
-        self.round_cap_extensions
-            .last()
-            .map(|extension| extension.new_cap)
-            .unwrap_or(base_cap)
+        let evidence_corrections = self.evidence_write_rounds();
+        self.round_cap_extensions.last().map_or_else(
+            || base_cap.saturating_add(evidence_corrections),
+            |extension| {
+                extension.new_cap.saturating_add(
+                    evidence_corrections.saturating_sub(extension.evidence_write_rounds),
+                )
+            },
+        )
+    }
+
+    fn evidence_write_rounds(&self) -> usize {
+        self.evidence_recoveries
+            .iter()
+            .filter(|recovery| {
+                recovery.state == EvidenceRecoveryState::CodeChange
+                    && recovery.targets.iter().any(|target| {
+                        target
+                            .review_task_id
+                            .as_ref()
+                            .is_some_and(|review_task_id| {
+                                self.tasks.iter().any(|task| {
+                                    task.kind == TaskKind::Write
+                                        && task
+                                            .input_artifacts
+                                            .iter()
+                                            .any(|artifact| artifact.producer_id == *review_task_id)
+                                })
+                            })
+                    })
+            })
+            .count()
     }
 
     pub fn record_round_cap_extension(
@@ -4018,6 +4049,7 @@ impl Attempt {
             old_cap: effective_cap,
             new_cap,
             additional_write_rounds: request.additional_write_rounds,
+            evidence_write_rounds: self.evidence_write_rounds(),
             candidate_commit: request.candidate_commit,
             failed_reviews: request.failed_reviews,
             approved_at: now_iso8601(),
@@ -6127,6 +6159,10 @@ impl WorkItemTransaction {
 }
 
 fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_usize(value: &usize) -> bool {
     *value == 0
 }
 
@@ -15008,6 +15044,11 @@ random banner prose that must be ignored
         assert_eq!(attempt.round_cap_extensions.len(), 1);
         assert_eq!(attempt.effective_write_round_cap(10), 12);
         assert_eq!(first.failed_reviews[0].digest, "sha256:approved");
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("evidence_write_rounds")
+        );
 
         let error = Attempt::default()
             .record_round_cap_extension(10, round_cap_request(4))
@@ -15016,6 +15057,74 @@ random banner prose that must be ignored
             error,
             WorkModelError::RoundCapExtensionIncrementOutOfRange { requested: 4 }
         ));
+    }
+
+    #[test]
+    fn evidence_code_changes_advance_the_effective_write_cap() {
+        let recovery = |id: &str, state: EvidenceRecoveryState| EvidenceRecovery {
+            id: id.to_string(),
+            candidate_commit: format!("candidate-{id}"),
+            attachment: EvidenceAttachment {
+                snapshot_path: format!(".fluent/work/artifacts/work-1/attempt-1/{id}.json"),
+                digest: format!("sha256:{id}"),
+            },
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: format!(
+                    ".fluent/work/artifacts/work-1/attempt-1/{id}/review.md"
+                ),
+                review_task_id: Some(format!("attempt-1-{id}-tests")),
+            }],
+            state,
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        };
+        let mut attempt = Attempt {
+            evidence_recoveries: vec![
+                recovery("evidence-1", EvidenceRecoveryState::CodeChange),
+                recovery("evidence-2", EvidenceRecoveryState::CodeChange),
+                recovery("evidence-3", EvidenceRecoveryState::Complete),
+                recovery("evidence-4", EvidenceRecoveryState::CodeChange),
+            ],
+            tasks: ["evidence-1", "evidence-2"]
+                .into_iter()
+                .map(|id| {
+                    let mut writer = task(TaskKind::Write, Vec::new());
+                    writer.input_artifacts = vec![ArtifactRef {
+                        producer_id: format!("attempt-1-{id}-tests"),
+                        path: format!(".fluent/work/artifacts/work-1/attempt-1/{id}/review.md"),
+                    }];
+                    writer
+                })
+                .collect(),
+            ..Attempt::default()
+        };
+
+        assert_eq!(attempt.effective_write_round_cap(10), 12);
+        let mut request = round_cap_request(1);
+        request.old_cap = 12;
+        let extension = attempt
+            .record_round_cap_extension(10, request)
+            .unwrap()
+            .clone();
+
+        assert_eq!(extension.old_cap, 12);
+        assert_eq!(extension.new_cap, 13);
+        assert_eq!(extension.evidence_write_rounds, 2);
+        assert_eq!(
+            serde_json::to_value(&extension).unwrap()["evidence_write_rounds"],
+            2
+        );
+        assert_eq!(attempt.effective_write_round_cap(10), 13);
+        assert_eq!(attempt.effective_write_round_cap(99), 13);
+
+        attempt.evidence_recoveries[2].state = EvidenceRecoveryState::CodeChange;
+        let mut writer = task(TaskKind::Write, Vec::new());
+        writer.input_artifacts = vec![ArtifactRef {
+            producer_id: "attempt-1-evidence-3-tests".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/evidence-3/review.md".to_string(),
+        }];
+        attempt.tasks.push(writer);
+        assert_eq!(attempt.effective_write_round_cap(99), 14);
     }
 
     #[test]

@@ -28405,6 +28405,145 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
 
 #[test]
 #[serial]
+fn attempt_extend_counts_repeated_evidence_corrections() {
+    use fluent::work_model::{
+        ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
+        EvidenceRecoveryState, EvidenceReviewTarget, PauseKind, TaskKind, TaskOutput, TaskStatus,
+        set_task_terminal,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Evidence correction cap",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let workspace_rel = fluent::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+    let workspace = main_dir
+        .parent()
+        .unwrap()
+        .join(workspace_rel.trim_start_matches("../"));
+    git::run(
+        &main_dir,
+        &["worktree", "add", workspace.to_str().unwrap()],
+        "create candidate workspace",
+    )
+    .unwrap();
+    let candidate = git_head(&workspace);
+    let writer_output = || TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: workspace_rel.clone(),
+        source_branch: "main".to_string(),
+        base_commit: None,
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    };
+
+    let store = WorkModelStore::new(&main_dir);
+    let mut item = store.read_work_item("work-1").unwrap();
+    set_task_terminal(&mut item.attempts[0].tasks[0], TaskStatus::Complete);
+    item.attempts[0].tasks[0].output = Some(writer_output());
+    for round in 1..=2 {
+        let review_path =
+            format!(".fluent/work/artifacts/work-1/attempt-1/evidence-{round}-tests/review.md");
+        item.attempts[0].evidence_recoveries.push(EvidenceRecovery {
+            id: format!("evidence-{round}"),
+            candidate_commit: candidate.clone(),
+            attachment: EvidenceAttachment {
+                snapshot_path: format!(
+                    ".fluent/work/artifacts/work-1/attempt-1/evidence-{round}.json"
+                ),
+                digest: format!("sha256:evidence-{round}"),
+            },
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: review_path.clone(),
+                review_task_id: Some(format!("attempt-1-evidence-{round}-tests")),
+            }],
+            state: EvidenceRecoveryState::CodeChange,
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        });
+        let writer_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: format!("attempt-1-evidence-{round}-tests"),
+                    path: review_path,
+                }],
+            )
+            .unwrap();
+        let writer = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == writer_id)
+            .unwrap();
+        set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(writer_output());
+    }
+    item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+    let review = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .rev()
+        .find(|task| task.kind == TaskKind::Review)
+        .unwrap();
+    set_task_terminal(review, TaskStatus::Complete);
+    let review_path = main_dir
+        .join(&review.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+    fs::write(&review_path, "Verdict: fail\n").unwrap();
+    item.attempts[0].status = AttemptStatus::NeedsUser;
+    item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+    item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+    store.write_work_item(&item).unwrap();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cap 3 -> 4"));
+
+    let stored = store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        3
+    );
+    assert_eq!(attempt.effective_write_round_cap(1), 4);
+    assert_eq!(attempt.round_cap_extensions[0].old_cap, 3);
+    assert_eq!(attempt.round_cap_extensions[0].new_cap, 4);
+}
+
+#[test]
+#[serial]
 fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
     use fluent::work_model::{
         AttemptReviewState, AttemptStatus, PauseKind, TaskKind, TaskOutput, TaskStatus,

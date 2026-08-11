@@ -680,6 +680,15 @@ without approving mutable or unreadable evidence. The append-only approval does
 no code work. Resume revalidates that frontier before reopening the same
 Attempt; any changed candidate or correction content fails closed.
 
+An evidence-targeted `code-change` result supplies one scoped Writer allowance
+because that recovery transition plans the Writer even when the ordinary cap is
+exhausted. The effective cap adds only `code-change` recovery records whose
+targeted review Task is an input to a Writer Task. Each explicit extension
+snapshots how many of those allowances its `new_cap` already includes, so
+repeated evidence corrections advance the frontier once each and later
+configuration changes cannot rewrite an approved cap. Reviewing,
+`evidence-needed`, and completed recovery records add no Writer capacity.
+
 After the
 initial write output completes it plans review Tasks for the full Work
 reviewer set. After a follow-up write output completes it derives the
