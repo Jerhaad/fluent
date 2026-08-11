@@ -473,6 +473,27 @@ it. An introduced failure or unreadable/error result returns to a corrective
 Writer; a pass advances to Learning. The Tester does not spawn a Coder process
 or write a transcript — it is a deterministic subprocess, not an LLM agent.
 
+Each Work Task Tester launch is wrapped in a host-owned tracked-state guard. The
+guard admits only the expected candidate commit with a clean tracked index and
+worktree. After the launch, including a launch that reports test or harness
+failure, Fluent records any tracked status in `candidate-mutation.json`, runs
+`git restore --staged --worktree -- .`, verifies the original commit and clean
+tracked state, and only then interprets or retries the Tester outcome. Command
+results and logs live in the Task artifact outside the candidate and therefore
+survive restoration. The guard deliberately does not run `git clean`: untracked
+and ignored build outputs remain governed by the existing candidate gate and
+project ignore rules. A preexisting tracked change or a changed `HEAD` is not
+attributed to the Tester and fails closed without restoration.
+
+An explicit resume can also recover a tracked mutation left by a completed
+Tester from an older Fluent build. This compatibility path is intentionally
+narrow: the persisted final-Tester gate must be blocked only with a parseable
+dirty candidate status, the latest completed Tester and Writer must still name
+the same commit, `HEAD` must match, the current tracked status must byte-match
+the gate after Git's output trimming, and the gate must contain no untracked
+entry. Fluent then writes the same mutation evidence, restores tracked state,
+and rechecks the unchanged candidate. Any mismatch leaves the workspace alone.
+
 Review-only Attempts keep their existing Tester-first contract because no Writer
 produces focused candidate evidence for them.
 
@@ -549,9 +570,12 @@ Task. It reports ordinary normalized failures as test-suite failures. Because
 the standalone check uses a temporary artifact and creates no Attempt, operators
 repair its configuration, extraction, sandbox, execution, or result-persistence
 problem and rerun `fluent tester check`. The same failures from a production
-Tester Task pause its existing Attempt as a resumable Tester harness error;
-after repair, `fluent attempt run` retries that Tester while completed Writer
-work remains complete.
+Tester Task pause its existing Attempt as a Tester harness error. An
+environmental repair can resume that exact Tester while completed Writer work
+remains complete because the reviewed candidate stays frozen. A repair to
+candidate-owned `tester.yaml` or the extractor must instead return through
+Writer and review; committing it directly in the candidate makes the exact
+Tester retry fail closed on candidate identity.
 
 The `behaviors.md` format supports two markers on EARS statements:
 - `Test:` — names a test that verifies the behavior.

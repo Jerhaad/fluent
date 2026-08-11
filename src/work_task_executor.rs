@@ -45,6 +45,8 @@ const EXECUTION_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const EXECUTION_CONTEXT_MAX_CHANGED_FILES: usize = 100;
 const EXECUTION_CONTEXT_MAX_EVIDENCE: usize = 25;
 const EXECUTION_CONTEXT_MAX_COMMANDS: usize = 25;
+const TESTER_CANDIDATE_MUTATION_FILE: &str = "candidate-mutation.json";
+const TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1888,6 +1890,10 @@ fn run_tester_task_with_settlement_preparer(
         config.project_root,
         &review_context.candidate_workspace_path,
     );
+    let candidate_guard = TesterCandidateGuard::begin(
+        candidate_workspace.clone(),
+        &review_context.candidate_commit,
+    )?;
     // Parse the Tester configuration without creating a settlement directory.
     // The immutable plan crosses the reservation boundary so the later sandbox
     // grants exactly the paths authorized for this Task start.
@@ -2006,11 +2012,8 @@ fn run_tester_task_with_settlement_preparer(
 
     let results_path = artifact_dir.join("tester-results.json");
 
-    let mut tester_result = crate::tester::run_with_sandbox_profile(
-        &candidate_workspace,
-        &artifact_dir,
-        &tester_sandbox,
-    );
+    let mut tester_result =
+        run_tester_with_candidate_guard(&candidate_guard, &artifact_dir, &tester_sandbox);
     let mut retries = 0;
     while tester_result.is_err() && retries < max_task_retries() {
         retries += 1;
@@ -2019,11 +2022,8 @@ fn run_tester_task_with_settlement_preparer(
             retries + 1,
             max_task_retries() + 1
         );
-        tester_result = crate::tester::run_with_sandbox_profile(
-            &candidate_workspace,
-            &artifact_dir,
-            &tester_sandbox,
-        );
+        tester_result =
+            run_tester_with_candidate_guard(&candidate_guard, &artifact_dir, &tester_sandbox);
     }
 
     match tester_result {
@@ -2079,6 +2079,181 @@ fn run_tester_task_with_settlement_preparer(
             Err(error)
         }
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TesterCandidateMutationEvidence {
+    schema_version: u32,
+    candidate_commit: String,
+    tracked_status: Vec<String>,
+    restored: bool,
+}
+
+#[derive(Debug)]
+struct TesterCandidateGuard {
+    path: PathBuf,
+    candidate_commit: String,
+}
+
+impl TesterCandidateGuard {
+    fn begin(path: PathBuf, candidate_commit: &str) -> Result<Self> {
+        ensure_tester_candidate_head(&path, candidate_commit)?;
+        ensure_tester_candidate_tracked_clean(&path)?;
+        Ok(Self {
+            path,
+            candidate_commit: candidate_commit.to_string(),
+        })
+    }
+
+    fn prepare_run(&self) -> Result<()> {
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        ensure_tester_candidate_tracked_clean(&self.path)
+    }
+
+    fn restore_after_run(&self, artifact_dir: &Path) -> Result<()> {
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        let tracked_status = tester_candidate_tracked_status(&self.path)?;
+        if tracked_status.is_empty() {
+            return Ok(());
+        }
+
+        let evidence_path = artifact_dir.join(TESTER_CANDIDATE_MUTATION_FILE);
+        let initial_evidence_error = write_tester_candidate_mutation_evidence(
+            &evidence_path,
+            &TesterCandidateMutationEvidence {
+                schema_version: TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION,
+                candidate_commit: self.candidate_commit.clone(),
+                tracked_status: tracked_status.clone(),
+                restored: false,
+            },
+        )
+        .err();
+
+        let restore = git::run_raw(
+            &self.path,
+            &["restore", "--staged", "--worktree", "--", "."],
+        )?;
+        if !restore.status.success() {
+            let error = anyhow::anyhow!(
+                "Failed to restore tracked candidate changes created during Tester execution: {}",
+                String::from_utf8_lossy(&restore.stderr)
+            );
+            return match initial_evidence_error {
+                Some(evidence_error) => Err(error.context(format!(
+                    "Failed to persist Tester candidate-mutation diagnostic: {evidence_error:#}"
+                ))),
+                None => Err(error),
+            };
+        }
+        ensure_tester_candidate_head(&self.path, &self.candidate_commit)?;
+        let remaining = tester_candidate_tracked_status(&self.path)?;
+        if !remaining.is_empty() {
+            bail!(
+                "Tester candidate still has tracked changes after restoration:\n{}",
+                remaining.join("\n")
+            );
+        }
+
+        write_tester_candidate_mutation_evidence(
+            &evidence_path,
+            &TesterCandidateMutationEvidence {
+                schema_version: TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION,
+                candidate_commit: self.candidate_commit.clone(),
+                tracked_status,
+                restored: true,
+            },
+        )
+    }
+}
+
+fn run_tester_with_candidate_guard(
+    guard: &TesterCandidateGuard,
+    artifact_dir: &Path,
+    sandbox: &crate::tester::TesterSandbox,
+) -> Result<crate::tester::TesterOutcome> {
+    guard.prepare_run()?;
+    let tester_result = crate::tester::run_with_sandbox_profile(&guard.path, artifact_dir, sandbox);
+    let restore_result = guard.restore_after_run(artifact_dir);
+    match (tester_result, restore_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore_error)) => Err(restore_error),
+        (Err(run_error), Err(restore_error)) => Err(restore_error.context(format!(
+            "Tester execution also failed before candidate restoration: {run_error:#}"
+        ))),
+    }
+}
+
+fn tester_candidate_tracked_status(workspace_path: &Path) -> Result<Vec<String>> {
+    let output = git_status_output(workspace_path, &["--porcelain", "--untracked-files=no"])?;
+    if !output.status.success() {
+        bail!(
+            "Failed to read Tester candidate tracked status: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+fn ensure_tester_candidate_tracked_clean(workspace_path: &Path) -> Result<()> {
+    let status = tester_candidate_tracked_status(workspace_path)?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Tester candidate has tracked changes before execution; refusing to overwrite them:\n{}",
+            status.join("\n")
+        )
+    }
+}
+
+fn ensure_tester_candidate_head(workspace_path: &Path, expected: &str) -> Result<()> {
+    let actual = head_commit(workspace_path)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        bail!(
+            "Tester candidate HEAD changed from expected commit {expected} to {actual}; refusing restoration"
+        )
+    }
+}
+
+fn write_tester_candidate_mutation_evidence(
+    path: &Path,
+    evidence: &TesterCandidateMutationEvidence,
+) -> Result<()> {
+    crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(evidence)?)?;
+    Ok(())
+}
+
+pub(crate) fn recover_completed_tester_candidate_mutation(
+    workspace_path: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+    expected_tracked_status: &[String],
+) -> Result<()> {
+    ensure_tester_candidate_head(workspace_path, candidate_commit)?;
+    let current_status = tester_candidate_tracked_status(workspace_path)?;
+    let normalized_current = current_status.join("\n").trim().to_string();
+    let normalized_expected = expected_tracked_status.join("\n").trim().to_string();
+    if normalized_current != normalized_expected {
+        bail!(
+            "candidate tracked state changed after the final-Tester gate; refusing recovery:\nexpected:\n{}\ncurrent:\n{}",
+            expected_tracked_status.join("\n"),
+            current_status.join("\n")
+        );
+    }
+    if current_status.is_empty() {
+        return Ok(());
+    }
+    TesterCandidateGuard {
+        path: workspace_path.to_path_buf(),
+        candidate_commit: candidate_commit.to_string(),
+    }
+    .restore_after_run(artifact_dir)
 }
 
 struct FailedCommandRecheckPlan {
@@ -7762,6 +7937,137 @@ mod tests {
     }
 
     #[test]
+    fn tester_candidate_guard_rejects_preexisting_tracked_changes_without_restoring_them() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head = head_commit(root.path()).unwrap();
+        fs::write(root.path().join("tracked.txt"), "user change\n").unwrap();
+
+        let error = TesterCandidateGuard::begin(root.path().to_path_buf(), &head)
+            .expect_err("a preexisting tracked change must fail closed");
+
+        assert!(format!("{error:#}").contains("before execution"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("tracked.txt")).unwrap(),
+            "user change\n",
+            "preflight must not overwrite a change that predates Tester execution"
+        );
+    }
+
+    #[test]
+    fn tester_candidate_guard_records_failed_restoration_and_leaves_task_untrusted() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head = head_commit(root.path()).unwrap();
+        let guard = TesterCandidateGuard::begin(root.path().to_path_buf(), &head).unwrap();
+        let artifact_dir = root.path().join("artifact");
+        fs::create_dir(&artifact_dir).unwrap();
+        fs::write(root.path().join("tracked.txt"), "tester mutation\n").unwrap();
+        fs::write(root.path().join(".git/index.lock"), "held\n").unwrap();
+
+        let error = guard
+            .restore_after_run(&artifact_dir)
+            .expect_err("a failed Git restore must fail the Tester boundary");
+
+        assert!(format!("{error:#}").contains("Failed to restore tracked candidate changes"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("tracked.txt")).unwrap(),
+            "tester mutation\n"
+        );
+        let evidence: TesterCandidateMutationEvidence = serde_json::from_slice(
+            &fs::read(artifact_dir.join(TESTER_CANDIDATE_MUTATION_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence.candidate_commit, head);
+        assert!(!evidence.restored);
+    }
+
+    #[test]
+    fn tester_candidate_guard_does_not_rewind_a_head_change_during_execution() {
+        let root = tempfile::tempdir().unwrap();
+        crate::git::run(root.path(), &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.email", "test@example.invalid"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            root.path(),
+            &["config", "user.name", "Test"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(root.path().join("tracked.txt"), "baseline\n").unwrap();
+        crate::git::run(root.path(), &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let original_head = head_commit(root.path()).unwrap();
+        let guard = TesterCandidateGuard::begin(root.path().to_path_buf(), &original_head).unwrap();
+        fs::write(root.path().join("later.txt"), "later commit\n").unwrap();
+        crate::git::run(root.path(), &["add", "later.txt"], "stage later commit").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-q", "-m", "Move candidate head"],
+            "move candidate head",
+        )
+        .unwrap();
+        let moved_head = head_commit(root.path()).unwrap();
+
+        let error = guard
+            .restore_after_run(&root.path().join("artifact"))
+            .expect_err("a moved candidate HEAD must fail closed");
+
+        assert!(format!("{error:#}").contains("HEAD changed"));
+        assert_eq!(head_commit(root.path()).unwrap(), moved_head);
+        assert!(root.path().join("later.txt").is_file());
+    }
+
+    #[test]
     fn reviewer_project_instruction_grant_follows_an_in_project_file_symlink() {
         let root = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -12233,6 +12539,24 @@ mod tests {
     fn review_item_with_final_tester() -> WorkItem {
         let mut item = review_item();
         item.add_final_tester_task("attempt-1").unwrap();
+        for task in &mut item.attempts[0].tasks {
+            if let Some(output) = task.output.as_mut() {
+                output.workspace_path = "candidate".to_string();
+            }
+            if let Some(context) = task.review_context.as_mut() {
+                context.candidate_workspace_path = "candidate".to_string();
+            }
+            for workspace in task
+                .workspace_access
+                .reads
+                .iter_mut()
+                .chain(task.workspace_access.writes.iter_mut())
+            {
+                if workspace.id == "candidate" {
+                    workspace.path = "candidate".to_string();
+                }
+            }
+        }
         item
     }
 
@@ -12271,7 +12595,7 @@ mod tests {
             format!("printf second > {}; exit 7", second.display()),
             format!("printf third > {}", third.display()),
         ];
-        let source_json = serde_json::json!({
+        let mut source_json = serde_json::json!({
             "candidate_commit": "abc123",
             "commands": [
                 {"command": commands[0], "test_harness": "shell", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
@@ -12315,6 +12639,13 @@ mod tests {
         let extractor = candidate.join(".fluent/extract-tester-results");
         fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        commit_tester_candidate_fixture(&project_root, &mut item);
+        source_json["candidate_commit"] = serde_json::json!(head_commit(&candidate).unwrap());
+        fs::write(
+            source_dir.join("tester-results.json"),
+            serde_json::to_vec_pretty(&source_json).unwrap(),
+        )
+        .unwrap();
         store.create_work_item(&item).unwrap();
 
         let resolver = ContentResolver::new(Some(&project_root));
@@ -12385,6 +12716,52 @@ mod tests {
         });
         item.add_review_tasks("attempt-1", &[role]).unwrap();
         item
+    }
+
+    fn commit_tester_candidate_fixture(project_root: &Path, item: &mut WorkItem) -> PathBuf {
+        let workspace_path = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .and_then(|task| task.review_context.as_ref())
+            .map(|context| context.candidate_workspace_path.clone())
+            .unwrap();
+        let workspace = project_root.join(workspace_path);
+        crate::git::run(
+            &workspace,
+            &["init", "-q", "-b", "main"],
+            "init candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "test@example.invalid"],
+            "configure candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Test"],
+            "configure candidate fixture",
+        )
+        .unwrap();
+        crate::git::run(&workspace, &["add", "."], "stage candidate fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Create candidate fixture"],
+            "commit candidate fixture",
+        )
+        .unwrap();
+        let commit = head_commit(&workspace).unwrap();
+        for task in &mut item.attempts[0].tasks {
+            if let Some(output) = task.output.as_mut() {
+                output.commit = commit.clone();
+            }
+            if let Some(context) = task.review_context.as_mut() {
+                context.candidate_commit = commit.clone();
+            }
+        }
+        workspace
     }
 
     fn failed_tester_inspection_fixture()
@@ -13241,12 +13618,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
-        let item = review_item_with_final_tester();
+        let mut item = review_item_with_final_tester();
         let tester = item.attempts[0]
             .tasks
             .iter()
             .find(|task| task.kind == TaskKind::Tester)
             .unwrap();
+        let tester_id = tester.id.clone();
         let workspace = project_root.join(
             &tester
                 .review_context
@@ -13261,6 +13639,7 @@ mod tests {
             "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
         )
         .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
         store.create_work_item(&item).unwrap();
 
         // Let preparation create settlement/0, but occupy settlement/1 so its
@@ -13275,7 +13654,7 @@ mod tests {
             store: &store,
             work_item_id: "work-1",
             attempt_id: "attempt-1",
-            task_id: &tester.id,
+            task_id: &tester_id,
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: true,
@@ -13314,12 +13693,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
-        let item = review_item_with_final_tester();
+        let mut item = review_item_with_final_tester();
         let tester = item.attempts[0]
             .tasks
             .iter()
             .find(|task| task.kind == TaskKind::Tester)
             .unwrap();
+        let tester_id = tester.id.clone();
         let workspace = project_root.join(
             &tester
                 .review_context
@@ -13333,6 +13713,7 @@ mod tests {
             "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
         )
         .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
         store.create_work_item(&item).unwrap();
 
         unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail") };
@@ -13343,7 +13724,7 @@ mod tests {
             store: &store,
             work_item_id: "work-1",
             attempt_id: "attempt-1",
-            task_id: &tester.id,
+            task_id: &tester_id,
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: false,
@@ -13362,7 +13743,7 @@ mod tests {
             stored.attempts[0]
                 .tasks
                 .iter()
-                .find(|task| task.id == tester.id)
+                .find(|task| task.id == tester_id)
                 .unwrap()
                 .status,
             TaskStatus::Failed,
@@ -13376,12 +13757,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
-        let item = review_item_with_final_tester();
+        let mut item = review_item_with_final_tester();
         let tester = item.attempts[0]
             .tasks
             .iter()
             .find(|task| task.kind == TaskKind::Tester)
             .unwrap();
+        let tester_id = tester.id.clone();
         let workspace = project_root.join(
             &tester
                 .review_context
@@ -13395,6 +13777,7 @@ mod tests {
             "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
         )
         .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
         store.create_work_item(&item).unwrap();
 
         TEST_TESTER_ROLLBACK_PERSISTENCE_FAILURE.with(|value| value.set(true));
@@ -13405,7 +13788,7 @@ mod tests {
                 store: &store,
                 work_item_id: "work-1",
                 attempt_id: "attempt-1",
-                task_id: &tester.id,
+                task_id: &tester_id,
                 resolver: &resolver,
                 extra_args: &[],
                 no_sandbox: true,
@@ -13425,7 +13808,7 @@ mod tests {
             stored.attempts[0]
                 .tasks
                 .iter()
-                .find(|task| task.id == tester.id)
+                .find(|task| task.id == tester_id)
                 .unwrap()
                 .status,
             TaskStatus::Failed,
@@ -13439,12 +13822,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path();
         let store = WorkModelStore::new(project_root);
-        let item = review_item_with_final_tester();
+        let mut item = review_item_with_final_tester();
         let tester = item.attempts[0]
             .tasks
             .iter()
             .find(|task| task.kind == TaskKind::Tester)
             .unwrap();
+        let tester_id = tester.id.clone();
         let workspace = project_root.join(
             &tester
                 .review_context
@@ -13462,6 +13846,7 @@ mod tests {
             ),
         )
         .unwrap();
+        commit_tester_candidate_fixture(project_root, &mut item);
         store.create_work_item(&item).unwrap();
 
         unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail") };
@@ -13471,7 +13856,7 @@ mod tests {
             store: &store,
             work_item_id: "work-1",
             attempt_id: "attempt-1",
-            task_id: &tester.id,
+            task_id: &tester_id,
             resolver: &resolver,
             extra_args: &[],
             no_sandbox: false,
@@ -13488,7 +13873,7 @@ mod tests {
             stored.attempts[0]
                 .tasks
                 .iter()
-                .find(|task| task.id == tester.id)
+                .find(|task| task.id == tester_id)
                 .unwrap()
                 .status,
             TaskStatus::NeedsUser

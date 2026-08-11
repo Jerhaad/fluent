@@ -5420,6 +5420,34 @@ Tester infrastructure errors.
 Test: src/tester.rs (tester_continues_when_command_exits_nonzero)
 Test: src/tester.rs (tester_task_succeeds_when_individual_commands_fail)
 
+### B10a
+
+WHEN a Work Task Tester command changes a tracked file in the clean candidate
+workspace without changing the candidate commit,
+THE SYSTEM SHALL preserve the command result and logs, record the changed paths,
+restore the candidate's tracked index and worktree to that commit before another
+Tester execution or lifecycle gate, and leave untracked and ignored outputs
+unchanged.
+Test: tests/binary.rs (work_task_run_tester_restores_tracked_candidate_mutations_and_keeps_evidence)
+Test: tests/binary.rs (work_task_run_tester_recovers_when_error_is_transient)
+
+### B10b
+
+IF the candidate has tracked changes before a Work Task Tester starts, or its
+HEAD changes during execution,
+THEN THE SYSTEM SHALL fail closed without overwriting that state.
+Test: src/work_task_executor.rs (tester_candidate_guard_rejects_preexisting_tracked_changes_without_restoring_them)
+Test: src/work_task_executor.rs (tester_candidate_guard_does_not_rewind_a_head_change_during_execution)
+
+### B10c
+
+WHEN an explicit resume encounters a final-Tester gate created by an older
+Fluent build,
+THE SYSTEM SHALL restore the tracked mutation only if the gate's exact dirty
+status, completed Tester, candidate commit, and current tracked status still
+match; otherwise it SHALL leave the candidate unchanged.
+Test: src/work_attempt_loop.rs (explicit_final_tester_gate_resume_restores_matching_legacy_tracked_mutation)
+
 ### B11
 
 IF `.fluent/extract-tester-results` exits non-zero or emits output

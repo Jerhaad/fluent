@@ -18,10 +18,12 @@ repair the project-owned Tester harness and rerun the check. In contrast, a
 failure from the production Tester boundary — including configuration,
 execution, extraction, normalization, or result persistence — means the
 evidence is untrustworthy. Pause that same Tester Task and Attempt with a
-resumable harness state. After repair, resume only that Tester so completed
-Writer and review work remains complete. For code-producing Work this final
-Tester runs after reviewers and blocks Learning; review-only Work retains its
-Tester-first boundary before reviewers.
+resumable harness state. After an environmental repair that leaves the reviewed
+candidate unchanged, resume only that Tester so completed Writer and review
+work remains complete. A candidate-owned Tester contract repair must return
+through Writer and review rather than changing the frozen worktree. For
+code-producing Work this final Tester runs after reviewers and blocks Learning;
+review-only Work retains its Tester-first boundary before reviewers.
 
 Persist all command records accumulated before a harness failure in the Tester
 artifact. An empty command list is accurate only for failures that occurred

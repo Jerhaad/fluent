@@ -1209,6 +1209,7 @@ fn reopen_candidate_gate_attempt(
     if evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Passed {
         bail!("candidate-gate pause points at passing evidence");
     }
+    recover_completed_tester_mutation_at_explicit_resume(project_root, attempt, output, &evidence)?;
     let correction_artifacts = if evidence.disposition
         == crate::candidate_gate::CandidateGateDisposition::Rejected
         && evidence.phase == crate::candidate_gate::CandidateGatePhase::FinalTester
@@ -1311,6 +1312,62 @@ fn reopen_candidate_gate_attempt(
         }
     })?;
     Ok(outcome)
+}
+
+fn recover_completed_tester_mutation_at_explicit_resume(
+    project_root: &Path,
+    attempt: &Attempt,
+    writer_output: &TaskOutput,
+    evidence: &crate::candidate_gate::CandidateGateEvidence,
+) -> Result<()> {
+    if evidence.phase != crate::candidate_gate::CandidateGatePhase::FinalTester
+        || evidence.disposition != crate::candidate_gate::CandidateGateDisposition::Blocked
+    {
+        return Ok(());
+    }
+    let Some(identity) = evidence
+        .checks
+        .iter()
+        .find(|check| check.name == "candidate-identity")
+    else {
+        return Ok(());
+    };
+    let [diagnostic] = identity.diagnostics.as_slice() else {
+        return Ok(());
+    };
+    let Some(status) = diagnostic.strip_prefix("candidate workspace is dirty before admission:\n")
+    else {
+        return Ok(());
+    };
+    let expected_status = status.lines().map(str::to_string).collect::<Vec<_>>();
+    if expected_status.is_empty() || expected_status.iter().any(|entry| entry.starts_with("?? ")) {
+        return Ok(());
+    }
+
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("final-Tester mutation recovery has no completed Tester"))?;
+    let tester_artifact = tester.artifact_area.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("final-Tester mutation recovery has no Tester artifact area")
+    })?;
+    let artifact_dir = work_task_executor::resolve_managed_artifact_area_path(
+        project_root,
+        &tester_artifact.path,
+    )?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &writer_output.workspace_path,
+        "final Tester mutation recovery workspace",
+    )?;
+    work_task_executor::recover_completed_tester_candidate_mutation(
+        &workspace,
+        &artifact_dir,
+        &writer_output.commit,
+        &expected_status,
+    )
 }
 
 fn reopen_approved_round_cap_attempt(
@@ -13441,6 +13498,102 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn explicit_final_tester_gate_resume_restores_matching_legacy_tracked_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let writer = item.attempts[0].tasks[0].clone();
+        let output = writer.output.as_ref().unwrap().clone();
+        let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester_id)
+            .unwrap();
+        crate::work_model::set_task_terminal(tester, TaskStatus::Complete);
+        let tester_artifact = tester.artifact_area.as_ref().unwrap().path.clone();
+        fs::create_dir_all(project.path().join(&tester_artifact)).unwrap();
+
+        fs::write(workspace.path().join("src/lib.rs"), "tester mutation\n").unwrap();
+        let tracked_status = crate::git::run_stdout(
+            workspace.path(),
+            &["status", "--porcelain", "--untracked-files=no"],
+            "read Tester mutation status",
+        )
+        .unwrap();
+        let gate_path = format!(
+            "{}/{}/{}",
+            work_artifact_path("work-1", "attempt-1", "candidate-gates"),
+            tester_id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        );
+        let gate = ArtifactRef {
+            producer_id: writer.id,
+            path: gate_path.clone(),
+        };
+        let evidence = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Blocked,
+            base_commit: output.commit.clone(),
+            candidate_commit: output.commit.clone(),
+            tester_results_path: Some(format!("{tester_artifact}/tester-results.json")),
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "candidate-identity".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Error,
+                diagnostics: vec![format!(
+                    "candidate workspace is dirty before admission:\n{tracked_status}"
+                )],
+                log_path: None,
+            }],
+        };
+        let absolute_gate = project.path().join(&gate_path);
+        fs::create_dir_all(absolute_gate.parent().unwrap()).unwrap();
+        fs::write(
+            &absolute_gate,
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(gate);
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+        item.attempts[0].completed_at = Some("2026-08-10T00:00:00Z".to_string());
+        store.write_work_item(&item).unwrap();
+
+        assert_eq!(
+            reopen_candidate_gate_attempt(project.path(), &store, "work-1", "attempt-1").unwrap(),
+            CandidateGateResume::Recheck
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap(),
+            "pub fn value() {}\n"
+        );
+        assert!(
+            crate::git::run_stdout(
+                workspace.path(),
+                &["status", "--porcelain", "--untracked-files=no"],
+                "verify restored Tester mutation",
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let mutation: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                project
+                    .path()
+                    .join(tester_artifact)
+                    .join("candidate-mutation.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mutation["candidate_commit"], output.commit);
+        assert_eq!(mutation["restored"], true);
     }
 
     #[test]

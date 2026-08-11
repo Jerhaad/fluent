@@ -12,6 +12,13 @@ Fluent has four complementary test surfaces:
 
 `.fluent/tester.yaml` is the canonical full-suite definition. Writers should run the smallest harness-native selection that covers their change and report it as advisory focused verification. For code-producing Work, Fluent runs the complete configured suite once, after code review, as the authoritative final Tester gate. Review-only Work retains Tester-first ordering.
 
+A Work Task Tester may execute tools that rewrite tracked lockfiles or generated
+metadata. The host admits only a clean tracked candidate at the expected commit,
+captures the Tester evidence, restores tracked index/worktree changes after each
+launch, and records the mutation. It does not delete untracked or ignored build
+outputs. Tests for this boundary must assert both evidence retention and the
+post-run Git state; a helper-only restoration test is insufficient.
+
 ## Where failure logs live
 
 Every test run writes per-case stdout and stderr to `tests/output/`:

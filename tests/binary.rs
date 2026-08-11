@@ -12026,6 +12026,7 @@ fn tester_recovery_reruns_same_tester_without_writer() {
     let bin_dir = tmp.path().join("bin-tester-recovery");
     let writer_counter = tmp.path().join("writer-count");
     let boundary_log = tmp.path().join("tester-recovery-boundary.log");
+    let harness_repaired = tmp.path().join("tester-harness-repaired");
     write_mock_claude(
         &bin_dir,
         &format!(
@@ -12061,7 +12062,10 @@ exit 0
     );
     fs::write(
         main_dir.join(".fluent/extract-tester-results"),
-        "#!/bin/sh\necho not-json\n",
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then echo '[]'; else echo not-json; fi\n",
+            harness_repaired.display()
+        ),
     )
     .unwrap();
     git::run(
@@ -12112,34 +12116,7 @@ exit 0
     assert_eq!(paused["attempts"][0]["pause_kind"], "tester-harness");
     assert_eq!(fs::read_to_string(&writer_counter).unwrap().trim(), "1");
     write_mock_sandbox_exec(&bin_dir);
-
-    let candidate_workspace = main_dir.join(
-        paused["attempts"][0]["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|task| task["kind"] == "tester")
-            .unwrap()["review_context"]["candidate_workspace_path"]
-            .as_str()
-            .unwrap(),
-    );
-    fs::write(
-        candidate_workspace.join(".fluent/extract-tester-results"),
-        "#!/bin/sh\necho '[]'\n",
-    )
-    .unwrap();
-    git::run(
-        &candidate_workspace,
-        &["add", ".fluent/extract-tester-results"],
-        "stage repaired Tester fixture",
-    )
-    .unwrap();
-    git::run(
-        &candidate_workspace,
-        &["commit", "-m", "Repair Tester fixture"],
-        "commit repaired Tester fixture",
-    )
-    .unwrap();
+    fs::write(&harness_repaired, "repaired\n").unwrap();
     let resumed = fluent_cmd()
         .current_dir(&main_dir)
         .args([
@@ -15864,10 +15841,13 @@ fn work_task_run_tester_recovers_when_error_is_transient() {
         &tester_yaml,
         format!(
             "commands:\n  - command: |\n      \
+             if [ \"$FLUENT_TEST_MUTATE_DURING_RETRY\" != 1 ]; then exit 0; fi\n        \
              if [ ! -f '{attempt_file}' ]; then\n        \
              printf '1' > '{attempt_file}'\n        \
+             printf 'tester mutation\\n' > README.md\n        \
              mkdir -p '{blocker}'\n      \
              else\n        \
+             [ \"$(cat README.md)\" = test ] || exit 99\n        \
              rm -rf '{blocker}'\n      \
              fi\n    \
              test_harness: shell-harness\n",
@@ -15880,9 +15860,6 @@ fn work_task_run_tester_recovers_when_error_is_transient() {
     git::run(&main_dir, &["commit", "-m", "Add tester.yaml"], "commit").unwrap();
 
     create_completed_work_attempt(&tmp, &main_dir);
-    // The baseline tester capture ran the script once, consuming the "first
-    // call" state. Reset so the actual tester task still exercises the retry.
-    let _ = fs::remove_file(&attempt_file);
     fluent_cmd()
         .current_dir(&main_dir)
         .args(["review", "work-1", "attempt-1"])
@@ -15904,6 +15881,7 @@ fn work_task_run_tester_recovers_when_error_is_transient() {
             "--no-sandbox",
         ])
         .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_MUTATE_DURING_RETRY", "1")
         .env("FLUENT_MAX_TASK_RETRIES", "2")
         .assert()
         .success();
@@ -15926,6 +15904,133 @@ fn work_task_run_tester_recovers_when_error_is_transient() {
     assert_ne!(
         value["attempts"][0]["status"], "needs-user",
         "attempt should not be needs-user after successful retry"
+    );
+    let candidate_workspace = main_dir.join(
+        value["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["kind"] == "write" && task["status"] == "complete")
+            .unwrap()["output"]["workspace_path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(candidate_workspace.join("README.md")).unwrap(),
+        "test",
+        "the first launch's tracked mutation must be restored before retry"
+    );
+    assert!(artifact_dir.join("candidate-mutation.json").is_file());
+}
+
+#[test]
+fn work_task_run_tester_restores_tracked_candidate_mutations_and_keeps_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+
+    fs::write(
+        main_dir.join(".fluent/tester.yaml"),
+        "commands:\n  - command: \"if [ \\\"$FLUENT_TEST_MUTATE_CANDIDATE\\\" = 1 ]; then printf 'tester mutation\\n' > README.md; printf 'cache\\n' > tester-output.tmp; exit 42; fi\"\n    test_harness: shell-harness\n",
+    )
+    .unwrap();
+    fs::write(
+        main_dir.join(".fluent/extract-tester-results"),
+        "#!/bin/sh\necho '[{\"id\":\"suite::fails\",\"test_harness\":\"shell-harness\",\"status\":\"fail\",\"duration_ms\":null,\"failure_excerpt\":\"expected failure\"}]'\n",
+    )
+    .unwrap();
+    git::run(
+        &main_dir,
+        &[
+            "add",
+            ".fluent/tester.yaml",
+            ".fluent/extract-tester-results",
+        ],
+        "stage mutating tester",
+    )
+    .unwrap();
+    git::run(
+        &main_dir,
+        &["commit", "-m", "Add mutating tester"],
+        "commit mutating tester",
+    )
+    .unwrap();
+
+    create_completed_work_attempt(&tmp, &main_dir);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["review", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    plan_final_tester_after_passing_reviews(&main_dir);
+
+    let before = read_work_show_json(&main_dir, "work-1");
+    let candidate_workspace = PathBuf::from(
+        before["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["kind"] == "write" && task["status"] == "complete")
+            .unwrap()["output"]["workspace_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let candidate_workspace = main_dir.join(candidate_workspace);
+    let readme_before = fs::read(candidate_workspace.join("README.md")).unwrap();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester",
+            "--no-sandbox",
+        ])
+        .env("FLUENT_TEST_MUTATE_CANDIDATE", "1")
+        .env("FLUENT_MAX_TASK_RETRIES", "0")
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read(candidate_workspace.join("README.md")).unwrap(),
+        readme_before,
+        "the host must restore tracked files changed by Tester commands"
+    );
+    let tracked_status = git::run_stdout(
+        &candidate_workspace,
+        &["status", "--porcelain", "--untracked-files=no"],
+        "read tracked candidate status",
+    )
+    .unwrap();
+    assert!(
+        tracked_status.is_empty(),
+        "the Tester must leave the candidate's tracked state clean: {tracked_status}"
+    );
+    assert_eq!(
+        fs::read_to_string(candidate_workspace.join("tester-output.tmp")).unwrap(),
+        "cache\n",
+        "tracked restoration must not delete untracked Tester outputs"
+    );
+
+    let artifact_dir = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
+    let results: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact_dir.join("tester-results.json")).unwrap())
+            .unwrap();
+    assert_eq!(results["commands"][0]["exit_code"], 42);
+    assert!(artifact_dir.join("commands/0-stdout.log").is_file());
+    assert!(artifact_dir.join("commands/0-stderr.log").is_file());
+    let mutation: serde_json::Value =
+        serde_json::from_slice(&fs::read(artifact_dir.join("candidate-mutation.json")).unwrap())
+            .unwrap();
+    assert_eq!(mutation["candidate_commit"], results["candidate_commit"]);
+    assert_eq!(mutation["restored"], true);
+    assert!(
+        mutation["tracked_status"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.as_str().unwrap().contains("README.md"))
     );
 }
 

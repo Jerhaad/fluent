@@ -91,6 +91,7 @@
 - [test-fixtures-use-production-state](test-fixtures-use-production-state.md) — Test fixtures must use state values that production code actually creates, not unreachable states
 - [test-names-match-assertions](test-names-match-assertions.md) — Test function names must describe the behavior the test actually asserts, not what a behavior statement claims
 - [tester-readiness-shares-production-boundary](tester-readiness-shares-production-boundary.md) — Tester readiness validates structure and executes through the production sandbox, extraction, and normalization boundary; production boundary failures pause only the Tester for repair and retry
+- [tester-tracked-mutations-restore-after-evidence](tester-tracked-mutations-restore-after-evidence.md) — Work Task Testers retain command evidence while a host guard restores only tracked candidate side effects after every launch
 - [token-bound-to-persisted-record](token-bound-to-persisted-record.md) — Identity tokens returned by dispatch operations must be constructed from persisted record fields, not from caller-supplied request fields
 - [unix-socket-bind-eperm-in-sandbox](unix-socket-bind-eperm-in-sandbox.md) — The execution test sandbox returns EPERM on Unix socket bind; socket-level tests must export fake types for downstream non-sandboxed consumers
 - [utf8-safe-diagnostic-truncation](utf8-safe-diagnostic-truncation.md) — Byte-capped diagnostic excerpts must realign truncation to a UTF-8 character boundary before slicing
