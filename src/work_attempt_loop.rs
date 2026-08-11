@@ -6767,13 +6767,47 @@ fn interpret_reviews(
 
     let mut failed = Vec::new();
     let mut uncertain = Vec::new();
+    let mut focused_evidence_requests = Vec::new();
     for review_artifact in &review_artifacts {
         let content = fs::read_to_string(&review_artifact.review_path).unwrap_or_default();
         match review::extract_verdict(&content) {
             Verdict::Pass => {}
-            Verdict::Fail => failed.push(review_artifact.artifact.clone()),
+            Verdict::Fail => {
+                failed.push(review_artifact.artifact.clone());
+                let is_tests_review = item.attempts[attempt_index].tasks.iter().any(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role == "tests"
+                        && task.artifact_area.as_ref().is_some_and(|area| {
+                            format!("{}/review.md", area.path) == review_artifact.artifact.path
+                        })
+                });
+                if is_tests_review && review::extract_focused_evidence_request(&content).is_some() {
+                    focused_evidence_requests.push(review_artifact.artifact.clone());
+                }
+            }
             Verdict::Uncertain => uncertain.push(review_artifact.artifact.clone()),
         }
+    }
+
+    // One exact focused evidence request is an operator decision, not source
+    // correction work. Pause before planning a Writer so an explicit host run
+    // can reuse the unchanged candidate and rerun only the Tests Reviewer.
+    if failed.len() == 1
+        && focused_evidence_requests.len() == 1
+        && uncertain.is_empty()
+        && !item.attempts[attempt_index].kind.is_review_only_like()
+    {
+        return settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            crate::work_model::PauseKind::Uncertain,
+            &focused_evidence_requests,
+            write_focused_evidence_handoff,
+            &|_| {},
+        );
     }
 
     // Advancement gate B2: when reviews would otherwise pass, a marked Attempt must
@@ -7324,6 +7358,30 @@ fn write_needs_user_handoff(
         &path,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop found uncertain or missing review verdicts.\n\n{artifacts}\n"
+        ),
+    )?;
+    Ok(relative_path)
+}
+
+fn write_focused_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    reviews: &[ArtifactRef],
+) -> Result<String> {
+    let review = reviews
+        .first()
+        .context("focused evidence pause requires one failed Tests Review")?;
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &path,
+        format!(
+            "# Attempt needs focused test evidence\n\nThe failed Tests Review requested one focused check against the unchanged candidate. Fluent did not plan another Writer.\n\nReview: `{}`\n\nTo authorize the exact command recorded in that review, run:\n\n`fluent attempt evidence run {} {} --review-artifact {}`\n",
+            review.path, work_item_id, attempt_id, review.path
         ),
     )?;
     Ok(relative_path)
@@ -10916,6 +10974,67 @@ mod tests {
         assert_eq!(
             stored.attempts[0].evidence_recoveries[0].state,
             EvidenceRecoveryState::NeedsEvidence
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count
+        );
+    }
+
+    #[test]
+    fn ordinary_tests_review_focused_request_pauses_without_writer_round() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        let review_path = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+        ));
+        fs::write(
+            review_path.join("review.md"),
+            "Verdict: fail\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: .\n",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == "attempt-1-review-behaviors")
+                    .unwrap()
+                    .role = "tests".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = store.read_work_item("work-1").unwrap();
+        let writer_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        let handoff_path = match outcome {
+            WorkAttemptRunOutcome::NeedsUser { handoff_path } => handoff_path,
+            other => panic!("expected focused evidence pause, got {other:?}"),
+        };
+        let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains(
+            "fluent attempt evidence run work-1 attempt-1 --review-artifact .fluent/work/artifacts/work-1/attempt-1/attempt-1-review-behaviors/review.md"
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::Uncertain));
+        assert_eq!(
+            stored.attempts[0].review_state,
+            Some(AttemptReviewState::Failed)
         );
         assert_eq!(
             stored.attempts[0]

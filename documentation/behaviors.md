@@ -343,6 +343,55 @@ WHEN an evidence-targeted reviewer passes, THE SYSTEM SHALL preserve the prior
 Writer history.
 Test: src/work_attempt_loop.rs (evidence_targeted_review_pass_preserves_writer_and_tester)
 
+### B11a
+
+WHEN the only failed review requests one well-formed focused Tests Review check,
+THE SYSTEM SHALL pause with the exact evidence-run command without planning a
+Writer.
+Test: src/work_attempt_loop.rs (ordinary_tests_review_focused_request_pauses_without_writer_round)
+Test: src/work_status.rs (focused_evidence_status_names_exact_run_command)
+
+### B11b
+
+WHEN an operator runs one accepted focused evidence check for a failed Tests
+Review, THE SYSTEM SHALL retain its exact command, resolved working directory,
+captured result, output, and candidate commit as host evidence.
+Test: tests/binary.rs (attempt_evidence_run_plans_only_targeted_tests_review)
+Test: tests/binary.rs (attempt_evidence_run_records_timeout_as_failed_evidence)
+
+### B11c
+
+WHEN Fluent accepts a focused evidence result, THE SYSTEM SHALL plan no Writer.
+Test: tests/binary.rs (attempt_evidence_run_plans_only_targeted_tests_review)
+
+### B11d
+
+WHILE a focused evidence check runs, THE SYSTEM SHALL keep candidate source
+read-only.
+Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+
+### B11e
+
+WHILE a focused evidence check runs, THE SYSTEM SHALL provide a private writable
+scratch path for build and cache state.
+Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+
+### B11f
+
+WHILE a focused evidence check runs, THE SYSTEM SHALL withhold provider
+credential environment variables and files under the caller's Claude, Codex,
+and agent state directories from the child command.
+Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+
+### B11g
+
+IF a focused evidence request is missing, malformed, or belongs to a role other
+than Tests Review, THEN THE SYSTEM SHALL reject it without changing the Work
+Item or candidate.
+Test: tests/binary.rs (attempt_evidence_run_rejects_invalid_request_without_mutation)
+Test: tests/binary.rs (attempt_evidence_run_rejects_non_tests_review_without_mutation)
+Test: tests/binary.rs (attempt_evidence_run_rejects_legacy_review_without_explicit_request)
+
 ### B12
 
 WHEN an evidence-targeted reviewer passes, THE SYSTEM SHALL preserve the prior

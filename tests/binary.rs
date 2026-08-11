@@ -22651,6 +22651,421 @@ fn attempt_evidence_attach_plans_targeted_reviews_without_writer() {
     }));
 }
 
+fn setup_focused_evidence_fixture(
+    tmp: &TempDir,
+    work_item_id: &str,
+    role: &str,
+    review_body: &str,
+) -> (PathBuf, String, String) {
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, PauseKind, TaskOutput, TaskStatus, WorkItem,
+        WorkModelStore,
+    };
+
+    let project = setup_git_project(tmp);
+    let candidate = git_head(&project);
+    let store = WorkModelStore::new(&project);
+    let mut item = WorkItem::planned(work_item_id, "Run focused reviewer evidence");
+    item.add_initial_attempt("attempt-1").unwrap();
+    let writer = &mut item.attempts[0].tasks[0];
+    writer.status = TaskStatus::Complete;
+    writer.output = Some(TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: project.display().to_string(),
+        source_branch: "main".to_string(),
+        base_commit: None,
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    item.add_review_tasks("attempt-1", &[role]).unwrap();
+    let reviewer = item.attempts[0].tasks.last_mut().unwrap();
+    reviewer.status = TaskStatus::Complete;
+    let review_path = format!(
+        "{}/review.md",
+        reviewer.artifact_area.as_ref().unwrap().path
+    );
+    fs::create_dir_all(project.join(&review_path).parent().unwrap()).unwrap();
+    fs::write(project.join(&review_path), review_body).unwrap();
+    item.attempts[0].status = AttemptStatus::NeedsUser;
+    item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+    item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+    store.create_work_item(&item).unwrap();
+    (project, candidate, review_path)
+}
+
+#[test]
+fn attempt_evidence_run_plans_only_targeted_tests_review() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-run",
+        "tests",
+        "Verdict: fail\nEvidence-Command: printf focused-pass\nEvidence-Working-Directory: .\n",
+    );
+    let bin = tmp.path().join("bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-run",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Focused evidence passed"));
+
+    let shown = work_item_value(&project, "focused-evidence-run");
+    let attempt = &shown["attempts"][0];
+    assert_eq!(attempt["status"], "reviewing");
+    assert_eq!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1
+    );
+    let targeted = attempt["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["evidence_review_context"].is_object())
+        .collect::<Vec<_>>();
+    assert_eq!(targeted.len(), 1);
+    assert_eq!(targeted[0]["role"], "tests");
+    let snapshot = project.join(
+        attempt["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(evidence["result"], "pass");
+    assert_eq!(evidence["check"], "printf focused-pass");
+    assert_eq!(
+        evidence["working_directory"],
+        project.canonicalize().unwrap().display().to_string()
+    );
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("focused-pass")
+    );
+    assert_eq!(
+        attempt["evidence_recoveries"][0]["candidate_commit"],
+        candidate
+    );
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
+fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-profile",
+        "tests",
+        "Verdict: fail\nEvidence-Command: env\nEvidence-Working-Directory: .\n",
+    );
+    let bin = tmp.path().join("bin");
+    let profile_log = tmp.path().join("focused-profile.sb");
+    let sandbox_script = format!(
+        "#!/bin/sh\ncp \"$2\" '{}'\nshift 2\nexec \"$@\"\n",
+        profile_log.display()
+    );
+    write_mock_executable(&bin, "sandbox-exec", &sandbox_script);
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("OPENAI_API_KEY", "must-not-reach-focused-check")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-profile",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success();
+
+    let profile = fs::read_to_string(profile_log).unwrap();
+    let canonical_project = project.canonicalize().unwrap();
+    assert!(profile.contains(&format!(
+        "(allow file-read*  (subpath \"{}\"))",
+        canonical_project.display()
+    )));
+    assert!(!profile.contains(&format!(
+        "(allow file-write* (subpath \"{}\"))",
+        canonical_project.display()
+    )));
+    assert!(profile.contains(&format!(
+        "(deny file-write* (subpath \"{}\"))",
+        canonical_project.display()
+    )));
+    assert!(profile.contains("focused-evidence-runs/run-1"));
+    let source_home = PathBuf::from(std::env::var("HOME").unwrap());
+    for state in [".claude", ".codex", ".agents"] {
+        assert!(profile.contains(&format!(
+            "(deny file-read* (subpath \"{}\"))",
+            source_home.join(state).display()
+        )));
+        assert!(profile.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            source_home.join(state).display()
+        )));
+    }
+    let shown = work_item_value(&project, "focused-evidence-profile");
+    let snapshot = project.join(
+        shown["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert!(
+        !evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("must-not-reach-focused-check")
+    );
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("FLUENT_EVIDENCE_SCRATCH=")
+    );
+    assert_eq!(git_head(&project), candidate);
+    assert!(
+        git::run_stdout(&project, &["status", "--porcelain"], "inspect candidate")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn attempt_evidence_run_rejects_invalid_request_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-reject",
+        "tests",
+        "Verdict: fail\nEvidence-Command: printf one && printf two\nEvidence-Working-Directory: .\n",
+    );
+    let item_path = project.join(".fluent/work/items/focused-evidence-reject.json");
+    let before = fs::read_to_string(&item_path).unwrap();
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-reject",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("one direct harness invocation"));
+
+    assert_json_unchanged(&item_path, &before);
+    assert_eq!(git_head(&project), candidate);
+    assert!(
+        git::run_stdout(&project, &["status", "--porcelain"], "inspect candidate")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !project
+            .join(".fluent/work/artifacts/focused-evidence-reject/attempt-1/focused-evidence-runs")
+            .exists()
+    );
+}
+
+#[test]
+fn attempt_evidence_run_rejects_non_tests_review_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-role",
+        "architecture",
+        "Verdict: fail\nEvidence-Command: printf should-not-run\nEvidence-Working-Directory: .\n",
+    );
+    let item_path = project.join(".fluent/work/items/focused-evidence-role.json");
+    let before = fs::read_to_string(&item_path).unwrap();
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-role",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only a failed Tests Review"));
+
+    assert_json_unchanged(&item_path, &before);
+    assert_eq!(git_head(&project), candidate);
+    assert!(
+        !project
+            .join(".fluent/work/artifacts/focused-evidence-role/attempt-1/focused-evidence-runs")
+            .exists()
+    );
+}
+
+#[test]
+fn attempt_evidence_run_accepts_explicit_legacy_request() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-legacy",
+        "tests",
+        "Verdict: fail\n\n## Findings\n- [ ] One focused reproduction could resolve this.\n",
+    );
+    let bin = tmp.path().join("bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-legacy",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+            "--command",
+            "printf legacy-pass",
+            "--working-directory",
+            ".",
+        ])
+        .assert()
+        .success();
+
+    let shown = work_item_value(&project, "focused-evidence-legacy");
+    assert_eq!(shown["attempts"][0]["status"], "reviewing");
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
+fn attempt_evidence_run_records_timeout_as_failed_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-timeout",
+        "tests",
+        "Verdict: fail\nEvidence-Command: /bin/sleep 30\nEvidence-Working-Directory: .\n",
+    );
+    let bin = tmp.path().join("bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-timeout",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+            "--timeout-seconds",
+            "1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Focused evidence failed"));
+
+    let shown = work_item_value(&project, "focused-evidence-timeout");
+    let snapshot = project.join(
+        shown["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(evidence["result"], "fail");
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("exit_code: 124")
+    );
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
+fn attempt_evidence_run_rejects_legacy_review_without_explicit_request() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-missing",
+        "tests",
+        "Verdict: fail\n\n## Findings\n- [ ] One focused reproduction could resolve this.\n",
+    );
+    let item_path = project.join(".fluent/work/items/focused-evidence-missing.json");
+    let before = fs::read_to_string(&item_path).unwrap();
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-missing",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "supply the missing focused evidence command explicitly",
+        ));
+
+    assert_json_unchanged(&item_path, &before);
+    assert_eq!(git_head(&project), candidate);
+    assert!(
+        !project
+            .join(".fluent/work/artifacts/focused-evidence-missing/attempt-1/focused-evidence-runs")
+            .exists()
+    );
+}
+
 fn setup_candidate_preservation_fixture(
     tmp: &TempDir,
 ) -> (PathBuf, String, serde_json::Value, serde_json::Value) {

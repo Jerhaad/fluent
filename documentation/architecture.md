@@ -744,6 +744,33 @@ write Task. Uncertain verdicts without failures mark the Attempt
 
 ### Host evidence recovery
 
+When one missing focused result prevents a Tests Reviewer from deciding, the
+review may emit one `Evidence-Command` and one candidate-relative
+`Evidence-Working-Directory`. Fluent pauses before planning another Writer and
+reports this explicit recovery action:
+
+```sh
+fluent attempt evidence run <work-item> <attempt> \
+  --review-artifact <path>
+```
+
+The operator invocation authorizes that exact model-proposed command. Fluent
+accepts one direct, single-line harness invocation, binds it to the latest
+failed Tests Review and unchanged Writer commit, and runs it under a host-owned
+Seatbelt profile. Candidate source is read-only. `HOME`, `TMPDIR`, Cargo, Clang,
+and Swift build/cache paths point into an already-created private run directory
+available as `$FLUENT_EVIDENCE_SCRATCH`; the profile may read installed user
+toolchains but explicitly denies Claude, Codex, and agent session trees. The
+child environment is rebuilt from a small toolchain allowlist, so provider
+credentials and enclosing-agent variables do not reach the check. Each
+run owns a process group and a
+bounded deadline; timeout advances only after Fluent confirms cleanup. Fluent
+captures stdout and stderr, writes one schema-version-1 evidence document with
+exclusive creation, and passes that document to the ordinary attachment path.
+Legacy reviews without structured request lines require the operator to supply
+both `--command` and `--working-directory`; a structured request cannot be
+overridden with different values.
+
 An operator can attach trusted host-run proof to an unchanged candidate:
 
 ```sh

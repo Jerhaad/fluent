@@ -19,6 +19,23 @@ launch, and records the mutation. It does not delete untracked or ignored build
 outputs. Tests for this boundary must assert both evidence retention and the
 post-run Git state; a helper-only restoration test is insufficient.
 
+## Recover one missing reviewer result
+
+A Tests Reviewer that needs one focused result should first use the project's
+harness-native selector. When its read-only sandbox cannot create the required
+build state, it records one `Evidence-Command` and one candidate-relative
+`Evidence-Working-Directory` instead of asking a Writer to change unrelated
+source. Keep the command to one direct harness invocation and place explicit
+build/cache arguments under `$FLUENT_EVIDENCE_SCRATCH`.
+
+`fluent attempt evidence run` is the human authorization boundary for that
+model-proposed command. The host creates private scratch before applying the
+sandbox, keeps candidate source read-only, removes provider credentials from the
+child environment, captures the exact result, and uses the existing
+candidate-bound evidence attachment to rerun only the Tests Reviewer. Do not
+execute these requests implicitly from the scheduler, and do not turn them into
+named project-specific subset registries.
+
 ## Where failure logs live
 
 Every test run writes per-case stdout and stderr to `tests/output/`:

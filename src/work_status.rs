@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::work_model::{
     Attempt, AttemptReviewState, AttemptStatus, MergeCandidate, MergeCandidateMergeStatus,
-    MergeReviewState, Task, TaskKind, TaskStatus, WorkItem, WorkModelStore,
+    MergeReviewState, PauseKind, Task, TaskKind, TaskStatus, WorkItem, WorkModelStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +144,7 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .unwrap_or_else(|| "-".to_string()),
         action: action_label_with_liveness(item, attempt, merge_candidate, project_root)
             .to_string(),
-        next_action: attempt_recovery_next_action(attempt),
+        next_action: attempt_recovery_next_action(attempt, project_root),
         metrics: work_metrics(item, project_root),
         compatibility_warnings: item.compatibility_warnings(),
         release: item
@@ -748,7 +748,10 @@ fn action_label_with_liveness(
     }
 }
 
-fn attempt_recovery_next_action(attempt: Option<&Attempt>) -> Option<String> {
+fn attempt_recovery_next_action(
+    attempt: Option<&Attempt>,
+    project_root: Option<&Path>,
+) -> Option<String> {
     let attempt = attempt?;
     if let Some(recovery) = attempt.evidence_recoveries.last().filter(|recovery| {
         attempt.status == AttemptStatus::NeedsUser
@@ -763,6 +766,56 @@ fn attempt_recovery_next_action(attempt: Option<&Attempt>) -> Option<String> {
             "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path>{artifacts}",
             attempt.work_item_id, attempt.id, recovery.candidate_commit
         ));
+    }
+    if attempt.status == AttemptStatus::NeedsUser
+        && attempt.review_state == Some(AttemptReviewState::Failed)
+        && matches!(
+            attempt.pause_kind,
+            Some(PauseKind::RoundCap | PauseKind::Uncertain)
+        )
+    {
+        let (writer_index, candidate_commit) = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, task)| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|(index, task)| {
+                task.output
+                    .as_ref()
+                    .map(|output| (index, output.commit.as_str()))
+            })?;
+        let latest_tests_review = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, task)| {
+                *index > writer_index
+                    && task.kind == TaskKind::Review
+                    && task.role == "tests"
+                    && task.status == TaskStatus::Complete
+            });
+        if let Some(review_artifact) = latest_tests_review.and_then(|(_, task)| {
+            if task
+                .review_context
+                .as_ref()
+                .map(|context| context.candidate_commit.as_str())
+                != Some(candidate_commit)
+            {
+                return None;
+            }
+            let path = format!("{}/review.md", task.artifact_area.as_ref()?.path);
+            let content = std::fs::read_to_string(project_root?.join(&path)).ok()?;
+            (crate::review::extract_verdict(&content) == crate::review::Verdict::Fail
+                && crate::review::extract_focused_evidence_request(&content).is_some())
+            .then_some(path)
+        }) {
+            return Some(format!(
+                "fluent attempt evidence run {} {} --review-artifact {}",
+                attempt.work_item_id, attempt.id, review_artifact
+            ));
+        }
     }
     attempt.ensure_resume_ready().ok().map(|()| {
         format!(
@@ -1308,10 +1361,68 @@ mod tests {
         };
 
         assert_eq!(
-            attempt_recovery_next_action(Some(&attempt)).as_deref(),
+            attempt_recovery_next_action(Some(&attempt), None).as_deref(),
             Some(
                 "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/review/review.md"
             )
+        );
+    }
+
+    #[test]
+    fn focused_evidence_status_names_exact_run_command() {
+        let root = tempfile::TempDir::new().unwrap();
+        let artifact = ".fluent/work/artifacts/work-1/attempt-1/review-tests";
+        std::fs::create_dir_all(root.path().join(artifact)).unwrap();
+        std::fs::write(
+            root.path().join(artifact).join("review.md"),
+            "Verdict: fail\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: .\n",
+        )
+        .unwrap();
+        let mut item = WorkItem::planned("work-1", "Focused evidence");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(crate::work_model::TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: root.path().display().to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: "abc123".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+        let review = item.attempts[0].tasks.last_mut().unwrap();
+        review.status = TaskStatus::Complete;
+        review.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact.to_string(),
+        });
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::Uncertain);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        assert_eq!(
+            attempt_recovery_next_action(Some(&item.attempts[0]), Some(root.path())).as_deref(),
+            Some(
+                "fluent attempt evidence run work-1 attempt-1 --review-artifact .fluent/work/artifacts/work-1/attempt-1/review-tests/review.md"
+            )
+        );
+
+        let newer_artifact = ".fluent/work/artifacts/work-1/attempt-1/review-tests-newer";
+        std::fs::create_dir_all(root.path().join(newer_artifact)).unwrap();
+        std::fs::write(
+            root.path().join(newer_artifact).join("review.md"),
+            "Verdict: pass\n",
+        )
+        .unwrap();
+        let mut newer_review = item.attempts[0].tasks.last().unwrap().clone();
+        newer_review.id = "review-tests-newer".to_string();
+        newer_review.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: newer_artifact.to_string(),
+        });
+        item.attempts[0].tasks.push(newer_review);
+        assert_eq!(
+            attempt_recovery_next_action(Some(&item.attempts[0]), Some(root.path())),
+            None
         );
     }
 

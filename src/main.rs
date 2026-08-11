@@ -546,6 +546,43 @@ fn cmd_attempt(
     match command {
         AttemptCommands::Evidence {
             command:
+                AttemptEvidenceCommands::Run {
+                    work_item_id,
+                    attempt_id,
+                    review_artifact,
+                    command,
+                    working_directory,
+                    timeout_seconds,
+                },
+        } => {
+            let run = fluent::host_evidence::run_focused(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &review_artifact,
+                command.as_deref(),
+                working_directory.as_deref(),
+                timeout_seconds,
+                resolver,
+            )?;
+            println!(
+                "Focused evidence {} for Attempt {}; targeted reviews: {}",
+                match run.result {
+                    fluent::host_evidence::EvidenceResult::Pass => "passed",
+                    fluent::host_evidence::EvidenceResult::Fail => "failed",
+                },
+                attempt_id,
+                run.recovery
+                    .targets
+                    .iter()
+                    .map(|target| target.role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        AttemptCommands::Evidence {
+            command:
                 AttemptEvidenceCommands::Attach {
                     work_item_id,
                     attempt_id,

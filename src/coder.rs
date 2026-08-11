@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_PI_MODEL: &str = "qwen3.6-35b-a3b";
 
@@ -2166,6 +2166,75 @@ pub(crate) fn terminate_owned_process_tree(child: Child) -> Result<GroupSweepDis
         .terminate_and_reap()
         .map(|_| managed.group_sweep_disposition())
         .map_err(|error| error.to_string())
+}
+
+/// Wait for a separately spawned host command until its deadline, then sweep
+/// every descendant before returning. The leader is polled without reaping so
+/// its PID continues to pin process-group identity through cleanup.
+pub(crate) fn wait_owned_process_tree(
+    child: Child,
+    deadline: Duration,
+) -> Result<(i32, bool, GroupSweepDisposition), String> {
+    let child_id = child.id();
+    let mut managed = ManagedChild::new(Box::new(SystemLeader::new(child, child_id)));
+    let started = Instant::now();
+    loop {
+        let timed_out = started.elapsed() >= deadline;
+        match managed.poll_exit() {
+            ExitObservation::Exited => {
+                let code = managed
+                    .terminate_and_reap()
+                    .map_err(|error| error.to_string())?;
+                return Ok((code, false, managed.group_sweep_disposition()));
+            }
+            ExitObservation::Running if timed_out => {
+                let code = managed
+                    .terminate_and_reap()
+                    .map_err(|error| error.to_string())?;
+                return Ok((code, true, managed.group_sweep_disposition()));
+            }
+            ExitObservation::Running => std::thread::sleep(Duration::from_millis(20)),
+            ExitObservation::IdentityLost => {
+                return Err(format!(
+                    "host command process {child_id} identity was lost before cleanup"
+                ));
+            }
+            ExitObservation::Unknown => {
+                let cleanup = managed.terminate_and_reap();
+                return Err(match cleanup {
+                    Ok(_) => format!("host command process {child_id} exit state is unknown"),
+                    Err(error) => format!(
+                        "host command process {child_id} exit state is unknown; cleanup failed: {error}"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn bounded_host_command_preserves_exit_and_sweeps_descendants() {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "exit 7"]).process_group(0);
+    let (code, timed_out, disposition) =
+        wait_owned_process_tree(command.spawn().unwrap(), Duration::from_secs(2)).unwrap();
+    assert_eq!(code, 7);
+    assert!(!timed_out);
+    assert!(disposition.is_verified_swept());
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn bounded_host_command_timeout_confirms_process_cleanup() {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "sleep 30"]).process_group(0);
+    let (_code, timed_out, disposition) =
+        wait_owned_process_tree(command.spawn().unwrap(), Duration::from_millis(30)).unwrap();
+    assert!(timed_out);
+    assert!(disposition.is_verified_swept());
 }
 
 /// Compose a pump terminal outcome with a cleanup outcome. A pump failure is the

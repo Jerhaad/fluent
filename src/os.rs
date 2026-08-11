@@ -293,6 +293,21 @@ fn sandbox_exec_program() -> &'static str {
     "/usr/bin/sandbox-exec"
 }
 
+/// Build a command under the exact rendered Seatbelt profile. Production
+/// always uses the system launcher; route tests may replace only that launcher
+/// in test-support builds.
+pub(crate) fn command_under_profile(profile: &SandboxProfile, program: &Path) -> Command {
+    #[cfg(feature = "test-support")]
+    let launcher = env::var_os("FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(sandbox_exec_program()));
+    #[cfg(not(feature = "test-support"))]
+    let launcher = PathBuf::from(sandbox_exec_program());
+    let mut command = Command::new(launcher);
+    command.arg("-f").arg(&profile.path).arg(program);
+    command
+}
+
 /// Run a rendered profile through a caller-supplied probe executor.
 ///
 /// Production calls this through [`preflight_profile`] with the trusted absolute
@@ -502,6 +517,40 @@ pub fn render_profile_common_only(
         None,
         None,
     )
+}
+
+/// Render the common tool profile and deny access to exact user-state trees
+/// that a host-owned check never needs. Keep these denials after the common
+/// grants so broad provider compatibility rules cannot expose agent sessions.
+pub fn render_profile_common_only_with_denied_access(
+    resolver: &ContentResolver,
+    home: &str,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    denied_read_roots: &[PathBuf],
+    denied_write_roots: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let profile = render_profile_common_only(resolver, home, writable_roots, readable_roots)?;
+    let mut rules = Vec::new();
+    rules.extend(
+        denied_read_roots
+            .iter()
+            .map(|root| format!("(deny file-read* (subpath {}))", sbpl_string(root))),
+    );
+    rules.extend(
+        denied_write_roots
+            .iter()
+            .map(|root| format!("(deny file-write* (subpath {}))", sbpl_string(root))),
+    );
+    if !rules.is_empty() {
+        let content = format!(
+            "{}\n{}\n",
+            std::fs::read_to_string(&profile.path)?,
+            rules.join("\n")
+        );
+        std::fs::write(&profile.path, content)?;
+    }
+    Ok(profile)
 }
 
 fn render_profile_for_access(

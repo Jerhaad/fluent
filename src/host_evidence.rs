@@ -5,9 +5,12 @@ use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
-use std::path::{Component, Path};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
+use crate::content::ContentResolver;
 use crate::review::{self, Verdict};
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
@@ -16,6 +19,9 @@ use crate::work_model::{
 };
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+const MAX_FOCUSED_COMMAND_BYTES: usize = 4096;
+const MAX_FOCUSED_OUTPUT_BYTES: u64 = 384 * 1024;
+const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
 
 /// Version-one operator evidence document. Its serialized bytes, not a
 /// re-rendering, are the audited artifact.
@@ -36,6 +42,427 @@ pub struct EvidenceDocument {
 pub enum EvidenceResult {
     Pass,
     Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedEvidenceRun {
+    pub recovery: EvidenceRecovery,
+    pub result: EvidenceResult,
+    pub command: String,
+    pub working_directory: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_focused(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    review_artifact: &str,
+    command_override: Option<&str>,
+    working_directory_override: Option<&str>,
+    timeout_seconds: u64,
+    resolver: &ContentResolver,
+) -> Result<FocusedEvidenceRun> {
+    anyhow::ensure!(
+        (1..=MAX_FOCUSED_TIMEOUT_SECONDS).contains(&timeout_seconds),
+        "focused evidence timeout must be between 1 and {MAX_FOCUSED_TIMEOUT_SECONDS} seconds"
+    );
+    let item = store
+        .read_work_item(work_item_id)
+        .with_context(|| format!("read Work Item {work_item_id}"))?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .with_context(|| format!("Attempt {attempt_id} not found"))?;
+    let candidate_commit = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+        .context("focused evidence requires a completed Writer candidate")?;
+    let selected = validate_evidence_frontier(
+        project_root,
+        &item,
+        attempt_id,
+        &candidate_commit,
+        &[review_artifact.to_string()],
+    )?;
+    let review_task = selected
+        .first()
+        .context("focused evidence requires one failed review")?;
+    anyhow::ensure!(
+        review_task.role == "tests",
+        "focused evidence can target only a failed Tests Review"
+    );
+    let review_path = project_root.join(review_artifact);
+    let review_content = fs::read_to_string(&review_path)
+        .with_context(|| format!("read failed review {}", review_path.display()))?;
+    let declared = review::extract_focused_evidence_request(&review_content);
+    let command = resolve_requested_value(
+        "command",
+        declared.as_ref().map(|request| request.command.as_str()),
+        command_override,
+    )?;
+    validate_focused_command(&command)?;
+    let working_directory = resolve_requested_value(
+        "working directory",
+        declared
+            .as_ref()
+            .map(|request| request.working_directory.as_str()),
+        working_directory_override,
+    )?;
+
+    let candidate_workspace = review_task
+        .review_context
+        .as_ref()
+        .map(|context| PathBuf::from(&context.candidate_workspace_path))
+        .context("failed Tests Review has no candidate workspace")?;
+    let candidate_workspace = if candidate_workspace.is_absolute() {
+        candidate_workspace
+    } else {
+        project_root.join(candidate_workspace)
+    };
+    let candidate_workspace = canonical_candidate_workspace(&candidate_workspace)?;
+    let working_path = resolve_working_directory(&candidate_workspace, &working_directory)?;
+
+    // Prevent Fluent landing from changing the candidate while this command
+    // reads it. The later attachment reacquires the same boundary and validates
+    // the complete frontier again before publishing Work state.
+    let land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
+        .context("acquire land lock before focused evidence run")?;
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at(
+            project_root,
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref())
+                .context("focused evidence lost its Writer output")?,
+            &candidate_commit,
+        ),
+        "focused evidence candidate changed before execution"
+    );
+    let run_dir = allocate_focused_run_dir(project_root, work_item_id, attempt_id)?;
+    let execution = execute_focused_command(
+        &candidate_workspace,
+        &working_path,
+        &run_dir,
+        &command,
+        Duration::from_secs(timeout_seconds),
+        resolver,
+    )?;
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at(
+            project_root,
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref())
+                .context("focused evidence lost its Writer output")?,
+            &candidate_commit,
+        ),
+        "focused evidence candidate changed during execution"
+    );
+    let result = if execution.exit_code == 0 {
+        EvidenceResult::Pass
+    } else {
+        EvidenceResult::Fail
+    };
+    let document = EvidenceDocument {
+        schema_version: 1,
+        producer: "fluent focused evidence runner".to_string(),
+        check: command.clone(),
+        working_directory: working_path.display().to_string(),
+        result: result.clone(),
+        run_at: chrono::Utc::now().to_rfc3339(),
+        output: execution.output,
+    };
+    let document_bytes = serde_json::to_vec_pretty(&document)?;
+    anyhow::ensure!(
+        document_bytes.len() <= MAX_EVIDENCE_BYTES,
+        "focused evidence document exceeds {MAX_EVIDENCE_BYTES} bytes"
+    );
+    let document_path = run_dir.join("evidence.json");
+    write_exclusive(&document_path, &document_bytes)?;
+    drop(land_lock);
+
+    let recovery = attach(
+        project_root,
+        store,
+        work_item_id,
+        attempt_id,
+        &candidate_commit,
+        &document_path,
+        &[review_artifact.to_string()],
+    )?;
+    Ok(FocusedEvidenceRun {
+        recovery,
+        result,
+        command,
+        working_directory,
+    })
+}
+
+fn resolve_requested_value(
+    name: &str,
+    declared: Option<&str>,
+    supplied: Option<&str>,
+) -> Result<String> {
+    match (declared, supplied) {
+        (Some(declared), Some(supplied)) if declared != supplied => {
+            bail!("supplied focused evidence {name} does not match the failed review")
+        }
+        (Some(declared), _) => Ok(declared.to_string()),
+        (None, Some(supplied)) if !supplied.trim().is_empty() => Ok(supplied.to_string()),
+        _ => bail!(
+            "failed review has no valid Evidence-Command and Evidence-Working-Directory; supply the missing focused evidence {name} explicitly"
+        ),
+    }
+}
+
+fn validate_focused_command(command: &str) -> Result<()> {
+    anyhow::ensure!(
+        !command.trim().is_empty() && command.len() <= MAX_FOCUSED_COMMAND_BYTES,
+        "focused evidence command must be between 1 and {MAX_FOCUSED_COMMAND_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !command.contains(['\n', '\r', '\0']),
+        "focused evidence command must occupy one line"
+    );
+    for token in [";", "&", "|", "`", "$(", "(", ")", ">", "<"] {
+        anyhow::ensure!(
+            !command.contains(token),
+            "focused evidence command must name one direct harness invocation; shell control token {token:?} is not allowed"
+        );
+    }
+    Ok(())
+}
+
+fn canonical_candidate_workspace(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect candidate workspace {}", path.display()))?;
+    anyhow::ensure!(metadata.is_dir(), "candidate workspace must be a directory");
+    path.canonicalize()
+        .with_context(|| format!("canonicalize candidate workspace {}", path.display()))
+}
+
+fn resolve_working_directory(candidate: &Path, relative: &str) -> Result<PathBuf> {
+    let relative = Path::new(relative);
+    let canonical_spelling = relative == Path::new(".")
+        || relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    anyhow::ensure!(
+        !relative.is_absolute() && canonical_spelling,
+        "focused evidence working directory must be a canonical relative candidate path"
+    );
+    let joined = candidate.join(relative);
+    let resolved = joined.canonicalize().with_context(|| {
+        format!(
+            "resolve focused evidence working directory {}",
+            joined.display()
+        )
+    })?;
+    anyhow::ensure!(
+        resolved.starts_with(candidate) && resolved.is_dir(),
+        "focused evidence working directory must stay inside the candidate"
+    );
+    Ok(resolved)
+}
+
+fn allocate_focused_run_dir(project_root: &Path, work: &str, attempt: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        [work, attempt].iter().all(|identity| {
+            let path = Path::new(identity);
+            !identity.is_empty()
+                && !path.is_absolute()
+                && path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+                && path.components().count() == 1
+        }),
+        "focused evidence identities must be single managed path components"
+    );
+    let relative = PathBuf::from(".fluent/work/artifacts")
+        .join(work)
+        .join(attempt)
+        .join("focused-evidence-runs");
+    let parent = create_managed_directory_chain(project_root, &relative)?;
+    for index in 1..=10_000_u32 {
+        let path = parent.join(format!("run-{index}"));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("create focused evidence run {}", path.display()));
+            }
+        }
+    }
+    bail!("focused evidence run index exhausted")
+}
+
+fn create_managed_directory_chain(project_root: &Path, relative: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "managed evidence directory must use normal relative components"
+    );
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            unreachable!("validated normal component");
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("managed evidence directory must not traverse a symlink")
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("managed evidence path component must be a directory")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&current)
+                .with_context(|| {
+                    format!("create managed evidence directory {}", current.display())
+                })?,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(current)
+}
+
+struct FocusedExecution {
+    exit_code: i32,
+    output: String,
+}
+
+fn execute_focused_command(
+    candidate_workspace: &Path,
+    working_directory: &Path,
+    run_dir: &Path,
+    command: &str,
+    timeout: Duration,
+    resolver: &ContentResolver,
+) -> Result<FocusedExecution> {
+    let scratch = run_dir.join("scratch");
+    let home = scratch.join("home");
+    let temporary = scratch.join("tmp");
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&temporary)?;
+    let source_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("focused evidence requires the host HOME path for toolchain confinement")?;
+    let denied_agent_state = [".claude", ".codex", ".agents"]
+        .into_iter()
+        .map(|path| source_home.join(path))
+        .collect::<Vec<_>>();
+    let mut denied_writes = denied_agent_state.clone();
+    denied_writes.extend([
+        candidate_workspace.to_path_buf(),
+        source_home.join(".local/state"),
+        source_home.join(".claude.json"),
+        source_home.join(".claude.json.lock"),
+    ]);
+    let profile = crate::os::render_profile_common_only_with_denied_access(
+        resolver,
+        &source_home.to_string_lossy(),
+        &[run_dir.to_path_buf()],
+        &[candidate_workspace.to_path_buf()],
+        &denied_agent_state,
+        &denied_writes,
+    )?;
+    crate::os::preflight_profile(&profile)?;
+
+    let stdout_path = run_dir.join("stdout.log");
+    let stderr_path = run_dir.join("stderr.log");
+    let stdout = create_exclusive_file(&stdout_path)?;
+    let stderr = create_exclusive_file(&stderr_path)?;
+    let mut process = crate::os::command_under_profile(&profile, Path::new("/bin/sh"));
+    process
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_directory)
+        .env_clear()
+        .env("HOME", &home)
+        .env("TMPDIR", &temporary)
+        .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
+        .env("CARGO_TARGET_DIR", scratch.join("cargo-target"))
+        .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
+        .env("SWIFT_MODULE_CACHE_PATH", scratch.join("swift-modules"))
+        .env(
+            "SWIFTPM_MODULECACHE_OVERRIDE",
+            scratch.join("swiftpm-modules"),
+        )
+        .env("FLUENT_EVIDENCE_SCRATCH", &scratch)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    for name in ["PATH", "DEVELOPER_DIR", "SDKROOT", "LANG", "LC_ALL"] {
+        if let Some(value) = std::env::var_os(name) {
+            process.env(name, value);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    let child = process
+        .spawn()
+        .with_context(|| format!("spawn focused evidence command: {command}"))?;
+    let (natural_exit_code, timed_out, disposition) =
+        crate::coder::wait_owned_process_tree(child, timeout)
+            .map_err(|error| anyhow::anyhow!(error))?;
+    anyhow::ensure!(
+        disposition.is_verified_swept(),
+        "focused evidence process cleanup was not confirmed: {disposition:?}"
+    );
+    let exit_code = if timed_out { 124 } else { natural_exit_code };
+    let stdout = read_bounded_file(&stdout_path)?;
+    let stderr = read_bounded_file(&stderr_path)?;
+    let output = format!(
+        "exit_code: {exit_code}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    Ok(FocusedExecution { exit_code, output })
+}
+
+fn create_exclusive_file(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("create host evidence file {}", path.display()))
+}
+
+fn write_exclusive(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = create_exclusive_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_FOCUSED_OUTPUT_BYTES {
+        file.seek(SeekFrom::Start(length - MAX_FOCUSED_OUTPUT_BYTES))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FOCUSED_OUTPUT_BYTES)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub fn attach(
@@ -238,6 +665,12 @@ fn validate_evidence_frontier(
         return Err(rejected());
     }
     let is_legacy = attempt.is_evidence_only_recoverable(candidate_commit, review_artifacts);
+    let is_failed_review_pause = attempt.status == work_model::AttemptStatus::NeedsUser
+        && matches!(
+            attempt.pause_kind,
+            Some(work_model::PauseKind::RoundCap | work_model::PauseKind::Uncertain)
+        )
+        && attempt.review_state == Some(work_model::AttemptReviewState::Failed);
     let is_paused_evidence_recovery = attempt.status == work_model::AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(work_model::PauseKind::Uncertain)
         && attempt.evidence_recoveries.last().is_some_and(|recovery| {
@@ -256,6 +689,7 @@ fn validate_evidence_frontier(
                 })
         });
     if !(attempt.status == work_model::AttemptStatus::Reviewing
+        || is_failed_review_pause
         || is_legacy
         || is_paused_evidence_recovery)
     {
@@ -434,6 +868,28 @@ mod tests {
 
         let missing_check = br#"{"schema_version":1,"producer":"host","check":"","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
         assert!(parse_document(missing_check).is_err());
+    }
+
+    #[test]
+    fn focused_request_requires_missing_values_and_rejects_disagreement() {
+        assert!(resolve_requested_value("command", None, None).is_err());
+        assert!(
+            resolve_requested_value(
+                "command",
+                Some("swift test --filter one"),
+                Some("swift test --filter two")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            resolve_requested_value(
+                "command",
+                Some("swift test --filter one"),
+                Some("swift test --filter one")
+            )
+            .unwrap(),
+            "swift test --filter one"
+        );
     }
 
     #[test]

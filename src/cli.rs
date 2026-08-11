@@ -518,6 +518,25 @@ pub enum AttemptCommands {
 
 #[derive(Subcommand)]
 pub enum AttemptEvidenceCommands {
+    /// Run one failed Tests Review's focused check and attach its result
+    Run {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Failed Tests Review artifact this check addresses
+        #[arg(long, value_name = "PATH")]
+        review_artifact: String,
+        /// Exact one-line command for a legacy review without Evidence-Command
+        #[arg(long)]
+        command: Option<String>,
+        /// Candidate-relative directory for a legacy review without Evidence-Working-Directory
+        #[arg(long, value_name = "PATH")]
+        working_directory: Option<String>,
+        /// Maximum command duration
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+    },
     /// Attach one versioned JSON evidence document to an unchanged candidate
     Attach {
         /// Work Item ID

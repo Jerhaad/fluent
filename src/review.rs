@@ -317,6 +317,47 @@ pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition
     })
 }
 
+/// One focused command requested by a failed Tests Reviewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedEvidenceRequest {
+    pub command: String,
+    pub working_directory: String,
+}
+
+/// Read the exact focused-check request from a failed review. Both fields must
+/// occur exactly once; malformed, duplicated, or multiline requests are not
+/// executable authority.
+pub fn extract_focused_evidence_request(content: &str) -> Option<FocusedEvidenceRequest> {
+    if extract_verdict(content) != Verdict::Fail {
+        return None;
+    }
+    let values = |label: &str| {
+        content
+            .lines()
+            .filter_map(|line| {
+                let (actual, value) = line.split_once(':')?;
+                actual
+                    .trim()
+                    .eq_ignore_ascii_case(label)
+                    .then(|| value.trim())
+            })
+            .collect::<Vec<_>>()
+    };
+    let commands = values("Evidence-Command");
+    let working_directories = values("Evidence-Working-Directory");
+    if commands.len() != 1
+        || working_directories.len() != 1
+        || commands[0].is_empty()
+        || working_directories[0].is_empty()
+    {
+        return None;
+    }
+    Some(FocusedEvidenceRequest {
+        command: commands[0].to_string(),
+        working_directory: working_directories[0].to_string(),
+    })
+}
+
 /// Reviewer's self-reported judgment about whether the writer made
 /// progress on prior-round concerns. Emitted as a `Progress:` line in
 /// review.md. Round 1 has no prior review to compare against, so
@@ -438,6 +479,30 @@ mod tests {
         assert_eq!(
             extract_evidence_disposition("Verdict: fail\nDisposition: later\n"),
             None
+        );
+    }
+
+    #[test]
+    fn focused_evidence_request_is_failed_exact_and_complete() {
+        let request = extract_focused_evidence_request(
+            "Verdict: fail\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: crate\n",
+        )
+        .unwrap();
+        assert_eq!(request.command, "cargo test exact_case");
+        assert_eq!(request.working_directory, "crate");
+        assert!(extract_focused_evidence_request(
+            "Verdict: pass\nEvidence-Command: cargo test exact_case\nEvidence-Working-Directory: crate\n"
+        )
+        .is_none());
+        assert!(extract_focused_evidence_request(
+            "Verdict: fail\nEvidence-Command: cargo test one\nEvidence-Command: cargo test two\nEvidence-Working-Directory: crate\n"
+        )
+        .is_none());
+        assert!(
+            extract_focused_evidence_request(
+                "Verdict: fail\nEvidence-Command: cargo test exact_case\n"
+            )
+            .is_none()
         );
     }
 
