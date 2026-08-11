@@ -1119,9 +1119,13 @@ Test: tests/binary.rs (work_attempt_run_exposes_followup_input_artifacts)
 
 WHEN Fluent launches a Work-model `review` Task that includes input
 artifacts,
-THE SYSTEM SHALL name the input artifact paths in the review prompt and
-tell the reviewer to read them first before evaluating the candidate.
+THE SYSTEM SHALL name the input artifact paths in the review prompt, grant
+read-only access to each exact named file, and tell the reviewer to open those
+paths directly before evaluating the candidate, without granting their parent
+or sibling artifact directories.
 Test: tests/binary.rs (work_task_run_completes_review_task_with_fail_verdict_artifact)
+Test: src/work_task_executor.rs (reviewer_readable_inputs_include_every_advertised_exact_file)
+Test: tests/binary.rs (reviewer_sandbox_does_not_include_writer_artifact_dir)
 
 ### B40
 
@@ -1333,9 +1337,9 @@ Test: tests/binary.rs (write_task_transcript_persists_after_failed_attempt)
 
 WHEN any reviewer Task (architecture, behaviors, documentation, skills,
 tests) is executed,
-THE SYSTEM SHALL NOT receive read access to the writer transcript file
-in its sandbox readable roots, and the reviewer prompt SHALL NOT
-mention the writer transcript file.
+THE SYSTEM SHALL receive read-only access to the exact Writer transcript and
+completion-matrix files named in its prompt while the Writer artifact directory
+and every unnamed sibling remain inaccessible.
 Test: tests/binary.rs (reviewer_sandbox_does_not_include_writer_artifact_dir)
 
 ### B60
@@ -1374,11 +1378,11 @@ Test: tests/binary.rs (reviewer_sandbox_does_not_include_other_reviewer_artifact
 
 ### B64
 
-WHEN any reviewer Task is executed,
-THE SYSTEM SHALL NOT receive read access to the writer transcript file
-in its sandbox readable roots (regression behavior preserved from
-`persist-writer-transcripts`).
-Test: tests/binary.rs (reviewer_sandbox_does_not_include_writer_artifact_dir)
+IF an existing candidate workspace or named input path is unreadable under a
+Review Task's rendered sandbox, THEN THE SYSTEM SHALL pause the Attempt for
+user recovery without reserving the Task or launching the reviewer.
+Test: src/os.rs (readable_path_preflight_accepts_exact_file_and_rejects_sibling)
+Test: src/work_task_executor.rs (reviewer_read_path_preflight_failure_precedes_reservation)
 
 ### B65
 

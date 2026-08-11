@@ -1588,9 +1588,12 @@ sandbox grants write access to both the candidate workspace and the
 artifact directory. Review Tasks also persist `transcript.jsonl`
 alongside their primary artifact (`review.md`). Tester Tasks write
 `tester-results.json`, per-command log files, and `commands.json` to
-their artifact directory but do not write a transcript. Reviewer
-sandboxes intentionally exclude writer artifact directories and other
-reviewers' artifact directories to preserve independent verification.
+their artifact directory but do not write a transcript. Reviewer sandboxes
+intentionally exclude writer artifact directories and other reviewers'
+artifact directories to preserve independent verification. They grant each
+exact input file named in the reviewer prompt, including the Writer transcript,
+completion matrix, and progress record. An exact-file grant does not open its
+producer directory or unnamed siblings.
 
 ### progress.md
 
@@ -2481,6 +2484,17 @@ so it does not consume a Writer round. Learner and rebase routes preflight
 before they record their respective in-progress work. Resuming with `fluent
 attempt run` reopens the authentication-paused Task using the Attempt's stored
 coder mapping.
+
+The Reviewer preflight also opens every existing readable root under the
+rendered production profile. It batches files through `cat` and directories
+through a one-level `ls`, so a successful preflight uses at most two processes.
+A failed batch checks paths individually only to identify the denied path.
+Reading file bytes and directory entries avoids the false confidence of a
+metadata-only `stat`.
+The gate prevents an expensive model call from discovering that an advertised
+input is unreadable. Reviewer prompts tell agents to open supplied absolute
+paths directly because parent directories can remain intentionally
+inaccessible.
 
 ## Repository structure
 

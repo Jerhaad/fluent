@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use tempfile::NamedTempFile;
 
 use crate::coder::CoderKind;
@@ -71,6 +71,109 @@ pub fn preflight_profile(profile: &SandboxProfile) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = profile;
+        Ok(())
+    }
+}
+
+/// Verify that an already-rendered profile can read every existing root in a
+/// Reviewer launch plan.
+///
+/// Run this before reserving the model call. A profile that launches correctly
+/// but cannot open its declared candidate or evidence inputs is not a usable
+/// reviewer boundary.
+pub fn preflight_readable_paths(profile: &SandboxProfile, paths: &[PathBuf]) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_reviewer_read_preflight_result() {
+        return result;
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(result) = test_preflight_result() {
+        return result;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let existing = paths
+            .iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if existing.is_empty() {
+            return Ok(());
+        }
+
+        let files = existing
+            .iter()
+            .copied()
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        let directories = existing
+            .iter()
+            .copied()
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        let run_probe = |program: &str, args: &[&str], probe_paths: &[&PathBuf]| {
+            let mut command = Command::new(sandbox_exec_program());
+            command
+                .arg("-f")
+                .arg(&profile.path)
+                .arg(program)
+                .args(args)
+                .args(probe_paths)
+                .stdout(Stdio::null());
+            command.output()
+        };
+        for (kind, program, args, group) in [
+            ("file", "/bin/cat", Vec::new(), files),
+            ("directory", "/bin/ls", vec!["-1"], directories),
+        ] {
+            if group.is_empty() {
+                continue;
+            }
+            let output =
+                run_probe(program, &args, &group).map_err(|error| HostSandboxPreflightError {
+                    message: format!("could not probe reviewer {kind} read paths: {error}"),
+                })?;
+            if output.status.success() {
+                continue;
+            }
+
+            for path in group {
+                let output = run_probe(program, &args, &[path]).map_err(|error| {
+                    HostSandboxPreflightError {
+                        message: format!(
+                            "could not probe reviewer read path {}: {error}",
+                            path.display()
+                        ),
+                    }
+                })?;
+                if output.status.success() {
+                    continue;
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let detail = if stderr.is_empty() {
+                    format!("{program} exited with {}", output.status)
+                } else {
+                    stderr
+                };
+                return Err(HostSandboxPreflightError {
+                    message: format!(
+                        "reviewer cannot read declared path {}: {detail}",
+                        path.display()
+                    ),
+                }
+                .into());
+            }
+            return Err(HostSandboxPreflightError {
+                message: format!(
+                    "reviewer {kind} read-path probe failed without identifying a path"
+                ),
+            }
+            .into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (profile, paths);
         Ok(())
     }
 }
@@ -158,6 +261,22 @@ fn test_preflight_result() -> Option<Result<()>> {
         Some("pass" | "render-pass") => Some(Ok(())),
         Some("fail") => Some(Err(HostSandboxPreflightError {
             message: "test host sandbox preflight failure".to_string(),
+        }
+        .into())),
+        _ => None,
+    }
+}
+
+/// Fail only the Reviewer read-path probe in route tests. The general host
+/// preflight can still pass, proving that this later gate prevents reservation.
+#[cfg(feature = "test-support")]
+fn test_reviewer_read_preflight_result() -> Option<Result<()>> {
+    match env::var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT")
+        .ok()
+        .as_deref()
+    {
+        Some("fail") => Some(Err(HostSandboxPreflightError {
+            message: "test reviewer read-path preflight failure".to_string(),
         }
         .into())),
         _ => None,
@@ -693,6 +812,58 @@ mod tests {
         assert!(
             !content.contains("(allow file-write* (subpath \"/Users/test/workspace/candidate\"))"),
             "{content}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn readable_path_preflight_accepts_exact_file_and_rejects_sibling() {
+        let host_preflight_override = std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+        let root = tempfile::tempdir_in("target").unwrap();
+        let artifact = root.path().join("review");
+        let evidence = root.path().join("writer/evidence.json");
+        let completion = root.path().join("writer/completion.json");
+        let sibling = root.path().join("writer/private.json");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+        std::fs::write(&evidence, "allowed\n").unwrap();
+        std::fs::write(&completion, "allowed\n").unwrap();
+        std::fs::write(&sibling, "denied\n").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&artifact),
+            &[evidence.clone(), completion.clone()],
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        if let Err(error) = preflight_profile(&profile) {
+            if let Some(value) = host_preflight_override {
+                unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+            }
+            if error.to_string().contains("Operation not permitted") {
+                return;
+            }
+            panic!("reviewer profile preflight failed: {error:#}");
+        }
+
+        let allowed = preflight_readable_paths(&profile, &[artifact, evidence, completion]);
+        let denied = preflight_readable_paths(&profile, std::slice::from_ref(&sibling));
+        if let Some(value) = host_preflight_override {
+            unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+        }
+
+        allowed.unwrap();
+        let error = denied.expect_err("an undeclared sibling must remain unreadable");
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer cannot read declared path"),
+            "{error:#}"
         );
     }
 

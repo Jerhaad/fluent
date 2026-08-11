@@ -10,6 +10,10 @@ This is derived corrective Work with no brief, behaviors, approach, or plan. The
 {{/if}}
 Review the codebase at {{candidate_workspace_path}}.
 
+Open the supplied absolute paths directly; do not discover them by listing parent directories.
+Fluent grants the exact review workspace and named evidence files, while their parent and sibling
+directories may remain intentionally unreadable.
+
 ## Phase 1 — Understand the Work Item
 
 1. Read Brief at {{brief_path}} — what to review and why.

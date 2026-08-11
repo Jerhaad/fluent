@@ -11338,7 +11338,16 @@ fn reviewer_sandbox_does_not_include_writer_artifact_dir() {
         .success();
 
     let writer_artifact_canonical = fs::canonicalize(&writer_artifact_dir).unwrap();
+    let writer_transcript_canonical =
+        fs::canonicalize(writer_artifact_dir.join("transcript.jsonl")).unwrap();
     let sandbox_profile = fs::read_to_string(&sandbox_profile_log).unwrap();
+    assert!(
+        sandbox_profile.contains(&format!(
+            "(allow file-read*  (subpath \"{}\"))",
+            writer_transcript_canonical.display()
+        )),
+        "reviewer sandbox should include the exact advertised Writer transcript: {sandbox_profile}"
+    );
     assert!(
         !sandbox_profile.contains(&format!(
             "(allow file-read*  (subpath \"{}\"))",

@@ -6200,9 +6200,7 @@ fn run_review_coder_with_coder(
         (CoderSandbox::None, None)
     } else {
         let mut readable_roots = review_readable_sandbox_roots(project_root, readable_workspaces)?;
-        readable_roots.extend(input_artifact_readable_roots(
-            &readable_input_artifacts_only(input_artifacts),
-        ));
+        readable_roots.extend(input_artifact_readable_roots(input_artifacts));
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
         readable_roots.push(review_skills_dir(project_root));
@@ -7139,9 +7137,7 @@ fn preflight_review_sandbox_profile(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut readable_roots = review_readable_sandbox_roots(project_root, &readable_workspaces)?;
-    readable_roots.extend(input_artifact_readable_roots(
-        &readable_input_artifacts_only(input_artifacts),
-    ));
+    readable_roots.extend(input_artifact_readable_roots(input_artifacts));
     readable_roots.push(planning_files_dir(project_root, work_item_id));
     readable_roots.push(general_expertise_dir(project_root));
     readable_roots.push(review_skills_dir(project_root));
@@ -7164,6 +7160,7 @@ fn preflight_review_sandbox_profile(
     } else {
         os::preflight_profile(&profile)?;
     }
+    os::preflight_readable_paths(&profile, &readable_roots)?;
     Ok(Some(profile))
 }
 
@@ -12772,6 +12769,98 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn reviewer_read_path_preflight_failure_precedes_reservation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let git = |args: &[&str]| {
+            crate::git::run(&project_root, args, "test git setup").unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "baseline"]);
+
+        let store = WorkModelStore::new(&project_root);
+        let item = review_item_with_role("architecture");
+        let review = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap();
+        let review_task_id = review.id.clone();
+        let candidate_path = resolve_managed_readable_workspace_path(
+            &project_root,
+            &review.workspace_access.reads[0].path,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let artifact_dir = project_root.join(&review.artifact_area.as_ref().unwrap().path);
+        let input_artifacts = review.input_artifacts.clone();
+        store.create_work_item(&item).unwrap();
+
+        fs::create_dir_all(candidate_path.parent().unwrap()).unwrap();
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            candidate_path.to_str().unwrap(),
+        ]);
+        for input in input_artifacts {
+            let path = project_root.join(input.path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "{}\n").unwrap();
+        }
+
+        unsafe {
+            std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass");
+            std::env::set_var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT", "fail");
+        }
+        let resolver = ContentResolver::new(Some(&project_root));
+        let result = run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &review_task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        });
+        unsafe {
+            std::env::remove_var("FLUENT_TEST_REVIEWER_READ_PREFLIGHT");
+            std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        }
+
+        let error = result.expect_err("an unreadable advertised path must stop the reviewer");
+        assert!(
+            error
+                .to_string()
+                .contains("test reviewer read-path preflight failure"),
+            "{error:#}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        let review = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == review_task_id)
+            .unwrap();
+        assert_eq!(review.status, TaskStatus::NeedsUser);
+        assert!(
+            review.started_at.is_none(),
+            "read-path preflight must fail before Task reservation"
+        );
+        assert!(
+            !artifact_dir.exists(),
+            "read-path preflight must not create reviewer artifacts"
+        );
+    }
+
     #[test]
     fn tester_start_rejected_by_peer_terminal_creates_no_settlement_artifacts() {
         // A Tester start that loses the race to a peer pause rejects at the atomic
@@ -14035,6 +14124,9 @@ mod tests {
             "prompt should tell reviewer not to write to candidate"
         );
         assert!(prompts.review_prompt.contains("exact candidate commit"));
+        assert!(prompts.review_prompt.contains(
+            "Open the supplied absolute paths directly; do not discover them by listing parent directories"
+        ));
         let execution_context = artifact_dir.join("execution-context.json");
         assert!(execution_context.is_file());
         assert!(
@@ -15721,7 +15813,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_artifacts_expose_gate_but_not_writer_private_files() {
+    fn reviewer_readable_inputs_include_every_advertised_exact_file() {
         let artifacts = vec![
             PathBuf::from("writer/transcript.jsonl"),
             PathBuf::from("writer/writer-completion.json"),
@@ -15745,26 +15837,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            readable_input_artifacts_only(&artifacts),
-            vec![
-                artifacts[2].clone(),
-                artifacts[3].clone(),
-                artifacts[4].clone(),
-                artifacts[5].clone(),
-                artifacts[6].clone(),
-                artifacts[8].clone(),
-            ]
-        );
-        assert_eq!(
-            input_artifact_readable_roots(&readable_input_artifacts_only(&artifacts)),
-            vec![
-                artifacts[2].clone(),
-                artifacts[3].clone(),
-                artifacts[4].clone(),
-                artifacts[5].clone(),
-                artifacts[6].clone(),
-                artifacts[8].clone(),
-            ],
+            input_artifact_readable_roots(&artifacts),
+            artifacts,
             "sandbox grants remain exact files rather than parent directories"
         );
     }

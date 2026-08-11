@@ -13,6 +13,10 @@ The Writer's workspace and commits:
 - Workspace: {{candidate_workspace_path}}
 - Commits: {{source_branch}}..{{candidate_commit}}
 
+Open the supplied absolute paths directly; do not discover them by listing parent directories.
+Fluent grants the exact candidate workspace and named evidence files, while their parent and
+sibling directories may remain intentionally unreadable.
+
 {{#if evidence_review_context}}
 ## Evidence-targeted review
 
