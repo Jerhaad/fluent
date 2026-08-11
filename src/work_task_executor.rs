@@ -3288,7 +3288,7 @@ fn preflight_write_sandbox_profile(
 
     let home = std::env::var("HOME").unwrap_or_default();
     let common_git_dir = worktree::git_common_dir(project_root)?;
-    let mut readable_roots = input_artifact_readable_roots(prior_reviews);
+    let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
     readable_roots.push(planning_files_dir(project_root, &task.work_item_id));
     readable_roots.push(general_expertise_dir(project_root));
     if let Some(worker) = codex_worker {
@@ -3548,7 +3548,7 @@ fn run_task_coder_with_coder(
         (CoderSandbox::None, None)
     } else {
         let common_git_dir = worktree::git_common_dir(workspace_path)?;
-        let mut readable_roots = input_artifact_readable_roots(prior_reviews);
+        let mut readable_roots = declared_file_readable_roots(prior_reviews, project_root)?;
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
         if let Some(worker) = codex_worker {
@@ -6067,11 +6067,51 @@ fn work_item_inputs_only(item: &WorkItem, project_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn input_artifact_readable_roots(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
-    // Every prompt names the complete artifact path. Grant that exact file, not
-    // its parent directory: a correction may expose one failed command log
-    // without making sibling Tester artifacts readable.
-    input_artifacts.to_vec()
+/// Return exact Seatbelt roots for host-declared files.
+///
+/// Seatbelt resolves a symlink before checking file access, so granting only
+/// the declared link path is insufficient. Add its canonical regular-file
+/// target only while that target remains confined to the canonical project
+/// root; never widen the grant to a containing directory.
+fn declared_file_readable_roots(
+    declared_files: &[PathBuf],
+    approved_workspace: &Path,
+) -> Result<Vec<PathBuf>> {
+    let approved_workspace = fs::canonicalize(approved_workspace).with_context(|| {
+        format!(
+            "resolve approved workspace for declared sandbox inputs: {}",
+            approved_workspace.display()
+        )
+    })?;
+    let mut roots = Vec::new();
+    for declared in declared_files {
+        let resolved = fs::canonicalize(declared)
+            .with_context(|| format!("resolve declared input {}", declared.display()))?;
+        if !fs::metadata(&resolved)
+            .with_context(|| format!("inspect declared input {}", declared.display()))?
+            .is_file()
+        {
+            bail!(
+                "declared input {} is not a regular file",
+                declared.display()
+            );
+        }
+        if !resolved.starts_with(&approved_workspace) {
+            bail!(
+                "declared input {} resolves outside approved workspace {}: {}",
+                declared.display(),
+                approved_workspace.display(),
+                resolved.display()
+            );
+        }
+        if !roots.contains(declared) {
+            roots.push(declared.clone());
+        }
+        if !roots.contains(&resolved) {
+            roots.push(resolved);
+        }
+    }
+    Ok(roots)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6200,7 +6240,7 @@ fn run_review_coder_with_coder(
         (CoderSandbox::None, None)
     } else {
         let mut readable_roots = review_readable_sandbox_roots(project_root, readable_workspaces)?;
-        readable_roots.extend(input_artifact_readable_roots(input_artifacts));
+        readable_roots.extend(declared_file_readable_roots(input_artifacts, project_root)?);
         readable_roots.push(planning_files_dir(project_root, &item.id));
         readable_roots.push(general_expertise_dir(project_root));
         readable_roots.push(review_skills_dir(project_root));
@@ -7091,13 +7131,18 @@ fn review_readable_sandbox_roots(
             roots.push(common_git_dir);
         }
     }
-    roots.extend(project_instruction_readable_root(project_root));
+    roots.extend(project_instruction_readable_roots(project_root)?);
     Ok(roots)
 }
 
-fn project_instruction_readable_root(project_root: &Path) -> Option<PathBuf> {
+fn project_instruction_readable_roots(project_root: &Path) -> Result<Vec<PathBuf>> {
     let instructions = project_root.join("AGENTS.md");
-    instructions.is_file().then_some(instructions)
+    match fs::symlink_metadata(&instructions) {
+        Ok(_) => declared_file_readable_roots(std::slice::from_ref(&instructions), project_root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect project instructions {}", instructions.display())),
+    }
 }
 
 /// Render and probe the Reviewer profile from the read-only start plan.
@@ -7137,7 +7182,7 @@ fn preflight_review_sandbox_profile(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut readable_roots = review_readable_sandbox_roots(project_root, &readable_workspaces)?;
-    readable_roots.extend(input_artifact_readable_roots(input_artifacts));
+    readable_roots.extend(declared_file_readable_roots(input_artifacts, project_root)?);
     readable_roots.push(planning_files_dir(project_root, work_item_id));
     readable_roots.push(general_expertise_dir(project_root));
     readable_roots.push(review_skills_dir(project_root));
@@ -7717,16 +7762,124 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_project_instruction_grant_is_exact_and_optional() {
+    fn reviewer_project_instruction_grant_follows_an_in_project_file_symlink() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(project_instruction_readable_root(root.path()), None);
-        fs::write(root.path().join("AGENTS.md"), "review instructions").unwrap();
+        assert_eq!(
+            project_instruction_readable_roots(root.path()).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        fs::write(root.path().join("CLAUDE.md"), "review instructions").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", root.path().join("AGENTS.md")).unwrap();
         fs::write(root.path().join("private-notes.md"), "not instructions").unwrap();
 
         assert_eq!(
-            project_instruction_readable_root(root.path()),
-            Some(root.path().join("AGENTS.md"))
+            project_instruction_readable_roots(root.path()).unwrap(),
+            vec![
+                root.path().join("AGENTS.md"),
+                fs::canonicalize(root.path().join("CLAUDE.md")).unwrap(),
+            ]
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reviewer_profile_reads_an_in_project_instruction_symlink_but_not_its_sibling() {
+        let host_preflight_override = std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+        unsafe { std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT") };
+        let root = tempfile::tempdir_in("target").unwrap();
+        let artifact_dir = root.path().join("review-artifact");
+        fs::create_dir(&artifact_dir).unwrap();
+        let target = root.path().join("CLAUDE.md");
+        let declared = root.path().join("AGENTS.md");
+        let sibling = root.path().join("private-notes.md");
+        fs::write(&target, "review instructions\n").unwrap();
+        fs::write(&sibling, "private\n").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", &declared).unwrap();
+
+        let readable = project_instruction_readable_roots(root.path()).unwrap();
+        let resolver = ContentResolver::new(None);
+        let profile = os::render_profile_for_access_for_coder(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&artifact_dir),
+            &readable,
+            CoderKind::Codex,
+        )
+        .unwrap();
+
+        if let Err(error) = os::preflight_profile(&profile) {
+            if let Some(value) = host_preflight_override {
+                unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+            }
+            if error.to_string().contains("Operation not permitted") {
+                return;
+            }
+            panic!("reviewer profile preflight failed: {error:#}");
+        }
+
+        os::preflight_readable_paths(&profile, &[declared, target]).unwrap();
+        let error = os::preflight_readable_paths(&profile, std::slice::from_ref(&sibling))
+            .expect_err("an undeclared sibling must remain unreadable");
+        if let Some(value) = host_preflight_override {
+            unsafe { std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", value) };
+        }
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer cannot read declared path"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn declared_file_grant_rejects_a_symlink_outside_its_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("outside.md");
+        fs::write(&outside, "private\n").unwrap();
+        let declared = workspace.join("AGENTS.md");
+        std::os::unix::fs::symlink(&outside, &declared).unwrap();
+
+        let error = declared_file_readable_roots(std::slice::from_ref(&declared), &workspace)
+            .expect_err("a declared input may not grant its out-of-workspace target");
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside approved workspace"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn declared_file_grant_rejects_missing_directory_and_cycle_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = workspace.path().join("missing");
+        let missing_error =
+            declared_file_readable_roots(std::slice::from_ref(&missing), workspace.path())
+                .expect_err("a declared exact-file input must exist");
+        assert!(missing_error.to_string().contains("resolve declared input"));
+
+        let directory = workspace.path().join("directory");
+        fs::create_dir(&directory).unwrap();
+        let directory_error =
+            declared_file_readable_roots(std::slice::from_ref(&directory), workspace.path())
+                .expect_err("a declared exact-file input may not be a directory");
+        assert!(
+            directory_error
+                .to_string()
+                .contains("is not a regular file")
+        );
+
+        let first = workspace.path().join("first");
+        let second = workspace.path().join("second");
+        std::os::unix::fs::symlink("second", &first).unwrap();
+        std::os::unix::fs::symlink("first", &second).unwrap();
+        let cycle_error =
+            declared_file_readable_roots(std::slice::from_ref(&first), workspace.path())
+                .expect_err("a declared exact-file input may not be a symlink cycle");
+        assert!(cycle_error.to_string().contains("resolve declared input"));
     }
 
     #[test]
@@ -15814,17 +15967,25 @@ mod tests {
 
     #[test]
     fn reviewer_readable_inputs_include_every_advertised_exact_file() {
-        let artifacts = vec![
-            PathBuf::from("writer/transcript.jsonl"),
-            PathBuf::from("writer/writer-completion.json"),
-            PathBuf::from("candidate-gates/write-2/candidate-gate.json"),
-            PathBuf::from("review/review.md"),
-            PathBuf::from("tester/tester-results.json"),
-            PathBuf::from("tester/commands/0-stdout.log"),
-            PathBuf::from("tester/commands/0-stderr.log"),
-            PathBuf::from("tester/commands/commands.json"),
-            PathBuf::from("work-1/inputs/0000-user-evidence.jsonl"),
-        ];
+        let workspace = tempfile::tempdir().unwrap();
+        let artifacts = [
+            "writer/transcript.jsonl",
+            "writer/writer-completion.json",
+            "candidate-gates/write-2/candidate-gate.json",
+            "review/review.md",
+            "tester/tester-results.json",
+            "tester/commands/0-stdout.log",
+            "tester/commands/0-stderr.log",
+            "tester/commands/commands.json",
+            "work-1/inputs/0000-user-evidence.jsonl",
+        ]
+        .into_iter()
+        .map(|relative| workspace.path().join(relative))
+        .collect::<Vec<_>>();
+        for artifact in &artifacts {
+            fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+            fs::write(artifact, "evidence\n").unwrap();
+        }
 
         assert_eq!(
             correction_artifacts_only(&artifacts),
@@ -15836,11 +15997,12 @@ mod tests {
                 artifacts[6].clone(),
             ]
         );
-        assert_eq!(
-            input_artifact_readable_roots(&artifacts),
-            artifacts,
-            "sandbox grants remain exact files rather than parent directories"
-        );
+        let roots = declared_file_readable_roots(&artifacts, workspace.path()).unwrap();
+        for artifact in &artifacts {
+            assert!(roots.contains(artifact));
+            assert!(roots.contains(&fs::canonicalize(artifact).unwrap()));
+            assert!(!roots.contains(&artifact.parent().unwrap().to_path_buf()));
+        }
     }
 
     #[test]

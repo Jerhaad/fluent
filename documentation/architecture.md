@@ -1602,7 +1602,12 @@ intentionally exclude writer artifact directories and other reviewers'
 artifact directories to preserve independent verification. They grant each
 exact input file named in the reviewer prompt, including the Writer transcript,
 completion matrix, and progress record. An exact-file grant does not open its
-producer directory or unnamed siblings.
+producer directory or unnamed siblings. Before rendering either a Writer or
+Reviewer profile, Fluent canonicalizes each declared exact-file input. A
+symlink adds only its resolved regular-file target when that target remains
+under the canonical project root. Missing targets, cycles, directories, and
+targets outside the project fail closed; Fluent never substitutes a parent
+directory grant.
 
 ### progress.md
 
@@ -2484,8 +2489,12 @@ hooks, and home access.
 Writers, Learners, and rebase workers run from a candidate worktree, where
 Codex can discover the applicable `AGENTS.md` normally. Reviewers run from a
 writable artifact directory, so their profile adds the project-root
-`AGENTS.md` as one exact read-only file. This does not grant the project root or
-adjacent files.
+`AGENTS.md` as one exact read-only file. When that file is a symlink to an
+in-project regular file such as `CLAUDE.md`, the profile grants both the
+declared path and the exact canonical target so macOS Seatbelt can follow the
+link. The same canonicalization boundary applies to declared Writer and
+Reviewer input artifacts. It rejects targets outside the project and does not
+grant the project root, a parent directory, or adjacent files.
 
 Writer and Reviewer routes preflight before reserving their planned Tasks. An
 authentication failure pauses the existing Attempt for `codex login` recovery,

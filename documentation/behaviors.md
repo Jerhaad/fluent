@@ -1127,6 +1127,23 @@ Test: tests/binary.rs (work_task_run_completes_review_task_with_fail_verdict_art
 Test: src/work_task_executor.rs (reviewer_readable_inputs_include_every_advertised_exact_file)
 Test: tests/binary.rs (reviewer_sandbox_does_not_include_writer_artifact_dir)
 
+### B39a
+
+WHEN a declared Writer or Reviewer exact-file input resolves through a symlink
+to a regular file inside the project root, THE SYSTEM SHALL let the Task read
+the file through its declared path without granting a parent directory or an
+unnamed sibling.
+Test: src/work_task_executor.rs (reviewer_project_instruction_grant_follows_an_in_project_file_symlink)
+Test: src/work_task_executor.rs (reviewer_profile_reads_an_in_project_instruction_symlink_but_not_its_sibling)
+
+### B39b
+
+IF a declared Writer or Reviewer exact-file input is missing, resolves through
+a symlink cycle, resolves to a directory, or resolves outside the project root,
+THEN THE SYSTEM SHALL reject it before Task reservation.
+Test: src/work_task_executor.rs (declared_file_grant_rejects_a_symlink_outside_its_workspace)
+Test: src/work_task_executor.rs (declared_file_grant_rejects_missing_directory_and_cycle_targets)
+
 ### B40
 
 WHEN Fluent launches a Work-model `review` Task,
@@ -8557,8 +8574,9 @@ Test: src/codex_worker.rs (duplicate_configured_skill_names_fail_closed)
 
 WHERE a project-root `AGENTS.md` exists and an autonomous Reviewer runs from
 its artifact directory, THE SYSTEM SHALL grant that exact instruction file as
-read-only input without granting adjacent project files.
-Test: src/work_task_executor.rs (reviewer_project_instruction_grant_is_exact_and_optional)
+read-only input without granting adjacent project files. Behaviors B39a and
+B39b govern a symlinked instruction file.
+Test: src/work_task_executor.rs (reviewer_project_instruction_grant_follows_an_in_project_file_symlink)
 
 ### B16
 
