@@ -22701,7 +22701,7 @@ fn attempt_evidence_run_plans_only_targeted_tests_review() {
         &tmp,
         "focused-evidence-run",
         "tests",
-        "Verdict: fail\nEvidence-Command: printf focused-pass\nEvidence-Working-Directory: .\n",
+        "Verdict: fail\n- Evidence-Command: printf focused-pass\n- Evidence-Working-Directory: .\n",
     );
     let bin = tmp.path().join("bin");
     write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");

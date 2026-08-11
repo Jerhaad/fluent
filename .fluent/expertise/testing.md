@@ -24,9 +24,10 @@ post-run Git state; a helper-only restoration test is insufficient.
 A Tests Reviewer that needs one focused result should first use the project's
 harness-native selector. When its read-only sandbox cannot create the required
 build state, it records one `Evidence-Command` and one candidate-relative
-`Evidence-Working-Directory` instead of asking a Writer to change unrelated
-source. Keep the command to one direct harness invocation and place explicit
-build/cache arguments under `$FLUENT_EVIDENCE_SCRATCH`.
+`Evidence-Working-Directory` as plain lines or Markdown list entries instead of
+asking a Writer to change unrelated source. Keep the command to one direct
+harness invocation and place explicit build/cache arguments under
+`$FLUENT_EVIDENCE_SCRATCH`.
 
 `fluent attempt evidence run` is the human authorization boundary for that
 model-proposed command. The host creates private scratch before applying the

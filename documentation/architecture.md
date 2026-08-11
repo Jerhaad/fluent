@@ -746,8 +746,9 @@ write Task. Uncertain verdicts without failures mark the Attempt
 
 When one missing focused result prevents a Tests Reviewer from deciding, the
 review may emit one `Evidence-Command` and one candidate-relative
-`Evidence-Working-Directory`. Fluent pauses before planning another Writer and
-reports this explicit recovery action:
+`Evidence-Working-Directory`, either as plain lines or Markdown list entries.
+Fluent pauses before planning another Writer and reports this explicit recovery
+action:
 
 ```sh
 fluent attempt evidence run <work-item> <attempt> \

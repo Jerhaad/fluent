@@ -335,6 +335,8 @@ pub fn extract_focused_evidence_request(content: &str) -> Option<FocusedEvidence
         content
             .lines()
             .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
                 let (actual, value) = line.split_once(':')?;
                 actual
                     .trim()
@@ -504,6 +506,12 @@ mod tests {
             )
             .is_none()
         );
+        let bulleted = extract_focused_evidence_request(
+            "Verdict: fail\n- Evidence-Command: cargo test exact_case\n- Evidence-Working-Directory: crate\n",
+        )
+        .unwrap();
+        assert_eq!(bulleted.command, "cargo test exact_case");
+        assert_eq!(bulleted.working_directory, "crate");
     }
 
     #[test]
