@@ -757,13 +757,15 @@ fluent attempt evidence run <work-item> <attempt> \
 The operator invocation authorizes that exact model-proposed command. Fluent
 accepts one direct, single-line harness invocation, binds it to the latest
 failed Tests Review and unchanged Writer commit, and runs it under a host-owned
-Seatbelt profile. Candidate source is read-only. `HOME`, `TMPDIR`, Cargo, Clang,
-and Swift build/cache paths point into an already-created private run directory
-available as `$FLUENT_EVIDENCE_SCRATCH`; the profile may read installed user
-toolchains but explicitly denies Claude, Codex, and agent session trees. The
-child environment is rebuilt from a small toolchain allowlist, so provider
-credentials and enclosing-agent variables do not reach the check. Each
-run owns a process group and a
+Seatbelt profile. Candidate source is read-only. `HOME`, Core Foundation's
+fixed user home, `TMPDIR`, Cargo, Clang, and Swift build/cache paths point into
+an already-created private run directory available as
+`$FLUENT_EVIDENCE_SCRATCH`; this keeps Foundation-backed macOS caches private
+even when a tool resolves the account home without reading `HOME`. The profile
+may read installed user toolchains but explicitly denies Claude, Codex, and
+agent session trees. The child environment is rebuilt from a small toolchain
+allowlist, so provider credentials and enclosing-agent variables do not reach
+the check. Each run owns a process group and a
 bounded deadline; timeout advances only after Fluent confirms cleanup. Fluent
 captures stdout and stderr, writes one schema-version-1 evidence document with
 exclusive creation, and passes that document to the ordinary attachment path.

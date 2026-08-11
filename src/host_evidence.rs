@@ -395,6 +395,9 @@ fn execute_focused_command(
         .current_dir(working_directory)
         .env_clear()
         .env("HOME", &home)
+        // Foundation-backed tools can resolve the account home without HOME.
+        // Keep their user caches in the same private tree as shell-native tools.
+        .env("CFFIXED_USER_HOME", &home)
         .env("TMPDIR", &temporary)
         .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
         .env("CARGO_TARGET_DIR", scratch.join("cargo-target"))

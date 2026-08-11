@@ -31,10 +31,11 @@ build/cache arguments under `$FLUENT_EVIDENCE_SCRATCH`.
 `fluent attempt evidence run` is the human authorization boundary for that
 model-proposed command. The host creates private scratch before applying the
 sandbox, keeps candidate source read-only, removes provider credentials from the
-child environment, captures the exact result, and uses the existing
-candidate-bound evidence attachment to rerun only the Tests Reviewer. Do not
-execute these requests implicitly from the scheduler, and do not turn them into
-named project-specific subset registries.
+child environment, redirects both shell and Core Foundation user-home caches,
+captures the exact result, and uses the existing candidate-bound evidence
+attachment to rerun only the Tests Reviewer. Do not execute these requests
+implicitly from the scheduler, and do not turn them into named project-specific
+subset registries.
 
 ## Where failure logs live
 

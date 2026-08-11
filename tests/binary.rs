@@ -22853,6 +22853,12 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
             .unwrap()
             .contains("FLUENT_EVIDENCE_SCRATCH=")
     );
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("CFFIXED_USER_HOME=")
+    );
     assert_eq!(git_head(&project), candidate);
     assert!(
         git::run_stdout(&project, &["status", "--porcelain"], "inspect candidate")
