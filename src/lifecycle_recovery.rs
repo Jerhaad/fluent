@@ -1,4 +1,4 @@
-//! Read-only recognition of narrowly supported lifecycle migrations.
+//! Read-only recognition of narrowly supported lifecycle recovery frontiers.
 //!
 //! Queue admission and Attempt execution share these predicates so an explicit
 //! resume cannot authorize a broader state than execution knows how to repair.
@@ -10,10 +10,143 @@ use std::path::{Path, PathBuf};
 
 use crate::work_model::{
     Attempt, AttemptReviewState, AttemptStatus, LearningFailureKind, MergeCandidateMergeStatus,
-    MergeReviewState, TaskKind, TaskStatus, WorkItem,
+    MergeReviewState, TaskKind, TaskStatus, WorkItem, resolve_managed_sibling_workspace_path,
 };
 
 const LEGACY_LEARNER_GATE_SCHEMA_VERSION: u32 = 2;
+
+/// The immutable frontier that authorizes a targeted uncertain-review retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UncertainReviewRecovery {
+    pub writer_task_id: String,
+    pub candidate_commit: String,
+    pub latest_review_task_ids: Vec<String>,
+    pub uncertain_roles: Vec<String>,
+}
+
+/// Verify that an uncertain review pause still points at one clean candidate and
+/// readable latest verdicts. Callers may reopen only the returned roles.
+pub(crate) fn inspect_uncertain_review_recovery(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> Result<UncertainReviewRecovery> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    attempt.ensure_resume_ready()?;
+    if !attempt.is_uncertain_review_pause() {
+        anyhow::bail!("Attempt {attempt_id:?} is not paused on uncertain reviews");
+    }
+    if item
+        .merge_candidates
+        .iter()
+        .any(|candidate| candidate.attempt_id == attempt_id)
+    {
+        anyhow::bail!("uncertain-review recovery cannot reopen an existing Merge Candidate");
+    }
+
+    let write_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("uncertain-review pause has no completed Writer Task"))?;
+    let writer = &attempt.tasks[write_index];
+    let output = writer
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("uncertain-review Writer has no candidate output"))?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "uncertain-review candidate workspace",
+    )?;
+    let head = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "resolve uncertain-review candidate HEAD",
+    )?;
+    if head != output.commit {
+        anyhow::bail!(
+            "uncertain-review candidate HEAD no longer matches {}",
+            output.commit
+        );
+    }
+    let status = crate::git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
+        "check uncertain-review candidate cleanliness",
+    )?;
+    if !status.is_empty() {
+        anyhow::bail!("uncertain-review candidate workspace is dirty");
+    }
+
+    let mut latest: Vec<(String, &crate::work_model::Task)> = Vec::new();
+    for task in attempt.tasks[write_index + 1..].iter().filter(|task| {
+        task.kind == TaskKind::Review
+            && task.status == TaskStatus::Complete
+            && crate::review::REVIEWERS.contains(&task.role.as_str())
+    }) {
+        if let Some((_, prior)) = latest.iter_mut().find(|(role, _)| role == &task.role) {
+            *prior = task;
+        } else {
+            latest.push((task.role.clone(), task));
+        }
+    }
+    if latest.is_empty() {
+        anyhow::bail!("uncertain-review pause has no completed reviewer evidence");
+    }
+
+    let mut latest_review_task_ids = Vec::new();
+    let mut uncertain_roles = Vec::new();
+    for (role, task) in latest {
+        let context = task
+            .review_context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("review Task {:?} has no candidate context", task.id))?;
+        if context.candidate_commit != output.commit
+            || context.candidate_workspace_id != output.workspace_id
+            || context.candidate_workspace_path != output.workspace_path
+            || context.source_branch != output.source_branch
+        {
+            anyhow::bail!(
+                "review Task {:?} does not match the current candidate",
+                task.id
+            );
+        }
+        let area = task
+            .artifact_area
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("review Task {:?} has no artifact area", task.id))?;
+        let artifact_dir = crate::work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &area.path,
+        )?;
+        let review_path = artifact_dir.join("review.md");
+        let content = fs::read_to_string(&review_path)
+            .with_context(|| format!("read review evidence {}", review_path.display()))?;
+        match crate::review::extract_verdict(&content) {
+            crate::review::Verdict::Pass => {}
+            crate::review::Verdict::Uncertain => uncertain_roles.push(role),
+            crate::review::Verdict::Fail => {
+                anyhow::bail!("review Task {:?} now reports fail, not uncertain", task.id)
+            }
+        }
+        latest_review_task_ids.push(task.id.clone());
+    }
+    if uncertain_roles.is_empty() {
+        anyhow::bail!("uncertain-review pause has no uncertain latest verdict");
+    }
+
+    Ok(UncertainReviewRecovery {
+        writer_task_id: writer.id.clone(),
+        candidate_commit: output.commit.clone(),
+        latest_review_task_ids,
+        uncertain_roles,
+    })
+}
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
     let start = attempt

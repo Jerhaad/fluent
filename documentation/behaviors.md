@@ -4125,12 +4125,46 @@ Test: src/claude_auth.rs (auth_handoff_names_attempt_run_recovery)
 ### B6
 
 WHEN `fluent attempt run` is invoked on an Attempt suspended with a
-pause kind whose resume is not implemented (`uncertain`, or a `round-cap`
-Attempt that does not match the legacy provider migration below),
+pause kind whose resume is not implemented (for example, a `round-cap`
+Attempt without an approved extension or legacy provider migration),
 THE SYSTEM SHALL report that the pause needs its specific input and
-that resuming it is not yet supported, rather than the generic
-"cannot advance" error — and leave the Attempt suspended.
+leave the Attempt suspended.
 Test: src/work_attempt_loop.rs (resume_unimplemented_kind_reports_clearly_and_leaves_suspended)
+
+### B6a
+
+WHEN `fluent attempt run` resumes an Attempt paused by uncertain reviewer
+verdicts, and every Task is complete, the latest reviewer evidence matches the
+unchanged clean Writer candidate, and no latest verdict is `fail`,
+THE SYSTEM SHALL add a new review round containing only the reviewer roles whose
+latest verdict is uncertain, preserve completed passing reviews, clear the
+pause, and continue the same Attempt.
+Test: src/work_model.rs (completed_uncertain_review_pause_is_resumable_but_active_work_is_not)
+Test: src/work_attempt_loop.rs (uncertain_review_resume_reopens_only_uncertain_roles)
+Test: src/work_attempt_loop.rs (retried_uncertain_role_combines_with_preserved_passes)
+
+### B6b
+
+IF the candidate HEAD changed, the candidate is dirty, reviewer evidence is
+missing or does not match the Writer candidate, any latest verdict is `fail`, or
+a Task is incomplete,
+THEN THE SYSTEM SHALL reject uncertain-review recovery without changing the
+Work Item.
+Test: src/work_attempt_loop.rs (uncertain_review_resume_rejects_missing_evidence_without_mutation)
+Test: src/work_attempt_loop.rs (uncertain_review_resume_rejects_dirty_candidate_without_mutation)
+Test: src/work_attempt_loop.rs (uncertain_review_resume_rejects_moved_candidate_without_mutation)
+Test: src/work_attempt_loop.rs (uncertain_review_resume_rejects_stale_review_context_without_mutation)
+Test: src/work_attempt_loop.rs (uncertain_review_resume_rejects_a_latest_failed_verdict_without_mutation)
+Test: src/work_model.rs (completed_uncertain_review_pause_is_resumable_but_active_work_is_not)
+
+### B6c
+
+WHEN `fluent queue resume <work-item-id> --attempt <attempt-id>` names an
+uncertain-review pause that satisfies B6a,
+THE SYSTEM SHALL apply the same recovery checks before queueing a resume bound
+to that exact Attempt.
+Test: src/queue.rs (resume_queues_a_valid_uncertain_review_recovery)
+Test: tests/binary.rs (queue_resume_accepts_verified_uncertain_review_pause)
 
 ## Legacy provider-pause recovery
 

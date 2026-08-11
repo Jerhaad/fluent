@@ -696,7 +696,16 @@ same-invocation follow-up write Task, the Attempt loop marks the Attempt
 and says the auto-continue budget was exhausted, and stops without
 creating the over-budget Task. When no review artifact fails, uncertain
 or missing verdicts mark the Attempt `needs-user` with a handoff under
-`.fluent/work/artifacts/<work-item-id>/<attempt-id>/`.
+`.fluent/work/artifacts/<work-item-id>/<attempt-id>/`. An explicit direct or
+queued resume reopens only the roles whose latest verdict remains uncertain.
+`lifecycle_recovery` verifies that every Task has settled, each latest review
+artifact is readable and bound to the latest Writer commit, the candidate
+worktree is clean at that commit, no latest verdict is `fail`, and no Merge
+Candidate exists. The Attempt loop repeats the same inspection inside the Work
+Item mutation, appends the targeted review round, and clears the pause. Passing
+roles remain complete and continue to count when the targeted roles finish.
+Changed or dirty candidates, missing evidence, active Tasks, and stale review
+contexts fail without a model write.
 For review-only Attempts, all pass marks the Attempt complete with review
 state `passed` and does not create a Merge Candidate. Any fail marks the
 Attempt failed with review state `failed` and does not create a follow-up
@@ -2955,6 +2964,11 @@ needs-user dispatch exists. Repeating the command while that same resume is
 active is idempotent; a later needs-user outcome requires a new explicit
 authorization. Mismatched Attempts, unsupported pause kinds, unrelated active
 dispatches, and contradictory terminal history fail without queue mutation.
+For an uncertain-review pause, queue admission calls the same read-only
+`lifecycle_recovery` inspection as foreground execution before it appends the
+resume dispatch. The scheduler later launches the bound Attempt through the
+ordinary Attempt loop, which revalidates the frontier before reopening only the
+uncertain roles.
 Legacy dispatches omit the new fields and deserialize as ordinary run intent.
 
 For the narrow Xcode/SwiftPM recovery, the same command accepts `--no-sandbox`

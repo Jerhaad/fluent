@@ -3850,8 +3850,33 @@ impl Attempt {
             | Some(PauseKind::CandidateGate) => Ok(()),
             Some(PauseKind::Uncertain) if self.is_legacy_candidate_gate_pause() => Ok(()),
             Some(PauseKind::Uncertain) if self.is_legacy_writer_completion_pause() => Ok(()),
+            Some(PauseKind::Uncertain) if self.is_uncertain_review_pause() => {
+                let completed_writer = self.tasks.iter().rposition(|task| {
+                    task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Complete
+                        && task.output.is_some()
+                });
+                let has_completed_review = completed_writer.is_some_and(|write_index| {
+                    self.tasks[write_index + 1..].iter().any(|task| {
+                        task.kind == TaskKind::Review && task.status == TaskStatus::Complete
+                    })
+                });
+                if self
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == TaskStatus::Complete)
+                    && has_completed_review
+                {
+                    Ok(())
+                } else {
+                    Err(ineligible(
+                        "Attempt does not have a settled Writer and reviewer frontier for uncertain-review recovery."
+                            .to_string(),
+                    ))
+                }
+            }
             Some(PauseKind::Uncertain) => Err(ineligible(
-                "Attempt is paused with uncertain reviews. Resolve the uncertain verdicts and re-run; resuming this pause kind is not yet supported."
+                "Attempt has an unsupported uncertain pause shape; resuming it is not yet supported."
                     .to_string(),
             )),
             Some(PauseKind::RoundCap) => {
@@ -3890,6 +3915,12 @@ impl Attempt {
                 artifact.producer_id == "required-progress"
                     && artifact.path.ends_with("/writer-completion-needs-user.md")
             })
+    }
+
+    pub(crate) fn is_uncertain_review_pause(&self) -> bool {
+        self.status == AttemptStatus::NeedsUser
+            && self.pause_kind == Some(PauseKind::Uncertain)
+            && self.review_state == Some(AttemptReviewState::Uncertain)
     }
 
     pub(crate) fn is_candidate_gate_pause(&self) -> bool {
@@ -13316,6 +13347,35 @@ random banner prose that must be ignored
 
         attempt.review_state = Some(AttemptReviewState::Uncertain);
         assert!(!attempt.is_candidate_gate_pause());
+        assert!(attempt.ensure_resume_ready().is_err());
+    }
+
+    #[test]
+    fn completed_uncertain_review_pause_is_resumable_but_active_work_is_not() {
+        let mut tasks = vec![Task {
+            work_item_id: "work-1".to_string(),
+            ..completed_write_task("attempt-1-write-1", "initial")
+        }];
+        for role in crate::review::REVIEWERS {
+            tasks.push(frozen_context_task(
+                &format!("attempt-1-review-1-{role}"),
+                TaskKind::Review,
+                role,
+            ));
+        }
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::Uncertain),
+            review_state: Some(AttemptReviewState::Uncertain),
+            tasks,
+            ..Attempt::default()
+        };
+
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.tasks.last_mut().unwrap().status = TaskStatus::Executing;
         assert!(attempt.ensure_resume_ready().is_err());
     }
 

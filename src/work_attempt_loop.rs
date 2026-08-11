@@ -332,6 +332,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
         let candidate_gate_pause = attempt.is_candidate_gate_pause();
+        let uncertain_review_pause = attempt.is_uncertain_review_pause();
 
         // Earlier versions recorded an exhausted provider outage as a RoundCap.
         // Recover only the narrow, durable review-only shape before the normal
@@ -365,6 +366,13 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                     )?;
                 } else if attempt.pause_kind == Some(PauseKind::RoundCap) {
                     reopen_approved_round_cap_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
+                } else if uncertain_review_pause {
+                    reopen_uncertain_review_attempt(
                         config.project_root,
                         config.store,
                         config.work_item_id,
@@ -1062,6 +1070,59 @@ fn reopen_resumable_attempt(
         Ok(())
     })?;
     Ok(())
+}
+
+/// Reopen only the latest reviewer roles whose durable verdict is uncertain.
+/// Passing roles remain complete and continue to count at the unchanged
+/// candidate frontier.
+fn reopen_uncertain_review_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<Vec<String>> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    let item = read_work_item_or_not_found(store, work_item_id)?;
+    let expected = crate::lifecycle_recovery::inspect_uncertain_review_recovery(
+        project_root,
+        &item,
+        attempt_id,
+    )?;
+
+    let task_ids = store.mutate_work_item(work_item_id, |fresh| {
+        let current = crate::lifecycle_recovery::inspect_uncertain_review_recovery(
+            project_root,
+            fresh,
+            attempt_id,
+        )
+        .map_err(|error| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("uncertain-review frontier cannot be recovered: {error:#}"),
+        })?;
+        if current != expected {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "the uncertain-review frontier changed before recovery".to_string(),
+            });
+        }
+        let roles = current
+            .uncertain_roles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let task_ids = fresh.add_next_review_tasks(attempt_id, &roles)?;
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        attempt.pause_kind = None;
+        attempt.completed_at = None;
+        Ok(task_ids)
+    })?;
+    Ok(task_ids)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12829,6 +12890,253 @@ mod tests {
         });
         store.create_work_item(&item).unwrap();
         (store, workspace)
+    }
+
+    fn make_uncertain_review_pause_fixture(
+        project_root: &Path,
+    ) -> (WorkModelStore, tempfile::TempDir) {
+        let (store, workspace) =
+            make_candidate_gate_fixture(project_root, "pub fn value() {}\n", None);
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                for role in crate::review::REVIEWERS {
+                    let id = format!("attempt-1-review-{role}");
+                    let artifact_path = work_artifact_path("work-1", "attempt-1", &id);
+                    let mut task = review_task_with_artifact(&id, role, &artifact_path);
+                    task.workspace_access.reads[0].path = output.workspace_path.clone();
+                    let context = task.review_context.as_mut().unwrap();
+                    context.candidate_workspace_path = output.workspace_path.clone();
+                    context.candidate_commit = output.commit.clone();
+                    context.source_branch = output.source_branch.clone();
+                    item.attempts[0].tasks.push(task);
+                }
+                item.attempts[0].review_state = Some(AttemptReviewState::Uncertain);
+                crate::work_model::suspend_attempt(&mut item.attempts[0], PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        for task in item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let directory = project_root.join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&directory).unwrap();
+            let verdict = if task.role == "skills" {
+                "UNCERTAIN"
+            } else {
+                "PASS"
+            };
+            fs::write(directory.join("review.md"), format!("Verdict: {verdict}\n")).unwrap();
+        }
+        (store, workspace)
+    }
+
+    #[test]
+    fn uncertain_review_resume_reopens_only_uncertain_roles() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+
+        let task_ids =
+            reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1").unwrap();
+
+        assert_eq!(task_ids, vec!["attempt-1-review-2-skills"]);
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.review_state, Some(AttemptReviewState::NotReviewed));
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.completed_at, None);
+        assert!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role != "skills"
+                        && task.status == TaskStatus::Complete
+                })
+                .count()
+                == crate::review::REVIEWERS.len() - 1
+        );
+        let retry = attempt.tasks.last().unwrap();
+        assert_eq!(retry.role, "skills");
+        assert_eq!(retry.status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn retried_uncertain_role_combines_with_preserved_passes() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let task_id =
+            reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+                .unwrap()
+                .pop()
+                .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        let retry = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let directory = project
+            .path()
+            .join(&retry.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("review.md"), "Verdict: PASS\n").unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFinalTester { .. }
+        ));
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_missing_evidence_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        let skills = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.role == "skills")
+            .unwrap();
+        fs::remove_file(
+            project
+                .path()
+                .join(&skills.artifact_area.as_ref().unwrap().path)
+                .join("review.md"),
+        )
+        .unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("read review evidence"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_dirty_candidate_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        fs::write(workspace.path().join("untracked.txt"), "dirty\n").unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("workspace is dirty"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_moved_candidate_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_uncertain_review_pause_fixture(project.path());
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn value() { 1 }\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/lib.rs"],
+            "stage moved candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Move candidate"],
+            "commit moved candidate",
+        )
+        .unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("HEAD no longer matches"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_stale_review_context_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.role == "skills")
+                    .unwrap()
+                    .review_context
+                    .as_mut()
+                    .unwrap()
+                    .candidate_commit = "stale-review-commit".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the current candidate")
+        );
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn uncertain_review_resume_rejects_a_latest_failed_verdict_without_mutation() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) = make_uncertain_review_pause_fixture(project.path());
+        let stored = store.read_work_item("work-1").unwrap();
+        let tests = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.role == "tests")
+            .unwrap();
+        let path = project
+            .path()
+            .join(&tests.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        fs::write(path, "Verdict: FAIL\n").unwrap();
+        let before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+
+        let error = reopen_uncertain_review_attempt(project.path(), &store, "work-1", "attempt-1")
+            .unwrap_err();
+        assert!(error.to_string().contains("now reports fail"));
+        let after = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        assert_eq!(after, before);
     }
 
     #[test]

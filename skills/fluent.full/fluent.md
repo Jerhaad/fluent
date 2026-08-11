@@ -232,7 +232,13 @@ The round outcome determines what happens next:
   Attempt records `needs-user`; restore the host-owned rows before resuming.
 - A provider exhausts its retries before the model produces tokens or uses tools — Attempt records `needs-user` as `provider-unavailable`.
 
-The user provides input; `fluent attempt run` resumes the loop where it left off.
+When an uncertain review came from an external problem and the candidate does
+not need to change, repair that problem and run `fluent attempt run`. Fluent
+first verifies the unchanged clean candidate and the latest review evidence,
+then reruns only the uncertain reviewer roles while preserving passing reviews.
+For scheduler-owned Work, use the exact `fluent queue resume <work-item-id>
+--attempt <attempt-id>` command reported by status; queue admission applies the
+same checks before binding the existing Attempt.
 When the pause is `provider-unavailable`, wait for provider capacity, then run
 `fluent attempt run <work-item-id> [attempt-id]` without new input. For a hung or
 interrupted local coder, run `fluent attempt cancel <work-item-id> <attempt-id>`;

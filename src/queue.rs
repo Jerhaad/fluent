@@ -745,6 +745,13 @@ fn ensure_resume_eligible(
         )?
     {
         attempt.ensure_resume_ready()?;
+        if attempt.is_uncertain_review_pause() {
+            crate::lifecycle_recovery::inspect_uncertain_review_recovery(
+                project_root,
+                item,
+                attempt_id,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1039,7 +1046,9 @@ fn with_matching_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::work_model::{ArtifactRef, AttemptReviewState, PauseKind, TaskOutput, TaskStatus};
+    use crate::work_model::{
+        ArtifactRef, AttemptReviewState, PauseKind, TaskKind, TaskOutput, TaskStatus,
+    };
 
     fn setup_project(tmp: &Path) {
         fs::create_dir_all(tmp.join(".fluent/work/items")).unwrap();
@@ -1106,6 +1115,95 @@ mod tests {
     fn write_tester_suspension(tmp: &Path, id: &str, attempt_id: &str) {
         write_scheduler_suspension(tmp, id, attempt_id);
         suspend_attempt(tmp, id, attempt_id, PauseKind::TesterHarness);
+    }
+
+    fn write_uncertain_review_suspension(tmp: &Path, id: &str, attempt_id: &str) {
+        crate::git::run(tmp, &["init", "-q"], "initialize queue recovery project").unwrap();
+        crate::git::run(
+            tmp,
+            &["config", "user.name", "Test Author"],
+            "configure author",
+        )
+        .unwrap();
+        crate::git::run(
+            tmp,
+            &["config", "user.email", "test@example.com"],
+            "configure email",
+        )
+        .unwrap();
+        fs::write(tmp.join("README.md"), "base\n").unwrap();
+        crate::git::run(tmp, &["add", "README.md"], "stage base").unwrap();
+        crate::git::run(tmp, &["commit", "-q", "-m", "Create base"], "commit base").unwrap();
+        let workspace_path = crate::work_model::initial_candidate_workspace_path(id, attempt_id);
+        let workspace = tmp.parent().unwrap().join(
+            Path::new(&workspace_path)
+                .file_name()
+                .expect("candidate workspace name"),
+        );
+        crate::git::run(
+            tmp,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/attempt-1",
+                workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create candidate worktree",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "candidate").unwrap();
+
+        write_scheduler_suspension(tmp, id, attempt_id);
+        let store = WorkModelStore::new(tmp);
+        store
+            .mutate_work_item(id, |item| {
+                let writer = &mut item.attempts[0].tasks[0];
+                writer.status = TaskStatus::Complete;
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: workspace_path.clone(),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: None,
+                    commit: candidate.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                item.add_review_tasks(attempt_id, crate::review::REVIEWERS)?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item(id, |item| {
+                let attempt = &mut item.attempts[0];
+                for task in &mut attempt.tasks {
+                    if task.kind == TaskKind::Review {
+                        task.status = TaskStatus::Complete;
+                    }
+                }
+                attempt.review_state = Some(AttemptReviewState::Uncertain);
+                crate::work_model::suspend_attempt(attempt, PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+        let item = store.read_work_item(id).unwrap();
+        for task in item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let directory = tmp.join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&directory).unwrap();
+            let verdict = if task.role == "skills" {
+                "UNCERTAIN"
+            } else {
+                "PASS"
+            };
+            fs::write(directory.join("review.md"), format!("Verdict: {verdict}\n")).unwrap();
+        }
     }
 
     /// Overwrite a ledger directly so a test can start from an arbitrary
@@ -1304,6 +1402,29 @@ mod tests {
             .unwrap();
         assert!(resume(dir.path(), "wi-1", "attempt-1", None).is_err());
         assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_queues_a_valid_uncertain_review_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        write_uncertain_review_suspension(&project, "wi-1", "attempt-1");
+
+        assert_eq!(
+            resume(&project, "wi-1", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(&project, "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(
+            ledger.active().unwrap().bound_attempt_id.as_deref(),
+            Some("attempt-1")
+        );
+        assert_eq!(
+            ledger.active().unwrap().intent,
+            DispatchIntent::ResumeAttempt
+        );
     }
 
     #[test]

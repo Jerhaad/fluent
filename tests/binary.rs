@@ -21098,6 +21098,110 @@ fn queue_resume_records_exact_authorization_and_is_idempotent() {
 }
 
 #[test]
+fn queue_resume_accepts_verified_uncertain_review_pause() {
+    use fluent::queue::{self, DispatchStatus};
+    use fluent::work_model::{
+        AttemptReviewState, PauseKind, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelStore,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let store = WorkModelStore::new(&main_dir);
+    let mut item = WorkItem::planned("wi-uncertain", "Retry uncertain reviewer");
+    item.add_initial_attempt("attempt-1").unwrap();
+    store.create_work_item(&item).unwrap();
+    queue::add(&main_dir, "wi-uncertain", None).unwrap();
+    queue::claim(&main_dir, "wi-uncertain", "attempt-1")
+        .unwrap()
+        .unwrap();
+
+    let workspace_path =
+        fluent::work_model::initial_candidate_workspace_path("wi-uncertain", "attempt-1");
+    let workspace = main_dir
+        .parent()
+        .unwrap()
+        .join(Path::new(&workspace_path).file_name().unwrap());
+    git::run(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work/uncertain-review",
+            workspace.to_str().unwrap(),
+            "HEAD",
+        ],
+        "create uncertain-review candidate",
+    )
+    .unwrap();
+    let candidate = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "candidate").unwrap();
+    store
+        .mutate_work_item("wi-uncertain", |item| {
+            let writer = &mut item.attempts[0].tasks[0];
+            writer.status = TaskStatus::Complete;
+            writer.output = Some(TaskOutput {
+                workspace_id: "candidate".to_string(),
+                workspace_path: workspace_path.clone(),
+                source_branch: "work/uncertain-review".to_string(),
+                base_commit: None,
+                commit: candidate.clone(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            item.add_review_tasks("attempt-1", fluent::review::REVIEWERS)?;
+            Ok(())
+        })
+        .unwrap();
+    store
+        .mutate_work_item("wi-uncertain", |item| {
+            let attempt = &mut item.attempts[0];
+            for task in &mut attempt.tasks {
+                if task.kind == TaskKind::Review {
+                    task.status = TaskStatus::Complete;
+                }
+            }
+            attempt.review_state = Some(AttemptReviewState::Uncertain);
+            fluent::work_model::suspend_attempt(attempt, PauseKind::Uncertain);
+            Ok(())
+        })
+        .unwrap();
+    let stored = store.read_work_item("wi-uncertain").unwrap();
+    for task in stored.attempts[0]
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Review)
+    {
+        let directory = main_dir.join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&directory).unwrap();
+        let verdict = if task.role == "skills" {
+            "UNCERTAIN"
+        } else {
+            "PASS"
+        };
+        fs::write(directory.join("review.md"), format!("Verdict: {verdict}\n")).unwrap();
+    }
+    queue::reconcile_active(&main_dir, "wi-uncertain", DispatchStatus::NeedsUser).unwrap();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "resume", "wi-uncertain", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Queued resume of Attempt attempt-1 for Work Item wi-uncertain",
+        ));
+    let ledger = queue::read_ledger(&main_dir, "wi-uncertain")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.dispatches.len(), 2);
+    assert_eq!(
+        ledger.active().unwrap().bound_attempt_id.as_deref(),
+        Some("attempt-1")
+    );
+}
+
+#[test]
 fn queue_resume_requires_exact_legacy_learner_evidence() {
     use fluent::candidate_gate::{
         CANDIDATE_GATE_FILE, CandidateCheckEvidence, CandidateCheckStatus,
