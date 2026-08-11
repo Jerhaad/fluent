@@ -27878,6 +27878,7 @@ fn scheduler_service_installation_is_current_user_scoped() {
 fn attempt_extend_binds_candidate_and_failed_review_bytes() {
     use fluent::work_model::{
         AttemptReviewState, AttemptStatus, PauseKind, TaskKind, TaskOutput, TaskStatus,
+        set_task_terminal,
     };
 
     let tmp = TempDir::new().unwrap();
@@ -27906,7 +27907,7 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
     .unwrap();
     let store = WorkModelStore::new(&main_dir);
     let mut item = store.read_work_item("work-1").unwrap();
-    item.attempts[0].tasks[0].status = TaskStatus::Complete;
+    set_task_terminal(&mut item.attempts[0].tasks[0], TaskStatus::Complete);
     item.attempts[0].tasks[0].output = Some(TaskOutput {
         workspace_id: "candidate".to_string(),
         workspace_path: workspace_rel,
@@ -27979,4 +27980,127 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
         .stderr(predicate::str::contains(
             "failed-correction bytes no longer match the approval",
         ));
+}
+
+#[test]
+#[serial]
+fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, PauseKind, TaskKind, TaskOutput, TaskStatus,
+        set_task_terminal,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Tester round cap",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let workspace_rel = fluent::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+    let workspace = main_dir
+        .parent()
+        .unwrap()
+        .join(workspace_rel.trim_start_matches("../"));
+    git::run(
+        &main_dir,
+        &["worktree", "add", workspace.to_str().unwrap()],
+        "create candidate workspace",
+    )
+    .unwrap();
+    let candidate = git_head(&workspace);
+    let store = WorkModelStore::new(&main_dir);
+    let mut item = store.read_work_item("work-1").unwrap();
+    set_task_terminal(&mut item.attempts[0].tasks[0], TaskStatus::Complete);
+    item.attempts[0].tasks[0].output = Some(TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: workspace_rel,
+        source_branch: "main".to_string(),
+        base_commit: None,
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+    let tester = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == tester_id && task.kind == TaskKind::Tester)
+        .unwrap();
+    set_task_terminal(tester, TaskStatus::Complete);
+    let tester_area = tester.artifact_area.as_ref().unwrap().path.clone();
+    let tester_dir = main_dir.join(&tester_area);
+    fs::create_dir_all(tester_dir.join("commands")).unwrap();
+    fs::write(tester_dir.join("commands/0-stdout.log"), "suite output\n").unwrap();
+    fs::write(tester_dir.join("commands/0-stderr.log"), "suite failed\n").unwrap();
+    fs::write(
+        tester_dir.join("tester-results.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "make test",
+                "test_harness": "shell-harness",
+                "exit_code": 2,
+                "duration_ms": 10,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [{
+                "id": "suite/failure",
+                "test_harness": "shell-harness",
+                "status": "fail",
+                "duration_ms": 1,
+                "failure_excerpt": "assertion failed"
+            }],
+            "summary": {"total": 1, "pass": 0, "fail": 1, "skipped": 0},
+            "error": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    item.attempts[0].status = AttemptStatus::NeedsUser;
+    item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+    item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+    store.write_work_item(&item).unwrap();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cap 1 -> 2"));
+
+    let stored = store.read_work_item("work-1").unwrap();
+    let extension = &stored.attempts[0].round_cap_extensions[0];
+    assert_eq!(extension.failed_reviews.len(), 3);
+    assert!(
+        extension
+            .failed_reviews
+            .iter()
+            .any(|artifact| artifact.artifact.path.ends_with("/tester-results.json"))
+    );
+    assert!(extension.failed_reviews.iter().all(|artifact| {
+        !artifact.artifact.path.ends_with("/candidate-gate.json")
+            && artifact.digest.starts_with("sha256:")
+    }));
 }

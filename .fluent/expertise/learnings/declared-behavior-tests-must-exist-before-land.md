@@ -34,6 +34,14 @@ fresh no-change declaration to bind every attached gate, structured result, and
 command log by exact path and SHA-256 digest. Validate that set before launching
 reviewers, and direct the Writer to inspect candidate-owned `.fluent/tester.yaml`
 path and cache choices rather than assuming every sandbox failure is external.
+When a final Tester failure stops before the candidate gate, a round-cap
+approval still needs the same immutable boundary: use only the latest completed
+final Tester after the latest Writer, require its result to name that Writer's
+exact candidate commit, and bind the result plus the exact failed-command logs.
+Never fall back to this ungated evidence when a candidate gate exists; the gate
+owns that frontier. Reject failed-command rechecks and passing, stale, missing,
+malformed, or candidate-mismatched Tester evidence rather than approving a
+mutable or unrelated correction.
 That digest proves inspection, not recovery. If the Writer preserves the
 candidate, rerun only the previously nonzero commands through the host-owned
 Tester boundary before reviewers. Bind the subset to the source result, current

@@ -5289,10 +5289,7 @@ fn failed_tester_command_artifacts(
         .output
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("final-Tester correction Writer has no output"))?;
-    let tester = attempt.tasks[last_write_index + 1..]
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+    let tester = latest_completed_final_tester_after(attempt, last_write_index)
         .ok_or_else(|| anyhow::anyhow!("final-Tester correction has no completed Tester"))?;
     let area = tester
         .artifact_area
@@ -5360,6 +5357,14 @@ fn failed_tester_command_artifacts(
         }
     }
     Ok(artifacts)
+}
+
+fn latest_completed_final_tester_after(attempt: &Attempt, write_index: usize) -> Option<&Task> {
+    attempt.tasks[write_index + 1..].iter().rev().find(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+    })
 }
 
 /// Move one preserved 0.1.5 Learner evidence rejection back to the same
@@ -7030,8 +7035,106 @@ fn round_cap_failure_frontier(
             });
         }
     }
-    failed.extend(rejected_final_tester_gate_frontier(project_root, attempt)?);
+    let gated_tester = rejected_final_tester_gate_frontier(project_root, attempt)?;
+    if gated_tester.is_empty() {
+        failed.extend(failed_final_tester_without_gate_frontier(
+            project_root,
+            attempt,
+        )?);
+    } else {
+        failed.extend(gated_tester);
+    }
     Ok(failed)
+}
+
+/// Bind an exhausted round-cap approval to the latest failed final Tester when
+/// a structured failure or harness error prevented the candidate gate from running.
+/// A present gate always owns this frontier; the fallback is only for the
+/// no-gate path produced by `interpret_reviews`.
+fn failed_final_tester_without_gate_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let Some(last_write_index) = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    else {
+        return Ok(Vec::new());
+    };
+    let write_task = &attempt.tasks[last_write_index];
+    let Some(output) = write_task.output.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(tester) = latest_completed_final_tester_after(attempt, last_write_index) else {
+        return Ok(Vec::new());
+    };
+    let gate_path = project_root.join(format!(
+        "{}/{}/{}",
+        work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+        tester.id,
+        crate::candidate_gate::CANDIDATE_GATE_FILE
+    ));
+    if gate_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let Some(area) = tester.artifact_area.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let artifact_dir =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    let tester_results_path = artifact_dir.join("tester-results.json");
+    if !tester_results_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(&tester_results_path).with_context(|| {
+        format!(
+            "read failed final-Tester evidence {}",
+            tester_results_path.display()
+        )
+    })?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "parse failed final-Tester evidence {}",
+                tester_results_path.display()
+            )
+        })?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        bail!(
+            "failed final-Tester evidence is not bound to candidate {}",
+            output.commit
+        );
+    }
+    let failed = results.summary.fail > 0
+        || results.error.is_some()
+        || results.commands.iter().any(|command| {
+            command.exit_code != 0
+                || command
+                    .process_settlement
+                    .as_ref()
+                    .is_some_and(|evidence| !evidence.leaks.is_empty())
+        });
+    if !failed {
+        return Ok(Vec::new());
+    }
+
+    failed_tester_command_artifacts(project_root, attempt, &tester_results_path)?
+        .into_iter()
+        .map(|artifact| {
+            let path = work_task_executor::resolve_managed_artifact_area_path(
+                project_root,
+                &artifact.path,
+            )?;
+            let bytes = fs::read(&path)
+                .with_context(|| format!("read failed correction artifact {}", path.display()))?;
+            Ok(RoundCapReviewArtifact {
+                artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
 }
 
 fn rejected_final_tester_gate_frontier(
@@ -7049,11 +7152,7 @@ fn rejected_final_tester_gate_frontier(
     let Some(output) = write_task.output.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(tester) = attempt.tasks[last_write_index + 1..]
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
-    else {
+    let Some(tester) = latest_completed_final_tester_after(attempt, last_write_index) else {
         return Ok(Vec::new());
     };
     let artifact = ArtifactRef {
@@ -10154,6 +10253,291 @@ mod tests {
             still_paused.attempts[0].pause_kind,
             Some(PauseKind::RoundCap)
         );
+    }
+
+    #[test]
+    fn structured_final_tester_failure_without_gate_is_an_approvable_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"] = serde_json::json!([{
+            "id": "behavior/required",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "assertion failed"
+        }]);
+        results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let template = attempt.tasks[0].clone();
+                let additional_writers = (2..=10).map(|round| {
+                    let mut task = template.clone();
+                    task.id = format!("attempt-1-write-{round}");
+                    if let Some(area) = task.artifact_area.as_mut() {
+                        area.path = work_artifact_path("work-1", "attempt-1", &task.id);
+                    }
+                    task
+                });
+                attempt.tasks.splice(1..1, additional_writers);
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let gate = project.path().join(format!(
+            "{}/{}/{}",
+            work_artifact_path("work-1", "attempt-1", "candidate-gates"),
+            tester.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ));
+        assert!(
+            !gate.exists(),
+            "structured failures skip the final Tester gate"
+        );
+
+        let frontier = round_cap_failure_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .expect("the exact failed Tester bytes must form a frontier");
+        assert_eq!(frontier.len(), 3);
+        assert!(
+            frontier
+                .iter()
+                .any(|artifact| artifact.artifact.path.ends_with("/tester-results.json"))
+        );
+        assert!(frontier.iter().all(|artifact| {
+            !artifact
+                .artifact
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                && artifact.digest.starts_with("sha256:")
+        }));
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .round_cap_extensions
+                    .push(RoundCapExtension {
+                        id: "round-cap-10-11".to_string(),
+                        old_cap: 10,
+                        new_cap: 11,
+                        additional_write_rounds: 1,
+                        candidate_commit: candidate.clone(),
+                        failed_reviews: frontier,
+                        approved_at: "2026-08-11T00:00:00Z".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+
+        fs::write(&results_path, b"changed after approval\n").unwrap();
+        let error =
+            reopen_approved_round_cap_attempt(project.path(), &store, "work-1", "attempt-1")
+                .expect_err("changed Tester bytes must invalidate the approval");
+        assert!(error.to_string().contains("cannot be resolved"));
+        let still_paused = store.read_work_item("work-1").unwrap();
+        assert_eq!(still_paused.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            still_paused.attempts[0].pause_kind,
+            Some(PauseKind::RoundCap)
+        );
+    }
+
+    #[test]
+    fn passing_final_tester_without_gate_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_candidate_mismatch() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["candidate_commit"] = serde_json::json!("different-candidate");
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("a mismatched Tester result must not authorize more Writer rounds");
+
+        assert!(error.to_string().contains("not bound to candidate"));
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_missing_exact_log() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let missing = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("commands/0-stderr.log");
+        fs::remove_file(missing).unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("a missing exact command log must fail closed");
+
+        assert!(error.to_string().contains("command log is missing"));
+    }
+
+    #[test]
+    fn failed_final_tester_without_gate_rejects_malformed_results() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        fs::write(results_path, b"not json\n").unwrap();
+
+        let error = failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0])
+            .expect_err("malformed Tester results must not authorize more Writer rounds");
+
+        assert!(
+            error
+                .to_string()
+                .contains("parse failed final-Tester evidence")
+        );
+    }
+
+    #[test]
+    fn missing_final_tester_results_without_gate_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        fs::remove_file(results_path).unwrap();
+
+        let frontier =
+            failed_final_tester_without_gate_frontier(project.path(), &item.attempts[0]).unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_tester_before_latest_writer_is_not_a_round_cap_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut writer = item.attempts[0].tasks[0].clone();
+                writer.id = "attempt-1-write-2".to_string();
+                writer.output.as_mut().unwrap().base_commit = Some(candidate.clone());
+                item.attempts[0].tasks.push(writer);
+                Ok(())
+            })
+            .unwrap();
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
+    }
+
+    #[test]
+    fn failed_command_recheck_is_not_an_ungated_final_tester_frontier() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                let tester = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap();
+                let source = ArtifactRef {
+                    producer_id: tester.id.clone(),
+                    path: format!(
+                        "{}/tester-results.json",
+                        tester.artifact_area.as_ref().unwrap().path
+                    ),
+                };
+                let recheck_id = item.add_failed_command_recheck_task("attempt-1", source)?;
+                let recheck = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == recheck_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+
+        let frontier = failed_final_tester_without_gate_frontier(
+            project.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
+        )
+        .unwrap();
+
+        assert!(frontier.is_empty());
     }
 
     fn legacy_learner_tester_evidence_fixture(

@@ -134,6 +134,29 @@ Attempt frontier.
 Test: tests/binary.rs (attempt_extend_binds_candidate_and_failed_review_bytes)
 Test: src/work_attempt_loop.rs (final_tester_gate_round_cap_frontier_binds_all_correction_bytes)
 
+### B3
+
+WHEN a failed final Tester reaches the Writer-round cap before a candidate gate
+is created, THE SYSTEM SHALL accept a bounded continuation from its structured
+result and exact failed-command logs only when it is the latest completed final
+Tester after the latest Writer and names that Writer's exact candidate commit.
+Test: tests/binary.rs (attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate)
+Test: src/work_attempt_loop.rs (structured_final_tester_failure_without_gate_is_an_approvable_round_cap_frontier)
+
+### B4
+
+IF a candidate gate exists or no latest candidate-bound final Tester failure can
+be verified, THEN THE SYSTEM SHALL NOT substitute ungated Tester evidence for
+the round-cap correction frontier.
+Test: src/work_attempt_loop.rs (passing_final_tester_without_gate_is_not_a_round_cap_frontier)
+Test: src/work_attempt_loop.rs (failed_tester_before_latest_writer_is_not_a_round_cap_frontier)
+Test: src/work_attempt_loop.rs (failed_command_recheck_is_not_an_ungated_final_tester_frontier)
+Test: src/work_attempt_loop.rs (failed_final_tester_without_gate_rejects_candidate_mismatch)
+Test: src/work_attempt_loop.rs (failed_final_tester_without_gate_rejects_missing_exact_log)
+Test: src/work_attempt_loop.rs (failed_final_tester_without_gate_rejects_malformed_results)
+Test: src/work_attempt_loop.rs (missing_final_tester_results_without_gate_is_not_a_round_cap_frontier)
+Test: src/work_attempt_loop.rs (final_tester_gate_round_cap_frontier_binds_all_correction_bytes)
+
 ## Actionable final Tester evidence
 
 ### B1
