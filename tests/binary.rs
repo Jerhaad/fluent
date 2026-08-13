@@ -20996,6 +20996,141 @@ fn dispatch_count(project_root: &Path, work_item_id: &str) -> usize {
     value["dispatches"].as_array().map(|d| d.len()).unwrap_or(0)
 }
 
+fn run_scheduler_until_dispatch_status(
+    project_root: &Path,
+    work_item_id: &str,
+    bin_dir: &Path,
+    expected_status: &str,
+) -> std::process::Output {
+    let mut scheduler = {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+        command
+            .current_dir(project_root)
+            .env("PATH", mock_path(bin_dir))
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .env("FLUENT_MAX_TASK_RETRIES", "0")
+            .env_remove("FLUENT_TASK_KIND")
+            .args(["scheduler", "run", "--poll-seconds", "1"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        OwnedFixtureProcess::spawn(&mut command)
+    };
+    let reached_terminal = poll_until(std::time::Duration::from_secs(60), || {
+        matches!(
+            latest_dispatch_status(project_root, work_item_id).as_str(),
+            "candidate-ready" | "failed" | "needs-user" | "canceled" | "blocked"
+        )
+    });
+    let actual_status = latest_dispatch_status(project_root, work_item_id);
+    send_signal(scheduler.id(), "TERM");
+    let output = scheduler.wait_with_output().unwrap();
+    assert!(
+        reached_terminal,
+        "scheduler did not reach a terminal status within 60 seconds; status={actual_status}; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "scheduler did not drain cleanly: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        actual_status,
+        expected_status,
+        "scheduler reached the wrong terminal status: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+fn write_scheduler_claude(bin_dir: &Path, script: &str) {
+    write_mock_claude(bin_dir, script);
+    fs::remove_file(bin_dir.join("sandbox-exec")).unwrap();
+}
+
+fn learner_only_success_mock_script() -> &'static str {
+    r##"#!/bin/bash
+PROMPT=""
+NEXT_IS_PROMPT=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+done
+if ! printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  exit 86
+fi
+DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+mkdir -p "$(dirname "$DRAFT")"
+printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT"
+exit 0
+"##
+}
+
+#[test]
+fn scheduler_resume_retries_only_a_failed_learner() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-scheduler-learner-retry");
+    write_scheduler_claude(&bin_dir, &learner_failing_mock_script());
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Learner"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "add", "work-1"])
+        .assert()
+        .success();
+
+    let first_scheduler =
+        run_scheduler_until_dispatch_status(&main_dir, "work-1", &bin_dir, "blocked");
+    let before = read_work_show_json(&main_dir, "work-1");
+    let tasks_before = before["attempts"][0]["tasks"].as_array().unwrap().len();
+    let commit_before = before["merge_candidates"][0]["candidate_commit"].clone();
+    assert_eq!(
+        before["attempts"][0]["learning"]["status"],
+        "failed",
+        "first scheduler stopped before the expected Learner failure: model={before}; stdout={} stderr={}",
+        String::from_utf8_lossy(&first_scheduler.stdout),
+        String::from_utf8_lossy(&first_scheduler.stderr)
+    );
+
+    write_scheduler_claude(&bin_dir, learner_only_success_mock_script());
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    run_scheduler_until_dispatch_status(&main_dir, "work-1", &bin_dir, "candidate-ready");
+
+    let after = read_work_show_json(&main_dir, "work-1");
+    assert_eq!(
+        after["attempts"][0]["tasks"].as_array().unwrap().len(),
+        tasks_before,
+        "the scheduler retry must not add Writer, Tester, or reviewer Tasks"
+    );
+    assert_eq!(
+        after["merge_candidates"][0]["candidate_commit"], commit_before,
+        "the scheduler retry must preserve the tested candidate"
+    );
+    assert_eq!(after["attempts"][0]["learning"]["status"], "succeeded");
+    assert_eq!(after["attempts"][0]["learning"]["runs"], 2);
+
+    let ledger = read_json_path(&queue_ledger_path(&main_dir, "work-1"));
+    let dispatches = ledger["dispatches"].as_array().unwrap();
+    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches[0]["status"], "blocked");
+    assert_eq!(dispatches[1]["status"], "candidate-ready");
+    assert_eq!(dispatches[1]["bound_attempt_id"], "attempt-1");
+    assert_eq!(dispatches[1]["resume_of_dispatch_id"], "dispatch-1");
+}
+
 #[test]
 fn explicit_queue_add_after_terminal_creates_new_dispatch() {
     use fluent::queue::{self, DispatchStatus};

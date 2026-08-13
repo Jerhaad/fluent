@@ -4874,6 +4874,41 @@ Test: src/tester.rs (tester_diagnoses_nested_swiftpm_sandbox_failure)
 Test: src/work_task_executor.rs (nested_swiftpm_handoff_names_exact_one_dispatch_approval)
 Test: tests/binary.rs (tester_nested_sandbox_diagnosis_does_not_rewrite_project)
 
+### B2l
+
+WHEN `fluent queue resume <work-item-id> --attempt <attempt-id>` names a
+completed, review-passed Attempt whose Learner failed with a relaunchable
+disposition, and every Task is complete, exactly one pending unreviewed Merge
+Candidate still identifies the clean candidate HEAD, and no Learner run is
+live, THE SYSTEM SHALL append a resume dispatch bound to that Attempt.
+Test: src/queue.rs (resume_queues_and_claims_only_the_retryable_failed_learner)
+
+### B2m
+
+WHEN the scheduler runs the resume dispatch from B2l, THE SYSTEM SHALL retry
+only the Learner and preserve the Writer, Tester, reviewer, and Merge Candidate
+records.
+Test: tests/binary.rs (scheduler_resume_retries_only_a_failed_learner)
+
+### B2n
+
+IF the Learner failure is not relaunchable, a Task is incomplete, a Learner run
+is live, or the candidate is missing, ambiguous, reviewed, landed, moved, or
+dirty, THEN THE SYSTEM SHALL reject the resume without changing the queue.
+Test: src/queue.rs (resume_rejects_a_dirty_learner_retry_candidate_without_queue_mutation,
+resume_rejects_a_non_relaunchable_learner_without_queue_mutation,
+resume_rejects_a_live_learner_without_queue_mutation,
+resume_rejects_an_incomplete_task_in_a_learner_retry,
+resume_rejects_a_moved_learner_retry_candidate,
+resume_rejects_a_reviewed_or_landed_learner_candidate,
+resume_rejects_a_missing_or_ambiguous_learner_candidate)
+
+### B2o
+
+IF a candidate no longer satisfies B2l when the scheduler claims its admitted
+resume, THEN THE SYSTEM SHALL reject the claim and leave the dispatch queued.
+Test: src/queue.rs (claim_rejects_a_learner_candidate_dirtied_after_resume)
+
 ### B3
 
 WHEN `fluent queue list` is invoked,

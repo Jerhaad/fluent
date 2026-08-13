@@ -25,6 +25,17 @@ stale bound id from impersonating human authorization. Tests must prove the
 public command, preserved history, exact binding, no extra Attempt, restart,
 another `needs-user` outcome, and fail-closed mismatch cases.
 
+A current pre-land Learner failure uses the same explicit authorization even
+though the Attempt is complete and the scheduler recorded `blocked` rather than
+`needs-user`. Admit that recovery only when reviews passed, every Task is
+complete, the failed Learning disposition is relaunchable, exactly one pending
+unreviewed candidate remains clean at its recorded commit, and no Learner lease
+is live. Repeat the read-only inspection at claim, then let the Attempt loop
+repeat its reservation-time checks and retry only the Learner. Preserve the
+prior blocked dispatch, Tasks, review evidence, Tester evidence, and candidate.
+Reject a moved, dirty, reviewed, landed, or ambiguous candidate, or one with a
+live Learner run, without changing the queue.
+
 Apply the same boundary to a `candidate-gate` pause. When gate evidence says
 the candidate was rejected, one explicit resume may plan one corrective Writer
 on the same workspace and provider session. When the gate was blocked by the

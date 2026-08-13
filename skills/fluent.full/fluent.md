@@ -242,6 +242,12 @@ then reruns only the uncertain reviewer roles while preserving passing reviews.
 For scheduler-owned Work, use the exact `fluent queue resume <work-item-id>
 --attempt <attempt-id>` command reported by status; queue admission applies the
 same checks before binding the existing Attempt.
+When a pre-land Learner fails with a relaunchable disposition, the scheduler
+records the dispatch as blocked. Run `fluent queue resume <work-item-id>
+--attempt <attempt-id>`, then `fluent scheduler run`. Fluent verifies that the
+reviewed candidate is still clean and unchanged before queueing and again at
+claim, then retries only the Learner. Use `fluent attempt run <work-item-id>
+<attempt-id>` for the equivalent foreground recovery.
 When the pause is `provider-unavailable`, wait for provider capacity, then run
 `fluent attempt run <work-item-id> [attempt-id]` without new input. For a hung or
 interrupted local coder, run `fluent attempt cancel <work-item-id> <attempt-id>`;

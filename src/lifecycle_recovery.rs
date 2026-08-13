@@ -24,6 +24,117 @@ pub(crate) struct UncertainReviewRecovery {
     pub uncertain_roles: Vec<String>,
 }
 
+/// Return whether this Attempt has the durable lifecycle shape of a failed
+/// pre-land Learner. Callers use this coarse check only to select the detailed
+/// inspector below; it grants no recovery authority by itself.
+pub(crate) fn is_learner_retry_recovery(item: &WorkItem, attempt_id: &str) -> bool {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return false;
+    };
+    attempt.status == AttemptStatus::Complete
+        && attempt.review_state == Some(AttemptReviewState::Passed)
+        && attempt
+            .learning
+            .as_ref()
+            .is_some_and(|learning| learning.is_failed())
+        && item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        })
+}
+
+/// Verify that a completed passing Attempt still exposes exactly one safe,
+/// relaunchable Learner frontier. Queue admission and claim both call this
+/// function; the Attempt loop repeats its own candidate and Learning gates
+/// immediately before launch.
+pub(crate) fn inspect_learner_retry_recovery(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    if attempt.kind.is_review_only_like()
+        || attempt.status != AttemptStatus::Complete
+        || attempt.review_state != Some(AttemptReviewState::Passed)
+    {
+        anyhow::bail!("Attempt {attempt_id:?} is not a completed, review-passed Learner retry");
+    }
+    if attempt
+        .tasks
+        .iter()
+        .any(|task| task.status != TaskStatus::Complete)
+    {
+        anyhow::bail!("Attempt {attempt_id:?} still has an active or incomplete Task");
+    }
+    let learning = attempt
+        .learning
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} has no failed Learner record"))?;
+    if !learning.is_failed() {
+        anyhow::bail!("Attempt {attempt_id:?} Learner has not failed");
+    }
+    if !learning.is_relaunchable() {
+        anyhow::bail!("Attempt {attempt_id:?} Learner failure is not relaunchable");
+    }
+    if crate::lease::is_leased(&crate::lease::learner_lock_path(
+        project_root,
+        &item.id,
+        attempt_id,
+    )) {
+        anyhow::bail!("Attempt {attempt_id:?} already has a live Learner run");
+    }
+
+    let mut candidates = item.merge_candidates.iter().filter(|candidate| {
+        candidate.attempt_id == attempt_id
+            && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+    });
+    let candidate = candidates
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} has no pending Merge Candidate"))?;
+    if candidates.next().is_some() {
+        anyhow::bail!("Attempt {attempt_id:?} has multiple pending Merge Candidates");
+    }
+    if candidate.merge_review_state != MergeReviewState::Pending {
+        anyhow::bail!("Learner retry candidate is no longer pending review");
+    }
+    candidate.validate(item)?;
+
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &candidate.source_workspace.path,
+        "Learner retry candidate workspace",
+    )?;
+    let head = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "resolve Learner retry candidate HEAD",
+    )?;
+    if head != candidate.candidate_commit {
+        anyhow::bail!(
+            "Learner retry candidate HEAD no longer matches {}",
+            candidate.candidate_commit
+        );
+    }
+    let status = crate::git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
+        "check Learner retry candidate cleanliness",
+    )?;
+    if !status.is_empty() {
+        anyhow::bail!("Learner retry candidate workspace is dirty");
+    }
+
+    Ok(())
+}
+
 /// Verify that an uncertain review pause still points at one clean candidate and
 /// readable latest verdicts. Callers may reopen only the returned roles.
 pub(crate) fn inspect_uncertain_review_recovery(

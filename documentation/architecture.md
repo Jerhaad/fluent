@@ -3071,6 +3071,19 @@ For an uncertain-review pause, queue admission calls the same read-only
 resume dispatch. The scheduler later launches the bound Attempt through the
 ordinary Attempt loop, which revalidates the frontier before reopening only the
 uncertain roles.
+
+A relaunchable failed pre-land Learner is also an explicit scheduler recovery
+frontier even though its review-passed Attempt is complete and its prior
+dispatch is `blocked`, not `needs-user`. Queue admission and claim share a
+read-only `lifecycle_recovery` inspection. It requires every Task to remain
+complete, exactly one pending and unreviewed Merge Candidate, a clean candidate
+workspace at the recorded commit, and no live Learner lease. The resume keeps
+the prior blocked dispatch as history and launches the same Attempt. The
+ordinary Attempt loop then performs its own reservation-time checks and retries
+only the Learner; it does not repeat the Writer, Tester, or reviewers. A changed,
+dirty, reviewed, landed, or ambiguous candidate fails closed, as does a
+candidate with a live Learner run.
+
 Legacy dispatches omit the new fields and deserialize as ordinary run intent.
 
 For the narrow Xcode/SwiftPM recovery, the same command accepts `--no-sandbox`

@@ -455,6 +455,7 @@ pub fn resume_with_tester_no_sandbox(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .is_some_and(crate::work_model::Attempt::is_failed_candidate_gate_correction);
+    let learner_retry = crate::lifecycle_recovery::is_learner_retry_recovery(&item, attempt_id);
     let legacy_learner_tester_evidence =
         crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
             project_root,
@@ -501,6 +502,7 @@ pub fn resume_with_tester_no_sandbox(
         Some(previous) => {
             if previous.status != DispatchStatus::NeedsUser
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
+                && !(previous.status == DispatchStatus::Blocked && learner_retry)
                 && !(legacy_learner_tester_evidence
                     && matches!(
                         previous.status,
@@ -737,13 +739,19 @@ fn ensure_resume_eligible(
             attempt.id
         );
     }
-    if !known_legacy_learner_tester_evidence
-        && !crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
+    let legacy_learner_tester_evidence = known_legacy_learner_tester_evidence
+        || crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
             project_root,
             item,
             attempt_id,
-        )?
+        )?;
+    if !legacy_learner_tester_evidence
+        && crate::lifecycle_recovery::is_learner_retry_recovery(item, attempt_id)
     {
+        crate::lifecycle_recovery::inspect_learner_retry_recovery(project_root, item, attempt_id)?;
+        return Ok(());
+    }
+    if !legacy_learner_tester_evidence {
         attempt.ensure_resume_ready()?;
         if attempt.is_uncertain_review_pause() {
             crate::lifecycle_recovery::inspect_uncertain_review_recovery(
@@ -1047,7 +1055,8 @@ fn with_matching_active(
 mod tests {
     use super::*;
     use crate::work_model::{
-        ArtifactRef, AttemptReviewState, PauseKind, TaskKind, TaskOutput, TaskStatus,
+        ArtifactRef, AttemptLearning, AttemptReviewState, LearningFailureKind,
+        MergeCandidateMergeStatus, MergeReviewState, PauseKind, TaskKind, TaskOutput, TaskStatus,
     };
 
     fn setup_project(tmp: &Path) {
@@ -1115,6 +1124,75 @@ mod tests {
     fn write_tester_suspension(tmp: &Path, id: &str, attempt_id: &str) {
         write_scheduler_suspension(tmp, id, attempt_id);
         suspend_attempt(tmp, id, attempt_id, PauseKind::TesterHarness);
+    }
+
+    fn write_blocked_relaunchable_learner(tmp: &Path, id: &str, attempt_id: &str) -> PathBuf {
+        crate::git::run(tmp, &["init", "-q"], "initialize learner recovery project").unwrap();
+        crate::git::run(
+            tmp,
+            &["config", "user.name", "Test Author"],
+            "configure author",
+        )
+        .unwrap();
+        crate::git::run(
+            tmp,
+            &["config", "user.email", "test@example.com"],
+            "configure email",
+        )
+        .unwrap();
+        fs::write(tmp.join("README.md"), "base\n").unwrap();
+        crate::git::run(tmp, &["add", "README.md"], "stage base").unwrap();
+        crate::git::run(tmp, &["commit", "-q", "-m", "Create base"], "commit base").unwrap();
+
+        let workspace_path = crate::work_model::initial_candidate_workspace_path(id, attempt_id);
+        let workspace = tmp.parent().unwrap().join(
+            Path::new(&workspace_path)
+                .file_name()
+                .expect("candidate workspace name"),
+        );
+        crate::git::run(
+            tmp,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/learner-retry",
+                workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create learner recovery candidate",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "candidate").unwrap();
+
+        write_planned_attempt(tmp, id, attempt_id);
+        add(tmp, id, Some(3)).unwrap();
+        claim(tmp, id, attempt_id).unwrap().unwrap();
+        WorkModelStore::new(tmp)
+            .mutate_work_item(id, |item| {
+                let attempt = &mut item.attempts[0];
+                let writer = &mut attempt.tasks[0];
+                writer.status = TaskStatus::Complete;
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: workspace_path.clone(),
+                    source_branch: "work/learner-retry".to_string(),
+                    base_commit: None,
+                    commit: candidate.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                attempt.status = AttemptStatus::Complete;
+                attempt.review_state = Some(AttemptReviewState::Passed);
+                attempt.learning = Some(AttemptLearning::failed(1, "retry learner"));
+                item.create_or_get_merge_candidate(attempt_id)?;
+                Ok(())
+            })
+            .unwrap();
+        reconcile_active(tmp, id, DispatchStatus::Blocked).unwrap();
+        workspace
     }
 
     fn write_uncertain_review_suspension(tmp: &Path, id: &str, attempt_id: &str) {
@@ -1381,6 +1459,215 @@ mod tests {
         let replayed = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
         assert_eq!(replayed.dispatches.len(), 2);
         assert_eq!(replayed.active().unwrap().priority, 11);
+    }
+
+    #[test]
+    fn resume_queues_and_claims_only_the_retryable_failed_learner() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+
+        assert_eq!(
+            resume(&project, "wi-1", "attempt-1", Some(8)).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(&project, "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::Blocked);
+        assert_eq!(
+            ledger.active().unwrap().resume_of_dispatch_id.as_deref(),
+            Some("dispatch-1")
+        );
+
+        let token = claim(&project, "wi-1", "attempt-1")
+            .unwrap()
+            .expect("the unchanged Learner retry frontier remains claimable");
+        assert_eq!(token.bound_attempt_id, "attempt-1");
+        let item = WorkModelStore::new(&project)
+            .read_work_item("wi-1")
+            .unwrap();
+        assert_eq!(item.attempts[0].tasks.len(), 1);
+        assert!(item.attempts[0].learning.as_ref().unwrap().is_failed());
+    }
+
+    #[test]
+    fn resume_rejects_a_dirty_learner_retry_candidate_without_queue_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        let workspace = write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        fs::write(workspace.join("unreviewed.txt"), "dirty\n").unwrap();
+        let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+        let error = resume(&project, "wi-1", "attempt-1", None).unwrap_err();
+        assert!(error.to_string().contains("candidate workspace is dirty"));
+        assert_eq!(fs::read(queue_file(&project, "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn claim_rejects_a_learner_candidate_dirtied_after_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        let workspace = write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        resume(&project, "wi-1", "attempt-1", None).unwrap();
+        fs::write(workspace.join("unreviewed.txt"), "dirty\n").unwrap();
+
+        let error = claim(&project, "wi-1", "attempt-1").unwrap_err();
+        assert!(error.to_string().contains("candidate workspace is dirty"));
+        let ledger = read_ledger(&project, "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.active().unwrap().status, DispatchStatus::Queued);
+    }
+
+    #[test]
+    fn resume_rejects_a_non_relaunchable_learner_without_queue_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        WorkModelStore::new(&project)
+            .mutate_work_item("wi-1", |item| {
+                item.attempts[0].learning = Some(AttemptLearning::failed_with_kind(
+                    1,
+                    "evidence pending",
+                    LearningFailureKind::EvidencePending,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+        let error = resume(&project, "wi-1", "attempt-1", None).unwrap_err();
+        assert!(error.to_string().contains("not relaunchable"));
+        assert_eq!(fs::read(queue_file(&project, "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_rejects_a_live_learner_without_queue_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        let _learner = crate::lease::acquire(&crate::lease::learner_lock_path(
+            &project,
+            "wi-1",
+            "attempt-1",
+        ))
+        .unwrap();
+        let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+        let error = resume(&project, "wi-1", "attempt-1", None).unwrap_err();
+        assert!(error.to_string().contains("live Learner run"));
+        assert_eq!(fs::read(queue_file(&project, "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_rejects_an_incomplete_task_in_a_learner_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        let store = WorkModelStore::new(&project);
+        let task_path = store
+            .work_task_path("wi-1", "attempt-1", "attempt-1-write-1")
+            .unwrap();
+        let mut task: serde_json::Value =
+            serde_json::from_slice(&fs::read(&task_path).unwrap()).unwrap();
+        task["status"] = serde_json::json!("planned");
+        fs::write(&task_path, serde_json::to_vec_pretty(&task).unwrap()).unwrap();
+        let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+        resume(&project, "wi-1", "attempt-1", None).unwrap_err();
+        assert_eq!(fs::read(queue_file(&project, "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_rejects_a_moved_learner_retry_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("main");
+        setup_project(&project);
+        let workspace = write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+        fs::write(workspace.join("later.txt"), "later\n").unwrap();
+        crate::git::run(&workspace, &["add", "later.txt"], "stage later commit").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Move candidate"],
+            "move candidate",
+        )
+        .unwrap();
+        let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+        let error = resume(&project, "wi-1", "attempt-1", None).unwrap_err();
+        assert!(error.to_string().contains("HEAD no longer matches"));
+        assert_eq!(fs::read(queue_file(&project, "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn resume_rejects_a_reviewed_or_landed_learner_candidate() {
+        for state in ["reviewed", "landed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("main");
+            setup_project(&project);
+            write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+            WorkModelStore::new(&project)
+                .mutate_work_item("wi-1", |item| {
+                    if state == "reviewed" {
+                        item.merge_candidates[0].merge_review_state = MergeReviewState::Passed;
+                    } else {
+                        item.merge_candidates[0].merge_state.status =
+                            MergeCandidateMergeStatus::Merged;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+            assert!(resume(&project, "wi-1", "attempt-1", None).is_err());
+            assert_eq!(
+                fs::read(queue_file(&project, "wi-1")).unwrap(),
+                before,
+                "{state} candidate changed the queue"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_rejects_a_missing_or_ambiguous_learner_candidate() {
+        for state in ["missing", "ambiguous"] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("main");
+            setup_project(&project);
+            write_blocked_relaunchable_learner(&project, "wi-1", "attempt-1");
+            let store = WorkModelStore::new(&project);
+            let candidate_path = store
+                .work_merge_candidate_path("wi-1", "attempt-1-merge-candidate")
+                .unwrap();
+            if state == "missing" {
+                fs::remove_file(&candidate_path).unwrap();
+            } else {
+                let mut duplicate: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&candidate_path).unwrap()).unwrap();
+                duplicate["id"] = serde_json::json!("attempt-1-second-candidate");
+                let duplicate_path = store
+                    .work_merge_candidate_path("wi-1", "attempt-1-second-candidate")
+                    .unwrap();
+                fs::write(
+                    duplicate_path,
+                    serde_json::to_vec_pretty(&duplicate).unwrap(),
+                )
+                .unwrap();
+            }
+            let before = fs::read(queue_file(&project, "wi-1")).unwrap();
+
+            assert!(resume(&project, "wi-1", "attempt-1", None).is_err());
+            assert_eq!(
+                fs::read(queue_file(&project, "wi-1")).unwrap(),
+                before,
+                "{state} candidate changed the queue"
+            );
+        }
     }
 
     #[test]
