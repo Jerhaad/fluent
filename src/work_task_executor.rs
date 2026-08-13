@@ -2690,10 +2690,10 @@ fn is_supervision_sidecar_error(result: &Result<()>) -> bool {
 }
 
 fn is_host_sandbox_preflight_error(result: &Result<()>) -> bool {
-    result
-        .as_ref()
-        .err()
-        .map_or(false, |e| e.is::<crate::os::HostSandboxPreflightError>())
+    result.as_ref().err().is_some_and(|e| {
+        e.is::<crate::os::HostSandboxPreflightError>()
+            || e.is::<crate::os::HostSandboxLaunchError>()
+    })
 }
 
 /// Wait for one shared provider slot while the Task remains eligible to start.
@@ -2783,8 +2783,8 @@ enum TaskFailure {
     /// failure is not retried in-process; a supported resume retries after the
     /// operator fixes the transport.
     TranscriptPump(String),
-    /// The enclosing host sandbox rejected Fluent's real production profile
-    /// before a workload launched.
+    /// The enclosing host sandbox rejected Fluent's production profile, or a
+    /// provider runtime could not initialize inside that exact boundary.
     HostSandbox(String),
     /// Tester configuration, sandbox, extraction, or result persistence failed.
     TesterHarness,
@@ -2839,6 +2839,8 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
         TaskFailure::TranscriptPump(pump.message().to_string())
     } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
         TaskFailure::HostSandbox(host.message().to_string())
+    } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxLaunchError>() {
+        TaskFailure::HostSandbox(host.message().to_string())
     } else {
         TaskFailure::Generic
     }
@@ -2859,6 +2861,7 @@ fn provider_pause_error(
             if error.is::<crate::transcript_pump::TranscriptPumpError>()
                 || error.is::<crate::coder::SupervisionSidecarError>()
                 || error.is::<crate::os::HostSandboxPreflightError>()
+                || error.is::<crate::os::HostSandboxLaunchError>()
                 || error.is::<crate::claude_auth::AuthError>()
                 || error.is::<crate::codex_worker::CodexAuthError>()
                 || error.is::<crate::provider_readiness::ProviderReadinessError>()
@@ -2871,6 +2874,15 @@ fn provider_pause_error(
                     .and_then(crate::claude_auth::classify_transcript_auth_failure)
             {
                 return Err(anyhow::Error::new(auth).context(error));
+            }
+            if coder == CoderKind::Claude
+                && let Some(host) = transcript.as_deref().and_then(|path| {
+                    crate::os::classify_host_sandbox_launch_stderr(
+                        &crate::coder::provider_stderr_path(path),
+                    )
+                })
+            {
+                return Err(anyhow::Error::new(host).context(error));
             }
             match transcript.as_deref().and_then(|path| {
                 crate::provider_evidence::classify_provider_unavailable(coder, path)
@@ -3074,7 +3086,7 @@ fn write_task_error_handoff(
              unwritable transcript path), then re-run `fluent attempt run` to retry.\n"
         ),
         TaskFailure::HostSandbox(diagnostic) => format!(
-            "# Attempt needs user input\n\nTask {task_id:?} could not start because the enclosing macOS sandbox blocked Fluent's production Seatbelt boundary:\n\n    {diagnostic}\n\nNo coder or Tester process was launched and this did not consume a retry or write round. {} Then run `fluent attempt run {work_item_id}` to resume this same Attempt.\n",
+            "# Attempt needs user input\n\nTask {task_id:?} could not perform usable work because a macOS sandbox boundary blocked Fluent's production Seatbelt execution:\n\n    {diagnostic}\n\nNo usable coder or Tester work was recorded, and this did not consume a write round. {} Then run `fluent attempt run {work_item_id}` to resume this same Attempt.\n",
             crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE
         ),
         TaskFailure::TesterHarness => format!(
@@ -3617,8 +3629,9 @@ fn run_task_coder_with_coder(
     materialize_planning_files(item, project_root)?;
     materialize_general_expertise(project_root)?;
 
-    if should_seed_project_model(task.kind, workspace_path) && coder_kind != CoderKind::Codex {
-        if let Err(err) = run_seed_project_model(
+    if should_seed_project_model(task.kind, workspace_path)
+        && coder_kind != CoderKind::Codex
+        && let Err(err) = run_seed_project_model(
             workspace_path,
             resolver,
             extra_args,
@@ -3626,11 +3639,11 @@ fn run_task_coder_with_coder(
             no_sandbox,
             model,
             effort,
-        ) {
-            eprintln!(
-                "  Warning: seed project model failed, continuing without project expertise: {err}"
-            );
-        }
+        )
+    {
+        eprintln!(
+            "  Warning: seed project model failed, continuing without project expertise: {err}"
+        );
     }
 
     let progress_dir = progress_md_dir(project_root, &item.id, attempt_id);
@@ -4920,17 +4933,21 @@ fn run_seed_project_model(
         )?
     };
 
-    let coder = coder_kind.boxed_with_model(sandbox, model, effort);
-    let exit_code = coder.run(
+    let result = coder_kind.run_bounded_seed(
+        sandbox,
+        model,
+        effort,
         &prompt,
         &system_prompt,
         workspace_path,
         extra_args,
-        &[],
-        None,
+        std::time::Duration::from_secs(120),
     )?;
-    if exit_code != 0 {
-        bail!("Seed coder exited with code {exit_code}");
+    if result.timed_out {
+        bail!("Seed coder exceeded its 120 second best-effort deadline");
+    }
+    if result.exit_code != 0 {
+        bail!("Seed coder exited with code {}", result.exit_code);
     }
 
     if !index_path.is_file() {
@@ -5412,24 +5429,27 @@ fn run_learner_with_coder_with_provider_readiness(
     // still read-only. The granted expertise, handoff, and artifact paths may not
     // exist yet; Seatbelt profiles deliberately support such deterministic future
     // paths. Keep this profile alive and reuse it below for the actual launch.
-    let (sandbox, _sandbox_profile, effectively_sandboxed) =
-        if let Some(prepared) = prepared_sandbox {
-            (
-                prepared.sandbox.clone(),
-                None,
-                prepared.effectively_sandboxed,
-            )
-        } else {
-            let (sandbox, profile) = plan_learner_sandbox(
-                &inputs,
-                mode,
-                effectively_sandboxed,
-                codex_worker,
-                &expertise_dir,
-                &mut readable_roots,
-            )?;
-            (sandbox, profile, effectively_sandboxed)
-        };
+    let (sandbox, _sandbox_profile, effectively_sandboxed) = if let Some(prepared) =
+        prepared_sandbox
+    {
+        (
+            prepared.sandbox.clone(),
+            None,
+            prepared.effectively_sandboxed,
+        )
+    } else {
+        let provider_artifact_dir = capture.as_ref().and_then(|capture| capture.path().parent());
+        let (sandbox, profile) = plan_learner_sandbox(
+            &inputs,
+            mode,
+            effectively_sandboxed,
+            codex_worker,
+            &expertise_dir,
+            &mut readable_roots,
+            provider_artifact_dir,
+        )?;
+        (sandbox, profile, effectively_sandboxed)
+    };
 
     fs::create_dir_all(&expertise_dir)?;
     fs::create_dir_all(inputs.handoff_dir)?;
@@ -5504,6 +5524,7 @@ fn plan_learner_sandbox(
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
     expertise_dir: &Path,
     readable_roots: &mut Vec<PathBuf>,
+    provider_artifact_dir: Option<&Path>,
 ) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
     if !effectively_sandboxed {
         return Ok((CoderSandbox::None, None));
@@ -5511,16 +5532,24 @@ fn plan_learner_sandbox(
 
     let common_git_dir = worktree::git_common_dir(inputs.workspace_path)?;
     readable_roots.push(inputs.workspace_path.to_path_buf());
+    // The host owns the transcript and provider-stderr files, so the Learner may
+    // not write their directory. Claude/Bun still has to inspect the pre-opened
+    // stderr descriptor during startup; grant the exact run directory read access
+    // without widening the Learner's writable staging surface.
+    readable_roots.extend(provider_artifact_dir.map(Path::to_path_buf));
     if let Some(worker) = codex_worker {
         readable_roots.extend(worker.launcher().readable_roots().iter().cloned());
     }
     let home = std::env::var("HOME").unwrap_or_default();
+    let claude_bash_temp = (inputs.coder_kind == CoderKind::Claude)
+        .then(|| os::claude_bash_temp_root(inputs.workspace_path));
     let (profile, sandbox) = if mode.expertise_writable() {
-        let writable = vec![
+        let mut writable = vec![
             expertise_dir.to_path_buf(),
             inputs.handoff_dir.to_path_buf(),
             common_git_dir,
         ];
+        writable.extend(claude_bash_temp.iter().cloned());
         let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
             inputs.resolver,
             &home,
@@ -5539,7 +5568,8 @@ fn plan_learner_sandbox(
         denied.extend(inputs.denied_write_roots.iter().cloned());
         denied.sort();
         denied.dedup();
-        let writable = vec![inputs.handoff_dir.to_path_buf()];
+        let mut writable = vec![inputs.handoff_dir.to_path_buf()];
+        writable.extend(claude_bash_temp.iter().cloned());
         let profile = os::render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
             inputs.resolver,
             &home,
@@ -5573,6 +5603,7 @@ pub(crate) fn prepare_learner_host_sandbox(
     inputs: LearnerRunInputs<'_>,
     mode: LearnerExecutionMode,
     codex_worker: Option<&crate::codex_worker::CodexWorkerEnvironment>,
+    provider_artifact_dir: &Path,
 ) -> Result<Option<PreparedLearnerSandbox>> {
     let effectively_sandboxed =
         mode.effectively_sandboxed(inputs.no_sandbox) || codex_worker.is_some();
@@ -5592,6 +5623,7 @@ pub(crate) fn prepare_learner_host_sandbox(
         codex_worker,
         &expertise_dir,
         &mut readable_roots,
+        Some(provider_artifact_dir),
     )?;
     Ok(profile.map(|profile| PreparedLearnerSandbox {
         sandbox,
@@ -8352,6 +8384,33 @@ mod tests {
         assert!(
             !should_retry_coder_error(&result),
             "structured authentication failure must bypass the generic retry budget"
+        );
+    }
+
+    #[test]
+    fn claude_stream_startup_denial_uses_host_sandbox_pause_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        fs::write(&transcript, "").unwrap();
+        fs::write(
+            crate::coder::provider_stderr_path(&transcript),
+            "EPERM: operation not permitted, fstat\n    at new WriteStream\nprocess.stderr.fd\n",
+        )
+        .unwrap();
+
+        let result = provider_pause_error(
+            Err(anyhow::anyhow!("Coder exited with code 1")),
+            CoderKind::Claude,
+            Some(transcript),
+        );
+
+        assert!(matches!(
+            classify_task_failure(result.as_ref().unwrap_err()),
+            TaskFailure::HostSandbox(message) if message.contains("standard stream")
+        ));
+        assert!(
+            !should_retry_coder_error(&result),
+            "a provider startup failure caused by the sandbox must not spend the generic retry budget"
         );
     }
 
@@ -17192,6 +17251,96 @@ mod tests {
                 .system_prompt
                 .contains("you may refine the project's learned model")
         );
+    }
+
+    #[test]
+    fn learner_profile_reads_host_evidence_without_granting_write_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let handoff_dir = tmp.path().join("learner/runs/run-1/staging");
+        let provider_artifact_dir = tmp.path().join("learner/runs/run-1");
+        let provider_stderr = provider_artifact_dir.join("provider-stderr.log");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&handoff_dir).unwrap();
+        std::fs::write(&provider_stderr, "diagnostic\n").unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "init learner fixture").unwrap();
+
+        let resolver = ContentResolver::new(None);
+        let inputs = LearnerRunInputs {
+            workspace_path: &workspace,
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Claude,
+            no_sandbox: false,
+            model: None,
+            effort: None,
+            review_artifact_paths: &[],
+            tester_artifact_paths: &[],
+            diff_command: "git diff",
+            handoff_dir: &handoff_dir,
+            denied_write_roots: &[],
+            handoff_only: false,
+            repair: None,
+        };
+        let mut readable_roots = Vec::new();
+        let expertise_dir = workspace.join(".fluent/expertise");
+        let (_, profile) = plan_learner_sandbox(
+            &inputs,
+            LearnerExecutionMode::Capture,
+            true,
+            None,
+            &expertise_dir,
+            &mut readable_roots,
+            Some(&provider_artifact_dir),
+        )
+        .unwrap();
+        let profile = profile.unwrap();
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let evidence = provider_artifact_dir.display();
+        let staging = handoff_dir.display();
+
+        assert!(content.contains(&format!("(allow file-read*  (subpath \"{evidence}\"))")));
+        assert!(!content.contains(&format!("(allow file-write* (subpath \"{evidence}\"))")));
+        assert!(content.contains(&format!("(allow file-write* (subpath \"{staging}\"))")));
+
+        #[cfg(target_os = "macos")]
+        {
+            let sandbox_usable = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if sandbox_usable {
+                let inspected = std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(&profile.path)
+                    .arg("/usr/bin/stat")
+                    .arg(&provider_stderr)
+                    .status()
+                    .unwrap();
+                assert!(
+                    inspected.success(),
+                    "Claude/Bun must be able to inspect the host-owned stderr descriptor"
+                );
+
+                let mutated = std::process::Command::new("/usr/bin/sandbox-exec")
+                    .arg("-f")
+                    .arg(&profile.path)
+                    .args([
+                        "/bin/sh",
+                        "-c",
+                        "echo changed >> \"$1\"",
+                        "learner-evidence",
+                    ])
+                    .arg(&provider_stderr)
+                    .status()
+                    .unwrap();
+                assert!(
+                    !mutated.success(),
+                    "the Learner must not write host-owned run evidence"
+                );
+            }
+        }
     }
 
     #[test]

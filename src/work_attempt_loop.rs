@@ -2384,6 +2384,7 @@ fn prepare_learner_run(
         },
         mode,
         codex_worker,
+        &run_dir,
     )?;
     let repair_budget = crate::config::resolve_learner_schema_repair_budget(project_root)
         .unwrap_or(crate::config::DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET);
@@ -2413,6 +2414,7 @@ fn prepare_learner_run(
             },
             mode,
             codex_worker,
+            &run_dir,
         )?;
         repairs.push(PreparedLearnerRepairRun {
             sandbox,

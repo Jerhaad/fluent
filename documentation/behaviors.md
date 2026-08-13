@@ -3940,6 +3940,14 @@ THE SYSTEM SHALL check the local command and authentication status without
 sending a model prompt.
 Test: tests/binary.rs (coder_profile_preflight_does_not_invoke_model)
 
+### B2a
+
+WHEN configured init checks Claude readiness on macOS while the host Claude Code
+login is valid,
+THE SYSTEM SHALL recognize that login without exposing the credential in
+diagnostics even when the isolated worker home has no Claude login state.
+Test: tests/binary.rs (configured_claude_readiness_bridges_keychain_before_auth_probe)
+
 ### B2
 
 IF any configured provider fails readiness during initialization,
@@ -7733,6 +7741,13 @@ without a project model — degrading to the pre-seed behavior — rather
 than aborting the Attempt.
 Test: tests/binary.rs (seed_failure_does_not_abort_attempt)
 
+### B6a
+
+IF the optional seed coder does not finish within 120 seconds,
+THEN THE SYSTEM SHALL continue to the Writer without consuming a Writer round.
+Test: src/coder.rs (bounded_optional_coder_timeout_sweeps_its_process_group)
+Test: tests/binary.rs (seed_failure_does_not_abort_attempt)
+
 ## Learning capture and portable handoff
 
 The **Learner** performs learning capture after a code-producing Attempt
@@ -7910,10 +7925,12 @@ Test: tests/binary.rs (trusted_learner_hydrates_credentials_before_sandbox)
 
 WHEN an effectively sandboxed Learner launches a coder tool that requires
 temporary files,
-THE SYSTEM SHALL provide a unique private writable temporary directory and
-keep shared temporary trees and live project roots non-writable.
+THE SYSTEM SHALL let that tool use temporary state scoped to the current
+workspace while keeping sibling workspace state, shared temporary trees, and
+live project roots non-writable.
 Test: tests/binary.rs (trusted_learner_has_private_temp_without_shared_temp_access)
 Test: src/work_task_executor.rs (create_private_launch_temp_gives_distinct_mode_0700_dirs)
+Test: src/os.rs (confined_profile_writes_only_its_claude_bash_temp_namespace)
 
 ### B17
 

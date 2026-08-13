@@ -92,6 +92,18 @@ impl ProviderReadiness {
                 })
             }
             CoderKind::Claude => {
+                // Autonomous Claude workers run with a Fluent-managed HOME, so
+                // bridge the host credential before asking that isolated CLI
+                // whether it is logged in. The later launch preparation remains
+                // idempotent and reuses the same process environment value.
+                crate::credential::inject_claude_credentials().map_err(|error| {
+                    ProviderReadinessError::Claude(
+                        crate::claude_diagnostics::ClaudeProbeFailure::new(
+                            crate::claude_diagnostics::ClaudeProbeFailureKind::Unknown,
+                            format!("cannot prepare Claude credentials: {error}"),
+                        ),
+                    )
+                })?;
                 let output = Command::new("claude")
                     .args(["auth", "status", "--json"])
                     .output()

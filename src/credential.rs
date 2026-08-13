@@ -1,5 +1,8 @@
 use anyhow::Result;
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -291,16 +294,58 @@ fn read_bounded_probe_output(
 }
 
 /// Read the OAuth token from Keychain via `security find-generic-password`.
+#[cfg(target_os = "macos")]
+fn account_home_from_user_database() -> Option<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    let mut record = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: getpwuid_r receives valid pointers to an owned record and buffer,
+    // and result is checked before pw_dir is read and copied.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut record,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || record.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: a successful getpwuid_r returns a NUL-terminated pw_dir pointer
+    // into buffer, which remains alive until the value is copied below.
+    let home = unsafe { CStr::from_ptr(record.pw_dir) };
+    Some(PathBuf::from(home.to_string_lossy().into_owned()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn account_home_from_user_database() -> Option<PathBuf> {
+    None
+}
+
+fn claude_keychain_command_for(account_home: Option<&Path>) -> Command {
+    let mut command = Command::new("security");
+    command.args([
+        "find-generic-password",
+        "-s",
+        "Claude Code-credentials",
+        "-w",
+    ]);
+    #[cfg(target_os = "macos")]
+    if let Some(home) = account_home {
+        command.arg(home.join("Library/Keychains/login.keychain-db"));
+    }
+    command
+}
+
+pub(crate) fn claude_keychain_command() -> Command {
+    claude_keychain_command_for(account_home_from_user_database().as_deref())
+}
+
 fn read_oauth_from_keychain() -> Option<String> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()
-        .ok()?;
+    let output = claude_keychain_command().output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -724,6 +769,23 @@ mod tests {
         let args = command.get_args().collect::<Vec<_>>();
         assert!(args.contains(&OsStr::new("--safe-mode")));
         assert!(!args.contains(&OsStr::new("--max-turns")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claude_keychain_lookup_uses_account_home_explicitly() {
+        let account_home = Path::new("/Users/account-home");
+        let command = claude_keychain_command_for(Some(account_home));
+        let args = command.get_args().collect::<Vec<_>>();
+
+        assert!(args.contains(&OsStr::new(
+            "/Users/account-home/Library/Keychains/login.keychain-db"
+        )));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("$HOME"))
+        );
     }
 
     #[test]

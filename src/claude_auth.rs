@@ -1,11 +1,9 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
 
 use serde::Deserialize;
 
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone)]
@@ -75,10 +73,7 @@ struct ClaudeAiOauth {
 }
 
 fn read_keychain() -> Option<ClaudeAiOauth> {
-    let output = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
-        .output()
-        .ok()?;
+    let output = crate::credential::claude_keychain_command().output().ok()?;
 
     if !output.status.success() {
         return None;

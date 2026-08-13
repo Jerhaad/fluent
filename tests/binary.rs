@@ -342,10 +342,18 @@ fn nested_work_routes_use_only_fixture_coders() {
             .env("PATH", &path)
             .env("FLUENT_TEST_HERMETIC_NO_SANDBOX", "1")
             .assert()
-            .failure()
-            .stderr(predicate::str::contains(format!(
-                "test provider double blocked {coder} invocation"
-            )));
+            .failure();
+
+        let provider_stderr = project
+            .join(".fluent/work/artifacts")
+            .join(&work_item_id)
+            .join("attempt-1/attempt-1-write-1/provider-stderr.log");
+        let diagnostic = fs::read_to_string(&provider_stderr)
+            .unwrap_or_else(|error| panic!("read {}: {error}", provider_stderr.display()));
+        assert!(
+            diagnostic.contains(&format!("test provider double blocked {coder} invocation")),
+            "provider diagnostic: {diagnostic}"
+        );
     }
 }
 
@@ -396,10 +404,17 @@ fn fixture_coders_fail_closed_on_unknown_invocations() {
         ])
         .env("PATH", &path)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "test provider double blocked claude invocation",
-        ));
+        .failure();
+
+    let provider_stderr = project.join(
+        ".fluent/work/artifacts/unknown-coder/attempt-1/attempt-1-write-1/provider-stderr.log",
+    );
+    let diagnostic = fs::read_to_string(&provider_stderr)
+        .unwrap_or_else(|error| panic!("read {}: {error}", provider_stderr.display()));
+    assert!(
+        diagnostic.contains("test provider double blocked claude invocation"),
+        "provider diagnostic: {diagnostic}"
+    );
 }
 
 #[test]
@@ -2628,6 +2643,48 @@ fn coder_profile_preflight_does_not_invoke_model() {
         ])
         .assert()
         .success();
+}
+
+#[test]
+fn configured_claude_readiness_bridges_keychain_before_auth_probe() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_security(&bin_dir, "readiness-oauth-token");
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        r##"#!/bin/bash
+set -euo pipefail
+if [ "$1 $2 $3" = "auth status --json" ]; then
+  [ "${CLAUDE_CODE_OAUTH_TOKEN:-}" = "readiness-oauth-token" ]
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "$1" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+exit 1
+"##,
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_ALLOW_CREDENTIAL_FIXTURES", "1")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .args([
+            "init",
+            "--coder-profile",
+            "claude-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("readiness-oauth-token").not())
+        .stderr(predicate::str::contains("readiness-oauth-token").not());
 }
 
 #[test]

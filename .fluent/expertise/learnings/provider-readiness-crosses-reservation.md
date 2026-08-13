@@ -13,6 +13,14 @@ interactive session or request model inference. When a provider returns
 structured authentication status, parse and validate the declared state rather
 than treating a successful process exit as proof of authentication.
 
+Do not assume a provider's isolated `HOME` can locate host credentials. On
+macOS, the `security` command derives its default Keychain search list from
+`HOME`; a clean worker home can therefore make a valid login Keychain appear
+empty. A host credential bridge should address the effective Unix account's
+login Keychain explicitly, then pass only the supported credential into the
+prepared provider environment. Never copy the Keychain or credential into the
+worker home.
+
 Run readiness before a phase records its durable in-progress reservation. If
 readiness prepares a launch capability, such as the private Codex worker
 environment, retain the complete readiness object through the reserved launch

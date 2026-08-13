@@ -48,6 +48,79 @@ impl HostSandboxPreflightError {
     }
 }
 
+/// A provider process started, but its runtime could not inspect inherited
+/// process streams inside Fluent's production Seatbelt boundary. This is a host
+/// boundary failure rather than model work and is therefore safely resumable.
+#[derive(Debug)]
+pub(crate) struct HostSandboxLaunchError {
+    message: String,
+}
+
+impl fmt::Display for HostSandboxLaunchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{HOST_SANDBOX_BLOCKED_CODE}: provider launch was blocked by the sandbox boundary: {}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for HostSandboxLaunchError {}
+
+impl HostSandboxLaunchError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Recognize the narrow Claude/Bun startup failure seen when an inherited
+/// stdout or stderr descriptor points outside the worker's readable boundary.
+/// Requiring both the fstat denial and stream-construction evidence avoids
+/// treating ordinary workspace permission errors as host-sandbox failures.
+pub(crate) fn classify_host_sandbox_launch_stderr(path: &Path) -> Option<HostSandboxLaunchError> {
+    let diagnostic = std::fs::read_to_string(path).ok()?;
+    let denied_fstat = diagnostic.contains("EPERM: operation not permitted, fstat");
+    let inherited_stream = diagnostic.contains("new WriteStream")
+        || diagnostic.contains("process.stderr.fd")
+        || diagnostic.contains("process.stdout.fd");
+    (denied_fstat && inherited_stream).then(|| HostSandboxLaunchError {
+        message: format!(
+            "Claude's runtime could not inspect its standard stream; diagnostic saved at {}",
+            path.display()
+        ),
+    })
+}
+
+/// Claude 2.1.220's Bash tool ignores TMPDIR and creates per-session command
+/// state beneath `/private/tmp/claude-<uid>/<workspace-key>/`. Learner profiles
+/// intentionally remove the shared temp-tree grant, so grant only the current
+/// workspace's namespace rather than restoring write access to `/private/tmp`.
+#[cfg(unix)]
+pub(crate) fn claude_bash_temp_root(workspace_path: &Path) -> PathBuf {
+    // SAFETY: geteuid has no preconditions and does not mutate process state.
+    let uid = unsafe { libc::geteuid() };
+    let workspace_key: String = workspace_path
+        .to_string_lossy()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    PathBuf::from(format!("/private/tmp/claude-{uid}/{workspace_key}"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn claude_bash_temp_root(workspace_path: &Path) -> PathBuf {
+    std::env::temp_dir()
+        .join("claude")
+        .join(workspace_path.to_string_lossy().replace(['/', '\\'], "-"))
+}
+
 /// Apply an already-rendered production profile to a harmless command.
 ///
 /// macOS is the only platform where Fluent uses Seatbelt. Keeping this probe
@@ -791,6 +864,94 @@ mod tests {
         assert!(rendered.contains("Fluent will still sandbox its workers"));
         assert!(rendered.contains("do not pass --no-sandbox"));
         assert!(rendered.contains("full-session access"));
+    }
+
+    #[test]
+    fn claude_stream_fstat_denial_is_a_host_sandbox_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostic = dir.path().join("provider-stderr.log");
+        std::fs::write(
+            &diagnostic,
+            "EPERM: operation not permitted, fstat\n    at new WriteStream\nprocess.stderr.fd\n",
+        )
+        .unwrap();
+
+        let failure = classify_host_sandbox_launch_stderr(&diagnostic)
+            .expect("the Claude/Bun inherited-stream failure must be recognized");
+        assert!(failure.message().contains("standard stream"));
+        assert!(failure.message().contains("provider-stderr.log"));
+    }
+
+    #[test]
+    fn unrelated_permission_failure_is_not_a_host_sandbox_launch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostic = dir.path().join("provider-stderr.log");
+        std::fs::write(
+            &diagnostic,
+            "EPERM: operation not permitted, open '/project/private-file'\n",
+        )
+        .unwrap();
+
+        assert!(classify_host_sandbox_launch_stderr(&diagnostic).is_none());
+    }
+
+    #[test]
+    fn claude_bash_temp_root_is_scoped_to_uid_and_workspace() {
+        let first = claude_bash_temp_root(Path::new("/workspace/attempt-a"));
+        let second = claude_bash_temp_root(Path::new("/workspace/attempt-b"));
+        let dotted = claude_bash_temp_root(Path::new("/workspace/.scratch/release-0.2"));
+
+        assert!(first.to_string_lossy().starts_with("/private/tmp/claude-"));
+        assert!(first.ends_with("-workspace-attempt-a"));
+        assert!(dotted.ends_with("-workspace--scratch-release-0-2"));
+        assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn confined_profile_writes_only_its_claude_bash_temp_namespace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let own_temp = claude_bash_temp_root(workspace.path());
+        let sibling_temp = own_temp.with_file_name(format!(
+            "{}-sibling",
+            own_temp.file_name().unwrap().to_string_lossy()
+        ));
+        let resolver = ContentResolver::new(None);
+        let profile = render_profile_for_access_for_coder_with_denied_writes(
+            &resolver,
+            "/Users/test",
+            std::slice::from_ref(&own_temp),
+            &[],
+            &[],
+            CoderKind::Claude,
+        )
+        .unwrap();
+
+        let own_session = own_temp.join("session");
+        let own = Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&profile.path)
+            .arg("/bin/mkdir")
+            .arg("-p")
+            .arg(&own_session)
+            .status()
+            .unwrap();
+        assert!(own.success(), "the task-owned Claude temp must be writable");
+
+        let sibling = Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&profile.path)
+            .arg("/bin/mkdir")
+            .arg("-p")
+            .arg(sibling_temp.join("session"))
+            .status()
+            .unwrap();
+        assert!(
+            !sibling.success(),
+            "a sibling Claude temp namespace must remain denied"
+        );
+
+        let _ = std::fs::remove_dir_all(own_temp);
     }
 
     #[test]

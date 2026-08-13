@@ -1394,7 +1394,11 @@ Git data read-only, strips the shared `/private/tmp` and per-user
 sandboxed branch, and explicitly denies every live root while allowing only the
 coder's staging directory. In place of the shared temp trees, each coder launch
 receives a distinct, mode-0700 private temporary directory created beneath its
-staging scope and held alive for the launch. Fluent launches the coder in its
+staging scope and held alive for the launch. Claude 2.1.220's Bash tool creates
+command state under `/private/tmp/claude-<uid>/<workspace-key>/` even when
+`TMPDIR` points at that private directory, so a Claude Learner additionally gets
+write access to only its current workspace key. Sibling workspace keys and the
+rest of `/private/tmp` remain denied. Fluent launches the coder in its
 own process group and kills surviving descendants before it imports the draft.
 It then opens the draft without following the final component, requires one
 bounded regular inode with no hardlink aliases, and writes through a retained
@@ -1535,6 +1539,17 @@ while preserving the selected model, subscription authentication, built-in
 tools, and Fluent's Seatbelt sandbox. Intentionally interactive Claude sessions
 do not receive that flag and retain user customizations.
 
+Captured provider launches do not inherit Fluent's scheduler stderr descriptor.
+Fluent pre-opens `provider-stderr.log` beside the task transcript and gives that
+task-owned descriptor to the provider. This preserves diagnostics while keeping
+Claude/Bun startup independent of whether the scheduler's own log path is inside
+the worker's Seatbelt roots. Learner profiles grant read access to the exact
+host-owned run-evidence directory so Claude can inspect that descriptor, while
+keeping the directory outside the Learner's writable `staging` subtree. Optional
+autonomous calls with no transcript use stable null device streams. A Claude/Bun
+`fstat` denial while constructing an inherited standard stream is classified as
+a resumable `host-sandbox` launch failure rather than a Writer round cap.
+
 `claude_auth.rs` detects Claude auth token expiry before and during
 coder invocations, failing the Task with a clear recovery message
 instead of letting the coder fail mid-Task with a cold 401. Two layers:
@@ -1580,7 +1595,11 @@ login. Readiness treats valid `claude auth status --json` output as the
 authoritative status even when the command exits nonzero because Claude can
 return a logged-out JSON status with exit code 1. For a logged-out status,
 Fluent probes the Claude Code Keychain entry to distinguish an inaccessible
-host credential boundary from an actual logout.
+host credential boundary from an actual logout. Before the Claude readiness
+probe, it runs the same host Keychain-to-environment bridge used by
+managed Claude workers. On macOS, the bridge derives the login Keychain from the
+effective Unix account record instead of the launch's `HOME`, so an isolated
+worker home does not turn a healthy host login into a false logged-out result.
 
 The coder returns a typed `AuthError` (via `anyhow::Error::new`) instead of a plain
 string `bail!`, so callers can recover the type via
@@ -1590,6 +1609,11 @@ immediately to `needs-user` with the auth-specific handoff message
 from `AuthError::user_message()`. Typed rate-limit exhaustion follows the same
 no-outer-retry rule; other coder errors still retry up to
 `FLUENT_MAX_TASK_RETRIES`.
+
+Project-model seeding is best-effort work before the first Writer. Built-in seed
+coders run under a 120-second host deadline and own their process group. A
+timeout terminates that group, emits a warning, and continues to the
+authoritative Writer without charging its round budget.
 
 `fluent cleanup` owns the terminal Work model cleanup lifecycle. It
 defaults to a dry run and only mutates state with `--apply`. A Work Item
