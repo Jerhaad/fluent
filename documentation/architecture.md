@@ -2969,6 +2969,10 @@ behaviors, and contracts.
 Observations captured during usage become Work Items that build or
 improve things. Patterns observed across Work Items accumulate as
 project expertise in `.fluent/expertise/`.
+The initial seed describes the workspace immediately before the first
+Writer starts. Fluent passes that source commit to the first Writer and
+instructs the Writer to reconcile seeded current-state claims that its
+changes invalidate before review.
 
 ## Content resolution
 

@@ -7768,6 +7768,20 @@ Attempt's writer Task so the writer's prompt includes the project
 model.
 Test: src/work_task_executor.rs (write_prompt_includes_project_index_after_seed)
 
+### B5a
+
+WHEN the seed step completes before an Attempt's writer Task,
+THE SYSTEM SHALL tell that writer which starting commit the project model
+describes.
+Test: src/work_task_executor.rs (write_prompt_identifies_new_seed_as_starting_state)
+
+### B5b
+
+WHEN a writer Task receives a project model seeded immediately before it runs,
+THE SYSTEM SHALL instruct that writer to reconcile any current-state expertise
+claims that its changes invalidate before finishing.
+Test: src/work_task_executor.rs (write_prompt_identifies_new_seed_as_starting_state)
+
 ### B6
 
 IF the seed step fails,

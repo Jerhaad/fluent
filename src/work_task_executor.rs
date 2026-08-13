@@ -3629,9 +3629,15 @@ fn run_task_coder_with_coder(
     materialize_planning_files(item, project_root)?;
     materialize_general_expertise(project_root)?;
 
-    if should_seed_project_model(task.kind, workspace_path)
+    let seeded_project_expertise_source = if should_seed_project_model(task.kind, workspace_path)
         && coder_kind != CoderKind::Codex
-        && let Err(err) = run_seed_project_model(
+    {
+        let source_commit = crate::git::run_stdout(
+            workspace_path,
+            &["rev-parse", "HEAD"],
+            "identifying the project expertise seed source",
+        )?;
+        match run_seed_project_model(
             workspace_path,
             resolver,
             extra_args,
@@ -3639,12 +3645,18 @@ fn run_task_coder_with_coder(
             no_sandbox,
             model,
             effort,
-        )
-    {
-        eprintln!(
-            "  Warning: seed project model failed, continuing without project expertise: {err}"
-        );
-    }
+        ) {
+            Ok(()) => Some(source_commit),
+            Err(err) => {
+                eprintln!(
+                    "  Warning: seed project model failed, continuing without project expertise: {err}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let progress_dir = progress_md_dir(project_root, &item.id, attempt_id);
     fs::create_dir_all(&progress_dir).with_context(|| {
@@ -3694,13 +3706,14 @@ fn run_task_coder_with_coder(
         )
     } else {
         (
-            build_write_task_prompt_with_workspace(
+            build_write_task_prompt_with_seed_context(
                 item,
                 attempt_id,
                 task_id,
                 prior_reviews,
                 Some(workspace_path),
                 Some(project_root),
+                seeded_project_expertise_source.as_deref(),
             ),
             crate::writer_context::WriterPromptKind::Initial,
         )
@@ -3997,6 +4010,7 @@ fn build_write_task_prompt(
     build_write_task_prompt_with_workspace(item, attempt_id, task_id, prior_reviews, None, None)
 }
 
+#[cfg(test)]
 fn build_write_task_prompt_with_workspace(
     item: &WorkItem,
     attempt_id: &str,
@@ -4004,6 +4018,26 @@ fn build_write_task_prompt_with_workspace(
     prior_reviews: &[PathBuf],
     workspace_path: Option<&Path>,
     project_root: Option<&Path>,
+) -> String {
+    build_write_task_prompt_with_seed_context(
+        item,
+        attempt_id,
+        task_id,
+        prior_reviews,
+        workspace_path,
+        project_root,
+        None,
+    )
+}
+
+fn build_write_task_prompt_with_seed_context(
+    item: &WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    prior_reviews: &[PathBuf],
+    workspace_path: Option<&Path>,
+    project_root: Option<&Path>,
+    seeded_project_expertise_source: Option<&str>,
 ) -> String {
     let attempt = item
         .attempts
@@ -4140,6 +4174,11 @@ fn build_write_task_prompt_with_workspace(
     } else {
         ""
     };
+    let has_newly_seeded_project_expertise_value = if seeded_project_expertise_source.is_some() {
+        "yes"
+    } else {
+        ""
+    };
     let corrective_context = corrective_execution_context(item).unwrap_or_default();
     let is_corrective_value = if corrective_context.is_empty() {
         ""
@@ -4211,6 +4250,14 @@ fn build_write_task_prompt_with_workspace(
             (
                 "has_project_expertise_index",
                 has_project_expertise_index_value,
+            ),
+            (
+                "has_newly_seeded_project_expertise",
+                has_newly_seeded_project_expertise_value,
+            ),
+            (
+                "seeded_project_expertise_source",
+                seeded_project_expertise_source.unwrap_or_default(),
             ),
         ],
     )
@@ -16995,6 +17042,59 @@ mod tests {
         assert!(
             prompt_after.contains(&expertise_dir.join("INDEX.md").display().to_string()),
             "prompt should reference the INDEX.md path"
+        );
+    }
+
+    #[test]
+    fn write_prompt_identifies_new_seed_as_starting_state() {
+        let item = review_item();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let expertise_dir = workspace.join(".fluent/expertise");
+        fs::create_dir_all(&expertise_dir).unwrap();
+        fs::write(expertise_dir.join("INDEX.md"), "# Project Index\n").unwrap();
+        fs::write(expertise_dir.join("overview.md"), "# Overview\n").unwrap();
+        let source_commit = "0123456789abcdef0123456789abcdef01234567";
+
+        let prompt = build_write_task_prompt_with_seed_context(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            Some(workspace),
+            None,
+            Some(source_commit),
+        );
+
+        assert!(
+            prompt.contains(source_commit),
+            "prompt should identify the commit described by the seed"
+        );
+        assert!(
+            prompt.contains("current-state claims")
+                && prompt.contains("Update any claim your changes"),
+            "prompt should instruct the first Writer to reconcile invalidated claims"
+        );
+        assert!(
+            !prompt.contains("{{"),
+            "prompt should not retain template placeholders: {prompt}"
+        );
+
+        let ordinary_prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            Some(workspace),
+            None,
+        );
+        assert!(
+            !ordinary_prompt.contains(source_commit),
+            "ordinary project expertise should not include fresh-seed provenance"
+        );
+        assert_ne!(
+            prompt, ordinary_prompt,
+            "freshly seeded and ordinary expertise should render different context"
         );
     }
 
