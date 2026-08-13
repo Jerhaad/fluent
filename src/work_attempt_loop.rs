@@ -597,6 +597,11 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 });
                 return Ok(WorkAttemptRunResult { outcomes });
             }
+            let candidate_id = config
+                .store
+                .mutate_work_item(config.work_item_id, |fresh| {
+                    fresh.mark_merge_candidate_ready(config.attempt_id)
+                })?;
             outcomes.push(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
             return Ok(WorkAttemptRunResult { outcomes });
         }
@@ -6998,6 +7003,12 @@ fn interpret_reviews(
         store.write_work_item(&item)?;
         return Ok(WorkAttemptRunOutcome::ReviewOnlyComplete);
     }
+    // A production code-producing Attempt is structurally Complete after reviews,
+    // but its end-to-end completion time is the later instant when Learning
+    // succeeds. Tests may deliberately omit the Learner boundary.
+    if learner_config.is_some() {
+        item.attempts[attempt_index].completed_at = None;
+    }
     // Allocate the Merge Candidate identity before the Learner runs, so the
     // handoff can reference it and a confined expertise commit can update its
     // tip.
@@ -7008,12 +7019,9 @@ fn interpret_reviews(
     store.write_work_item(&item)?;
     // Run the Learner for every code-producing Attempt, whether or not a
     // reviewer raised a finding.
-    // A no-expertise Learner settles every terminal transition through its own
-    // fresh, field-level mutations and refreshes `item` from the durable store, so a
-    // post-Learner whole-aggregate write here would reopen the stale-write window the
-    // release correction closes. Skip it for that mode; capture persists its
-    // canonical result inside `run_learner_step`.
-    let mut skip_post_learner_aggregate_write = false;
+    // Each Learner mode persists its own outcome. The final readiness stamp below
+    // uses one fresh field-level mutation so no-expertise execution does not reopen
+    // its stale whole-aggregate write window.
     if let Some(ref learner_config) = learner_config {
         // The Learner runs before land here, so it is never post-land handoff-only.
         // The Work Item's stored policy selects capture or pre-land no-expertise.
@@ -7027,7 +7035,6 @@ fn interpret_reviews(
             mode,
             learner_config,
         )?;
-        skip_post_learner_aggregate_write = mode.is_pre_land_no_expertise();
         // Advancement gate: a Learner ran in this path, so its result gates
         // readiness. A non-succeeded Learner blocks MergeCandidateReady with the same
         // durable reason surfaced by Merge Candidate validation and landing, rather
@@ -7039,10 +7046,12 @@ fn interpret_reviews(
                 relaunchable: learner_relaunchable(&item, attempt_id),
             });
         }
+        let candidate_id = store.mutate_work_item(&item.id, |fresh| {
+            fresh.mark_merge_candidate_ready(attempt_id)
+        })?;
+        return Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
     }
-    if !skip_post_learner_aggregate_write {
-        store.write_work_item(&item)?;
-    }
+    store.write_work_item(&item)?;
     Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id })
 }
 
@@ -11780,6 +11789,11 @@ mod tests {
             .as_ref()
             .expect("learner ran on first pass");
         assert!(learning.is_succeeded());
+        let ready_at = stored.merge_candidates[0]
+            .ready_at
+            .as_ref()
+            .expect("successful Learning stamps candidate readiness");
+        assert_eq!(stored.attempts[0].completed_at.as_ref(), Some(ready_at));
         let handoff_ref = learning.handoff.as_ref().expect("handoff persisted");
         let handoff = crate::learner::load_verified_handoff(&project_root, handoff_ref).unwrap();
         assert_eq!(handoff.source_work_item_id, "work-1");
@@ -11827,6 +11841,15 @@ mod tests {
                 ..
             }
         ));
+        let failed = store.read_work_item("work-1").unwrap();
+        assert!(
+            failed.attempts[0].completed_at.is_none(),
+            "failed Learning must not end end-to-end Attempt timing"
+        );
+        assert!(
+            failed.merge_candidates[0].ready_at.is_none(),
+            "failed Learning must not stamp candidate readiness"
+        );
 
         let resumed = store.read_work_item("work-1").unwrap();
         let task_count = resumed.attempts[0].tasks.len();
@@ -11889,6 +11912,11 @@ mod tests {
                 .as_ref()
                 .is_some_and(AttemptLearning::is_succeeded)
         );
+        let ready_at = resumed.merge_candidates[0]
+            .ready_at
+            .as_ref()
+            .expect("Learner retry stamps candidate readiness");
+        assert_eq!(resumed.attempts[0].completed_at.as_ref(), Some(ready_at));
     }
 
     #[test]
@@ -15751,6 +15779,10 @@ mod tests {
         assert!(
             stored.attempts[0].learning.is_none(),
             "review-only Attempt records no learning"
+        );
+        assert!(
+            stored.attempts[0].completed_at.is_some(),
+            "review-only Attempt completion ends its timing"
         );
     }
 

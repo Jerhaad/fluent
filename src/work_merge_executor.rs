@@ -3135,6 +3135,7 @@ mod tests {
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         }

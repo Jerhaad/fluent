@@ -9,6 +9,7 @@ attempts, tasks, and merge candidates persist as separate records.
 
 - [Patterns](#patterns)
 - [Resume transitions](#resume-transitions)
+- [Readiness timing](#readiness-timing)
 - [Writer-cap accounting](#writer-cap-accounting)
 
 ## Patterns
@@ -25,6 +26,20 @@ inside `mutate_work_item` before changing lifecycle state, so a stale queue
 decision cannot reopen a different candidate frontier. Return a small immutable
 frontier value and compare it across the transition; do not infer recovery from
 the pause label alone.
+
+## Readiness timing
+
+Allocate a Merge Candidate before Learning so its identity remains durable
+across Learner failure and retry. Treat `merge_candidate.created_at` as that
+allocation time, not as proof that the candidate can land.
+
+For a code-producing Attempt, passing review makes the Attempt structurally
+Complete but leaves `attempt.completed_at` unset. After Learning succeeds, use
+one fresh Work-model mutation to stamp `merge_candidate.ready_at` and
+`attempt.completed_at` with the same first-readiness time. Reuse an existing
+`ready_at` during retry or legacy repair so repeated readiness checks remain
+idempotent. Review-only Attempts do not run Learning and keep their review
+completion time.
 
 ## Writer-cap accounting
 

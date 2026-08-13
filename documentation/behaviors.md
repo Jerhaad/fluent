@@ -3595,10 +3595,11 @@ Test: src/work_model.rs (initial_attempt_populates_created_at_timestamps)
 
 ### B5
 
-WHEN Fluent transitions an Attempt to a terminal status (Complete,
-Failed, or NeedsUser),
+WHEN an Attempt reaches Failed, NeedsUser, or review-only Complete without a
+pending Learning gate,
 THE SYSTEM SHALL set `attempt.completed_at` to the current UTC time.
-Test: src/work_model.rs (set_attempt_terminal_round_trip)
+Test: src/work_model.rs (set_attempt_terminal_round_trip),
+src/work_attempt_loop.rs (review_only_attempt_skips_learner)
 
 ### B6
 
@@ -3647,7 +3648,31 @@ WHEN Fluent writes a Task, Attempt, or Merge Candidate JSON file,
 THE SYSTEM SHALL skip emitting timestamp keys whose value is None,
 so on-disk JSON stays compact and existing JSON files remain stable
 when re-saved unchanged.
-Test: src/work_model.rs (task_default_serializes_without_timestamps)
+Test: src/work_model.rs (task_default_serializes_without_timestamps,
+legacy_merge_candidate_without_ready_at_round_trips_without_field)
+
+### B12
+
+WHEN a code-producing Attempt passes review and its Learner has not succeeded,
+THE SYSTEM SHALL leave `attempt.completed_at` and its Merge Candidate's
+`ready_at` unset.
+Test: src/work_attempt_loop.rs (learner_only_resume_uses_attempt_coder_mapping)
+
+### B13
+
+WHEN a code-producing Attempt's Learner succeeds initially or on retry,
+THE SYSTEM SHALL record one first-readiness time as both the Merge Candidate's
+`ready_at` and the Attempt's `completed_at`.
+Test: src/work_attempt_loop.rs (learner_runs_after_first_pass_without_findings,
+learner_only_resume_uses_attempt_coder_mapping)
+
+### B14
+
+WHEN a legacy Merge Candidate without `ready_at` next passes the Learning
+readiness gate,
+THE SYSTEM SHALL stamp its first-readiness time without changing its identity.
+Test: src/work_model.rs (legacy_merge_candidate_without_ready_at_round_trips_without_field,
+merge_candidate_readiness_stamps_one_shared_idempotent_time)
 
 ## Per-test log output
 

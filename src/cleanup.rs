@@ -816,6 +816,7 @@ mod tests {
             merge_review_state: MergeReviewState::Reviewing,
             merge_state: crate::work_model::MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         };
@@ -882,6 +883,7 @@ mod tests {
                 merge_review_state: MergeReviewState::Passed,
                 merge_state: crate::work_model::MergeCandidateMergeState::default(),
                 created_at: None,
+                ready_at: None,
                 started_at: None,
                 completed_at: None,
             };

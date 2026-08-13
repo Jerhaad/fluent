@@ -75,6 +75,12 @@ the reviewed Writer commit exact through Learner for a release gate that require
 one unchanged SHA. Only a successful Learner run makes the pending Merge
 Candidate ready. A relaunchable Learner failure leaves the candidate non-ready
 and unlandable; `fluent attempt run` retries only the Learner in the same mode.
+A Merge Candidate's `created_at` records its pre-Learner identity allocation.
+When Learning succeeds, one fresh Work-model mutation stamps its `ready_at` and
+the code-producing Attempt's `completed_at` with the same instant. This keeps
+crash recovery anchored to the early candidate identity while end-to-end Attempt
+timing includes Learning. Legacy candidates omit `ready_at` until a later
+readiness check backfills it.
 A failure after the coder ran but before its host evidence became durable is
 non-relaunchable: status reports
 `learner-blocked`, and human evidence recovery is required before advancement.

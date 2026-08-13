@@ -369,6 +369,7 @@ mod tests {
                 follow_up_failure: None,
             },
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });

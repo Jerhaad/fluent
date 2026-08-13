@@ -1400,10 +1400,39 @@ impl WorkItem {
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: Some(now_iso8601()),
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
 
+        self.validate()?;
+        Ok(candidate_id)
+    }
+
+    /// Stamp the first instant a reviewed, learned candidate becomes eligible
+    /// to land and use the same instant as the Attempt's end-to-end completion.
+    pub fn mark_merge_candidate_ready(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<String, WorkModelError> {
+        let attempt_index = self
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let candidate_index = self
+            .merge_candidates
+            .iter()
+            .position(|candidate| candidate.attempt_id == attempt_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: format!("{attempt_id}-merge-candidate"),
+            })?;
+        let attempt = &mut self.attempts[attempt_index];
+        let candidate = &mut self.merge_candidates[candidate_index];
+        mark_attempt_merge_candidate_ready(attempt, candidate)?;
+        let candidate_id = candidate.id.clone();
         self.validate()?;
         Ok(candidate_id)
     }
@@ -5118,6 +5147,10 @@ pub struct MergeCandidate {
     pub merge_state: MergeCandidateMergeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// The instant this candidate first passed its Learning gate and became
+    /// eligible to land. Legacy candidates omit it and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5217,6 +5250,15 @@ impl MergeCandidate {
                 candidate_id: self.id.clone(),
                 attempt_id: self.attempt_id.clone(),
             });
+        }
+        if let Some(ready_at) = self.ready_at.as_ref() {
+            attempt.learning_advancement_readiness()?;
+            if attempt.completed_at.as_ref() != Some(ready_at) {
+                return Err(WorkModelError::MergeCandidateReadinessTimestampMismatch {
+                    candidate_id: self.id.clone(),
+                    attempt_id: self.attempt_id.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -5420,6 +5462,26 @@ pub fn mark_merge_candidate_started(candidate: &mut MergeCandidate) {
     candidate.started_at.get_or_insert_with(now_iso8601);
 }
 
+/// Record the first instant a code-producing Attempt and its Merge Candidate
+/// become ready to land. Reusing `ready_at` makes retries idempotent and repairs
+/// legacy Attempts whose `completed_at` stopped at review completion.
+fn mark_attempt_merge_candidate_ready(
+    attempt: &mut Attempt,
+    candidate: &mut MergeCandidate,
+) -> Result<(), WorkModelError> {
+    if attempt.status != AttemptStatus::Complete
+        || attempt.review_state != Some(AttemptReviewState::Passed)
+    {
+        return Err(WorkModelError::AttemptReviewsNotPassed {
+            attempt_id: attempt.id.clone(),
+        });
+    }
+    attempt.learning_advancement_readiness()?;
+    let ready_at = candidate.ready_at.get_or_insert_with(now_iso8601).clone();
+    attempt.completed_at = Some(ready_at);
+    Ok(())
+}
+
 pub fn set_merge_candidate_terminal(
     candidate: &mut MergeCandidate,
     status: MergeCandidateMergeStatus,
@@ -5438,6 +5500,10 @@ pub enum WorkModelError {
     AttemptResumeIneligible {
         attempt_id: String,
         reason: String,
+    },
+    MergeCandidateReadinessTimestampMismatch {
+        candidate_id: String,
+        attempt_id: String,
     },
     RoundCapExtensionIncrementOutOfRange {
         requested: usize,
@@ -5684,6 +5750,13 @@ impl fmt::Display for WorkModelError {
                     "Merge Candidate {candidate_id:?} references missing Attempt {attempt_id:?}"
                 )
             }
+            Self::MergeCandidateReadinessTimestampMismatch {
+                candidate_id,
+                attempt_id,
+            } => write!(
+                f,
+                "Merge Candidate {candidate_id:?} readiness time does not match Attempt {attempt_id:?} completion time"
+            ),
             Self::MergeCandidateAttemptReviewsNotPassed {
                 candidate_id,
                 attempt_id,
@@ -9218,6 +9291,7 @@ random banner prose that must be ignored
                 merge_review_state: MergeReviewState::Reviewing,
                 merge_state: MergeCandidateMergeState::default(),
                 created_at: None,
+                ready_at: None,
                 started_at: None,
                 completed_at: None,
             }],
@@ -10494,6 +10568,7 @@ random banner prose that must be ignored
                 follow_up_failure: None,
             },
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -11054,6 +11129,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -11272,6 +11348,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -11336,6 +11413,7 @@ random banner prose that must be ignored
                 follow_up_failure: None,
             },
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -11394,6 +11472,7 @@ random banner prose that must be ignored
                 follow_up_failure: None,
             },
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -11434,6 +11513,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Passed,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         };
@@ -11642,9 +11722,47 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         }
+    }
+
+    #[test]
+    fn merge_candidate_readiness_stamps_one_shared_idempotent_time() {
+        let mut item = work_item_with_completed_write("work-1");
+        item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        item.attempts[0].completed_at = Some("2026-01-01T00:00:00Z".to_string());
+        item.attempts[0].learning = Some(AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/learner/work-1/attempt-1/handoff.json".to_string(),
+                digest: "sha256:test".to_string(),
+            },
+        ));
+        let candidate_id = item.create_or_get_merge_candidate("attempt-1").unwrap();
+
+        assert_eq!(
+            item.mark_merge_candidate_ready("attempt-1").unwrap(),
+            candidate_id
+        );
+        let first = item.merge_candidates[0].ready_at.clone().unwrap();
+        assert_eq!(
+            item.attempts[0].completed_at.as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(item.merge_candidates[0].id, candidate_id);
+
+        item.attempts[0].completed_at = Some("2025-01-01T00:00:00Z".to_string());
+        item.mark_merge_candidate_ready("attempt-1").unwrap();
+        assert_eq!(
+            item.merge_candidates[0].ready_at.as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            item.attempts[0].completed_at.as_deref(),
+            Some(first.as_str())
+        );
     }
 
     #[test]
@@ -12234,14 +12352,36 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: Some("2026-06-12T10:00:00+00:00".to_string()),
+            ready_at: Some("2026-06-12T10:04:00+00:00".to_string()),
             started_at: Some("2026-06-12T10:01:00+00:00".to_string()),
             completed_at: Some("2026-06-12T10:05:00+00:00".to_string()),
         };
         let json = serde_json::to_string(&candidate).unwrap();
         let round_tripped: MergeCandidate = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped.created_at, candidate.created_at);
+        assert_eq!(round_tripped.ready_at, candidate.ready_at);
         assert_eq!(round_tripped.started_at, candidate.started_at);
         assert_eq!(round_tripped.completed_at, candidate.completed_at);
+    }
+
+    #[test]
+    fn legacy_merge_candidate_without_ready_at_round_trips_without_field() {
+        let json = r#"{
+            "id": "mc-1",
+            "attempt_id": "a-1",
+            "source_workspace": {"id": "candidate", "path": "../candidate"},
+            "target_workspace": {"id": "target", "path": "."},
+            "source_branch": "main",
+            "target_branch": "main",
+            "candidate_commit": "abc123",
+            "merge_review_state": "pending",
+            "merge_state": {"status": "pending"}
+        }"#;
+
+        let candidate: MergeCandidate = serde_json::from_str(json).unwrap();
+        assert_eq!(candidate.ready_at, None);
+        let reserialized = serde_json::to_string(&candidate).unwrap();
+        assert!(!reserialized.contains("\"ready_at\""));
     }
 
     #[test]
@@ -12395,6 +12535,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         });
@@ -12949,6 +13090,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: None,
             completed_at: None,
         };
@@ -12969,6 +13111,7 @@ random banner prose that must be ignored
             merge_review_state: MergeReviewState::Pending,
             merge_state: MergeCandidateMergeState::default(),
             created_at: None,
+            ready_at: None,
             started_at: Some("2026-01-01T00:00:00+00:00".to_string()),
             completed_at: None,
         };
