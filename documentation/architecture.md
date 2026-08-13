@@ -594,12 +594,15 @@ focused verification only as advisory evidence. Review-only reviewers consume
 their Tester-first result as default executable evidence.
 
 Status and `work-item show` expose cycle-cost measurements alongside lifecycle
-state: review rounds, summed duration of completed Tasks, input/output tokens,
-repeated stable findings, artifact bytes, and pre-review continuation cycles that
-avoided premature Tester and review work. Task settlement updates only that
-Task's contribution to one per-Work-Item sidecar under `.fluent/work/metrics/`;
+state: review rounds, summed duration of completed Tasks, known provider wait,
+active duration after subtracting that wait, input/output tokens, repeated stable
+findings, artifact bytes, and pre-review continuation cycles that avoided
+premature Tester and review work. Task settlement updates only that Task's
+contribution to one per-Work-Item sidecar under `.fluent/work/metrics/`;
 read-only status and show load only that bounded file and never recursively walk
-artifact trees. After an upgrade or manual artifact repair,
+artifact trees. Live Task state may read the Task's two bounded provider timing
+documents directly to distinguish `provider-wait` from ordinary execution.
+After an upgrade or manual artifact repair,
 `fluent work-item rebuild-metrics [id]` reconstructs the complete sidecar
 explicitly.
 
@@ -1509,6 +1512,20 @@ entering rate-limit state (naming the reason and expected resume
 time) and once on leaving (after the first successful invocation
 following a pause). Repeated retries within the same pause do not
 fire additional enter-state notifications.
+
+Provider wait has two observation points because two processes own retries.
+Fluent's wrapper writes each outer rate-limit sleep to `provider-timing.json` in
+the role artifact directory. While a provider child remains alive, the transcript
+pump recognizes Claude Code `system/api_retry` records and writes their declared
+delay and observed elapsed wait to `transcript-pump.json`. The pump persists an
+expected resume time as soon as it sees the record, so status can show
+`provider-wait` while no further bytes arrive. The next provider record or pump
+completion closes the interval, capped at the provider's declared delay. These
+documents are diagnostics, not retry authority. Before an authentication or
+rate-limit relaunch replaces pump status, Fluent adds the completed phase's pump
+timing to the role-owned sidecar. The recorded phase number prevents a resumed
+handoff from counting the same wait twice. Malformed or unknown records do not
+change execution.
 
 Author and reviewer Tasks inherit this
 behavior without further plumbing.

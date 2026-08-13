@@ -277,6 +277,18 @@ WHEN `fluent work-item rebuild-metrics` runs, THE SYSTEM SHALL rebuild persisted
 metrics for the named Work Item, or for every Work Item when no id is supplied.
 Test: tests/binary.rs (work_item_rebuild_metrics_indexes_artifacts_for_fast_reads)
 
+### B4
+
+WHEN an executing Task's provider reports a retry delay whose expected resume
+time is still in the future, THE SYSTEM SHALL show that Task as `provider-wait`.
+Test: src/work_status.rs (executing_task_shows_active_provider_wait)
+
+### B5
+
+WHEN Fluent reports completed cycle-cost metrics, THE SYSTEM SHALL report active
+Task duration as total Task duration minus known provider wait.
+Test: src/work_status.rs (metrics_are_derived_from_local_work_evidence)
+
 ## Host evidence recovery
 
 ### B1
@@ -6093,9 +6105,10 @@ Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execu
 ### B15
 
 WHEN Fluent reports status or shows a Work Item, THE SYSTEM SHALL expose review
-rounds, completed-stage duration, local transcript token use, repeated findings,
-artifact bytes, and pre-review cycles avoided, deriving measurements only from
-that Work Item's stored model and project-local artifacts.
+rounds, completed-stage duration, active duration, provider wait, local transcript
+token use, repeated findings, artifact bytes, and pre-review cycles avoided,
+deriving measurements only from that Work Item's stored model and project-local
+artifacts.
 Test: src/work_status.rs (metrics_are_derived_from_local_work_evidence)
 Test: src/usage.rs (task_usage_is_persisted_beside_the_transcript)
 Test: tests/binary.rs (work_show_outputs_pretty_json_for_one_work_item)

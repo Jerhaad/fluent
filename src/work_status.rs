@@ -49,6 +49,8 @@ pub struct ReleaseStatus {
 pub struct WorkMetrics {
     pub review_rounds: usize,
     pub stage_duration_ms: u64,
+    pub active_duration_ms: u64,
+    pub provider_wait_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub repeated_findings: usize,
@@ -69,6 +71,8 @@ struct PersistedFilesystemMetrics {
     #[serde(default)]
     artifact_bytes: u64,
     #[serde(default)]
+    provider_wait_ms: u64,
+    #[serde(default)]
     unattributed_input_tokens: u64,
     #[serde(default)]
     unattributed_output_tokens: u64,
@@ -86,6 +90,8 @@ struct PersistedTaskMetrics {
     input_tokens: u64,
     output_tokens: u64,
     artifact_bytes: u64,
+    #[serde(default)]
+    provider_wait_ms: u64,
     #[serde(default)]
     finding_identities: Vec<String>,
 }
@@ -293,6 +299,7 @@ fn collect_task_metrics(project_root: &Path, item: &WorkItem, task: &Task) -> Pe
         } else {
             0
         },
+        provider_wait_ms: provider_wait_ms(&root),
         ..Default::default()
     };
     if task.kind == TaskKind::Review {
@@ -321,6 +328,11 @@ fn aggregate_persisted_metrics(persisted: &mut PersistedFilesystemMetrics) {
         .values()
         .map(|metrics| metrics.artifact_bytes)
         .fold(persisted.unattributed_artifact_bytes, u64::saturating_add);
+    persisted.provider_wait_ms = persisted
+        .tasks
+        .values()
+        .map(|metrics| metrics.provider_wait_ms)
+        .fold(0_u64, u64::saturating_add);
     let mut findings_seen = HashSet::new();
     persisted.repeated_findings = persisted
         .tasks
@@ -387,8 +399,26 @@ fn compute_work_metrics(item: &WorkItem, persisted: &PersistedFilesystemMetrics)
         .flat_map(|attempt| &attempt.tasks)
         .filter_map(task_duration_ms)
         .fold(0_u64, u64::saturating_add);
+    metrics.provider_wait_ms = persisted.provider_wait_ms;
+    metrics.active_duration_ms = metrics
+        .stage_duration_ms
+        .saturating_sub(metrics.provider_wait_ms);
 
     metrics
+}
+
+fn provider_wait_ms(artifact_dir: &Path) -> u64 {
+    let pump_wait = fs::read(artifact_dir.join("transcript-pump.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::transcript_pump::PumpStatus>(&bytes).ok())
+        .map(|status| status.provider_timing.wait_ms)
+        .unwrap_or(0);
+    let outer_wait = crate::coder::read_provider_retry_timing(
+        &artifact_dir.join(crate::coder::PROVIDER_TIMING_FILENAME),
+    )
+    .map(|timing| timing.wait_ms)
+    .unwrap_or(0);
+    pump_wait.saturating_add(outer_wait)
 }
 
 fn task_duration_ms(task: &Task) -> Option<u64> {
@@ -473,9 +503,11 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                 ));
             }
             output.push_str(&format!(
-                "  metrics: rounds:{} duration:{}ms tokens:{}/{} repeated:{} artifacts:{}B avoided:{}\n",
+                "  metrics: rounds:{} duration:{}ms active:{}ms provider-wait:{}ms tokens:{}/{} repeated:{} artifacts:{}B avoided:{}\n",
                 row.metrics.review_rounds,
                 row.metrics.stage_duration_ms,
+                row.metrics.active_duration_ms,
+                row.metrics.provider_wait_ms,
                 row.metrics.input_tokens,
                 row.metrics.output_tokens,
                 row.metrics.repeated_findings,
@@ -512,9 +544,11 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
         lines.push(format!("  Merge Candidate: {}", row.merge_candidate));
         lines.push(format!("  Merge: {}", row.merge));
         lines.push(format!(
-            "  Metrics: rounds {} · duration {}ms · tokens {}/{} · repeated {} · artifacts {}B · avoided {}",
+            "  Metrics: rounds {} · duration {}ms · active {}ms · provider-wait {}ms · tokens {}/{} · repeated {} · artifacts {}B · avoided {}",
             row.metrics.review_rounds,
             row.metrics.stage_duration_ms,
+            row.metrics.active_duration_ms,
+            row.metrics.provider_wait_ms,
             row.metrics.input_tokens,
             row.metrics.output_tokens,
             row.metrics.repeated_findings,
@@ -624,8 +658,33 @@ fn effective_task_status_label(
                 return "interrupted";
             }
         }
+        if project_root.is_some_and(|root| task_is_provider_waiting(root, task)) {
+            return "provider-wait";
+        }
     }
     task.status.as_str()
+}
+
+fn task_is_provider_waiting(project_root: &Path, task: &Task) -> bool {
+    let Some(area) = task.artifact_area.as_ref() else {
+        return false;
+    };
+    let artifact_dir = project_root.join(&area.path);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let pump_waiting = fs::read(artifact_dir.join("transcript-pump.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::transcript_pump::PumpStatus>(&bytes).ok())
+        .and_then(|status| status.provider_timing.resume_at_ms)
+        .is_some_and(|resume| resume > now);
+    let outer_waiting = crate::coder::read_provider_retry_timing(
+        &artifact_dir.join(crate::coder::PROVIDER_TIMING_FILENAME),
+    )
+    .and_then(|timing| timing.resume_at_ms)
+    .is_some_and(|resume| resume > now);
+    pump_waiting || outer_waiting
 }
 
 fn is_task_live_executing(task: &Task, item: &WorkItem, project_root: Option<&Path>) -> bool {
@@ -1039,12 +1098,37 @@ mod tests {
             r#"[{"ts":"2026-08-03T10:00:02Z","coder":"codex","work_item_id":"metrics-work","attempt_id":"attempt-1","task_id":"attempt-1-write-1","model":"gpt-5","input_tokens":120,"output_tokens":30,"cached_input_tokens":0}]"#,
         )
         .unwrap();
+        fs::write(
+            usage_dir.join("transcript-pump.json"),
+            serde_json::to_vec_pretty(&crate::transcript_pump::PumpStatus {
+                schema_version: crate::transcript_pump::PUMP_STATUS_SCHEMA_VERSION,
+                state: crate::transcript_pump::PumpState::Complete,
+                started_at_ms: 1,
+                updated_at_ms: 2,
+                bytes: 10,
+                records: 2,
+                dropped_console: 2,
+                provider_timing: crate::transcript_pump::ProviderTimingDiagnostics {
+                    retry_count: 1,
+                    wait_ms: 750,
+                    waiting_since_ms: None,
+                    resume_at_ms: None,
+                },
+                error: None,
+                periodic_error: None,
+                transport: Default::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
 
         refresh_persisted_metrics(tmp.path(), &item).unwrap();
         let metrics = work_metrics(&item, Some(tmp.path()));
 
         assert_eq!(metrics.review_rounds, 1);
         assert_eq!(metrics.stage_duration_ms, 2_000);
+        assert_eq!(metrics.provider_wait_ms, 750);
+        assert_eq!(metrics.active_duration_ms, 1_250);
         assert_eq!(metrics.input_tokens, 120);
         assert_eq!(metrics.output_tokens, 30);
         assert_eq!(metrics.repeated_findings, 1);
@@ -1063,7 +1147,39 @@ mod tests {
         assert!(incrementally_refreshed.artifact_bytes > metrics.artifact_bytes);
         let show = work_item_show_value(&item, tmp.path()).unwrap();
         assert_eq!(show["metrics"]["stage-duration-ms"], 2_000);
+        assert_eq!(show["metrics"]["provider-wait-ms"], 750);
+        assert_eq!(show["metrics"]["active-duration-ms"], 1_250);
         assert_eq!(show["metrics"]["input-tokens"], 120);
+    }
+
+    #[test]
+    fn legacy_metrics_without_provider_wait_remain_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("legacy-metrics", "Read old metrics");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].started_at = Some("2026-08-03T10:00:00Z".to_string());
+        item.attempts[0].tasks[0].completed_at = Some("2026-08-03T10:00:02Z".to_string());
+        let path = persisted_metrics_path(tmp.path(), &item.id);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            r#"{
+                "schema-version":2,
+                "input-tokens":10,
+                "output-tokens":5,
+                "repeated-findings":0,
+                "artifact-bytes":20,
+                "tasks":{},
+                "updated-at":"2026-08-03T10:00:02Z"
+            }"#,
+        )
+        .unwrap();
+
+        let metrics = work_metrics(&item, Some(tmp.path()));
+
+        assert_eq!(metrics.stage_duration_ms, 2_000);
+        assert_eq!(metrics.provider_wait_ms, 0);
+        assert_eq!(metrics.active_duration_ms, 2_000);
     }
 
     #[test]
@@ -1196,6 +1312,86 @@ mod tests {
 
         assert_eq!(row.task, "write:attempt-1-write-1 [needs-user]");
         assert_eq!(row.action, "needs-user");
+    }
+
+    #[test]
+    fn executing_task_shows_active_provider_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("work-1", "Wait for provider");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].status = AttemptStatus::Executing;
+        item.attempts[0].tasks[0].status = TaskStatus::Executing;
+        let task = &item.attempts[0].tasks[0];
+        let artifact_dir = tmp.path().join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let status = crate::transcript_pump::PumpStatus {
+            schema_version: crate::transcript_pump::PUMP_STATUS_SCHEMA_VERSION,
+            state: crate::transcript_pump::PumpState::Running,
+            started_at_ms: now.saturating_sub(1_000),
+            updated_at_ms: now,
+            bytes: 100,
+            records: 2,
+            dropped_console: 2,
+            provider_timing: crate::transcript_pump::ProviderTimingDiagnostics {
+                retry_count: 1,
+                wait_ms: 0,
+                waiting_since_ms: Some(now),
+                resume_at_ms: Some(now.saturating_add(60_000)),
+            },
+            error: None,
+            periodic_error: None,
+            transport: Default::default(),
+        };
+        fs::write(
+            artifact_dir.join("transcript-pump.json"),
+            serde_json::to_vec_pretty(&status).unwrap(),
+        )
+        .unwrap();
+        let lock = crate::lease::task_lock_path(tmp.path(), &item.id, &task.id);
+        let _lease = crate::lease::acquire(&lock).unwrap();
+
+        let row = summarize_work_item(&item, Some(tmp.path()));
+
+        assert_eq!(row.task, "write:attempt-1-write-1 [provider-wait]");
+    }
+
+    #[test]
+    fn executing_task_shows_outer_provider_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("work-1", "Wait before provider relaunch");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].status = AttemptStatus::Executing;
+        item.attempts[0].tasks[0].status = TaskStatus::Executing;
+        let task = &item.attempts[0].tasks[0];
+        let artifact_dir = tmp.path().join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let timing = crate::coder::ProviderRetryTiming {
+            schema_version: 1,
+            retry_count: 1,
+            wait_ms: 0,
+            waiting_since_ms: Some(now),
+            resume_at_ms: Some(now.saturating_add(60_000)),
+            absorbed_through_phase: None,
+        };
+        fs::write(
+            artifact_dir.join(crate::coder::PROVIDER_TIMING_FILENAME),
+            serde_json::to_vec_pretty(&timing).unwrap(),
+        )
+        .unwrap();
+        let lock = crate::lease::task_lock_path(tmp.path(), &item.id, &task.id);
+        let _lease = crate::lease::acquire(&lock).unwrap();
+
+        let row = summarize_work_item(&item, Some(tmp.path()));
+
+        assert_eq!(row.task, "write:attempt-1-write-1 [provider-wait]");
     }
 
     #[test]

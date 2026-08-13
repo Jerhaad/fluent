@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 /// v3 adds `transport`: the status coordinator's exact accounting of every status
 /// submission (written, coalesced, dropped, disconnected, write-failed) plus the
 /// last error, so a terminal status proves it lost nothing silently.
-pub const PUMP_STATUS_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 adds provider retry timing observed directly from streamed provider records.
+pub const PUMP_STATUS_SCHEMA_VERSION: u32 = 4;
 
 /// Built-in size, in bytes, of each read chunk pulled from coder stdout.
 pub const DEFAULT_READ_CHUNK_SIZE: usize = 64 * 1024;
@@ -259,9 +261,25 @@ pub struct PumpSummary {
     pub bytes: u64,
     pub records: u64,
     pub dropped_console: u64,
+    pub provider_timing: ProviderTimingDiagnostics,
     /// The final balanced status transport accounting, populated when the capture
     /// settles successfully (it is carried on the typed error otherwise).
     pub transport: StatusTransportDiagnostics,
+}
+
+/// Best-effort timing derived from provider-owned retry records in the canonical
+/// stream. `wait_ms` is elapsed wait observed so far; `resume_at_ms` is present
+/// only while the latest declared retry delay remains active.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTimingDiagnostics {
+    #[serde(default)]
+    pub retry_count: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at_ms: Option<u64>,
 }
 
 /// The lifecycle state of a transcript pump, persisted in its status document.
@@ -289,6 +307,8 @@ pub struct PumpStatus {
     pub bytes: u64,
     pub records: u64,
     pub dropped_console: u64,
+    #[serde(default)]
+    pub provider_timing: ProviderTimingDiagnostics,
     /// The terminal failure cause, present only on a `Failed` state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -352,6 +372,15 @@ struct SharedCounters {
     bytes: AtomicU64,
     records: AtomicU64,
     dropped_console: AtomicU64,
+    provider_timing: Mutex<ProviderTimingState>,
+}
+
+#[derive(Default)]
+struct ProviderTimingState {
+    retry_count: u64,
+    settled_wait_ms: u64,
+    waiting_since_ms: Option<u64>,
+    resume_at_ms: Option<u64>,
 }
 
 impl SharedCounters {
@@ -368,13 +397,64 @@ impl SharedCounters {
         self.dropped_console.fetch_sub(1, Ordering::Relaxed);
     }
     fn snapshot(&self) -> PumpSummary {
+        let provider_timing = self.provider_timing.lock().unwrap().snapshot(now_ms());
         PumpSummary {
             transport: StatusTransportDiagnostics::default(),
             bytes: self.bytes.load(Ordering::Relaxed),
             records: self.records.load(Ordering::Relaxed),
             dropped_console: self.dropped_console.load(Ordering::Relaxed),
+            provider_timing,
         }
     }
+
+    fn observe_record(&self, record: &[u8]) -> bool {
+        let now = now_ms();
+        let mut timing = self.provider_timing.lock().unwrap();
+        timing.finish_wait(now);
+        let Some(delay_ms) = claude_api_retry_delay_ms(record) else {
+            return false;
+        };
+        timing.retry_count = timing.retry_count.saturating_add(1);
+        timing.waiting_since_ms = Some(now);
+        timing.resume_at_ms = Some(now.saturating_add(delay_ms));
+        true
+    }
+
+    fn finish_provider_wait(&self) {
+        self.provider_timing.lock().unwrap().finish_wait(now_ms());
+    }
+}
+
+impl ProviderTimingState {
+    fn finish_wait(&mut self, now: u64) {
+        if let (Some(started), Some(resume)) = (self.waiting_since_ms, self.resume_at_ms) {
+            self.settled_wait_ms = self
+                .settled_wait_ms
+                .saturating_add(now.min(resume).saturating_sub(started));
+        }
+        self.waiting_since_ms = None;
+        self.resume_at_ms = None;
+    }
+
+    fn snapshot(&self, now: u64) -> ProviderTimingDiagnostics {
+        let live_wait = match (self.waiting_since_ms, self.resume_at_ms) {
+            (Some(started), Some(resume)) => now.min(resume).saturating_sub(started),
+            _ => 0,
+        };
+        ProviderTimingDiagnostics {
+            retry_count: self.retry_count,
+            wait_ms: self.settled_wait_ms.saturating_add(live_wait),
+            waiting_since_ms: self.waiting_since_ms,
+            resume_at_ms: self.resume_at_ms.filter(|resume| *resume > now),
+        }
+    }
+}
+
+fn claude_api_retry_delay_ms(record: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(record).ok()?;
+    (value["type"].as_str() == Some("system") && value["subtype"].as_str() == Some("api_retry"))
+        .then(|| value["retry_delay_ms"].as_u64())
+        .flatten()
 }
 
 /// Drain `reader` into the transcript at `transcript_path`, writing every byte
@@ -545,6 +625,7 @@ fn capture(
     let chunk_size = config.read_chunk_size.max(1);
     let mut buf = vec![0u8; chunk_size];
     let mut line = PreviewLine::new(config.console_preview_limit);
+    let mut diagnostic_line = DiagnosticLine::default();
     let mut last_flush = Instant::now();
 
     loop {
@@ -555,14 +636,26 @@ fn capture(
             break;
         }
         let chunk = &buf[..read];
-        persist_chunk(
+        let provider_retry_observed = persist_chunk(
             &mut file,
             chunk,
             &mut line,
+            &mut diagnostic_line,
             preview,
             counters,
             transcript_path,
         )?;
+
+        if provider_retry_observed && let Some(coordinator) = coordinator {
+            coordinator.submit_periodic(build_status(
+                PumpState::Running,
+                started,
+                &counters.snapshot(),
+                None,
+                None,
+                StatusTransportDiagnostics::default(),
+            ));
+        }
 
         if last_flush.elapsed() >= config.status_flush_interval {
             // Periodic snapshots go through the coordinator's coalescing slot, never
@@ -585,8 +678,10 @@ fn capture(
     // emitted; count it and offer its preview before completing.
     if line.has_bytes() {
         counters.add_record();
+        counters.observe_record(diagnostic_line.as_slice());
         deliver_preview(&mut line, preview, counters);
     }
+    counters.finish_provider_wait();
 
     file.flush().map_err(|err| {
         TranscriptPumpError::new(format!(
@@ -610,11 +705,13 @@ fn persist_chunk<W: Write>(
     writer: &mut W,
     chunk: &[u8],
     line: &mut PreviewLine,
+    diagnostic_line: &mut DiagnosticLine,
     preview: &dyn PreviewSink,
     counters: &SharedCounters,
     transcript_path: &Path,
-) -> Result<(), TranscriptPumpError> {
+) -> Result<bool, TranscriptPumpError> {
     let mut written = 0;
+    let mut provider_retry_observed = false;
     while written < chunk.len() {
         match writer.write(&chunk[written..]) {
             Ok(0) => {
@@ -630,9 +727,12 @@ fn persist_chunk<W: Write>(
                 for &byte in &chunk[written..written + n] {
                     if byte == b'\n' {
                         counters.add_record();
+                        provider_retry_observed |=
+                            counters.observe_record(diagnostic_line.take().as_slice());
                         deliver_preview(line, preview, counters);
                     } else {
                         line.push(byte);
+                        diagnostic_line.push(byte);
                     }
                 }
                 written += n;
@@ -646,7 +746,7 @@ fn persist_chunk<W: Write>(
             }
         }
     }
-    Ok(())
+    Ok(provider_retry_observed)
 }
 
 /// Offer one record's bounded preview to the console sink, accounting the loss
@@ -687,6 +787,7 @@ fn build_status(
         bytes: summary.bytes,
         records: summary.records,
         dropped_console: summary.dropped_console,
+        provider_timing: summary.provider_timing.clone(),
         // Bound the persisted primary and periodic errors so a pathological store
         // error can never bloat the on-disk status document either.
         error: error.map(bound_error),
@@ -2266,6 +2367,42 @@ struct ConsoleSink;
 impl PreviewSink for ConsoleSink {
     fn deliver(&self, _preview: &[u8]) -> bool {
         false
+    }
+}
+
+const MAX_DIAGNOSTIC_RECORD_BYTES: usize = 64 * 1024;
+
+/// Retains a bounded copy of one record for best-effort provider diagnostics.
+/// Oversized records remain canonical transcript evidence but are ignored by the
+/// diagnostic parser, so parsing can never make capture memory unbounded.
+#[derive(Default)]
+struct DiagnosticLine {
+    buf: Vec<u8>,
+    oversized: bool,
+}
+
+impl DiagnosticLine {
+    fn push(&mut self, byte: u8) {
+        if self.buf.len() < MAX_DIAGNOSTIC_RECORD_BYTES {
+            self.buf.push(byte);
+        } else {
+            self.oversized = true;
+        }
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        let record = if self.oversized {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.buf)
+        };
+        self.buf.clear();
+        self.oversized = false;
+        record
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        if self.oversized { &[] } else { &self.buf }
     }
 }
 
@@ -5197,6 +5334,81 @@ mod tests {
         assert_eq!(summary.transport.disconnected, 0);
         assert_eq!(summary.transport.write_failures, 0);
         assert!(summary.transport.is_balanced());
+        assert_eq!(
+            summary.provider_timing,
+            ProviderTimingDiagnostics::default(),
+            "ordinary provider activity must not be classified as wait"
+        );
+    }
+
+    #[test]
+    fn claude_api_retry_records_provider_wait_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let status = status_path_for(&transcript);
+        let sink = SaturatedSink::new();
+        let input = concat!(
+            "{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":10000}\n",
+            "{\"type\":\"assistant\",\"message\":{}}\n"
+        );
+
+        let summary = drain(
+            Cursor::new(input.as_bytes()),
+            &transcript,
+            Some(&status),
+            &sink,
+            &TranscriptPumpConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.provider_timing.retry_count, 1);
+        assert_eq!(summary.provider_timing.resume_at_ms, None);
+        let persisted: PumpStatus =
+            serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
+        assert_eq!(persisted.schema_version, PUMP_STATUS_SCHEMA_VERSION);
+        assert_eq!(persisted.provider_timing.retry_count, 1);
+        assert_eq!(persisted.provider_timing.resume_at_ms, None);
+    }
+
+    #[test]
+    fn provider_wait_accumulates_only_declared_interval() {
+        let mut timing = ProviderTimingState {
+            retry_count: 1,
+            settled_wait_ms: 200,
+            waiting_since_ms: Some(1_000),
+            resume_at_ms: Some(1_500),
+        };
+
+        assert_eq!(timing.snapshot(1_250).wait_ms, 450);
+        timing.finish_wait(2_000);
+
+        assert_eq!(timing.settled_wait_ms, 700);
+        assert_eq!(timing.snapshot(2_000).resume_at_ms, None);
+    }
+
+    #[test]
+    fn legacy_pump_status_without_provider_timing_deserializes() {
+        let legacy = r#"{
+            "schema_version":3,
+            "state":"complete",
+            "started_at_ms":1,
+            "updated_at_ms":2,
+            "bytes":3,
+            "records":1,
+            "dropped_console":1,
+            "transport":{
+                "submitted":2,
+                "written":2,
+                "coalesced":0,
+                "dropped":0,
+                "disconnected":0,
+                "write_failures":0
+            }
+        }"#;
+
+        let status: PumpStatus = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(status.provider_timing, ProviderTimingDiagnostics::default());
     }
 
     #[test]
@@ -5720,6 +5932,7 @@ mod tests {
         // transcript, not the whole chunk it was handed.
         let counters = SharedCounters::default();
         let mut line = PreviewLine::new(DEFAULT_CONSOLE_PREVIEW_LIMIT);
+        let mut diagnostic_line = DiagnosticLine::default();
         let sink = SaturatedSink::new();
         let chunk = b"{\"rec\":1}\n{\"rec\":2}\n"; // 20 bytes, two records
         let mut writer = WriteThenFail { budget: 10 }; // persists exactly the first record
@@ -5727,6 +5940,7 @@ mod tests {
             &mut writer,
             chunk,
             &mut line,
+            &mut diagnostic_line,
             &sink,
             &counters,
             Path::new("t.jsonl"),

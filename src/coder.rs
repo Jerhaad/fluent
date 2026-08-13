@@ -8,6 +8,22 @@ use std::time::{Duration, Instant, SystemTime};
 
 const DEFAULT_PI_MODEL: &str = "qwen3.6-35b-a3b";
 pub(crate) const PROVIDER_STDERR_FILENAME: &str = "provider-stderr.log";
+pub(crate) const PROVIDER_TIMING_FILENAME: &str = "provider-timing.json";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProviderRetryTiming {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub retry_count: u64,
+    #[serde(default)]
+    pub wait_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbed_through_phase: Option<u32>,
+}
 
 /// Keep provider diagnostics inside the same task-owned artifact boundary as
 /// the canonical transcript. Besides preserving evidence, this prevents a
@@ -18,6 +34,110 @@ pub(crate) fn provider_stderr_path(transcript_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(PROVIDER_STDERR_FILENAME)
+}
+
+pub(crate) fn provider_timing_path(transcript_path: &Path) -> PathBuf {
+    transcript_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(PROVIDER_TIMING_FILENAME)
+}
+
+pub(crate) fn read_provider_retry_timing(path: &Path) -> Option<ProviderRetryTiming> {
+    let mut timing: ProviderRetryTiming =
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    if timing.schema_version != 1 {
+        return None;
+    }
+    timing.settle(provider_timing_now_ms(), false);
+    Some(timing)
+}
+
+impl ProviderRetryTiming {
+    fn settle(&mut self, now: u64, clear: bool) {
+        if let (Some(started), Some(resume)) = (self.waiting_since_ms, self.resume_at_ms) {
+            self.wait_ms = self
+                .wait_ms
+                .saturating_add(now.min(resume).saturating_sub(started));
+            self.waiting_since_ms = Some(now.min(resume));
+        }
+        if clear || self.resume_at_ms.is_some_and(|resume| resume <= now) {
+            self.waiting_since_ms = None;
+            self.resume_at_ms = None;
+        }
+    }
+}
+
+fn provider_timing_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn write_provider_retry_wait(transcript_path: &Path, wait: Duration) -> Result<()> {
+    let path = provider_timing_path(transcript_path);
+    let now = provider_timing_now_ms();
+    let mut timing = read_provider_retry_timing(&path).unwrap_or(ProviderRetryTiming {
+        schema_version: 1,
+        ..ProviderRetryTiming::default()
+    });
+    timing.retry_count = timing.retry_count.saturating_add(1);
+    timing.waiting_since_ms = Some(now);
+    timing.resume_at_ms = Some(now.saturating_add(wait.as_millis() as u64));
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn finish_provider_retry_wait(transcript_path: &Path) -> Result<()> {
+    let path = provider_timing_path(transcript_path);
+    let Some(mut timing) = read_provider_retry_timing(&path) else {
+        return Ok(());
+    };
+    timing.settle(provider_timing_now_ms(), true);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn absorb_pump_provider_timing(transcript_path: &Path, phase: u32) -> Result<()> {
+    let status_path = crate::transcript_pump::status_path_for(transcript_path);
+    let Some(status) = std::fs::read(&status_path).ok().and_then(|bytes| {
+        serde_json::from_slice::<crate::transcript_pump::PumpStatus>(&bytes).ok()
+    }) else {
+        return Ok(());
+    };
+    let path = provider_timing_path(transcript_path);
+    let mut timing = read_provider_retry_timing(&path).unwrap_or(ProviderRetryTiming {
+        schema_version: 1,
+        ..ProviderRetryTiming::default()
+    });
+    if timing
+        .absorbed_through_phase
+        .is_some_and(|absorbed| absorbed >= phase)
+    {
+        return Ok(());
+    }
+    timing.retry_count = timing
+        .retry_count
+        .saturating_add(status.provider_timing.retry_count);
+    timing.wait_ms = timing
+        .wait_ms
+        .saturating_add(status.provider_timing.wait_ms);
+    timing.absorbed_through_phase = Some(phase);
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&timing)?)?;
+    Ok(())
+}
+
+fn prepare_transcript_retry_phase(
+    transcript_file: Option<&Path>,
+    phase: &mut u32,
+) -> std::result::Result<(), crate::transcript_pump::TranscriptPumpError> {
+    if let Some(path) = transcript_file
+        && let Err(error) = absorb_pump_provider_timing(path, *phase)
+    {
+        eprintln!("warning: could not preserve provider retry timing: {error:#}");
+    }
+    preserve_transcript_phase(transcript_file, phase)
 }
 
 fn trusted_sandbox_executable() -> &'static str {
@@ -3053,7 +3173,7 @@ where
                 } else {
                     eprintln!("  Auth 401 detected — refreshing credentials and retrying.");
                 }
-                if let Err(err) = preserve_transcript_phase(transcript_file, &mut phase) {
+                if let Err(err) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
                     return CoderRunCompletion {
                         terminal: Err(anyhow::Error::new(err)),
                         report: aggregate,
@@ -3116,13 +3236,19 @@ where
             attempt + 1,
             wait.as_secs()
         );
-        if let Err(err) = preserve_transcript_phase(transcript_file, &mut phase) {
+        if let Err(err) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
             return CoderRunCompletion {
                 terminal: Err(anyhow::Error::new(err)),
                 report: aggregate,
             };
         }
+        if let Err(error) = write_provider_retry_wait(path, wait) {
+            eprintln!("warning: could not persist provider retry timing: {error:#}");
+        }
         std::thread::sleep(wait);
+        if let Err(error) = finish_provider_retry_wait(path) {
+            eprintln!("warning: could not finalize provider retry timing: {error:#}");
+        }
         attempt += 1;
     }
 }
@@ -5577,6 +5703,50 @@ exit 1"#
                 "retry phase {phase} must be preserved before the next launch"
             );
         }
+        let timing = read_provider_retry_timing(&provider_timing_path(&transcript))
+            .expect("outer rate-limit waits persist provider timing");
+        assert_eq!(timing.retry_count, u64::from(RATE_LIMIT_MAX_RETRIES));
+        assert_eq!(timing.resume_at_ms, None);
+    }
+
+    #[test]
+    fn retry_phase_preserves_pump_provider_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "phase zero body\n").unwrap();
+        let status = crate::transcript_pump::PumpStatus {
+            schema_version: crate::transcript_pump::PUMP_STATUS_SCHEMA_VERSION,
+            state: crate::transcript_pump::PumpState::Complete,
+            started_at_ms: 100,
+            updated_at_ms: 900,
+            bytes: 16,
+            records: 2,
+            dropped_console: 2,
+            provider_timing: crate::transcript_pump::ProviderTimingDiagnostics {
+                retry_count: 2,
+                wait_ms: 700,
+                waiting_since_ms: None,
+                resume_at_ms: None,
+            },
+            error: None,
+            periodic_error: None,
+            transport: Default::default(),
+        };
+        std::fs::write(
+            crate::transcript_pump::status_path_for(&transcript),
+            serde_json::to_vec_pretty(&status).unwrap(),
+        )
+        .unwrap();
+        let mut phase = 0;
+
+        prepare_transcript_retry_phase(Some(&transcript), &mut phase).unwrap();
+        absorb_pump_provider_timing(&transcript, 0).unwrap();
+
+        let timing = read_provider_retry_timing(&provider_timing_path(&transcript)).unwrap();
+        assert_eq!(timing.retry_count, 2);
+        assert_eq!(timing.wait_ms, 700);
+        assert_eq!(timing.absorbed_through_phase, Some(0));
+        assert_eq!(phase, 1);
     }
 
     #[test]

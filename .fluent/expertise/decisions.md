@@ -97,6 +97,18 @@ Declining touches no descriptor and no Rust process-global stderr lock, so
 capture is never backpressured and control-plane output never stalls behind the
 console. The canonical transcript already holds every byte.
 
+The pump may derive bounded provider-wait diagnostics from complete streamed
+records, but those diagnostics never gate capture or execution. Claude Code's
+`system/api_retry` record opens a wait interval capped by its `retry_delay_ms`;
+the next record or terminal pump settlement closes it. Persist the retry count,
+elapsed wait, and active expected resume time in the existing pump status so a
+quiet provider is visible without scanning the transcript. Fluent-owned outer
+rate-limit sleeps use the sibling role-owned `provider-timing.json` file. Work
+metrics index both bounded documents at Task settlement. Before a relaunch
+replaces pump status, Fluent adds that phase's completed pump timing to the
+role-owned sidecar and records the absorbed phase number to prevent double
+counting after resume. Read-only status never walks transcript trees.
+
 Do not "fix" the declining sink by mirroring previews to any stderr or by
 reintroducing a background renderer thread. Re-enabling live previews is a separate
 change that must first move all Fluent-owned stderr writes behind one independently

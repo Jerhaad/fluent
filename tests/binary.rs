@@ -5593,7 +5593,7 @@ exit 0
     let status_json: serde_json::Value =
         serde_json::from_slice(&fs::read(&status_file).unwrap()).unwrap();
     assert_eq!(status_json["state"], "complete");
-    assert_eq!(status_json["schema_version"], 3);
+    assert_eq!(status_json["schema_version"], 4);
 }
 
 #[cfg(unix)]
@@ -17399,6 +17399,8 @@ fn work_show_outputs_pretty_json_for_one_work_item() {
     assert!(stdout.contains("  \"title\": \"Inspect work item\""));
     assert!(stdout.contains("  \"metrics\": {"));
     assert!(stdout.contains("    \"review-rounds\": 0"));
+    assert!(stdout.contains("    \"active-duration-ms\": 0"));
+    assert!(stdout.contains("    \"provider-wait-ms\": 0"));
     assert!(stdout.contains("    \"artifact-bytes\": 0"));
     assert!(stdout.ends_with('\n'));
 }
