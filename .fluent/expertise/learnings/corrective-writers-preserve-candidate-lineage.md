@@ -14,6 +14,9 @@ Prevent that avoidable loop by making correction lineage explicit before launch:
 
 - Record the exact current candidate in the generated execution context as the
   prior candidate for the correction.
+- Select the reviewed-correction prompt whenever correction evidence is
+  attached. A preceding `continue` outcome may coexist with a later
+  candidate-gate rejection and must not select the generic continuation prompt.
 - Select a host-owned lineage mode from durable gate evidence, not from the
   Writer's interpretation of prose or Git state.
 - Default to append-only. Content removal, restoration, and other ordinary

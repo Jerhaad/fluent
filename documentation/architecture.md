@@ -297,6 +297,9 @@ current candidate and commit metadata is its sole failed check. That mode tells
 the Writer to change metadata without changing the tree. These instructions
 reduce avoidable correction failures; the deterministic candidate gate remains
 the enforcement boundary and independently verifies the resulting history.
+An attached review, Tester, or candidate-gate correction artifact selects this
+route even when the preceding Writer run was recorded as a pre-review
+continuation; corrective evidence takes precedence over that older outcome.
 
 The same gate invokes the project's existing `check-pre-merge` hook from the
 candidate workspace. This keeps formatting and architecture rules project-owned;

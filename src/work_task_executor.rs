@@ -3695,19 +3695,7 @@ fn run_task_coder_with_coder(
         .and_then(|attempt| attempt.writer_runs.last())
         .is_some_and(|run| run.outcome == crate::work_model::WriterOutcome::Continue);
     let has_correction_artifacts = !correction_artifacts_only(prior_reviews).is_empty();
-    let (prompt, prompt_kind) = if previous_writer_continues {
-        (
-            build_writer_continuation_prompt(
-                item,
-                attempt_id,
-                task_id,
-                prior_reviews,
-                workspace_path,
-                project_root,
-            )?,
-            crate::writer_context::WriterPromptKind::PreReviewContinuation,
-        )
-    } else if has_correction_artifacts {
+    let (prompt, prompt_kind) = if has_correction_artifacts {
         (
             build_reviewed_correction_prompt(
                 item,
@@ -3718,6 +3706,18 @@ fn run_task_coder_with_coder(
                 project_root,
             )?,
             crate::writer_context::WriterPromptKind::ReviewedCorrection,
+        )
+    } else if previous_writer_continues {
+        (
+            build_writer_continuation_prompt(
+                item,
+                attempt_id,
+                task_id,
+                prior_reviews,
+                workspace_path,
+                project_root,
+            )?,
+            crate::writer_context::WriterPromptKind::PreReviewContinuation,
         )
     } else {
         (
@@ -14338,6 +14338,19 @@ mod tests {
         )
         .unwrap();
         let mut item = review_item();
+        item.attempts[0]
+            .writer_runs
+            .push(crate::work_model::WriterRun {
+                task_id: "attempt-1-write-1".to_string(),
+                outcome: crate::work_model::WriterOutcome::Continue,
+                kind: crate::work_model::WriterRunKind::Initial,
+                provider: "codex".to_string(),
+                session_id: Some("writer-session-1".to_string()),
+                continuation: 0,
+                checked_required: 0,
+                completed_matrix: 0,
+                candidate_commit: prior_candidate.clone(),
+            });
         let task_id = item
             .add_next_write_round(
                 "attempt-1",
