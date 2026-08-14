@@ -17,6 +17,10 @@ Prevent that avoidable loop by making correction lineage explicit before launch:
 - Select the reviewed-correction prompt whenever correction evidence is
   attached. A preceding `continue` outcome may coexist with a later
   candidate-gate rejection and must not select the generic continuation prompt.
+- Use that same correction-evidence classification when recording the durable
+  Writer run. Inferring the run kind only from preceding review Tasks misses
+  candidate-gate corrections that occur before the first review wave and
+  undercounts corrective work.
 - Select a host-owned lineage mode from durable gate evidence, not from the
   Writer's interpretation of prose or Git state.
 - Default to append-only. Content removal, restoration, and other ordinary

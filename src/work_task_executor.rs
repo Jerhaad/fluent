@@ -6146,17 +6146,9 @@ fn prior_reviews_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
 fn correction_artifacts_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
     input_artifacts
         .iter()
-        .filter(|path| is_correction_artifact(path))
+        .filter(|path| crate::writer_context::is_correction_artifact(path))
         .cloned()
         .collect()
-}
-
-fn is_correction_artifact(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| {
-        name == "review.md"
-            || name == "tester-results.json"
-            || name == crate::candidate_gate::CANDIDATE_GATE_FILE
-    }) || crate::tester::is_command_log_path(path)
 }
 
 fn is_failed_tester_evidence_artifact(path: &Path) -> bool {
@@ -6264,7 +6256,7 @@ fn readable_input_artifacts_only(input_artifacts: &[PathBuf]) -> Vec<PathBuf> {
     input_artifacts
         .iter()
         .filter(|path| {
-            is_correction_artifact(path)
+            crate::writer_context::is_correction_artifact(path)
                 || path
                     .parent()
                     .and_then(Path::file_name)

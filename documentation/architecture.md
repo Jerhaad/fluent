@@ -300,6 +300,10 @@ the enforcement boundary and independently verifies the resulting history.
 An attached review, Tester, or candidate-gate correction artifact selects this
 route even when the preceding Writer run was recorded as a pre-review
 continuation; corrective evidence takes precedence over that older outcome.
+The same artifact classification records the resulting Writer run as
+corrective for status and scope-calibration metrics. Progress and
+completion-matrix evidence alone continue to identify a pre-review
+continuation.
 
 The same gate invokes the project's existing `check-pre-merge` hook from the
 candidate workspace. This keeps formatting and architecture rules project-owned;

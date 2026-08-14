@@ -20,6 +20,14 @@ pub(crate) enum WriterPromptKind {
     ReviewedCorrection,
 }
 
+pub(crate) fn is_correction_artifact(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name == "review.md"
+            || name == "tester-results.json"
+            || name == crate::candidate_gate::CANDIDATE_GATE_FILE
+    }) || crate::tester::is_command_log_path(path)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct WriterContextUsage {

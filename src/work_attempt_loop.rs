@@ -6501,7 +6501,12 @@ fn writer_run_kind(attempt: &Attempt, task: &Task) -> WriterRunKind {
         .iter()
         .position(|candidate| candidate.id == task.id)
         .unwrap_or(attempt.tasks.len());
-    if attempt.tasks[..task_index].iter().any(is_review_phase_task) {
+    let consumes_correction_evidence = task
+        .input_artifacts
+        .iter()
+        .any(|artifact| crate::writer_context::is_correction_artifact(Path::new(&artifact.path)));
+    if consumes_correction_evidence || attempt.tasks[..task_index].iter().any(is_review_phase_task)
+    {
         WriterRunKind::Corrective
     } else if attempt.writer_runs.is_empty() {
         WriterRunKind::Initial
@@ -8785,6 +8790,103 @@ mod tests {
             started_at: None,
             completed_at: None,
         }
+    }
+
+    fn completed_initial_writer_run() -> WriterRun {
+        WriterRun {
+            task_id: "attempt-1-write-1".to_string(),
+            outcome: WriterOutcome::Continue,
+            kind: WriterRunKind::Initial,
+            provider: "codex".to_string(),
+            session_id: Some("writer-session-1".to_string()),
+            continuation: 0,
+            checked_required: 0,
+            completed_matrix: 0,
+            candidate_commit: "candidate-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn correction_artifacts_record_corrective_writer_runs_before_reviews() {
+        for (producer_id, path) in [
+            (
+                "attempt-1-write-1",
+                ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+            (
+                "attempt-1-tester",
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester/tester-results.json",
+            ),
+            (
+                "attempt-1-review-tests",
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md",
+            ),
+        ] {
+            let first = write_task("attempt-1-write-1", Vec::new());
+            let mut correction = write_task(
+                "attempt-1-write-2",
+                vec![ArtifactRef {
+                    producer_id: producer_id.to_string(),
+                    path: path.to_string(),
+                }],
+            );
+            correction.output = Some(TaskOutput {
+                workspace_id: "candidate".to_string(),
+                workspace_path: "candidate".to_string(),
+                source_branch: "work/attempt-1".to_string(),
+                base_commit: Some("candidate-1".to_string()),
+                commit: "candidate-2".to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            let mut attempt = attempt_with_tasks(vec![first, correction]);
+            attempt.writer_runs.push(completed_initial_writer_run());
+            let mut item = WorkItem::planned("work-1", "Account for correction evidence");
+            item.attempts = vec![attempt];
+
+            record_writer_run(Path::new("."), &mut item, 0, WriterOutcome::Complete, 2, 4);
+
+            let run = item.attempts[0].writer_runs.last().unwrap();
+            assert_eq!(run.kind, WriterRunKind::Corrective, "artifact: {path}");
+            assert_eq!(run.continuation, 1, "artifact: {path}");
+        }
+    }
+
+    #[test]
+    fn progress_and_matrix_only_follow_up_records_a_pre_review_continuation() {
+        let first = write_task("attempt-1-write-1", Vec::new());
+        let mut continuation = write_task(
+            "attempt-1-write-2",
+            vec![
+                ArtifactRef {
+                    producer_id: "required-progress".to_string(),
+                    path: ".fluent/work/progress/work-1/attempt-1/progress.md".to_string(),
+                },
+                ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json".to_string(),
+                },
+            ],
+        );
+        continuation.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("candidate-1".to_string()),
+            commit: "candidate-2".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let mut attempt = attempt_with_tasks(vec![first, continuation]);
+        attempt.writer_runs.push(completed_initial_writer_run());
+        let mut item = WorkItem::planned("work-1", "Continue required progress");
+        item.attempts = vec![attempt];
+
+        record_writer_run(Path::new("."), &mut item, 0, WriterOutcome::Complete, 2, 4);
+
+        let run = item.attempts[0].writer_runs.last().unwrap();
+        assert_eq!(run.kind, WriterRunKind::PreReviewContinuation);
+        assert_eq!(run.continuation, 1);
     }
 
     #[test]
