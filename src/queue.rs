@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
 
-use crate::work_model::{AttemptStatus, WorkItem, WorkModelStore};
+use crate::work_model::{AttemptStatus, PauseRecovery, WorkItem, WorkModelStore};
 
 /// Execution status of a single dispatch.
 ///
@@ -780,9 +780,10 @@ fn ensure_tester_no_sandbox_eligible(
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found for Work Item {id:?}"))?;
     if attempt.status != AttemptStatus::NeedsUser
         || attempt.pause_kind.as_ref() != Some(&crate::work_model::PauseKind::TesterHarness)
+        || attempt.pause_recovery != Some(PauseRecovery::TesterNoSandbox)
     {
         bail!(
-            "--no-sandbox is allowed only when Attempt {attempt_id:?} is paused at tester-harness"
+            "--no-sandbox is allowed only when Attempt {attempt_id:?} records a Tester no-sandbox recovery"
         );
     }
     Ok(())
@@ -1107,6 +1108,7 @@ mod tests {
                     .unwrap();
                 attempt.status = AttemptStatus::NeedsUser;
                 attempt.pause_kind = Some(pause_kind);
+                attempt.pause_recovery = None;
                 attempt.tasks[0].status = TaskStatus::NeedsUser;
                 Ok(())
             })
@@ -1124,6 +1126,16 @@ mod tests {
     fn write_tester_suspension(tmp: &Path, id: &str, attempt_id: &str) {
         write_scheduler_suspension(tmp, id, attempt_id);
         suspend_attempt(tmp, id, attempt_id, PauseKind::TesterHarness);
+        WorkModelStore::new(tmp)
+            .mutate_work_item(id, |item| {
+                item.attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .unwrap()
+                    .pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn write_blocked_relaunchable_learner(tmp: &Path, id: &str, attempt_id: &str) -> PathBuf {
@@ -1333,7 +1345,22 @@ mod tests {
 
         let error =
             resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", None, true).unwrap_err();
-        assert!(error.to_string().contains("paused at tester-harness"));
+        assert!(error.to_string().contains("Tester no-sandbox recovery"));
+        assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn tester_no_sandbox_resume_rejects_an_unapproved_tester_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+        suspend_attempt(dir.path(), "wi-1", "attempt-1", PauseKind::TesterHarness);
+        let before = fs::read(queue_file(dir.path(), "wi-1")).unwrap();
+
+        let error =
+            resume_with_tester_no_sandbox(dir.path(), "wi-1", "attempt-1", None, true).unwrap_err();
+
+        assert!(error.to_string().contains("Tester no-sandbox recovery"));
         assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
     }
 
@@ -1372,7 +1399,7 @@ mod tests {
 
         suspend_attempt(dir.path(), "wi-1", "attempt-1", PauseKind::WriterCompletion);
         let error = claim(dir.path(), "wi-1", "attempt-1").unwrap_err();
-        assert!(error.to_string().contains("paused at tester-harness"));
+        assert!(error.to_string().contains("Tester no-sandbox recovery"));
         assert_eq!(
             read_ledger(dir.path(), "wi-1")
                 .unwrap()
@@ -1384,6 +1411,12 @@ mod tests {
         );
 
         suspend_attempt(dir.path(), "wi-1", "attempt-1", PauseKind::TesterHarness);
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-1", |item| {
+                item.attempts[0].pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+                Ok(())
+            })
+            .unwrap();
         let token = claim(dir.path(), "wi-1", "attempt-1").unwrap().unwrap();
         assert!(token.tester_no_sandbox);
     }

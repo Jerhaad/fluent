@@ -570,9 +570,11 @@ restrictive outer Tester Seatbelt profile. Fluent does not weaken that profile
 automatically: even a minimally restricted outer profile can block the inner
 `sandbox_apply`, while permitting arbitrary child profiles would let a project
 command escape the outer policy. A production occurrence is therefore persisted
-as a `tester-harness` pause with an exact recovery handoff. If the user trusts
-the candidate, `fluent queue resume <work-item-id> --attempt <attempt-id>
---no-sandbox` records one dispatch-scoped approval. The scheduler translates it
+as a `tester-harness` pause with a structured Tester no-sandbox recovery and an
+exact recovery handoff. Status and Work Item show derive the same command from
+that durable recovery. If the user trusts the candidate, `fluent queue resume
+<work-item-id> --attempt <attempt-id> --no-sandbox` records one dispatch-scoped
+approval. The scheduler translates it
 to an internal Tester-only Attempt capability, which is validated against the
 single `NeedsUser` Tester Task before the Attempt is reopened and consumed only
 when that Task launches. Completed Writers are not rerun, and later Writers,
@@ -700,9 +702,10 @@ multiplication. Tester Task errors follow the same retry-then-pause policy but
 do not check for auth rejections because the tester invokes test harnesses, not
 a coder.
 Each failed Task writes a per-task handoff file
-(`needs-user-{task_id}.md`) so concurrent review failures preserve
-independent context. The loop reloads stored state before deciding the
-next transition.
+(`needs-user-{task_id}.md`) so concurrent review failures preserve independent
+context. When that Task owns the Attempt's current pause, Fluent also replaces
+the managed `needs-user.md` atomically and reports recovery only after that write
+succeeds. The loop reloads stored state before deciding the next transition.
 
 Each local coder launch also writes `execution.json` beside its transcript and
 holds an inherited `execution-owner.lock` across the process tree. The record

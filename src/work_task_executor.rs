@@ -14,9 +14,10 @@ use crate::prep;
 use crate::review_diff_command::render_review_diff_command;
 use crate::work_model::{
     ArtifactRef, AttemptKind, AttemptStatus, NoChangeOutput, NoChangeVerification,
-    NoChangeVerificationResult, Task, TaskKind, TaskOutput, TaskStatus, WorkItem,
-    WorkModelStorageError, WorkModelStore, WorkspaceRef, resolve_expected_candidate_workspace_path,
-    resolve_managed_sibling_workspace_path, to_json_pretty, work_artifact_path,
+    NoChangeVerificationResult, PauseKind, PauseRecovery, Task, TaskKind, TaskOutput, TaskStatus,
+    WorkItem, WorkModelStorageError, WorkModelStore, WorkspaceRef,
+    resolve_expected_candidate_workspace_path, resolve_managed_sibling_workspace_path,
+    to_json_pretty, work_artifact_path,
 };
 use crate::worktree;
 
@@ -2387,6 +2388,18 @@ fn settle_tester_harness_failure(
     config: &WorkTaskRunConfig<'_>,
     nested_swiftpm_sandbox: bool,
 ) -> Result<()> {
+    settle_tester_harness_failure_with_notify(
+        config,
+        nested_swiftpm_sandbox,
+        &crate::notify::notify,
+    )
+}
+
+fn settle_tester_harness_failure_with_notify(
+    config: &WorkTaskRunConfig<'_>,
+    nested_swiftpm_sandbox: bool,
+    notify_fn: &dyn Fn(&str, &str),
+) -> Result<()> {
     let failure = if nested_swiftpm_sandbox {
         TaskFailure::TesterNestedSwiftPmSandbox
     } else {
@@ -2400,8 +2413,14 @@ fn settle_tester_harness_failure(
         config.attempt_id,
         config.task_id,
         &failure,
-        &crate::notify::notify,
+        notify_fn,
     ) {
+        if pause_error
+            .downcast_ref::<CurrentHandoffPublicationError>()
+            .is_some()
+        {
+            return Err(pause_error).context("publishing Tester harness recovery");
+        }
         lock_mark_task_failed(
             config.store,
             config.store_lock,
@@ -2834,6 +2853,17 @@ enum TaskFailure {
     Generic,
 }
 
+#[derive(Debug)]
+struct CurrentHandoffPublicationError(String);
+
+impl std::fmt::Display for CurrentHandoffPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CurrentHandoffPublicationError {}
+
 /// Classify a terminal coder error for durable persistence and resume.
 fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
     if error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>() {
@@ -2950,11 +2980,13 @@ fn mark_task_failed_attempt_needs_user(
     failure: &TaskFailure,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<()> {
-    let transitioned = store.mutate_work_item(work_item_id, |item| {
+    let pause_kind = task_failure_pause_kind(failure);
+    let pause_recovery = task_failure_pause_recovery(failure);
+    let (transitioned, owns_pause) = store.mutate_work_item(work_item_id, |item| {
         let Some((attempt_index, task_index)) =
             find_attempt_task_indexes(item, attempt_id, task_id)
         else {
-            return Ok(false);
+            return Ok((false, false));
         };
         // A preflight failure owns a Planned Task; a later coder auth failure
         // owns its Executing Task. Do not overwrite a peer's terminal state.
@@ -2962,7 +2994,7 @@ fn mark_task_failed_attempt_needs_user(
             item.attempts[attempt_index].tasks[task_index].status,
             TaskStatus::Planned | TaskStatus::Executing
         ) {
-            return Ok(false);
+            return Ok((false, false));
         }
         // A resumable Auth/transcript failure gets durable `NeedsUser` Task state,
         // distinct from a hard `Failed`, so a supported resume can reopen exactly
@@ -2981,62 +3013,29 @@ fn mark_task_failed_attempt_needs_user(
             &mut item.attempts[attempt_index].tasks[task_index],
             task_terminal,
         );
-        let pause_kind = match failure {
-            TaskFailure::Auth(_) => crate::work_model::PauseKind::Auth,
-            TaskFailure::TranscriptPump(_) => crate::work_model::PauseKind::TranscriptPump,
-            TaskFailure::HostSandbox(_) => crate::work_model::PauseKind::HostSandbox,
-            TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox => {
-                crate::work_model::PauseKind::TesterHarness
-            }
-            TaskFailure::WriterCompletion(_) => crate::work_model::PauseKind::WriterCompletion,
-            TaskFailure::ProviderUnavailable(_) => {
-                crate::work_model::PauseKind::ProviderUnavailable
-            }
-            TaskFailure::Generic => crate::work_model::PauseKind::RoundCap,
-        };
         // Route through the precedence boundary so a resumable pause cannot mask
         // a harder terminal state a peer Task already recorded.
-        crate::work_model::transition_attempt(
+        let pause_applied = crate::work_model::transition_attempt(
             &mut item.attempts[attempt_index],
             crate::work_model::AttemptStatus::NeedsUser,
-            Some(pause_kind),
+            Some(pause_kind.clone()),
         );
-        Ok(true)
+        if pause_applied {
+            item.attempts[attempt_index].pause_recovery = pause_recovery;
+        }
+        let attempt = &item.attempts[attempt_index];
+        let owns_pause = pause_applied
+            && attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind.as_ref() == Some(&pause_kind)
+            && attempt.pause_recovery == pause_recovery;
+        Ok((true, owns_pause))
     })?;
 
     // Persist the authoritative terminal Task/Attempt state before any auxiliary
     // handoff or notification. A later effect failure cannot undo the pause.
     if transitioned {
-        match failure {
-            TaskFailure::Auth(message) => notify_fn("Fluent", message),
-            TaskFailure::TranscriptPump(_) => notify_fn(
-                "Fluent",
-                "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
-            ),
-            TaskFailure::HostSandbox(_) => {
-                notify_fn("Fluent", crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE)
-            }
-            TaskFailure::TesterHarness => notify_fn(
-                "Fluent",
-                "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
-            ),
-            TaskFailure::TesterNestedSwiftPmSandbox => notify_fn(
-                "Fluent",
-                &format!(
-                    "Xcode's embedded SwiftPM cannot create its sandbox inside Fluent's Tester sandbox. To trust and retry this exact Tester Task without Fluent's outer sandbox, run 'fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox', then run or reuse 'fluent scheduler run' from a host shell that is not itself sandboxed."
-                ),
-            ),
-            TaskFailure::WriterCompletion(_) => notify_fn(
-                "Fluent",
-                "Writer completion evidence is missing or invalid. Inspect the handoff, then resume the same Writer Task.",
-            ),
-            TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
-            TaskFailure::Generic => {}
-        }
-
-        // Write the auxiliary handoff and attach its reference in a second durable
-        // mutation, both best-effort. A handoff or attach failure preserves — never
-        // rolls back — the authoritative terminal state persisted above.
+        // Preserve one immutable handoff for this Task even when another peer owns
+        // the aggregate Attempt pause.
         match write_task_error_handoff(project_root, work_item_id, attempt_id, task_id, failure) {
             Ok(handoff_path) => {
                 // Attach the reference through a FRESH lock-held mutation that
@@ -3081,8 +3080,91 @@ fn mark_task_failed_attempt_needs_user(
                 );
             }
         }
+
+        // Only the Task whose pause still owns the aggregate Attempt may replace
+        // the managed current handoff. Publish it atomically, then notify: the
+        // terminal must never report a recovery action that was not recorded.
+        if owns_pause {
+            let still_owns = store
+                .read_work_item(work_item_id)?
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::NeedsUser
+                        && attempt.pause_kind.as_ref() == Some(&pause_kind)
+                        && attempt.pause_recovery == pause_recovery
+                });
+            if still_owns {
+                if let Err(error) = write_current_task_error_handoff(
+                    project_root,
+                    work_item_id,
+                    attempt_id,
+                    task_id,
+                    failure,
+                ) {
+                    return Err(anyhow::Error::new(CurrentHandoffPublicationError(format!(
+                        "recorded the {pause_kind:?} pause but could not publish its current needs-user handoff: {error:#}"
+                    ))));
+                }
+                notify_task_failure(notify_fn, work_item_id, attempt_id, failure);
+            }
+        }
     }
     Ok(())
+}
+
+fn task_failure_pause_kind(failure: &TaskFailure) -> PauseKind {
+    match failure {
+        TaskFailure::Auth(_) => PauseKind::Auth,
+        TaskFailure::TranscriptPump(_) => PauseKind::TranscriptPump,
+        TaskFailure::HostSandbox(_) => PauseKind::HostSandbox,
+        TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox => {
+            PauseKind::TesterHarness
+        }
+        TaskFailure::WriterCompletion(_) => PauseKind::WriterCompletion,
+        TaskFailure::ProviderUnavailable(_) => PauseKind::ProviderUnavailable,
+        TaskFailure::Generic => PauseKind::RoundCap,
+    }
+}
+
+fn task_failure_pause_recovery(failure: &TaskFailure) -> Option<PauseRecovery> {
+    matches!(failure, TaskFailure::TesterNestedSwiftPmSandbox)
+        .then_some(PauseRecovery::TesterNoSandbox)
+}
+
+fn notify_task_failure(
+    notify_fn: &dyn Fn(&str, &str),
+    work_item_id: &str,
+    attempt_id: &str,
+    failure: &TaskFailure,
+) {
+    match failure {
+        TaskFailure::Auth(message) => notify_fn("Fluent", message),
+        TaskFailure::TranscriptPump(_) => notify_fn(
+            "Fluent",
+            "Transcript capture failed. Fix the console/transcript transport, then 'fluent attempt run' to retry.",
+        ),
+        TaskFailure::HostSandbox(_) => {
+            notify_fn("Fluent", crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE)
+        }
+        TaskFailure::TesterHarness => notify_fn(
+            "Fluent",
+            "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
+        ),
+        TaskFailure::TesterNestedSwiftPmSandbox => notify_fn(
+            "Fluent",
+            &format!(
+                "Xcode's embedded SwiftPM cannot create its sandbox inside Fluent's Tester sandbox. To trust and retry this exact Tester Task without Fluent's outer sandbox, run 'fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox', then run or reuse 'fluent scheduler run' from a host shell that is not itself sandboxed."
+            ),
+        ),
+        TaskFailure::WriterCompletion(_) => notify_fn(
+            "Fluent",
+            "Writer completion evidence is missing or invalid. Inspect the handoff, then resume the same Writer Task.",
+        ),
+        TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
+        TaskFailure::Generic => {}
+    }
 }
 
 /// Pause an unlaunched Task when the enclosing macOS sandbox rejects Fluent's
@@ -3120,7 +3202,35 @@ fn write_task_error_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = match failure {
+    let body = render_task_error_handoff(work_item_id, attempt_id, task_id, failure);
+    fs::write(&path, body)?;
+    Ok(relative_path)
+}
+
+fn write_current_task_error_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    failure: &TaskFailure,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = render_task_error_handoff(work_item_id, attempt_id, task_id, failure);
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
+    Ok(relative_path)
+}
+
+fn render_task_error_handoff(
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    failure: &TaskFailure,
+) -> String {
+    match failure {
         TaskFailure::Auth(msg) => format!("# Attempt needs user input\n\n{msg}\n"),
         TaskFailure::TranscriptPump(diagnostic) => format!(
             "# Attempt needs user input\n\nTask {task_id:?} stopped on a transcript-pump \
@@ -3150,9 +3260,7 @@ fn write_task_error_handoff(
              The coder execution errored persistently.\n",
             max_task_retries()
         ),
-    };
-    fs::write(&path, body)?;
-    Ok(relative_path)
+    }
 }
 
 fn lock_mark_task_failed(
@@ -8494,6 +8602,129 @@ mod tests {
         assert!(handoff.contains("host shell"), "{handoff}");
         assert!(handoff.contains("enclosing agent sandbox"), "{handoff}");
         assert!(handoff.contains("resume dispatch only"), "{handoff}");
+    }
+
+    #[test]
+    fn tester_pause_replaces_a_resumed_round_cap_current_handoff() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Refresh the current handoff");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].role = "tester".to_string();
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        crate::work_model::suspend_attempt(attempt, crate::work_model::PauseKind::RoundCap);
+        store.create_work_item(&item).unwrap();
+
+        let current_rel = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+        let current_path = tmp.path().join(&current_rel);
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        fs::write(
+            &current_path,
+            "# Attempt needs user input\n\nRun `fluent attempt extend work-1 attempt-1`.\n",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+        let task_id = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .id
+            .clone();
+
+        let notified_after_publish = std::cell::Cell::new(false);
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            &task_id,
+            &TaskFailure::TesterNestedSwiftPmSandbox,
+            &|_, _| {
+                let current = fs::read_to_string(&current_path).unwrap();
+                notified_after_publish.set(
+                    current.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+                );
+            },
+        )
+        .unwrap();
+
+        let current = fs::read_to_string(&current_path).unwrap();
+        assert!(
+            current.contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox"),
+            "{current}"
+        );
+        assert!(!current.contains("fluent attempt extend"), "{current}");
+        assert!(
+            notified_after_publish.get(),
+            "notification follows the durable current handoff"
+        );
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].pause_recovery,
+            Some(PauseRecovery::TesterNoSandbox)
+        );
+
+        let historical = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &format!("needs-user-{task_id}.md"),
+        ));
+        assert!(
+            historical.is_file(),
+            "the per-Task handoff remains durable history"
+        );
+    }
+
+    #[test]
+    fn current_handoff_failure_surfaces_after_the_pause_is_durable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Surface current handoff failure");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].kind = TaskKind::Tester;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+
+        let current = tmp
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", "needs-user.md"));
+        fs::create_dir_all(&current).unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+        let config = WorkTaskRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &task_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: false,
+            store_lock: None,
+        };
+        let notified = std::cell::Cell::new(false);
+
+        let error =
+            settle_tester_harness_failure_with_notify(&config, true, &|_, _| notified.set(true))
+                .unwrap_err();
+
+        assert!(format!("{error:#}").contains("current needs-user handoff"));
+        assert!(
+            !notified.get(),
+            "do not report an unrecorded recovery action"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_recovery,
+            Some(PauseRecovery::TesterNoSandbox)
+        );
     }
 
     #[test]

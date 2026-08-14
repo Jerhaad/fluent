@@ -17,10 +17,10 @@ use crate::review_only_worktree;
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMappingInputs,
     EvidenceRecoveryState, LearnerCommitCanonicalization, MergeCandidateMergeStatus, PauseKind,
-    RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind,
-    TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError, WorkModelStore,
-    WriterOutcome, WriterRun, WriterRunKind, resolve_managed_sibling_workspace_path,
-    work_artifact_path,
+    PauseRecovery, RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task,
+    TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError,
+    WorkModelStore, WriterOutcome, WriterRun, WriterRunKind,
+    resolve_managed_sibling_workspace_path, work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
 
@@ -282,9 +282,10 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
         if attempt.status != AttemptStatus::NeedsUser
             || attempt.pause_kind != Some(PauseKind::TesterHarness)
+            || attempt.pause_recovery != Some(PauseRecovery::TesterNoSandbox)
         {
             bail!(
-                "Tester no-sandbox recovery requires Attempt {:?} to be paused at tester-harness",
+                "Tester no-sandbox recovery requires Attempt {:?} to record that exact recovery",
                 config.attempt_id
             );
         }
@@ -333,6 +334,18 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
         let candidate_gate_pause = attempt.is_candidate_gate_pause();
         let uncertain_review_pause = attempt.is_uncertain_review_pause();
+
+        if attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_recovery == Some(PauseRecovery::TesterNoSandbox)
+            && !config.tester_no_sandbox
+        {
+            bail!(
+                "Attempt {:?} requires the recorded scheduler recovery: fluent queue resume {} --attempt {} --no-sandbox",
+                config.attempt_id,
+                config.work_item_id,
+                config.attempt_id
+            );
+        }
 
         // Earlier versions recorded an exhausted provider outage as a RoundCap.
         // Recover only the narrow, durable review-only shape before the normal
@@ -7370,11 +7383,12 @@ fn write_needs_user_handoff(
         .map(|artifact| format!("- {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
-    fs::write(
+    crate::atomic_write::atomic_write(
         &path,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop found uncertain or missing review verdicts.\n\n{artifacts}\n"
-        ),
+        )
+        .as_bytes(),
     )?;
     Ok(relative_path)
 }
@@ -7393,12 +7407,13 @@ fn write_focused_evidence_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(
+    crate::atomic_write::atomic_write(
         &path,
         format!(
             "# Attempt needs focused test evidence\n\nThe failed Tests Review requested one focused check against the unchanged candidate. Fluent did not plan another Writer.\n\nReview: `{}`\n\nTo authorize the exact command recorded in that review, run:\n\n`fluent attempt evidence run {} {} --review-artifact {}`\n",
             review.path, work_item_id, attempt_id, review.path
-        ),
+        )
+        .as_bytes(),
     )?;
     Ok(relative_path)
 }
@@ -7430,11 +7445,12 @@ fn write_budget_exhausted_handoff(
             max_no_progress_rounds()
         )
     };
-    fs::write(
+    crate::atomic_write::atomic_write(
         &path,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop stopped advancing. The candidate commit and review history remain unchanged.\n\n{recovery}\n\nFailed correction artifacts still need attention:\n\n{artifacts}\n"
-        ),
+        )
+        .as_bytes(),
     )?;
     Ok(relative_path)
 }
@@ -16106,6 +16122,45 @@ mod tests {
             TaskStatus::Planned,
             "auth-failed review task should reset to Planned"
         );
+    }
+
+    #[test]
+    fn direct_run_names_the_scheduler_command_required_by_tester_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Resume Tester with explicit approval");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::TesterHarness);
+        attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+
+        let error = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("fluent queue resume work-1 --attempt attempt-1 --no-sandbox")
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
     }
 
     #[test]

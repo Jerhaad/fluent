@@ -3808,6 +3808,11 @@ pub struct Attempt {
     pub review_state: Option<AttemptReviewState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_kind: Option<PauseKind>,
+    /// The exact exceptional recovery authorized by the current pause. Keep this
+    /// separate from `pause_kind`: two Tester harness failures can share the same
+    /// classification while only one requires a dispatch-scoped sandbox approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_recovery: Option<PauseRecovery>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
     /// Append-only host-owned recovery frontiers for an unchanged candidate.
@@ -3853,6 +3858,7 @@ impl Default for Attempt {
             tasks: Vec::new(),
             review_state: None,
             pause_kind: None,
+            pause_recovery: None,
             artifacts: Vec::new(),
             evidence_recoveries: Vec::new(),
             writer_runs: Vec::new(),
@@ -4595,6 +4601,14 @@ pub enum PauseKind {
     /// A pause written by a newer Fluent version. Read-only commands preserve
     /// and display the original value; mutation remains fail-closed.
     Unknown(String),
+}
+
+/// An executable recovery that cannot be derived from the coarse pause kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PauseRecovery {
+    /// Resume through the scheduler with one exact Tester-only no-sandbox grant.
+    TesterNoSandbox,
 }
 
 impl PauseKind {
@@ -5405,6 +5419,7 @@ pub fn set_attempt_terminal(attempt: &mut Attempt, status: AttemptStatus) {
 pub fn suspend_attempt(attempt: &mut Attempt, kind: PauseKind) {
     attempt.status = AttemptStatus::NeedsUser;
     attempt.pause_kind = Some(kind);
+    attempt.pause_recovery = None;
     attempt.completed_at.get_or_insert_with(now_iso8601);
 }
 
@@ -5460,6 +5475,7 @@ pub fn transition_attempt(
     );
     attempt.status = status;
     attempt.pause_kind = pause;
+    attempt.pause_recovery = None;
     if is_terminal {
         attempt.completed_at.get_or_insert_with(now_iso8601);
     } else {
@@ -5477,6 +5493,7 @@ pub fn transition_attempt(
 pub fn reopen_attempt(attempt: &mut Attempt) {
     attempt.status = AttemptStatus::Planned;
     attempt.pause_kind = None;
+    attempt.pause_recovery = None;
     attempt.completed_at = None;
     for task in &mut attempt.tasks {
         if task.status == TaskStatus::NeedsUser {
@@ -6286,6 +6303,8 @@ struct AttemptRecord {
     review_state: Option<AttemptReviewState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause_kind: Option<PauseKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_recovery: Option<PauseRecovery>,
     #[serde(default)]
     artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -6377,6 +6396,7 @@ impl AttemptRecord {
             coder_mapping: attempt.coder_mapping.clone(),
             review_state: attempt.review_state.clone(),
             pause_kind: attempt.pause_kind.clone(),
+            pause_recovery: attempt.pause_recovery,
             artifacts: attempt.artifacts.clone(),
             evidence_recoveries: attempt.evidence_recoveries.clone(),
             writer_runs: attempt.writer_runs.clone(),
@@ -6401,6 +6421,7 @@ impl From<AttemptRecord> for Attempt {
             tasks: Vec::new(),
             review_state: record.review_state,
             pause_kind: record.pause_kind,
+            pause_recovery: record.pause_recovery,
             artifacts: record.artifacts,
             evidence_recoveries: record.evidence_recoveries,
             writer_runs: record.writer_runs,
@@ -13064,6 +13085,22 @@ random banner prose that must be ignored
     }
 
     #[test]
+    fn a_new_attempt_state_clears_the_previous_pause_recovery() {
+        let mut attempt = attempt_in(AttemptStatus::NeedsUser, Some(PauseKind::TesterHarness));
+        attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+
+        assert!(transition_attempt(
+            &mut attempt,
+            AttemptStatus::Failed,
+            None
+        ));
+
+        assert_eq!(attempt.status, AttemptStatus::Failed);
+        assert!(attempt.pause_kind.is_none());
+        assert!(attempt.pause_recovery.is_none());
+    }
+
+    #[test]
     fn reopen_attempt_replans_only_pause_failed_tasks() {
         // Reopen resets only the resumable pause-failed Task (durably NeedsUser),
         // leaving Complete peers, hard Failed Tasks, and still-live Executing
@@ -13516,11 +13553,16 @@ random banner prose that must be ignored
         let mut item = WorkItem::planned("tester-harness-pause", "Tester harness pause");
         item.add_initial_attempt("attempt-1").unwrap();
         suspend_attempt(&mut item.attempts[0], PauseKind::TesterHarness);
+        item.attempts[0].pause_recovery = Some(PauseRecovery::TesterNoSandbox);
         item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
         store.create_work_item(&item).unwrap();
 
         let read = store.read_work_item("tester-harness-pause").unwrap();
         assert_eq!(read.attempts[0].pause_kind, Some(PauseKind::TesterHarness));
+        assert_eq!(
+            read.attempts[0].pause_recovery,
+            Some(PauseRecovery::TesterNoSandbox)
+        );
     }
 
     #[test]

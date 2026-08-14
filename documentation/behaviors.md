@@ -4909,20 +4909,21 @@ status_reports_queued_work_without_live_scheduler)
 ### B2g
 
 WHEN `fluent queue resume <work-item-id> --attempt <attempt-id> --no-sandbox`
-names the current Attempt paused at `tester-harness`, THE SYSTEM SHALL append a
-resume dispatch that durably records the exact Attempt binding and one Tester
-no-sandbox approval. The terminal dispatch SHALL retain that approval as audit
-evidence.
+names the current `tester-harness` Attempt with a recorded Tester no-sandbox
+recovery, THE SYSTEM SHALL append a resume dispatch that durably records the
+exact Attempt binding and one Tester no-sandbox approval. The terminal dispatch
+SHALL retain that approval as audit evidence.
 Test: src/queue.rs (tester_no_sandbox_approval_is_durable_and_idempotent)
 Test: src/scheduler.rs (tester_recovery_dispatch_forwards_one_run_no_sandbox_approval)
 
 ### B2h
 
-IF `fluent queue resume ... --no-sandbox` names an Attempt not paused at
-`tester-harness`, or an ordinary run dispatch carries Tester no-sandbox
-approval, THEN THE SYSTEM SHALL reject it without changing or claiming the
-queue entry.
+IF `fluent queue resume ... --no-sandbox` names an Attempt without a recorded
+Tester no-sandbox recovery, or an ordinary run dispatch carries Tester
+no-sandbox approval, THEN THE SYSTEM SHALL reject it without changing or
+claiming the queue entry.
 Test: src/queue.rs (tester_no_sandbox_resume_rejects_non_tester_pause_without_mutation,
+tester_no_sandbox_resume_rejects_an_unapproved_tester_pause,
 tester_no_sandbox_claim_revalidates_the_tester_pause,
 claim_rejects_no_sandbox_approval_on_ordinary_dispatch)
 Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent)
@@ -4934,7 +4935,7 @@ SYSTEM SHALL retry only the exact paused Tester Task without Fluent's Tester
 sandbox while preserving completed Writer Tasks.
 Test: src/scheduler.rs (scheduler_child_uses_tester_only_capability_for_approved_recovery,
 tester_recovery_dispatch_forwards_one_run_no_sandbox_approval)
-Test: tests/binary.rs (tester_recovery_reruns_same_tester_without_writer)
+Test: tests/binary.rs (tester_sandbox_recovery_reruns_same_tester_without_writer)
 
 ### B2j
 
@@ -4951,7 +4952,8 @@ write a needs-user handoff naming the exact `fluent queue resume ...
 --no-sandbox` command and the resulting host-permission boundary.
 Test: src/tester.rs (tester_diagnoses_nested_swiftpm_sandbox_failure)
 Test: src/work_task_executor.rs (nested_swiftpm_handoff_names_exact_one_dispatch_approval)
-Test: tests/binary.rs (tester_nested_sandbox_diagnosis_does_not_rewrite_project)
+Test: tests/binary.rs (tester_nested_sandbox_diagnosis_does_not_rewrite_project,
+tester_sandbox_recovery_reruns_same_tester_without_writer)
 
 ### B2l
 
@@ -4987,6 +4989,40 @@ resume_rejects_a_missing_or_ambiguous_learner_candidate)
 IF a candidate no longer satisfies B2l when the scheduler claims its admitted
 resume, THEN THE SYSTEM SHALL reject the claim and leave the dispatch queued.
 Test: src/queue.rs (claim_rejects_a_learner_candidate_dirtied_after_resume)
+
+### B2p
+
+WHEN a Task pause supersedes an earlier pause after the Attempt resumes, THE
+SYSTEM SHALL replace the Attempt's managed current needs-user handoff.
+Test: src/work_task_executor.rs (tester_pause_replaces_a_resumed_round_cap_current_handoff)
+
+### B2q
+
+WHEN Fluent replaces an Attempt's managed current needs-user handoff, THE
+SYSTEM SHALL preserve each Task-specific handoff as history.
+Test: src/work_task_executor.rs (tester_pause_replaces_a_resumed_round_cap_current_handoff)
+Test: tests/binary.rs (work_task_run_preserves_task_handoff_and_updates_current)
+
+### B2r
+
+WHEN status or Work Item show reports a current Tester no-sandbox recovery, THE
+SYSTEM SHALL name the exact `fluent queue resume <work-item-id> --attempt
+<attempt-id> --no-sandbox` command.
+Test: src/work_status.rs (tester_sandbox_recovery_status_names_the_exact_approved_command,
+tester_sandbox_recovery_show_names_the_exact_approved_command)
+Test: tests/binary.rs (tester_sandbox_recovery_reruns_same_tester_without_writer)
+
+### B2s
+
+IF Fluent cannot publish the managed current handoff after recording its pause,
+THEN THE SYSTEM SHALL preserve the pause and return the publication failure.
+Test: src/work_task_executor.rs (current_handoff_failure_surfaces_after_the_pause_is_durable)
+
+### B2t
+
+IF Fluent cannot publish the managed current handoff after recording its pause,
+THEN THE SYSTEM SHALL NOT notify the user that the recovery action was recorded.
+Test: src/work_task_executor.rs (current_handoff_failure_surfaces_after_the_pause_is_durable)
 
 ### B3
 

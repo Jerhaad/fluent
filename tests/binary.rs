@@ -12317,7 +12317,7 @@ fn tester_check_uses_production_tester_boundary() {
 }
 
 #[test]
-fn tester_recovery_reruns_same_tester_without_writer() {
+fn tester_sandbox_recovery_reruns_same_tester_without_writer() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     let bin_dir = tmp.path().join("bin-tester-recovery");
@@ -12357,16 +12357,16 @@ exit 0
         ),
     );
     fs::write(
-        main_dir.join(".fluent/extract-tester-results"),
+        main_dir.join(".fluent/tester.yaml"),
         format!(
-            "#!/bin/sh\nif [ -f '{}' ]; then echo '[]'; else echo not-json; fi\n",
+            "commands:\n  - command: \"if [ -f '{}' ]; then echo 'ok repaired'; else printf 'sandbox-exec: sandbox_apply: Operation not permitted\\n' >&2; exit 1; fi # swift test\"\n    test_harness: shell-harness\n",
             harness_repaired.display()
         ),
     )
     .unwrap();
     git::run(
         &main_dir,
-        &["add", ".fluent/extract-tester-results"],
+        &["add", ".fluent/tester.yaml"],
         "stage broken Tester fixture",
     )
     .unwrap();
@@ -12410,6 +12410,21 @@ exit 0
         String::from_utf8_lossy(&_first.stderr),
     );
     assert_eq!(paused["attempts"][0]["pause_kind"], "tester-harness");
+    assert_eq!(paused["attempts"][0]["pause_recovery"], "tester-no-sandbox");
+    let recovery = "fluent queue resume work-1 --attempt attempt-1 --no-sandbox";
+    assert_eq!(paused["next-action"], recovery);
+    let current_handoff = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user.md");
+    assert!(
+        fs::read_to_string(current_handoff)
+            .unwrap()
+            .contains(recovery)
+    );
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["status"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(recovery));
     assert_eq!(fs::read_to_string(&writer_counter).unwrap().trim(), "1");
     write_mock_sandbox_exec(&bin_dir);
     fs::write(&harness_repaired, "repaired\n").unwrap();
@@ -15282,7 +15297,7 @@ fn work_task_run_persistent_coder_error_pauses_attempt_at_needs_user() {
 }
 
 #[test]
-fn work_task_run_handoff_file_includes_task_id() {
+fn work_task_run_preserves_task_handoff_and_updates_current() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
     create_completed_work_attempt(&tmp, &main_dir);
@@ -15321,11 +15336,9 @@ fn work_task_run_handoff_file_includes_task_id() {
         content.contains("attempt-1-review-tests"),
         "handoff content should reference the failing task"
     );
-    let old_path = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user.md");
-    assert!(
-        !old_path.exists(),
-        "old fixed-name handoff should not exist"
-    );
+    let current_path = main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user.md");
+    let current = fs::read_to_string(current_path).unwrap();
+    assert!(current.contains("attempt-1-review-tests"));
 }
 
 #[test]
@@ -21750,7 +21763,7 @@ fn queue_resume_records_exact_authorization_and_is_idempotent() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("paused at tester-harness"));
+        .stderr(predicate::str::contains("Tester no-sandbox recovery"));
     assert_eq!(
         queue::read_ledger(tmp.path(), "wi-resume")
             .unwrap()

@@ -4,7 +4,8 @@ use std::path::Path;
 
 use crate::work_model::{
     Attempt, AttemptReviewState, AttemptStatus, MergeCandidate, MergeCandidateMergeStatus,
-    MergeReviewState, PauseKind, Task, TaskKind, TaskStatus, WorkItem, WorkModelStore,
+    MergeReviewState, PauseKind, PauseRecovery, Task, TaskKind, TaskStatus, WorkItem,
+    WorkModelStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +369,15 @@ pub fn work_item_show_value(
     let warnings = item.compatibility_warnings();
     if !warnings.is_empty() {
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
+    }
+    if item
+        .attempts
+        .last()
+        .is_some_and(|attempt| attempt.pause_recovery.is_some())
+        && let Some(next_action) =
+            attempt_recovery_next_action(item.attempts.last(), Some(project_root))
+    {
+        output["next-action"] = serde_json::to_value(next_action)?;
     }
     Ok(output)
 }
@@ -812,6 +822,14 @@ fn attempt_recovery_next_action(
     project_root: Option<&Path>,
 ) -> Option<String> {
     let attempt = attempt?;
+    if attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_recovery == Some(PauseRecovery::TesterNoSandbox)
+    {
+        return Some(format!(
+            "fluent queue resume {} --attempt {} --no-sandbox",
+            attempt.work_item_id, attempt.id
+        ));
+    }
     if let Some(recovery) = attempt.evidence_recoveries.last().filter(|recovery| {
         attempt.status == AttemptStatus::NeedsUser
             && recovery.state == crate::work_model::EvidenceRecoveryState::NeedsEvidence
@@ -1638,6 +1656,36 @@ mod tests {
             row.next_action.as_deref(),
             Some("fluent queue resume work-1 --attempt attempt-1")
         );
+    }
+
+    fn tester_sandbox_recovery_item() -> WorkItem {
+        let mut item = WorkItem::planned("work-1", "Resume Tester outside Fluent's sandbox");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::TesterHarness);
+        attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        item
+    }
+
+    #[test]
+    fn tester_sandbox_recovery_status_names_the_exact_approved_command() {
+        let item = tester_sandbox_recovery_item();
+        let expected = "fluent queue resume work-1 --attempt attempt-1 --no-sandbox";
+        let row = summarize_work_item(&item, None);
+        assert_eq!(row.next_action.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn tester_sandbox_recovery_show_names_the_exact_approved_command() {
+        let item = tester_sandbox_recovery_item();
+        let expected = "fluent queue resume work-1 --attempt attempt-1 --no-sandbox";
+        let shown = work_item_show_value(&item, Path::new(".")).unwrap();
+        assert_eq!(shown["next-action"], expected);
+        assert_eq!(shown["attempts"][0]["pause_kind"], "tester-harness");
+        assert_eq!(shown["attempts"][0]["pause_recovery"], "tester-no-sandbox");
     }
 
     #[test]

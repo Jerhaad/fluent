@@ -1147,7 +1147,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::work_model::{MergeCandidateMergeStatus, PauseKind, TaskStatus, WorkItem};
+    use crate::work_model::{
+        MergeCandidateMergeStatus, PauseKind, PauseRecovery, TaskStatus, WorkItem,
+    };
 
     fn add_queued(project_root: &Path, id: &str, priority: i64) {
         queue::add(project_root, id, Some(priority)).unwrap();
@@ -2175,6 +2177,7 @@ mod tests {
                 let attempt = &mut item.attempts[0];
                 attempt.status = AttemptStatus::NeedsUser;
                 attempt.pause_kind = Some(PauseKind::TesterHarness);
+                attempt.pause_recovery = Some(PauseRecovery::TesterNoSandbox);
                 attempt.tasks[0].status = TaskStatus::NeedsUser;
                 Ok(())
             })
