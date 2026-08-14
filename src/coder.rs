@@ -335,62 +335,6 @@ impl CoderKind {
             }),
         }
     }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_bounded_seed(
-        &self,
-        sandbox: CoderSandbox,
-        model: Option<&str>,
-        effort: Option<&str>,
-        prompt: &str,
-        system_prompt: &str,
-        working_dir: &Path,
-        extra_args: &[String],
-        deadline: Duration,
-    ) -> Result<BoundedCoderRun> {
-        match self {
-            Self::Claude => {
-                match sandbox {
-                    CoderSandbox::SeatbeltProfile(profile) => SandboxedClaudeCode {
-                        sandbox_profile: Some(profile),
-                        trusted_sandbox: false,
-                        model_override: model.map(str::to_string),
-                        effort: effort.map(str::to_string),
-                    }
-                    .run_bounded_seed(prompt, system_prompt, working_dir, extra_args, deadline),
-                    CoderSandbox::TrustedSeatbeltProfile(profile) => SandboxedClaudeCode {
-                        sandbox_profile: Some(profile),
-                        trusted_sandbox: true,
-                        model_override: model.map(str::to_string),
-                        effort: effort.map(str::to_string),
-                    }
-                    .run_bounded_seed(prompt, system_prompt, working_dir, extra_args, deadline),
-                    _ => BareClaudeCode {
-                        model_override: model.map(str::to_string),
-                        effort: effort.map(str::to_string),
-                    }
-                    .run_bounded_seed(
-                        prompt,
-                        system_prompt,
-                        working_dir,
-                        extra_args,
-                        deadline,
-                    ),
-                }
-            }
-            Self::Pi => PiCode {
-                sandbox_profile: match &sandbox {
-                    CoderSandbox::SeatbeltProfile(profile)
-                    | CoderSandbox::TrustedSeatbeltProfile(profile) => Some(profile.clone()),
-                    _ => None,
-                },
-                trusted_sandbox: matches!(sandbox, CoderSandbox::TrustedSeatbeltProfile(_)),
-                model_override: model.map(str::to_string),
-            }
-            .run_bounded_seed(prompt, system_prompt, working_dir, extra_args, deadline),
-            Self::Codex => bail!("Codex project-model seeding is disabled"),
-        }
-    }
 }
 
 /// Trait abstracting the coding agent.
@@ -535,12 +479,6 @@ pub trait Coder: Send + Sync {
         extra_args: &[String],
         extra_env: &[(String, String)],
     ) -> Result<i32>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundedCoderRun {
-    pub exit_code: i32,
-    pub timed_out: bool,
 }
 
 /// Select how an autonomous provider launch treats its conversation state.
@@ -730,28 +668,6 @@ impl SandboxedClaudeCode {
         }
         cmd
     }
-
-    fn run_bounded_seed(
-        &self,
-        prompt: &str,
-        system_prompt: &str,
-        working_dir: &Path,
-        extra_args: &[String],
-        deadline: Duration,
-    ) -> Result<BoundedCoderRun> {
-        if let Err(error) = ensure_not_expired_with_refresh() {
-            return Err(error.into());
-        }
-        let mut command = self.build_writer_command(working_dir, CoderSession::Ephemeral);
-        apply_coder_env(&mut command, &[]);
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .args(["--append-system-prompt", system_prompt])
-            .args(["-p", prompt])
-            .args(extra_args);
-        run_bounded_coder_command(command, deadline)
-    }
 }
 
 /// Bare Claude Code (no sandbox, for Fargate/Linux/--no-sandbox).
@@ -780,34 +696,6 @@ impl BareClaudeCode {
             cmd.args(["--resume", session_id]);
         }
         cmd
-    }
-
-    fn run_bounded_seed(
-        &self,
-        prompt: &str,
-        system_prompt: &str,
-        working_dir: &Path,
-        extra_args: &[String],
-        deadline: Duration,
-    ) -> Result<BoundedCoderRun> {
-        if let Err(error) = ensure_not_expired_with_refresh() {
-            return Err(error.into());
-        }
-        let mut command = self.build_writer_command(working_dir, CoderSession::Ephemeral);
-        apply_coder_env(&mut command, &[]);
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .args(["--append-system-prompt", system_prompt])
-            .args(["-p", prompt])
-            .args(extra_args);
-        if let Some(model) = self.effective_model() {
-            command.args(["--model", &model]);
-        }
-        if let Some(effort) = &self.effort {
-            command.args(["--effort", effort]);
-        }
-        run_bounded_coder_command(command, deadline)
     }
 }
 
@@ -936,22 +824,6 @@ impl Coder for BareClaudeCode {
         let status = cmd.status()?;
         Ok(status.code().unwrap_or(1))
     }
-}
-
-fn run_bounded_coder_command(mut command: Command, deadline: Duration) -> Result<BoundedCoderRun> {
-    restrict_test_provider_credentials(&mut command);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = command.spawn()?;
-    let (exit_code, timed_out, _disposition) =
-        wait_owned_process_tree(child, deadline).map_err(anyhow::Error::msg)?;
-    Ok(BoundedCoderRun {
-        exit_code,
-        timed_out,
-    })
 }
 
 /// OpenAI Codex CLI.
@@ -1188,26 +1060,6 @@ impl PiCode {
             cmd.current_dir(working_dir);
             cmd
         }
-    }
-
-    fn run_bounded_seed(
-        &self,
-        prompt: &str,
-        system_prompt: &str,
-        working_dir: &Path,
-        extra_args: &[String],
-        deadline: Duration,
-    ) -> Result<BoundedCoderRun> {
-        let mut command = self.build_command(working_dir);
-        apply_coder_env(&mut command, &[]);
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .args(["--thinking", "off"])
-            .args(["--append-system-prompt", system_prompt])
-            .args(["-p", prompt])
-            .args(extra_args);
-        run_bounded_coder_command(command, deadline)
     }
 }
 
@@ -1774,17 +1626,6 @@ fn captured_run_refuses_to_launch_without_provider_stderr_artifact() {
         !marker.exists(),
         "the provider command must not have started"
     );
-}
-
-#[cfg(all(test, unix))]
-#[test]
-fn bounded_optional_coder_timeout_sweeps_its_process_group() {
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", "sleep 30"]);
-
-    let result = run_bounded_coder_command(command, Duration::from_millis(30)).unwrap();
-
-    assert!(result.timed_out);
 }
 
 /// Keep release fixtures from passing operator credentials through a test-owned

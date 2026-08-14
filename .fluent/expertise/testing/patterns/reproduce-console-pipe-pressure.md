@@ -29,9 +29,8 @@ writer, failing the test.
 - Launch the writer with `std::process::Command` (not `assert_cmd`) so
   the test owns the child's pipes. Pipe stderr and **never read it** —
   that is the pressure condition the regression is about.
-- Drain **stdout** on a thread. A `--no-sandbox` writer inherits the
-  coder's stdout from unrelated steps (e.g. project-model seeding), which
-  can itself exceed 64 KiB and block on its own pipe; that noise is not
+- Drain **stdout** on a thread. Provider output outside the console-preview
+  path can itself exceed 64 KiB and block on its own pipe; that noise is not
   the console path under test, so read it to end.
 - Wait with a bounded timeout (`try_wait` loop that kills on expiry). A
   capture regression blocks the writer forever; the timeout turns that

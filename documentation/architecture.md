@@ -1671,10 +1671,14 @@ from `AuthError::user_message()`. Typed rate-limit exhaustion follows the same
 no-outer-retry rule; other coder errors still retry up to
 `FLUENT_MAX_TASK_RETRIES`.
 
-Project-model seeding is best-effort work before the first Writer. Built-in seed
-coders run under a 120-second host deadline and own their process group. A
-timeout terminates that group, emits a warning, and continues to the
-authoritative Writer without charging its round budget.
+The first Writer starts from the committed candidate base without a separate
+project-model generation step. If `.fluent/expertise/INDEX.md` already exists
+in that committed state, the Writer reads it; otherwise the Writer orients from
+the project and general expertise directly. A Writer may change project
+expertise when that change belongs to its planned work. After reviews pass, the
+Learner may also create or update project expertise. Fluent does not generate a
+separate orientation commit before the Writer, so orientation cannot expand the
+Work Item's pre-review candidate scope.
 
 `fluent cleanup` owns the terminal Work model cleanup lifecycle. It
 defaults to a dry run and only mutates state with `--apply`. A Work Item

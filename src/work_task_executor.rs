@@ -3648,35 +3648,6 @@ fn run_task_coder_with_coder(
     materialize_planning_files(item, project_root)?;
     materialize_general_expertise(project_root)?;
 
-    let seeded_project_expertise_source = if should_seed_project_model(task.kind, workspace_path)
-        && coder_kind != CoderKind::Codex
-    {
-        let source_commit = crate::git::run_stdout(
-            workspace_path,
-            &["rev-parse", "HEAD"],
-            "identifying the project expertise seed source",
-        )?;
-        match run_seed_project_model(
-            workspace_path,
-            resolver,
-            extra_args,
-            coder_kind,
-            no_sandbox,
-            model,
-            effort,
-        ) {
-            Ok(()) => Some(source_commit),
-            Err(err) => {
-                eprintln!(
-                    "  Warning: seed project model failed, continuing without project expertise: {err}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let progress_dir = progress_md_dir(project_root, &item.id, attempt_id);
     fs::create_dir_all(&progress_dir).with_context(|| {
         format!(
@@ -3725,14 +3696,13 @@ fn run_task_coder_with_coder(
         )
     } else {
         (
-            build_write_task_prompt_with_seed_context(
+            build_write_task_prompt_with_workspace(
                 item,
                 attempt_id,
                 task_id,
                 prior_reviews,
                 Some(workspace_path),
                 Some(project_root),
-                seeded_project_expertise_source.as_deref(),
             ),
             crate::writer_context::WriterPromptKind::Initial,
         )
@@ -4029,7 +3999,6 @@ fn build_write_task_prompt(
     build_write_task_prompt_with_workspace(item, attempt_id, task_id, prior_reviews, None, None)
 }
 
-#[cfg(test)]
 fn build_write_task_prompt_with_workspace(
     item: &WorkItem,
     attempt_id: &str,
@@ -4037,26 +4006,6 @@ fn build_write_task_prompt_with_workspace(
     prior_reviews: &[PathBuf],
     workspace_path: Option<&Path>,
     project_root: Option<&Path>,
-) -> String {
-    build_write_task_prompt_with_seed_context(
-        item,
-        attempt_id,
-        task_id,
-        prior_reviews,
-        workspace_path,
-        project_root,
-        None,
-    )
-}
-
-fn build_write_task_prompt_with_seed_context(
-    item: &WorkItem,
-    attempt_id: &str,
-    task_id: &str,
-    prior_reviews: &[PathBuf],
-    workspace_path: Option<&Path>,
-    project_root: Option<&Path>,
-    seeded_project_expertise_source: Option<&str>,
 ) -> String {
     let attempt = item
         .attempts
@@ -4193,11 +4142,6 @@ fn build_write_task_prompt_with_seed_context(
     } else {
         ""
     };
-    let has_newly_seeded_project_expertise_value = if seeded_project_expertise_source.is_some() {
-        "yes"
-    } else {
-        ""
-    };
     let corrective_context = corrective_execution_context(item).unwrap_or_default();
     let is_corrective_value = if corrective_context.is_empty() {
         ""
@@ -4269,14 +4213,6 @@ fn build_write_task_prompt_with_seed_context(
             (
                 "has_project_expertise_index",
                 has_project_expertise_index_value,
-            ),
-            (
-                "has_newly_seeded_project_expertise",
-                has_newly_seeded_project_expertise_value,
-            ),
-            (
-                "seeded_project_expertise_source",
-                seeded_project_expertise_source.unwrap_or_default(),
             ),
         ],
     )
@@ -4947,80 +4883,6 @@ pub fn materialize_skill(skill_name: &str, dest_dir: &Path) -> Result<PathBuf> {
             .with_context(|| format!("Failed to write skill at {}", file_path.display()))?;
     }
     Ok(skill_dir)
-}
-
-fn should_seed_project_model(task_kind: TaskKind, workspace_path: &Path) -> bool {
-    task_kind == TaskKind::Write && !workspace_path.join(".fluent/expertise/INDEX.md").is_file()
-}
-
-fn run_seed_project_model(
-    workspace_path: &Path,
-    resolver: &ContentResolver,
-    extra_args: &[String],
-    coder_kind: CoderKind,
-    no_sandbox: bool,
-    model: Option<&str>,
-    effort: Option<&str>,
-) -> Result<()> {
-    eprintln!("  Seeding project expertise model…");
-
-    let workspace_resolver = ContentResolver::new(Some(workspace_path));
-    let system_prompt = workspace_resolver
-        .resolve_content("prompts/seed-system.md")
-        .unwrap_or_default();
-
-    let expertise_dir = workspace_path.join(".fluent/expertise");
-    let index_path = expertise_dir.join("INDEX.md");
-    let overview_path = expertise_dir.join("overview.md");
-
-    let template = resolver
-        .resolve_content("prompts/seed-user.md")
-        .ok_or_else(|| anyhow::anyhow!("bundled seed-user.md must resolve"))?;
-    let prompt = crate::content::render_template(
-        &template,
-        &[
-            ("index_path", &index_path.display().to_string()),
-            ("overview_path", &overview_path.display().to_string()),
-            ("workspace_path", &workspace_path.display().to_string()),
-        ],
-    )
-    .map_err(|e| anyhow::anyhow!("seed-user.md template error: {e}"))?;
-
-    let (sandbox, _sandbox_profile) = if no_sandbox {
-        (CoderSandbox::None, None)
-    } else {
-        let common_git_dir = worktree::git_common_dir(workspace_path)?;
-        build_coder_sandbox_with_writable_and_read_only_roots(
-            coder_kind,
-            resolver,
-            workspace_path,
-            &[common_git_dir],
-            &[],
-        )?
-    };
-
-    let result = coder_kind.run_bounded_seed(
-        sandbox,
-        model,
-        effort,
-        &prompt,
-        &system_prompt,
-        workspace_path,
-        extra_args,
-        std::time::Duration::from_secs(120),
-    )?;
-    if result.timed_out {
-        bail!("Seed coder exceeded its 120 second best-effort deadline");
-    }
-    if result.exit_code != 0 {
-        bail!("Seed coder exited with code {}", result.exit_code);
-    }
-
-    if !index_path.is_file() {
-        bail!("Seed coder did not produce {}", index_path.display());
-    }
-
-    Ok(())
 }
 
 /// Inputs the Learner coder needs to refine expertise and write its handoff
@@ -7482,6 +7344,7 @@ fn preflight_review_sandbox_profile(
     Ok(Some(profile))
 }
 
+#[cfg(test)]
 fn build_coder_sandbox_with_writable_and_read_only_roots(
     coder_kind: CoderKind,
     resolver: &ContentResolver,
@@ -7519,26 +7382,6 @@ fn build_coder_sandbox_with_writable_and_read_only_roots_and_codex_home(
         codex_home,
     )?;
     #[cfg(not(test))]
-    os::preflight_profile(&profile)?;
-    let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
-    Ok((sandbox, Some(profile)))
-}
-
-fn build_coder_sandbox_with_read_only_roots(
-    coder_kind: CoderKind,
-    resolver: &ContentResolver,
-    working_dir: &Path,
-    readable_roots: &[PathBuf],
-) -> Result<(CoderSandbox, Option<os::SandboxProfile>)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let writable_roots = vec![working_dir.to_path_buf()];
-    let profile = os::render_profile_for_access_for_coder(
-        resolver,
-        &home,
-        &writable_roots,
-        readable_roots,
-        coder_kind,
-    )?;
     os::preflight_profile(&profile)?;
     let sandbox = CoderSandbox::SeatbeltProfile(profile.path.to_string_lossy().to_string());
     Ok((sandbox, Some(profile)))
@@ -16993,195 +16836,6 @@ mod tests {
         assert!(
             results_path.exists(),
             "baseline tester should persist tester-results.json as artifact"
-        );
-    }
-
-    #[test]
-    fn seed_prompt_renders_with_output_paths() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let resolver = ContentResolver::new(None);
-        let template = resolver
-            .resolve_content("prompts/seed-user.md")
-            .expect("seed-user.md must resolve");
-
-        let index_path = workspace.join(".fluent/expertise/INDEX.md");
-        let overview_path = workspace.join(".fluent/expertise/overview.md");
-        let rendered = crate::content::render_template(
-            &template,
-            &[
-                ("index_path", &index_path.display().to_string()),
-                ("overview_path", &overview_path.display().to_string()),
-                ("workspace_path", &workspace.display().to_string()),
-            ],
-        )
-        .expect("seed template must render");
-
-        assert!(
-            rendered.contains(&index_path.display().to_string()),
-            "rendered seed prompt should contain the INDEX.md path"
-        );
-        assert!(
-            rendered.contains(&overview_path.display().to_string()),
-            "rendered seed prompt should contain the overview.md path"
-        );
-        assert!(
-            rendered.contains(&workspace.display().to_string()),
-            "rendered seed prompt should contain the workspace path"
-        );
-        assert!(
-            rendered.contains("Seed project expertise overview"),
-            "rendered seed prompt should include the commit message instruction"
-        );
-    }
-
-    #[test]
-    fn write_prompt_includes_project_index_after_seed() {
-        let item = review_item();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-
-        assert!(
-            should_seed_project_model(TaskKind::Write, workspace),
-            "seed should fire before INDEX.md exists"
-        );
-
-        let prompt_before = build_write_task_prompt_with_workspace(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-        );
-        assert!(
-            !prompt_before.contains("learned model of THIS project"),
-            "prompt should not include project expertise before seed"
-        );
-
-        let expertise_dir = workspace.join(".fluent/expertise");
-        fs::create_dir_all(&expertise_dir).unwrap();
-        fs::write(expertise_dir.join("INDEX.md"), "# Project Index\n").unwrap();
-        fs::write(expertise_dir.join("overview.md"), "# Overview\n").unwrap();
-
-        assert!(
-            !should_seed_project_model(TaskKind::Write, workspace),
-            "seed should not fire after INDEX.md exists"
-        );
-
-        let prompt_after = build_write_task_prompt_with_workspace(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-        );
-        assert!(
-            prompt_after.contains("learned model of THIS project"),
-            "prompt should include project expertise after seed produces INDEX.md"
-        );
-        assert!(
-            prompt_after.contains(&expertise_dir.join("INDEX.md").display().to_string()),
-            "prompt should reference the INDEX.md path"
-        );
-    }
-
-    #[test]
-    fn write_prompt_identifies_new_seed_as_starting_state() {
-        let item = review_item();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let expertise_dir = workspace.join(".fluent/expertise");
-        fs::create_dir_all(&expertise_dir).unwrap();
-        fs::write(expertise_dir.join("INDEX.md"), "# Project Index\n").unwrap();
-        fs::write(expertise_dir.join("overview.md"), "# Overview\n").unwrap();
-        let source_commit = "0123456789abcdef0123456789abcdef01234567";
-
-        let prompt = build_write_task_prompt_with_seed_context(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-            Some(source_commit),
-        );
-
-        assert!(
-            prompt.contains(source_commit),
-            "prompt should identify the commit described by the seed"
-        );
-        assert!(
-            prompt.contains("current-state claims")
-                && prompt.contains("Update any claim your changes"),
-            "prompt should instruct the first Writer to reconcile invalidated claims"
-        );
-        assert!(
-            !prompt.contains("{{"),
-            "prompt should not retain template placeholders: {prompt}"
-        );
-
-        let ordinary_prompt = build_write_task_prompt_with_workspace(
-            &item,
-            "attempt-1",
-            "attempt-1-write-1",
-            &[],
-            Some(workspace),
-            None,
-        );
-        assert!(
-            !ordinary_prompt.contains(source_commit),
-            "ordinary project expertise should not include fresh-seed provenance"
-        );
-        assert_ne!(
-            prompt, ordinary_prompt,
-            "freshly seeded and ordinary expertise should render different context"
-        );
-    }
-
-    #[test]
-    fn should_seed_project_model_true_when_write_role_and_index_absent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        assert!(should_seed_project_model(TaskKind::Write, workspace));
-    }
-
-    #[test]
-    fn should_seed_project_model_false_when_index_present() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        let expertise_dir = workspace.join(".fluent/expertise");
-        fs::create_dir_all(&expertise_dir).unwrap();
-        fs::write(expertise_dir.join("INDEX.md"), "# Index\n").unwrap();
-        assert!(!should_seed_project_model(TaskKind::Write, workspace));
-    }
-
-    #[test]
-    fn should_seed_project_model_false_for_non_write_tasks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let workspace = tmp.path();
-        assert!(!should_seed_project_model(TaskKind::Review, workspace));
-        assert!(!should_seed_project_model(TaskKind::Tester, workspace));
-    }
-
-    #[test]
-    fn seed_session_uses_non_writer_system_prompt() {
-        let resolver = ContentResolver::new(None);
-        let seed_prompt = resolver
-            .resolve_content("prompts/seed-system.md")
-            .expect("seed-system.md must resolve");
-        let write_prompt = resolver
-            .resolve_content("prompts/write-system.md")
-            .expect("write-system.md must resolve");
-
-        assert_ne!(
-            seed_prompt, write_prompt,
-            "seed session must not reuse the writer's system prompt"
-        );
-        assert!(
-            !seed_prompt.contains("Fluent Writer"),
-            "seed system prompt must not identify as a Fluent Writer"
         );
     }
 

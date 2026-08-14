@@ -65,16 +65,6 @@ First, understand what this Work Item asks for:
      conventions, patterns, and a codebase overview when present). Read the files it indexes now;
      this is fluent's own accumulated understanding of the project — prefer it over re-deriving.
 {{/if}}
-{{#if has_newly_seeded_project_expertise}}
-
-### Reconcile the newly seeded project model
-
-Fluent generated this project model from commit `{{seeded_project_expertise_source}}`
-immediately before starting your work. It describes the starting workspace, not the
-state after your changes. Before you finish, compare your changed files with the
-current-state claims in the indexed expertise files. Update any claim your changes
-make inaccurate, but do not rewrite unrelated expertise.
-{{/if}}
 {{#if has_prior_reviews}}
 - Read each prior correction artifact, including review reports, Tester evidence, or `candidate-gate.json`. The list below is the complete set for this continuation: {{prior_reviews_list}}
 {{/if}}

@@ -5949,9 +5949,6 @@ for arg in "$@"; do
   if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
   if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
 done
-# The seed invocation runs in the attempt worktree too; leave it to fail rather
-# than committing the writer's output during seeding.
-if printf '%s' "$PROMPT" | grep -q "seeding fluent"; then exit 0; fi
 case "$PWD" in
   */work-*-work-1-attempt-1)
     printf '{"type":"result","subtype":"success"}\n'
@@ -6079,7 +6076,6 @@ for arg in "$@"; do
   if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
   if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
 done
-if printf '%s' "$PROMPT" | grep -q "seeding fluent"; then exit 0; fi
 # The Learner runs in the attempt worktree too. It must succeed so the
 # advancement gate admits the Merge Candidate; it writes an empty handoff and
 # never touches the writer counter.
@@ -6204,10 +6200,10 @@ exit 0
 }
 
 #[test]
-fn seed_failure_does_not_abort_attempt() {
+fn initial_claude_writer_runs_once_without_pre_writer_expertise_seed() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
-    let bin_dir = tmp.path().join("bin-seed-fail");
+    let bin_dir = tmp.path().join("bin-single-writer");
     let counter_path = tmp.path().join("call-counter");
 
     write_mock_claude(
@@ -6215,10 +6211,10 @@ fn seed_failure_does_not_abort_attempt() {
         &format!(
             r##"#!/bin/bash
 COUNTER="{}"
-if [ ! -f "$COUNTER" ]; then
-    echo 1 > "$COUNTER"
-    exit 1
-fi
+count=0
+if [ -f "$COUNTER" ]; then count=$(cat "$COUNTER"); fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$COUNTER"
 printf 'task output\n' > task-output.txt
 git add task-output.txt
 git commit -m "Add task output" >/dev/null
@@ -6230,7 +6226,13 @@ exit 0
 
     fluent_cmd()
         .current_dir(&main_dir)
-        .args(["work-item", "create", "work-1", "--title", "Seed fail test"])
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Single writer test",
+        ])
         .assert()
         .success();
     fluent_cmd()
@@ -6256,16 +6258,50 @@ exit 0
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("seed project model failed"),
-        "stderr should warn about seed failure; got:\n{stderr}"
-    );
-    assert!(
         output.status.success(),
-        "write task should succeed despite seed failure: stdout={} stderr={}",
+        "the initial Writer should succeed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         stderr
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Completed Task attempt-1-write-1"));
+    assert_eq!(
+        fs::read_to_string(&counter_path).unwrap().trim(),
+        "1",
+        "the first Write Task must launch only the Writer, without a seed-model call"
+    );
+
+    let task: serde_json::Value = serde_json::from_slice(
+        &fs::read(main_dir.join(".fluent/work/tasks/work-1/attempt-1/attempt-1-write-1.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let base = task["output"]["base_commit"].as_str().unwrap();
+    let candidate = task["output"]["commit"].as_str().unwrap();
+    let workspace = main_dir.join(task["output"]["workspace_path"].as_str().unwrap());
+    assert_eq!(
+        git::run_stdout(
+            &workspace,
+            &["rev-list", "--count", &format!("{base}..{candidate}")],
+            "count initial Writer commits",
+        )
+        .unwrap(),
+        "1",
+        "the candidate must contain only the Writer commit"
+    );
+    assert_eq!(
+        git::run_stdout(
+            &workspace,
+            &["diff", "--name-only", base, candidate],
+            "inspect initial Writer candidate scope",
+        )
+        .unwrap(),
+        "task-output.txt",
+        "Fluent must not add project expertise before review"
+    );
+    assert!(
+        !workspace.join(".fluent/expertise/INDEX.md").exists(),
+        "project expertise remains absent until the post-review Learner"
+    );
 }
 
 /// A mock coder that drives write and review rounds like `loop_mock_script`, but
@@ -7024,7 +7060,6 @@ if [ -z "$PROMPT" ]; then exit 0; fi
 if [ -n "${{MOCK_PROMPT_LOG:-}}" ]; then
   printf '%s\n' "$PROMPT" >> "$MOCK_PROMPT_LOG"
 fi
-if printf '%s' "$PROMPT" | grep -q "seeding fluent"; then exit 0; fi
 if printf '%s' "$PROMPT" | grep -q "Rebase the candidate branch"; then
   TARGET=$(printf '%s' "$PROMPT" | grep -o 'onto `[^`]*`' | sed 's/onto `//;s/`//')
   git rebase "$TARGET" 2>/dev/null
@@ -12299,7 +12334,6 @@ for arg in "$@"; do
   if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
   if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
 done
-if printf '%s' "$PROMPT" | grep -q "seeding fluent"; then exit 0; fi
 if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
   DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
   mkdir -p "$(dirname "$DRAFT")"
@@ -20963,7 +20997,7 @@ fn no_legacy_prompt_files_in_prompts_dir() {
         "Legacy prompts/author.md should not exist"
     );
 
-    let allowed_prefixes = ["write-", "review-", "rebase-", "seed-", "learner-"];
+    let allowed_prefixes = ["write-", "review-", "rebase-", "learner-"];
     for entry in fs::read_dir(&prompts_dir).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name().to_string_lossy().to_string();
@@ -20974,7 +21008,7 @@ fn no_legacy_prompt_files_in_prompts_dir() {
             allowed_prefixes
                 .iter()
                 .any(|prefix| name.starts_with(prefix)),
-            "Unexpected prompt file: {name}. Only write-*, review-*, rebase-*, seed-*, and learner-* prompts should exist."
+            "Unexpected prompt file: {name}. Only write-*, review-*, rebase-*, and learner-* prompts should exist."
         );
     }
 }
