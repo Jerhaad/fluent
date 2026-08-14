@@ -16629,6 +16629,49 @@ mod tests {
     }
 
     #[test]
+    fn writer_route_preserves_wrapped_execution_guidance_in_matrix() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Wrapped guidance");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            approach: Some(
+                "# Approach\n\n\
+                 ## Execution guidance\n\n\
+                 - Preserve the approved requirement,\n\
+                   including this wrapped constraint.\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+
+        let matrix_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&matrix_path).unwrap()).unwrap();
+        assert_eq!(
+            matrix.rows[0].requirement,
+            "Preserve the approved requirement, including this wrapped constraint."
+        );
+
+        let prompt = build_write_task_prompt_with_workspace(
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+            &[],
+            None,
+            Some(project.path()),
+        );
+        assert!(prompt.contains(&matrix_path.display().to_string()));
+        assert!(prompt.contains("`approach:guidance:1`"));
+    }
+
+    #[test]
     fn corrective_writer_matrix_carries_planning_rows_and_adds_open_findings() {
         let project = tempfile::TempDir::new().unwrap();
         let mut item = WorkItem::planned("work-1", "Dashboard correction");

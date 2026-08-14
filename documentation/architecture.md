@@ -209,8 +209,12 @@ immutable completion contract from approved behavior statements and their existi
 verification markers, Approach choices and execution guidance, and required Plan
 rows and Verification cells. Before each Writer launch the host materializes a
 bounded task-owned `writer-completion.json` matrix from that contract and an
-unchecked `## Required completion` projection from the Plan. Planning claims from
-the prior Writer carry forward; open findings from the current review artifacts
+unchecked `## Required completion` projection from the Plan. Wrapped
+execution-guidance bullets retain every continuation line until the next bullet
+or section. Physical line breaks therefore cannot remove an approved constraint
+from the matrix.
+Planning claims from the prior Writer carry forward; open findings from the
+current review artifacts
 become pending rows identified by stable role-scoped finding identities. The
 Writer may fill only completion state, implementation evidence, passing focused
 commands, and finding-to-constraint mappings. Findings may cite the exact

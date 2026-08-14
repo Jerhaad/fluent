@@ -6160,9 +6160,11 @@ Test: tests/binary.rs (work_show_outputs_pretty_json_for_one_work_item)
 WHEN Fluent creates a new code-producing Attempt from approved Behaviors,
 Approach, and Plan inputs, THE SYSTEM SHALL stamp an immutable Writer completion
 contract containing every EARS statement and its existing verification marker,
-every applicable Approach decision, structural boundary, and execution-guidance
-constraint, and every required Plan row and its existing Verification cell.
+the complete text of every applicable Approach decision, structural boundary,
+and execution-guidance constraint, and every required Plan row and its existing
+Verification cell.
 Test: src/work_model.rs (writer_completion_contract_maps_approved_planning_inputs)
+Test: src/work_task_executor.rs (writer_route_preserves_wrapped_execution_guidance_in_matrix)
 
 ### B17
 

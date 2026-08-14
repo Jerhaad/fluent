@@ -2558,6 +2558,15 @@ fn completion_slug(value: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
+fn is_markdown_heading(value: &str) -> bool {
+    let marker_len = value.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&marker_len)
+        && value
+            .as_bytes()
+            .get(marker_len)
+            .is_none_or(u8::is_ascii_whitespace)
+}
+
 fn parse_behavior_completion_requirements(source: &str) -> Vec<WriterCompletionRequirement> {
     let lines = source.lines().collect::<Vec<_>>();
     let mut requirements = Vec::new();
@@ -2658,6 +2667,11 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
             index += 1;
             continue;
         }
+        if section == Section::Guidance && is_markdown_heading(line) {
+            section = Section::Other;
+            index += 1;
+            continue;
+        }
         if section == Section::Decisions {
             if let Some(heading) = line.strip_prefix("### ") {
                 decision = Some(heading.trim().to_string());
@@ -2691,13 +2705,27 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
         } else if section == Section::Guidance {
             if let Some(guidance) = line.strip_prefix("- ") {
                 guidance_index += 1;
+                let mut guidance_lines = vec![guidance.trim().to_string()];
+                let mut cursor = index + 1;
+                while cursor < lines.len() {
+                    let continuation = lines[cursor].trim();
+                    if is_markdown_heading(continuation) || continuation.starts_with("- ") {
+                        break;
+                    }
+                    if !continuation.is_empty() {
+                        guidance_lines.push(continuation.to_string());
+                    }
+                    cursor += 1;
+                }
                 requirements.push(WriterCompletionRequirement {
                     id: format!("approach:guidance:{guidance_index}"),
                     kind: WriterCompletionRequirementKind::Approach,
                     source: format!("approach.md#execution-guidance-{guidance_index}"),
-                    requirement: guidance.trim().to_string(),
+                    requirement: guidance_lines.join(" "),
                     verification_refs: Vec::new(),
                 });
+                index = cursor;
+                continue;
             }
         }
         index += 1;
@@ -8263,7 +8291,14 @@ mod tests {
                  ## Structure\n\n\
                  The app owns selection; render depends only on render data.\n\n\
                  ## Execution guidance\n\n\
-                 - Keep render independent from app state.\n"
+                 - Keep render independent from app state,\n\
+                   including layout-aware selection.\n\
+                   Preserve explicit navigation boundaries.\n\n\
+                 - Keep diagnostics reachable\n\
+                   without coupling rendering to terminal input.\n\
+                   #not-a-heading remains part of the constraint.\n\n\
+                 ### Risks\n\n\
+                 - Do not treat this risk as execution guidance.\n"
                     .to_string(),
             ),
             plan: Some(
@@ -8301,15 +8336,27 @@ mod tests {
                     WriterCompletionRequirementKind::Approach,
                     "approach:guidance:1"
                 ),
+                (
+                    WriterCompletionRequirementKind::Approach,
+                    "approach:guidance:2"
+                ),
                 (WriterCompletionRequirementKind::Plan, "plan:step-1"),
             ]
+        );
+        assert_eq!(
+            contract.requirements[3].requirement,
+            "Keep render independent from app state, including layout-aware selection. Preserve explicit navigation boundaries."
+        );
+        assert_eq!(
+            contract.requirements[4].requirement,
+            "Keep diagnostics reachable without coupling rendering to terminal input. #not-a-heading remains part of the constraint."
         );
         assert_eq!(
             contract.requirements[0].verification_refs,
             vec!["tests/dashboard.rs (down_moves_selection)"]
         );
         assert_eq!(
-            contract.requirements[4].verification_refs,
+            contract.requirements[5].verification_refs,
             vec!["`cargo test down_moves_selection`"]
         );
 
