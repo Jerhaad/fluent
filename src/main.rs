@@ -1906,10 +1906,6 @@ fn cmd_init(cwd: &Path, inputs: fluent::setup::InitSetupInputs) -> Result<()> {
         eprintln!("  Initialized .fluent/ in {}", cwd.display());
     }
 
-    if let Err(e) = cmd_skills_add(cwd, false, false, None) {
-        eprintln!("  warning: could not install skills: {e}");
-    }
-
     if let Err(e) = seed_agent_instructions(cwd) {
         eprintln!("  warning: could not seed agent instructions: {e}");
     }
@@ -2163,7 +2159,8 @@ fn cmd_skills_add(
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME not set; cannot locate agent skills directory"))?;
 
-    preflight_external_shim_handoffs(cwd, &home, force_global, force_project, agent.as_deref())?;
+    let install_dirs = resolve_install_dirs(cwd, &home, force_global, force_project, &agent)?;
+    preflight_external_shim_handoffs(cwd, &home, &install_dirs)?;
 
     let names = fluent::content::bundled_skill_names();
 
@@ -2174,18 +2171,29 @@ fn cmd_skills_add(
         work_task_executor::materialize_skill(name, &data_dir)?;
     }
 
-    let install_dirs = resolve_install_dirs(cwd, &home, force_global, force_project, &agent)?;
-
     for dir in &install_dirs {
         let (agent_name, scope) = install_identity(cwd, dir);
         let lock_path = external_skill_lock_path(cwd, &home, dir);
-        let outcomes = names
-            .iter()
-            .map(|name| {
-                install_skill_with_external_handoff(name, dir, agent_name, scope, Some(&lock_path))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if outcomes
+        let fluent_outcome = install_skill_with_external_handoff(
+            "fluent",
+            dir,
+            agent_name,
+            scope,
+            Some(&lock_path),
+        )?;
+        let mut outcomes = vec![fluent_outcome];
+        if fluent_outcome != InstallOutcome::Conflict {
+            outcomes.extend(
+                names
+                    .iter()
+                    .filter(|name| **name != "fluent")
+                    .map(|name| install_skill(name, dir, agent_name, scope))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+        if fluent_outcome == InstallOutcome::Conflict {
+            eprintln!("No bundled skills installed to {}", dir.display());
+        } else if outcomes
             .iter()
             .all(|outcome| *outcome == InstallOutcome::Current)
         {
@@ -2204,16 +2212,11 @@ fn cmd_skills_add(
         }
     }
 
-    // Scan bounded project and global roots for a Fluent-marked bootstrap shim
-    // beyond the selected install targets. This adopts an npx-installed
-    // canonical shim without creating any otherwise absent agent root.
-    let scan_dirs =
-        shim_scan_candidate_dirs(cwd, &home, force_global, force_project, agent.as_deref());
-    for dir in &scan_dirs {
-        if install_dirs.iter().any(|candidate| candidate == dir) {
-            continue;
-        }
-        replace_shim_if_present(cwd, &home, dir)?;
+    if install_dirs.is_empty() {
+        eprintln!(
+            "Wrote bundled skills to {}. No Fluent bootstrap or managed installation was found; use --agent with --project or --global to create one.",
+            data_dir.display()
+        );
     }
 
     let mut reported_dirs = install_dirs.clone();
@@ -2368,9 +2371,11 @@ fn resolve_install_dirs(
     force_project: bool,
     agent: &Option<String>,
 ) -> Result<Vec<PathBuf>> {
-    if force_project {
-        let project_dir = cwd.join(".claude/skills");
-        return Ok(vec![project_dir]);
+    let explicit_scope = force_global || force_project;
+    match (explicit_scope, agent.as_ref()) {
+        (true, None) => bail!("--project and --global require --agent <codex|claude|*>"),
+        (false, Some(_)) => bail!("--agent requires either --project or --global"),
+        _ => {}
     }
 
     if let Some(agents) = agent {
@@ -2378,59 +2383,38 @@ fn resolve_install_dirs(
         let mut dirs = Vec::new();
         for a in agents.split(',') {
             let a = a.trim();
-            if a == "*" {
-                dirs.extend(all_agent_skill_dirs(&home));
-            } else {
-                dirs.push(home.join(format!(".{a}/skills")));
+            let selected = match a {
+                "*" => vec!["claude", "codex"],
+                "claude" => vec!["claude"],
+                "codex" => vec!["codex"],
+                "" => bail!("--agent must name codex, claude, or *"),
+                other => bail!("Unsupported agent {other:?}; expected codex, claude, or *"),
+            };
+            for selected_agent in selected {
+                let dir = if force_project {
+                    cwd.join(format!(".{selected_agent}/skills"))
+                } else {
+                    home.join(format!(".{selected_agent}/skills"))
+                };
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
             }
         }
         if dirs.is_empty() {
-            bail!("No agent skill directories found");
+            bail!("--agent must name codex, claude, or *");
         }
         return Ok(dirs);
     }
 
-    // Default or --global: install to global roots.
-    let mut dirs = global_skill_roots(home);
-
-    // If not explicitly --global, also update a project-level fluent skill
-    // if one already exists (B5).
-    if !force_global {
-        let project_dir = cwd.join(".claude/skills");
-        let project_fluent = project_dir.join("fluent/SKILL.md");
-        if project_fluent.exists() {
-            dirs.push(project_dir);
-        }
-    }
-
-    Ok(dirs)
-}
-
-fn all_agent_skill_dirs(home: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    for agent in &["claude", "codex"] {
-        let dir = home.join(format!(".{agent}/skills"));
-        dirs.push(dir);
-    }
-    dirs
+    Ok(shim_candidate_roots(cwd, home)
+        .into_iter()
+        .filter(|dir| dir.join("fluent").exists())
+        .collect())
 }
 
 fn is_fluent_shim(skills_dir: &Path) -> bool {
     skill_install::is_fluent_shim(&skills_dir.join("fluent"))
-}
-
-fn replace_shim_if_present(cwd: &Path, home: &str, skills_dir: &Path) -> Result<()> {
-    if !is_fluent_shim(skills_dir) {
-        return Ok(());
-    }
-    let (agent, scope) = install_identity(cwd, skills_dir);
-    let lock_path = external_skill_lock_path(cwd, home, skills_dir);
-    let outcome =
-        install_skill_with_external_handoff("fluent", skills_dir, agent, scope, Some(&lock_path))?;
-    if outcome == InstallOutcome::ReplacedShim {
-        eprintln!("Replaced fluent shim in {}", skills_dir.display());
-    }
-    Ok(())
 }
 
 /// Candidate directories where the external `skills` CLI may install a shim.
@@ -2458,31 +2442,12 @@ fn global_shim_candidate_roots(home: &str) -> Vec<PathBuf> {
     ]
 }
 
-fn shim_scan_candidate_dirs(
-    cwd: &Path,
-    home: &str,
-    force_global: bool,
-    force_project: bool,
-    agent: Option<&str>,
-) -> Vec<PathBuf> {
-    let roots = if force_project {
-        project_shim_candidate_roots(cwd)
-    } else if force_global || agent.is_some() {
-        global_shim_candidate_roots(home)
-    } else {
-        shim_candidate_roots(cwd, home)
-    };
-    roots.into_iter().filter(|dir| dir.is_dir()).collect()
-}
-
 fn preflight_external_shim_handoffs(
     cwd: &Path,
     home: &str,
-    force_global: bool,
-    force_project: bool,
-    agent: Option<&str>,
+    install_dirs: &[PathBuf],
 ) -> Result<()> {
-    for dir in shim_scan_candidate_dirs(cwd, home, force_global, force_project, agent) {
+    for dir in install_dirs {
         if is_sidecar_free_fluent_shim(&dir)? {
             let lock_path = external_skill_lock_path(cwd, home, &dir);
             skill_install::prepare_external_skill_lock_handoff(&lock_path)?;
@@ -2526,18 +2491,6 @@ fn skills_data_dir(home: &str) -> PathBuf {
         .join("share")
         .join("fluent")
         .join("skills")
-}
-
-/// Candidate global skill roots where agents may read skills from.
-fn global_skill_roots(home: &str) -> Vec<PathBuf> {
-    let home = PathBuf::from(home);
-    let mut roots = Vec::new();
-
-    // Claude Code global skills directory
-    let claude_skills = home.join(".claude").join("skills");
-    roots.push(claude_skills);
-
-    roots
 }
 
 // -------------------------------------------------------------------------

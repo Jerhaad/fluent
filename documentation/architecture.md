@@ -31,26 +31,32 @@ sandbox setup, credential injection, session continuity, worktree
 creation, and remote execution. The fluent skill bridges the two — an
 agent reads it and can drive the entire workflow.
 
-`fluent skills add` materializes bundled skills at agent-facing roots. Each
-installed bundle records a `.fluent-managed.json` sidecar with its schema,
-agent, scope, skill name, complete file inventory, and content digest. A
-self-consistent sidecar grants Fluent authority to update that same identity
-across releases, even when its earlier digest is unknown to the running
-binary. Any malformed or mismatched sidecar, changed file, missing file, or
-unlisted file withdraws that authority: Fluent preserves the directory and
-reports its path with cleanup guidance. Exact allowlisted pre-sidecar bundles
+`fluent skills add --agent <agents> --project|--global` creates selected
+agent-facing roots. The agent target chooses where the interactive Fluent skill
+is available; it is independent of the Writer and reviewer coder profile saved
+by `fluent init`. Each installed bundle records a `.fluent-managed.json`
+sidecar with its schema, agent, scope, skill name, complete file inventory, and
+content digest. A self-consistent sidecar grants Fluent authority to update that
+same identity across releases, even when its earlier digest is unknown to the
+running binary. Any malformed or mismatched sidecar, changed file, missing
+file, or unlisted file withdraws that authority: Fluent preserves the directory
+and reports its path with cleanup guidance. Exact allowlisted pre-sidecar bundles
 and sidecar-free Fluent-marked shims remain bounded migration targets. The shim
 scan covers existing project `.agents/skills`, `.claude/skills`, and
-`.codex/skills` roots plus their supported global counterparts; it does not
-create otherwise absent roots. Explicit `--project` and `--global` scope the
-scan as well as the selected install targets. When a shim has a matching
+`.codex/skills` roots plus their supported global counterparts. A bare
+`fluent skills add` materializes the fixed handoff copy and updates only those
+existing managed installations and Fluent-marked bootstraps; it does not create
+otherwise absent roots. An explicit agent and scope operate only on the selected
+install targets. When a shim has a matching
 `skills` CLI lock entry, Fluent removes only that entry before adoption and
 restores it if bundle installation fails. Invalid or foreign lock entries stop
 the install before any mutation. This releases the external updater before
 Fluent records its own sidecar, preventing a later `npx skills update` from
 restoring the bootstrap.
-The fixed data copy used by the bootstrap shim is host-owned hand-off data, not
-a managed agent-facing installation.
+The fixed data copy used by the bootstrap shim is host-owned handoff data, not
+a managed agent-facing installation. `fluent init` does not install or refresh
+interactive-agent skills, while `fluent update` uses the safe bare refresh after
+it replaces the binary.
 
 ## Workflow
 
@@ -2177,7 +2183,8 @@ path. The smoke `HOME` remains isolated under the root.
 **Skill and scheduler boundaries.** Before initialization, `run` invokes
 `fluent skills add` exactly as the bootstrap instructs. It requires the marked
 project skill to become a sidecar-managed full skill, Fluent's lock entry to be
-removed, and unrelated lock values to remain. It then initializes with
+removed, unrelated lock values to remain, and no unselected Codex or Claude
+Code project skill root to be created. It then initializes with
 `propose` follow-up mode, writes the fixture Tester configuration and executable
 extractor, and commits the complete first-use state before creating the Work
 Item and planned Attempt. The fixture extractor maps `./check.sh` to the stable

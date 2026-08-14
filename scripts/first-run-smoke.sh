@@ -742,6 +742,10 @@ verify_skill_handoff() {
   jq -e '.skills.fluent == null' "$lock" > /dev/null 2>> "$logfile" || return 1
   jq -e '.metadata.fixture == "keep" and .skills.other.source == "owner/other"' \
     "$lock" > /dev/null 2>> "$logfile" || return 1
+  if [ -e "$project/.claude" ] || [ -e "$project/.codex" ]; then
+    printf 'error: bare skill handoff created an unselected agent root\n' >> "$logfile"
+    return 1
+  fi
 }
 
 phase_run() {

@@ -1092,7 +1092,7 @@ fn fluent_skills_install_writes_all_public_skills() {
     let output = fluent_cmd()
         .current_dir(tmp.path())
         .env("HOME", tmp.path().to_string_lossy().to_string())
-        .arg("skills")
+        .args(["skills", "add", "--agent", "claude", "--global"])
         .output()
         .unwrap();
 
@@ -24825,11 +24825,11 @@ fn skills_add_materializes_full_skill_and_references() {
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
-    let skills_dir = home.join(".claude/skills");
+    let skills_dir = home.join(".codex/skills");
     let fluent_skill = skills_dir.join("fluent/SKILL.md");
     assert!(
         fluent_skill.exists(),
@@ -24878,7 +24878,7 @@ fn skills_add_updates_prior_managed_release_without_digest_allowlist() {
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add"])
         .assert()
         .success();
 
@@ -24893,7 +24893,7 @@ fn skills_add_updates_prior_managed_release_without_digest_allowlist() {
     let expected_home = tmp.path().join("expected-home");
     fluent_cmd()
         .env("HOME", expected_home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
     assert_eq!(
@@ -24911,7 +24911,7 @@ fn skills_add_leaves_one_managed_installation_per_agent_and_scope() {
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
@@ -24932,7 +24932,7 @@ fn skills_add_preserves_edited_added_and_missing_managed_files() {
         let home = tmp.path().join("home");
         fluent_cmd()
             .env("HOME", home.to_str().unwrap())
-            .args(["skills", "add", "--agent", "codex"])
+            .args(["skills", "add", "--agent", "codex", "--global"])
             .assert()
             .success();
 
@@ -24950,7 +24950,7 @@ fn skills_add_preserves_edited_added_and_missing_managed_files() {
 
         let output = fluent_cmd()
             .env("HOME", home.to_str().unwrap())
-            .args(["skills", "add", "--agent", "codex"])
+            .args(["skills", "add", "--agent", "codex", "--global"])
             .output()
             .unwrap();
 
@@ -24976,7 +24976,7 @@ fn skills_add_preserves_malformed_and_identity_mismatched_sidecars() {
         let home = tmp.path().join("home");
         fluent_cmd()
             .env("HOME", home.to_str().unwrap())
-            .args(["skills", "add", "--agent", "codex"])
+            .args(["skills", "add", "--agent", "codex", "--global"])
             .assert()
             .success();
         let skill_dir = home.join(".codex/skills/fluent");
@@ -24999,7 +24999,7 @@ fn skills_add_preserves_malformed_and_identity_mismatched_sidecars() {
 
         let output = fluent_cmd()
             .env("HOME", home.to_str().unwrap())
-            .args(["skills", "add", "--agent", "codex"])
+            .args(["skills", "add", "--agent", "codex", "--global"])
             .output()
             .unwrap();
 
@@ -25031,7 +25031,7 @@ fn skills_add_reports_unmarked_conflict_without_modifying_it() {
 
     let output = fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .output()
         .unwrap();
 
@@ -25290,7 +25290,7 @@ fn skills_add_explicit_scope_does_not_adopt_other_scope_shims() {
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "--global"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
     assert_eq!(complete_skill_snapshot(&project_shim), project_before);
@@ -25307,7 +25307,7 @@ fn skills_add_explicit_scope_does_not_adopt_other_scope_shims() {
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "--project"])
+        .args(["skills", "add", "--agent", "codex", "--project"])
         .assert()
         .success();
     assert_eq!(complete_skill_snapshot(&global_shim), global_before);
@@ -25359,7 +25359,7 @@ fn skills_add_reports_shim_replacement_only_for_its_target() {
 
     let output = fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "claude,codex"])
+        .args(["skills", "add", "--agent", "claude,codex", "--global"])
         .output()
         .unwrap();
 
@@ -25456,7 +25456,7 @@ fn skills_add_does_not_rewrite_current_managed_installation() {
     let home = tmp.path().join("home");
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
@@ -25464,7 +25464,7 @@ fn skills_add_does_not_rewrite_current_managed_installation() {
     let before = complete_skill_snapshot(&skill_dir);
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
@@ -25477,13 +25477,13 @@ fn skills_add_current_installation_reports_success_without_warning() {
     let home = tmp.path().join("home");
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success()
         .stderr(
@@ -25501,13 +25501,13 @@ fn skills_add_preserves_and_reports_cross_scope_installations() {
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "--global"])
+        .args(["skills", "add", "--agent", "claude", "--global"])
         .assert()
         .success();
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "--project"])
+        .args(["skills", "add", "--agent", "claude", "--project"])
         .assert()
         .success();
 
@@ -25533,7 +25533,7 @@ fn skills_add_preserves_and_reports_cross_scope_installations() {
 }
 
 #[test]
-fn skills_add_bare_is_alias_for_skills_add() {
+fn skills_add_bare_refreshes_without_creating_agent_roots() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -25544,11 +25544,13 @@ fn skills_add_bare_is_alias_for_skills_add() {
         .assert()
         .success();
 
-    let fluent_skill = home.join(".claude/skills/fluent/SKILL.md");
     assert!(
-        fluent_skill.exists(),
-        "bare 'fluent skills' must install skills (backward compat)"
+        home.join(".local/share/fluent/skills/fluent/SKILL.md")
+            .is_file(),
+        "bare 'fluent skills' must materialize the handoff copy"
     );
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
 }
 
 #[test]
@@ -25606,10 +25608,14 @@ fn skills_add_does_not_clobber_unmarked_directory() {
         content, custom_content,
         "unmarked fluent skill must not be overwritten"
     );
+    assert!(
+        !agent_skills.join("review-tests").exists(),
+        "a bare refresh must not install sibling skills beside a user-owned Fluent directory"
+    );
 }
 
 #[test]
-fn skills_add_default_is_global() {
+fn skills_add_bare_does_not_create_agent_roots() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -25618,25 +25624,23 @@ fn skills_add_default_is_global() {
     let project = tmp.path().join("project");
     fs::create_dir_all(&project).unwrap();
 
-    fluent_cmd()
+    let output = fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
         .args(["skills", "add"])
-        .assert()
-        .success();
+        .output()
+        .unwrap();
 
-    assert!(
-        home.join(".claude/skills/fluent/SKILL.md").exists(),
-        "default install should go to global directory"
-    );
-    assert!(
-        !project.join(".claude/skills/fluent/SKILL.md").exists(),
-        "should not install to project when no project-level skill exists"
-    );
+    assert!(output.status.success());
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
+    assert!(!project.join(".claude").exists());
+    assert!(!project.join(".codex").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use --agent"));
 }
 
 #[test]
-fn skills_add_default_updates_existing_project_skill() {
+fn skills_add_bare_updates_existing_project_skill() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -25677,16 +25681,16 @@ fn skills_add_project_flag_targets_project() {
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "--project"])
+        .args(["skills", "add", "--agent", "codex", "--project"])
         .assert()
         .success();
 
     assert!(
-        project.join(".claude/skills/fluent/SKILL.md").exists(),
-        "--project should install to project directory"
+        project.join(".codex/skills/fluent/SKILL.md").exists(),
+        "--agent codex --project should install to the project Codex directory"
     );
     assert!(
-        !home.join(".claude/skills/fluent/SKILL.md").exists(),
+        !home.join(".codex/skills/fluent/SKILL.md").exists(),
         "--project should not install to global directory"
     );
 }
@@ -25707,7 +25711,7 @@ fn skills_add_global_flag_skips_project() {
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
-        .args(["skills", "add", "-g"])
+        .args(["skills", "add", "--agent", "claude", "-g"])
         .assert()
         .success();
 
@@ -25730,7 +25734,7 @@ fn skills_add_agent_flag_targets_agents() {
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "codex"])
+        .args(["skills", "add", "--agent", "codex", "--global"])
         .assert()
         .success();
 
@@ -25741,6 +25745,63 @@ fn skills_add_agent_flag_targets_agents() {
 }
 
 #[test]
+fn skills_add_requires_a_scope_with_an_agent() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .args(["skills", "add", "--agent", "codex"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--agent requires either --project or --global",
+        ));
+
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".local/share/fluent").exists());
+}
+
+#[test]
+fn skills_add_requires_an_agent_with_a_scope() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .args(["skills", "add", "--global"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--project and --global require --agent",
+        ));
+
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".local/share/fluent").exists());
+}
+
+#[test]
+fn skills_add_rejects_unknown_agent_without_creating_a_root() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    fluent_cmd()
+        .env("HOME", home.to_str().unwrap())
+        .args(["skills", "add", "--agent", "cursor", "--global"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Unsupported agent \"cursor\""));
+
+    assert!(!home.join(".cursor").exists());
+    assert!(!home.join(".local/share/fluent").exists());
+}
+
+#[test]
 fn skills_add_agent_wildcard_targets_all_agents() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
@@ -25748,7 +25809,7 @@ fn skills_add_agent_wildcard_targets_all_agents() {
 
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
-        .args(["skills", "add", "--agent", "*"])
+        .args(["skills", "add", "--agent", "*", "--global"])
         .assert()
         .success();
 
@@ -25787,7 +25848,7 @@ fn skills_add_writes_to_data_directory() {
 }
 
 #[test]
-fn init_installs_full_fluent_skill() {
+fn init_does_not_install_interactive_agent_skills() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -25805,24 +25866,50 @@ fn init_installs_full_fluent_skill() {
         project.join(".fluent").is_dir(),
         "fluent init must create .fluent/"
     );
-    assert!(
-        home.join(".claude/skills/fluent/SKILL.md").exists(),
-        "fluent init must install the full skill to global directory"
-    );
-    let content = fs::read_to_string(home.join(".claude/skills/fluent/SKILL.md")).unwrap();
-    assert!(
-        !content.contains("fluent-shim: true"),
-        "installed skill must be the full skill, not the shim"
-    );
+    assert!(!home.join(".claude").exists());
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".local/share/fluent").exists());
 }
 
 #[test]
-fn init_succeeds_when_skill_installation_fails() {
+fn configured_init_does_not_use_coder_profile_as_skill_target() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    let codex_home = home.join("codex-auth");
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&codex_home).unwrap();
+    fs::write(codex_home.join("auth.json"), "authenticated").unwrap();
+    init_git_repo(&project);
+    write_mock_codex(&bin_dir, "#!/bin/bash\n[ \"$1 $2\" = \"login status\" ]\n");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "codex-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .success();
+
+    assert!(project.join(".fluent/config.yaml").is_file());
+    assert!(!home.join(".codex").exists());
+    assert!(!home.join(".claude").exists());
+}
+
+#[test]
+fn init_succeeds_without_home_when_no_skill_installation_is_requested() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
     fs::create_dir_all(&project).unwrap();
 
-    // Without HOME, cmd_skills_add fails, but init should still succeed.
     let output = fluent_cmd()
         .env_remove("HOME")
         .current_dir(&project)
@@ -25832,28 +25919,31 @@ fn init_succeeds_when_skill_installation_fails() {
 
     assert!(
         output.status.success(),
-        "init must succeed even when skill installation fails"
+        "init must not depend on a skill-installation home"
     );
     assert!(
         project.join(".fluent").is_dir(),
-        "init must create .fluent/ even when skill installation fails"
+        "init must create .fluent/ without installing skills"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("warning: could not install skills"),
-        "init must print a warning when skill installation fails: {stderr}"
+        !stderr.contains("install skills"),
+        "unexpected warning: {stderr}"
     );
 }
 
 #[test]
-fn init_reinit_installs_skills() {
+fn init_reinit_preserves_existing_interactive_agent_skill() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let project = tmp.path().join("project");
     fs::create_dir_all(&project).unwrap();
 
-    // First init creates .fluent/
+    let skill_path = home.join(".claude/skills/fluent/SKILL.md");
+    fs::create_dir_all(skill_path.parent().unwrap()).unwrap();
+    fs::write(&skill_path, "---\nname: fluent\n---\nuser-owned\n").unwrap();
+
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
@@ -25861,12 +25951,6 @@ fn init_reinit_installs_skills() {
         .assert()
         .success();
 
-    // Remove the installed skill to prove re-init installs it again
-    let skill_path = home.join(".claude/skills/fluent/SKILL.md");
-    assert!(skill_path.exists(), "first init must install the skill");
-    fs::remove_dir_all(home.join(".claude/skills/fluent")).unwrap();
-
-    // Second init on already-initialized project
     fluent_cmd()
         .env("HOME", home.to_str().unwrap())
         .current_dir(&project)
@@ -25875,9 +25959,9 @@ fn init_reinit_installs_skills() {
         .success()
         .stderr(predicate::str::contains("Already initialized"));
 
-    assert!(
-        skill_path.exists(),
-        "re-init must install skills to global directory"
+    assert_eq!(
+        fs::read_to_string(skill_path).unwrap(),
+        "---\nname: fluent\n---\nuser-owned\n"
     );
 }
 

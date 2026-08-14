@@ -794,6 +794,10 @@ test_run_configures_init_and_commits_before_attempt() {
     "$ROOT/project/main/.agents/skills/fluent/SKILL.md"; then
     printf '    FAIL: run left the bootstrap marker installed\n'; rc=1
   fi
+  [ ! -e "$ROOT/project/main/.claude" ] \
+    || { printf '    FAIL: bare handoff created a project Claude root\n'; rc=1; }
+  [ ! -e "$ROOT/project/main/.codex" ] \
+    || { printf '    FAIL: bare handoff created a project Codex root\n'; rc=1; }
   jq -e '.skills.fluent == null and .metadata.fixture == "keep" and
     .skills.other.source == "owner/other"' "$ROOT/project/main/skills-lock.json" \
     > /dev/null || { printf '    FAIL: run did not preserve the external lock\n'; rc=1; }

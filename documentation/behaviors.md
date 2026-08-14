@@ -6688,9 +6688,12 @@ Test: tests/binary.rs (update_replaces_binary_and_rematerializes_skills)
 ### B3
 
 WHEN `fluent update` replaces the running binary,
-THE SYSTEM SHALL re-materialize the skills so they reflect the newly
-installed version.
+THE SYSTEM SHALL use the updated binary's bare skill command to refresh handoff
+data and existing managed installations without creating an absent agent root.
 Test: tests/binary.rs (update_replaces_binary_and_rematerializes_skills)
+Test: tests/binary.rs (skills_add_bare_does_not_create_agent_roots,
+skills_add_bare_updates_existing_project_skill,
+skills_add_writes_to_data_directory)
 
 ### B4
 
@@ -6765,9 +6768,9 @@ Test: tests/binary.rs (init_writes_gitignore_when_absent)
 
 ### B3
 
-WHEN `fluent init` is invoked at a Git repository root without `.fluent/`,
-THE SYSTEM SHALL install skills via the default `fluent skills add` path.
-Test: tests/binary.rs (init_installs_full_fluent_skill)
+WHEN `fluent init` is invoked at a Git repository root,
+THE SYSTEM SHALL NOT create or update an interactive-agent skill directory.
+Test: tests/binary.rs (init_does_not_install_interactive_agent_skills)
 
 ### B4
 
@@ -6784,16 +6787,9 @@ Test: tests/binary.rs (init_backfills_gitignore_on_existing_fluent)
 
 ### B6
 
-WHEN `fluent init` is invoked at a Git repository root that already has `.fluent/`,
-THE SYSTEM SHALL install skills via the default `fluent skills add` path.
-Test: tests/binary.rs (init_reinit_installs_skills)
-
-### B7
-
-IF skill installation fails during `fluent init`,
-THEN THE SYSTEM SHALL print a warning and continue without failing the
-init.
-Test: tests/binary.rs (init_succeeds_when_skill_installation_fails)
+WHEN configured `fluent init` saves a Writer and reviewer coder profile,
+THE SYSTEM SHALL NOT use either provider as an interactive-agent skill target.
+Test: tests/binary.rs (configured_init_does_not_use_coder_profile_as_skill_target)
 
 ### B8
 
@@ -7253,7 +7249,7 @@ Test: tests/binary.rs (run_commands_reject_retired_role_flags_before_project_loo
 
 ### B1
 
-WHEN `fluent skills add` runs,
+WHEN `fluent skills add` runs with an explicit agent and scope,
 THE SYSTEM SHALL materialize the full fluent skill — its `SKILL.md` and
 `references/` — from the running binary into the target skill
 directories, together with the review skills, and SHALL record one managed
@@ -7270,35 +7266,57 @@ Test: tests/behaviors/operations/test-plugin-install.sh
 
 ### B3
 
-WHEN `fluent skills add` runs without an explicit scope flag,
-THE SYSTEM SHALL install into the global skill directories, unless a
-project-level fluent skill already exists, in which case it SHALL
-update that project-level installation.
-Test: tests/binary.rs (skills_add_default_is_global,
-skills_add_default_updates_existing_project_skill)
+WHEN `fluent skills add` runs without `--agent`, `--project`, or `--global`,
+THE SYSTEM SHALL materialize the full skill bundle in the fixed handoff data
+directory.
+Test: tests/binary.rs (skills_add_writes_to_data_directory)
+
+### B3a
+
+WHEN bare `fluent skills add` finds an existing managed installation,
+THE SYSTEM SHALL refresh that installation from the running bundle.
+Test: tests/binary.rs (skills_add_updates_prior_managed_release_without_digest_allowlist)
+
+### B3b
+
+WHEN bare `fluent skills add` runs without an existing Fluent installation or
+bootstrap, THE SYSTEM SHALL NOT create an interactive-agent skill root.
+Test: tests/binary.rs (skills_add_bare_does_not_create_agent_roots,
+skills_add_bare_refreshes_without_creating_agent_roots)
 
 ### B4
 
-WHEN `fluent skills add` runs with `-g`/`--global`,
-THE SYSTEM SHALL scope the install to the global skill directories
+WHEN `fluent skills add` runs with `--agent <agents> -g`/`--global`,
+THE SYSTEM SHALL scope the install to the named agents' global skill directories
 and SHALL NOT update any project-level installation.
 Test: tests/binary.rs (skills_add_global_flag_skips_project)
 Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
 
 ### B5
 
-WHEN `fluent skills add` runs with `--project`,
-THE SYSTEM SHALL scope the install to the project skill directory
+WHEN `fluent skills add` runs with `--agent <agents> --project`,
+THE SYSTEM SHALL scope the install to the named agents' project skill directories
 and SHALL NOT install to global directories.
 Test: tests/binary.rs (skills_add_project_flag_targets_project)
 Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
 
 ### B6
 
-WHEN `fluent skills add` runs with `--agent <agents>`,
-THE SYSTEM SHALL scope the install to the named agents' skill
-directories.
-Test: tests/binary.rs (skills_add_agent_flag_targets_agents)
+IF `fluent skills add` names an agent without a scope, THEN THE SYSTEM SHALL
+reject the command before creating an agent root or materializing handoff data.
+Test: tests/binary.rs (skills_add_requires_a_scope_with_an_agent)
+
+### B6a
+
+IF `fluent skills add` names a scope without an agent, THEN THE SYSTEM SHALL
+reject the command before creating an agent root or materializing handoff data.
+Test: tests/binary.rs (skills_add_requires_an_agent_with_a_scope)
+
+### B6b
+
+IF `fluent skills add` names an unsupported agent, THEN THE SYSTEM SHALL reject
+the command before creating an agent root or materializing handoff data.
+Test: tests/binary.rs (skills_add_rejects_unknown_agent_without_creating_a_root)
 
 ### B7
 
@@ -7332,6 +7350,12 @@ skills_add_preserves_malformed_and_identity_mismatched_sidecars,
 skills_add_preserves_invalid_sidecar_on_shim_marked_installation,
 skills_add_preserves_invalid_sidecar_on_scanned_shim_installation,
 skills_add_reports_unmarked_conflict_without_modifying_it)
+
+### B10a
+
+IF a bare `fluent skills add` finds a user-owned Fluent directory, THEN THE
+SYSTEM SHALL NOT install sibling bundled skills into that agent root.
+Test: tests/binary.rs (skills_add_does_not_clobber_unmarked_directory)
 
 ### B11
 
@@ -7375,10 +7399,9 @@ Test: tests/binary.rs (fluent_skills_install_writes_all_public_skills)
 
 ### B16
 
-WHEN `fluent skills add` scans supported bootstrap roots beyond its selected
-install targets,
-THE SYSTEM SHALL NOT create an absent scanned root.
-Test: tests/binary.rs (skills_add_converges_project_bootstrap_roots_and_lock)
+WHEN `fluent skills add` runs with an explicit agent and scope,
+THE SYSTEM SHALL NOT adopt or modify Fluent installations outside the selected
+targets.
 Test: tests/binary.rs (skills_add_explicit_scope_does_not_adopt_other_scope_shims)
 
 ### B17
@@ -7684,6 +7707,13 @@ Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures
 WHEN the candidate binary releases Fluent's external lock entry,
 THE SYSTEM SHALL require every unrelated fixture lock value to remain before
 initialization.
+Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
+
+### B4c1
+
+WHEN the candidate binary replaces the clean-room bootstrap with a bare skill
+handoff command, THE SYSTEM SHALL NOT create a project Codex or Claude Code
+skill root that the bootstrap did not select.
 Test: tests/behaviors/operations/test-first-run-smoke-harness.sh (run configures init and commits before attempt)
 
 ### B4d

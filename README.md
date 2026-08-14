@@ -29,7 +29,20 @@ The installed skill is a small bootstrap. On its first invocation,
 Fluent ownership sidecar. It also removes only Fluent's entry from
 `skills-lock.json`, so `npx skills update` cannot restore the bootstrap; other
 skills in the lock remain unchanged. Repeating the Fluent command leaves a
-current managed installation untouched.
+current managed installation untouched. The bare command does not create an
+absent `.claude` or `.codex` skill root.
+
+To install the interactive skill somewhere other than the detected bootstrap,
+name both the agent and the scope:
+
+```bash
+fluent skills add --agent codex --project
+fluent skills add --agent claude --global
+fluent skills add --agent codex,claude --global
+```
+
+These commands choose where you invoke Fluent. The coder profile selected by
+`fluent init` separately chooses which providers run Writer and reviewer work.
 
 Start your coding agent in the project folder, then ask it to use Fluent and
 describe what you want to explore, build, fix, or improve.
@@ -46,9 +59,11 @@ sandbox.
 
 Run `fluent update` to install the latest binary. Starting with v0.1.5, Fluent
 downloads the release checksum and verifies the binary before replacing the
-installed executable. After upgrading from an earlier release, rebuild stored
-artifact metrics once with `fluent work-item rebuild-metrics` if you want
-historical Work Items to report their complete storage totals immediately.
+installed executable. It then refreshes existing managed skill installations
+without creating new agent roots. After upgrading from an earlier release,
+rebuild stored artifact metrics once with `fluent work-item rebuild-metrics` if
+you want historical Work Items to report their complete storage totals
+immediately.
 
 See the [v0.2.0 release notes](documentation/releases/v0.2.0.md) for behavior
 changes and recovery commands.

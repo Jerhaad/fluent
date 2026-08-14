@@ -39,7 +39,9 @@ under `.agents/skills`, `.claude/skills`, or `.codex/skills` and an entry in
 `skills-lock.json`. This command replaces only a Fluent-marked bootstrap,
 records Fluent ownership, and removes only Fluent's matching lock entry. It
 preserves other locked skills and any unrecognized or user-owned skill
-directory.
+directory. It does not create an absent agent-specific skill root. A later
+coder profile selection controls Fluent's Writer and reviewers, not where this
+interactive skill is installed.
 
 ## Step 3 — Continue with the full skill
 

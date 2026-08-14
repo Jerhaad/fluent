@@ -184,7 +184,7 @@ pub enum Commands {
         path: Option<String>,
     },
 
-    /// Install bundled skills into agent skill directories
+    /// Adopt, install, or refresh bundled agent skills
     Skills {
         #[command(subcommand)]
         command: Option<SkillsCommands>,
@@ -891,18 +891,18 @@ pub enum ObservationCommands {
 
 #[derive(Subcommand)]
 pub enum SkillsCommands {
-    /// Install bundled skills into agent skill directories
+    /// Refresh existing skills, or install with --agent and --project/--global
     Add {
-        /// Install into global skill directories only
-        #[arg(short = 'g', long, conflicts_with_all = ["project", "agent"])]
+        /// Install into the selected agents' global skill directories
+        #[arg(short = 'g', long, conflicts_with = "project")]
         global: bool,
 
-        /// Install into the project skill directory
-        #[arg(long, conflicts_with_all = ["global", "agent"])]
+        /// Install into the selected agents' project skill directories
+        #[arg(long, conflicts_with = "global")]
         project: bool,
 
-        /// Install for specific agents (comma-separated, or * for all)
-        #[arg(long, conflicts_with_all = ["global", "project"])]
+        /// Select agents to install for: codex, claude, comma-separated, or *
+        #[arg(long)]
         agent: Option<String>,
     },
 
