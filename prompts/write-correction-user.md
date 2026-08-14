@@ -22,6 +22,24 @@ managed paths to the full historical artifacts. For review findings, read a spec
 artifact or a focused diff only when its summary does not provide enough detail. Do not bulk-print planning files,
 expertise, source trees, prior transcripts, or complete test output into the model conversation.
 
+Correction lineage is host-owned:
+
+- Mode: `{{correction_lineage_mode}}`
+- Prior candidate commit: `{{prior_candidate_commit}}`
+
+{{#if correction_lineage_append_only}}
+Keep the prior candidate commit in the candidate's history. Create a new correction commit for
+every content fix, including reverting unwanted files or changes. Do not rebase, reset, amend,
+drop, or replace the prior candidate commit. Before finishing, verify that
+`{{prior_candidate_commit}}` is an ancestor of `HEAD`.
+{{/if}}
+{{#if correction_lineage_metadata_rewrite}}
+Fluent explicitly authorizes a tree-identical metadata rewrite of
+`{{prior_candidate_commit}}`. Change commit metadata only; the resulting candidate tree must
+remain exactly identical to that prior candidate's tree. Do not change file content as part of
+this rewrite. Fluent will verify the tree identity and original-base ancestry afterward.
+{{/if}}
+
 {{#if has_failed_tester_inspection}}
 Failed final-Tester evidence is attached. Read every artifact below before deciding that no
 candidate change is needed:

@@ -62,6 +62,8 @@ struct ExecutionContextV1 {
     schema_version: u32,
     candidate_commit: String,
     base_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
     changed_files: Vec<String>,
     unresolved_steps: Vec<String>,
     current_findings: Vec<ExecutionContextFinding>,
@@ -69,6 +71,29 @@ struct ExecutionContextV1 {
     executed_commands: Vec<String>,
     historical_artifacts: Vec<String>,
     omitted: ExecutionContextOmitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionContextCorrectionLineageMode {
+    AppendOnly,
+    TreeIdenticalMetadataRewrite,
+}
+
+impl ExecutionContextCorrectionLineageMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AppendOnly => "append-only",
+            Self::TreeIdenticalMetadataRewrite => "tree-identical-metadata-rewrite",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ExecutionContextCorrectionLineage {
+    mode: ExecutionContextCorrectionLineageMode,
+    prior_candidate_commit: String,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -4260,6 +4285,7 @@ fn build_writer_continuation_prompt(
         Some(base_commit.as_str()),
         &unresolved_steps,
         prior_reviews,
+        None,
     )?;
     let has_writer_completion_matrix = item
         .attempts
@@ -4343,8 +4369,9 @@ fn build_reviewed_correction_prompt(
         anyhow::anyhow!("corrective Writer Task {task_id:?} must declare an artifact area")
     })?;
     let artifact_dir = resolve_managed_artifact_area_path(project_root, &artifact_area.path)?;
-    let candidate_commit = git_stdout(workspace_path, &["rev-parse", "HEAD"]);
+    let candidate_commit = head_commit(workspace_path)?;
     let base_commit = writer_context_base_commit(item, attempt_id, workspace_path);
+    let correction_lineage = correction_lineage(&candidate_commit, correction_artifacts);
     let context_path = write_execution_context(
         &artifact_dir,
         workspace_path,
@@ -4352,6 +4379,7 @@ fn build_reviewed_correction_prompt(
         base_commit.as_deref(),
         &unresolved_steps,
         correction_artifacts,
+        Some(correction_lineage.clone()),
     )?;
     let corrective_authority_path = if let Some(authority) = corrective_execution_context(item) {
         let path = artifact_dir.join("corrective-authority.md");
@@ -4416,6 +4444,29 @@ fn build_reviewed_correction_prompt(
                 "execution_context_path",
                 &context_path.display().to_string(),
             ),
+            ("correction_lineage_mode", correction_lineage.mode.as_str()),
+            (
+                "prior_candidate_commit",
+                &correction_lineage.prior_candidate_commit,
+            ),
+            (
+                "correction_lineage_append_only",
+                if correction_lineage.mode == ExecutionContextCorrectionLineageMode::AppendOnly {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
+            (
+                "correction_lineage_metadata_rewrite",
+                if correction_lineage.mode
+                    == ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+                {
+                    "yes"
+                } else {
+                    ""
+                },
+            ),
             ("correction_artifacts_list", &correction_artifacts_list),
             (
                 "has_failed_tester_inspection",
@@ -4457,6 +4508,32 @@ fn build_reviewed_correction_prompt(
         );
     }
     Ok(prompt)
+}
+
+fn correction_lineage(
+    prior_candidate_commit: &str,
+    correction_artifacts: &[PathBuf],
+) -> ExecutionContextCorrectionLineage {
+    let candidate_gates = correction_artifacts
+        .iter()
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .collect::<Vec<_>>();
+    let mode = if candidate_gates.len() == 1
+        && crate::candidate_gate::authorizes_tree_identical_metadata_rewrite(
+            candidate_gates[0],
+            prior_candidate_commit,
+        ) {
+        ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+    } else {
+        ExecutionContextCorrectionLineageMode::AppendOnly
+    };
+    ExecutionContextCorrectionLineage {
+        mode,
+        prior_candidate_commit: prior_candidate_commit.to_string(),
+    }
 }
 
 fn writer_completion_allowed_constraints(item: &WorkItem, attempt_id: &str) -> String {
@@ -4538,6 +4615,7 @@ fn write_execution_context(
     base_commit: Option<&str>,
     unresolved_steps: &[String],
     input_artifacts: &[PathBuf],
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
 ) -> Result<PathBuf> {
     let changed_files = if let Some(base_commit) = base_commit.filter(|value| !value.is_empty()) {
         git_stdout(
@@ -4584,6 +4662,7 @@ fn write_execution_context(
         base_commit: base_commit
             .filter(|value| !value.is_empty())
             .map(|value| truncate_utf8(value, 128)),
+        correction_lineage,
         changed_files,
         unresolved_steps,
         current_findings,
@@ -6686,6 +6765,7 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
         context_base_commit.as_deref(),
         &unresolved_steps,
         input.input_artifacts,
+        None,
     )?
     .display()
     .to_string();
@@ -8820,6 +8900,51 @@ mod tests {
 
     struct RecordingEnvironmentCoder {
         recorded: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    struct RecordingWriterPromptCoder {
+        recorded: Arc<Mutex<Option<String>>>,
+    }
+
+    impl crate::coder::Coder for RecordingWriterPromptCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the writer route launches through the session boundary")
+        }
+
+        fn run_captured_reported_session(
+            &self,
+            prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            _session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            *self.recorded.lock().unwrap() = Some(prompt.to_string());
+            crate::coder::CoderRunCompletion {
+                terminal: Ok(0),
+                report: Default::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the writer route never runs interactively")
+        }
     }
 
     impl crate::coder::Coder for RecordingEnvironmentCoder {
@@ -14113,6 +14238,25 @@ mod tests {
         let project_root = tmp.path();
         let workspace = tmp.path().join("candidate");
         fs::create_dir_all(&workspace).unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "initialize correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "--allow-empty", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
         let mut item = corrective_review_item("tests");
         let authority = item.write_task_instructions().unwrap();
         let review_path = project_root
@@ -14154,6 +14298,108 @@ mod tests {
         assert!(!prompt.contains("Retries stop after the configured cap"));
         assert_eq!(fs::read_to_string(authority_path).unwrap(), authority);
         assert!(!prompt.contains("{{"));
+    }
+
+    #[test]
+    fn reviewed_correction_launch_route_hands_append_only_lineage_to_the_coder() {
+        let project = tempfile::tempdir().unwrap();
+        let project_root = project.path();
+        let workspace = project_root.join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        crate::git::run(&workspace, &["init", "-q"], "initialize correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(&workspace, &["add", "."], "stage correction fixture").unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Add candidate"],
+            "commit correction fixture",
+        )
+        .unwrap();
+        let prior_candidate = head_commit(&workspace).unwrap();
+
+        let review_path = project_root
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            &review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Remove the unwanted file\n",
+        )
+        .unwrap();
+        let mut item = review_item();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: review_path
+                        .strip_prefix(project_root)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+        let recorded = Arc::new(Mutex::new(None));
+        let recorded_for_coder = Arc::clone(&recorded);
+        let resolver = ContentResolver::new(Some(project_root));
+        let pump_config = crate::transcript_pump::resolve_config(project_root);
+
+        run_task_coder_with_coder(
+            &item,
+            "attempt-1",
+            &task_id,
+            project_root,
+            &workspace,
+            std::slice::from_ref(&review_path),
+            &resolver,
+            &[],
+            CoderKind::Codex,
+            true,
+            None,
+            None,
+            &pump_config,
+            None,
+            None,
+            &test_writer_cache(project_root),
+            None,
+            move |_sandbox, _executable| {
+                Box::new(RecordingWriterPromptCoder {
+                    recorded: recorded_for_coder,
+                })
+            },
+        )
+        .unwrap();
+
+        let prompt = recorded
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the production Writer route launches the coder once");
+        assert!(prompt.contains("append-only"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(!prompt.contains("{{"));
+        let context_path = project_root
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+        assert_eq!(context["correction-lineage"]["mode"], "append-only");
+        assert_eq!(
+            context["correction-lineage"]["prior-candidate-commit"],
+            prior_candidate
+        );
     }
 
     #[test]
@@ -14723,6 +14969,7 @@ mod tests {
             Some("base123"),
             &["finish context schema".to_string()],
             &[first_review, second_review, tester, stale_tester],
+            None,
         )
         .unwrap();
         let context: ExecutionContextV1 =
@@ -14775,6 +15022,7 @@ mod tests {
             Some("base123"),
             &[],
             std::slice::from_ref(&tester_results),
+            None,
         )
         .unwrap();
         let context: ExecutionContextV1 =
@@ -14942,6 +15190,7 @@ mod tests {
             Some("base"),
             &[],
             std::slice::from_ref(&gate_path),
+            None,
         )
         .unwrap();
         let context: ExecutionContextV1 =
@@ -14990,6 +15239,7 @@ mod tests {
             Some("base123"),
             &unresolved,
             &inputs,
+            None,
         )
         .unwrap();
         let source = fs::read_to_string(&context_path).unwrap();
@@ -15761,6 +16011,7 @@ mod tests {
             "commit correction candidate",
         )
         .unwrap();
+        let prior_candidate = head_commit(workspace.path()).unwrap();
 
         let review_path = project
             .path()
@@ -15831,6 +16082,8 @@ mod tests {
         assert!(prompt.contains("- `plan:step-2`"));
         assert!(prompt.contains("host-owned `## Required completion` projection"));
         assert!(prompt.contains("\"schema_version\": 1"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(prompt.contains("append-only"));
         assert!(!prompt.contains(large_output_marker));
         assert!(!prompt.contains("{{"));
 
@@ -15844,6 +16097,212 @@ mod tests {
             context["historical-artifacts"],
             serde_json::json!([review_path.display().to_string()])
         );
+        assert_eq!(
+            context["correction-lineage"],
+            serde_json::json!({
+                "mode": "append-only",
+                "prior-candidate-commit": prior_candidate,
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_only_gate_explicitly_authorizes_tree_identical_rewrite_guidance() {
+        let mut item = review_item();
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Fluent Test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "fluent@example.test"],
+            "configure correction fixture",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "."],
+            "stage correction candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "bad subject."],
+            "commit correction candidate",
+        )
+        .unwrap();
+        let prior_candidate = head_commit(workspace.path()).unwrap();
+
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            (
+                "candidate-identity",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "whitespace",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "commit-metadata",
+                crate::candidate_gate::CandidateCheckStatus::Failed,
+            ),
+            (
+                "behavior-references",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+            (
+                "tester-reference-evidence",
+                crate::candidate_gate::CandidateCheckStatus::Skipped,
+            ),
+            (
+                "project-check",
+                crate::candidate_gate::CandidateCheckStatus::Passed,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(name, status)| crate::candidate_gate::CandidateCheckEvidence {
+                name: name.to_string(),
+                status,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+        )
+        .collect();
+        let mut gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: prior_candidate.clone(),
+            candidate_commit: prior_candidate.clone(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks,
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: gate_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&gate_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context_path = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert_eq!(
+            context["correction-lineage"],
+            serde_json::json!({
+                "mode": "tree-identical-metadata-rewrite",
+                "prior-candidate-commit": prior_candidate,
+            })
+        );
+        assert!(prompt.contains("tree-identical-metadata-rewrite"));
+        assert!(prompt.contains(&prior_candidate));
+        assert!(!prompt.contains("{{"));
+
+        let whitespace = gate
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "whitespace")
+            .unwrap();
+        whitespace.status = crate::candidate_gate::CandidateCheckStatus::Failed;
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let prompt = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&gate_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                project
+                    .path()
+                    .join(work_artifact_path("work-1", "attempt-1", &task_id))
+                    .join("execution-context.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(context["correction-lineage"]["mode"], "append-only");
+        assert!(prompt.contains("append-only"));
+        assert!(!prompt.contains("tree-identical-metadata-rewrite"));
+    }
+
+    #[test]
+    fn reviewed_correction_prompt_requires_an_exact_prior_candidate() {
+        let project = tempfile::tempdir().unwrap();
+        let workspace = project.path().join("not-a-repository");
+        fs::create_dir_all(&workspace).unwrap();
+        let review_path = project
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests/review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(&review_path, "Verdict: fail\n\n- [ ] Fix the candidate\n").unwrap();
+        let mut item = review_item();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: review_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+
+        let error = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&review_path),
+            &workspace,
+            project.path(),
+        )
+        .expect_err("a correction prompt cannot name an empty prior candidate");
+
+        assert!(format!("{error:#}").contains("resolve task workspace HEAD"));
     }
 
     #[test]
@@ -15953,6 +16412,7 @@ mod tests {
             None,
             &[],
             std::slice::from_ref(&review_path),
+            None,
         )
         .unwrap();
         let context: serde_json::Value =
@@ -15991,6 +16451,7 @@ mod tests {
             None,
             &[],
             std::slice::from_ref(&review_path),
+            None,
         )
         .unwrap_err();
 
@@ -16024,6 +16485,7 @@ mod tests {
             None,
             &[],
             &artifacts,
+            None,
         )
         .unwrap_err();
 

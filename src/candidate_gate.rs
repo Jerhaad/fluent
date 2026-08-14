@@ -351,6 +351,30 @@ fn validate_prior_writer_gate(
     Ok(())
 }
 
+/// Return whether a prior host-owned gate explicitly permits replacing the
+/// current candidate commit solely to repair its commit metadata.
+///
+/// Prompt guidance treats every missing, malformed, mismatched, or otherwise
+/// untrusted gate as append-only. The candidate gate still performs the final
+/// tree-identity verification after the Writer produces a replacement.
+pub(crate) fn authorizes_tree_identical_metadata_rewrite(
+    path: &Path,
+    expected_candidate: &str,
+) -> bool {
+    let Ok(prior) = read_prior_writer_gate(path) else {
+        return false;
+    };
+    if validate_prior_writer_gate(&prior, expected_candidate).is_err() {
+        return false;
+    }
+    prior
+        .checks
+        .iter()
+        .filter(|check| check.status == CandidateCheckStatus::Failed)
+        .map(|check| check.name.as_str())
+        .eq(["commit-metadata"])
+}
+
 fn validate_metadata_only_rewrite(
     request: &CandidateGateRequest<'_>,
     prior_gate_path: &Path,

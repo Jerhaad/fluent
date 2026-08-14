@@ -287,6 +287,17 @@ the shared tree, and the prior artifact path. A changed tree, another prior
 failure, malformed evidence, or an ordinary non-ancestor candidate blocks before
 review.
 
+Before that Writer launches, Fluent writes the immediately preceding candidate
+and a host-owned lineage mode into the generated execution context and renders
+both into the correction prompt. The default mode is `append-only`: removing
+unwanted content still requires a new correction commit, and the preceding
+candidate must remain an ancestor. Fluent renders
+`tree-identical-metadata-rewrite` only when one validated rejected gate names the
+current candidate and commit metadata is its sole failed check. That mode tells
+the Writer to change metadata without changing the tree. These instructions
+reduce avoidable correction failures; the deterministic candidate gate remains
+the enforcement boundary and independently verifies the resulting history.
+
 The same gate invokes the project's existing `check-pre-merge` hook from the
 candidate workspace. This keeps formatting and architecture rules project-owned;
 for example, this repository's hook rejects the dashboard `app` importing
