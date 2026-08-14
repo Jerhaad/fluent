@@ -3968,6 +3968,38 @@ Test: src/work_task_executor.rs (only_managed_home_claude_launches_need_the_unsa
 Test: src/work_task_executor.rs (claude_writer_launch_uses_managed_home)
 Test: src/credential.rs (claude_credential_bridge_reads_oauth_for_managed_home_launch)
 
+### B4
+
+WHEN an autonomous Claude launch reaches its configured deadline without model
+or tool activity and Fluent confirms that the provider process has stopped,
+THE SYSTEM SHALL retry the same Task within the configured recovery budget
+without consuming a Writer round.
+Test: src/coder.rs (safe_claude_no_progress_launch_is_terminated_and_typed)
+Test: src/coder.rs (claude_no_progress_retries_same_logical_run_and_preserves_phases)
+Test: tests/binary.rs (scheduler_recovers_a_safe_claude_no_progress_launch_inside_the_same_task)
+
+### B5
+
+IF an autonomous Claude launch has model or tool activity, or Fluent cannot
+prove that no such activity occurred,
+THEN THE SYSTEM SHALL continue that launch without applying no-progress
+recovery.
+Test: src/transcript_pump.rs (claude_startup_retry_records_remain_pre_progress)
+Test: src/transcript_pump.rs (claude_assistant_record_marks_progress)
+Test: src/transcript_pump.rs (claude_progress_classifier_fails_closed_on_malformed_or_unknown_records)
+Test: src/coder.rs (claude_assistant_progress_disables_no_progress_termination)
+Test: src/coder.rs (partial_claude_record_at_deadline_disables_no_progress_termination)
+
+### B6
+
+IF the configured Claude no-progress retry budget exhausts before model
+progress,
+THEN THE SYSTEM SHALL pause the same Task as `provider-unavailable` with guidance
+to resume the same Attempt.
+Test: src/coder.rs (claude_no_progress_exhaustion_remains_typed)
+Test: src/work_task_executor.rs (terminal_coder_failures_bypass_generic_retries)
+Test: tests/binary.rs (scheduler_pauses_the_same_task_after_claude_no_progress_exhaustion)
+
 ## Claude readiness diagnosis
 
 ### B1

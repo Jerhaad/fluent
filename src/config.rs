@@ -29,6 +29,12 @@ pub const DEFAULT_LEARNER_SCHEMA_REPAIR_BUDGET: u32 = 2;
 pub const DEFAULT_TRANSCRIPT_CONSOLE_PREVIEW_LIMIT: u32 = 8 * 1024;
 /// Built-in interval, in milliseconds, between transcript-pump status flushes.
 pub const DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS: u32 = 1000;
+/// Built-in time an autonomous Claude launch may remain before model progress.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS: u32 = 60;
+/// Built-in number of automatic same-Task relaunches after a safe no-progress timeout.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_RETRIES: u32 = 2;
+/// Built-in first delay before a safe Claude no-progress relaunch. Later delays double.
+pub const DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS: u32 = 5;
 /// Built-in maximum managed reviewer cache footprint for one project.
 pub const DEFAULT_REVIEWER_CACHE_MAX_PROJECT_GIB: u64 = 50;
 /// Built-in filesystem space reserved after a reviewer cache admission.
@@ -229,13 +235,16 @@ pub struct ResolvedSchedulerConfig {
     pub max_local_concurrency: ResolvedLeaf<u32>,
 }
 
-/// Operator-facing transcript-pump thresholds resolved from project, then user,
-/// then built-in defaults. The pump uses these to bound console previews and to
-/// pace status flushes; they never affect canonical byte capture.
+/// Transcript-enabled launch settings resolved from project, then user, then
+/// built-in defaults. Capture thresholds never affect canonical bytes; the
+/// Claude recovery leaves are correctness-sensitive and may disable relaunch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTranscriptPumpConfig {
     pub console_preview_limit: ResolvedLeaf<u32>,
     pub status_flush_interval_ms: ResolvedLeaf<u32>,
+    pub claude_no_progress_timeout_seconds: ResolvedLeaf<u32>,
+    pub claude_no_progress_retries: ResolvedLeaf<u32>,
+    pub claude_no_progress_backoff_seconds: ResolvedLeaf<u32>,
 }
 
 /// Reviewer cache limits resolved from project, then user, then built-in defaults.
@@ -819,9 +828,30 @@ pub(crate) fn resolve_transcript_pump_config_from(
         DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS,
         convert_positive_count,
     )?;
+    let claude_no_progress_timeout_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "no-progress-timeout-seconds"],
+        DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS,
+        convert_positive_count,
+    )?;
+    let claude_no_progress_retries = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "automatic-retries"],
+        DEFAULT_CLAUDE_NO_PROGRESS_RETRIES,
+        convert_count,
+    )?;
+    let claude_no_progress_backoff_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "claude", "retry-backoff-seconds"],
+        DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS,
+        convert_count,
+    )?;
     Ok(ResolvedTranscriptPumpConfig {
         console_preview_limit,
         status_flush_interval_ms,
+        claude_no_progress_timeout_seconds,
+        claude_no_progress_retries,
+        claude_no_progress_backoff_seconds,
     })
 }
 
@@ -1322,6 +1352,65 @@ coders:
         assert_eq!(
             resolved.status_flush_interval_ms.value,
             DEFAULT_TRANSCRIPT_STATUS_FLUSH_INTERVAL_MS
+        );
+        assert_eq!(
+            resolved.claude_no_progress_timeout_seconds.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            resolved.claude_no_progress_retries.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_RETRIES
+        );
+        assert_eq!(
+            resolved.claude_no_progress_backoff_seconds.value,
+            DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS
+        );
+    }
+
+    #[test]
+    fn claude_no_progress_recovery_layers_each_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 12\n    automatic-retries: 0\n",
+        );
+        let user = write_yaml(
+            dir.path(),
+            "user.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 90\n    automatic-retries: 4\n    retry-backoff-seconds: 3\n",
+        );
+
+        let resolved = resolve_transcript_pump_config_from(&project, Some(&user)).unwrap();
+
+        assert_eq!(resolved.claude_no_progress_timeout_seconds.value, 12);
+        assert_eq!(
+            resolved.claude_no_progress_timeout_seconds.source,
+            ConfigSource::Project
+        );
+        assert_eq!(resolved.claude_no_progress_retries.value, 0);
+        assert_eq!(resolved.claude_no_progress_backoff_seconds.value, 3);
+        assert_eq!(
+            resolved.claude_no_progress_backoff_seconds.source,
+            ConfigSource::User
+        );
+    }
+
+    #[test]
+    fn invalid_claude_no_progress_timeout_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = write_yaml(
+            dir.path(),
+            "project.yaml",
+            "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 0\n",
+        );
+
+        let error = resolve_transcript_pump_config_from(&project, None).unwrap_err();
+
+        assert_eq!(error.path, project);
+        assert_eq!(
+            error.key,
+            "provider-recovery.claude.no-progress-timeout-seconds"
         );
     }
 

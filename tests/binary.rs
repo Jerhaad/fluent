@@ -21359,6 +21359,164 @@ fn scheduler_resume_retries_only_a_failed_learner() {
 }
 
 #[test]
+fn scheduler_recovers_a_safe_claude_no_progress_launch_inside_the_same_task() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-scheduler-no-progress");
+    let counter = tmp.path().join("claude-prompt-launches");
+    let script = format!(
+        r##"#!/bin/bash
+PROMPT=""
+NEXT_IS_PROMPT=0
+HAS_STREAM=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+  if [ "$arg" = "stream-json" ]; then HAS_STREAM=1; fi
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+if [ "$HAS_STREAM" = 0 ]; then exit 1; fi
+COUNT=0
+if [ -f "{counter}" ]; then COUNT=$(tr -cd '0-9' < "{counter}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "{counter}"
+if [ "$COUNT" = 1 ]; then
+  printf '%s\n' '{{"type":"system","subtype":"init"}}'
+  printf '%s\n' '{{"type":"system","subtype":"api_retry","retry_delay_ms":5000}}'
+  sleep 5
+  exit 1
+fi
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{{"learning_summary":"learned","follow_ups":[]}}' > "$DRAFT"
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    printf 'scheduler recovery\n' > scheduler-recovery.txt
+    git add scheduler-recovery.txt
+    git commit -m "Recover scheduler launch" >/dev/null 2>&1
+    ;;
+  *)
+    printf 'Verdict: pass\n\nScheduler recovery review.\n' > review.md
+    ;;
+esac
+exit 0
+"##,
+        counter = counter.display()
+    );
+    write_scheduler_claude(&bin_dir, &script);
+    let config_path = main_dir.join(".fluent/config.yaml");
+    fs::write(
+        &config_path,
+        "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 1\n    automatic-retries: 1\n    retry-backoff-seconds: 0\n",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Recovery"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "add", "work-1"])
+        .assert()
+        .success();
+
+    run_scheduler_until_dispatch_status(&main_dir, "work-1", &bin_dir, "candidate-ready");
+
+    let item = read_work_show_json(&main_dir, "work-1");
+    let write_tasks = item["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+    assert_eq!(
+        write_tasks, 1,
+        "the recovery must not consume a Writer round"
+    );
+    assert!(
+        fs::read_to_string(&counter)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2,
+        "Claude must have been relaunched automatically"
+    );
+    assert!(
+        main_dir
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/transcript.0.jsonl")
+            .is_file(),
+        "the timed-out provider phase must remain as evidence"
+    );
+}
+
+#[test]
+fn scheduler_pauses_the_same_task_after_claude_no_progress_exhaustion() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let bin_dir = tmp.path().join("bin-scheduler-no-progress-exhausted");
+    let counter = tmp.path().join("claude-stalled-launches");
+    let script = format!(
+        r##"#!/bin/bash
+HAS_STREAM=0
+for arg in "$@"; do
+  if [ "$arg" = "stream-json" ]; then HAS_STREAM=1; fi
+done
+if [ "$HAS_STREAM" = 0 ]; then exit 1; fi
+COUNT=0
+if [ -f "{counter}" ]; then COUNT=$(tr -cd '0-9' < "{counter}"); fi
+COUNT=$((COUNT + 1))
+printf '%s' "$COUNT" > "{counter}"
+printf '%s\n' '{{"type":"system","subtype":"init"}}'
+printf '%s\n' '{{"type":"system","subtype":"api_retry","retry_delay_ms":5000}}'
+sleep 5
+exit 1
+"##,
+        counter = counter.display()
+    );
+    write_scheduler_claude(&bin_dir, &script);
+    fs::write(
+        main_dir.join(".fluent/config.yaml"),
+        "provider-recovery:\n  claude:\n    no-progress-timeout-seconds: 1\n    automatic-retries: 1\n    retry-backoff-seconds: 0\n",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["work-item", "create", "work-1", "--title", "Exhaustion"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "add", "work-1"])
+        .assert()
+        .success();
+
+    run_scheduler_until_dispatch_status(&main_dir, "work-1", &bin_dir, "needs-user");
+
+    let item = read_work_show_json(&main_dir, "work-1");
+    assert_eq!(item["attempts"][0]["tasks"][0]["status"], "needs-user");
+    assert_eq!(item["attempts"][0]["pause_kind"], "provider-unavailable");
+    assert_eq!(
+        fs::read_to_string(&counter).unwrap(),
+        "2",
+        "only the initial launch and one configured relaunch may run"
+    );
+    assert_eq!(
+        item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1,
+        "exhaustion must pause the same Writer Task"
+    );
+}
+
+#[test]
 fn explicit_queue_add_after_terminal_creates_new_dispatch() {
     use fluent::queue::{self, DispatchStatus};
 

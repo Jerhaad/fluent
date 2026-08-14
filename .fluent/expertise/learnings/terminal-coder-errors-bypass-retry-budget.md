@@ -11,6 +11,8 @@ failure. They gate the retry `while` on a single predicate,
 **terminal for the Task**. These classes include authentication, transcript-pump
 infrastructure, supervision-sidecar persistence, host-sandbox preflight,
 provider-unavailable, and coder-owned rate-limit-exhaustion failures.
+Coder-owned Claude no-progress exhaustion is also terminal to the outer loop:
+its bounded safe relaunches already ran inside the same logical Task.
 
 The principle: a failure must be terminal (not retried) when re-running the
 coder could repeat side effects the first run already produced. A capture
@@ -19,6 +21,9 @@ invisibly; spinning it again through the generic retry budget would redo that
 work. Auth failures are terminal because retrying cannot succeed. The coder
 layer owns bounded rate-limit recovery, so its typed exhaustion result must not
 fall through to the outer Task loop and multiply the launch budget.
+The same rule applies to no-progress recovery. Only the inner coder loop may
+relaunch while canonical evidence proves no model or tool progress; after its
+cap, the outer loop must pause as provider-unavailable.
 
 When you introduce a new typed failure from inside a coder run, decide whether
 re-running is safe. If it is not, add a classifier and extend

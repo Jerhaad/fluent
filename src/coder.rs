@@ -395,11 +395,11 @@ impl CoderKind {
 
 /// Trait abstracting the coding agent.
 /// A resolved, immutable per-launch transcript capture: where to persist the
-/// canonical byte stream and the pump thresholds to use for it.
+/// canonical byte stream and the immutable launch settings to use for it.
 ///
 /// The config travels WITH the launch rather than through mutable process-global
 /// state, so a concurrent launch (for example a parallel reviewer) can never
-/// overwrite another capture's resolved thresholds between resolution and pump
+/// overwrite another capture's resolved settings between resolution and pump
 /// spawn. The one value is retained across a launch's auth/rate-limit phases.
 pub struct TranscriptCapture<'a> {
     pub(crate) path: &'a Path,
@@ -662,6 +662,7 @@ impl Coder for SandboxedClaudeCode {
             &config,
             &crate::notify::notify,
             &real_credential_refresh,
+            true,
         )
     }
 
@@ -915,6 +916,7 @@ impl Coder for BareClaudeCode {
             &config,
             &crate::notify::notify,
             &real_credential_refresh,
+            true,
         )
     }
 
@@ -1052,6 +1054,7 @@ impl Coder for CodexCode {
             &config,
             &crate::notify::notify,
             &real_credential_refresh,
+            false,
         )
     }
 
@@ -1279,6 +1282,7 @@ impl Coder for PiCode {
             &config,
             &crate::notify::notify,
             &real_credential_refresh,
+            false,
         )
     }
 
@@ -1520,7 +1524,7 @@ fn run_with_transcript(
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
 ) -> Result<i32> {
-    run_with_transcript_reported(cmd, transcript_file, config).into_result()
+    run_with_transcript_reported(cmd, transcript_file, config, None).into_result()
 }
 
 /// Run a command, optionally draining stdout into a transcript file through the
@@ -1538,6 +1542,7 @@ fn run_with_transcript_reported(
     mut cmd: Command,
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
+    no_progress_deadline: Option<Duration>,
 ) -> CoderRunCompletion {
     restrict_test_provider_credentials(&mut cmd);
     #[cfg(unix)]
@@ -1620,7 +1625,7 @@ fn run_with_transcript_reported(
                 }
             };
             supervisor.attach_pump(pump);
-            let supervised = supervisor.supervise();
+            let supervised = supervisor.supervise(no_progress_deadline);
             let terminal = supervisor.settle_execution(supervised);
             CoderRunCompletion {
                 report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
@@ -1670,6 +1675,80 @@ fn captured_run_routes_provider_stderr_to_task_artifact() {
         std::fs::read_to_string(provider_stderr_path(&transcript)).unwrap(),
         "provider diagnostic\n"
     );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn safe_claude_no_progress_launch_is_terminated_and_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s\n' '{\"type\":\"system\",\"subtype\":\"init\"}' '{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":5000}'; sleep 5",
+    ]);
+    let started = Instant::now();
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(Duration::from_millis(100)),
+    );
+
+    let error = completion.terminal.unwrap_err();
+    assert!(error.is::<ClaudeNoProgressTimeoutError>());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the process group must be stopped promptly"
+    );
+    assert!(
+        std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("api_retry")
+    );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn claude_assistant_progress_disables_no_progress_termination() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s\n' '{\"type\":\"assistant\",\"message\":{}}'; sleep 1; exit 0",
+    ]);
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(Duration::from_millis(300)),
+    );
+
+    assert_eq!(completion.terminal.unwrap(), 0);
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn partial_claude_record_at_deadline_disables_no_progress_termination() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("transcript.jsonl");
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "printf '%s' '{\"type\":\"assistant\"'; sleep 1; exit 0",
+    ]);
+
+    let completion = run_with_transcript_reported(
+        command,
+        Some(&transcript),
+        &crate::transcript_pump::TranscriptPumpConfig::default(),
+        Some(Duration::from_millis(300)),
+    );
+
+    assert_eq!(completion.terminal.unwrap(), 0);
 }
 
 #[cfg(test)]
@@ -2420,7 +2499,9 @@ impl CoderSupervisor {
     /// descendants before reaping. Every cleanup failure is composed with the pump
     /// outcome rather than discarded, and an unobservable leader is terminal rather
     /// than an infinite poll loop.
-    fn supervise(&mut self) -> Result<i32> {
+    fn supervise(&mut self, no_progress_deadline: Option<Duration>) -> Result<i32> {
+        let started = Instant::now();
+        let mut no_progress_deadline = no_progress_deadline;
         loop {
             if let Some(execution) = self.execution.as_mut()
                 && let Err(error) = execution.heartbeat()
@@ -2447,6 +2528,53 @@ impl CoderSupervisor {
                 let cleanup = self.managed.terminate_and_reap();
                 let outcome = self.pump_mut().wait_terminal();
                 return compose_terminal(outcome, cleanup);
+            }
+            if no_progress_deadline.is_some()
+                && self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .claude_progress_observed()
+            {
+                // Any complete malformed, unknown, model, or tool record makes
+                // automatic relaunch unsafe for the rest of this launch.
+                no_progress_deadline = None;
+            }
+            if let Some(deadline) = no_progress_deadline
+                && started.elapsed() >= deadline
+            {
+                if !self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .claude_no_progress_retry_is_safe()
+                {
+                    // A partial record at the deadline may hide model or tool
+                    // activity. Fail closed and let this launch finish naturally.
+                    no_progress_deadline = None;
+                    continue;
+                }
+                let cleanup = self.managed.terminate_and_reap();
+                let pump = self.pump_mut().wait_terminal();
+                return match pump {
+                    Err(pump_error) => Err(compose_pump_error(pump_error, cleanup)),
+                    Ok(_) => match cleanup {
+                        Ok(_) if self.managed.group_swept() => {
+                            Err(anyhow::Error::new(ClaudeNoProgressTimeoutError {
+                                deadline,
+                            }))
+                        }
+                        Ok(_) => Err(anyhow::Error::new(
+                            ClaudeNoProgressCleanupUnconfirmedError::new(format!(
+                                "{:?}",
+                                self.managed.group_sweep_disposition()
+                            )),
+                        )),
+                        Err(cleanup) => Err(anyhow::Error::new(
+                            ClaudeNoProgressCleanupUnconfirmedError::new(cleanup.to_string()),
+                        )),
+                    },
+                };
             }
             if let Some(terminal) = self.pump_mut().try_terminal() {
                 return match terminal {
@@ -2692,6 +2820,77 @@ impl std::fmt::Display for RateLimitExhaustedError {
 }
 
 impl std::error::Error for RateLimitExhaustedError {}
+
+/// One autonomous Claude launch exceeded its deadline while the canonical
+/// transcript still proved that no model or tool activity had occurred.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressTimeoutError {
+    deadline: Duration,
+}
+
+impl std::fmt::Display for ClaudeNoProgressTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude produced no model progress within {} seconds",
+            self.deadline.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressTimeoutError {}
+
+/// A safe no-progress launch's leader exited, but Fluent could not prove that
+/// every descendant in its process group stopped. Relaunching would be unsafe.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressCleanupUnconfirmedError {
+    disposition: String,
+}
+
+impl ClaudeNoProgressCleanupUnconfirmedError {
+    pub(crate) fn new(disposition: impl Into<String>) -> Self {
+        Self {
+            disposition: disposition.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ClaudeNoProgressCleanupUnconfirmedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude no-progress recovery stopped because process-group cleanup was not confirmed ({})",
+            self.disposition
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressCleanupUnconfirmedError {}
+
+/// Claude exhausted its bounded safe no-progress relaunches. Task orchestration
+/// pauses the same Task as provider-unavailable instead of multiplying retries.
+#[derive(Debug)]
+pub(crate) struct ClaudeNoProgressExhaustedError {
+    launches: u32,
+}
+
+impl ClaudeNoProgressExhaustedError {
+    pub(crate) fn new(launches: u32) -> Self {
+        Self { launches }
+    }
+}
+
+impl std::fmt::Display for ClaudeNoProgressExhaustedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Claude remained unavailable before model progress across {} bounded launches",
+            self.launches
+        )
+    }
+}
+
+impl std::error::Error for ClaudeNoProgressExhaustedError {}
 
 fn ensure_not_expired_with_refresh() -> Result<(), crate::claude_auth::AuthError> {
     if crate::credential::hermetic_provider_test_mode() {
@@ -3040,8 +3239,15 @@ fn run_with_transcript_retrying<F>(
 where
     F: Fn() -> Command,
 {
-    run_with_transcript_retrying_reported(build_cmd, transcript_file, config, notify_fn, refresh_fn)
-        .into_result()
+    run_with_transcript_retrying_reported(
+        build_cmd,
+        transcript_file,
+        config,
+        notify_fn,
+        refresh_fn,
+        false,
+    )
+    .into_result()
 }
 
 /// The reported retry loop: identical retry behavior, but it returns the terminal
@@ -3053,6 +3259,7 @@ fn run_with_transcript_retrying_reported<F>(
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
     refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+    claude_no_progress_recovery: bool,
 ) -> CoderRunCompletion
 where
     F: Fn() -> Command,
@@ -3063,7 +3270,10 @@ where
         config,
         notify_fn,
         refresh_fn,
-        &|cmd, transcript, cfg| run_with_transcript_reported(cmd, transcript, cfg),
+        claude_no_progress_recovery,
+        &|cmd, transcript, cfg, deadline| {
+            run_with_transcript_reported(cmd, transcript, cfg, deadline)
+        },
     )
 }
 
@@ -3092,7 +3302,10 @@ where
         config,
         notify_fn,
         refresh_fn,
-        &|cmd, transcript, cfg| CoderRunCompletion::terminal_only(run_fn(cmd, transcript, cfg)),
+        false,
+        &|cmd, transcript, cfg, _deadline| {
+            CoderRunCompletion::terminal_only(run_fn(cmd, transcript, cfg))
+        },
     )
     .into_result()
 }
@@ -3106,10 +3319,12 @@ fn run_with_transcript_retrying_reported_using<F>(
     config: &crate::transcript_pump::TranscriptPumpConfig,
     notify_fn: &dyn Fn(&str, &str),
     refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+    claude_no_progress_recovery: bool,
     run_fn: &dyn Fn(
         Command,
         Option<&Path>,
         &crate::transcript_pump::TranscriptPumpConfig,
+        Option<Duration>,
     ) -> CoderRunCompletion,
 ) -> CoderRunCompletion
 where
@@ -3118,6 +3333,7 @@ where
     let mut attempt: u32 = 0;
     let mut rl_state = RateLimitState::Normal;
     let mut auth_refreshed = false;
+    let mut no_progress_retries = 0u32;
     // Derive the starting phase from existing per-phase siblings so a resumed
     // Task never overwrites or collides with `.N.jsonl` evidence a prior run
     // preserved; the process-local counter alone would restart at 0.
@@ -3130,11 +3346,61 @@ where
         // The one resolved config value is retained across every auth/rate-limit
         // phase of this launch, so a mid-launch retry never re-resolves or picks
         // up a different value.
-        let completion = run_fn(build_cmd(), transcript_file, config);
+        let deadline = (claude_no_progress_recovery
+            && transcript_file.is_some()
+            && config.claude_no_progress_retries > 0)
+            .then_some(config.claude_no_progress_timeout);
+        let completion = run_fn(build_cmd(), transcript_file, config, deadline);
         aggregate.extend_ordered(completion.report);
         let exit = match completion.terminal {
             Ok(exit) => exit,
             Err(err) => {
+                if claude_no_progress_recovery && err.is::<ClaudeNoProgressTimeoutError>() {
+                    if no_progress_retries >= config.claude_no_progress_retries {
+                        return CoderRunCompletion {
+                            terminal: Err(anyhow::Error::new(ClaudeNoProgressExhaustedError::new(
+                                no_progress_retries.saturating_add(1),
+                            ))),
+                            report: aggregate,
+                        };
+                    }
+                    if let Err(phase_error) =
+                        prepare_transcript_retry_phase(transcript_file, &mut phase)
+                    {
+                        return CoderRunCompletion {
+                            terminal: Err(anyhow::Error::new(phase_error)),
+                            report: aggregate,
+                        };
+                    }
+                    let factor = 1u32.checked_shl(no_progress_retries).unwrap_or(u32::MAX);
+                    let wait = config
+                        .claude_no_progress_backoff
+                        .checked_mul(factor)
+                        .unwrap_or(Duration::MAX);
+                    no_progress_retries = no_progress_retries.saturating_add(1);
+                    eprintln!(
+                        "  Claude made no model progress before the deadline; retrying the same Task after {}s ({}/{}).",
+                        wait.as_secs(),
+                        no_progress_retries,
+                        config.claude_no_progress_retries
+                    );
+                    if let Some(path) = transcript_file
+                        && let Err(error) = write_provider_retry_wait(path, wait)
+                    {
+                        eprintln!(
+                            "warning: could not persist Claude no-progress retry timing: {error:#}"
+                        );
+                    }
+                    std::thread::sleep(wait);
+                    if let Some(path) = transcript_file
+                        && let Err(error) = finish_provider_retry_wait(path)
+                    {
+                        eprintln!(
+                            "warning: could not finalize Claude no-progress retry timing: {error:#}"
+                        );
+                    }
+                    continue;
+                }
                 return CoderRunCompletion {
                     terminal: Err(err),
                     report: aggregate,
@@ -3351,7 +3617,7 @@ mod pump_supervision_tests {
         supervisor.attach_pump(pump);
 
         let started = Instant::now();
-        let result = supervisor.supervise();
+        let result = supervisor.supervise(None);
         let elapsed = started.elapsed();
 
         let err = result.expect_err("a pump panic must surface as a typed failure");
@@ -4374,7 +4640,7 @@ mod pump_supervision_tests {
 
         let mut supervisor = CoderSupervisor::new(child, child_id);
         supervisor.attach_pump(pump);
-        let handle = std::thread::spawn(move || supervisor.supervise());
+        let handle = std::thread::spawn(move || supervisor.supervise(None));
 
         // Handshake: the store has entered terminal persistence and is now blocked.
         let entered = entered_rx
@@ -4553,7 +4819,8 @@ mod pump_supervision_tests {
         let phase = std::sync::atomic::AtomicUsize::new(0);
         let run_fn = |_cmd: Command,
                       _t: Option<&Path>,
-                      _c: &crate::transcript_pump::TranscriptPumpConfig|
+                      _c: &crate::transcript_pump::TranscriptPumpConfig,
+                      _deadline: Option<Duration>|
          -> CoderRunCompletion {
             let n = phase.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
@@ -4588,6 +4855,7 @@ mod pump_supervision_tests {
             &crate::transcript_pump::TranscriptPumpConfig::default(),
             &|_, _| {},
             &|| Ok(()),
+            false,
             &run_fn,
         );
         assert_eq!(completion.terminal.unwrap(), 0, "the final retry succeeds");
@@ -4607,6 +4875,138 @@ mod pump_supervision_tests {
             !completion.report.is_clean(),
             "a report with any non-clean launch is persisted"
         );
+    }
+
+    #[test]
+    fn claude_no_progress_retries_same_logical_run_and_preserves_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let run_fn = |_cmd: Command,
+                      path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      deadline: Option<Duration>| {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(deadline, Some(Duration::from_millis(25)));
+            std::fs::write(
+                path.unwrap(),
+                "{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":25}\n",
+            )
+            .unwrap();
+            if call < 2 {
+                CoderRunCompletion::terminal_only(Err(anyhow::Error::new(
+                    ClaudeNoProgressTimeoutError {
+                        deadline: Duration::from_millis(25),
+                    },
+                )))
+            } else {
+                CoderRunCompletion::terminal_only(Ok(0))
+            }
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_timeout: Duration::from_millis(25),
+            claude_no_progress_retries: 2,
+            claude_no_progress_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            &run_fn,
+        );
+
+        assert_eq!(completion.terminal.unwrap(), 0);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(phase_transcript_path(&transcript, 0).is_file());
+        assert!(phase_transcript_path(&transcript, 1).is_file());
+        assert_eq!(
+            read_provider_retry_timing(&provider_timing_path(&transcript))
+                .unwrap()
+                .retry_count,
+            2,
+            "each no-progress backoff is visible as provider wait"
+        );
+    }
+
+    #[test]
+    fn claude_no_progress_exhaustion_remains_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let run_fn = |_cmd: Command,
+                      path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      _deadline: Option<Duration>| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::fs::write(
+                path.unwrap(),
+                "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            )
+            .unwrap();
+            CoderRunCompletion::terminal_only(Err(anyhow::Error::new(
+                ClaudeNoProgressTimeoutError {
+                    deadline: Duration::from_millis(1),
+                },
+            )))
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_timeout: Duration::from_millis(1),
+            claude_no_progress_retries: 1,
+            claude_no_progress_backoff: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            &run_fn,
+        );
+
+        assert!(
+            completion
+                .terminal
+                .unwrap_err()
+                .is::<ClaudeNoProgressExhaustedError>()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn zero_claude_no_progress_retries_disables_the_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let run_fn = |_cmd: Command,
+                      _path: Option<&Path>,
+                      _config: &crate::transcript_pump::TranscriptPumpConfig,
+                      deadline: Option<Duration>| {
+            assert_eq!(deadline, None);
+            CoderRunCompletion::terminal_only(Ok(0))
+        };
+        let config = crate::transcript_pump::TranscriptPumpConfig {
+            claude_no_progress_retries: 0,
+            ..Default::default()
+        };
+
+        let completion = run_with_transcript_retrying_reported_using(
+            || Command::new("/bin/true"),
+            Some(&transcript),
+            &config,
+            &|_, _| {},
+            &|| Ok(()),
+            true,
+            &run_fn,
+        );
+
+        assert_eq!(completion.terminal.unwrap(), 0);
     }
 
     #[test]

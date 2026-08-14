@@ -2768,6 +2768,13 @@ fn should_retry_coder_error(result: &Result<()>) -> bool {
         && !result
             .as_ref()
             .err()
+            .is_some_and(|error| error.is::<crate::coder::ClaudeNoProgressExhaustedError>())
+        && !result.as_ref().err().is_some_and(|error| {
+            error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
+        })
+        && !result
+            .as_ref()
+            .err()
             .is_some_and(|error| error.is::<crate::provider_evidence::ProviderUnavailableError>())
 }
 
@@ -2804,7 +2811,17 @@ enum TaskFailure {
 
 /// Classify a terminal coder error for durable persistence and resume.
 fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
-    if error.is::<crate::provider_evidence::ProviderUnavailableError>() {
+    if error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Inspect the provider cleanup evidence, then run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::ClaudeNoProgressExhaustedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::provider_evidence::ProviderUnavailableError>() {
         TaskFailure::ProviderUnavailable(format!(
             "{}. Run 'fluent attempt run' to resume the same Task.",
             error
@@ -2865,6 +2882,8 @@ fn provider_pause_error(
                 || error.is::<crate::claude_auth::AuthError>()
                 || error.is::<crate::codex_worker::CodexAuthError>()
                 || error.is::<crate::provider_readiness::ProviderReadinessError>()
+                || error.is::<crate::coder::ClaudeNoProgressExhaustedError>()
+                || error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
             {
                 return Err(error);
             }
@@ -8651,6 +8670,29 @@ mod tests {
             !should_retry_coder_error(&rate_limit),
             "coder-owned rate-limit exhaustion must bypass the outer retry budget"
         );
+
+        let no_progress: Result<()> = Err(anyhow::Error::new(
+            crate::coder::ClaudeNoProgressExhaustedError::new(3),
+        ));
+        assert!(
+            !should_retry_coder_error(&no_progress),
+            "bounded Claude no-progress recovery must not multiply through generic retries"
+        );
+        assert!(matches!(
+            classify_task_failure(no_progress.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("same Task") && message.contains("same Attempt")
+        ));
+
+        let cleanup_unconfirmed: Result<()> = Err(anyhow::Error::new(
+            crate::coder::ClaudeNoProgressCleanupUnconfirmedError::new("unconfirmed"),
+        ));
+        assert!(!should_retry_coder_error(&cleanup_unconfirmed));
+        assert!(matches!(
+            classify_task_failure(cleanup_unconfirmed.as_ref().unwrap_err()),
+            TaskFailure::ProviderUnavailable(message)
+                if message.contains("cleanup evidence") && message.contains("same Task")
+        ));
 
         let auth: Result<()> = Err(anyhow::Error::new(crate::claude_auth::AuthError::Expired {
             expires_at: 0,

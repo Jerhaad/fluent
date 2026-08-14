@@ -649,10 +649,34 @@ Task executor retries up to `FLUENT_MAX_TASK_RETRIES` (default 2) times before
 marking the Task failed and pausing the Attempt at `needs-user`. Authentication
 and rate-limit recovery belong exclusively to the coder layer: one credential
 refresh or two bounded rate-limit retries occur inside the same logical run.
-Typed auth failures and typed rate-limit exhaustion bypass the generic Task
-retry loop, preventing nested retry multiplication. Tester
-Task errors follow the same retry-then-pause policy but do not check for
-auth rejections because the tester invokes test harnesses, not a coder.
+Claude no-progress recovery also belongs to the coder layer. A transcript-enabled
+autonomous Claude launch has a project-layered 60-second deadline until model or
+tool progress, two automatic relaunches, and a 5-second initial exponential
+backoff. The transcript pump accepts only complete `system/init` and
+`system/api_retry` records as pre-progress evidence. Any assistant, tool,
+malformed, unknown, or deadline-partial record disables automatic relaunch for
+that launch. On a safe timeout, the supervisor terminates and reaps the full
+process group, the retry loop preserves the phase, and the same logical Task
+continues without consuming a Writer round. If termination, reaping, or the
+process-group sweep cannot be confirmed, Fluent does not relaunch and pauses the
+same Task with the cleanup diagnostic. The configuration keys are
+`provider-recovery.claude.no-progress-timeout-seconds`, `automatic-retries`, and
+`retry-backoff-seconds`; zero retries disables automatic recovery. A malformed
+layer disables recovery rather than substituting a retry policy.
+
+```yaml
+provider-recovery:
+  claude:
+    no-progress-timeout-seconds: 60
+    automatic-retries: 2
+    retry-backoff-seconds: 5
+```
+
+Typed auth failures, typed rate-limit exhaustion, and typed Claude no-progress
+exhaustion bypass the generic Task retry loop, preventing nested retry
+multiplication. Tester Task errors follow the same retry-then-pause policy but
+do not check for auth rejections because the tester invokes test harnesses, not
+a coder.
 Each failed Task writes a per-task handoff file
 (`needs-user-{task_id}.md`) so concurrent review failures preserve
 independent context. The loop reloads stored state before deciding the
@@ -1529,6 +1553,14 @@ rate-limit relaunch replaces pump status, Fluent adds the completed phase's pump
 timing to the role-owned sidecar. The recorded phase number prevents a resumed
 handoff from counting the same wait twice. Malformed or unknown records do not
 change execution.
+
+The same preserved-phase mechanism records safe Claude no-progress timeouts.
+Its backoff is included in the role-owned provider timing sidecar, so status and
+duration reports do not misclassify that wait as active model work.
+After the configured relaunch budget is exhausted, Task orchestration records
+the affected Task and Attempt as `needs-user` / `provider-unavailable`. The
+handoff names `fluent attempt run` as the manual same-Attempt recovery. Fluent
+never switches providers automatically.
 
 Author and reviewer Tasks inherit this
 behavior without further plumbing.
