@@ -3973,11 +3973,21 @@ Test: src/credential.rs (claude_credential_bridge_reads_oauth_for_managed_home_l
 ### B1
 
 WHEN configured initialization checks Claude readiness,
-THE SYSTEM SHALL check the local command and authentication status without
-sending a model prompt.
-Test: tests/binary.rs (coder_profile_preflight_does_not_invoke_model)
+THE SYSTEM SHALL check the local command and authentication status before
+changing the project.
+Test: tests/binary.rs (mixed_coder_profile_preflights_both_providers)
 
-### B2a
+### B1a
+
+WHEN a configured initialization selects Claude,
+THE SYSTEM SHALL require one bounded, tool-free successful response from each
+distinct selected Claude model before changing the project.
+Test: tests/binary.rs (configured_claude_readiness_requires_live_response_before_mutation)
+Test: tests/binary.rs (configured_claude_readiness_uses_bounded_tool_free_canary)
+Test: tests/binary.rs (configured_claude_readiness_checks_each_distinct_model)
+Test: tests/binary.rs (configured_claude_readiness_timeout_preserves_uninitialized_project)
+
+### B1b
 
 WHEN configured init checks Claude readiness on macOS while the host Claude Code
 login is valid,
@@ -7094,10 +7104,10 @@ Test: tests/binary.rs (claude_writer_profiles_preflight_only_selected_providers)
 
 ### B2
 
-WHEN configured init preflights a provider,
+WHEN configured init preflights Codex,
 THE SYSTEM SHALL check command and authentication readiness without requesting
 model inference or consuming model quota.
-Test: tests/binary.rs (coder_profile_preflight_does_not_invoke_model)
+Test: tests/binary.rs (codex_profile_preflight_does_not_invoke_model)
 
 ### B3
 

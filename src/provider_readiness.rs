@@ -1,9 +1,14 @@
 #[cfg(not(test))]
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::coder::CoderKind;
+
+const CLAUDE_READINESS_MARKER: &str = "FLUENT_CLAUDE_READY";
+const DEFAULT_CLAUDE_READINESS_DEADLINE_SECS: u64 = 30;
+const CLAUDE_READINESS_DEADLINE_ENV: &str = "FLUENT_CLAUDE_READINESS_DEADLINE_SECS";
 
 /// A provider checked for local command and authentication readiness.
 ///
@@ -174,6 +179,111 @@ impl ProviderReadiness {
     pub fn codex_worker(&self) -> Option<&crate::codex_worker::CodexWorkerEnvironment> {
         self.codex_worker.as_ref()
     }
+
+    /// Require one real, tool-free Claude response for the selected model.
+    pub fn verify_claude_inference(model: &str) -> Result<(), ProviderReadinessError> {
+        #[cfg(test)]
+        {
+            let _ = model;
+            return Ok(());
+        }
+
+        #[cfg(not(test))]
+        {
+            let deadline = configured_claude_readiness_deadline().map_err(|diagnostic| {
+                ProviderReadinessError::Claude(crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Unknown,
+                    diagnostic,
+                ))
+            })?;
+            let mut command = Command::new("claude");
+            command.args([
+                "--safe-mode",
+                "--tools",
+                "",
+                "--effort",
+                "low",
+                "--output-format",
+                "json",
+                "--no-session-persistence",
+            ]);
+            if !model.is_empty() {
+                command.args(["--model", model]);
+            }
+            command.args([
+                "-p",
+                &format!("Reply with exactly: {CLAUDE_READINESS_MARKER}"),
+            ]);
+            let output = crate::credential::run_bounded_claude_probe(command, deadline)
+                .map_err(|error| ProviderReadinessError::Claude(error.probe_failure()))?;
+            if claude_live_response_is_ready(&output.stdout) {
+                return Ok(());
+            }
+            let classified = crate::claude_diagnostics::ClaudeProbeFailure::from_output(
+                &output.stdout,
+                &output.stderr,
+            );
+            let failure = if classified.kind()
+                == crate::claude_diagnostics::ClaudeProbeFailureKind::Unknown
+            {
+                crate::claude_diagnostics::ClaudeProbeFailure::new(
+                    crate::claude_diagnostics::ClaudeProbeFailureKind::Unknown,
+                    "Claude live readiness did not return the expected response",
+                )
+            } else {
+                classified
+            };
+            Err(ProviderReadinessError::Claude(failure))
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn configured_claude_readiness_deadline() -> Result<Duration, String> {
+    let value = match std::env::var(CLAUDE_READINESS_DEADLINE_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "invalid {CLAUDE_READINESS_DEADLINE_ENV} value: use a positive number of seconds"
+            ));
+        }
+    };
+    configured_claude_readiness_deadline_from(value.as_deref())
+}
+
+fn configured_claude_readiness_deadline_from(value: Option<&str>) -> Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(DEFAULT_CLAUDE_READINESS_DEADLINE_SECS));
+    };
+    let seconds = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            format!(
+                "invalid {CLAUDE_READINESS_DEADLINE_ENV} value {value:?}; use a positive number of seconds"
+            )
+        })?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn claude_live_response_is_ready(output: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(output) else {
+        return false;
+    };
+    let terminal = match &value {
+        serde_json::Value::Object(_) => &value,
+        serde_json::Value::Array(events) => match events.last() {
+            Some(terminal) => terminal,
+            None => return false,
+        },
+        _ => return false,
+    };
+    terminal["type"].as_str() == Some("result")
+        && terminal["subtype"].as_str() == Some("success")
+        && terminal["is_error"].as_bool() == Some(false)
+        && terminal["result"].as_str().map(str::trim) == Some(CLAUDE_READINESS_MARKER)
 }
 
 #[derive(Deserialize)]
@@ -263,5 +373,36 @@ mod tests {
     #[test]
     fn unknown_claude_version_does_not_block_readiness() {
         assert!(claude_version_warning(b"Claude Code development build").is_none());
+    }
+
+    #[test]
+    fn claude_live_response_requires_exact_success_marker() {
+        assert!(claude_live_response_is_ready(
+            br#"{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}"#
+        ));
+        assert!(claude_live_response_is_ready(
+            br#"[{"type":"system","subtype":"init"},{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}]"#
+        ));
+        assert!(!claude_live_response_is_ready(
+            br#"{"type":"result","subtype":"success","is_error":false,"result":"almost"}"#
+        ));
+        assert!(!claude_live_response_is_ready(
+            br#"[{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"},{"type":"result","subtype":"error","is_error":true,"result":"failed"}]"#
+        ));
+        assert!(!claude_live_response_is_ready(b"not json"));
+    }
+
+    #[test]
+    fn claude_live_readiness_deadline_is_positive() {
+        assert_eq!(
+            configured_claude_readiness_deadline_from(None).unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            configured_claude_readiness_deadline_from(Some("7")).unwrap(),
+            Duration::from_secs(7)
+        );
+        assert!(configured_claude_readiness_deadline_from(Some("0")).is_err());
+        assert!(configured_claude_readiness_deadline_from(Some("bad")).is_err());
     }
 }

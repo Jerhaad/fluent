@@ -209,18 +209,31 @@ fn run_refresh_probe(
     command: Command,
     deadline: Duration,
 ) -> std::result::Result<(), CredentialRefreshError> {
-    run_refresh_probe_with_cleanup(
+    run_bounded_claude_probe(command, deadline).map(|_| ())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedClaudeProbeOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub(crate) fn run_bounded_claude_probe(
+    command: Command,
+    deadline: Duration,
+) -> std::result::Result<BoundedClaudeProbeOutput, CredentialRefreshError> {
+    run_bounded_claude_probe_with_cleanup(
         command,
         deadline,
         crate::coder::terminate_owned_process_tree,
     )
 }
 
-fn run_refresh_probe_with_cleanup<F>(
+fn run_bounded_claude_probe_with_cleanup<F>(
     mut command: Command,
     deadline: Duration,
     cleanup: F,
-) -> std::result::Result<(), CredentialRefreshError>
+) -> std::result::Result<BoundedClaudeProbeOutput, CredentialRefreshError>
 where
     F: FnOnce(
         std::process::Child,
@@ -252,7 +265,12 @@ where
     let started = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => {
+                return Ok(BoundedClaudeProbeOutput {
+                    stdout: read_bounded_probe_output(&mut stdout)?,
+                    stderr: read_bounded_probe_output(&mut stderr)?,
+                });
+            }
             Ok(Some(status)) => {
                 let stdout = read_bounded_probe_output(&mut stdout)?;
                 let stderr = read_bounded_probe_output(&mut stderr)?;
@@ -615,6 +633,17 @@ mod tests {
     }
 
     #[test]
+    fn bounded_probe_returns_success_output() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'ready'; printf 'note' >&2"]);
+
+        let output = run_bounded_claude_probe(command, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(output.stdout, b"ready");
+        assert_eq!(output.stderr, b"note");
+    }
+
+    #[test]
     fn refresh_probe_retains_bounded_sanitized_diagnostic() {
         let mut command = Command::new("/bin/sh");
         command.args([
@@ -660,8 +689,10 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 60"]);
 
-        let result =
-            run_refresh_probe_with_cleanup(command, Duration::from_millis(30), |mut child| {
+        let result = run_bounded_claude_probe_with_cleanup(
+            command,
+            Duration::from_millis(30),
+            |mut child| {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 Ok(crate::coder::GroupSweepDisposition::Unconfirmed(
@@ -672,7 +703,8 @@ mod tests {
                         message: Some("operation not permitted".to_string()),
                     },
                 ))
-            });
+            },
+        );
 
         assert!(
             matches!(result, Err(CredentialRefreshError::Cleanup(message)) if message.contains("process group cleanup was not confirmed"))

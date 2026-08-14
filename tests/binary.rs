@@ -2546,11 +2546,7 @@ fn mixed_coder_profile_preflights_both_providers() {
         &bin_dir,
         "#!/bin/bash\nprintf 'codex %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2\" = \"login status\" ]\n",
     );
-    write_mock_executable(
-        &bin_dir,
-        "claude",
-        "#!/bin/bash\nprintf 'claude %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":true}\\n'\n",
-    );
+    write_mock_ready_claude(&bin_dir);
     fluent_cmd()
         .current_dir(tmp.path())
         .env("PATH", mock_path(&bin_dir))
@@ -2587,11 +2583,7 @@ fn claude_writer_profiles_preflight_only_selected_providers() {
             &bin_dir,
             "#!/bin/bash\nprintf 'codex %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2\" = \"login status\" ]\n",
         );
-        write_mock_executable(
-            &bin_dir,
-            "claude",
-            "#!/bin/bash\nprintf 'claude %s\\n' \"$*\" >> \"${PREFLIGHT_LOG:?}\"\n[ \"$1 $2 $3\" = \"auth status --json\" ] || exit 1\nprintf '{\"loggedIn\":true}\\n'\n",
-        );
+        write_mock_ready_claude(&bin_dir);
 
         fluent_cmd()
             .current_dir(tmp.path())
@@ -2619,7 +2611,7 @@ fn claude_writer_profiles_preflight_only_selected_providers() {
 }
 
 #[test]
-fn coder_profile_preflight_does_not_invoke_model() {
+fn codex_profile_preflight_does_not_invoke_model() {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().join("bin");
     let codex_home = tmp.path().join("codex-home");
@@ -2665,7 +2657,7 @@ if [ "$1" = "--version" ]; then
   printf '2.1.220 (Claude Code)\n'
   exit 0
 fi
-exit 1
+printf '[{"type":"system","subtype":"init"},{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}]\n'
 "##,
     );
 
@@ -2685,6 +2677,219 @@ exit 1
         .success()
         .stdout(predicate::str::contains("readiness-oauth-token").not())
         .stderr(predicate::str::contains("readiness-oauth-token").not());
+}
+
+#[test]
+fn configured_claude_readiness_requires_live_response_before_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        r#"#!/bin/bash
+set -euo pipefail
+if [ "${1:-} ${2:-} ${3:-}" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+printf 'service unavailable while starting model response\n' >&2
+exit 23
+"#,
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .args([
+            "init",
+            "--coder-profile",
+            "claude-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "FLUENT_CLAUDE_PROVIDER_UNAVAILABLE",
+        ))
+        .stderr(predicates::str::contains("claude /login").not());
+    assert!(!tmp.path().join(".fluent").exists());
+}
+
+#[test]
+fn configured_claude_readiness_uses_bounded_tool_free_canary() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let args_log = tmp.path().join("canary-args.log");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        r#"#!/bin/bash
+set -euo pipefail
+if [ "${1:-} ${2:-} ${3:-}" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+printf '<%s>\n' "$@" >> "${CANARY_ARGS_LOG:?}"
+printf '[{"type":"system","subtype":"init"},{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}]\n'
+"#,
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .env("CANARY_ARGS_LOG", &args_log)
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "selected-claude",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "selected-claude",
+            "--review-effort",
+            "high",
+        ])
+        .assert()
+        .success();
+
+    let args = fs::read_to_string(args_log).unwrap();
+    for expected in [
+        "<--safe-mode>",
+        "<--tools>\n<>\n",
+        "<--effort>\n<low>",
+        "<--output-format>\n<json>",
+        "<--no-session-persistence>",
+        "<--model>\n<selected-claude>",
+        "<-p>\n<Reply with exactly: FLUENT_CLAUDE_READY>",
+    ] {
+        assert!(args.contains(expected), "missing {expected:?} in {args}");
+    }
+    assert_eq!(args.matches("<--safe-mode>").count(), 1);
+}
+
+#[test]
+fn configured_claude_readiness_checks_each_distinct_model() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    let model_log = tmp.path().join("models.log");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        r#"#!/bin/bash
+set -euo pipefail
+if [ "${1:-} ${2:-} ${3:-}" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = "--model" ]; then
+    printf '%s\n' "$argument" >> "${MODEL_LOG:?}"
+  fi
+  previous="$argument"
+done
+printf '[{"type":"system","subtype":"init"},{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}]\n'
+"#,
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .env("MODEL_LOG", &model_log)
+        .args([
+            "init",
+            "--coder-profile",
+            "custom",
+            "--follow-up-mode",
+            "propose",
+            "--write-coder",
+            "claude",
+            "--write-model",
+            "writer-model",
+            "--write-effort",
+            "medium",
+            "--review-coder",
+            "claude",
+            "--review-model",
+            "reviewer-model",
+            "--review-effort",
+            "medium",
+        ])
+        .assert()
+        .success();
+
+    let models = fs::read_to_string(model_log).unwrap();
+    assert_eq!(
+        models.lines().collect::<Vec<_>>(),
+        ["writer-model", "reviewer-model"]
+    );
+}
+
+#[test]
+fn configured_claude_readiness_timeout_preserves_uninitialized_project() {
+    let tmp = TempDir::new().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    init_git_repo(tmp.path());
+    write_mock_executable(
+        &bin_dir,
+        "claude",
+        r#"#!/bin/bash
+set -euo pipefail
+if [ "${1:-} ${2:-} ${3:-}" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+sleep 60
+"#,
+    );
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_CLAUDE_READINESS_DEADLINE_SECS", "1")
+        .args([
+            "init",
+            "--coder-profile",
+            "claude-balanced",
+            "--follow-up-mode",
+            "propose",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("FLUENT_CLAUDE_PROBE_TIMEOUT"))
+        .stderr(predicates::str::contains(
+            "FLUENT_CLAUDE_READINESS_DEADLINE_SECS",
+        ))
+        .stderr(predicates::str::contains("FLUENT_CLAUDE_REFRESH_DEADLINE_SECS").not());
+    assert!(!tmp.path().join(".fluent").exists());
 }
 
 #[test]
@@ -2873,7 +3078,7 @@ fn coder_profile_preflight_warns_for_old_claude_parallel_auth() {
     write_mock_executable(
         &bin_dir,
         "claude",
-        "#!/bin/bash\nif [ \"$1 $2 $3\" = \"auth status --json\" ]; then printf '{\"loggedIn\":true}\\n'; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then printf '2.1.191 (Claude Code)\\n'; exit 0; fi\nexit 1\n",
+        "#!/bin/bash\nif [ \"$1 $2 $3\" = \"auth status --json\" ]; then printf '{\"loggedIn\":true}\\n'; exit 0; fi\nif [ \"$1\" = \"--version\" ]; then printf '2.1.191 (Claude Code)\\n'; exit 0; fi\nprintf '[{\"type\":\"system\",\"subtype\":\"init\"},{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"FLUENT_CLAUDE_READY\"}]\\n'\n",
     );
 
     fluent_cmd()
@@ -19285,6 +19490,26 @@ fn write_mock_executable(bin_dir: &Path, name: &str, script: &str) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+fn write_mock_ready_claude(bin_dir: &Path) {
+    write_mock_executable(
+        bin_dir,
+        "claude",
+        r#"#!/bin/bash
+set -euo pipefail
+[ -z "${PREFLIGHT_LOG:-}" ] || printf 'claude %s\n' "$*" >> "$PREFLIGHT_LOG"
+if [ "${1:-} ${2:-} ${3:-}" = "auth status --json" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '2.1.220 (Claude Code)\n'
+  exit 0
+fi
+printf '[{"type":"system","subtype":"init"},{"type":"result","subtype":"success","is_error":false,"result":"FLUENT_CLAUDE_READY"}]\n'
+"#,
+    );
 }
 
 fn write_mock_sandbox_exec(bin_dir: &Path) {

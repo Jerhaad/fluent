@@ -158,7 +158,8 @@ fn curated_claude() -> CoderMapping {
     }
 }
 
-/// Check selected providers without asking any model to generate output.
+/// Check selected providers and require a live response from each selected
+/// Claude model before configured initialization mutates the project.
 pub fn preflight_providers(mapping: &CoderMapping) -> Result<()> {
     let mut providers = Vec::new();
     for provider in [mapping.write.coder, mapping.review.coder] {
@@ -166,13 +167,33 @@ pub fn preflight_providers(mapping: &CoderMapping) -> Result<()> {
             providers.push(provider);
         }
     }
-    let failures = providers
-        .into_iter()
-        .filter_map(|provider| {
-            crate::provider_readiness::ProviderReadiness::prepare(provider).err()
-        })
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    let mut claude_authenticated = false;
+    for provider in providers {
+        match crate::provider_readiness::ProviderReadiness::prepare(provider) {
+            Ok(_) => {
+                if provider == CoderKind::Claude {
+                    claude_authenticated = true;
+                }
+            }
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    if claude_authenticated && failures.is_empty() {
+        let mut models = Vec::new();
+        for pair in [&mapping.write, &mapping.review] {
+            if pair.coder == CoderKind::Claude && !models.contains(&pair.model) {
+                models.push(pair.model.clone());
+            }
+        }
+        for model in models {
+            if let Err(error) =
+                crate::provider_readiness::ProviderReadiness::verify_claude_inference(&model)
+            {
+                failures.push(error.to_string());
+            }
+        }
+    }
     if failures.is_empty() {
         Ok(())
     } else {

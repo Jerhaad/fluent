@@ -1,17 +1,25 @@
 ---
 name: provider-readiness-crosses-reservation
-description: Provider readiness is one no-inference, provider-keyed boundary shared by setup and autonomous launches, and its prepared proof must cross a durable reservation into execution
+description: Shared provider admission remains a no-inference boundary whose prepared proof crosses reservation; configured init may add a separate pre-mutation live canary
 metadata:
   type: architecture
 ---
 
-Provider readiness has one shared `CoderKind`-keyed boundary
-(`provider_readiness::ProviderReadiness`) for configured setup and autonomous
-Writer, Reviewer, Learner, and Rebase launches. Provider adapters must verify
-only local command and authentication readiness: they must not start an
-interactive session or request model inference. When a provider returns
-structured authentication status, parse and validate the declared state rather
-than treating a successful process exit as proof of authentication.
+Provider admission has one shared `CoderKind`-keyed boundary
+(`provider_readiness::ProviderReadiness::prepare`) for configured setup and
+autonomous Writer, Reviewer, Learner, and Rebase launches. Provider adapters at
+this boundary must verify only local command and authentication readiness: they
+must not start an interactive session or request model inference. When a
+provider returns structured authentication status, parse and validate the
+declared state rather than treating a successful process exit as proof of
+authentication.
+
+Configured setup may add a separate check before mutation when first-use
+confidence requires more than local authentication. Claude configured init does
+this with one bounded, safe-mode, tool-free response from every distinct
+selected model. Keep that canary outside `prepare`: it proves only that the
+chosen model answers now, is not retained as a launch capability, and must not
+make autonomous phase admission consume model quota before reservation.
 
 Do not assume a provider's isolated `HOME` can locate host credentials. On
 macOS, the `security` command derives its default Keychain search list from

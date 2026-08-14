@@ -1142,16 +1142,19 @@ hooks, the project Dockerfile, and Tester contract files trackable.
 
 After that gate, configured init preflights the enclosing host and every
 distinct selected provider before it creates `.fluent/`, installs skills, seeds
-instructions, or writes configuration. Readiness checks command availability
-and local authentication without a model inference, so they cannot reserve or
-guarantee future provider capacity. The configuration writer parses the
-existing YAML, updates only the two role mappings and (for execute)
-`follow-up.mode`, then atomically replaces the file. It preserves unrelated
-keys and never leaves a partial role mapping. `propose` adds no follow-up
-mapping. Coder configuration and persisted coder mappings reject the retired
-`behavior-tests` key instead of discarding or translating it. Bare `fluent init`
-remains compatible with existing non-interactive
-callers and therefore retains the legacy implicit-default path.
+instructions, or writes configuration. The shared admission boundary checks
+command availability and local authentication without model inference. In
+addition, configured init requires one bounded live response from every
+distinct selected Claude model. That tool-free canary verifies that the exact
+model can answer at setup time; it neither reserves nor guarantees future
+provider capacity. Codex configured init remains authentication-only. The
+configuration writer parses the existing YAML, updates only the two role
+mappings and (for execute) `follow-up.mode`, then atomically replaces the file.
+It preserves unrelated keys and never leaves a partial role mapping. `propose`
+adds no follow-up mapping. Coder configuration and persisted coder mappings
+reject the retired `behavior-tests` key instead of discarding or translating
+it. Bare `fluent init` remains compatible with existing non-interactive callers
+and therefore retains the legacy implicit-default path.
 
 Execute mode authorizes and queues corrective Work; it still requires a
 separately started scheduler and human candidate landing.
@@ -1597,14 +1600,17 @@ instead of letting the coder fail mid-Task with a cold 401. Two layers:
 
 When that expiry check or a transcript 401 requires a refresh,
 `credential::refresh_credentials()` runs a minimal host-side Claude probe in
-safe mode. `FLUENT_CLAUDE_REFRESH_DEADLINE_SECS` configures its wall-clock
-deadline (30 seconds by default and must be positive). The probe owns a process
-group; on deadline expiry, Fluent attempts to terminate and reap the owned group,
-including its descendants. A verified sweep returns a timeout, while an
-unconfirmed sweep returns a cleanup failure that retains its diagnostic. Fluent
-captures command output in temporary files so a full pipe cannot deadlock the
-probe, reads a bounded prefix after failure, redacts credential-shaped values,
-and rereads the Keychain only after a successful zero exit.
+safe mode. The same bounded process runner supports configured init's live
+Claude canary. Each probe owns a process group; on deadline expiry, Fluent
+attempts to terminate and reap the owned group, including its descendants. A
+verified sweep returns a timeout, while an unconfirmed sweep returns a cleanup
+failure that retains its diagnostic. Fluent captures command output in
+temporary files so a full pipe cannot deadlock the probe, reads a bounded prefix
+after failure, and redacts credential-shaped values. The refresh probe uses
+`FLUENT_CLAUDE_REFRESH_DEADLINE_SECS` and rereads the Keychain only after a
+successful zero exit. The configured-init canary uses
+`FLUENT_CLAUDE_READINESS_DEADLINE_SECS`; both deadlines default to 30 seconds
+and must be positive.
 
 `claude_diagnostics.rs` classifies readiness and refresh failures as
 authentication, host credential boundary, rate limit, network, provider
@@ -2554,6 +2560,17 @@ Configured Claude readiness also runs `claude --version` after authentication
 succeeds. Versions older than 2.1.211 produce a non-blocking warning because
 that release contains Claude Code's parallel session token-renewal fix. Missing
 or unparseable version output does not turn successful readiness into failure.
+Before configured init mutates the project, it then invokes each distinct
+selected Claude model once with safe mode, no tools, low effort, JSON output,
+and no session persistence. The response must be a successful result containing
+the exact readiness marker. Fluent accepts both Claude's single-result JSON and
+the current event-array JSON when its terminal event is that exact successful
+result. The probe uses the host credential bridge and the bounded process-group
+runner described above. A failure leaves a new project uninitialized and
+reports the matching redacted diagnostic category. This configured-init canary
+is deliberately not part of the shared runtime readiness boundary: autonomous
+phases retain the cheaper authentication-only preflight before reservation and
+perform useful inference only in their assigned task.
 
 ### Fargate runtime
 

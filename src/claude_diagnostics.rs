@@ -61,6 +61,10 @@ impl ClaudeProbeFailure {
     }
 
     pub fn recovery(&self) -> String {
+        self.recovery_for("credential refresh")
+    }
+
+    fn recovery_for(&self, action: &str) -> String {
         match self.kind {
             ClaudeProbeFailureKind::Authentication => {
                 "Run 'claude /login' to re-authenticate, then retry the same Fluent command."
@@ -79,8 +83,14 @@ impl ClaudeProbeFailure {
                 "Retry the same Fluent command after Claude service availability returns.".to_string()
             }
             ClaudeProbeFailureKind::Timeout => {
-                "Retry the same Fluent command; if the host is consistently slow, increase FLUENT_CLAUDE_REFRESH_DEADLINE_SECS."
-                    .to_string()
+                let deadline = if action == "readiness" {
+                    "FLUENT_CLAUDE_READINESS_DEADLINE_SECS"
+                } else {
+                    "FLUENT_CLAUDE_REFRESH_DEADLINE_SECS"
+                };
+                format!(
+                    "Retry the same Fluent command; if the host is consistently slow, increase {deadline}."
+                )
             }
             ClaudeProbeFailureKind::Unknown => {
                 "Inspect the diagnostic, repair the Claude command or environment, then retry the same Fluent command."
@@ -98,7 +108,7 @@ impl ClaudeProbeFailure {
     }
 
     pub fn user_message(&self, action: &str) -> String {
-        format!("{} {}", self.summary(action), self.recovery())
+        format!("{} {}", self.summary(action), self.recovery_for(action))
     }
 
     pub fn task_user_message(&self, action: &str) -> String {
@@ -480,6 +490,14 @@ mod tests {
                 .recovery()
                 .contains("claude /login")
         );
+    }
+
+    #[test]
+    fn readiness_timeout_names_the_readiness_deadline() {
+        let message = ClaudeProbeFailure::new(ClaudeProbeFailureKind::Timeout, "timed out")
+            .user_message("readiness");
+        assert!(message.contains("FLUENT_CLAUDE_READINESS_DEADLINE_SECS"));
+        assert!(!message.contains("FLUENT_CLAUDE_REFRESH_DEADLINE_SECS"));
     }
 
     #[test]

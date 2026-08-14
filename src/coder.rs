@@ -2523,7 +2523,7 @@ impl CoderSupervisor {
 
 /// Terminate a separately spawned Claude process through the same identity-safe
 /// process-group owner used by autonomous coder launches.  This is deliberately
-/// crate-private: credential refresh is the only host-side launch that needs the
+/// crate-private: bounded host-side credential and readiness probes need the
 /// cleanup boundary without a transcript pump.
 pub(crate) fn terminate_owned_process_tree(child: Child) -> Result<GroupSweepDisposition, String> {
     let child_id = child.id();
