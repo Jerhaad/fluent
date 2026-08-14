@@ -50,7 +50,7 @@ installed executable. After upgrading from an earlier release, rebuild stored
 artifact metrics once with `fluent work-item rebuild-metrics` if you want
 historical Work Items to report their complete storage totals immediately.
 
-See the [v0.1.5 release notes](documentation/releases/v0.1.5.md) for behavior
+See the [v0.2.0 release notes](documentation/releases/v0.2.0.md) for behavior
 changes and recovery commands.
 
 ## How Fluent works
