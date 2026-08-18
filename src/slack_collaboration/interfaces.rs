@@ -11,6 +11,13 @@ pub enum InboxState {
     Processed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryTarget {
+    pub channel: String,
+    pub thread_timestamp: String,
+    pub oldest: String,
+}
+
 /// Durable collaboration state boundary for inbox, aggregate snapshots,
 /// outbox, and recovery cursors.
 pub trait CollaborationStore {
@@ -172,7 +179,7 @@ pub trait SlackTransport {
         bail!("Slack transport cannot reconnect")
     }
 
-    fn bounded_history(&mut self, _threads: &[(String, String)]) -> Result<Vec<InboundEnvelope>> {
+    fn bounded_history(&mut self, _threads: &[RecoveryTarget]) -> Result<Vec<InboundEnvelope>> {
         Ok(Vec::new())
     }
 }

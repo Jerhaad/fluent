@@ -12,7 +12,7 @@ use crate::content::ContentResolver;
 
 use super::{
     ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, ProviderTurnRecovery,
-    SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
+    RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
 };
 
 pub struct LocalSchedulerClient {
@@ -121,32 +121,60 @@ impl SlackTransport for SocketModeTransport {
         Ok(())
     }
 
-    fn bounded_history(&mut self, threads: &[(String, String)]) -> Result<Vec<InboundEnvelope>> {
+    fn bounded_history(&mut self, threads: &[RecoveryTarget]) -> Result<Vec<InboundEnvelope>> {
+        self.web.recover_history(threads)
+    }
+}
+
+impl SlackWebApiTransport {
+    #[doc(hidden)]
+    pub fn recover_history(&self, threads: &[RecoveryTarget]) -> Result<Vec<InboundEnvelope>> {
         let mut events = Vec::new();
-        for (channel, thread_timestamp) in threads {
-            let value = self.web.call_value(
-                "conversations.replies",
-                &self.web.bot_token,
-                serde_json::json!({"channel": channel, "ts": thread_timestamp, "limit": 100}),
-            )?;
-            for message in value["messages"].as_array().into_iter().flatten() {
-                let Some(timestamp) = message["ts"].as_str() else {
-                    continue;
-                };
-                if timestamp == thread_timestamp {
-                    continue;
-                }
-                events.push(InboundEnvelope {
-                    id: format!("history:{channel}:{timestamp}"),
-                    acknowledgement_id: String::new(),
-                    channel: channel.clone(),
-                    timestamp: timestamp.into(),
-                    thread_timestamp: Some(thread_timestamp.clone()),
-                    user: message["user"].as_str().unwrap_or_default().into(),
-                    text: message["text"].as_str().unwrap_or_default().into(),
+        for target in threads {
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut body = serde_json::json!({
+                    "channel": target.channel,
+                    "ts": target.thread_timestamp,
+                    "oldest": target.oldest,
+                    "inclusive": false,
+                    "limit": 100,
                 });
+                if let Some(cursor) = &cursor {
+                    body["cursor"] = serde_json::Value::String(cursor.clone());
+                }
+                let value = self.call_value("conversations.replies", &self.bot_token, body)?;
+                for message in value["messages"].as_array().into_iter().flatten() {
+                    let Some(timestamp) = message["ts"].as_str() else {
+                        continue;
+                    };
+                    if timestamp == target.thread_timestamp {
+                        continue;
+                    }
+                    events.push(InboundEnvelope {
+                        id: format!("history:{}:{timestamp}", target.channel),
+                        acknowledgement_id: String::new(),
+                        channel: target.channel.clone(),
+                        timestamp: timestamp.into(),
+                        thread_timestamp: Some(target.thread_timestamp.clone()),
+                        user: message["user"].as_str().unwrap_or_default().into(),
+                        text: message["text"].as_str().unwrap_or_default().into(),
+                    });
+                }
+                cursor = value["response_metadata"]["next_cursor"]
+                    .as_str()
+                    .filter(|cursor| !cursor.is_empty())
+                    .map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
             }
         }
+        events.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.id.cmp(&right.id))
+        });
         Ok(events)
     }
 }

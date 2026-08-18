@@ -605,6 +605,7 @@ struct RecoverySlack {
     acknowledgements: Vec<String>,
     deliveries: Vec<OutboundDelivery>,
     history: Vec<InboundEnvelope>,
+    targets: Vec<RecoveryTarget>,
 }
 
 impl SlackTransport for RecoverySlack {
@@ -620,8 +621,9 @@ impl SlackTransport for RecoverySlack {
 
     fn bounded_history(
         &mut self,
-        _threads: &[(String, String)],
+        threads: &[RecoveryTarget],
     ) -> anyhow::Result<Vec<InboundEnvelope>> {
+        self.targets = threads.to_vec();
         Ok(std::mem::take(&mut self.history))
     }
 }
@@ -818,6 +820,217 @@ fn configured_recovery_reconciles_bounded_thread_history() {
     assert_eq!(recovered.provider().calls.len(), 1);
     assert_eq!(recovered.provider().calls[0].2, "missed reply");
     assert!(recovered.slack().acknowledgements.is_empty());
+    assert_eq!(recovered.slack().targets[0].oldest, "1.0");
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .recovery_cursor("C1", "1.0")
+            .unwrap()
+            .as_deref(),
+        Some("2.0")
+    );
+}
+
+#[test]
+fn slack_history_paginates_after_the_durable_high_water_mark() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let server = std::thread::spawn(move || {
+        for page in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            captured
+                .lock()
+                .unwrap()
+                .push(String::from_utf8(request).unwrap());
+            let range = if page == 0 { 1..=100 } else { 101..=125 };
+            let messages: Vec<_> = range
+                .map(|index| {
+                    serde_json::json!({
+                        "ts": format!("2.{index:06}"),
+                        "user": "U1",
+                        "text": format!("reply {index}")
+                    })
+                })
+                .collect();
+            let next_cursor = if page == 0 { "page-2" } else { "" };
+            let body = serde_json::json!({
+                "ok": true,
+                "messages": messages,
+                "response_metadata": {"next_cursor": next_cursor}
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    let slack = SlackWebApiTransport::new(
+        format!("http://{address}"),
+        "xapp-test".into(),
+        "xoxb-test".into(),
+    );
+    let events = slack
+        .recover_history(&[RecoveryTarget {
+            channel: "C1".into(),
+            thread_timestamp: "1.0".into(),
+            oldest: "1.500000".into(),
+        }])
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(events.len(), 125);
+    assert_eq!(events.first().unwrap().timestamp, "2.000001");
+    assert_eq!(events.last().unwrap().timestamp, "2.000125");
+    let requests = requests.lock().unwrap();
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap())
+        .collect();
+    assert_eq!(bodies[0]["oldest"], "1.500000");
+    assert!(bodies[0].get("cursor").is_none());
+    assert_eq!(bodies[1]["cursor"], "page-2");
+}
+
+#[derive(Clone)]
+struct FailContributionOnceProvider {
+    failed: Arc<Mutex<bool>>,
+    completed: Arc<Mutex<Vec<String>>>,
+}
+
+impl ConversationProvider for FailContributionOnceProvider {
+    fn start(
+        &mut self,
+        _action_id: &str,
+        _scope: &ProviderScope,
+        contribution: &str,
+        _actor: &str,
+    ) -> anyhow::Result<(String, String)> {
+        Ok(("session-1".into(), format!("reply: {contribution}")))
+    }
+
+    fn resume(
+        &mut self,
+        _action_id: &str,
+        _session: &str,
+        _scope: &ProviderScope,
+        contribution: &str,
+        _actor: &str,
+    ) -> anyhow::Result<String> {
+        if contribution == "second" && !*self.failed.lock().unwrap() {
+            *self.failed.lock().unwrap() = true;
+            anyhow::bail!("crash midway through Slack recovery");
+        }
+        self.completed.lock().unwrap().push(contribution.into());
+        Ok(format!("reply: {contribution}"))
+    }
+}
+
+fn recovered_reply(id: &str, timestamp: &str, text: &str) -> InboundEnvelope {
+    InboundEnvelope {
+        id: id.into(),
+        acknowledgement_id: String::new(),
+        channel: "C1".into(),
+        timestamp: timestamp.into(),
+        thread_timestamp: Some("1.0".into()),
+        user: "U1".into(),
+        text: text.into(),
+    }
+}
+
+#[test]
+fn recovery_retains_the_last_safe_cursor_and_deduplicates_live_overlap() {
+    let (home, _checkout, config) = setup(true);
+    let mut initial = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    initial.ingest(event("E1", None, "@Fluent start")).unwrap();
+
+    let live = recovered_reply("EV-LIVE", "2.0", "first");
+    let mut pending_live = live.clone();
+    pending_live.acknowledgement_id = "ENV-LIVE".into();
+    let mut disconnected = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        FailingSlack {
+            fail_acknowledgements: 1,
+            ..Default::default()
+        },
+    );
+    assert!(disconnected.ingest(pending_live).is_err());
+
+    let completed = Arc::new(Mutex::new(Vec::new()));
+    let provider = FailContributionOnceProvider {
+        failed: Arc::new(Mutex::new(false)),
+        completed: completed.clone(),
+    };
+    let history = vec![
+        recovered_reply("history:C1:2.0", "2.0", "first"),
+        recovered_reply("history:C1:3.0", "3.0", "second"),
+        recovered_reply("history:C1:4.0", "4.0", "third"),
+    ];
+    let mut crashed = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        provider.clone(),
+        RecoverySlack {
+            history: history.clone(),
+            ..Default::default()
+        },
+    );
+    assert!(reconcile_connected_runner(&mut crashed).is_err());
+    let store = FileCollaborationStore::new(home.path());
+    assert_eq!(
+        store.recovery_cursor("C1", "1.0").unwrap().as_deref(),
+        Some("2.0")
+    );
+
+    let mut restarted = CollaborationRunner::new(
+        home.path(),
+        config,
+        provider,
+        RecoverySlack {
+            history: history.into_iter().skip(1).collect(),
+            ..Default::default()
+        },
+    );
+    reconcile_connected_runner(&mut restarted).unwrap();
+    assert_eq!(restarted.slack().targets[0].oldest, "2.0");
+    assert_eq!(
+        store.recovery_cursor("C1", "1.0").unwrap().as_deref(),
+        Some("4.0")
+    );
+    assert_eq!(&*completed.lock().unwrap(), &["first", "second", "third"]);
 }
 
 #[test]

@@ -88,15 +88,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         connected_at: String,
         report_interruption: bool,
     ) -> Result<()> {
-        let mut events = self.store.load_pending_inbox(&self.config)?;
-        events.extend(history);
-        events.sort_by(|left, right| {
+        let mut events: Vec<_> = self
+            .store
+            .load_pending_inbox(&self.config)?
+            .into_iter()
+            .map(|event| (false, event))
+            .collect();
+        events.extend(history.into_iter().map(|event| (true, event)));
+        events.sort_by(|(left_history, left), (right_history, right)| {
             left.timestamp
                 .cmp(&right.timestamp)
-                .then(left.id.cmp(&right.id))
+                .then(left_history.cmp(right_history).then(left.id.cmp(&right.id)))
         });
-        for event in events {
-            self.ingest(event)?;
+        for (recovered, event) in events {
+            self.ingest(event.clone())?;
+            if recovered {
+                self.store.save_recovery_cursor(
+                    &event.channel,
+                    &event.thread_id(),
+                    &event.timestamp,
+                )?;
+            }
         }
         let thread_ids: Vec<_> = self.store.load_threads(&self.config)?.into_keys().collect();
         for id in thread_ids {
@@ -113,14 +125,23 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         self.deliver_pending()
     }
 
-    pub fn recovery_targets(&self) -> Result<Vec<(String, String)>> {
-        Ok(self
-            .store
+    pub fn recovery_targets(&self) -> Result<Vec<RecoveryTarget>> {
+        self.store
             .load_threads(&self.config)?
             .into_values()
             .filter(|thread| thread.state == ThreadState::Active)
-            .map(|thread| (thread.channel, thread.id))
-            .collect())
+            .map(|thread| {
+                let oldest = self
+                    .store
+                    .recovery_cursor(&thread.channel, &thread.id)?
+                    .unwrap_or_else(|| thread.id.clone());
+                Ok(RecoveryTarget {
+                    channel: thread.channel,
+                    thread_timestamp: thread.id,
+                    oldest,
+                })
+            })
+            .collect()
     }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = self.store.load_outbox()?;
