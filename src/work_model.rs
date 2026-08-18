@@ -3214,6 +3214,96 @@ impl RequiredProgressStatus {
 }
 
 impl ProgressContract {
+    /// Derive required Plan progress from the validated Writer matrix without
+    /// coupling it to task-specific review findings. Corrective rounds replace
+    /// their finding frontier, but the approved Plan rows remain stable.
+    pub(crate) fn status_against_writer_matrix(
+        &self,
+        matrix: &WriterCompletionMatrix,
+    ) -> Result<RequiredProgressStatus, String> {
+        let plan_rows = matrix
+            .rows
+            .iter()
+            .filter(|row| row.kind == WriterCompletionRequirementKind::Plan)
+            .collect::<Vec<_>>();
+        if plan_rows.len() != self.required.len() {
+            return Err(format!(
+                "required-progress contract has {} rows but Writer completion matrix has {} Plan rows",
+                self.required.len(),
+                plan_rows.len()
+            ));
+        }
+
+        let mut checked = 0usize;
+        let mut incomplete_reason = None;
+        for entry in &self.required {
+            let matrix_id = format!("plan:{}", entry.id);
+            let matching = plan_rows
+                .iter()
+                .filter(|row| row.id == matrix_id)
+                .copied()
+                .collect::<Vec<_>>();
+            let [row] = matching.as_slice() else {
+                return Err(format!(
+                    "required-progress entry {:?} must map to exactly one Writer completion row {:?}",
+                    entry.id, matrix_id
+                ));
+            };
+            if row.requirement != entry.requirement {
+                return Err(format!(
+                    "required-progress entry {:?} disagrees with Writer completion row {:?}",
+                    entry.id, matrix_id
+                ));
+            }
+            if row.state == WriterCompletionState::Pending {
+                incomplete_reason.get_or_insert_with(|| {
+                    format!("Writer completion row {:?} is still pending", matrix_id)
+                });
+                continue;
+            }
+            if row
+                .implementation_evidence
+                .iter()
+                .all(|value| value.trim().is_empty())
+            {
+                incomplete_reason.get_or_insert_with(|| {
+                    format!(
+                        "Writer completion row {:?} lacks implementation evidence",
+                        matrix_id
+                    )
+                });
+                continue;
+            }
+            if row.verification.is_empty()
+                || row
+                    .verification
+                    .iter()
+                    .any(|claim| claim.command.trim().is_empty())
+            {
+                incomplete_reason.get_or_insert_with(|| {
+                    format!(
+                        "Writer completion row {:?} lacks focused verification",
+                        matrix_id
+                    )
+                });
+                continue;
+            }
+            if !row.applicable_constraints.is_empty() {
+                return Err(format!(
+                    "Writer completion row {:?} is not a review finding but carries constraint mappings",
+                    matrix_id
+                ));
+            }
+            checked += 1;
+        }
+
+        Ok(RequiredProgressStatus {
+            checked,
+            required: self.required.len(),
+            incomplete_reason,
+        })
+    }
+
     /// Derive an immutable manifest from a Plan's markdown step table, one entry per
     /// required row (`Req?` column `Yes`). Returns `None` when the Plan has no
     /// required rows, so an Attempt without required work carries no marker and

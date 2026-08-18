@@ -6207,104 +6207,56 @@ fn gate_writer_completion_before_reviews(
             incomplete_reason: None,
         }
     };
-    let progress =
-        if let Some(progress_contract) = item.attempts[attempt_index].progress_contract.as_ref() {
-            let path = project_root.join(&progress_artifact.path);
-            let source = match fs::read_to_string(&path) {
-                Ok(source) => source,
-                Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "read required progress before review planning: {}",
-                            path.display()
-                        )
-                    });
+    let progress = if let Some(progress_contract) =
+        item.attempts[attempt_index].progress_contract.as_ref()
+    {
+        let path = project_root.join(&progress_artifact.path);
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read required progress before review planning: {}",
+                        path.display()
+                    )
+                });
+            }
+        };
+        if item.attempts[attempt_index]
+            .writer_completion_contract
+            .is_some()
+        {
+            let artifact = matrix_artifact
+                .as_ref()
+                .expect("a matrix-backed Writer has a matrix artifact");
+            let matrix = validated_matrix
+                .as_ref()
+                .expect("a matrix-backed Writer has a validated matrix");
+            let plan_status = match progress_contract.status_against_writer_matrix(matrix) {
+                Ok(status) => status,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        &progress_artifact,
+                        &format!("host-owned required-progress projection is invalid: {reason}"),
+                        0,
+                        matrix_status.complete,
+                    )
+                    .map(Some);
                 }
             };
-            if item.attempts[attempt_index]
-                .writer_completion_contract
-                .is_some()
-            {
-                if matrix_status.is_complete() {
-                    let artifact = matrix_artifact
-                        .as_ref()
-                        .expect("a matrix-backed Writer has a matrix artifact");
-                    let matrix = validated_matrix
-                        .as_ref()
-                        .expect("a complete matrix status has a validated matrix");
-                    let projected = match progress_contract.project_completed_required_progress(
-                        &source,
-                        matrix,
-                        &artifact.path,
-                    ) {
-                        Ok(projected) => projected,
-                        Err(reason) => {
-                            return pause_writer_completion_before_reviews(
-                                project_root,
-                                store,
-                                item,
-                                attempt_index,
-                                attempt_id,
-                                &progress_artifact,
-                                &reason,
-                                0,
-                                matrix_status.complete,
-                            )
-                            .map(Some);
-                        }
-                    };
-                    if projected != source {
-                        if let Some(parent) = path.parent() {
-                            fs::create_dir_all(parent).with_context(|| {
-                                format!(
-                                    "create host-owned required-progress directory: {}",
-                                    parent.display()
-                                )
-                            })?;
-                        }
-                        crate::atomic_write::atomic_write(&path, projected.as_bytes())
-                            .with_context(|| {
-                                format!(
-                                    "write host-owned required progress before review planning: {}",
-                                    path.display()
-                                )
-                            })?;
-                    }
-                    match item.attempts[attempt_index].required_progress_status(&projected) {
-                        Ok(progress) => progress,
-                        Err(reason) => {
-                            return pause_writer_completion_before_reviews(
-                                project_root,
-                                store,
-                                item,
-                                attempt_index,
-                                attempt_id,
-                                &progress_artifact,
-                                &format!(
-                                    "host-owned required-progress projection is invalid: {reason}"
-                                ),
-                                0,
-                                matrix_status.complete,
-                            )
-                            .map(Some);
-                        }
-                    }
-                } else {
-                    // The matrix is the sole Writer completion claim for current
-                    // Attempts. Leave the host-owned projection unchanged until every
-                    // matrix row is valid, and let the matrix drive the continuation.
-                    crate::work_model::RequiredProgressStatus {
-                        checked: 0,
-                        required: 0,
-                        incomplete_reason: None,
-                    }
-                }
-            } else {
-                // Attempts created before the matrix contract keep their established
-                // Writer-owned required-progress behavior.
-                match item.attempts[attempt_index].required_progress_status(&source) {
-                    Ok(progress) => progress,
+            if plan_status.is_complete() {
+                let projected = match progress_contract.project_completed_required_progress(
+                    &source,
+                    matrix,
+                    &artifact.path,
+                ) {
+                    Ok(projected) => projected,
                     Err(reason) => {
                         return pause_writer_completion_before_reviews(
                             project_root,
@@ -6315,19 +6267,83 @@ fn gate_writer_completion_before_reviews(
                             &progress_artifact,
                             &reason,
                             0,
+                            matrix_status.complete,
+                        )
+                        .map(Some);
+                    }
+                };
+                if projected != source {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!(
+                                "create host-owned required-progress directory: {}",
+                                parent.display()
+                            )
+                        })?;
+                    }
+                    crate::atomic_write::atomic_write(&path, projected.as_bytes()).with_context(
+                        || {
+                            format!(
+                                "write host-owned required progress before review planning: {}",
+                                path.display()
+                            )
+                        },
+                    )?;
+                }
+                match item.attempts[attempt_index].required_progress_status(&projected) {
+                    Ok(progress) => progress,
+                    Err(reason) => {
+                        return pause_writer_completion_before_reviews(
+                            project_root,
+                            store,
+                            item,
+                            attempt_index,
+                            attempt_id,
+                            &progress_artifact,
+                            &format!(
+                                "host-owned required-progress projection is invalid: {reason}"
+                            ),
                             0,
+                            matrix_status.complete,
                         )
                         .map(Some);
                     }
                 }
+            } else {
+                // Review findings are task-specific and may be pending in a
+                // corrective round after every stable Plan row was completed.
+                // Derive Plan progress from those stable rows instead of
+                // zeroing it until the changing finding frontier is complete.
+                plan_status
             }
         } else {
-            crate::work_model::RequiredProgressStatus {
-                checked: 0,
-                required: 0,
-                incomplete_reason: None,
+            // Attempts created before the matrix contract keep their established
+            // Writer-owned required-progress behavior.
+            match item.attempts[attempt_index].required_progress_status(&source) {
+                Ok(progress) => progress,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        &progress_artifact,
+                        &reason,
+                        0,
+                        0,
+                    )
+                    .map(Some);
+                }
             }
-        };
+        }
+    } else {
+        crate::work_model::RequiredProgressStatus {
+            checked: 0,
+            required: 0,
+            incomplete_reason: None,
+        }
+    };
     if progress.is_complete() && matrix_status.is_complete() {
         record_writer_run(
             project_root,
@@ -13701,6 +13717,88 @@ mod tests {
             stored.attempts[0].writer_runs[0].outcome,
             WriterOutcome::Continue
         );
+    }
+
+    #[test]
+    fn pending_new_findings_do_not_regress_completed_plan_progress() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        let review_path = ".fluent/work/artifacts/matrix-progress-work/attempt-1/attempt-1-review-2-tests/review.md";
+        fs::create_dir_all(tmp.path().join(review_path).parent().unwrap()).unwrap();
+        fs::write(
+            tmp.path().join(review_path),
+            "Verdict: fail\n\n- [ ] Exercise the new failure path directly (blocking)\n",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let first_task_id = item.attempts[0].tasks[0].id.clone();
+                item.attempts[0].writer_runs.push(WriterRun {
+                    task_id: first_task_id,
+                    outcome: WriterOutcome::Complete,
+                    kind: WriterRunKind::Initial,
+                    provider: "codex".to_string(),
+                    session_id: Some("thread-1".to_string()),
+                    continuation: 0,
+                    checked_required: 1,
+                    completed_matrix: 1,
+                    candidate_commit: "abc123".to_string(),
+                });
+                item.add_next_write_round(
+                    "attempt-1",
+                    vec![ArtifactRef {
+                        producer_id: "attempt-1-review-2-tests".to_string(),
+                        path: review_path.to_string(),
+                    }],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let item = store.read_work_item("matrix-progress-work").unwrap();
+        let second_task_id = item.attempts[0].tasks.last().unwrap().id.clone();
+        crate::work_task_executor::materialize_writer_completion_before_writer(
+            tmp.path(),
+            &item,
+            "attempt-1",
+            &second_task_id,
+        )
+        .unwrap();
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let writer = item.attempts[0].tasks.last_mut().unwrap();
+                writer.status = TaskStatus::Complete;
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: "candidate".to_string(),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: Some("abc123".to_string()),
+                    commit: "def456".to_string(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let mut item = store.read_work_item("matrix-progress-work").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("the pending finding must return to the Writer");
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        let latest_run = stored.attempts[0].writer_runs.last().unwrap();
+        assert_eq!(latest_run.outcome, WriterOutcome::Continue);
+        assert_eq!(latest_run.kind, WriterRunKind::Corrective);
+        assert_eq!(latest_run.checked_required, 1);
+        assert_eq!(latest_run.completed_matrix, 1);
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
     }
 
     #[test]
