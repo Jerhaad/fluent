@@ -74,6 +74,91 @@ fn bound_thread_shows_safe_checkout_identity() {
             .contains(&checkout.path().display().to_string())
     );
 }
+
+#[test]
+fn changed_checkout_identity_is_unavailable() {
+    let (_home, checkout, mut config) = setup(true);
+    let path = checkout.path();
+    assert!(
+        std::process::Command::new("git")
+            .args(["-C", &path.display().to_string(), "init", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &path.display().to_string(),
+                "config",
+                "user.email",
+                "test@example.invalid"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "-C",
+                &path.display().to_string(),
+                "config",
+                "user.name",
+                "Fluent test"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(path.join("README"), "fixture").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["-C", &path.display().to_string(), "add", "README"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["-C", &path.display().to_string(), "commit", "-m", "fixture"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let commit = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["-C", &path.display().to_string(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    config.projects.get_mut("app").unwrap().checkout.commit = commit.trim().into();
+    assert!(checkout_is_available(&config.projects["app"].checkout));
+    config.projects.get_mut("app").unwrap().checkout.commit = "different".into();
+    assert!(!checkout_is_available(&config.projects["app"].checkout));
+}
+
+#[test]
+fn bound_thread_home_index_excludes_active_snapshot_state() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let index: std::collections::BTreeMap<String, FluentThread> =
+        serde_json::from_slice(&fs::read(state_root(home.path()).join("threads.json")).unwrap())
+            .unwrap();
+    let mapping = &index["1.0"];
+    assert_eq!(mapping.project_label.as_deref(), Some("app"));
+    assert!(mapping.provider_session.is_none());
+    assert!(mapping.processed_events.is_empty());
+}
 #[test]
 fn missing_channel_default_requires_project_selection() {
     let (home, _checkout, config) = setup(false);
