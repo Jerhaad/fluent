@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
 use tempfile::TempDir;
@@ -102,6 +103,81 @@ impl SlackTransport for FailingSlack {
         self.deliveries.push(delivery.clone());
         Ok(())
     }
+}
+
+#[derive(Clone, Default)]
+struct CrashOnceProvider {
+    actions: Arc<Mutex<BTreeMap<String, (String, String)>>>,
+    fail_after_start: Arc<Mutex<bool>>,
+}
+
+impl ConversationProvider for CrashOnceProvider {
+    fn start(
+        &mut self,
+        action_id: &str,
+        _checkout: &std::path::Path,
+        contribution: &str,
+        _actor: &str,
+    ) -> anyhow::Result<(String, String)> {
+        let mut actions = self.actions.lock().unwrap();
+        let result = actions
+            .entry(action_id.into())
+            .or_insert_with(|| ("session-1".into(), format!("reply: {contribution}")))
+            .clone();
+        drop(actions);
+        let mut fail = self.fail_after_start.lock().unwrap();
+        if *fail {
+            *fail = false;
+            anyhow::bail!("simulated crash after provider side effect");
+        }
+        Ok(result)
+    }
+
+    fn resume(
+        &mut self,
+        action_id: &str,
+        session: &str,
+        _checkout: &std::path::Path,
+        contribution: &str,
+        _actor: &str,
+    ) -> anyhow::Result<String> {
+        Ok(self
+            .actions
+            .lock()
+            .unwrap()
+            .entry(action_id.into())
+            .or_insert_with(|| (session.into(), format!("reply: {contribution}")))
+            .1
+            .clone())
+    }
+}
+
+#[test]
+fn provider_turn_reuses_durable_action_after_crash() {
+    let (home, _checkout, config) = setup(true);
+    let provider = CrashOnceProvider {
+        fail_after_start: Arc::new(Mutex::new(true)),
+        ..Default::default()
+    };
+    let inbound = event("E1", None, "@Fluent keep this turn");
+    let mut first = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        provider.clone(),
+        InMemorySlack::default(),
+    );
+    assert!(first.ingest(inbound.clone()).is_err());
+    assert_eq!(provider.actions.lock().unwrap().len(), 1);
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        provider.clone(),
+        InMemorySlack::default(),
+    );
+    recovered.reconnect([inbound], "recovered".into()).unwrap();
+    assert_eq!(provider.actions.lock().unwrap().len(), 1);
+    assert_eq!(recovered.slack().deliveries.len(), 2);
 }
 
 #[test]
@@ -490,7 +566,7 @@ fn reconnect_reconciles_slack_messages_exactly_once() {
             .slack()
             .deliveries
             .iter()
-            .any(|d| d.text.contains("reconnected at now"))
+            .any(|d| d.id == "1.0:status" && d.text.contains("last connected at now"))
     );
 }
 #[test]

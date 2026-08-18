@@ -29,6 +29,7 @@ use fluent::os;
 use fluent::post_merge_review;
 use fluent::review;
 use fluent::skill_install::{self, InstallOutcome};
+use fluent::slack_collaboration::{self, LaunchAgentServiceManager, RunnerControl, ServiceManager};
 use fluent::update;
 use fluent::version;
 use fluent::work_attempt_loop::{self, WorkAttemptRunConfig, WorkAttemptRunOutcome};
@@ -234,12 +235,7 @@ fn main() -> Result<()> {
         Some(Commands::KeepAwake { command }) => {
             cmd_keep_awake(command)?;
         }
-        Some(Commands::Slack { command }) => match command {
-            SlackCommands::Manifest => {
-                print!("{}", fluent::slack_collaboration::SOCKET_MODE_MANIFEST)
-            }
-            SlackCommands::Setup => print!("{}", include_str!("../docs/slack-runner.md")),
-        },
+        Some(Commands::Slack { command }) => cmd_slack(command)?,
         None => {
             let coder_kind = CoderKind::resolve(cli.coder.as_deref())?;
             cmd_interactive(&sandbox_root, &resolver, &cli.extra_args, coder_kind)?;
@@ -250,6 +246,47 @@ fn main() -> Result<()> {
         update::maybe_nudge();
     }
 
+    Ok(())
+}
+
+fn slack_home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("Slack runner requires a home directory")
+}
+
+fn cmd_slack(command: SlackCommands) -> Result<()> {
+    match command {
+        SlackCommands::Manifest => print!("{}", slack_collaboration::SOCKET_MODE_MANIFEST),
+        SlackCommands::Setup => print!("{}", include_str!("../docs/slack-runner.md")),
+        SlackCommands::Enable => {
+            let home = slack_home()?;
+            let executable = std::env::current_exe()?;
+            let mut manager = LaunchAgentServiceManager::new(&home);
+            slack_collaboration::enable_runner(&mut manager, &executable)?;
+            println!("enabled Slack runner at {}", manager.plist.display());
+        }
+        SlackCommands::Restart => {
+            let mut manager = LaunchAgentServiceManager::new(&slack_home()?);
+            slack_collaboration::control_runner(&mut manager, RunnerControl::Restart)?;
+            println!("restarted Slack runner");
+        }
+        SlackCommands::Stop => {
+            let mut manager = LaunchAgentServiceManager::new(&slack_home()?);
+            slack_collaboration::control_runner(&mut manager, RunnerControl::Stop)?;
+            println!("stopped Slack runner");
+        }
+        SlackCommands::Status => {
+            let home = slack_home()?;
+            let config = slack_collaboration::read_config(&home)?;
+            let manager = LaunchAgentServiceManager::new(&home);
+            println!(
+                "{}",
+                slack_collaboration::runner_status(&config, manager.enabled(), None, None,)
+            );
+        }
+        SlackCommands::Run => slack_collaboration::run_configured_runner(&slack_home()?)?,
+    }
     Ok(())
 }
 

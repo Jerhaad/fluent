@@ -227,6 +227,16 @@ pub enum SlackCommands {
     Manifest,
     /// Print the owner-facing local Slack runner setup instructions
     Setup,
+    /// Install and start the local Slack runner at login
+    Enable,
+    /// Start the configured local Slack runner
+    Run,
+    /// Restart the local Slack runner
+    Restart,
+    /// Stop the local Slack runner
+    Stop,
+    /// Show the local Slack runner's safe operational status
+    Status,
 }
 
 // ---------------------------------------------------------------------------

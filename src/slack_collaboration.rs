@@ -154,6 +154,14 @@ impl LaunchAgentServiceManager {
         }
         Ok(())
     }
+
+    pub fn program_arguments(executable: &Path) -> Vec<String> {
+        vec![
+            executable.display().to_string(),
+            "slack".into(),
+            "run".into(),
+        ]
+    }
 }
 impl ServiceManager for LaunchAgentServiceManager {
     fn install(&mut self, executable: &Path) -> Result<()> {
@@ -162,10 +170,10 @@ impl ServiceManager for LaunchAgentServiceManager {
             .parent()
             .context("LaunchAgent path has no parent")?;
         fs::create_dir_all(parent)?;
+        let arguments = Self::program_arguments(executable);
         let xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>slack</string><string>run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>",
-            self.label,
-            executable.display()
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>{}</string><string>{}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>",
+            self.label, arguments[0], arguments[1], arguments[2]
         );
         atomic_write(&self.plist, xml.as_bytes())?;
         Ok(())
@@ -228,6 +236,20 @@ impl ServiceManager for FakeServiceManager {
 pub fn enable_runner(manager: &mut impl ServiceManager, executable: &Path) -> Result<()> {
     manager.install(executable)?;
     manager.start()
+}
+
+/// Apply an owner-requested service lifecycle action.
+pub fn control_runner(manager: &mut impl ServiceManager, action: RunnerControl) -> Result<()> {
+    match action {
+        RunnerControl::Restart => manager.restart(),
+        RunnerControl::Stop => manager.stop(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerControl {
+    Restart,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +422,18 @@ pub struct FluentThread {
     pub pending_question: Option<String>,
     pub processed_events: BTreeSet<String>,
     pub last_connection: Option<String>,
+    #[serde(default)]
+    pub pending_turn: Option<PendingTurn>,
+}
+
+/// A provider action recorded before the provider can observe it. The event
+/// identity remains stable across restart, so providers can reconcile a retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTurn {
+    pub action_id: String,
+    pub contribution: String,
+    pub actor: String,
+    pub starts_session: bool,
 }
 
 impl FluentThread {
@@ -416,6 +450,7 @@ impl FluentThread {
             pending_question: None,
             processed_events: BTreeSet::new(),
             last_connection: None,
+            pending_turn: None,
         }
     }
 }
@@ -424,12 +459,14 @@ impl FluentThread {
 pub trait ConversationProvider {
     fn start(
         &mut self,
+        action_id: &str,
         checkout: &Path,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)>;
     fn resume(
         &mut self,
+        action_id: &str,
         session: &str,
         checkout: &Path,
         contribution: &str,
@@ -453,39 +490,54 @@ pub trait SlackTransport {
 #[derive(Debug, Default)]
 pub struct InMemoryProvider {
     pub calls: Vec<(Option<String>, PathBuf, String, String)>,
+    completed_actions: BTreeMap<String, (String, String)>,
 }
 impl ConversationProvider for InMemoryProvider {
     fn start(
         &mut self,
+        action_id: &str,
         checkout: &Path,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
+        if let Some((session, reply)) = self.completed_actions.get(action_id) {
+            return Ok((session.clone(), reply.clone()));
+        }
         self.calls.push((
             None,
             checkout.to_path_buf(),
             contribution.into(),
             actor.into(),
         ));
-        Ok((
+        let result = (
             format!("session-{}", self.calls.len()),
             format!("Fluent received: {contribution}"),
-        ))
+        );
+        self.completed_actions
+            .insert(action_id.into(), result.clone());
+        Ok(result)
     }
     fn resume(
         &mut self,
+        action_id: &str,
         session: &str,
         checkout: &Path,
         contribution: &str,
         actor: &str,
     ) -> Result<String> {
+        if let Some((_, reply)) = self.completed_actions.get(action_id) {
+            return Ok(reply.clone());
+        }
         self.calls.push((
             Some(session.into()),
             checkout.to_path_buf(),
             contribution.into(),
             actor.into(),
         ));
-        Ok(format!("Fluent received: {contribution}"))
+        let reply = format!("Fluent received: {contribution}");
+        self.completed_actions
+            .insert(action_id.into(), (session.into(), reply.clone()));
+        Ok(reply)
     }
 }
 
@@ -578,12 +630,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             persist_outbox(
                 self.home,
                 OutboundDelivery {
-                    id: format!("{}:reconnected:{connected_at}", thread.id),
+                    id: format!("{}:status", thread.id),
                     channel: thread.channel.clone(),
                     thread_timestamp: thread.id.clone(),
-                    text: format!(
-                        "Fluent reconnected at {connected_at}; reconciling Slack messages."
-                    ),
+                    text: format!("Fluent thread status: runner last connected at {connected_at}."),
                     delivered: false,
                 },
             )?;
@@ -603,6 +653,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
     fn process(&mut self, event: InboundEnvelope) -> Result<()> {
         let mut thread = load_thread(self.home, &self.config, &event.thread_id())?
             .unwrap_or_else(|| FluentThread::new(&event));
+        if thread
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.action_id == event.id)
+        {
+            return self.complete_pending_turn(&event, &mut thread);
+        }
         if !thread.processed_events.insert(event.id.clone()) {
             return Ok(());
         }
@@ -612,15 +669,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
-            let checkout = self.bound_project(&thread)?.checkout.path.clone();
-            let session = thread
-                .provider_session
-                .as_deref()
-                .context("active thread lacks provider session")?;
-            let reply = self
-                .provider
-                .resume(session, &checkout, &event.text, &event.user)?;
-            self.queue_reply(&event, &reply)?;
+            thread.pending_turn = Some(PendingTurn {
+                action_id: event.id.clone(),
+                contribution: event.text.clone(),
+                actor: event.user.clone(),
+                starts_session: false,
+            });
+            save_thread(self.home, &self.config, &thread)?;
+            self.complete_pending_turn(&event, &mut thread)?;
         }
         save_thread(self.home, &self.config, &thread)
     }
@@ -634,16 +690,16 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
         });
         if let Some(project) = available {
-            let (session, reply) =
-                self.provider
-                    .start(&project.checkout.path, &event.text, &event.user)?;
             thread.state = ThreadState::Active;
             thread.project_label = Some(project.label.clone());
-            thread.provider_session = Some(session);
-            self.queue_reply(
-                event,
-                &format!("Bound to {}.\n{}", safe_identity(project), reply),
-            )?;
+            thread.pending_turn = Some(PendingTurn {
+                action_id: event.id.clone(),
+                contribution: event.text.clone(),
+                actor: event.user.clone(),
+                starts_session: true,
+            });
+            save_thread(self.home, &self.config, thread)?;
+            self.complete_pending_turn(event, thread)?;
         } else {
             let projects = self.available_projects(&event.user);
             let reason = if default.is_some() {
@@ -658,6 +714,43 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             )?;
         }
         Ok(())
+    }
+    fn complete_pending_turn(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+    ) -> Result<()> {
+        let turn = thread
+            .pending_turn
+            .clone()
+            .context("thread has no pending provider turn")?;
+        let checkout = self.bound_project(thread)?.checkout.path.clone();
+        let reply = if turn.starts_session {
+            let (session, reply) =
+                self.provider
+                    .start(&turn.action_id, &checkout, &turn.contribution, &turn.actor)?;
+            thread.provider_session = Some(session);
+            format!(
+                "Bound to {}.\n{}",
+                safe_identity(self.bound_project(thread)?),
+                reply
+            )
+        } else {
+            let session = thread
+                .provider_session
+                .as_deref()
+                .context("active thread lacks provider session")?;
+            self.provider.resume(
+                &turn.action_id,
+                session,
+                &checkout,
+                &turn.contribution,
+                &turn.actor,
+            )?
+        };
+        thread.pending_turn = None;
+        self.queue_reply(event, &reply)?;
+        save_thread(self.home, &self.config, thread)
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let label = thread
@@ -776,6 +869,17 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
     provider.ready()?;
     slack.check()?;
     Ok(())
+}
+
+/// Validate owner-scoped configuration and read both Keychain credentials
+/// before the foreground runner enters its transport loop.
+pub fn run_configured_runner(home: &Path) -> Result<()> {
+    let config = read_config(home)?;
+    let secrets = KeychainSecretStore;
+    let _app_token = secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)?;
+    let _bot_token = secrets.read(KEYCHAIN_SERVICE, BOT_TOKEN_ACCOUNT)?;
+    config.validate()?;
+    bail!("Slack transport startup is unavailable in this build")
 }
 
 fn ensure_root(home: &Path) -> Result<()> {
@@ -1131,6 +1235,21 @@ mod tests {
         assert!(service.running);
         service.stop().unwrap();
         assert!(!service.running);
+    }
+
+    #[test]
+    fn launch_agent_installs_the_runner_command() {
+        let home = TempDir::new().unwrap();
+        let mut service = LaunchAgentServiceManager::new(home.path());
+        let executable = Path::new("/Applications/fluent");
+        service.install(executable).unwrap();
+        let plist = fs::read_to_string(&service.plist).unwrap();
+        assert!(plist.contains("/Applications/fluent"));
+        assert!(plist.contains("<string>slack</string><string>run</string>"));
+        assert_eq!(
+            LaunchAgentServiceManager::program_arguments(executable),
+            ["/Applications/fluent", "slack", "run"]
+        );
     }
 
     #[test]

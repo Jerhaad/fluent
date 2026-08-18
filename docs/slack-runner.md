@@ -18,9 +18,16 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
 5. Create a `RunnerConfig` in the runner owner's local integration code that names the Slack workspace and explicitly pins
    each checkout label, identity, branch, commit, and allowed participant. Run
    preflight before accepting events; invalid or changed checkouts fail closed.
-6. Print this guide at any time with `fluent slack setup`. Install the exact Fluent executable as the owner-scoped LaunchAgent with
-   `LaunchAgentServiceManager`, then use its `install`, `start`, `restart`,
-   `stop`, and `enabled` controls. This starts it at login and keeps it local.
+6. Print this guide at any time with `fluent slack setup`. Enable the exact
+   Fluent executable as an owner-scoped LaunchAgent with:
+
+   ```sh
+   fluent slack enable
+   ```
+
+   Inspect its safe status with `fluent slack status`, restart it with
+   `fluent slack restart`, and stop it with `fluent slack stop`. The
+   LaunchAgent runs `fluent slack run` at login and keeps the runner local.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,
