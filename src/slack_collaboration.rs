@@ -606,12 +606,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         if !thread.processed_events.insert(event.id.clone()) {
             return Ok(());
         }
-        let allowed = self
-            .config
-            .projects
-            .values()
-            .any(|p| p.allowed_participants.contains(&event.user));
-        if !allowed {
+        if !self.participant_can_contribute(&thread, &event) {
             return save_thread(self.home, &self.config, &thread);
         }
         if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
@@ -635,7 +630,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             .channel_defaults
             .get(&event.channel)
             .and_then(|p| self.config.projects.get(p));
-        let available = default.filter(|p| checkout_is_available(&p.checkout));
+        let available = default.filter(|p| {
+            p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
+        });
         if let Some(project) = available {
             let (session, reply) =
                 self.provider
@@ -648,7 +645,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
                 &format!("Bound to {}.\n{}", safe_identity(project), reply),
             )?;
         } else {
-            let projects = self.available_projects();
+            let projects = self.available_projects(&event.user);
             let reason = if default.is_some() {
                 "The channel default is unavailable."
             } else {
@@ -672,11 +669,34 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             .get(label)
             .context("thread project no longer configured")
     }
-    fn available_projects(&self) -> Vec<String> {
+    fn participant_can_contribute(&self, thread: &FluentThread, event: &InboundEnvelope) -> bool {
+        match thread.project_label.as_deref() {
+            Some(project_label) => self
+                .config
+                .projects
+                .get(project_label)
+                .is_some_and(|project| project.allowed_participants.contains(&event.user)),
+            None => match self.config.channel_defaults.get(&event.channel) {
+                Some(project_label) => self
+                    .config
+                    .projects
+                    .get(project_label)
+                    .is_some_and(|project| project.allowed_participants.contains(&event.user)),
+                None => self
+                    .config
+                    .projects
+                    .values()
+                    .any(|project| project.allowed_participants.contains(&event.user)),
+            },
+        }
+    }
+    fn available_projects(&self, participant: &str) -> Vec<String> {
         self.config
             .projects
             .values()
-            .filter(|p| checkout_is_available(&p.checkout))
+            .filter(|p| {
+                p.allowed_participants.contains(participant) && checkout_is_available(&p.checkout)
+            })
             .map(|p| p.label.clone())
             .collect()
     }

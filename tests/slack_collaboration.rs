@@ -336,6 +336,44 @@ fn unavailable_default_offers_available_projects() {
     );
     assert!(runner.slack().deliveries[0].text.contains("other"));
 }
+
+#[test]
+fn participant_cannot_start_or_continue_another_projects_thread() {
+    let (home, _checkout, mut config) = setup(true);
+    let other_checkout = TempDir::new().unwrap();
+    fs::create_dir(other_checkout.path().join(".git")).unwrap();
+    config.projects.insert(
+        "other".into(),
+        ConfiguredProject {
+            label: "other".into(),
+            checkout: Checkout {
+                label: "other-checkout".into(),
+                path: other_checkout.path().into(),
+                identity: "other-id".into(),
+                branch: "main".into(),
+                commit: "def".into(),
+            },
+            allowed_participants: BTreeSet::from(["U2".into()]),
+        },
+    );
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+
+    let mut unauthorized_start = event("E1", None, "@Fluent hello");
+    unauthorized_start.user = "U2".into();
+    runner.ingest(unauthorized_start).unwrap();
+    assert!(runner.provider().calls.is_empty());
+
+    runner.ingest(event("E2", None, "@Fluent hello")).unwrap();
+    let mut unauthorized_reply = event("E3", Some("1.0"), "continue");
+    unauthorized_reply.user = "U2".into();
+    runner.ingest(unauthorized_reply).unwrap();
+    assert_eq!(runner.provider().calls.len(), 1);
+}
 #[test]
 fn allowed_reply_continues_slice_without_mention() {
     let (home, _checkout, config) = setup(true);
