@@ -817,7 +817,7 @@ fn action_label_with_liveness(
     }
 }
 
-fn attempt_recovery_next_action(
+pub fn attempt_recovery_next_action(
     attempt: Option<&Attempt>,
     project_root: Option<&Path>,
 ) -> Option<String> {
@@ -837,8 +837,27 @@ fn attempt_recovery_next_action(
         let artifacts = recovery
             .targets
             .iter()
-            .map(|target| format!(" --review-artifact {}", target.prior_review_artifact))
-            .collect::<String>();
+            .map(|target| {
+                let review_task_id = target.review_task_id.as_ref()?;
+                let review_task = attempt.tasks.iter().find(|task| {
+                    task.id == *review_task_id
+                        && task.kind == TaskKind::Review
+                        && task.status == TaskStatus::Complete
+                        && task.role == target.role
+                })?;
+                let context = review_task.evidence_review_context.as_ref()?;
+                if context.recovery_id != recovery.id
+                    || context.candidate_commit != recovery.candidate_commit
+                {
+                    return None;
+                }
+                let artifact_area = review_task.artifact_area.as_ref()?;
+                Some(format!(
+                    " --review-artifact {}/review.md",
+                    artifact_area.path
+                ))
+            })
+            .collect::<Option<String>>()?;
         return Some(format!(
             "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path>{artifacts}",
             attempt.work_item_id, attempt.id, recovery.candidate_commit
@@ -1550,6 +1569,71 @@ mod tests {
 
     #[test]
     fn evidence_needed_status_names_exact_attachment_command() {
+        let recovery_id = "host-evidence-1";
+        let review_task_id = "attempt-1-evidence-1-architecture";
+        let candidate_commit = "abc123";
+        let attachment = crate::work_model::EvidenceAttachment {
+            snapshot_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/a.json"
+                .to_string(),
+            digest: "sha256:abc".to_string(),
+        };
+        let attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            tasks: vec![Task {
+                id: review_task_id.to_string(),
+                kind: TaskKind::Review,
+                status: TaskStatus::Complete,
+                role: "architecture".to_string(),
+                instructions: None,
+                work_item_id: "work-1".to_string(),
+                attempt_id: Some("attempt-1".to_string()),
+                workspace_access: WorkspaceAccess::read_only(Vec::new()),
+                artifact_area: Some(crate::work_model::TaskArtifactArea {
+                    path: ".fluent/work/artifacts/work-1/attempt-1/evidence-review".to_string(),
+                }),
+                review_context: None,
+                evidence_review_context: Some(crate::work_model::EvidenceReviewContext {
+                    recovery_id: recovery_id.to_string(),
+                    candidate_commit: candidate_commit.to_string(),
+                    attachment: attachment.clone(),
+                    prior_review_artifact:
+                        ".fluent/work/artifacts/work-1/attempt-1/review/review.md".to_string(),
+                }),
+                input_artifacts: Vec::new(),
+                depends_on: None,
+                output: None,
+                created_at: None,
+                started_at: None,
+                completed_at: None,
+            }],
+            evidence_recoveries: vec![crate::work_model::EvidenceRecovery {
+                id: recovery_id.to_string(),
+                candidate_commit: candidate_commit.to_string(),
+                attachment,
+                targets: vec![crate::work_model::EvidenceReviewTarget {
+                    role: "architecture".to_string(),
+                    prior_review_artifact:
+                        ".fluent/work/artifacts/work-1/attempt-1/review/review.md".to_string(),
+                    review_task_id: Some(review_task_id.to_string()),
+                }],
+                state: crate::work_model::EvidenceRecoveryState::NeedsEvidence,
+                created_at: "2026-08-03T00:00:00Z".to_string(),
+            }],
+            ..Attempt::default()
+        };
+
+        assert_eq!(
+            attempt_recovery_next_action(Some(&attempt), None).as_deref(),
+            Some(
+                "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/evidence-review/review.md"
+            )
+        );
+    }
+
+    #[test]
+    fn evidence_needed_status_fails_closed_without_targeted_review() {
         let attempt = Attempt {
             id: "attempt-1".to_string(),
             work_item_id: "work-1".to_string(),
@@ -1563,7 +1647,7 @@ mod tests {
                     digest: "sha256:abc".to_string(),
                 },
                 targets: vec![crate::work_model::EvidenceReviewTarget {
-                    role: "architecture".to_string(),
+                    role: "tests".to_string(),
                     prior_review_artifact:
                         ".fluent/work/artifacts/work-1/attempt-1/review/review.md".to_string(),
                     review_task_id: None,
@@ -1574,12 +1658,7 @@ mod tests {
             ..Attempt::default()
         };
 
-        assert_eq!(
-            attempt_recovery_next_action(Some(&attempt), None).as_deref(),
-            Some(
-                "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/review/review.md"
-            )
-        );
+        assert_eq!(attempt_recovery_next_action(Some(&attempt), None), None);
     }
 
     #[test]

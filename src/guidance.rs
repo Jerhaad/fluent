@@ -72,6 +72,7 @@ pub struct AttemptRunContext<'a> {
     pub pause_kind: Option<&'a PauseKind>,
     pub coder: Option<&'a str>,
     pub review_artifact: Option<&'a str>,
+    pub evidence_action: Option<&'a str>,
 }
 
 /// Name the coder-specific re-authentication step, falling back to a coder-agnostic
@@ -127,6 +128,9 @@ pub fn after_attempt_run(
         WorkAttemptRunOutcome::PlannedWriteRound { .. } => Some(
             "\n→ Next: a follow-up Writer round is ready; fluent attempt run <work-item-id> to continue the candidate".to_string(),
         ),
+        WorkAttemptRunOutcome::NeedsUser { .. } if ctx.evidence_action.is_some() => {
+            Some(format!("\n→ Next: {}", ctx.evidence_action.unwrap()))
+        }
         WorkAttemptRunOutcome::NeedsUser { handoff_path } => match ctx.pause_kind {
             Some(PauseKind::Auth) => Some(format!(
                 "\n→ Next: {}, then fluent attempt run <work-item-id>",
@@ -319,6 +323,7 @@ mod tests {
             pause_kind: Some(&PauseKind::Auth),
             coder: Some("codex"),
             review_artifact: None,
+            evidence_action: None,
         };
         let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
         assert!(hint.contains("re-authenticate"));
@@ -339,6 +344,25 @@ mod tests {
         assert!(hint.contains("handoff"));
         assert!(hint.contains("needs-user.md"));
         assert!(hint.contains("attempt run"));
+    }
+
+    #[test]
+    fn after_attempt_run_evidence_needed_names_attachment_action() {
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/old.json"
+                .to_string(),
+        };
+        let action = "fluent attempt evidence attach work-1 attempt-1 --candidate abc123 --evidence-file <path> --review-artifact .fluent/work/artifacts/work-1/attempt-1/evidence-review/review.md";
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::Uncertain),
+            evidence_action: Some(action),
+            ..AttemptRunContext::default()
+        };
+
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+
+        assert_eq!(hint, format!("\n→ Next: {action}"));
+        assert!(!hint.contains("old.json"));
     }
 
     #[test]

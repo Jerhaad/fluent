@@ -24255,6 +24255,7 @@ fn work_show_explains_evidence_only_recovery_history_and_next_action() {
         "Verdict: fail\nDisposition: evidence-needed\n",
     )
     .unwrap();
+    let targeted_review_path = format!("{targeted_path}/review.md");
 
     fluent_cmd()
         .current_dir(&project)
@@ -24266,7 +24267,10 @@ fn work_show_explains_evidence_only_recovery_history_and_next_action() {
             "--no-sandbox",
         ])
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains(format!(
+            "fluent attempt evidence attach evidence-show attempt-1 --candidate {candidate} --evidence-file <path> --review-artifact {targeted_review_path}"
+        )));
 
     let output = fluent_cmd()
         .current_dir(&project)
@@ -24289,7 +24293,42 @@ fn work_show_explains_evidence_only_recovery_history_and_next_action() {
     let guidance = String::from_utf8(output.stderr).unwrap();
     assert!(guidance.contains("fluent attempt evidence attach evidence-show attempt-1"));
     assert!(guidance.contains(&candidate));
-    assert!(guidance.contains(&review_path));
+    assert!(guidance.contains(&targeted_review_path));
+
+    let successor_evidence = tmp.path().join("successor-evidence.json");
+    fs::write(
+        &successor_evidence,
+        br#"{"schema_version":1,"producer":"host","check":"check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T18:00:47Z","output":"passing successor"}"#,
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-show",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            successor_evidence.to_str().unwrap(),
+            "--review-artifact",
+            &targeted_review_path,
+        ])
+        .assert()
+        .success();
+
+    let shown = work_item_value(&project, "evidence-show");
+    let attempt = &shown["attempts"][0];
+    assert_eq!(attempt["status"], "reviewing");
+    assert_eq!(attempt["evidence_recoveries"].as_array().unwrap().len(), 2);
+    assert_eq!(attempt["evidence_recoveries"][0]["state"], "needs-evidence");
+    assert_eq!(attempt["evidence_recoveries"][1]["state"], "reviewing");
+    assert_eq!(
+        attempt["evidence_recoveries"][1]["targets"][0]["prior_review_artifact"],
+        targeted_review_path
+    );
 }
 
 #[test]

@@ -844,7 +844,7 @@ fn cmd_attempt(
             // Resolve the runtime context the guidance hints need — why the
             // Attempt paused, which coder to re-authenticate, and where its latest
             // review verdicts live — from the persisted Attempt.
-            let (pause_kind, auth_coder, review_artifact) = {
+            let (pause_kind, auth_coder, review_artifact, evidence_action) = {
                 let item = store.read_work_item(&work_item_id).ok();
                 let attempt = item
                     .as_ref()
@@ -857,12 +857,26 @@ fn cmd_attempt(
                             .into_iter()
                             .next()
                     }),
+                    attempt
+                        .filter(|attempt| {
+                            attempt.evidence_recoveries.last().is_some_and(|recovery| {
+                                recovery.state
+                                    == fluent::work_model::EvidenceRecoveryState::NeedsEvidence
+                            })
+                        })
+                        .and_then(|attempt| {
+                            fluent::work_status::attempt_recovery_next_action(
+                                Some(attempt),
+                                Some(project_root),
+                            )
+                        }),
                 )
             };
             let hint_ctx = guidance::AttemptRunContext {
                 pause_kind: pause_kind.as_ref(),
                 coder: auth_coder.as_deref(),
                 review_artifact: review_artifact.as_deref(),
+                evidence_action: evidence_action.as_deref(),
             };
             let mut pending_recovery = None;
             for outcome in &result.outcomes {
