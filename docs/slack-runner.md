@@ -34,9 +34,8 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    Inspect its safe status with `fluent slack status`, restart it with
    `fluent slack restart`, and stop it with `fluent slack stop`.
 
-   `fluent slack run` currently performs the local Slack, checkout, and Codex
-   preflight only. Do not enable it as a collaboration service until the
-   Socket Mode receive loop is installed.
+   `fluent slack run` preflights the local Slack, checkout, and Codex
+   boundaries, opens Socket Mode, and keeps receiving events until stopped.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,

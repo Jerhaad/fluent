@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
@@ -40,6 +43,82 @@ fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
         user: "U1".into(),
         text: text.into(),
     }
+}
+
+#[test]
+fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
+    let envelope = decode_socket_mode_envelope(
+        r#"{"envelope_id":"ENV1","payload":{"event_id":"EV1","event":{"channel":"C1","ts":"1.0","thread_ts":"0.9","user":"U1","text":"continue"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(envelope.id, "EV1");
+    assert_eq!(envelope.acknowledgement_id, "ENV1");
+    assert_eq!(envelope.thread_timestamp.as_deref(), Some("0.9"));
+}
+
+#[test]
+fn socket_mode_envelope_rejects_missing_durable_identity() {
+    let error = decode_socket_mode_envelope(
+        r#"{"envelope_id":"ENV1","payload":{"event":{"channel":"C1","ts":"1.0","user":"U1"}}}"#,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Slack event id"));
+}
+
+#[test]
+fn slack_web_api_uses_bot_token_and_same_thread_destination() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let request = Arc::new(Mutex::new(String::new()));
+    let captured = request.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let count = stream.read(&mut buffer).unwrap();
+        *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..count]).into();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+            .unwrap();
+    });
+    let mut slack = SlackWebApiTransport::new(
+        format!("http://{address}"),
+        "xapp-test".into(),
+        "xoxb-test".into(),
+    );
+    slack
+        .post(&OutboundDelivery {
+            id: "delivery-1".into(),
+            channel: "C1".into(),
+            thread_timestamp: "1.0".into(),
+            text: "reply".into(),
+            delivered: false,
+        })
+        .unwrap();
+    server.join().unwrap();
+    let request = request.lock().unwrap();
+    assert!(request.contains("POST /chat.postMessage"));
+    assert!(request.contains("Authorization: Bearer xoxb-test"));
+    assert!(request.contains("\"thread_ts\":\"1.0\""));
+}
+
+#[test]
+fn codex_app_server_provider_exchanges_a_stable_turn() {
+    let fixture = TempDir::new().unwrap();
+    let executable = fixture.path().join("codex-fixture");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nif [ \"${2:-}\" = \"--help\" ]; then exit 0; fi\nrequest=$(cat)\ncase \"$request\" in *'\"action_id\":\"action-1\"'*) ;; *) exit 2;; esac\nprintf '%s' '{\"session\":\"session-1\",\"reply\":\"provider reply\"}'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let checkout = TempDir::new().unwrap();
+    let mut provider = CodexAppServerProvider::new(executable);
+    provider.ready().unwrap();
+    let (session, reply) = provider
+        .start("action-1", checkout.path(), "hello", "U1")
+        .unwrap();
+    assert_eq!(session, "session-1");
+    assert_eq!(reply, "provider reply");
 }
 
 #[test]

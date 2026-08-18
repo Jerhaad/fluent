@@ -594,6 +594,28 @@ impl SocketModeTransport {
     }
 }
 
+/// Translate one Socket Mode event envelope without exposing Slack payload
+/// shapes to the collaboration coordinator.
+pub fn decode_socket_mode_envelope(text: &str) -> Result<InboundEnvelope> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    let event = &value["payload"]["event"];
+    Ok(InboundEnvelope {
+        id: value["payload"]["event_id"]
+            .as_str()
+            .context("Slack event id")?
+            .into(),
+        acknowledgement_id: value["envelope_id"]
+            .as_str()
+            .context("Slack envelope id")?
+            .into(),
+        channel: event["channel"].as_str().context("Slack channel")?.into(),
+        timestamp: event["ts"].as_str().context("Slack timestamp")?.into(),
+        thread_timestamp: event["thread_ts"].as_str().map(str::to_owned),
+        user: event["user"].as_str().context("Slack user")?.into(),
+        text: event["text"].as_str().unwrap_or_default().into(),
+    })
+}
+
 impl SlackTransport for SocketModeTransport {
     fn acknowledge(&mut self, event_id: &str) -> Result<()> {
         self.socket.send(tungstenite::Message::Text(
@@ -610,23 +632,7 @@ impl SlackTransport for SocketModeTransport {
     fn receive(&mut self) -> Result<InboundEnvelope> {
         let message = self.socket.read()?;
         let text = message.into_text()?;
-        let value: serde_json::Value = serde_json::from_str(&text)?;
-        let event = &value["payload"]["event"];
-        Ok(InboundEnvelope {
-            id: value["payload"]["event_id"]
-                .as_str()
-                .context("Slack event id")?
-                .into(),
-            acknowledgement_id: value["envelope_id"]
-                .as_str()
-                .context("Slack envelope id")?
-                .into(),
-            channel: event["channel"].as_str().context("Slack channel")?.into(),
-            timestamp: event["ts"].as_str().context("Slack timestamp")?.into(),
-            thread_timestamp: event["thread_ts"].as_str().map(str::to_owned),
-            user: event["user"].as_str().context("Slack user")?.into(),
-            text: event["text"].as_str().unwrap_or_default().into(),
-        })
+        decode_socket_mode_envelope(&text)
     }
 }
 
