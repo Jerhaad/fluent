@@ -15,9 +15,15 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
 4. On the runner owner's Mac, store the tokens in the login Keychain under
    service `dev.fluent.slack` and accounts `app-token` and `bot-token`. The
    runner reads those names only; it redacts token-shaped values in status.
-5. Create a `RunnerConfig` in the runner owner's local integration code that names the Slack workspace and explicitly pins
-   each checkout label, identity, branch, commit, and allowed participant. Run
-   preflight before accepting events; invalid or changed checkouts fail closed.
+5. Create `~/.config/fluent/slack/config.json` with the runner policy. For
+   example:
+
+   ```json
+   {"workspace":"example","projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"local-id","branch":"main","commit":"<commit>"},"allowed_participants":["U123"]}},"channel_defaults":{"C123":"app"}}
+   ```
+
+   Pin every checkout label, identity, branch, commit, and allowed
+   participant. A malformed or changed checkout fails closed.
 6. Print this guide at any time with `fluent slack setup`. Enable the exact
    Fluent executable as an owner-scoped LaunchAgent with:
 
@@ -26,8 +32,11 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Inspect its safe status with `fluent slack status`, restart it with
-   `fluent slack restart`, and stop it with `fluent slack stop`. The
-   LaunchAgent runs `fluent slack run` at login and keeps the runner local.
+   `fluent slack restart`, and stop it with `fluent slack stop`.
+
+   `fluent slack run` currently performs the local Slack, checkout, and Codex
+   preflight only. Do not enable it as a collaboration service until the
+   Socket Mode receive loop is installed.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,
