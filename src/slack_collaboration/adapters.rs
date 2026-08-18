@@ -297,6 +297,7 @@ impl SlackTransport for SlackWebApiTransport {
 pub struct CodexAppServerProvider {
     executable: PathBuf,
     scoped: bool,
+    test_sandbox_launcher: Option<PathBuf>,
 }
 
 struct CodexConnection {
@@ -372,6 +373,7 @@ impl CodexAppServerProvider {
         Self {
             executable,
             scoped: false,
+            test_sandbox_launcher: None,
         }
     }
 
@@ -379,6 +381,16 @@ impl CodexAppServerProvider {
         Self {
             executable,
             scoped: true,
+            test_sandbox_launcher: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_scoped_with_test_launcher(executable: PathBuf, launcher: PathBuf) -> Self {
+        Self {
+            executable,
+            scoped: true,
+            test_sandbox_launcher: Some(launcher),
         }
     }
 
@@ -417,11 +429,19 @@ impl CodexAppServerProvider {
     fn connect(&self, scope: &ProviderScope) -> Result<CodexConnection> {
         fs::create_dir_all(&scope.slice_draft)?;
         let profile = self.render_scope_profile(scope)?;
-        if let Some(profile) = &profile {
+        if let Some(profile) = &profile
+            && self.test_sandbox_launcher.is_none()
+        {
             crate::os::preflight_profile(&profile)?;
         }
         let mut command = if let Some(profile) = &profile {
-            crate::os::command_under_profile(profile, &self.executable)
+            if let Some(launcher) = &self.test_sandbox_launcher {
+                let mut command = Command::new(launcher);
+                command.arg("-f").arg(&profile.path).arg(&self.executable);
+                command
+            } else {
+                crate::os::command_under_profile(profile, &self.executable)
+            }
         } else {
             Command::new(&self.executable)
         };

@@ -292,6 +292,13 @@ if "--help" in sys.argv:
 
 state_path = sys.argv[0] + ".state"
 log_path = sys.argv[0] + ".log"
+environment_path = sys.argv[0] + ".environment"
+
+with open(environment_path, "a") as output:
+    output.write(json.dumps({
+        "HOME": os.environ.get("HOME"),
+        "CODEX_HOME": os.environ.get("CODEX_HOME")
+    }) + "\n")
 
 def load_state():
     if os.path.exists(state_path):
@@ -372,6 +379,25 @@ fn codex_requests(executable: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn codex_environments(executable: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(format!("{}.environment", executable.display()))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn transparent_sandbox_launcher(fixture: &TempDir) -> std::path::PathBuf {
+    let launcher = fixture.path().join("sandbox-exec");
+    fs::write(
+        &launcher,
+        "#!/bin/sh\nset -eu\n[ \"$1\" = \"-f\" ]\nshift 2\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    launcher
+}
+
 #[test]
 fn codex_app_server_provider_exchanges_a_stable_turn() {
     let fixture = TempDir::new().unwrap();
@@ -423,7 +449,10 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
         slice_draft: checkout.join(".fluent/work/slack/drafts/test"),
         checkout,
     };
-    let provider = CodexAppServerProvider::new_scoped(executable);
+    let mut provider = CodexAppServerProvider::new_scoped_with_test_launcher(
+        executable.clone(),
+        transparent_sandbox_launcher(&fixture),
+    );
     let profile = provider.render_scope_profile(&scope).unwrap().unwrap();
     let rendered = fs::read_to_string(profile.path).unwrap();
     let checkout = scope.checkout.display();
@@ -442,22 +471,15 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
         runner_home.path().display()
     )));
 
-    let mut environment = std::process::Command::new("/usr/bin/env");
-    environment.env_clear();
-    provider.configure_scope_environment(&mut environment, &scope);
-    let output = environment.output().unwrap();
-    assert!(output.status.success());
-    let observed = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        observed
-            .lines()
-            .any(|line| { line == format!("HOME={}", private_home.display()) })
-    );
-    assert!(
-        observed
-            .lines()
-            .any(|line| { line == format!("CODEX_HOME={}", codex_home.display()) })
-    );
+    provider
+        .start("scoped-action", &scope, "inspect the checkout", "U1")
+        .unwrap();
+    let observed = codex_environments(&executable);
+    assert_eq!(observed.len(), 2);
+    for environment in observed {
+        assert_eq!(environment["HOME"], private_home.display().to_string());
+        assert_eq!(environment["CODEX_HOME"], codex_home.display().to_string());
+    }
 }
 
 fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint) {
@@ -1746,7 +1768,11 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         SOCKET_MODE_MANIFEST.contains("socket_mode_enabled: true")
             && !SOCKET_MODE_MANIFEST.contains("request_url")
     );
-    let guide = fs::read_to_string("docs/slack-runner.md").unwrap();
+    let guide = fs::read_to_string("docs/slack-runner.md")
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         guide.contains("Socket Mode")
             && guide.contains("Keychain")
