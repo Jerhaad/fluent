@@ -1361,44 +1361,43 @@ fn invalid_runtime_configuration_fails_closed() {
     assert!(runner.slack().deliveries.is_empty());
 }
 
-#[derive(Default)]
-struct MemorySecrets(BTreeMap<(String, String), String>);
-
-impl SecretStore for MemorySecrets {
-    fn store(&mut self, service: &str, account: &str, secret: &str) -> anyhow::Result<()> {
-        self.0.insert(
-            (service.to_string(), account.to_string()),
-            secret.to_string(),
-        );
-        Ok(())
-    }
-
-    fn read(&self, service: &str, account: &str) -> anyhow::Result<String> {
-        self.0
-            .get(&(service.to_string(), account.to_string()))
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("secret is missing"))
-    }
-}
-
 #[test]
 fn slack_credentials_use_host_store_and_are_redacted() {
-    let mut secrets = MemorySecrets::default();
-    store_slack_credentials(&mut secrets, "xapp-app-secret", "xoxb-bot-secret").unwrap();
-    assert_eq!(
-        secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT).unwrap(),
-        "xapp-app-secret"
-    );
-    assert_eq!(
-        redact_secrets("credentials xapp-app-secret xoxb-bot-secret"),
-        "credentials [REDACTED] [REDACTED]"
-    );
-    let structured =
-        redact_secrets(r#"{"app":"xapp-app-secret","bot":"xoxb-bot-secret","safe":"kept"}"#);
-    assert!(!structured.contains("xapp-app-secret"));
-    assert!(!structured.contains("xoxb-bot-secret"));
-    assert!(structured.contains("[REDACTED]"));
-    assert!(structured.contains("kept"));
+    let fake = TempDir::new().unwrap();
+    let security = fake.path().join("security");
+    fs::write(
+        &security,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$0.log\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&security, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut secrets = KeychainSecretStore::with_executable(&security);
+    let app_token = "xapp-app-secret";
+    let bot_token = "xoxb-bot-secret";
+    store_slack_credentials(&mut secrets, app_token, bot_token).unwrap();
+
+    let calls = fs::read_to_string(format!("{}.log", security.display())).unwrap();
+    assert!(calls.contains(&format!(
+        "add-generic-password -U -a {APP_TOKEN_ACCOUNT} -s {KEYCHAIN_SERVICE} -w {app_token}"
+    )));
+    assert!(calls.contains(&format!(
+        "add-generic-password -U -a {BOT_TOKEN_ACCOUNT} -s {KEYCHAIN_SERVICE} -w {bot_token}"
+    )));
+
+    let (_, _checkout, config) = setup(true);
+    let serialized_config = serde_json::to_string(&config).unwrap();
+    let diagnostics = runner_status(
+        &config,
+        false,
+        None,
+        Some(format!("credentials {app_token} {bot_token}")),
+    )
+    .to_string();
+    for token in [app_token, bot_token] {
+        assert!(!serialized_config.contains(token));
+        assert!(!diagnostics.contains(token));
+    }
+    assert!(diagnostics.contains("[REDACTED]"));
 }
 
 #[test]

@@ -67,10 +67,30 @@ pub trait SecretStore {
 }
 
 /// Stores credentials in the runner owner's login Keychain.
-pub struct KeychainSecretStore;
+pub struct KeychainSecretStore {
+    executable: PathBuf,
+}
+
+impl Default for KeychainSecretStore {
+    fn default() -> Self {
+        Self {
+            executable: PathBuf::from("security"),
+        }
+    }
+}
+
+impl KeychainSecretStore {
+    #[doc(hidden)]
+    pub fn with_executable(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+}
+
 impl SecretStore for KeychainSecretStore {
     fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()> {
-        let output = Command::new("security")
+        let output = Command::new(&self.executable)
             .args([
                 "add-generic-password",
                 "-U",
@@ -92,7 +112,7 @@ impl SecretStore for KeychainSecretStore {
         Ok(())
     }
     fn read(&self, service: &str, account: &str) -> Result<String> {
-        let output = Command::new("security")
+        let output = Command::new(&self.executable)
             .args(["find-generic-password", "-a", account, "-s", service, "-w"])
             .output()
             .context("read macOS Keychain")?;
@@ -638,7 +658,7 @@ fn reconcile_runner_connection<P: ConversationProvider, S: SlackTransport>(
 /// before the foreground runner enters its transport loop.
 pub fn run_configured_runner(home: &Path) -> Result<()> {
     let config = read_config(home)?;
-    let secrets = KeychainSecretStore;
+    let secrets = KeychainSecretStore::default();
     let app_token = secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)?;
     let bot_token = secrets.read(KEYCHAIN_SERVICE, BOT_TOKEN_ACCOUNT)?;
     let api_base =
@@ -925,6 +945,7 @@ mod tests {
         let plist = fs::read_to_string(&service.plist).unwrap();
         assert!(plist.contains("/Applications/fluent"));
         assert!(plist.contains("<string>slack</string><string>run</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
         assert_eq!(
             LaunchAgentServiceManager::program_arguments(executable),
             ["/Applications/fluent", "slack", "run"]

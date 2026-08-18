@@ -47,6 +47,8 @@ SCRIPT
   grep -F "bootstrap " "$launchctl_log"
   grep -F "bootout " "$launchctl_log"
   grep -F "$FLUENT_BIN" "$home/Library/LaunchAgents/dev.fluent.slack-runner.plist"
+  grep -F '<key>RunAtLoad</key><true/>' \
+    "$home/Library/LaunchAgents/dev.fluent.slack-runner.plist"
 }
 
 run_test "runner owner controls login service" test_runner_owner_controls_login_service
