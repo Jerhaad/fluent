@@ -7,7 +7,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 
 use super::{
@@ -297,7 +296,7 @@ impl SlackTransport for SlackWebApiTransport {
 
 pub struct CodexAppServerProvider {
     executable: PathBuf,
-    runner_home: Option<PathBuf>,
+    scoped: bool,
 }
 
 struct CodexConnection {
@@ -372,43 +371,53 @@ impl CodexAppServerProvider {
     pub fn new(executable: PathBuf) -> Self {
         Self {
             executable,
-            runner_home: None,
+            scoped: false,
         }
     }
 
-    pub fn new_scoped(executable: PathBuf, runner_home: PathBuf) -> Self {
+    pub fn new_scoped(executable: PathBuf) -> Self {
         Self {
             executable,
-            runner_home: Some(runner_home),
+            scoped: true,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn render_scope_profile(
+        &self,
+        scope: &ProviderScope,
+    ) -> Result<Option<crate::os::SandboxProfile>> {
+        if !self.scoped {
+            return Ok(None);
+        }
+        let private_home = scope.slice_draft.join(".provider-home");
+        let codex_home = scope.slice_draft.join(".codex-home");
+        fs::create_dir_all(&private_home)?;
+        fs::create_dir_all(&codex_home)?;
+        let resolver = ContentResolver::new(None);
+        crate::os::render_profile_for_scoped_codex_provider(
+            &resolver,
+            &private_home,
+            std::slice::from_ref(&scope.slice_draft),
+            std::slice::from_ref(&scope.checkout),
+            &codex_home,
+        )
+        .map(Some)
     }
 
     fn connect(&self, scope: &ProviderScope) -> Result<CodexConnection> {
         fs::create_dir_all(&scope.slice_draft)?;
-        let profile = if let Some(runner_home) = &self.runner_home {
-            let codex_home = scope.slice_draft.join(".codex-home");
-            fs::create_dir_all(&codex_home)?;
-            let resolver = ContentResolver::new(None);
-            let profile = crate::os::render_profile_for_access_for_coder_with_codex_home(
-                &resolver,
-                &runner_home.display().to_string(),
-                std::slice::from_ref(&scope.slice_draft),
-                std::slice::from_ref(&scope.checkout),
-                CoderKind::Codex,
-                Some(&codex_home),
-            )?;
+        let profile = self.render_scope_profile(scope)?;
+        if let Some(profile) = &profile {
             crate::os::preflight_profile(&profile)?;
-            Some(profile)
-        } else {
-            None
-        };
+        }
         let mut command = if let Some(profile) = &profile {
             crate::os::command_under_profile(profile, &self.executable)
         } else {
             Command::new(&self.executable)
         };
         command.arg("app-server");
-        if self.runner_home.is_some() {
+        if self.scoped {
             command.env("CODEX_HOME", scope.slice_draft.join(".codex-home"));
         }
         let mut child = command

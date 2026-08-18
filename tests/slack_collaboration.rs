@@ -411,6 +411,38 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
     assert_eq!(turn["params"]["threadId"], "thread-1");
 }
 
+#[test]
+fn scoped_codex_provider_accesses_checkout_below_runner_home() {
+    let fixture = TempDir::new().unwrap();
+    let executable = codex_fixture(&fixture);
+    let runner_home = TempDir::new().unwrap();
+    let checkout = runner_home.path().join("Workspace/project");
+    fs::create_dir_all(&checkout).unwrap();
+    fs::write(checkout.join("README"), "fixture").unwrap();
+    let scope = ProviderScope {
+        slice_draft: checkout.join(".fluent/work/slack/drafts/test"),
+        checkout,
+    };
+    let provider = CodexAppServerProvider::new_scoped(executable);
+    let profile = provider.render_scope_profile(&scope).unwrap().unwrap();
+    let rendered = fs::read_to_string(profile.path).unwrap();
+    let checkout = scope.checkout.display();
+    let private_home = scope.slice_draft.join(".provider-home");
+    let codex_home = scope.slice_draft.join(".codex-home");
+
+    assert!(rendered.contains(&format!("(allow file-read*  (subpath \"{checkout}\"))")));
+    assert!(rendered.contains(&format!(
+        "(allow file-write* (subpath \"{}\"))",
+        scope.slice_draft.display()
+    )));
+    assert!(rendered.contains(&private_home.display().to_string()));
+    assert!(rendered.contains(&codex_home.display().to_string()));
+    assert!(!rendered.contains(&format!(
+        "(allow file-read* (literal \"{}\"))",
+        runner_home.path().display()
+    )));
+}
+
 fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint) {
     let fixture = TempDir::new().unwrap();
     let executable = codex_fixture(&fixture);
@@ -1429,31 +1461,36 @@ fn project_selection_wait_denies_checkout_access() {
 }
 #[test]
 fn unavailable_default_offers_available_projects() {
-    let (home, checkout, mut config) = setup(true);
-    let alternative = TempDir::new().unwrap();
-    let (identity, commit) = initialize_checkout(alternative.path());
-    let mut other = config.projects["app"].clone();
-    other.label = "other".into();
-    other.checkout.label = "other-checkout".into();
-    other.checkout.path = alternative.path().into();
-    other.checkout.identity = identity;
-    other.checkout.commit = commit;
-    config.projects.insert("other".into(), other);
-    fs::remove_dir_all(checkout.path().join(".git")).unwrap();
-    let mut runner = CollaborationRunner::new(
-        home.path(),
-        config,
-        InMemoryProvider::default(),
-        InMemorySlack::default(),
-    );
-    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    assert!(runner.provider().calls.is_empty());
-    assert!(
-        runner.slack().deliveries[0]
-            .text
-            .contains("default is unavailable")
-    );
-    assert!(runner.slack().deliveries[0].text.contains("other"));
+    fn assert_fallback(mut break_default: impl FnMut(&mut ConfiguredProject)) {
+        let (home, _checkout, mut config) = setup(true);
+        let alternative = TempDir::new().unwrap();
+        let (identity, commit) = initialize_checkout(alternative.path());
+        let mut other = config.projects["app"].clone();
+        other.label = "other".into();
+        other.checkout.label = "other-checkout".into();
+        other.checkout.path = alternative.path().into();
+        other.checkout.identity = identity;
+        other.checkout.commit = commit;
+        config.projects.insert("other".into(), other);
+        break_default(config.projects.get_mut("app").unwrap());
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config,
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+        assert!(runner.provider().calls.is_empty());
+        assert!(
+            runner.slack().deliveries[0]
+                .text
+                .contains("default is unavailable")
+        );
+        assert!(runner.slack().deliveries[0].text.contains("other"));
+    }
+
+    assert_fallback(|project| project.checkout.identity = "checkout-v1:different".into());
+    assert_fallback(|project| fs::remove_dir_all(project.checkout.path.join(".git")).unwrap());
 }
 
 #[test]
@@ -1495,7 +1532,13 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
 }
 #[test]
 fn allowed_reply_continues_slice_without_mention() {
-    let (home, _checkout, config) = setup(true);
+    let (home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -1503,10 +1546,11 @@ fn allowed_reply_continues_slice_without_mention() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner
-        .ingest(event("E2", Some("1.0"), "next thought"))
-        .unwrap();
+    let mut reply = event("E2", Some("1.0"), "next thought");
+    reply.user = "U2".into();
+    runner.ingest(reply).unwrap();
     assert_eq!(runner.provider().calls.len(), 2);
+    assert_eq!(runner.provider().calls[1].3, "U2");
 }
 #[test]
 fn agent_response_preserves_thread_context_and_destination() {

@@ -473,6 +473,28 @@ pub fn render_profile_for_access_for_coder_with_codex_home(
         &[],
         Some(coder_kind),
         codex_home,
+        true,
+    )
+}
+
+/// Render a Codex profile whose private home and explicit scope roots replace
+/// access to the runner owner's home.
+pub fn render_profile_for_scoped_codex_provider(
+    resolver: &ContentResolver,
+    private_home: &Path,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: &Path,
+) -> Result<SandboxProfile> {
+    render_profile_for_access(
+        resolver,
+        &private_home.to_string_lossy(),
+        writable_roots,
+        readable_roots,
+        &[],
+        Some(CoderKind::Codex),
+        Some(codex_home),
+        false,
     )
 }
 
@@ -493,6 +515,7 @@ pub fn render_profile_for_access_for_autonomous_claude(
         &[],
         Some(CoderKind::Claude),
         None,
+        true,
     )?;
     let source_home = PathBuf::from(source_home);
     let canonical_source_home =
@@ -560,6 +583,7 @@ pub fn render_profile_for_access_for_coder_with_denied_writes_and_codex_home(
         denied_write_roots,
         Some(coder_kind),
         codex_home,
+        true,
     )?;
     let content = std::fs::read_to_string(&profile.path)?
         .replace(
@@ -589,6 +613,7 @@ pub fn render_profile_common_only(
         &[],
         None,
         None,
+        true,
     )
 }
 
@@ -634,6 +659,7 @@ fn render_profile_for_access(
     denied_write_roots: &[PathBuf],
     coder_kind: Option<CoderKind>,
     codex_home: Option<&Path>,
+    deny_codex_source_home: bool,
 ) -> Result<SandboxProfile> {
     if writable_roots.is_empty() {
         bail!("At least one writable sandbox root is required");
@@ -669,7 +695,7 @@ fn render_profile_for_access(
     // Autonomous Codex workers use a staged home.  Deny the interactive source
     // explicitly before common.sb's broad home read grants so the profile cannot
     // reach hooks, configuration, sessions, or the original credentials.
-    if let Some(worker_home) = codex_home {
+    if deny_codex_source_home && let Some(worker_home) = codex_home {
         let source_home = crate::codex_worker::effective_source_home();
         if worker_home != source_home {
             let source = sbpl_string(&source_home);

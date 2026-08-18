@@ -675,7 +675,7 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     let codex = std::env::var_os("FLUENT_CODEX_APP_SERVER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("codex"));
-    let provider = CodexAppServerProvider::new_scoped(codex, home.to_path_buf());
+    let provider = CodexAppServerProvider::new_scoped(codex);
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
     let scheduler = LocalSchedulerClient::new(
         config
