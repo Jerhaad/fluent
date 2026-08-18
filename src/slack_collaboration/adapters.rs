@@ -186,8 +186,16 @@ impl SlackWebApiTransport {
     }
 }
 
-fn slack_client_message_id(delivery_id: &str) -> String {
-    let digest = Sha256::digest(delivery_id.as_bytes());
+fn slack_client_message_id(delivery: &OutboundDelivery) -> String {
+    let mut input = Sha256::new();
+    input.update(delivery.id.as_bytes());
+    input.update([0]);
+    input.update(delivery.channel.as_bytes());
+    input.update([0]);
+    input.update(delivery.thread_timestamp.as_bytes());
+    input.update([0]);
+    input.update(delivery.text.as_bytes());
+    let digest = input.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x50;
@@ -230,7 +238,7 @@ impl SlackTransport for SlackWebApiTransport {
                 "channel": delivery.channel,
                 "thread_ts": delivery.thread_timestamp,
                 "text": delivery.text,
-                "client_msg_id": slack_client_message_id(&delivery.id)
+            "client_msg_id": slack_client_message_id(delivery)
             }),
         )
     }
