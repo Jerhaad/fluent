@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 
 use crate::coder::CoderKind;
 use crate::content::ContentResolver;
@@ -185,6 +186,33 @@ impl SlackWebApiTransport {
     }
 }
 
+fn slack_client_message_id(delivery_id: &str) -> String {
+    let digest = Sha256::digest(delivery_id.as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
+}
+
 impl SlackTransport for SlackWebApiTransport {
     fn acknowledge(&mut self, event_id: &str) -> Result<()> {
         self.call(
@@ -195,9 +223,16 @@ impl SlackTransport for SlackWebApiTransport {
     }
 
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
-        self.call("chat.postMessage", &self.bot_token, serde_json::json!({
-            "channel": delivery.channel, "thread_ts": delivery.thread_timestamp, "text": delivery.text
-        }))
+        self.call(
+            "chat.postMessage",
+            &self.bot_token,
+            serde_json::json!({
+                "channel": delivery.channel,
+                "thread_ts": delivery.thread_timestamp,
+                "text": delivery.text,
+                "client_msg_id": slack_client_message_id(&delivery.id)
+            }),
+        )
     }
 
     fn check(&self) -> Result<()> {

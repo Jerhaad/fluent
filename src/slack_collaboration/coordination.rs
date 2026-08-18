@@ -124,13 +124,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = self.store.load_outbox()?;
-        for delivery in &mut deliveries {
-            if !delivery.delivered {
-                self.slack.post(delivery)?;
-                delivery.delivered = true;
+        for index in 0..deliveries.len() {
+            if !deliveries[index].delivered {
+                self.slack.post(&deliveries[index])?;
+                deliveries[index].delivered = true;
+                self.store.save_outbox(&deliveries)?;
             }
         }
-        self.store.save_outbox(&deliveries)
+        Ok(())
     }
     fn process(&mut self, event: InboundEnvelope) -> Result<()> {
         let mut thread = self

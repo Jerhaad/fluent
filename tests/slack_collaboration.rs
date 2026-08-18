@@ -131,6 +131,19 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     assert!(request.contains("POST /chat.postMessage"));
     assert!(request.contains("Authorization: Bearer xoxb-test"));
     assert!(request.contains("\"thread_ts\":\"1.0\""));
+    let body = request.split("\r\n\r\n").nth(1).unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let client_message_id = body["client_msg_id"].as_str().unwrap();
+    assert_eq!(client_message_id.len(), 36);
+    assert_eq!(
+        client_message_id
+            .chars()
+            .enumerate()
+            .filter(|(_, character)| *character == '-')
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>(),
+        vec![8, 13, 18, 23]
+    );
 }
 
 #[test]
@@ -198,6 +211,47 @@ struct FailingSlack {
     fail_posts: usize,
     acknowledgements: Vec<String>,
     deliveries: Vec<OutboundDelivery>,
+}
+
+struct CrashAfterAcceptSlack {
+    accepted: Arc<Mutex<BTreeSet<String>>>,
+    attempts: Arc<Mutex<Vec<String>>>,
+    fail_after_accept: bool,
+}
+
+impl SlackTransport for CrashAfterAcceptSlack {
+    fn acknowledge(&mut self, _event_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn post(&mut self, delivery: &OutboundDelivery) -> anyhow::Result<()> {
+        self.attempts.lock().unwrap().push(delivery.id.clone());
+        self.accepted.lock().unwrap().insert(delivery.id.clone());
+        if self.fail_after_accept {
+            self.fail_after_accept = false;
+            anyhow::bail!("connection lost after Slack accepted delivery");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailSecondPostSlack {
+    posts: usize,
+}
+
+impl SlackTransport for FailSecondPostSlack {
+    fn acknowledge(&mut self, _event_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn post(&mut self, _delivery: &OutboundDelivery) -> anyhow::Result<()> {
+        self.posts += 1;
+        if self.posts == 2 {
+            anyhow::bail!("second post failed");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -452,6 +506,87 @@ fn persisted_outbound_reply_retries_without_second_provider_turn() {
             .count(),
         1
     );
+}
+
+#[test]
+fn accepted_outbound_reply_is_not_duplicated_after_crash() {
+    let (home, _checkout, config) = setup(true);
+    let accepted = Arc::new(Mutex::new(BTreeSet::new()));
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let inbound = event("E1", None, "@Fluent deliver this");
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        CrashAfterAcceptSlack {
+            accepted: accepted.clone(),
+            attempts: attempts.clone(),
+            fail_after_accept: true,
+        },
+    );
+    assert!(runner.ingest(inbound.clone()).is_err());
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        CrashAfterAcceptSlack {
+            accepted: accepted.clone(),
+            attempts: attempts.clone(),
+            fail_after_accept: false,
+        },
+    );
+    recovered.reconnect([inbound], "recovered".into()).unwrap();
+
+    assert_eq!(
+        accepted
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_str() == "E1:reply")
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|id| id.as_str() == "E1:reply")
+            .count(),
+        2,
+        "recovery retries the stable identity while Slack accepts it once"
+    );
+}
+
+#[test]
+fn outbound_progress_is_persisted_after_each_accepted_delivery() {
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    for id in ["delivery-1", "delivery-2"] {
+        store
+            .persist_outbox(OutboundDelivery {
+                id: id.into(),
+                channel: "C1".into(),
+                thread_timestamp: "1.0".into(),
+                text: id.into(),
+                delivered: false,
+            })
+            .unwrap();
+    }
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        FailSecondPostSlack::default(),
+    );
+    assert!(runner.deliver_pending().is_err());
+
+    let deliveries = FileCollaborationStore::new(home.path())
+        .load_outbox()
+        .unwrap();
+    assert!(deliveries[0].delivered);
+    assert!(!deliveries[1].delivered);
 }
 
 #[test]
