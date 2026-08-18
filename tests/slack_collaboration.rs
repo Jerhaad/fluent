@@ -205,3 +205,63 @@ fn invalid_runtime_configuration_fails_closed() {
     config.workspace.clear();
     assert!(config.validate().is_err());
 }
+
+#[derive(Default)]
+struct MemorySecrets(BTreeMap<(String, String), String>);
+
+impl SecretStore for MemorySecrets {
+    fn store(&mut self, service: &str, account: &str, secret: &str) -> anyhow::Result<()> {
+        self.0.insert(
+            (service.to_string(), account.to_string()),
+            secret.to_string(),
+        );
+        Ok(())
+    }
+
+    fn read(&self, service: &str, account: &str) -> anyhow::Result<String> {
+        self.0
+            .get(&(service.to_string(), account.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("secret is missing"))
+    }
+}
+
+#[test]
+fn slack_credentials_use_host_store_and_are_redacted() {
+    let mut secrets = MemorySecrets::default();
+    store_slack_credentials(&mut secrets, "xapp-app-secret", "xoxb-bot-secret").unwrap();
+    assert_eq!(
+        secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT).unwrap(),
+        "xapp-app-secret"
+    );
+    assert_eq!(
+        redact_secrets("credentials xapp-app-secret xoxb-bot-secret"),
+        "credentials [REDACTED] [REDACTED]"
+    );
+}
+
+#[test]
+fn sandboxed_setup_reports_host_handoff_without_false_login_failure() {
+    let handoff = host_handoff("fluent slack setup");
+    assert!(handoff.contains("outside the agent sandbox"));
+    assert!(handoff.contains("fluent slack setup"));
+    assert!(!handoff.to_lowercase().contains("login is invalid"));
+}
+
+#[test]
+fn runner_status_reports_safe_operational_identity() {
+    let (_, _checkout, config) = setup(true);
+    let rendered = runner_status(
+        &config,
+        true,
+        Some("2026-08-17T00:00:00Z".into()),
+        Some("xapp-app-secret disconnected".into()),
+    )
+    .to_string();
+    assert!(rendered.contains("workspace: workspace"));
+    assert!(rendered.contains("connection: connected"));
+    assert!(rendered.contains("last successful connection"));
+    assert!(rendered.contains("build:"));
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("xapp-app-secret"));
+}
