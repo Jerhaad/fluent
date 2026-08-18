@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -557,6 +559,132 @@ impl SlackTransport for InMemorySlack {
     }
 }
 
+/// Native Rust Web API edge used by the Socket Mode runner for durable posts.
+/// Socket acknowledgements travel through the same injected edge in tests.
+pub struct SlackWebApiTransport {
+    api_base: String,
+    bot_token: String,
+    app_token: String,
+}
+
+impl SlackWebApiTransport {
+    pub fn new(api_base: impl Into<String>, app_token: String, bot_token: String) -> Self {
+        Self {
+            api_base: api_base.into().trim_end_matches('/').into(),
+            app_token,
+            bot_token,
+        }
+    }
+    fn call(&self, method: &str, token: &str, body: serde_json::Value) -> Result<()> {
+        let response = ureq::post(&format!("{}/{method}", self.api_base))
+            .set("Authorization", &format!("Bearer {token}"))
+            .send_json(body)?;
+        let value: serde_json::Value = response.into_json()?;
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            bail!("Slack {method} failed")
+        }
+        Ok(())
+    }
+}
+
+impl SlackTransport for SlackWebApiTransport {
+    fn acknowledge(&mut self, event_id: &str) -> Result<()> {
+        self.call(
+            "apps.connections.ack",
+            &self.app_token,
+            serde_json::json!({"envelope_id": event_id}),
+        )
+    }
+    fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
+        self.call("chat.postMessage", &self.bot_token, serde_json::json!({
+            "channel": delivery.channel, "thread_ts": delivery.thread_timestamp, "text": delivery.text
+        }))
+    }
+    fn check(&self) -> Result<()> {
+        self.call("auth.test", &self.bot_token, serde_json::json!({}))
+    }
+}
+
+/// Minimal JSON-lines Codex App Server client. The app server receives a
+/// stable action id so a replay reconciles the same provider turn.
+pub struct CodexAppServerProvider {
+    executable: PathBuf,
+}
+
+impl CodexAppServerProvider {
+    pub fn new(executable: PathBuf) -> Self {
+        Self { executable }
+    }
+    fn turn(
+        &self,
+        action_id: &str,
+        session: Option<&str>,
+        checkout: &Path,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<(String, String)> {
+        let mut child = Command::new(&self.executable)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let request = serde_json::json!({"action_id": action_id, "session": session, "checkout": checkout, "contribution": contribution, "actor": actor});
+        child
+            .stdin
+            .as_mut()
+            .context("open Codex App Server stdin")?
+            .write_all(serde_json::to_string(&request)?.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!("Codex App Server failed")
+        }
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok((
+            response["session"]
+                .as_str()
+                .context("Codex response session")?
+                .into(),
+            response["reply"]
+                .as_str()
+                .context("Codex response reply")?
+                .into(),
+        ))
+    }
+}
+
+impl ConversationProvider for CodexAppServerProvider {
+    fn start(
+        &mut self,
+        action_id: &str,
+        checkout: &Path,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<(String, String)> {
+        self.turn(action_id, None, checkout, contribution, actor)
+    }
+    fn resume(
+        &mut self,
+        action_id: &str,
+        session: &str,
+        checkout: &Path,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<String> {
+        Ok(self
+            .turn(action_id, Some(session), checkout, contribution, actor)?
+            .1)
+    }
+    fn ready(&self) -> Result<()> {
+        Command::new(&self.executable)
+            .arg("app-server")
+            .arg("--help")
+            .status()?
+            .success()
+            .then_some(())
+            .context("Codex App Server is unavailable")
+    }
+}
+
 /// Coordinates one local runner. File state is written before external effects.
 pub struct CollaborationRunner<'a, P, S> {
     home: &'a Path,
@@ -876,10 +1004,16 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
 pub fn run_configured_runner(home: &Path) -> Result<()> {
     let config = read_config(home)?;
     let secrets = KeychainSecretStore;
-    let _app_token = secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)?;
-    let _bot_token = secrets.read(KEYCHAIN_SERVICE, BOT_TOKEN_ACCOUNT)?;
-    config.validate()?;
-    bail!("Slack transport startup is unavailable in this build")
+    let app_token = secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT)?;
+    let bot_token = secrets.read(KEYCHAIN_SERVICE, BOT_TOKEN_ACCOUNT)?;
+    let api_base =
+        std::env::var("FLUENT_SLACK_API_BASE").unwrap_or_else(|_| "https://slack.com/api".into());
+    let codex = std::env::var_os("FLUENT_CODEX_APP_SERVER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let provider = CodexAppServerProvider::new(codex);
+    let slack = SlackWebApiTransport::new(api_base, app_token, bot_token);
+    preflight(&config, &provider, &slack)
 }
 
 fn ensure_root(home: &Path) -> Result<()> {
