@@ -101,39 +101,57 @@ fn slack_thread_identity_rejects_filesystem_aliases() {
 fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
-    let request = Arc::new(Mutex::new(String::new()));
-    let captured = request.clone();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = [0; 4096];
-        let count = stream.read(&mut buffer).unwrap();
-        *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..count]).into();
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
-            .unwrap();
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let count = stream.read(&mut buffer).unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buffer[..count]).into_owned());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+                .unwrap();
+        }
     });
     let mut slack = SlackWebApiTransport::new(
         format!("http://{address}"),
         "xapp-test".into(),
         "xoxb-test".into(),
     );
+    let delivery = OutboundDelivery {
+        id: "1.0:status".into(),
+        channel: "C1".into(),
+        thread_timestamp: "1.0".into(),
+        text: "connected at first".into(),
+        delivered: false,
+    };
+    slack.post(&delivery).unwrap();
+    slack.post(&delivery).unwrap();
     slack
         .post(&OutboundDelivery {
-            id: "delivery-1".into(),
-            channel: "C1".into(),
-            thread_timestamp: "1.0".into(),
-            text: "reply".into(),
-            delivered: false,
+            text: "connected at second".into(),
+            ..delivery
         })
         .unwrap();
     server.join().unwrap();
-    let request = request.lock().unwrap();
+    let requests = requests.lock().unwrap();
+    let request = &requests[0];
     assert!(request.contains("POST /chat.postMessage"));
     assert!(request.contains("Authorization: Bearer xoxb-test"));
     assert!(request.contains("\"thread_ts\":\"1.0\""));
-    let body = request.split("\r\n\r\n").nth(1).unwrap();
-    let body: serde_json::Value = serde_json::from_str(body).unwrap();
-    let client_message_id = body["client_msg_id"].as_str().unwrap();
+    let client_message_ids: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            let body = request.split("\r\n\r\n").nth(1).unwrap();
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            body["client_msg_id"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    let client_message_id = &client_message_ids[0];
     assert_eq!(client_message_id.len(), 36);
     assert_eq!(
         client_message_id
@@ -144,6 +162,8 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
             .collect::<Vec<_>>(),
         vec![8, 13, 18, 23]
     );
+    assert_eq!(client_message_ids[0], client_message_ids[1]);
+    assert_ne!(client_message_ids[1], client_message_ids[2]);
 }
 
 #[test]
@@ -590,6 +610,28 @@ fn outbound_progress_is_persisted_after_each_accepted_delivery() {
 }
 
 #[test]
+fn durable_outbox_identity_cannot_be_rewritten() {
+    let (home, _checkout, _config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let original = OutboundDelivery {
+        id: "1.0:status:first".into(),
+        channel: "C1".into(),
+        thread_timestamp: "1.0".into(),
+        text: "connected at first".into(),
+        delivered: false,
+    };
+    store.persist_outbox(original.clone()).unwrap();
+    let error = store
+        .persist_outbox(OutboundDelivery {
+            text: "connected at second".into(),
+            ..original.clone()
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("immutable"));
+    assert_eq!(store.load_outbox().unwrap(), vec![original]);
+}
+
+#[test]
 fn changed_checkout_identity_is_unavailable() {
     let (_home, checkout, mut config) = setup(true);
     let path = checkout.path();
@@ -923,14 +965,14 @@ fn reconnect_reconciles_slack_messages_exactly_once() {
             .slack()
             .deliveries
             .iter()
-            .any(|d| d.id == "1.0:status" && d.text.contains("last connected at now"))
+            .any(|d| d.id == "1.0:status:now" && d.text.contains("last connected at now"))
     );
     assert!(
         runner
             .slack()
             .deliveries
             .iter()
-            .any(|d| d.id == "1.0:status" && d.text.contains("connection was interrupted"))
+            .any(|d| d.id == "1.0:status:now" && d.text.contains("connection was interrupted"))
     );
     runner.reconnect([], "later".into()).unwrap();
     assert!(
@@ -968,7 +1010,7 @@ fn thread_status_shows_runner_last_connection() {
         .slack()
         .deliveries
         .iter()
-        .find(|delivery| delivery.id == "1.0:status")
+        .find(|delivery| delivery.id.starts_with("1.0:status:"))
         .expect("active thread status delivery");
     assert!(
         thread_status

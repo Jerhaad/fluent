@@ -279,7 +279,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .map(|message| format!(" {message}"))
             .unwrap_or_default();
         self.store.persist_outbox(OutboundDelivery {
-            id: format!("{}:status", thread.id),
+            id: format!("{}:status:{connected_at}", thread.id),
             channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(),
             text: format!(

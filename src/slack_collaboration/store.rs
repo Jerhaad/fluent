@@ -203,10 +203,12 @@ pub(super) fn persist_outbox(home: &Path, delivery: OutboundDelivery) -> Result<
     ensure_root(home)?;
     let _lock = state_lock(home)?;
     let mut outbox = load_outbox(home)?;
-    if let Some(existing) = outbox.iter_mut().find(|item| item.id == delivery.id) {
-        if delivery.id.ends_with(":status") && existing.text != delivery.text {
-            *existing = delivery;
-            atomic_write(&outbox_path(home), &serde_json::to_vec_pretty(&outbox)?)?;
+    if let Some(existing) = outbox.iter().find(|item| item.id == delivery.id) {
+        if existing.channel != delivery.channel
+            || existing.thread_timestamp != delivery.thread_timestamp
+            || existing.text != delivery.text
+        {
+            bail!("durable outbox identity is immutable");
         }
     } else {
         outbox.push(delivery);
