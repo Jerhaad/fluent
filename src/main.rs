@@ -279,10 +279,14 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
         SlackCommands::Status => {
             let home = slack_home()?;
             let config = slack_collaboration::read_config(&home)?;
-            let manager = LaunchAgentServiceManager::new(&home);
             println!(
                 "{}",
-                slack_collaboration::runner_status(&config, manager.enabled(), None, None,)
+                slack_collaboration::runner_status(
+                    &config,
+                    false,
+                    None,
+                    Some("runner connection status is available after a successful Socket Mode session".into()),
+                )
             );
         }
         SlackCommands::Run => slack_collaboration::run_configured_runner(&slack_home()?)?,
