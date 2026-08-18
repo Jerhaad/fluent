@@ -68,10 +68,113 @@ fn bound_thread_shows_safe_checkout_identity() {
             .text
             .contains("branch: main; commit: abc")
     );
+    assert!(runner.slack().deliveries[0].text.contains("Project: app"));
+    assert!(runner.slack().deliveries[0].text.contains("checkout: main"));
     assert!(
         !runner.slack().deliveries[0]
             .text
             .contains(&checkout.path().display().to_string())
+    );
+}
+
+#[derive(Default)]
+struct FailingSlack {
+    fail_acknowledgements: usize,
+    fail_posts: usize,
+    acknowledgements: Vec<String>,
+    deliveries: Vec<OutboundDelivery>,
+}
+
+impl SlackTransport for FailingSlack {
+    fn acknowledge(&mut self, event_id: &str) -> anyhow::Result<()> {
+        if self.fail_acknowledgements > 0 {
+            self.fail_acknowledgements -= 1;
+            anyhow::bail!("temporary acknowledgement failure");
+        }
+        self.acknowledgements.push(event_id.into());
+        Ok(())
+    }
+    fn post(&mut self, delivery: &OutboundDelivery) -> anyhow::Result<()> {
+        if self.fail_posts > 0 {
+            self.fail_posts -= 1;
+            anyhow::bail!("temporary post failure");
+        }
+        self.deliveries.push(delivery.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn acknowledged_pending_event_replays_after_restart_once() {
+    let (home, _checkout, config) = setup(true);
+    let inbound = event("E1", None, "@Fluent recover this");
+    let mut failed = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        FailingSlack {
+            fail_acknowledgements: 1,
+            ..Default::default()
+        },
+    );
+    assert!(failed.ingest(inbound.clone()).is_err());
+    assert!(failed.provider().calls.is_empty());
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        FailingSlack::default(),
+    );
+    recovered
+        .reconnect([inbound.clone()], "recovered".into())
+        .unwrap();
+    recovered
+        .reconnect([inbound], "recovered-again".into())
+        .unwrap();
+    assert_eq!(recovered.provider().calls.len(), 1);
+    assert_eq!(
+        recovered
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|d| d.id == "E1:reply")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn persisted_outbound_reply_retries_without_second_provider_turn() {
+    let (home, _checkout, config) = setup(true);
+    let inbound = event("E1", None, "@Fluent deliver this");
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        FailingSlack {
+            fail_posts: 1,
+            ..Default::default()
+        },
+    );
+    assert!(runner.ingest(inbound.clone()).is_err());
+    assert_eq!(runner.provider().calls.len(), 1);
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        FailingSlack::default(),
+    );
+    recovered.reconnect([inbound], "recovered".into()).unwrap();
+    assert!(recovered.provider().calls.is_empty());
+    assert_eq!(
+        recovered
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|d| d.id == "E1:reply")
+            .count(),
+        1
     );
 }
 
@@ -139,6 +242,23 @@ fn changed_checkout_identity_is_unavailable() {
     assert!(checkout_is_available(&config.projects["app"].checkout));
     config.projects.get_mut("app").unwrap().checkout.commit = "different".into();
     assert!(!checkout_is_available(&config.projects["app"].checkout));
+    assert!(
+        preflight(
+            &config,
+            &InMemoryProvider::default(),
+            &InMemorySlack::default(),
+        )
+        .is_err()
+    );
+    fs::remove_dir_all(path.join(".git")).unwrap();
+    assert!(
+        preflight(
+            &config,
+            &InMemoryProvider::default(),
+            &InMemorySlack::default(),
+        )
+        .is_err()
+    );
 }
 
 #[test]

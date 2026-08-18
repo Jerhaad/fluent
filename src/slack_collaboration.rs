@@ -543,19 +543,22 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         if let Some(error) = &self.configuration_error {
             bail!("runner configuration is invalid; refusing Slack ingress: {error}");
         }
-        let is_new = persist_inbox(self.home, &event)?;
-        if is_new {
-            self.slack.acknowledge(&event.id)?;
-        } else {
-            return Ok(());
+        match persist_inbox(self.home, &event)? {
+            InboxState::Processed => return Ok(()),
+            InboxState::Pending => self.slack.acknowledge(&event.id)?,
         }
-        self.process(event)
+        self.process(event.clone())?;
+        mark_inbox_processed(self.home, &event.id)?;
+        self.deliver_pending()
     }
     pub fn reconnect(
         &mut self,
         events: impl IntoIterator<Item = InboundEnvelope>,
         connected_at: String,
     ) -> Result<()> {
+        for pending in load_pending_inbox(self.home)? {
+            self.ingest(pending)?;
+        }
         let mut events: Vec<_> = events.into_iter().collect();
         events.sort_by(|left, right| {
             left.timestamp
@@ -624,8 +627,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
                 .resume(session, &checkout, &event.text, &event.user)?;
             self.queue_reply(&event, &reply)?;
         }
-        save_thread(self.home, &self.config, &thread)?;
-        self.deliver_pending()
+        save_thread(self.home, &self.config, &thread)
     }
     fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
         let default = self
@@ -743,6 +745,14 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
     slack: &S,
 ) -> Result<()> {
     config.validate()?;
+    for project in config.projects.values() {
+        if !checkout_is_available(&project.checkout) {
+            bail!(
+                "configured checkout {} is unavailable or changed",
+                project.label
+            );
+        }
+    }
     provider.ready()?;
     slack.check()?;
     Ok(())
@@ -759,16 +769,62 @@ fn read_json<T: for<'a> Deserialize<'a> + Default>(path: PathBuf) -> Result<T> {
         Err(e) => Err(e.into()),
     }
 }
-fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<bool> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboxEntry {
+    event: InboundEnvelope,
+    processed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxState {
+    Pending,
+    Processed,
+}
+
+fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<InboxState> {
     ensure_root(home)?;
     let _lock = state_lock(home)?;
-    let mut inbox: BTreeMap<String, InboundEnvelope> = read_json(inbox_path(home))?;
-    if inbox.contains_key(&event.id) {
-        return Ok(false);
+    let mut inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
+    if let Some(entry) = inbox.get(&event.id) {
+        return Ok(if entry.processed {
+            InboxState::Processed
+        } else {
+            InboxState::Pending
+        });
     }
-    inbox.insert(event.id.clone(), event.clone());
+    inbox.insert(
+        event.id.clone(),
+        InboxEntry {
+            event: event.clone(),
+            processed: false,
+        },
+    );
     atomic_write(&inbox_path(home), &serde_json::to_vec_pretty(&inbox)?)?;
-    Ok(true)
+    Ok(InboxState::Pending)
+}
+fn mark_inbox_processed(home: &Path, id: &str) -> Result<()> {
+    let _lock = state_lock(home)?;
+    let mut inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
+    let entry = inbox
+        .get_mut(id)
+        .context("persisted inbox event is missing")?;
+    entry.processed = true;
+    atomic_write(&inbox_path(home), &serde_json::to_vec_pretty(&inbox)?)?;
+    Ok(())
+}
+fn load_pending_inbox(home: &Path) -> Result<Vec<InboundEnvelope>> {
+    let inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
+    let mut pending: Vec<_> = inbox
+        .into_values()
+        .filter(|entry| !entry.processed)
+        .map(|entry| entry.event)
+        .collect();
+    pending.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(pending)
 }
 fn load_outbox(home: &Path) -> Result<Vec<OutboundDelivery>> {
     read_json(outbox_path(home))

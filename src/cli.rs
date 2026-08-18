@@ -208,11 +208,25 @@ pub enum Commands {
         command: KeepAwakeCommands,
     },
 
+    /// Print local Slack Socket Mode setup material
+    Slack {
+        #[command(subcommand)]
+        command: SlackCommands,
+    },
+
     /// Manage Fargate infrastructure
     Fargate {
         #[command(subcommand)]
         command: FargateCommands,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SlackCommands {
+    /// Print the Slack app manifest for a Socket Mode installation
+    Manifest,
+    /// Print the owner-facing local Slack runner setup instructions
+    Setup,
 }
 
 // ---------------------------------------------------------------------------

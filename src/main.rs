@@ -13,7 +13,7 @@ use fluent::cleanup::{
 use fluent::cli::{
     AttemptCommands, AttemptEvidenceCommands, Cli, Commands, FargateCommands, KeepAwakeCommands,
     MergeCandidateCommands, ObservationCommands, QueueCommands, ReviewCommands, SchedulerCommands,
-    SkillsCommands, TaskCommands, TesterCommands, WorkItemCommands,
+    SkillsCommands, SlackCommands, TaskCommands, TesterCommands, WorkItemCommands,
 };
 use fluent::coder::CoderKind;
 use fluent::content::ContentResolver;
@@ -234,6 +234,12 @@ fn main() -> Result<()> {
         Some(Commands::KeepAwake { command }) => {
             cmd_keep_awake(command)?;
         }
+        Some(Commands::Slack { command }) => match command {
+            SlackCommands::Manifest => {
+                print!("{}", fluent::slack_collaboration::SOCKET_MODE_MANIFEST)
+            }
+            SlackCommands::Setup => print!("{}", include_str!("../docs/slack-runner.md")),
+        },
         None => {
             let coder_kind = CoderKind::resolve(cli.coder.as_deref())?;
             cmd_interactive(&sandbox_root, &resolver, &cli.extra_args, coder_kind)?;
