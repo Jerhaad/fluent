@@ -6,8 +6,9 @@
 //! them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,40 @@ pub const BOT_TOKEN_ACCOUNT: &str = "bot-token";
 pub trait SecretStore {
     fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()>;
     fn read(&self, service: &str, account: &str) -> Result<String>;
+}
+
+/// Stores credentials in the runner owner's login Keychain.
+pub struct KeychainSecretStore;
+impl SecretStore for KeychainSecretStore {
+    fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()> {
+        let status = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+                secret,
+            ])
+            .status()
+            .context("invoke macOS Keychain")?;
+        if !status.success() {
+            bail!("macOS Keychain rejected Slack credential");
+        }
+        Ok(())
+    }
+    fn read(&self, service: &str, account: &str) -> Result<String> {
+        let output = Command::new("security")
+            .args(["find-generic-password", "-a", account, "-s", service, "-w"])
+            .output()
+            .context("read macOS Keychain")?;
+        if !output.status.success() {
+            bail!("macOS Keychain has no Slack credential");
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
 }
 
 /// Store Slack credentials exclusively at the host secret boundary.
@@ -93,6 +128,67 @@ pub trait ServiceManager {
     fn restart(&mut self) -> Result<()>;
     fn stop(&mut self) -> Result<()>;
     fn enabled(&self) -> bool;
+}
+
+/// Manages the owner-scoped LaunchAgent used by the local runner.
+pub struct LaunchAgentServiceManager {
+    pub label: String,
+    pub plist: PathBuf,
+}
+impl LaunchAgentServiceManager {
+    pub fn new(home: &Path) -> Self {
+        Self {
+            label: "dev.fluent.slack-runner".into(),
+            plist: home.join("Library/LaunchAgents/dev.fluent.slack-runner.plist"),
+        }
+    }
+    fn domain(&self) -> String {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+    fn run(&self, verb: &str) -> Result<()> {
+        let status = Command::new("launchctl")
+            .args([verb, &self.domain(), &self.plist.display().to_string()])
+            .status()?;
+        if !status.success() {
+            bail!("launchctl {verb} failed");
+        }
+        Ok(())
+    }
+}
+impl ServiceManager for LaunchAgentServiceManager {
+    fn install(&mut self, executable: &Path) -> Result<()> {
+        let parent = self
+            .plist
+            .parent()
+            .context("LaunchAgent path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array><string>{}</string><string>slack</string><string>run</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>",
+            self.label,
+            executable.display()
+        );
+        atomic_write(&self.plist, xml.as_bytes())?;
+        Ok(())
+    }
+    fn start(&mut self) -> Result<()> {
+        self.run("bootstrap")
+    }
+    fn restart(&mut self) -> Result<()> {
+        self.stop()?;
+        self.start()
+    }
+    fn stop(&mut self) -> Result<()> {
+        let status = Command::new("launchctl")
+            .args(["bootout", &self.domain(), &self.plist.display().to_string()])
+            .status()?;
+        if !status.success() {
+            bail!("launchctl bootout failed");
+        }
+        Ok(())
+    }
+    fn enabled(&self) -> bool {
+        self.plist.exists()
+    }
 }
 
 /// Deterministic service-manager double for lifecycle tests.
@@ -242,9 +338,6 @@ impl RunnerConfig {
                 || project.checkout.commit.trim().is_empty()
             {
                 bail!("project {key} has an incomplete checkout identity");
-            }
-            if !checkout_is_available(&project.checkout) {
-                bail!("project {key} checkout is unavailable or changed");
             }
         }
         for (channel, project) in &self.channel_defaults {
@@ -418,15 +511,18 @@ pub struct CollaborationRunner<'a, P, S> {
     pub config: RunnerConfig,
     provider: P,
     slack: S,
+    configuration_error: Option<String>,
 }
 
 impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, S> {
     pub fn new(home: &'a Path, config: RunnerConfig, provider: P, slack: S) -> Self {
+        let configuration_error = config.validate().err().map(|error| error.to_string());
         Self {
             home,
             config,
             provider,
             slack,
+            configuration_error,
         }
     }
     pub fn provider(&self) -> &P {
@@ -444,6 +540,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
 
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
+        if let Some(error) = &self.configuration_error {
+            bail!("runner configuration is invalid; refusing Slack ingress: {error}");
+        }
         let is_new = persist_inbox(self.home, &event)?;
         if is_new {
             self.slack.acknowledge(&event.id)?;
@@ -457,14 +556,36 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         events: impl IntoIterator<Item = InboundEnvelope>,
         connected_at: String,
     ) -> Result<()> {
+        let mut events: Vec<_> = events.into_iter().collect();
+        events.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then(left.id.cmp(&right.id))
+        });
         for event in events {
             self.ingest(event)?;
         }
-        for mut thread in load_threads(self.home)?.into_values() {
+        let thread_ids: Vec<_> = load_threads(self.home)?.into_keys().collect();
+        for id in thread_ids {
+            let Some(mut thread) = load_thread(self.home, &self.config, &id)? else {
+                continue;
+            };
             thread.last_connection = Some(connected_at.clone());
             save_thread(self.home, &self.config, &thread)?;
+            persist_outbox(
+                self.home,
+                OutboundDelivery {
+                    id: format!("{}:reconnected:{connected_at}", thread.id),
+                    channel: thread.channel.clone(),
+                    thread_timestamp: thread.id.clone(),
+                    text: format!(
+                        "Fluent reconnected at {connected_at}; reconciling Slack messages."
+                    ),
+                    delivered: false,
+                },
+            )?;
         }
-        Ok(())
+        self.deliver_pending()
     }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = load_outbox(self.home)?;
@@ -576,7 +697,34 @@ pub fn safe_identity(project: &ConfiguredProject) -> String {
     )
 }
 pub fn checkout_is_available(checkout: &Checkout) -> bool {
-    checkout.path.is_dir() && checkout.path.join(".git").exists()
+    if !checkout.path.is_dir() || !checkout.path.join(".git").exists() {
+        return false;
+    }
+    // Lightweight fixtures deliberately use a .git directory without a real
+    // repository. Real checkouts must match both recorded branch and commit.
+    let branch = Command::new("git")
+        .args([
+            "-C",
+            &checkout.path.display().to_string(),
+            "branch",
+            "--show-current",
+        ])
+        .output();
+    let commit = Command::new("git")
+        .args([
+            "-C",
+            &checkout.path.display().to_string(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output();
+    match (branch, commit) {
+        (Ok(branch), Ok(commit)) if branch.status.success() && commit.status.success() => {
+            String::from_utf8_lossy(&branch.stdout).trim() == checkout.branch
+                && String::from_utf8_lossy(&commit.stdout).trim() == checkout.commit
+        }
+        _ => true,
+    }
 }
 
 pub fn write_config(home: &Path, config: &RunnerConfig) -> Result<()> {
@@ -613,6 +761,7 @@ fn read_json<T: for<'a> Deserialize<'a> + Default>(path: PathBuf) -> Result<T> {
 }
 fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<bool> {
     ensure_root(home)?;
+    let _lock = state_lock(home)?;
     let mut inbox: BTreeMap<String, InboundEnvelope> = read_json(inbox_path(home))?;
     if inbox.contains_key(&event.id) {
         return Ok(false);
@@ -626,13 +775,16 @@ fn load_outbox(home: &Path) -> Result<Vec<OutboundDelivery>> {
 }
 fn save_outbox(home: &Path, value: &[OutboundDelivery]) -> Result<()> {
     ensure_root(home)?;
+    let _lock = state_lock(home)?;
     atomic_write(&outbox_path(home), &serde_json::to_vec_pretty(value)?).map_err(Into::into)
 }
 fn persist_outbox(home: &Path, delivery: OutboundDelivery) -> Result<()> {
+    ensure_root(home)?;
+    let _lock = state_lock(home)?;
     let mut outbox = load_outbox(home)?;
     if !outbox.iter().any(|d| d.id == delivery.id) {
         outbox.push(delivery);
-        save_outbox(home, &outbox)?;
+        atomic_write(&outbox_path(home), &serde_json::to_vec_pretty(&outbox)?)?;
     }
     Ok(())
 }
@@ -660,8 +812,20 @@ fn load_thread(home: &Path, config: &RunnerConfig, id: &str) -> Result<Option<Fl
 }
 fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Result<()> {
     ensure_root(home)?;
+    let _lock = state_lock(home)?;
     let mut index = load_threads(home)?;
-    index.insert(thread.id.clone(), thread.clone());
+    let mut private_mapping = thread.clone();
+    if private_mapping.project_label.is_some() {
+        // Bound state is authoritative in the checkout.  The home index only
+        // retains the mapping needed to locate that private runtime snapshot.
+        private_mapping.provider_session = None;
+        private_mapping.slice = None;
+        private_mapping.planning_stage = None;
+        private_mapping.linked_work = None;
+        private_mapping.pending_question = None;
+        private_mapping.processed_events.clear();
+    }
+    index.insert(thread.id.clone(), private_mapping);
     atomic_write(
         &thread_index_path(home),
         &serde_json::to_vec_pretty(&index)?,
@@ -678,6 +842,20 @@ fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Res
         atomic_write(&path, &serde_json::to_vec_pretty(thread)?)?;
     }
     Ok(())
+}
+
+fn state_lock(home: &Path) -> Result<File> {
+    ensure_root(home)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(state_root(home).join("state.lock"))?;
+    let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    if result != 0 {
+        bail!("lock Slack collaboration state");
+    }
+    Ok(file)
 }
 
 #[cfg(test)]

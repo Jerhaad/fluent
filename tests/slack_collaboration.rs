@@ -42,7 +42,7 @@ fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
 
 #[test]
 fn top_level_mention_uses_available_channel_default() {
-    let (home, _checkout, config) = setup(true);
+    let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -51,6 +51,7 @@ fn top_level_mention_uses_available_channel_default() {
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     assert_eq!(runner.provider().calls.len(), 1);
+    assert_eq!(runner.provider().calls[0].1, checkout.path());
 }
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
@@ -92,11 +93,28 @@ fn missing_channel_default_requires_project_selection() {
 }
 #[test]
 fn project_selection_wait_denies_checkout_access() {
-    missing_channel_default_requires_project_selection();
+    let (home, _checkout, config) = setup(false);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.ingest(event("E2", Some("1.0"), "do work")).unwrap();
+    assert!(runner.provider().calls.is_empty());
+    assert_eq!(runner.slack().deliveries.len(), 1);
 }
 #[test]
 fn unavailable_default_offers_available_projects() {
-    let (home, checkout, config) = setup(true);
+    let (home, checkout, mut config) = setup(true);
+    let alternative = TempDir::new().unwrap();
+    fs::create_dir(alternative.path().join(".git")).unwrap();
+    let mut other = config.projects["app"].clone();
+    other.label = "other".into();
+    other.checkout.label = "other-checkout".into();
+    other.checkout.path = alternative.path().into();
+    config.projects.insert("other".into(), other);
     fs::remove_dir(checkout.path().join(".git")).unwrap();
     let mut runner = CollaborationRunner::new(
         home.path(),
@@ -111,6 +129,7 @@ fn unavailable_default_offers_available_projects() {
             .text
             .contains("default is unavailable")
     );
+    assert!(runner.slack().deliveries[0].text.contains("other"));
 }
 #[test]
 fn allowed_reply_continues_slice_without_mention() {
@@ -129,7 +148,22 @@ fn allowed_reply_continues_slice_without_mention() {
 }
 #[test]
 fn agent_response_preserves_thread_context_and_destination() {
-    allowed_reply_continues_slice_without_mention();
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "next thought"))
+        .unwrap();
+    let call = &runner.provider().calls[1];
+    assert_eq!(call.0.as_deref(), Some("session-1"));
+    assert_eq!(call.1, checkout.path());
+    assert_eq!(call.3, "U1");
+    assert_eq!(runner.slack().deliveries[1].thread_timestamp, "1.0");
 }
 #[test]
 fn redelivered_slack_event_has_no_duplicate_effect() {
@@ -147,7 +181,7 @@ fn redelivered_slack_event_has_no_duplicate_effect() {
 }
 #[test]
 fn runner_restart_recovers_active_fluent_thread() {
-    let (home, _checkout, config) = setup(true);
+    let (home, checkout, config) = setup(true);
     let mut initial = CollaborationRunner::new(
         home.path(),
         config.clone(),
@@ -155,6 +189,16 @@ fn runner_restart_recovers_active_fluent_thread() {
         InMemorySlack::default(),
     );
     initial.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let snapshot = checkout.path().join(".fluent/work/slack/threads/1.0.json");
+    let mut thread: FluentThread = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+    thread.slice = Some("slice-7".into());
+    thread.planning_stage = Some("approach".into());
+    thread.linked_work = Some("work-7".into());
+    thread.pending_question = Some("approve plan?".into());
+    thread
+        .processed_events
+        .insert("unprocessed-reply-marker".into());
+    fs::write(&snapshot, serde_json::to_vec_pretty(&thread).unwrap()).unwrap();
     let mut recovered = CollaborationRunner::new(
         home.path(),
         config,
@@ -168,10 +212,43 @@ fn runner_restart_recovers_active_fluent_thread() {
         recovered.provider().calls[0].0.as_deref(),
         Some("session-1")
     );
+    let restored: FluentThread = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert_eq!(restored.slice.as_deref(), Some("slice-7"));
+    assert_eq!(restored.planning_stage.as_deref(), Some("approach"));
+    assert_eq!(restored.linked_work.as_deref(), Some("work-7"));
+    assert_eq!(restored.pending_question.as_deref(), Some("approve plan?"));
+    assert!(
+        restored
+            .processed_events
+            .contains("unprocessed-reply-marker")
+    );
 }
 #[test]
 fn reconnect_reconciles_slack_messages_exactly_once() {
-    runner_restart_recovers_active_fluent_thread();
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut later = event("E3", Some("1.0"), "later");
+    later.timestamp = "3.0".into();
+    let mut earlier = event("E2", Some("1.0"), "earlier");
+    earlier.timestamp = "2.0".into();
+    runner
+        .reconnect([later.clone(), earlier.clone(), earlier], "now".into())
+        .unwrap();
+    assert_eq!(runner.provider().calls[1].2, "earlier");
+    assert_eq!(runner.provider().calls[2].2, "later");
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|d| d.text.contains("reconnected at now"))
+    );
 }
 #[test]
 fn thread_status_shows_runner_last_connection() {
@@ -188,6 +265,12 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         SOCKET_MODE_MANIFEST.contains("socket_mode_enabled: true")
             && !SOCKET_MODE_MANIFEST.contains("request_url")
     );
+    let guide = fs::read_to_string("docs/slack-runner.md").unwrap();
+    assert!(
+        guide.contains("Socket Mode")
+            && guide.contains("Keychain")
+            && guide.contains("LaunchAgent")
+    );
 }
 #[test]
 fn runner_start_preflights_external_and_local_boundaries() {
@@ -201,9 +284,18 @@ fn runner_start_preflights_external_and_local_boundaries() {
 }
 #[test]
 fn invalid_runtime_configuration_fails_closed() {
-    let (_, _checkout, mut config) = setup(true);
+    let (home, _checkout, mut config) = setup(true);
     config.workspace.clear();
-    assert!(config.validate().is_err());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    assert!(runner.ingest(event("E1", None, "@Fluent hello")).is_err());
+    assert!(runner.slack().acknowledgements.is_empty());
+    assert!(runner.provider().calls.is_empty());
+    assert!(runner.slack().deliveries.is_empty());
 }
 
 #[derive(Default)]
