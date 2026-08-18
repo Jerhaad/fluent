@@ -806,4 +806,26 @@ mod tests {
         assert!(rendered.contains("last successful connection"));
         assert!(!rendered.contains("xapp-secret"));
     }
+
+    #[test]
+    fn setup_writes_socket_mode_manifest_and_validates_configuration() {
+        let (home, _checkout, config) = setup();
+        assert!(SOCKET_MODE_MANIFEST.contains("socket_mode_enabled: true"));
+        assert!(!SOCKET_MODE_MANIFEST.contains("request_url"));
+        write_config(home.path(), &config).unwrap();
+        assert_eq!(read_config(home.path()).unwrap().workspace, "workspace");
+        preflight(
+            &config,
+            &InMemoryProvider::default(),
+            &InMemorySlack::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn malformed_configuration_fails_closed() {
+        let (home, _checkout, mut config) = setup();
+        config.workspace.clear();
+        assert!(write_config(home.path(), &config).is_err());
+    }
 }
