@@ -5071,19 +5071,87 @@ fn tester_errored(tester_results_path: &Path) -> bool {
     results.error.is_some()
 }
 
-fn failed_tester_commands(tester_results_path: &Path) -> usize {
-    let content = match fs::read_to_string(tester_results_path) {
-        Ok(content) => content,
-        Err(_) => return 0,
+fn unexplained_failed_tester_commands(
+    tester_results_path: &Path,
+    baseline_path: Option<&Path>,
+) -> usize {
+    let current: crate::tester::TesterResults = match fs::read(tester_results_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+    {
+        Some(results) => results,
+        None => return 0,
     };
-    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
-        Ok(results) => results,
-        Err(_) => return 0,
-    };
-    results
+    let failed_count = current
         .commands
         .iter()
         .filter(|command| command.exit_code != 0)
+        .count();
+    if failed_count == 0 {
+        return 0;
+    }
+    let baseline: crate::tester::TesterResults = match baseline_path
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+    {
+        Some(results) if current.error.is_none() && results.error.is_none() => results,
+        _ => return failed_count,
+    };
+
+    current
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(index, command)| {
+            if command.exit_code == 0 {
+                return false;
+            }
+            let Some(baseline_command) = baseline.commands.get(*index) else {
+                return true;
+            };
+            let command_identity_matches = command.command == baseline_command.command
+                && command.test_harness == baseline_command.test_harness
+                && command.exit_code == baseline_command.exit_code;
+            let settlements_are_clean = [command, baseline_command].iter().all(|command| {
+                command
+                    .process_settlement
+                    .as_ref()
+                    .is_none_or(|settlement| settlement.leaks.is_empty())
+            });
+            let harness_is_unambiguous = current
+                .commands
+                .iter()
+                .filter(|candidate| {
+                    candidate.exit_code != 0 && candidate.test_harness == command.test_harness
+                })
+                .count()
+                == 1
+                && baseline
+                    .commands
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.exit_code != 0 && candidate.test_harness == command.test_harness
+                    })
+                    .count()
+                    == 1;
+            let current_failures = current
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail" && test.test_harness == command.test_harness)
+                .map(|test| test.id.as_str())
+                .collect::<HashSet<_>>();
+            let baseline_failures = baseline
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail" && test.test_harness == command.test_harness)
+                .map(|test| test.id.as_str())
+                .collect::<HashSet<_>>();
+            !(command_identity_matches
+                && settlements_are_clean
+                && harness_is_unambiguous
+                && !current_failures.is_empty()
+                && current_failures.is_subset(&baseline_failures))
+        })
         .count()
 }
 
@@ -5097,12 +5165,11 @@ fn baseline_tester_results_path(project_root: &Path, attempt: &Attempt) -> Optio
 }
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    let start = attempt
+    let latest_write_index = attempt
         .tasks
         .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
-        .map(|index| index + 1)
-        .unwrap_or(0);
+        .rposition(|task| task.kind == TaskKind::Write);
+    let start = latest_write_index.map(|index| index + 1).unwrap_or(0);
     attempt.tasks[start..]
         .iter()
         .rev()
@@ -5116,6 +5183,51 @@ fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<
             work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path).ok()
         })
         .map(|dir| dir.join("tester-results.json"))
+        .or_else(|| {
+            latest_write_index.and_then(|index| {
+                no_change_source_tester_results_path(project_root, attempt, index)
+            })
+        })
+}
+
+fn no_change_source_tester_results_path(
+    project_root: &Path,
+    attempt: &Attempt,
+    latest_write_index: usize,
+) -> Option<PathBuf> {
+    let writer = &attempt.tasks[latest_write_index];
+    let output = writer.output.as_ref()?;
+    output.no_change.as_ref()?;
+    let sources = writer
+        .input_artifacts
+        .iter()
+        .filter(|artifact| artifact.path.ends_with("/tester-results.json"))
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        return None;
+    };
+    let source_task = attempt.tasks[..latest_write_index].iter().find(|task| {
+        task.id == source.producer_id
+            && task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+    })?;
+    let expected = source_task
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/tester-results.json", area.path));
+    if expected.as_deref() != Some(source.path.as_str()) {
+        return None;
+    }
+    let path =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &source.path).ok()?;
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+    if results.candidate_commit.as_deref() != Some(output.commit.as_str()) {
+        return None;
+    }
+    let baseline_path = baseline_tester_results_path(project_root, attempt);
+    (unexplained_failed_tester_commands(&path, baseline_path.as_deref()) == 0).then_some(path)
 }
 
 fn failed_command_recheck_source(
@@ -5188,6 +5300,10 @@ fn failed_command_recheck_source(
         .iter()
         .any(|command| command.exit_code != 0)
     {
+        return Ok(None);
+    }
+    let baseline_path = baseline_tester_results_path(project_root, attempt);
+    if unexplained_failed_tester_commands(&path, baseline_path.as_deref()) == 0 {
         return Ok(None);
     }
     Ok(Some((*source).clone()))
@@ -5477,18 +5593,6 @@ fn recover_legacy_learner_tester_evidence_failure(
         fresh.add_next_write_round(attempt_id, recovery_artifacts.clone())
     })?;
     Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
-}
-
-fn has_tester_after_latest_write(attempt: &Attempt) -> bool {
-    let start = attempt
-        .tasks
-        .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    attempt.tasks[start..]
-        .iter()
-        .any(|task| task.kind == TaskKind::Tester && !task.is_failed_command_recheck())
 }
 
 /// When a marked Attempt's current required progress does not reconcile with its
@@ -5847,14 +5951,23 @@ fn gate_candidate_after_final_tester(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref().map(|output| (task, output)))
         .ok_or_else(|| anyhow::anyhow!("final Tester gate has no completed Writer output"))?;
+    let tester_results_path = tester_results_path
+        .ok_or_else(|| anyhow::anyhow!("final Tester gate has no structured Tester evidence"))?;
     let tester = attempt
         .tasks
         .iter()
         .rev()
-        .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
-        .ok_or_else(|| anyhow::anyhow!("final Tester gate has no completed Tester Task"))?;
-    let tester_results_path = tester_results_path
-        .ok_or_else(|| anyhow::anyhow!("final Tester gate has no structured Tester evidence"))?;
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && task.artifact_area.as_ref().is_some_and(|area| {
+                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                        .is_ok_and(|dir| dir.join("tester-results.json") == tester_results_path)
+                })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("final Tester gate has no matching completed Tester Task")
+        })?;
     let workspace = resolve_managed_sibling_workspace_path(
         project_root,
         &output.workspace_path,
@@ -7004,7 +7117,7 @@ fn interpret_reviews(
     if failed.is_empty()
         && uncertain.is_empty()
         && !item.attempts[attempt_index].kind.is_review_only_like()
-        && !has_tester_after_latest_write(&item.attempts[attempt_index])
+        && latest_tester_results_path(project_root, &item.attempts[attempt_index]).is_none()
     {
         let task_id = item.add_final_tester_task(attempt_id)?;
         store.write_work_item(&item)?;
@@ -7030,7 +7143,7 @@ fn interpret_reviews(
     let tester_failed_command_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
-        .map(|path| failed_tester_commands(path))
+        .map(|path| unexplained_failed_tester_commands(path, baseline_path.as_deref()))
         .unwrap_or(0);
 
     if tester_gate_applicable && tester_fail_count == 0 && !tester_has_error {
@@ -10342,6 +10455,79 @@ mod tests {
     }
 
     #[test]
+    fn baseline_explained_no_change_skips_failed_command_recheck() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&results_path).unwrap()).unwrap();
+        results["tests"] = serde_json::json!([{
+            "id": "baseline_test",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "known baseline failure"
+        }]);
+        results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+
+        let item = store.read_work_item("work-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let source = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let baseline = project.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-baseline-tester",
+        ));
+        fs::create_dir_all(&baseline).unwrap();
+        fs::copy(&source, baseline.join("tester-results.json")).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::PlannedReviews { .. }),
+            "baseline-explained no-change should plan reviews, got {outcome:?}"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !task.is_failed_command_recheck()),
+            "baseline-equivalent Tester evidence must not be rerun"
+        );
+        assert_eq!(
+            latest_tester_results_path(project.path(), &stored.attempts[0]).as_deref(),
+            Some(source.as_path()),
+            "the no-change Writer preserves the candidate-bound final Tester"
+        );
+    }
+
+    #[test]
     fn reviews_after_passing_recheck_still_plan_full_final_tester() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
@@ -11542,6 +11728,24 @@ mod tests {
         )
     }
 
+    fn tester_json_with_failed_command(fail_ids: &[&str], command: &str, exit_code: i32) -> String {
+        let mut results: serde_json::Value =
+            serde_json::from_str(&tester_json_with_ids(fail_ids, &[])).unwrap();
+        results["commands"] = serde_json::json!([{
+            "command": command,
+            "test_harness": "cargo-nextest",
+            "exit_code": exit_code,
+            "duration_ms": 10,
+            "stdout_log": "commands/0-stdout.log",
+            "stderr_log": "commands/0-stderr.log",
+            "process_settlement": {
+                "settlement_directory": "commands/settlement/0",
+                "leaks": []
+            }
+        }]);
+        serde_json::to_string(&results).unwrap()
+    }
+
     #[test]
     fn failing_ids_extracts_fail_test_ids() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -11582,6 +11786,43 @@ mod tests {
     }
 
     #[test]
+    fn baseline_explains_matching_failed_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = tmp.path().join("current.json");
+        let baseline = tmp.path().join("baseline.json");
+        let results = tester_json_with_failed_command(&["test_a"], "cargo nextest run", 100);
+        fs::write(&current, &results).unwrap();
+        fs::write(&baseline, &results).unwrap();
+
+        assert_eq!(
+            unexplained_failed_tester_commands(&current, Some(&baseline)),
+            0
+        );
+    }
+
+    #[test]
+    fn changed_failed_tester_command_is_not_explained_by_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let current = tmp.path().join("current.json");
+        let baseline = tmp.path().join("baseline.json");
+        fs::write(
+            &current,
+            tester_json_with_failed_command(&["test_a"], "cargo nextest run --all", 100),
+        )
+        .unwrap();
+        fs::write(
+            &baseline,
+            tester_json_with_failed_command(&["test_a"], "cargo nextest run", 100),
+        )
+        .unwrap();
+
+        assert_eq!(
+            unexplained_failed_tester_commands(&current, Some(&baseline)),
+            1
+        );
+    }
+
+    #[test]
     fn preexisting_failures_pass_gate_with_baseline() {
         let tmp = tempfile::TempDir::new().unwrap();
         let baseline_json = tester_json_with_ids(&["test_b"], &["test_a"]);
@@ -11597,6 +11838,21 @@ mod tests {
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
             "pre-existing failure should pass gate when baseline matches; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn preexisting_failed_command_passes_gate_with_matching_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let results = tester_json_with_failed_command(&["test_b"], "cargo nextest run", 100);
+        let (store, _) =
+            make_fixture_with_baseline(tmp.path(), "PASS", Some(&results), Some(&results));
+        let item = store.read_work_item("work-1").unwrap();
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+
+        assert!(
+            matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
+            "a baseline-explained command exit should pass the gate; got {outcome:?}"
         );
     }
 
