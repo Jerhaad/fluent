@@ -62,6 +62,7 @@ pub mod scheduler_service;
 pub mod scope_calibration;
 pub mod setup;
 pub mod skill_install;
+pub mod slack_collaboration;
 #[cfg(test)]
 pub(crate) mod test_lock_probe;
 pub mod tester;
