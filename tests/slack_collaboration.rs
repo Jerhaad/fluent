@@ -107,16 +107,18 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
     let executable = fixture.path().join("codex-fixture");
     fs::write(
         &executable,
-        "#!/bin/sh\nif [ \"${2:-}\" = \"--help\" ]; then exit 0; fi\nrequest=$(cat)\ncase \"$request\" in *'\"action_id\":\"action-1\"'*) ;; *) exit 2;; esac\nprintf '%s' '{\"session\":\"session-1\",\"reply\":\"provider reply\"}'\n",
+        "#!/bin/sh\nif [ \"${2:-}\" = \"--help\" ]; then exit 0; fi\nrequest=$(cat)\ncase \"$request\" in *'\"action_id\":\"action-1\"'*) ;; *) exit 2;; esac\ncase \"$request\" in *'\"slice_draft\":'*) ;; *) exit 3;; esac\nprintf '%s' '{\"session\":\"session-1\",\"reply\":\"provider reply\"}'\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
     let checkout = TempDir::new().unwrap();
+    let scope = ProviderScope {
+        checkout: checkout.path().into(),
+        slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
+    };
     let mut provider = CodexAppServerProvider::new(executable);
     provider.ready().unwrap();
-    let (session, reply) = provider
-        .start("action-1", checkout.path(), "hello", "U1")
-        .unwrap();
+    let (session, reply) = provider.start("action-1", &scope, "hello", "U1").unwrap();
     assert_eq!(session, "session-1");
     assert_eq!(reply, "provider reply");
 }
@@ -166,6 +168,32 @@ struct FailingSlack {
     deliveries: Vec<OutboundDelivery>,
 }
 
+#[derive(Default)]
+struct RecoverySlack {
+    acknowledgements: Vec<String>,
+    deliveries: Vec<OutboundDelivery>,
+    history: Vec<InboundEnvelope>,
+}
+
+impl SlackTransport for RecoverySlack {
+    fn acknowledge(&mut self, event_id: &str) -> anyhow::Result<()> {
+        self.acknowledgements.push(event_id.into());
+        Ok(())
+    }
+
+    fn post(&mut self, delivery: &OutboundDelivery) -> anyhow::Result<()> {
+        self.deliveries.push(delivery.clone());
+        Ok(())
+    }
+
+    fn bounded_history(
+        &mut self,
+        _threads: &[(String, String)],
+    ) -> anyhow::Result<Vec<InboundEnvelope>> {
+        Ok(std::mem::take(&mut self.history))
+    }
+}
+
 impl SlackTransport for FailingSlack {
     fn acknowledge(&mut self, event_id: &str) -> anyhow::Result<()> {
         if self.fail_acknowledgements > 0 {
@@ -195,7 +223,7 @@ impl ConversationProvider for CrashOnceProvider {
     fn start(
         &mut self,
         action_id: &str,
-        _checkout: &std::path::Path,
+        _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
     ) -> anyhow::Result<(String, String)> {
@@ -217,7 +245,7 @@ impl ConversationProvider for CrashOnceProvider {
         &mut self,
         action_id: &str,
         session: &str,
-        _checkout: &std::path::Path,
+        _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
     ) -> anyhow::Result<String> {
@@ -298,6 +326,66 @@ fn acknowledged_pending_event_replays_after_restart_once() {
             .count(),
         1
     );
+}
+
+#[test]
+fn configured_recovery_replays_pending_ingress_on_startup() {
+    let (home, _checkout, config) = setup(true);
+    let inbound = event("E1", None, "@Fluent recover this");
+    let mut failed = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        FailingSlack {
+            fail_acknowledgements: 1,
+            ..Default::default()
+        },
+    );
+    assert!(failed.ingest(inbound).is_err());
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        RecoverySlack::default(),
+    );
+    reconcile_connected_runner(&mut recovered).unwrap();
+
+    assert_eq!(recovered.provider().calls.len(), 1);
+    assert_eq!(recovered.slack().acknowledgements, ["E1"]);
+    let status = read_runner_operational_state(home.path()).unwrap();
+    assert!(status.connected);
+    assert!(status.last_successful_connection.is_some());
+}
+
+#[test]
+fn configured_recovery_reconciles_bounded_thread_history() {
+    let (home, _checkout, config) = setup(true);
+    let mut initial = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        FailingSlack::default(),
+    );
+    initial.ingest(event("E1", None, "@Fluent start")).unwrap();
+
+    let mut historical = event("history:C1:2.0", Some("1.0"), "missed reply");
+    historical.timestamp = "2.0".into();
+    historical.acknowledgement_id.clear();
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        RecoverySlack {
+            history: vec![historical],
+            ..Default::default()
+        },
+    );
+    reconcile_connected_runner(&mut recovered).unwrap();
+
+    assert_eq!(recovered.provider().calls.len(), 1);
+    assert_eq!(recovered.provider().calls[0].2, "missed reply");
+    assert!(recovered.slack().acknowledgements.is_empty());
 }
 
 #[test]
@@ -434,6 +522,31 @@ fn bound_thread_home_index_excludes_active_snapshot_state() {
     assert_eq!(mapping.project_label.as_deref(), Some("app"));
     assert!(mapping.provider_session.is_none());
     assert!(mapping.processed_events.is_empty());
+}
+
+#[test]
+fn missing_bound_snapshot_fails_instead_of_loading_stripped_index_state() {
+    let (home, checkout, config) = setup(true);
+    let mut initial = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    initial.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    fs::remove_file(checkout.path().join(".fluent/work/slack/threads/1.0.json")).unwrap();
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    let error = recovered
+        .ingest(event("E2", Some("1.0"), "resume"))
+        .unwrap_err();
+    assert!(error.to_string().contains("snapshot 1.0 is unavailable"));
+    assert!(recovered.provider().calls.is_empty());
 }
 #[test]
 fn missing_channel_default_requires_project_selection() {
@@ -585,7 +698,7 @@ fn runner_restart_recovers_active_fluent_thread() {
         home.path(),
         config.clone(),
         InMemoryProvider::default(),
-        InMemorySlack::default(),
+        FailingSlack::default(),
     );
     initial.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let snapshot = checkout.path().join(".fluent/work/slack/threads/1.0.json");
@@ -594,19 +707,20 @@ fn runner_restart_recovers_active_fluent_thread() {
     thread.planning_stage = Some("approach".into());
     thread.linked_work = Some("work-7".into());
     thread.pending_question = Some("approve plan?".into());
-    thread
-        .processed_events
-        .insert("unprocessed-reply-marker".into());
     fs::write(&snapshot, serde_json::to_vec_pretty(&thread).unwrap()).unwrap();
+    initial.slack_mut().fail_acknowledgements = 1;
+    assert!(
+        initial
+            .ingest(event("E2", Some("1.0"), "resume after restart"))
+            .is_err()
+    );
     let mut recovered = CollaborationRunner::new(
         home.path(),
         config,
         InMemoryProvider::default(),
-        InMemorySlack::default(),
+        RecoverySlack::default(),
     );
-    recovered
-        .ingest(event("E2", Some("1.0"), "resume"))
-        .unwrap();
+    reconcile_connected_runner(&mut recovered).unwrap();
     assert_eq!(
         recovered.provider().calls[0].0.as_deref(),
         Some("session-1")
@@ -616,11 +730,7 @@ fn runner_restart_recovers_active_fluent_thread() {
     assert_eq!(restored.planning_stage.as_deref(), Some("approach"));
     assert_eq!(restored.linked_work.as_deref(), Some("work-7"));
     assert_eq!(restored.pending_question.as_deref(), Some("approve plan?"));
-    assert!(
-        restored
-            .processed_events
-            .contains("unprocessed-reply-marker")
-    );
+    assert!(restored.processed_events.contains("E2"));
 }
 #[test]
 fn reconnect_reconciles_slack_messages_exactly_once() {
@@ -648,15 +758,37 @@ fn reconnect_reconciles_slack_messages_exactly_once() {
             .iter()
             .any(|d| d.id == "1.0:status" && d.text.contains("last connected at now"))
     );
+    runner.reconnect([], "later".into()).unwrap();
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains("last connected at later")
+    );
 }
 #[test]
 fn thread_status_shows_runner_last_connection() {
-    let (_, _checkout, config) = setup(true);
-    assert!(
-        runner_status(&config, true, Some("now".into()), None)
-            .to_string()
-            .contains("last successful connection")
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        RecoverySlack::default(),
     );
+    reconcile_connected_runner(&mut runner).unwrap();
+    let operational = read_runner_operational_state(home.path()).unwrap();
+    let rendered = runner_status(
+        &config,
+        operational.connected,
+        operational.last_successful_connection,
+        operational.failure,
+    )
+    .to_string();
+    assert!(rendered.contains("connection: connected"));
+    assert!(rendered.contains("last successful connection"));
 }
 #[test]
 fn setup_provides_socket_mode_manifest_without_public_endpoint() {
@@ -733,10 +865,20 @@ fn slack_credentials_use_host_store_and_are_redacted() {
 
 #[test]
 fn sandboxed_setup_reports_host_handoff_without_false_login_failure() {
-    let handoff = host_handoff("fluent slack setup");
+    let handoff = classify_host_boundary(
+        anyhow::anyhow!("launchctl: Operation not permitted by sandbox"),
+        "fluent slack enable",
+    )
+    .to_string();
     assert!(handoff.contains("outside the agent sandbox"));
-    assert!(handoff.contains("fluent slack setup"));
+    assert!(handoff.contains("fluent slack enable"));
     assert!(!handoff.to_lowercase().contains("login is invalid"));
+
+    let authentication = classify_host_boundary(
+        anyhow::anyhow!("Slack authentication failed"),
+        "fluent slack run",
+    );
+    assert_eq!(authentication.to_string(), "Slack authentication failed");
 }
 
 #[test]

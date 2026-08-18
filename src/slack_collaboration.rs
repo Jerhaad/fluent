@@ -16,6 +16,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_write::atomic_write;
+use crate::coder::CoderKind;
+use crate::content::ContentResolver;
 
 /// Slack app manifest for a local Socket Mode installation. It intentionally
 /// has no request URL because the runner never accepts public HTTP ingress.
@@ -57,7 +59,7 @@ pub trait SecretStore {
 pub struct KeychainSecretStore;
 impl SecretStore for KeychainSecretStore {
     fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()> {
-        let status = Command::new("security")
+        let output = Command::new("security")
             .args([
                 "add-generic-password",
                 "-U",
@@ -68,10 +70,13 @@ impl SecretStore for KeychainSecretStore {
                 "-w",
                 secret,
             ])
-            .status()
+            .output()
             .context("invoke macOS Keychain")?;
-        if !status.success() {
-            bail!("macOS Keychain rejected Slack credential");
+        if !output.status.success() {
+            bail!(
+                "macOS Keychain rejected Slack credential: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -81,7 +86,10 @@ impl SecretStore for KeychainSecretStore {
             .output()
             .context("read macOS Keychain")?;
         if !output.status.success() {
-            bail!("macOS Keychain has no Slack credential");
+            bail!(
+                "macOS Keychain has no Slack credential: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
     }
@@ -122,6 +130,25 @@ pub fn host_handoff(command: &str) -> String {
     format!("Host access is required. Run outside the agent sandbox: {command}")
 }
 
+/// Preserve permission-denial classification at owner-only boundaries while
+/// leaving ordinary Slack authentication and configuration failures intact.
+pub fn classify_host_boundary(error: anyhow::Error, command: &str) -> anyhow::Error {
+    let diagnostic = format!("{error:#}");
+    let lowered = diagnostic.to_ascii_lowercase();
+    if lowered.contains("operation not permitted")
+        || lowered.contains("permission denied")
+        || lowered.contains("sandbox")
+    {
+        anyhow::anyhow!(
+            "{}\nCause: {}",
+            host_handoff(command),
+            redact_secrets(&diagnostic)
+        )
+    } else {
+        error
+    }
+}
+
 /// Background-service boundary for the per-user LaunchAgent. A production
 /// adapter owns `launchctl`; the coordinator never shells out to it directly.
 pub trait ServiceManager {
@@ -148,11 +175,14 @@ impl LaunchAgentServiceManager {
         format!("gui/{}", unsafe { libc::getuid() })
     }
     fn run(&self, verb: &str) -> Result<()> {
-        let status = Command::new("launchctl")
+        let output = Command::new("launchctl")
             .args([verb, &self.domain(), &self.plist.display().to_string()])
-            .status()?;
-        if !status.success() {
-            bail!("launchctl {verb} failed");
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "launchctl {verb} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -188,11 +218,14 @@ impl ServiceManager for LaunchAgentServiceManager {
         self.start()
     }
     fn stop(&mut self) -> Result<()> {
-        let status = Command::new("launchctl")
+        let output = Command::new("launchctl")
             .args(["bootout", &self.domain(), &self.plist.display().to_string()])
-            .status()?;
-        if !status.success() {
-            bail!("launchctl bootout failed");
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "launchctl bootout failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -263,6 +296,26 @@ pub struct RunnerStatus {
     pub failure: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerOperationalState {
+    pub connected: bool,
+    pub last_successful_connection: Option<String>,
+    pub failure: Option<String>,
+}
+
+pub fn read_runner_operational_state(home: &Path) -> Result<RunnerOperationalState> {
+    read_json(operational_status_path(home))
+}
+
+fn save_runner_operational_state(home: &Path, state: &RunnerOperationalState) -> Result<()> {
+    ensure_root(home)?;
+    atomic_write(
+        &operational_status_path(home),
+        &serde_json::to_vec_pretty(state)?,
+    )?;
+    Ok(())
+}
+
 impl std::fmt::Display for RunnerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -316,6 +369,9 @@ fn outbox_path(home: &Path) -> PathBuf {
 }
 fn thread_index_path(home: &Path) -> PathBuf {
     state_root(home).join("threads.json")
+}
+fn operational_status_path(home: &Path) -> PathBuf {
+    state_root(home).join("status.json")
 }
 fn thread_path(project: &Path, id: &str) -> PathBuf {
     project
@@ -459,12 +515,19 @@ impl FluentThread {
     }
 }
 
-/// The provider receives a checkout only once a thread is active and bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderScope {
+    pub checkout: PathBuf,
+    pub slice_draft: PathBuf,
+}
+
+/// The provider receives an explicit stage scope only once a thread is active
+/// and bound.
 pub trait ConversationProvider {
     fn start(
         &mut self,
         action_id: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)>;
@@ -472,7 +535,7 @@ pub trait ConversationProvider {
         &mut self,
         action_id: &str,
         session: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<String>;
@@ -492,6 +555,12 @@ pub trait SlackTransport {
     fn receive(&mut self) -> Result<InboundEnvelope> {
         bail!("Slack transport does not receive Socket Mode envelopes")
     }
+    fn reconnect(&mut self) -> Result<()> {
+        bail!("Slack transport cannot reconnect")
+    }
+    fn bounded_history(&mut self, _threads: &[(String, String)]) -> Result<Vec<InboundEnvelope>> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -503,7 +572,7 @@ impl ConversationProvider for InMemoryProvider {
     fn start(
         &mut self,
         action_id: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
@@ -512,7 +581,7 @@ impl ConversationProvider for InMemoryProvider {
         }
         self.calls.push((
             None,
-            checkout.to_path_buf(),
+            scope.checkout.clone(),
             contribution.into(),
             actor.into(),
         ));
@@ -528,7 +597,7 @@ impl ConversationProvider for InMemoryProvider {
         &mut self,
         action_id: &str,
         session: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<String> {
@@ -537,7 +606,7 @@ impl ConversationProvider for InMemoryProvider {
         }
         self.calls.push((
             Some(session.into()),
-            checkout.to_path_buf(),
+            scope.checkout.clone(),
             contribution.into(),
             actor.into(),
         ));
@@ -572,12 +641,11 @@ pub struct SocketModeTransport {
 }
 
 impl SocketModeTransport {
-    pub fn connect(
-        api_base: impl Into<String>,
-        app_token: String,
-        bot_token: String,
-    ) -> Result<Self> {
-        let api_base = api_base.into();
+    fn open_socket(
+        api_base: &str,
+        app_token: &str,
+    ) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>>
+    {
         let response = ureq::post(&format!(
             "{}/apps.connections.open",
             api_base.trim_end_matches('/')
@@ -586,7 +654,16 @@ impl SocketModeTransport {
         .send_json(serde_json::json!({}))?;
         let value: serde_json::Value = response.into_json()?;
         let url = value["url"].as_str().context("Slack Socket Mode URL")?;
-        let (socket, _) = tungstenite::connect(url)?;
+        Ok(tungstenite::connect(url)?.0)
+    }
+
+    pub fn connect(
+        api_base: impl Into<String>,
+        app_token: String,
+        bot_token: String,
+    ) -> Result<Self> {
+        let api_base = api_base.into();
+        let socket = Self::open_socket(&api_base, &app_token)?;
         Ok(Self {
             web: SlackWebApiTransport::new(api_base, app_token, bot_token),
             socket,
@@ -634,6 +711,38 @@ impl SlackTransport for SocketModeTransport {
         let text = message.into_text()?;
         decode_socket_mode_envelope(&text)
     }
+    fn reconnect(&mut self) -> Result<()> {
+        self.socket = Self::open_socket(&self.web.api_base, &self.web.app_token)?;
+        Ok(())
+    }
+    fn bounded_history(&mut self, threads: &[(String, String)]) -> Result<Vec<InboundEnvelope>> {
+        let mut events = Vec::new();
+        for (channel, thread_timestamp) in threads {
+            let value = self.web.call_value(
+                "conversations.replies",
+                &self.web.bot_token,
+                serde_json::json!({"channel": channel, "ts": thread_timestamp, "limit": 100}),
+            )?;
+            for message in value["messages"].as_array().into_iter().flatten() {
+                let Some(timestamp) = message["ts"].as_str() else {
+                    continue;
+                };
+                if timestamp == thread_timestamp {
+                    continue;
+                }
+                events.push(InboundEnvelope {
+                    id: format!("history:{channel}:{timestamp}"),
+                    acknowledgement_id: String::new(),
+                    channel: channel.clone(),
+                    timestamp: timestamp.into(),
+                    thread_timestamp: Some(thread_timestamp.clone()),
+                    user: message["user"].as_str().unwrap_or_default().into(),
+                    text: message["text"].as_str().unwrap_or_default().into(),
+                });
+            }
+        }
+        Ok(events)
+    }
 }
 
 /// Native Rust Web API edge used by the Socket Mode runner for durable posts.
@@ -652,7 +761,12 @@ impl SlackWebApiTransport {
             bot_token,
         }
     }
-    fn call(&self, method: &str, token: &str, body: serde_json::Value) -> Result<()> {
+    fn call_value(
+        &self,
+        method: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let response = ureq::post(&format!("{}/{method}", self.api_base))
             .set("Authorization", &format!("Bearer {token}"))
             .send_json(body)?;
@@ -660,7 +774,10 @@ impl SlackWebApiTransport {
         if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             bail!("Slack {method} failed")
         }
-        Ok(())
+        Ok(value)
+    }
+    fn call(&self, method: &str, token: &str, body: serde_json::Value) -> Result<()> {
+        self.call_value(method, token, body).map(|_| ())
     }
 }
 
@@ -686,26 +803,65 @@ impl SlackTransport for SlackWebApiTransport {
 /// stable action id so a replay reconciles the same provider turn.
 pub struct CodexAppServerProvider {
     executable: PathBuf,
+    runner_home: Option<PathBuf>,
 }
 
 impl CodexAppServerProvider {
     pub fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        Self {
+            executable,
+            runner_home: None,
+        }
+    }
+    pub fn new_scoped(executable: PathBuf, runner_home: PathBuf) -> Self {
+        Self {
+            executable,
+            runner_home: Some(runner_home),
+        }
     }
     fn turn(
         &self,
         action_id: &str,
         session: Option<&str>,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
-        let mut child = Command::new(&self.executable)
-            .arg("app-server")
+        fs::create_dir_all(&scope.slice_draft)?;
+        let profile = if let Some(runner_home) = &self.runner_home {
+            let codex_home = state_root(runner_home).join("provider/codex-home");
+            fs::create_dir_all(&codex_home)?;
+            let resolver = ContentResolver::new(Some(&scope.checkout));
+            let profile = crate::os::render_profile_for_access_for_coder_with_codex_home(
+                &resolver,
+                &runner_home.display().to_string(),
+                &[scope.slice_draft.clone(), codex_home.clone()],
+                std::slice::from_ref(&scope.checkout),
+                CoderKind::Codex,
+                Some(&codex_home),
+            )?;
+            crate::os::preflight_profile(&profile)?;
+            Some(profile)
+        } else {
+            None
+        };
+        let mut command = if let Some(profile) = &profile {
+            crate::os::command_under_profile(profile, &self.executable)
+        } else {
+            Command::new(&self.executable)
+        };
+        command.arg("app-server");
+        if let Some(runner_home) = &self.runner_home {
+            command.env(
+                "CODEX_HOME",
+                state_root(runner_home).join("provider/codex-home"),
+            );
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
-        let request = serde_json::json!({"action_id": action_id, "session": session, "checkout": checkout, "contribution": contribution, "actor": actor});
+        let request = serde_json::json!({"action_id": action_id, "session": session, "checkout": scope.checkout, "slice_draft": scope.slice_draft, "contribution": contribution, "actor": actor});
         child
             .stdin
             .as_mut()
@@ -733,22 +889,22 @@ impl ConversationProvider for CodexAppServerProvider {
     fn start(
         &mut self,
         action_id: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
-        self.turn(action_id, None, checkout, contribution, actor)
+        self.turn(action_id, None, scope, contribution, actor)
     }
     fn resume(
         &mut self,
         action_id: &str,
         session: &str,
-        checkout: &Path,
+        scope: &ProviderScope,
         contribution: &str,
         actor: &str,
     ) -> Result<String> {
         Ok(self
-            .turn(action_id, Some(session), checkout, contribution, actor)?
+            .turn(action_id, Some(session), scope, contribution, actor)?
             .1)
     }
     fn ready(&self) -> Result<()> {
@@ -802,14 +958,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         }
         match persist_inbox(self.home, &event)? {
             InboxState::Processed => return Ok(()),
-            InboxState::Pending => {
-                self.slack
-                    .acknowledge(if event.acknowledgement_id.is_empty() {
-                        &event.id
-                    } else {
-                        &event.acknowledgement_id
-                    })?
+            InboxState::Pending if !event.acknowledgement_id.is_empty() => {
+                self.slack.acknowledge(&event.acknowledgement_id)?
             }
+            InboxState::Pending => {}
         }
         self.process(event.clone())?;
         mark_inbox_processed(self.home, &event.id)?;
@@ -817,13 +969,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
     }
     pub fn reconnect(
         &mut self,
-        events: impl IntoIterator<Item = InboundEnvelope>,
+        history: impl IntoIterator<Item = InboundEnvelope>,
         connected_at: String,
     ) -> Result<()> {
-        for pending in load_pending_inbox(self.home)? {
-            self.ingest(pending)?;
-        }
-        let mut events: Vec<_> = events.into_iter().collect();
+        let mut events = load_pending_inbox(self.home)?;
+        events.extend(history);
         events.sort_by(|left, right| {
             left.timestamp
                 .cmp(&right.timestamp)
@@ -851,6 +1001,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             )?;
         }
         self.deliver_pending()
+    }
+
+    pub fn recovery_targets(&self) -> Result<Vec<(String, String)>> {
+        Ok(load_threads(self.home)?
+            .into_values()
+            .filter(|thread| thread.state == ThreadState::Active)
+            .map(|thread| (thread.channel, thread.id))
+            .collect())
     }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = load_outbox(self.home)?;
@@ -937,10 +1095,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             .clone()
             .context("thread has no pending provider turn")?;
         let checkout = self.bound_project(thread)?.checkout.path.clone();
+        let scope = ProviderScope {
+            slice_draft: checkout.join(".fluent/work/slack/drafts").join(&thread.id),
+            checkout,
+        };
         let reply = if turn.starts_session {
             let (session, reply) =
                 self.provider
-                    .start(&turn.action_id, &checkout, &turn.contribution, &turn.actor)?;
+                    .start(&turn.action_id, &scope, &turn.contribution, &turn.actor)?;
             thread.provider_session = Some(session);
             format!(
                 "Bound to {}.\n{}",
@@ -955,7 +1117,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             self.provider.resume(
                 &turn.action_id,
                 session,
-                &checkout,
+                &scope,
                 &turn.contribution,
                 &turn.actor,
             )?
@@ -1083,6 +1245,29 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
     Ok(())
 }
 
+fn connection_time() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Replay durable ingress and bounded Slack history through the same
+/// idempotent coordinator path after startup or reconnect.
+pub fn reconcile_connected_runner<P: ConversationProvider, S: SlackTransport>(
+    runner: &mut CollaborationRunner<'_, P, S>,
+) -> Result<()> {
+    let targets = runner.recovery_targets()?;
+    let history = runner.slack_mut().bounded_history(&targets)?;
+    let connected_at = connection_time();
+    runner.reconnect(history, connected_at.clone())?;
+    save_runner_operational_state(
+        runner.home,
+        &RunnerOperationalState {
+            connected: true,
+            last_successful_connection: Some(connected_at),
+            failure: None,
+        },
+    )
+}
+
 /// Validate owner-scoped configuration and read both Keychain credentials
 /// before the foreground runner enters its transport loop.
 pub fn run_configured_runner(home: &Path) -> Result<()> {
@@ -1095,13 +1280,28 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     let codex = std::env::var_os("FLUENT_CODEX_APP_SERVER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("codex"));
-    let provider = CodexAppServerProvider::new(codex);
+    let provider = CodexAppServerProvider::new_scoped(codex, home.to_path_buf());
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
     preflight(&config, &provider, &slack)?;
     let mut runner = CollaborationRunner::new(home, config, provider, slack);
+    reconcile_connected_runner(&mut runner)?;
     loop {
-        let event = runner.slack_mut().receive()?;
-        runner.ingest(event)?;
+        match runner.slack_mut().receive() {
+            Ok(event) => runner.ingest(event)?,
+            Err(error) => {
+                let previous = read_runner_operational_state(home).unwrap_or_default();
+                save_runner_operational_state(
+                    home,
+                    &RunnerOperationalState {
+                        connected: false,
+                        last_successful_connection: previous.last_successful_connection,
+                        failure: Some(redact_secrets(&error.to_string())),
+                    },
+                )?;
+                runner.slack_mut().reconnect()?;
+                reconcile_connected_runner(&mut runner)?;
+            }
+        }
     }
 }
 
@@ -1138,6 +1338,15 @@ fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<InboxState> {
         } else {
             InboxState::Pending
         });
+    }
+    if inbox.values().any(|entry| {
+        entry.processed
+            && entry.event.channel == event.channel
+            && entry.event.timestamp == event.timestamp
+            && entry.event.user == event.user
+            && entry.event.text == event.text
+    }) {
+        return Ok(InboxState::Processed);
     }
     inbox.insert(
         event.id.clone(),
@@ -1185,7 +1394,12 @@ fn persist_outbox(home: &Path, delivery: OutboundDelivery) -> Result<()> {
     ensure_root(home)?;
     let _lock = state_lock(home)?;
     let mut outbox = load_outbox(home)?;
-    if !outbox.iter().any(|d| d.id == delivery.id) {
+    if let Some(existing) = outbox.iter_mut().find(|item| item.id == delivery.id) {
+        if delivery.id.ends_with(":status") && existing.text != delivery.text {
+            *existing = delivery;
+            atomic_write(&outbox_path(home), &serde_json::to_vec_pretty(&outbox)?)?;
+        }
+    } else {
         outbox.push(delivery);
         atomic_write(&outbox_path(home), &serde_json::to_vec_pretty(&outbox)?)?;
     }
@@ -1209,7 +1423,9 @@ fn load_thread(home: &Path, config: &RunnerConfig, id: &str) -> Result<Option<Fl
     let path = thread_path(&project.checkout.path, id);
     match fs::read(path) {
         Ok(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(stub.clone())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("bound Slack thread snapshot {id} is unavailable")
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -1228,11 +1444,6 @@ fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Res
         private_mapping.pending_question = None;
         private_mapping.processed_events.clear();
     }
-    index.insert(thread.id.clone(), private_mapping);
-    atomic_write(
-        &thread_index_path(home),
-        &serde_json::to_vec_pretty(&index)?,
-    )?;
     if let Some(project) = thread
         .project_label
         .as_ref()
@@ -1244,6 +1455,14 @@ fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Res
         }
         atomic_write(&path, &serde_json::to_vec_pretty(thread)?)?;
     }
+    // Publish the private locator only after the authoritative bound snapshot
+    // is durable. A crash can leave an unreferenced snapshot, never a locator
+    // that resolves to stripped or missing state.
+    index.insert(thread.id.clone(), private_mapping);
+    atomic_write(
+        &thread_index_path(home),
+        &serde_json::to_vec_pretty(&index)?,
+    )?;
     Ok(())
 }
 

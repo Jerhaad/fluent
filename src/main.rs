@@ -263,7 +263,9 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
             let home = slack_home()?;
             let executable = std::env::current_exe()?;
             let mut manager = LaunchAgentServiceManager::new(&home);
-            slack_collaboration::enable_runner(&mut manager, &executable)?;
+            slack_collaboration::enable_runner(&mut manager, &executable).map_err(|error| {
+                slack_collaboration::classify_host_boundary(error, "fluent slack enable")
+            })?;
             println!("enabled Slack runner at {}", manager.plist.display());
         }
         SlackCommands::Restart => {
@@ -279,17 +281,22 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
         SlackCommands::Status => {
             let home = slack_home()?;
             let config = slack_collaboration::read_config(&home)?;
+            let operational = slack_collaboration::read_runner_operational_state(&home)?;
             println!(
                 "{}",
                 slack_collaboration::runner_status(
                     &config,
-                    false,
-                    None,
-                    Some("runner connection status is available after a successful Socket Mode session".into()),
+                    operational.connected,
+                    operational.last_successful_connection,
+                    operational.failure,
                 )
             );
         }
-        SlackCommands::Run => slack_collaboration::run_configured_runner(&slack_home()?)?,
+        SlackCommands::Run => {
+            slack_collaboration::run_configured_runner(&slack_home()?).map_err(|error| {
+                slack_collaboration::classify_host_boundary(error, "fluent slack run")
+            })?
+        }
     }
     Ok(())
 }
