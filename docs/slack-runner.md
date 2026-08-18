@@ -27,8 +27,14 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    security add-generic-password -U -a bot-token -s dev.fluent.slack -w "$FLUENT_SLACK_TOKEN"
    unset FLUENT_SLACK_TOKEN
    ```
-5. Create `~/.config/fluent/slack/config.json` with the runner policy. For
-   example:
+5. Create the runner configuration directory and then create
+   `~/.config/fluent/slack/config.json` with the runner policy:
+
+   ```sh
+   mkdir -p ~/.config/fluent/slack
+   ```
+
+   For example, write this policy to `config.json`:
 
    ```json
    {"workspace":"example","projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"]}},"channel_defaults":{"C123":"app"}}

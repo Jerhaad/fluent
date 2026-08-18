@@ -1409,14 +1409,21 @@ fn missing_channel_default_requires_project_selection() {
 #[test]
 fn project_selection_wait_denies_checkout_access() {
     let (home, _checkout, config) = setup(false);
+    let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
         home.path(),
-        config,
+        config.clone(),
         InMemoryProvider::default(),
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let waiting = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(waiting.state, ThreadState::WaitingForProject);
+    assert!(waiting.project_label.is_none());
     runner.ingest(event("E2", Some("1.0"), "do work")).unwrap();
+    let still_waiting = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(still_waiting.state, ThreadState::WaitingForProject);
+    assert!(still_waiting.project_label.is_none());
     assert!(runner.provider().calls.is_empty());
     assert_eq!(runner.slack().deliveries.len(), 1);
 }
@@ -1683,6 +1690,7 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         guide.contains("Socket Mode")
             && guide.contains("Keychain")
             && guide.contains("LaunchAgent")
+            && guide.contains("mkdir -p ~/.config/fluent/slack")
             && guide.contains("fluent slack checkout-identity")
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")
@@ -1809,20 +1817,106 @@ fn slack_credentials_use_host_store_and_are_redacted() {
         "add-generic-password -U -a {BOT_TOKEN_ACCOUNT} -s {KEYCHAIN_SERVICE} -w {bot_token}"
     )));
 
-    let (_, _checkout, config) = setup(true);
-    let serialized_config = serde_json::to_string(&config).unwrap();
+    struct CredentialEchoProvider {
+        app_token: String,
+        bot_token: String,
+    }
+    impl ConversationProvider for CredentialEchoProvider {
+        fn start(
+            &mut self,
+            _action_id: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<(String, String)> {
+            Ok((
+                "session-1".into(),
+                format!("provider error: {} {}", self.app_token, self.bot_token),
+            ))
+        }
+
+        fn resume(
+            &mut self,
+            _action_id: &str,
+            _session: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+
+    fn assert_tree_excludes(root: &std::path::Path, tokens: &[&str]) {
+        let mut paths = vec![root.to_path_buf()];
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                paths.extend(
+                    fs::read_dir(path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                continue;
+            }
+            let bytes = fs::read(&path).unwrap();
+            for token in tokens {
+                assert!(
+                    !bytes
+                        .windows(token.len())
+                        .any(|window| window == token.as_bytes()),
+                    "credential leaked to {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    let (home, checkout, config) = setup(true);
+    write_config(home.path(), &config).unwrap();
+    record_runner_failure(
+        home.path(),
+        &anyhow::anyhow!("connection failed with {app_token} and {bot_token}"),
+    )
+    .unwrap();
+    let operational = read_runner_operational_state(home.path()).unwrap();
     let diagnostics = runner_status(
         &config,
-        false,
-        None,
-        Some(format!("credentials {app_token} {bot_token}")),
+        operational.connected,
+        operational.last_successful_connection,
+        operational.failure,
     )
     .to_string();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        CredentialEchoProvider {
+            app_token: app_token.into(),
+            bot_token: bot_token.into(),
+        },
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent start")).unwrap();
+
     for token in [app_token, bot_token] {
-        assert!(!serialized_config.contains(token));
         assert!(!diagnostics.contains(token));
+        assert!(
+            runner
+                .slack()
+                .deliveries
+                .iter()
+                .all(|delivery| !delivery.text.contains(token))
+        );
     }
     assert!(diagnostics.contains("[REDACTED]"));
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("[REDACTED]"))
+    );
+    assert_tree_excludes(home.path(), &[app_token, bot_token]);
+    assert_tree_excludes(checkout.path(), &[app_token, bot_token]);
 }
 
 #[test]

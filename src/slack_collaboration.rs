@@ -391,6 +391,19 @@ fn save_runner_operational_state(home: &Path, state: &RunnerOperationalState) ->
     Ok(())
 }
 
+#[doc(hidden)]
+pub fn record_runner_failure(home: &Path, error: &anyhow::Error) -> Result<()> {
+    let previous = read_runner_operational_state(home).unwrap_or_default();
+    save_runner_operational_state(
+        home,
+        &RunnerOperationalState {
+            connected: false,
+            last_successful_connection: previous.last_successful_connection,
+            failure: Some(redact_secrets(&error.to_string())),
+        },
+    )
+}
+
 impl std::fmt::Display for RunnerStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -677,15 +690,7 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         match runner.slack_mut().receive() {
             Ok(event) => runner.ingest(event)?,
             Err(error) => {
-                let previous = read_runner_operational_state(home).unwrap_or_default();
-                save_runner_operational_state(
-                    home,
-                    &RunnerOperationalState {
-                        connected: false,
-                        last_successful_connection: previous.last_successful_connection,
-                        failure: Some(redact_secrets(&error.to_string())),
-                    },
-                )?;
+                record_runner_failure(home, &error)?;
                 runner.slack_mut().reconnect()?;
                 reconcile_interrupted_runner(&mut runner)?;
             }

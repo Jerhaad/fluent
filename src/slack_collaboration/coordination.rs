@@ -278,7 +278,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     }
                     ProviderTurnRecovery::Completed { turn_id, reply } => {
                         turn.provider_turn_id = Some(turn_id);
-                        turn.completed_reply = Some(reply);
+                        turn.completed_reply = Some(redact_secrets(&reply));
                     }
                 }
             }
@@ -309,12 +309,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread.provider_session = Some(session);
             }
             turn = thread.pending_turn.clone().unwrap_or(turn);
-            turn.completed_reply = Some(reply);
+            turn.completed_reply = Some(redact_secrets(&reply));
         }
         let raw_reply = turn
             .completed_reply
             .clone()
             .context("provider turn completed without a reply")?;
+        let raw_reply = redact_secrets(&raw_reply);
         let reply = if previously_completed {
             raw_reply
         } else if turn.starts_session {
@@ -348,7 +349,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             id: format!("{}:reply", event.id),
             channel: event.channel.clone(),
             thread_timestamp: event.thread_id(),
-            text: text.into(),
+            text: redact_secrets(text),
             delivered: false,
         };
         self.store.persist_outbox(delivery)
