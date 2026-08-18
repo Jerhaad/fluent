@@ -378,6 +378,8 @@ impl RunnerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundEnvelope {
     pub id: String,
+    #[serde(default)]
+    pub acknowledgement_id: String,
     pub channel: String,
     pub timestamp: String,
     pub thread_timestamp: Option<String>,
@@ -487,6 +489,9 @@ pub trait SlackTransport {
     fn check(&self) -> Result<()> {
         Ok(())
     }
+    fn receive(&mut self) -> Result<InboundEnvelope> {
+        bail!("Slack transport does not receive Socket Mode envelopes")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -556,6 +561,72 @@ impl SlackTransport for InMemorySlack {
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
         self.deliveries.push(delivery.clone());
         Ok(())
+    }
+}
+
+/// Live Slack Socket Mode edge. It opens the Socket Mode URL through Slack's
+/// Web API, accepts one event envelope, and acknowledges it on that socket.
+pub struct SocketModeTransport {
+    web: SlackWebApiTransport,
+    socket: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+}
+
+impl SocketModeTransport {
+    pub fn connect(
+        api_base: impl Into<String>,
+        app_token: String,
+        bot_token: String,
+    ) -> Result<Self> {
+        let api_base = api_base.into();
+        let response = ureq::post(&format!(
+            "{}/apps.connections.open",
+            api_base.trim_end_matches('/')
+        ))
+        .set("Authorization", &format!("Bearer {app_token}"))
+        .send_json(serde_json::json!({}))?;
+        let value: serde_json::Value = response.into_json()?;
+        let url = value["url"].as_str().context("Slack Socket Mode URL")?;
+        let (socket, _) = tungstenite::connect(url)?;
+        Ok(Self {
+            web: SlackWebApiTransport::new(api_base, app_token, bot_token),
+            socket,
+        })
+    }
+}
+
+impl SlackTransport for SocketModeTransport {
+    fn acknowledge(&mut self, event_id: &str) -> Result<()> {
+        self.socket.send(tungstenite::Message::Text(
+            serde_json::json!({"envelope_id": event_id}).to_string(),
+        ))?;
+        Ok(())
+    }
+    fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
+        self.web.post(delivery)
+    }
+    fn check(&self) -> Result<()> {
+        self.web.check()
+    }
+    fn receive(&mut self) -> Result<InboundEnvelope> {
+        let message = self.socket.read()?;
+        let text = message.into_text()?;
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        let event = &value["payload"]["event"];
+        Ok(InboundEnvelope {
+            id: value["payload"]["event_id"]
+                .as_str()
+                .context("Slack event id")?
+                .into(),
+            acknowledgement_id: value["envelope_id"]
+                .as_str()
+                .context("Slack envelope id")?
+                .into(),
+            channel: event["channel"].as_str().context("Slack channel")?.into(),
+            timestamp: event["ts"].as_str().context("Slack timestamp")?.into(),
+            thread_timestamp: event["thread_ts"].as_str().map(str::to_owned),
+            user: event["user"].as_str().context("Slack user")?.into(),
+            text: event["text"].as_str().unwrap_or_default().into(),
+        })
     }
 }
 
@@ -725,7 +796,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         }
         match persist_inbox(self.home, &event)? {
             InboxState::Processed => return Ok(()),
-            InboxState::Pending => self.slack.acknowledge(&event.id)?,
+            InboxState::Pending => {
+                self.slack
+                    .acknowledge(if event.acknowledgement_id.is_empty() {
+                        &event.id
+                    } else {
+                        &event.acknowledgement_id
+                    })?
+            }
         }
         self.process(event.clone())?;
         mark_inbox_processed(self.home, &event.id)?;
@@ -1012,8 +1090,13 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("codex"));
     let provider = CodexAppServerProvider::new(codex);
-    let slack = SlackWebApiTransport::new(api_base, app_token, bot_token);
-    preflight(&config, &provider, &slack)
+    let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
+    preflight(&config, &provider, &slack)?;
+    let mut runner = CollaborationRunner::new(home, config, provider, slack);
+    loop {
+        let event = runner.slack_mut().receive()?;
+        runner.ingest(event)?;
+    }
 }
 
 fn ensure_root(home: &Path) -> Result<()> {
@@ -1218,6 +1301,7 @@ mod tests {
     fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
         InboundEnvelope {
             id: id.into(),
+            acknowledgement_id: id.into(),
             channel: "C1".into(),
             timestamp: "1.0".into(),
             thread_timestamp: thread.map(str::to_owned),

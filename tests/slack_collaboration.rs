@@ -33,6 +33,7 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
 fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
     InboundEnvelope {
         id: id.into(),
+        acknowledgement_id: id.into(),
         channel: "C1".into(),
         timestamp: "1.0".into(),
         thread_timestamp: thread.map(str::to_owned),
