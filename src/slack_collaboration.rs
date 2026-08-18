@@ -534,12 +534,8 @@ pub fn checkout_identity(path: &Path) -> Result<String> {
 }
 
 fn git_output(path: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .output()
-        .with_context(|| format!("run git {}", args.join(" ")))?;
+    let output =
+        crate::git::run_raw(path, args).with_context(|| format!("run git {}", args.join(" ")))?;
     if !output.status.success() {
         bail!("git {} failed", args.join(" "));
     }
@@ -722,37 +718,15 @@ mod tests {
             &["config", "user.email", "test@example.invalid"][..],
             &["config", "user.name", "Fluent test"][..],
         ] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(path)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            crate::git::run(path, args, "initialize Slack checkout fixture").unwrap();
         }
         fs::write(path.join("README"), "fixture").unwrap();
         for args in [&["add", "README"][..], &["commit", "-m", "fixture"][..]] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(path)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            crate::git::run(path, args, "commit Slack checkout fixture").unwrap();
         }
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap();
         (
             checkout_identity(path).unwrap(),
-            String::from_utf8(output.stdout).unwrap().trim().into(),
+            crate::git::run_stdout(path, &["rev-parse", "HEAD"], "read fixture HEAD").unwrap(),
         )
     }
     fn setup() -> (TempDir, TempDir, RunnerConfig) {
