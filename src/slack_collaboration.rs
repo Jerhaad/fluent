@@ -27,7 +27,7 @@ pub use coordination::*;
 pub use domain::*;
 pub use interfaces::*;
 use store::*;
-pub use store::{FileCollaborationStore, config_path, state_root};
+pub use store::{FileCollaborationStore, ThreadCommitCrashPoint, config_path, state_root};
 
 /// Slack app manifest for a local Socket Mode installation. It intentionally
 /// has no request URL because the runner never accepts public HTTP ingress.
@@ -120,17 +120,27 @@ pub fn store_slack_credentials<S: SecretStore>(
 
 /// Remove token-shaped strings before writing a diagnostic or Slack message.
 pub fn redact_secrets(message: &str) -> String {
-    message
-        .split_whitespace()
-        .map(|word| {
-            if word.starts_with("xapp-") || word.starts_with("xoxb-") {
-                "[REDACTED]"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut redacted = String::with_capacity(message.len());
+    let mut remainder = message;
+    while let Some(start) = [remainder.find("xapp-"), remainder.find("xoxb-")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        redacted.push_str(&remainder[..start]);
+        redacted.push_str("[REDACTED]");
+        let token = &remainder[start..];
+        let end = token
+            .char_indices()
+            .find(|(_, character)| {
+                !character.is_ascii_alphanumeric() && *character != '-' && *character != '_'
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(token.len());
+        remainder = &token[end..];
+    }
+    redacted.push_str(remainder);
+    redacted
 }
 
 /// Report a host action that the current sandbox cannot perform. This is not a
@@ -898,7 +908,7 @@ mod tests {
             recovered.provider().calls[0].0.as_deref(),
             Some("session-1")
         );
-        let recovered_threads = load_threads(home.path()).unwrap();
+        let recovered_threads = load_threads(home.path(), &config).unwrap();
         assert_eq!(
             recovered_threads["1.0"].last_connection.as_deref(),
             Some("2026-08-17T00:00:00Z")

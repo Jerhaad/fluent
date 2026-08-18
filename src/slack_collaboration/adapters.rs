@@ -244,7 +244,25 @@ impl SlackTransport for SlackWebApiTransport {
     }
 
     fn check(&self) -> Result<()> {
-        self.call("auth.test", &self.bot_token, serde_json::json!({}))
+        let response = ureq::post(&format!("{}/auth.test", self.api_base))
+            .set("Authorization", &format!("Bearer {}", self.bot_token))
+            .send_json(serde_json::json!({}))?;
+        let granted: std::collections::BTreeSet<_> = response
+            .header("x-oauth-scopes")
+            .context("Slack auth.test omitted installed bot scopes")?
+            .split(',')
+            .map(str::trim)
+            .collect();
+        for required in ["app_mentions:read", "channels:history", "chat:write"] {
+            if !granted.contains(required) {
+                bail!("Slack bot is missing required scope {required}");
+            }
+        }
+        let value: serde_json::Value = response.into_json()?;
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            bail!("Slack auth.test failed")
+        }
+        Ok(())
     }
 }
 

@@ -20,7 +20,7 @@ pub trait CollaborationStore {
     fn load_outbox(&self) -> Result<Vec<OutboundDelivery>>;
     fn save_outbox(&self, deliveries: &[OutboundDelivery]) -> Result<()>;
     fn persist_outbox(&self, delivery: OutboundDelivery) -> Result<()>;
-    fn load_threads(&self) -> Result<BTreeMap<String, FluentThread>>;
+    fn load_threads(&self, config: &RunnerConfig) -> Result<BTreeMap<String, FluentThread>>;
     fn load_thread(&self, config: &RunnerConfig, id: &str) -> Result<Option<FluentThread>>;
     fn save_thread(&self, config: &RunnerConfig, thread: &FluentThread) -> Result<()>;
     fn recovery_cursor(&self, channel: &str, thread: &str) -> Result<Option<String>>;

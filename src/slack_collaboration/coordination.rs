@@ -98,7 +98,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         for event in events {
             self.ingest(event)?;
         }
-        let thread_ids: Vec<_> = self.store.load_threads()?.into_keys().collect();
+        let thread_ids: Vec<_> = self.store.load_threads(&self.config)?.into_keys().collect();
         for id in thread_ids {
             let Some(mut thread) = self.store.load_thread(&self.config, &id)? else {
                 continue;
@@ -116,7 +116,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     pub fn recovery_targets(&self) -> Result<Vec<(String, String)>> {
         Ok(self
             .store
-            .load_threads()?
+            .load_threads(&self.config)?
             .into_values()
             .filter(|thread| thread.state == ThreadState::Active)
             .map(|thread| (thread.channel, thread.id))

@@ -71,6 +71,62 @@ fn socket_mode_envelope_rejects_missing_durable_identity() {
 }
 
 #[test]
+fn socket_mode_transport_connects_receives_and_acknowledges() {
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let websocket_address = websocket_listener.local_addr().unwrap();
+    let websocket = std::thread::spawn(move || {
+        let (stream, _) = websocket_listener.accept().unwrap();
+        let mut socket = tungstenite::accept(stream).unwrap();
+        socket
+            .send(tungstenite::Message::Text(
+                r#"{"envelope_id":"ENV1","payload":{"event_id":"EV1","event":{"channel":"C1","ts":"1.0","user":"U1","text":"@Fluent hello"}}}"#
+                    .into(),
+            ))
+            .unwrap();
+        socket.read().unwrap().into_text().unwrap()
+    });
+
+    let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_address = api_listener.local_addr().unwrap();
+    let authorization = Arc::new(Mutex::new(String::new()));
+    let captured = authorization.clone();
+    let api = std::thread::spawn(move || {
+        let (mut stream, _) = api_listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let count = stream.read(&mut buffer).unwrap();
+        *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..count]).into_owned();
+        let body = format!(r#"{{"ok":true,"url":"ws://{websocket_address}"}}"#);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let mut transport = SocketModeTransport::connect(
+        format!("http://{api_address}"),
+        "xapp-contract".into(),
+        "xoxb-contract".into(),
+    )
+    .unwrap();
+    let envelope = transport.receive().unwrap();
+    assert_eq!(envelope.id, "EV1");
+    assert_eq!(envelope.acknowledgement_id, "ENV1");
+    transport.acknowledge(&envelope.acknowledgement_id).unwrap();
+
+    api.join().unwrap();
+    let acknowledgement = websocket.join().unwrap();
+    assert!(
+        authorization
+            .lock()
+            .unwrap()
+            .contains("Bearer xapp-contract")
+    );
+    assert_eq!(acknowledgement, r#"{"envelope_id":"ENV1"}"#);
+}
+
+#[test]
 fn slack_thread_identity_rejects_filesystem_aliases() {
     for thread_id in ["../outside", "..", ".", "/absolute", "1.0/../../outside"] {
         let envelope = event("EV1", Some(thread_id), "continue");
@@ -788,6 +844,41 @@ fn missing_bound_snapshot_fails_instead_of_loading_stripped_index_state() {
     assert!(error.to_string().contains("snapshot 1.0 is unavailable"));
     assert!(recovered.provider().calls.is_empty());
 }
+
+#[test]
+fn bound_thread_commit_recovers_both_partial_write_orders() {
+    for crash_point in [
+        ThreadCommitCrashPoint::AfterSnapshot,
+        ThreadCommitCrashPoint::AfterIndex,
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let inbound = event("E1", None, "@Fluent bind this");
+        let mut crashing = CollaborationRunner::with_store(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+            FileCollaborationStore::with_thread_commit_crash(home.path(), crash_point),
+        );
+        assert!(crashing.ingest(inbound.clone()).is_err());
+
+        let mut recovered = CollaborationRunner::new(
+            home.path(),
+            config,
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        recovered.reconnect([inbound], "recovered".into()).unwrap();
+        assert_eq!(recovered.provider().calls.len(), 1);
+        assert!(
+            recovered
+                .slack()
+                .deliveries
+                .iter()
+                .any(|delivery| delivery.text.contains("Bound to Project: app"))
+        );
+    }
+}
 #[test]
 fn missing_channel_default_requires_project_selection() {
     let (home, _checkout, config) = setup(false);
@@ -1084,6 +1175,33 @@ fn runner_start_preflights_external_and_local_boundaries() {
         &InMemorySlack::default(),
     )
     .unwrap();
+
+    fn web_api_check(scopes: &str) -> anyhow::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let scopes = scopes.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            stream.read(&mut buffer).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-OAuth-Scopes: {scopes}\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let result = SlackWebApiTransport::new(
+            format!("http://{address}"),
+            "xapp-test".into(),
+            "xoxb-test".into(),
+        )
+        .check();
+        server.join().unwrap();
+        result
+    }
+
+    web_api_check("app_mentions:read,channels:history,chat:write").unwrap();
+    let error = web_api_check("app_mentions:read,chat:write").unwrap_err();
+    assert!(error.to_string().contains("channels:history"));
 }
 
 #[test]
@@ -1178,6 +1296,12 @@ fn slack_credentials_use_host_store_and_are_redacted() {
         redact_secrets("credentials xapp-app-secret xoxb-bot-secret"),
         "credentials [REDACTED] [REDACTED]"
     );
+    let structured =
+        redact_secrets(r#"{"app":"xapp-app-secret","bot":"xoxb-bot-secret","safe":"kept"}"#);
+    assert!(!structured.contains("xapp-app-secret"));
+    assert!(!structured.contains("xoxb-bot-secret"));
+    assert!(structured.contains("[REDACTED]"));
+    assert!(structured.contains("kept"));
 }
 
 #[test]

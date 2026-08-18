@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 
@@ -15,11 +16,32 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct FileCollaborationStore {
     home: PathBuf,
+    thread_commit_crash: Option<ThreadCommitCrashPoint>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadCommitCrashPoint {
+    AfterIndex,
+    AfterSnapshot,
 }
 
 impl FileCollaborationStore {
     pub fn new(home: impl Into<PathBuf>) -> Self {
-        Self { home: home.into() }
+        Self {
+            home: home.into(),
+            thread_commit_crash: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn with_thread_commit_crash(
+        home: impl Into<PathBuf>,
+        thread_commit_crash: ThreadCommitCrashPoint,
+    ) -> Self {
+        Self {
+            home: home.into(),
+            thread_commit_crash: Some(thread_commit_crash),
+        }
     }
 }
 
@@ -45,6 +67,10 @@ fn outbox_path(home: &Path) -> PathBuf {
 
 fn thread_index_path(home: &Path) -> PathBuf {
     state_root(home).join("threads.json")
+}
+
+fn thread_commit_dir(home: &Path) -> PathBuf {
+    state_root(home).join("thread-commits")
 }
 
 fn cursor_path(home: &Path) -> PathBuf {
@@ -133,8 +159,8 @@ impl CollaborationStore for FileCollaborationStore {
         persist_outbox(&self.home, delivery)
     }
 
-    fn load_threads(&self) -> Result<BTreeMap<String, FluentThread>> {
-        load_threads(&self.home)
+    fn load_threads(&self, config: &RunnerConfig) -> Result<BTreeMap<String, FluentThread>> {
+        load_threads(&self.home, config)
     }
 
     fn load_thread(&self, config: &RunnerConfig, id: &str) -> Result<Option<FluentThread>> {
@@ -142,7 +168,7 @@ impl CollaborationStore for FileCollaborationStore {
     }
 
     fn save_thread(&self, config: &RunnerConfig, thread: &FluentThread) -> Result<()> {
-        save_thread(&self.home, config, thread)
+        save_thread_with_crash(&self.home, config, thread, self.thread_commit_crash)
     }
 
     fn recovery_cursor(&self, channel: &str, thread: &str) -> Result<Option<String>> {
@@ -217,8 +243,67 @@ pub(super) fn persist_outbox(home: &Path, delivery: OutboundDelivery) -> Result<
     Ok(())
 }
 
-pub(super) fn load_threads(home: &Path) -> Result<BTreeMap<String, FluentThread>> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThreadCommit {
+    previous: Option<FluentThread>,
+    next: FluentThread,
+    snapshot_digest: String,
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn load_thread_index(home: &Path) -> Result<BTreeMap<String, FluentThread>> {
     read_json(thread_index_path(home))
+}
+
+fn recover_thread_commits(home: &Path, config: &RunnerConfig) -> Result<()> {
+    let directory = thread_commit_dir(home);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut index = load_thread_index(home)?;
+    for entry in entries {
+        let path = entry?.path();
+        let commit: ThreadCommit = serde_json::from_slice(&fs::read(&path)?)?;
+        let snapshot_matches = commit
+            .next
+            .project_label
+            .as_ref()
+            .and_then(|label| config.projects.get(label))
+            .and_then(|project| thread_path(&project.checkout.path, &commit.next.id).ok())
+            .and_then(|snapshot| fs::read(snapshot).ok())
+            .is_some_and(|bytes| digest(&bytes) == commit.snapshot_digest);
+        if snapshot_matches {
+            index.insert(commit.next.id.clone(), commit.next);
+        } else if let Some(previous) = commit.previous {
+            index.insert(previous.id.clone(), previous);
+        } else {
+            index.remove(&commit.next.id);
+        }
+        atomic_write(
+            &thread_index_path(home),
+            &serde_json::to_vec_pretty(&index)?,
+        )?;
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+pub(super) fn load_threads(
+    home: &Path,
+    config: &RunnerConfig,
+) -> Result<BTreeMap<String, FluentThread>> {
+    ensure_root(home)?;
+    let _lock = state_lock(home)?;
+    recover_thread_commits(home, config)?;
+    load_thread_index(home)
 }
 
 pub(super) fn load_thread(
@@ -226,7 +311,7 @@ pub(super) fn load_thread(
     config: &RunnerConfig,
     id: &str,
 ) -> Result<Option<FluentThread>> {
-    let index = load_threads(home)?;
+    let index = load_threads(home, config)?;
     let Some(stub) = index.get(id) else {
         return Ok(None);
     };
@@ -246,10 +331,17 @@ pub(super) fn load_thread(
     }
 }
 
-pub(super) fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Result<()> {
+fn save_thread_with_crash(
+    home: &Path,
+    config: &RunnerConfig,
+    thread: &FluentThread,
+    crash: Option<ThreadCommitCrashPoint>,
+) -> Result<()> {
+    validate_thread_identity(&thread.id)?;
     ensure_root(home)?;
     let _lock = state_lock(home)?;
-    let mut index = load_threads(home)?;
+    recover_thread_commits(home, config)?;
+    let mut index = load_thread_index(home)?;
     let mut private_mapping = thread.clone();
     if private_mapping.project_label.is_some() {
         private_mapping.provider_session = None;
@@ -259,7 +351,7 @@ pub(super) fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThr
         private_mapping.pending_question = None;
         private_mapping.processed_events.clear();
     }
-    if let Some(project) = thread
+    let snapshot = if let Some(project) = thread
         .project_label
         .as_ref()
         .and_then(|label| config.projects.get(label))
@@ -268,13 +360,39 @@ pub(super) fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThr
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        atomic_write(&path, &serde_json::to_vec_pretty(thread)?)?;
-    }
+        Some(path)
+    } else {
+        None
+    };
+    let snapshot_bytes = serde_json::to_vec_pretty(thread)?;
+    fs::create_dir_all(thread_commit_dir(home))?;
+    let commit_path = thread_commit_dir(home).join(format!("{}.json", thread.id));
+    let commit = ThreadCommit {
+        previous: index.get(&thread.id).cloned(),
+        next: private_mapping.clone(),
+        snapshot_digest: digest(&snapshot_bytes),
+    };
+    atomic_write(&commit_path, &serde_json::to_vec_pretty(&commit)?)?;
+
     index.insert(thread.id.clone(), private_mapping);
+    if crash == Some(ThreadCommitCrashPoint::AfterIndex) {
+        atomic_write(
+            &thread_index_path(home),
+            &serde_json::to_vec_pretty(&index)?,
+        )?;
+        bail!("simulated crash after thread index commit");
+    }
+    if let Some(snapshot) = snapshot {
+        atomic_write(&snapshot, &snapshot_bytes)?;
+    }
+    if crash == Some(ThreadCommitCrashPoint::AfterSnapshot) {
+        bail!("simulated crash after thread snapshot commit");
+    }
     atomic_write(
         &thread_index_path(home),
         &serde_json::to_vec_pretty(&index)?,
     )?;
+    fs::remove_file(commit_path)?;
     Ok(())
 }
 
