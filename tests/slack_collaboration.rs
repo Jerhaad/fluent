@@ -1106,8 +1106,28 @@ fn redelivered_slack_event_has_no_duplicate_effect() {
     );
     let inbound = event("E1", None, "@Fluent hello");
     runner.ingest(inbound.clone()).unwrap();
+    let deliveries = runner.slack().deliveries.clone();
+    let outbox = FileCollaborationStore::new(home.path())
+        .load_outbox()
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap();
     runner.ingest(inbound).unwrap();
     assert_eq!(runner.provider().calls.len(), 1);
+    assert_eq!(runner.slack().deliveries, deliveries);
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_outbox()
+            .unwrap(),
+        outbox
+    );
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap(),
+        thread
+    );
 }
 #[test]
 fn runner_restart_recovers_active_fluent_thread() {
