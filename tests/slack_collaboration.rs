@@ -282,26 +282,236 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     assert_ne!(client_message_ids[1], client_message_ids[2]);
 }
 
+const CODEX_APP_SERVER_FIXTURE: &str = r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+if "--help" in sys.argv:
+    sys.exit(0)
+
+state_path = sys.argv[0] + ".state"
+log_path = sys.argv[0] + ".log"
+
+def load_state():
+    if os.path.exists(state_path):
+        with open(state_path) as source:
+            return json.load(source)
+    return {"thread_id": "thread-1", "turns": []}
+
+def save_state(state):
+    with open(state_path, "w") as output:
+        json.dump(state, output)
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(log_path, "a") as output:
+        output.write(json.dumps(request) + "\n")
+    method = request.get("method")
+    if "id" not in request:
+        continue
+    request_id = request["id"]
+    state = load_state()
+    if method == "initialize":
+        result = {"userAgent": "codex-fixture"}
+    elif method == "thread/start":
+        result = {"thread": {"id": state["thread_id"]}}
+        save_state(state)
+    elif method == "thread/resume":
+        result = {"thread": {"id": state["thread_id"], "turns": state["turns"]}}
+    elif method == "thread/read":
+        result = {"thread": {"id": state["thread_id"], "turns": state["turns"]}}
+    elif method == "turn/start":
+        action_id = request["params"]["clientUserMessageId"]
+        held = os.path.exists(sys.argv[0] + ".hold")
+        turn = {
+            "id": "turn-" + action_id,
+            "status": "inProgress" if held else "completed",
+            "items": [
+                {"id": "user-1", "type": "userMessage", "clientId": action_id,
+                 "content": request["params"]["input"]}
+            ]
+        }
+        if not held:
+            turn["items"].append(
+                {"id": "agent-1", "type": "agentMessage", "text": "provider reply"})
+        state["turns"].append(turn)
+        save_state(state)
+        result = {"turn": {"id": turn["id"], "status": "inProgress", "items": []}}
+        send({"jsonrpc": "2.0", "id": request_id, "result": result})
+        if held:
+            continue
+        send({"jsonrpc": "2.0", "method": "item/completed", "params": {
+            "threadId": state["thread_id"], "turnId": turn["id"],
+            "completedAtMs": 1, "item": turn["items"][1]}})
+        send({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+            "threadId": state["thread_id"], "turn": turn}})
+        continue
+    else:
+        send({"jsonrpc": "2.0", "id": request_id,
+              "error": {"code": -32601, "message": "unsupported"}})
+        continue
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+"#;
+
+fn codex_fixture(fixture: &TempDir) -> std::path::PathBuf {
+    let executable = fixture.path().join("codex-fixture");
+    fs::write(&executable, CODEX_APP_SERVER_FIXTURE).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    executable
+}
+
+fn codex_requests(executable: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(format!("{}.log", executable.display()))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 #[test]
 fn codex_app_server_provider_exchanges_a_stable_turn() {
     let fixture = TempDir::new().unwrap();
-    let executable = fixture.path().join("codex-fixture");
-    fs::write(
-        &executable,
-        "#!/bin/sh\nif [ \"${2:-}\" = \"--help\" ]; then exit 0; fi\nrequest=$(cat)\ncase \"$request\" in *'\"action_id\":\"action-1\"'*) ;; *) exit 2;; esac\ncase \"$request\" in *'\"slice_draft\":'*) ;; *) exit 3;; esac\nprintf '%s' '{\"session\":\"session-1\",\"reply\":\"provider reply\"}'\n",
-    )
-    .unwrap();
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let executable = codex_fixture(&fixture);
     let checkout = TempDir::new().unwrap();
     let scope = ProviderScope {
         checkout: checkout.path().into(),
         slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
     };
-    let mut provider = CodexAppServerProvider::new(executable);
+    let mut provider = CodexAppServerProvider::new(executable.clone());
     provider.ready().unwrap();
     let (session, reply) = provider.start("action-1", &scope, "hello", "U1").unwrap();
-    assert_eq!(session, "session-1");
+    assert_eq!(session, "thread-1");
     assert_eq!(reply, "provider reply");
+    let requests = codex_requests(&executable);
+    let methods: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request["method"].as_str())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "initialized",
+            "thread/start",
+            "initialize",
+            "initialized",
+            "thread/resume",
+            "turn/start"
+        ]
+    );
+    let turn = requests
+        .iter()
+        .find(|request| request["method"] == "turn/start")
+        .unwrap();
+    assert_eq!(turn["params"]["clientUserMessageId"], "action-1");
+    assert_eq!(turn["params"]["threadId"], "thread-1");
+}
+
+fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint) {
+    let fixture = TempDir::new().unwrap();
+    let executable = codex_fixture(&fixture);
+    if crash == ThreadCommitCrashPoint::AfterProviderAccepted {
+        fs::write(format!("{}.hold", executable.display()), "").unwrap();
+    }
+    let (home, _checkout, config) = setup(true);
+    let inbound = event("E1", None, "@Fluent settle this turn");
+    let mut first = CollaborationRunner::with_store(
+        home.path(),
+        config.clone(),
+        CodexAppServerProvider::new(executable.clone()),
+        InMemorySlack::default(),
+        FileCollaborationStore::with_thread_commit_crash(home.path(), crash),
+    );
+    assert!(first.ingest(inbound.clone()).is_err());
+    assert!(first.slack().deliveries.is_empty());
+    let persisted = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.provider_session.as_deref(), Some("thread-1"));
+    let pending = persisted.pending_turn.unwrap();
+    assert_eq!(pending.provider_turn_id.as_deref(), Some("turn-E1"));
+    assert_eq!(
+        pending.completed_reply.is_some(),
+        crash == ThreadCommitCrashPoint::AfterProviderCompleted
+    );
+    assert_eq!(
+        codex_requests(&executable)
+            .iter()
+            .filter(|request| request["method"] == "turn/start")
+            .count(),
+        1
+    );
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        CodexAppServerProvider::new(executable.clone()),
+        InMemorySlack::default(),
+    );
+    let recovery = recovered.reconnect([inbound.clone()], "recovered".into());
+    if crash == ThreadCommitCrashPoint::AfterProviderAccepted {
+        assert!(recovery.is_err());
+        assert!(recovered.slack().deliveries.is_empty());
+        let state_path = format!("{}.state", executable.display());
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        state["turns"][0]["status"] = "completed".into();
+        state["turns"][0]["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "agent-1", "type": "agentMessage", "text": "provider reply"
+            }));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        recovered = CollaborationRunner::new(
+            home.path(),
+            config,
+            CodexAppServerProvider::new(executable.clone()),
+            InMemorySlack::default(),
+        );
+        recovered.reconnect([inbound], "completed".into()).unwrap();
+    } else {
+        recovery.unwrap();
+    }
+    let requests = codex_requests(&executable);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "turn/start")
+            .count(),
+        1
+    );
+    if crash == ThreadCommitCrashPoint::AfterProviderAccepted {
+        assert!(
+            requests
+                .iter()
+                .any(|request| request["method"] == "thread/read")
+        );
+    }
+    assert_eq!(
+        recovered
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.id == "E1:reply")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn codex_turn_recovers_after_provider_acceptance() {
+    assert_codex_turn_recovers_without_resubmission(ThreadCommitCrashPoint::AfterProviderAccepted);
+}
+
+#[test]
+fn codex_turn_recovers_after_provider_completion() {
+    assert_codex_turn_recovers_without_resubmission(ThreadCommitCrashPoint::AfterProviderCompleted);
 }
 
 #[test]
@@ -863,6 +1073,8 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
             contribution: "private contribution".into(),
             actor: "U1".into(),
             starts_session: true,
+            provider_turn_id: None,
+            completed_reply: None,
         }),
     };
     let store = FileCollaborationStore::new(home.path());

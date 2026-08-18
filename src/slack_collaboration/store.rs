@@ -23,6 +23,8 @@ pub struct FileCollaborationStore {
 pub enum ThreadCommitCrashPoint {
     AfterIndex,
     AfterSnapshot,
+    AfterProviderAccepted,
+    AfterProviderCompleted,
 }
 
 impl FileCollaborationStore {
@@ -503,6 +505,22 @@ fn save_thread_with_crash(
         &serde_json::to_vec_pretty(&index)?,
     )?;
     fs::remove_file(commit_path)?;
+    if crash == Some(ThreadCommitCrashPoint::AfterProviderCompleted)
+        && thread
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.completed_reply.is_some())
+    {
+        bail!("simulated crash after provider completion");
+    }
+    if crash == Some(ThreadCommitCrashPoint::AfterProviderAccepted)
+        && thread
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.provider_turn_id.is_some() && turn.completed_reply.is_none())
+    {
+        bail!("simulated crash after provider acceptance");
+    }
     Ok(())
 }
 

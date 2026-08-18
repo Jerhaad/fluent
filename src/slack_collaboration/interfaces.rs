@@ -69,6 +69,13 @@ pub enum ProviderEvent {
     Interrupted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderTurnRecovery {
+    Missing,
+    Accepted { turn_id: String },
+    Completed { turn_id: String, reply: String },
+}
+
 /// Provider-neutral turn boundary with an explicit filesystem authority scope.
 pub trait ConversationProvider {
     fn start(
@@ -87,6 +94,41 @@ pub trait ConversationProvider {
         contribution: &str,
         actor: &str,
     ) -> Result<String>;
+
+    fn prepare_session(&mut self, _scope: &ProviderScope) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn recover_turn(
+        &mut self,
+        _action_id: &str,
+        _session: &str,
+        _scope: &ProviderScope,
+    ) -> Result<ProviderTurnRecovery> {
+        Ok(ProviderTurnRecovery::Missing)
+    }
+
+    fn run_turn(
+        &mut self,
+        action_id: &str,
+        session: Option<&str>,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+        accepted: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<(Option<String>, String)> {
+        let (new_session, reply) = if let Some(session) = session {
+            (
+                None,
+                self.resume(action_id, session, scope, contribution, actor)?,
+            )
+        } else {
+            let (session, reply) = self.start(action_id, scope, contribution, actor)?;
+            (Some(session), reply)
+        };
+        accepted(action_id)?;
+        Ok((new_session, reply))
+    }
 
     fn send(&mut self, _session: &str, _message: &str) -> Result<()> {
         bail!("conversation provider does not support direct messages")

@@ -163,6 +163,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: false,
+                provider_turn_id: None,
+                completed_reply: None,
             });
             self.store.save_thread(&self.config, &thread)?;
             self.complete_pending_turn(&event, &mut thread)?;
@@ -188,6 +190,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: true,
+                provider_turn_id: None,
+                completed_reply: None,
             });
             self.store.save_thread(&self.config, thread)?;
             if let Some(connected_at) =
@@ -219,40 +223,93 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: &InboundEnvelope,
         thread: &mut FluentThread,
     ) -> Result<()> {
-        let turn = thread
+        let mut turn = thread
             .pending_turn
             .clone()
             .context("thread has no pending provider turn")?;
+        let previously_completed = turn.completed_reply.is_some();
         let checkout = self.bound_project(thread)?.checkout.path.clone();
         let scope = ProviderScope {
             slice_draft: checkout.join(".fluent/work/slack/drafts").join(&thread.id),
             checkout,
         };
-        let reply = if turn.starts_session {
-            let (session, reply) =
-                self.provider
-                    .start(&turn.action_id, &scope, &turn.contribution, &turn.actor)?;
-            thread.provider_session = Some(session);
-            format!(
-                "Bound to {}.\n{}",
-                safe_identity(self.bound_project(thread)?),
-                reply
-            )
-        } else {
-            let session = thread
-                .provider_session
-                .as_deref()
-                .context("active thread lacks provider session")?;
-            self.provider.resume(
+        if turn.starts_session && thread.provider_session.is_none() {
+            if let Some(session) = self.provider.prepare_session(&scope)? {
+                thread.provider_session = Some(session);
+                self.store.save_thread(&self.config, thread)?;
+            }
+        }
+        if turn.completed_reply.is_none() {
+            if let Some(session) = thread.provider_session.as_deref() {
+                match self
+                    .provider
+                    .recover_turn(&turn.action_id, session, &scope)?
+                {
+                    ProviderTurnRecovery::Missing if turn.provider_turn_id.is_some() => {
+                        bail!("accepted provider turn is missing from provider history");
+                    }
+                    ProviderTurnRecovery::Missing => {}
+                    ProviderTurnRecovery::Accepted { turn_id } => {
+                        turn.provider_turn_id = Some(turn_id);
+                        thread.pending_turn = Some(turn);
+                        self.store.save_thread(&self.config, thread)?;
+                        bail!("provider turn is accepted but not complete");
+                    }
+                    ProviderTurnRecovery::Completed { turn_id, reply } => {
+                        turn.provider_turn_id = Some(turn_id);
+                        turn.completed_reply = Some(reply);
+                    }
+                }
+            }
+        }
+        if turn.completed_reply.is_none() {
+            let store = &self.store;
+            let config = &self.config;
+            let checkpoint = std::cell::RefCell::new(thread.clone());
+            let mut accepted = |turn_id: &str| {
+                let mut checkpoint = checkpoint.borrow_mut();
+                let current = checkpoint
+                    .pending_turn
+                    .as_mut()
+                    .context("thread lost its pending provider turn")?;
+                current.provider_turn_id = Some(turn_id.to_owned());
+                store.save_thread(config, &checkpoint)
+            };
+            let (session, reply) = self.provider.run_turn(
                 &turn.action_id,
-                session,
+                thread.provider_session.as_deref(),
                 &scope,
                 &turn.contribution,
                 &turn.actor,
-            )?
+                &mut accepted,
+            )?;
+            *thread = checkpoint.into_inner();
+            if let Some(session) = session {
+                thread.provider_session = Some(session);
+            }
+            turn = thread.pending_turn.clone().unwrap_or(turn);
+            turn.completed_reply = Some(reply);
+        }
+        let raw_reply = turn
+            .completed_reply
+            .clone()
+            .context("provider turn completed without a reply")?;
+        let reply = if previously_completed {
+            raw_reply
+        } else if turn.starts_session {
+            format!(
+                "Bound to {}.\n{}",
+                safe_identity(self.bound_project(thread)?),
+                raw_reply
+            )
+        } else {
+            raw_reply
         };
-        thread.pending_turn = None;
+        turn.completed_reply = Some(reply.clone());
+        thread.pending_turn = Some(turn);
+        self.store.save_thread(&self.config, thread)?;
         self.queue_reply(event, &reply)?;
+        thread.pending_turn = None;
         self.store.save_thread(&self.config, thread)
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {

@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -10,8 +11,8 @@ use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 
 use super::{
-    ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, SchedulerClient,
-    SchedulerRequest, SchedulerStatus, SlackTransport,
+    ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, ProviderTurnRecovery,
+    SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
 };
 
 pub struct LocalSchedulerClient {
@@ -271,6 +272,74 @@ pub struct CodexAppServerProvider {
     runner_home: Option<PathBuf>,
 }
 
+struct CodexConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+    pending: VecDeque<serde_json::Value>,
+}
+
+impl CodexConnection {
+    fn send(&mut self, value: &serde_json::Value) -> Result<()> {
+        serde_json::to_writer(&mut self.stdin, value)?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn read(&mut self) -> Result<serde_json::Value> {
+        let mut line = String::new();
+        if self.stdout.read_line(&mut line)? == 0 {
+            bail!("Codex App Server closed its protocol stream")
+        }
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    fn request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))?;
+        loop {
+            let message = self.read()?;
+            if message.get("id").and_then(serde_json::Value::as_u64) == Some(id) {
+                if let Some(error) = message.get("error") {
+                    bail!("Codex {method} failed: {error}")
+                }
+                return message
+                    .get("result")
+                    .cloned()
+                    .context("Codex response omitted result");
+            }
+            self.pending.push_back(message);
+        }
+    }
+
+    fn notification(&mut self, method: &str) -> Result<()> {
+        self.send(&serde_json::json!({"jsonrpc": "2.0", "method": method}))
+    }
+
+    fn next_message(&mut self) -> Result<serde_json::Value> {
+        if let Some(message) = self.pending.pop_front() {
+            Ok(message)
+        } else {
+            self.read()
+        }
+    }
+}
+
+impl Drop for CodexConnection {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl CodexAppServerProvider {
     pub fn new(executable: PathBuf) -> Self {
         Self {
@@ -286,14 +355,7 @@ impl CodexAppServerProvider {
         }
     }
 
-    fn turn(
-        &self,
-        action_id: &str,
-        session: Option<&str>,
-        scope: &ProviderScope,
-        contribution: &str,
-        actor: &str,
-    ) -> Result<(String, String)> {
+    fn connect(&self, scope: &ProviderScope) -> Result<CodexConnection> {
         fs::create_dir_all(&scope.slice_draft)?;
         let profile = if let Some(runner_home) = &self.runner_home {
             let codex_home = scope.slice_draft.join(".codex-home");
@@ -325,27 +387,65 @@ impl CodexAppServerProvider {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
-        let request = serde_json::json!({"action_id": action_id, "session": session, "checkout": scope.checkout, "slice_draft": scope.slice_draft, "contribution": contribution, "actor": actor});
-        child
-            .stdin
-            .as_mut()
-            .context("open Codex App Server stdin")?
-            .write_all(serde_json::to_string(&request)?.as_bytes())?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            bail!("Codex App Server failed")
+        let stdin = child.stdin.take().context("open Codex App Server stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("open Codex App Server stdout")?;
+        let mut connection = CodexConnection {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            pending: VecDeque::new(),
+        };
+        connection.request(
+            "initialize",
+            serde_json::json!({
+                "clientInfo": {"name": "fluent-slack", "version": env!("CARGO_PKG_VERSION")}
+            }),
+        )?;
+        connection.notification("initialized")?;
+        Ok(connection)
+    }
+
+    fn resume_thread(
+        &self,
+        connection: &mut CodexConnection,
+        session: &str,
+        scope: &ProviderScope,
+    ) -> Result<()> {
+        connection.request(
+            "thread/resume",
+            serde_json::json!({"threadId": session, "cwd": scope.checkout}),
+        )?;
+        Ok(())
+    }
+
+    fn recovered_turn(result: &serde_json::Value, action_id: &str) -> Result<ProviderTurnRecovery> {
+        for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
+            let matches = turn["items"].as_array().into_iter().flatten().any(|item| {
+                item["type"] == "userMessage" && item["clientId"].as_str() == Some(action_id)
+            });
+            if !matches {
+                continue;
+            }
+            let turn_id = turn["id"].as_str().unwrap_or_default().to_owned();
+            if turn["status"] != "completed" {
+                return Ok(ProviderTurnRecovery::Accepted { turn_id });
+            }
+            let reply = turn["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .rev()
+                .find(|item| item["type"] == "agentMessage")
+                .and_then(|item| item["text"].as_str())
+                .context("completed Codex turn has no agent reply")?
+                .to_owned();
+            return Ok(ProviderTurnRecovery::Completed { turn_id, reply });
         }
-        let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        Ok((
-            response["session"]
-                .as_str()
-                .context("Codex response session")?
-                .into(),
-            response["reply"]
-                .as_str()
-                .context("Codex response reply")?
-                .into(),
-        ))
+        Ok(ProviderTurnRecovery::Missing)
     }
 }
 
@@ -357,7 +457,18 @@ impl ConversationProvider for CodexAppServerProvider {
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
-        self.turn(action_id, None, scope, contribution, actor)
+        let session = self
+            .prepare_session(scope)?
+            .context("Codex did not create a thread")?;
+        let (_, reply) = self.run_turn(
+            action_id,
+            Some(&session),
+            scope,
+            contribution,
+            actor,
+            &mut |_| Ok(()),
+        )?;
+        Ok((session, reply))
     }
 
     fn resume(
@@ -369,8 +480,96 @@ impl ConversationProvider for CodexAppServerProvider {
         actor: &str,
     ) -> Result<String> {
         Ok(self
-            .turn(action_id, Some(session), scope, contribution, actor)?
+            .run_turn(
+                action_id,
+                Some(session),
+                scope,
+                contribution,
+                actor,
+                &mut |_| Ok(()),
+            )?
             .1)
+    }
+
+    fn prepare_session(&mut self, scope: &ProviderScope) -> Result<Option<String>> {
+        let mut connection = self.connect(scope)?;
+        let result = connection.request(
+            "thread/start",
+            serde_json::json!({
+                "cwd": scope.checkout,
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+            }),
+        )?;
+        Ok(Some(
+            result["thread"]["id"]
+                .as_str()
+                .context("Codex thread/start omitted thread id")?
+                .to_owned(),
+        ))
+    }
+
+    fn recover_turn(
+        &mut self,
+        action_id: &str,
+        session: &str,
+        scope: &ProviderScope,
+    ) -> Result<ProviderTurnRecovery> {
+        let mut connection = self.connect(scope)?;
+        self.resume_thread(&mut connection, session, scope)?;
+        let result = connection.request(
+            "thread/read",
+            serde_json::json!({"threadId": session, "includeTurns": true}),
+        )?;
+        Self::recovered_turn(&result, action_id)
+    }
+
+    fn run_turn(
+        &mut self,
+        action_id: &str,
+        session: Option<&str>,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+        accepted: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<(Option<String>, String)> {
+        let session = session.context("Codex turn requires a persisted thread id")?;
+        let mut connection = self.connect(scope)?;
+        self.resume_thread(&mut connection, session, scope)?;
+        let result = connection.request(
+            "turn/start",
+            serde_json::json!({
+                "threadId": session,
+                "clientUserMessageId": action_id,
+                "input": [{"type": "text", "text": format!("Slack user {actor}: {contribution}")}],
+            }),
+        )?;
+        let turn_id = result["turn"]["id"]
+            .as_str()
+            .context("Codex turn/start omitted turn id")?
+            .to_owned();
+        accepted(&turn_id)?;
+        let mut reply = None;
+        loop {
+            let message = connection.next_message()?;
+            let method = message["method"].as_str().unwrap_or_default();
+            let params = &message["params"];
+            if method == "item/completed"
+                && params["turnId"].as_str() == Some(&turn_id)
+                && params["item"]["type"] == "agentMessage"
+            {
+                reply = params["item"]["text"].as_str().map(str::to_owned);
+            }
+            if method == "turn/completed" && params["turn"]["id"].as_str() == Some(&turn_id) {
+                if params["turn"]["status"] != "completed" {
+                    bail!("Codex turn {turn_id} did not complete successfully")
+                }
+                return Ok((
+                    None,
+                    reply.context("Codex turn completed without an agent message")?,
+                ));
+            }
+        }
     }
 
     fn ready(&self) -> Result<()> {

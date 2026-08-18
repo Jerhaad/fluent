@@ -135,6 +135,10 @@ pub struct PendingTurn {
     pub contribution: String,
     pub actor: String,
     pub starts_session: bool,
+    #[serde(default)]
+    pub provider_turn_id: Option<String>,
+    #[serde(default)]
+    pub completed_reply: Option<String>,
 }
 
 impl FluentThread {
