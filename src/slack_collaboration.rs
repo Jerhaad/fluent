@@ -37,6 +37,54 @@ oauth_config:
       - chat:write
 "#;
 
+/// Names used for the two Slack secrets in the macOS Keychain. Token values
+/// are never represented in runner configuration or diagnostic structures.
+pub const KEYCHAIN_SERVICE: &str = "dev.fluent.slack";
+pub const APP_TOKEN_ACCOUNT: &str = "app-token";
+pub const BOT_TOKEN_ACCOUNT: &str = "bot-token";
+
+/// Host-owned secret boundary. Implement this with the macOS Keychain; tests
+/// can use an in-memory implementation without ever handling diagnostics.
+pub trait SecretStore {
+    fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()>;
+    fn read(&self, service: &str, account: &str) -> Result<String>;
+}
+
+/// Store Slack credentials exclusively at the host secret boundary.
+pub fn store_slack_credentials<S: SecretStore>(
+    secrets: &mut S,
+    app_token: &str,
+    bot_token: &str,
+) -> Result<()> {
+    if !app_token.starts_with("xapp-") || !bot_token.starts_with("xoxb-") {
+        bail!("Slack credentials have an unexpected token type");
+    }
+    secrets.store(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT, app_token)?;
+    secrets.store(KEYCHAIN_SERVICE, BOT_TOKEN_ACCOUNT, bot_token)
+}
+
+/// Remove token-shaped strings before writing a diagnostic or Slack message.
+pub fn redact_secrets(message: &str) -> String {
+    message
+        .split_whitespace()
+        .map(|word| {
+            if word.starts_with("xapp-") || word.starts_with("xoxb-") {
+                "[REDACTED]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Report a host action that the current sandbox cannot perform. This is not a
+/// Slack authentication failure: the owner must run the exact command outside
+/// the enclosing sandbox.
+pub fn host_handoff(command: &str) -> String {
+    format!("Host access is required. Run outside the agent sandbox: {command}")
+}
+
 /// Root for private collaboration state. Bound thread snapshots live under the
 /// configured checkout's ignored Fluent runtime directory instead.
 pub fn state_root(home: &Path) -> PathBuf {
@@ -540,6 +588,21 @@ fn save_thread(home: &Path, config: &RunnerConfig, thread: &FluentThread) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Default)]
+    struct MemorySecrets(BTreeMap<(String, String), String>);
+    impl SecretStore for MemorySecrets {
+        fn store(&mut self, service: &str, account: &str, secret: &str) -> Result<()> {
+            self.0
+                .insert((service.into(), account.into()), secret.into());
+            Ok(())
+        }
+        fn read(&self, service: &str, account: &str) -> Result<String> {
+            self.0
+                .get(&(service.into(), account.into()))
+                .cloned()
+                .context("missing secret")
+        }
+    }
     use tempfile::TempDir;
     fn setup() -> (TempDir, TempDir, RunnerConfig) {
         let home = TempDir::new().unwrap();
@@ -624,6 +687,20 @@ mod tests {
             r.slack().deliveries[0]
                 .text
                 .contains("Available projects: app")
+        );
+    }
+
+    #[test]
+    fn credentials_stay_in_secret_store_and_redact_output() {
+        let mut secrets = MemorySecrets::default();
+        store_slack_credentials(&mut secrets, "xapp-secret", "xoxb-secret").unwrap();
+        assert_eq!(
+            secrets.read(KEYCHAIN_SERVICE, APP_TOKEN_ACCOUNT).unwrap(),
+            "xapp-secret"
+        );
+        assert_eq!(
+            redact_secrets("failed xapp-secret xoxb-secret"),
+            "failed [REDACTED] [REDACTED]"
         );
     }
 }
