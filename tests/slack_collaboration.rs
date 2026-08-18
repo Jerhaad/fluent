@@ -441,6 +441,23 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
         "(allow file-read* (literal \"{}\"))",
         runner_home.path().display()
     )));
+
+    let mut environment = std::process::Command::new("/usr/bin/env");
+    environment.env_clear();
+    provider.configure_scope_environment(&mut environment, &scope);
+    let output = environment.output().unwrap();
+    assert!(output.status.success());
+    let observed = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        observed
+            .lines()
+            .any(|line| { line == format!("HOME={}", private_home.display()) })
+    );
+    assert!(
+        observed
+            .lines()
+            .any(|line| { line == format!("CODEX_HOME={}", codex_home.display()) })
+    );
 }
 
 fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint) {
@@ -1735,6 +1752,11 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("Keychain")
             && guide.contains("LaunchAgent")
             && guide.contains("mkdir -p ~/.config/fluent/slack")
+            && guide.contains("Copy member ID")
+            && guide.contains("channel ID (`C...`)")
+            && guide.contains("/invite @Fluent")
+            && guide.contains("@Fluent plan the next release")
+            && guide.contains("keeps the thread unbound")
             && guide.contains("fluent slack checkout-identity")
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")

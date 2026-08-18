@@ -67,3 +67,23 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,
 not a Slack login failure.
+
+## Start the first Fluent thread
+
+Invite the Fluent app to each configured channel before using it, for example
+with `/invite @Fluent`. In Slack, open the channel details and copy the channel
+ID (`C...`) for the `channel_defaults` key. Open each allowed participant's
+profile, choose
+**Copy member ID**, and add that `U...` value to `allowed_participants`.
+
+An allowed participant starts a thread by posting a top-level mention in the
+configured channel, for example:
+
+```text
+@Fluent plan the next release
+```
+
+Continue collaborating with ordinary replies in the resulting thread. When a
+channel has no available default project, Fluent keeps the thread unbound and
+offers the configured projects; it does not grant provider checkout access
+until an allowed participant selects an available project.

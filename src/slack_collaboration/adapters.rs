@@ -405,6 +405,15 @@ impl CodexAppServerProvider {
         .map(Some)
     }
 
+    #[doc(hidden)]
+    pub fn configure_scope_environment(&self, command: &mut Command, scope: &ProviderScope) {
+        if self.scoped {
+            command
+                .env("HOME", scope.slice_draft.join(".provider-home"))
+                .env("CODEX_HOME", scope.slice_draft.join(".codex-home"));
+        }
+    }
+
     fn connect(&self, scope: &ProviderScope) -> Result<CodexConnection> {
         fs::create_dir_all(&scope.slice_draft)?;
         let profile = self.render_scope_profile(scope)?;
@@ -417,9 +426,7 @@ impl CodexAppServerProvider {
             Command::new(&self.executable)
         };
         command.arg("app-server");
-        if self.scoped {
-            command.env("CODEX_HOME", scope.slice_draft.join(".codex-home"));
-        }
+        self.configure_scope_environment(&mut command, scope);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
