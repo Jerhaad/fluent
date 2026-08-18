@@ -703,6 +703,7 @@ fn cmd_attempt(
             work_item_id,
             attempt_id,
             additional_write_rounds,
+            resolution,
         } => {
             let extension = work_attempt_loop::extend_round_cap(
                 project_root,
@@ -710,6 +711,7 @@ fn cmd_attempt(
                 &work_item_id,
                 &attempt_id,
                 additional_write_rounds,
+                &resolution,
             )?;
             println!(
                 "Approved {} additional Writer round(s) for Attempt {} (cap {} -> {})",

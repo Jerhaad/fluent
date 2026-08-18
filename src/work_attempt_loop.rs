@@ -19,8 +19,8 @@ use crate::work_model::{
     EvidenceRecoveryState, LearnerCommitCanonicalization, MergeCandidateMergeStatus, PauseKind,
     PauseRecovery, RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task,
     TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError,
-    WorkModelStore, WriterOutcome, WriterRun, WriterRunKind,
-    resolve_managed_sibling_workspace_path, work_artifact_path,
+    WorkModelStore, WriterOutcome, WriterRun, WriterRunKind, normalize_round_cap_resolution,
+    resolve_managed_sibling_workspace_path, round_cap_resolution_digest, work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
 
@@ -55,10 +55,13 @@ pub fn extend_round_cap(
     work_item_id: &str,
     attempt_id: &str,
     additional_write_rounds: usize,
+    human_resolution: &str,
 ) -> Result<RoundCapExtension> {
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
         .map_err(|error| anyhow::anyhow!("failed to acquire land lock: {error}"))?;
     let base_cap = max_total_write_rounds();
+    let human_resolution = normalize_round_cap_resolution(human_resolution)?;
+    let human_resolution_digest = round_cap_resolution_digest(&human_resolution);
     Ok(store.mutate_work_item(work_item_id, |item| {
         let attempt_index = item
             .attempts
@@ -147,6 +150,8 @@ pub fn extend_round_cap(
                 && extension.candidate_commit == head
                 && extension.failed_reviews == failed_reviews
                 && extension.new_cap == effective_cap
+                && extension.human_resolution == human_resolution
+                && extension.human_resolution_digest == human_resolution_digest
         }) {
             return Ok(extension.clone());
         }
@@ -168,6 +173,7 @@ pub fn extend_round_cap(
                     additional_write_rounds,
                     candidate_commit: head,
                     failed_reviews,
+                    human_resolution,
                 },
             )
             .cloned()
@@ -1446,6 +1452,7 @@ fn validate_round_cap_frontier(
     attempt: &Attempt,
     extension: &RoundCapExtension,
 ) -> Result<(), WorkModelError> {
+    extension.validate_human_resolution()?;
     let failed_reviews = round_cap_failure_frontier(project_root, attempt).map_err(|error| {
         round_cap_ineligible(format!(
             "failed correction artifacts cannot be resolved: {error:#}"
@@ -7579,7 +7586,7 @@ fn write_budget_exhausted_handoff(
         .join("\n");
     let recovery = if round_cap_reached {
         format!(
-            "The current write-round ceiling was reached. To approve one to three additional Writer rounds for this exact candidate and failed-correction content, run:\n\n`fluent attempt extend {work_item_id} {attempt_id} --additional-write-rounds 1`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return it to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly."
+            "The current write-round ceiling was reached. To approve one to three additional Writer rounds for this exact candidate and failed-correction content, run:\n\n`fluent attempt extend {work_item_id} {attempt_id} --additional-write-rounds 1 --resolution \"<decision for the corrective Writer>\"`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return it to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly."
         )
     } else {
         format!(
@@ -10564,6 +10571,8 @@ mod tests {
                         evidence_write_rounds: 0,
                         candidate_commit: candidate_commit.clone(),
                         failed_reviews: frontier.clone(),
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
                         approved_at: "2026-08-08T00:00:00Z".to_string(),
                     });
                 Ok(())
@@ -10679,6 +10688,8 @@ mod tests {
                         evidence_write_rounds: 0,
                         candidate_commit: candidate.clone(),
                         failed_reviews: frontier,
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
                         approved_at: "2026-08-11T00:00:00Z".to_string(),
                     });
                 Ok(())
@@ -16675,6 +16686,8 @@ mod tests {
             evidence_write_rounds: 0,
             candidate_commit: "abc123".to_string(),
             failed_reviews: Vec::new(),
+            human_resolution: String::new(),
+            human_resolution_digest: String::new(),
             approved_at: "2026-08-07T00:00:00Z".to_string(),
         });
         store.create_work_item(&item).unwrap();

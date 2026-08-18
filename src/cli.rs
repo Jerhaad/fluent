@@ -416,6 +416,9 @@ pub enum AttemptCommands {
         /// Writer rounds to authorize (1 through 3)
         #[arg(long)]
         additional_write_rounds: usize,
+        /// Human decision that directs the corrective Writer at this boundary
+        #[arg(long)]
+        resolution: String,
     },
 
     /// Advance an Attempt through the next safe transitions

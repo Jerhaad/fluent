@@ -16,6 +16,16 @@ the authoritative index for this correction:
 Current correction artifacts (complete, untruncated paths):
 {{correction_artifacts_list}}
 
+{{#if has_human_resolution}}
+## Human resolution
+
+The operator made this decision for the exact candidate and failed-review bytes that authorized
+this correction. Treat it as authoritative within the approved Brief, Behaviors, Approach, and
+Plan:
+
+{{human_resolution}}
+{{/if}}
+
 Read the current context first. It contains the exact candidate and base commits, changed files,
 every unresolved progress entry, every current finding, concise passing evidence, and
 managed paths to the full historical artifacts. For review findings, read a specific historical

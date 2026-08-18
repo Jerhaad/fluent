@@ -28,6 +28,7 @@ pub const WORK_PROGRESS_DIR: &str = ".fluent/work/progress";
 pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
+pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
 
 fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
@@ -3982,6 +3983,12 @@ pub struct RoundCapExtension {
     pub evidence_write_rounds: usize,
     pub candidate_commit: String,
     pub failed_reviews: Vec<RoundCapReviewArtifact>,
+    /// The operator's exact decision for this candidate and failure frontier.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub human_resolution: String,
+    /// Detects manual or partial edits to the stored human decision.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub human_resolution_digest: String,
     pub approved_at: String,
 }
 
@@ -3991,6 +3998,27 @@ impl RoundCapExtension {
             && self.additional_write_rounds == request.additional_write_rounds
             && self.candidate_commit == request.candidate_commit
             && self.failed_reviews == request.failed_reviews
+            && self.human_resolution == request.human_resolution.trim()
+            && self.human_resolution_digest
+                == round_cap_resolution_digest(request.human_resolution.trim())
+    }
+
+    pub fn validate_human_resolution(&self) -> Result<(), WorkModelError> {
+        // Extensions written before human resolutions became mandatory remain
+        // readable. New extensions always persist both fields together.
+        if self.human_resolution.is_empty() && self.human_resolution_digest.is_empty() {
+            return Ok(());
+        }
+        let normalized = normalize_round_cap_resolution(&self.human_resolution)?;
+        if normalized != self.human_resolution
+            || self.human_resolution_digest != round_cap_resolution_digest(&normalized)
+        {
+            return Err(WorkModelError::RoundCapResolutionInvalid {
+                reason: "the stored human resolution no longer matches its approved bytes"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -4000,6 +4028,30 @@ pub struct RoundCapExtensionRequest {
     pub additional_write_rounds: usize,
     pub candidate_commit: String,
     pub failed_reviews: Vec<RoundCapReviewArtifact>,
+    pub human_resolution: String,
+}
+
+pub fn normalize_round_cap_resolution(resolution: &str) -> Result<String, WorkModelError> {
+    let normalized = resolution.trim();
+    if normalized.is_empty() {
+        return Err(WorkModelError::RoundCapResolutionInvalid {
+            reason: "provide a non-empty --resolution for the corrective Writer".to_string(),
+        });
+    }
+    if normalized.len() > MAX_ROUND_CAP_RESOLUTION_BYTES {
+        return Err(WorkModelError::RoundCapResolutionInvalid {
+            reason: format!(
+                "the human resolution is {} bytes; limit is {} bytes",
+                normalized.len(),
+                MAX_ROUND_CAP_RESOLUTION_BYTES
+            ),
+        });
+    }
+    Ok(normalized.to_string())
+}
+
+pub fn round_cap_resolution_digest(resolution: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(resolution.as_bytes()))
 }
 
 /// One execution history branch for a work item.
@@ -4301,6 +4353,7 @@ impl Attempt {
         base_cap: usize,
         request: RoundCapExtensionRequest,
     ) -> Result<&RoundCapExtension, WorkModelError> {
+        let human_resolution = normalize_round_cap_resolution(&request.human_resolution)?;
         if !(MIN_ADDITIONAL_WRITE_ROUNDS..=MAX_ADDITIONAL_WRITE_ROUNDS)
             .contains(&request.additional_write_rounds)
         {
@@ -4331,6 +4384,8 @@ impl Attempt {
             evidence_write_rounds: self.evidence_write_rounds(),
             candidate_commit: request.candidate_commit,
             failed_reviews: request.failed_reviews,
+            human_resolution_digest: round_cap_resolution_digest(&human_resolution),
+            human_resolution,
             approved_at: now_iso8601(),
         });
         Ok(self
@@ -5773,6 +5828,9 @@ pub enum WorkModelError {
         expected: usize,
         actual: usize,
     },
+    RoundCapResolutionInvalid {
+        reason: String,
+    },
     RoundCapExtensionIneligible {
         reason: String,
     },
@@ -5947,6 +6005,9 @@ impl fmt::Display for WorkModelError {
                 f,
                 "round-cap extension expected current cap {expected}, not stale cap {actual}"
             ),
+            Self::RoundCapResolutionInvalid { reason } => {
+                write!(f, "round-cap resolution is invalid: {reason}")
+            }
             Self::RoundCapExtensionIneligible { reason } => {
                 write!(f, "round-cap extension is not eligible: {reason}")
             }
@@ -15610,6 +15671,7 @@ random banner prose that must be ignored
                 },
                 digest: "sha256:approved".to_string(),
             }],
+            human_resolution: "Preserve the public contract and fix the boundary.".to_string(),
         }
     }
 
@@ -15628,6 +15690,14 @@ random banner prose that must be ignored
         assert_eq!(attempt.round_cap_extensions.len(), 1);
         assert_eq!(attempt.effective_write_round_cap(10), 12);
         assert_eq!(first.failed_reviews[0].digest, "sha256:approved");
+        assert_eq!(
+            first.human_resolution,
+            "Preserve the public contract and fix the boundary."
+        );
+        assert_eq!(
+            first.human_resolution_digest,
+            round_cap_resolution_digest(&first.human_resolution)
+        );
         assert!(
             !serde_json::to_string(&first)
                 .unwrap()
@@ -15641,6 +15711,21 @@ random banner prose that must be ignored
             error,
             WorkModelError::RoundCapExtensionIncrementOutOfRange { requested: 4 }
         ));
+
+        let mut empty = round_cap_request(1);
+        empty.human_resolution = "  \n".to_string();
+        let error = Attempt::default()
+            .record_round_cap_extension(10, empty)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkModelError::RoundCapResolutionInvalid { .. }
+        ));
+
+        let mut altered = first;
+        altered.human_resolution.push_str(" Changed.");
+        let error = altered.validate_human_resolution().unwrap_err();
+        assert!(error.to_string().contains("no longer matches"));
     }
 
     #[test]
@@ -15743,5 +15828,17 @@ random banner prose that must be ignored
                 .unwrap()
                 .contains("round_cap_extensions")
         );
+    }
+
+    #[test]
+    fn legacy_round_cap_extension_has_no_human_resolution() {
+        let extension: RoundCapExtension = serde_json::from_str(
+            r#"{"id":"round-cap-1-2","old_cap":1,"new_cap":2,"additional_write_rounds":1,"candidate_commit":"abc123","failed_reviews":[],"approved_at":"2026-08-18T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(extension.human_resolution.is_empty());
+        assert!(extension.human_resolution_digest.is_empty());
+        extension.validate_human_resolution().unwrap();
     }
 }

@@ -23406,6 +23406,8 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
     );
     let bin = tmp.path().join("bin");
     let profile_log = tmp.path().join("focused-profile.sb");
+    let rustup_home = tmp.path().join("rustup-home");
+    fs::create_dir(&rustup_home).unwrap();
     let sandbox_script = format!(
         "#!/bin/sh\ncp \"$2\" '{}'\nshift 2\nexec \"$@\"\n",
         profile_log.display()
@@ -23416,6 +23418,8 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
         .current_dir(&project)
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
         .env("OPENAI_API_KEY", "must-not-reach-focused-check")
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
         .env(
             "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
             bin.join("sandbox-exec"),
@@ -23447,6 +23451,14 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
         canonical_project.display()
     )));
     assert!(profile.contains("focused-evidence-runs/run-1"));
+    assert!(profile.contains(&format!(
+        "(allow file-read*  (subpath \"{}\"))",
+        rustup_home.canonicalize().unwrap().display()
+    )));
+    assert!(profile.contains(&format!(
+        "(deny file-write* (subpath \"{}\"))",
+        rustup_home.canonicalize().unwrap().display()
+    )));
     let source_home = PathBuf::from(std::env::var("HOME").unwrap());
     for state in [".claude", ".codex", ".agents"] {
         assert!(profile.contains(&format!(
@@ -23483,12 +23495,87 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
             .unwrap()
             .contains("CFFIXED_USER_HOME=")
     );
+    assert!(evidence["output"].as_str().unwrap().contains(&format!(
+        "RUSTUP_HOME={}",
+        rustup_home.canonicalize().unwrap().display()
+    )));
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("RUSTUP_TOOLCHAIN=stable-test-toolchain")
+    );
+    assert!(evidence["output"].as_str().unwrap().contains("CARGO_HOME="));
     assert_eq!(git_head(&project), candidate);
     assert!(
         git::run_stdout(&project, &["status", "--porcelain"], "inspect candidate")
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "focused-evidence-rustup",
+        "tests",
+        "Verdict: fail\nEvidence-Command: cargo\nEvidence-Working-Directory: .\n",
+    );
+    let bin = tmp.path().join("bin");
+    let rustup_home = tmp.path().join("rustup-home");
+    fs::create_dir(&rustup_home).unwrap();
+    let rustup_home = rustup_home.canonicalize().unwrap();
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+    write_mock_executable(
+        &bin,
+        "cargo",
+        &format!(
+            "#!/bin/sh\n[ \"$RUSTUP_HOME\" = '{}' ] || exit 31\n[ \"$RUSTUP_TOOLCHAIN\" = 'stable-test-toolchain' ] || exit 32\ncase \"$CARGO_HOME\" in */scratch/cargo-home) ;; *) exit 33 ;; esac\nprintf 'toolchain-preserved\\n'\n",
+            rustup_home.display()
+        ),
+    );
+    let mut paths = vec![bin.clone()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "focused-evidence-rustup",
+            "attempt-1",
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Focused evidence passed"));
+
+    let shown = work_item_value(&project, "focused-evidence-rustup");
+    let snapshot = project.join(
+        shown["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+            .as_str()
+            .unwrap(),
+    );
+    let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
+    assert!(
+        evidence["output"]
+            .as_str()
+            .unwrap()
+            .contains("toolchain-preserved")
+    );
+    assert_eq!(git_head(&project), candidate);
 }
 
 #[test]
@@ -29077,6 +29164,8 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
             "attempt-1",
             "--additional-write-rounds",
             "1",
+            "--resolution",
+            "Preserve the reviewed contract.",
         ])
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
         .assert()
@@ -29087,6 +29176,14 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
     let extension = &stored.attempts[0].round_cap_extensions[0];
     assert_eq!(extension.old_cap, 1);
     assert_eq!(extension.new_cap, 2);
+    assert_eq!(
+        extension.human_resolution,
+        "Preserve the reviewed contract."
+    );
+    assert_eq!(
+        extension.human_resolution_digest,
+        fluent::work_model::round_cap_resolution_digest(&extension.human_resolution)
+    );
     assert_eq!(extension.failed_reviews.len(), 1);
     assert!(extension.failed_reviews[0].digest.starts_with("sha256:"));
     assert_eq!(
@@ -29094,6 +29191,24 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
         2,
         "extending the cap records approval but does not plan work before attempt run"
     );
+
+    let mut altered = stored.clone();
+    altered.attempts[0].round_cap_extensions[0]
+        .human_resolution
+        .push_str(" Changed.");
+    store.write_work_item(&altered).unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "stored human resolution no longer matches",
+        ));
+    let mut restored = store.read_work_item("work-1").unwrap();
+    restored.attempts[0].round_cap_extensions[0] = extension.clone();
+    store.write_work_item(&restored).unwrap();
 
     fs::write(
         review_path.unwrap(),
@@ -29229,6 +29344,8 @@ fn attempt_extend_counts_repeated_evidence_corrections() {
             "attempt-1",
             "--additional-write-rounds",
             "1",
+            "--resolution",
+            "Keep evidence correction accounting stable.",
         ])
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
         .assert()
@@ -29352,6 +29469,8 @@ fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
             "attempt-1",
             "--additional-write-rounds",
             "1",
+            "--resolution",
+            "Correct the failed final Tester boundary.",
         ])
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
         .assert()

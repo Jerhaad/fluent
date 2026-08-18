@@ -4467,11 +4467,15 @@ fn build_reviewed_correction_prompt(
         .ok()
         .map(|source| unresolved_progress_steps(&source))
         .unwrap_or_default();
-    let task = item
+    let attempt = item
         .attempts
         .iter()
         .find(|attempt| attempt.id == attempt_id)
-        .and_then(|attempt| attempt.tasks.iter().find(|task| task.id == task_id))
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let task = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
         .ok_or_else(|| anyhow::anyhow!("corrective Writer Task {task_id:?} not found"))?;
     let artifact_area = task.artifact_area.as_ref().ok_or_else(|| {
         anyhow::anyhow!("corrective Writer Task {task_id:?} must declare an artifact area")
@@ -4510,6 +4514,19 @@ fn build_reviewed_correction_prompt(
     let writer_completion_allowed_constraints =
         writer_completion_allowed_constraints(item, attempt_id);
     let correction_artifacts_list = prior_reviews_block(correction_artifacts, "  ");
+    let human_resolution = attempt
+        .round_cap_extensions
+        .iter()
+        .rev()
+        .find(|extension| {
+            !extension.human_resolution.is_empty()
+                && extension
+                    .failed_reviews
+                    .iter()
+                    .all(|review| task.input_artifacts.contains(&review.artifact))
+        })
+        .map(|extension| extension.human_resolution.as_str())
+        .unwrap_or_default();
     let failed_tester_inspection_inputs = required_failed_tester_inspection_inputs(task);
     let failed_tester_inspection_list = failed_tester_inspection_inputs
         .iter()
@@ -4576,6 +4593,15 @@ fn build_reviewed_correction_prompt(
                 },
             ),
             ("correction_artifacts_list", &correction_artifacts_list),
+            ("human_resolution", human_resolution),
+            (
+                "has_human_resolution",
+                if human_resolution.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
             (
                 "has_failed_tester_inspection",
                 if failed_tester_inspection_inputs.is_empty() {
@@ -16262,19 +16288,38 @@ mod tests {
             ),
         )
         .unwrap();
+        let review_ref = crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-review-tests".to_string(),
+            path: review_path
+                .strip_prefix(project.path())
+                .unwrap()
+                .display()
+                .to_string(),
+        };
         let task_id = item
-            .add_next_write_round(
-                "attempt-1",
-                vec![crate::work_model::ArtifactRef {
-                    producer_id: "attempt-1-review-tests".to_string(),
-                    path: review_path
-                        .strip_prefix(project.path())
-                        .unwrap()
-                        .display()
-                        .to_string(),
-                }],
-            )
+            .add_next_write_round("attempt-1", vec![review_ref.clone()])
             .unwrap();
+        let human_resolution =
+            "Use the checkout's filesystem identity and fail closed after replacement.";
+        item.attempts[0]
+            .round_cap_extensions
+            .push(crate::work_model::RoundCapExtension {
+                id: "round-cap-1-2".to_string(),
+                old_cap: 1,
+                new_cap: 2,
+                additional_write_rounds: 1,
+                evidence_write_rounds: 0,
+                candidate_commit: prior_candidate.clone(),
+                failed_reviews: vec![crate::work_model::RoundCapReviewArtifact {
+                    artifact: review_ref,
+                    digest: "sha256:review".to_string(),
+                }],
+                human_resolution: human_resolution.to_string(),
+                human_resolution_digest: crate::work_model::round_cap_resolution_digest(
+                    human_resolution,
+                ),
+                approved_at: "2026-08-18T00:00:00Z".to_string(),
+            });
         item.attempts[0].writer_completion_contract =
             Some(crate::work_model::WriterCompletionContract {
                 version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
@@ -16320,6 +16365,8 @@ mod tests {
         assert!(prompt.contains("\"schema_version\": 1"));
         assert!(prompt.contains(&prior_candidate));
         assert!(prompt.contains("append-only"));
+        assert!(prompt.contains("## Human resolution"));
+        assert!(prompt.contains(human_resolution));
         assert!(!prompt.contains(large_output_marker));
         assert!(!prompt.contains("{{"));
 

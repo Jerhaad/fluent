@@ -347,6 +347,25 @@ struct FocusedExecution {
     output: String,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RustupEnvironment {
+    home: Option<PathBuf>,
+    toolchain: Option<std::ffi::OsString>,
+}
+
+fn host_rustup_environment(source_home: &Path) -> RustupEnvironment {
+    let configured_home = std::env::var_os("RUSTUP_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let home = configured_home
+        .unwrap_or_else(|| source_home.join(".rustup"))
+        .canonicalize()
+        .ok()
+        .filter(|path| path.is_dir());
+    let toolchain = std::env::var_os("RUSTUP_TOOLCHAIN").filter(|value| !value.is_empty());
+    RustupEnvironment { home, toolchain }
+}
+
 fn execute_focused_command(
     candidate_workspace: &Path,
     working_directory: &Path,
@@ -363,6 +382,7 @@ fn execute_focused_command(
     let source_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("focused evidence requires the host HOME path for toolchain confinement")?;
+    let rustup = host_rustup_environment(&source_home);
     let denied_agent_state = [".claude", ".codex", ".agents"]
         .into_iter()
         .map(|path| source_home.join(path))
@@ -374,11 +394,16 @@ fn execute_focused_command(
         source_home.join(".claude.json"),
         source_home.join(".claude.json.lock"),
     ]);
+    let mut readable_roots = vec![candidate_workspace.to_path_buf()];
+    if let Some(rustup_home) = &rustup.home {
+        denied_writes.push(rustup_home.clone());
+        readable_roots.push(rustup_home.clone());
+    }
     let profile = crate::os::render_profile_common_only_with_denied_access(
         resolver,
         &source_home.to_string_lossy(),
         &[run_dir.to_path_buf()],
-        &[candidate_workspace.to_path_buf()],
+        &readable_roots,
         &denied_agent_state,
         &denied_writes,
     )?;
@@ -400,6 +425,7 @@ fn execute_focused_command(
         .env("CFFIXED_USER_HOME", &home)
         .env("TMPDIR", &temporary)
         .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
+        .env("CARGO_HOME", scratch.join("cargo-home"))
         .env("CARGO_TARGET_DIR", scratch.join("cargo-target"))
         .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
         .env("SWIFT_MODULE_CACHE_PATH", scratch.join("swift-modules"))
@@ -410,6 +436,12 @@ fn execute_focused_command(
         .env("FLUENT_EVIDENCE_SCRATCH", &scratch)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    if let Some(rustup_home) = &rustup.home {
+        process.env("RUSTUP_HOME", rustup_home);
+    }
+    if let Some(toolchain) = &rustup.toolchain {
+        process.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
     for name in ["PATH", "DEVELOPER_DIR", "SDKROOT", "LANG", "LC_ALL"] {
         if let Some(value) = std::env::var_os(name) {
             process.env(name, value);
