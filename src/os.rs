@@ -486,7 +486,7 @@ pub fn render_profile_for_scoped_codex_provider(
     readable_roots: &[PathBuf],
     codex_home: &Path,
 ) -> Result<SandboxProfile> {
-    render_profile_for_access(
+    let profile = render_profile_for_access(
         resolver,
         &private_home.to_string_lossy(),
         writable_roots,
@@ -495,7 +495,25 @@ pub fn render_profile_for_scoped_codex_provider(
         Some(CoderKind::Codex),
         Some(codex_home),
         false,
-    )
+    )?;
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for broad_grant in [
+        "(allow file-read* (subpath \"/private/var\"))",
+        "(allow file-read* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/var\"))",
+        "(allow file-read* (subpath \"/tmp\"))",
+        "(allow file-read*  (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/Volumes\"))",
+    ] {
+        content = content.replace(
+            broad_grant,
+            "; scoped providers do not receive shared filesystem access",
+        );
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
 }
 
 /// Render an autonomous Claude profile whose mutable provider state lives under

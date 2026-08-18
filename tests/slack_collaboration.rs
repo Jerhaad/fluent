@@ -470,6 +470,18 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
         "(allow file-read* (literal \"{}\"))",
         runner_home.path().display()
     )));
+    for broad_grant in [
+        "(allow file-read* (subpath \"/private/var\"))",
+        "(allow file-read* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/var\"))",
+        "(allow file-read* (subpath \"/tmp\"))",
+        "(allow file-read*  (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/var/folders\"))",
+        "(allow file-write* (subpath \"/private/tmp\"))",
+        "(allow file-read* (subpath \"/Volumes\"))",
+    ] {
+        assert!(!rendered.contains(broad_grant), "found {broad_grant}");
+    }
 
     provider
         .start("scoped-action", &scope, "inspect the checkout", "U1")
@@ -480,6 +492,16 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
         assert_eq!(environment["HOME"], private_home.display().to_string());
         assert_eq!(environment["CODEX_HOME"], codex_home.display().to_string());
     }
+}
+
+#[test]
+fn pure_collaboration_domain_has_no_filesystem_authority() {
+    let domain = fs::read_to_string("src/slack_collaboration/domain.rs").unwrap();
+
+    assert!(!domain.contains("std::path"));
+    assert!(!domain.contains("PathBuf"));
+    assert!(!domain.contains("ProviderScope"));
+    assert!(!domain.contains("pub struct Checkout"));
 }
 
 fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint) {

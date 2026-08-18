@@ -1,58 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Checkout {
-    pub label: String,
-    pub path: PathBuf,
-    pub identity: String,
-    pub branch: String,
-    pub commit: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfiguredProject {
-    pub label: String,
-    pub checkout: Checkout,
-    pub allowed_participants: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RunnerConfig {
-    pub workspace: String,
-    pub projects: BTreeMap<String, ConfiguredProject>,
-    pub channel_defaults: BTreeMap<String, String>,
-}
-
-impl RunnerConfig {
-    /// Reject incomplete policy rather than accepting with partial authority.
-    pub fn validate(&self) -> Result<()> {
-        if self.workspace.trim().is_empty() {
-            bail!("Slack workspace is required");
-        }
-        for (key, project) in &self.projects {
-            if key != &project.label || key.trim().is_empty() {
-                bail!("configured project labels must be non-empty map keys");
-            }
-            if project.checkout.label.trim().is_empty()
-                || !project.checkout.identity.starts_with("checkout-v1:")
-                || project.checkout.branch.trim().is_empty()
-                || project.checkout.commit.trim().is_empty()
-            {
-                bail!("project {key} has an incomplete checkout identity");
-            }
-        }
-        for (channel, project) in &self.channel_defaults {
-            if channel.trim().is_empty() || !self.projects.contains_key(project) {
-                bail!("channel default references an unavailable configured project");
-            }
-        }
-        Ok(())
-    }
-}
 
 /// A persisted, idempotent Slack event. `id` is Slack's event id, never a
 /// generated retry id.
@@ -158,10 +107,4 @@ impl FluentThread {
             pending_turn: None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderScope {
-    pub checkout: PathBuf,
-    pub slice_draft: PathBuf,
 }
