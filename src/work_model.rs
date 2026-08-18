@@ -4257,14 +4257,20 @@ impl Attempt {
 
     pub fn effective_write_round_cap(&self, base_cap: usize) -> usize {
         let evidence_corrections = self.evidence_write_rounds();
-        self.round_cap_extensions.last().map_or_else(
+        let configured_cap = self.round_cap_extensions.last().map_or_else(
             || base_cap.saturating_add(evidence_corrections),
             |extension| {
                 extension.new_cap.saturating_add(
                     evidence_corrections.saturating_sub(extension.evidence_write_rounds),
                 )
             },
-        )
+        );
+        let materialized_write_rounds = self
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        configured_cap.max(materialized_write_rounds)
     }
 
     fn evidence_write_rounds(&self) -> usize {
@@ -15635,6 +15641,26 @@ random banner prose that must be ignored
             error,
             WorkModelError::RoundCapExtensionIncrementOutOfRange { requested: 4 }
         ));
+    }
+
+    #[test]
+    fn materialized_writer_overrun_becomes_the_extension_floor() {
+        let mut attempt = Attempt {
+            tasks: (0..11).map(|_| task(TaskKind::Write, Vec::new())).collect(),
+            ..Attempt::default()
+        };
+
+        assert_eq!(attempt.effective_write_round_cap(10), 11);
+        let mut request = round_cap_request(3);
+        request.old_cap = 11;
+        let extension = attempt
+            .record_round_cap_extension(10, request)
+            .unwrap()
+            .clone();
+
+        assert_eq!(extension.old_cap, 11);
+        assert_eq!(extension.new_cap, 14);
+        assert_eq!(attempt.effective_write_round_cap(10), 14);
     }
 
     #[test]
