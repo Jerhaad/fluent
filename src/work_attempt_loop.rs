@@ -374,6 +374,19 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             }
         }
 
+        // A prior Fluent build could pause after a failed-command recheck even
+        // when both the final Tester and its recheck were fully covered by the
+        // immutable Attempt baseline. Clear only that exact stale pause before
+        // the ordinary round-cap gate asks for another Writer authorization.
+        if reopen_baseline_covered_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
                 if candidate_gate_pause {
@@ -1445,6 +1458,77 @@ fn reopen_approved_round_cap_attempt(
         Ok(())
     })?;
     Ok(())
+}
+
+fn reopen_baseline_covered_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(store.mutate_work_item(work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || attempt.review_state != Some(AttemptReviewState::Failed)
+            || attempt
+                .tasks
+                .iter()
+                .any(|task| task.status != TaskStatus::Complete)
+        {
+            return Ok(false);
+        }
+        let Some(recheck) = attempt
+            .tasks
+            .last()
+            .filter(|task| task.kind == TaskKind::Tester && task.is_failed_command_recheck())
+        else {
+            return Ok(false);
+        };
+        let Some(recheck_area) = recheck.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let recheck_path = work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &recheck_area.path,
+        )
+        .map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered recheck evidence cannot be resolved: {error:#}"
+            ))
+        })?
+        .join("tester-results.json");
+        let Some(baseline_path) = baseline_tester_results_path(project_root, attempt) else {
+            return Ok(false);
+        };
+        let Some(final_tester_path) = latest_tester_results_path(project_root, attempt) else {
+            return Ok(false);
+        };
+        let evidence_is_covered = [&recheck_path, &final_tester_path].iter().all(|path| {
+            path.is_file()
+                && !tester_errored(path)
+                && introduced_tester_failures(path, Some(&baseline_path)) == 0
+                && unexplained_failed_tester_commands(path, Some(&baseline_path)) == 0
+        });
+        let failed_frontier =
+            round_cap_failure_frontier(project_root, attempt).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered correction frontier cannot be resolved: {error:#}"
+                ))
+            })?;
+        if !evidence_is_covered || !failed_frontier.is_empty() {
+            return Ok(false);
+        }
+        crate::work_model::reopen_attempt(attempt);
+        Ok(true)
+    })?)
 }
 
 fn validate_round_cap_frontier(
@@ -10525,6 +10609,99 @@ mod tests {
             Some(source.as_path()),
             "the no-change Writer preserves the candidate-bound final Tester"
         );
+    }
+
+    #[test]
+    fn baseline_covered_recheck_reopens_stale_round_cap() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let source = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut source_results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+        source_results["tests"] = serde_json::json!([{
+            "id": "baseline_test",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "known baseline failure"
+        }]);
+        source_results["summary"] =
+            serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+        fs::write(&source, serde_json::to_vec_pretty(&source_results).unwrap()).unwrap();
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedFailedCommandRecheck { .. }
+        ));
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        let recheck_path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut recheck_results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&recheck_path).unwrap()).unwrap();
+        recheck_results["tests"] = source_results["tests"].clone();
+        recheck_results["summary"] = source_results["summary"].clone();
+        fs::write(
+            &recheck_path,
+            serde_json::to_vec_pretty(&recheck_results).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        store.write_work_item(&item).unwrap();
+        let baseline = project.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-baseline-tester",
+        ));
+        fs::create_dir_all(&baseline).unwrap();
+        fs::copy(&source, baseline.join("tester-results.json")).unwrap();
+
+        assert!(
+            reopen_baseline_covered_round_cap_attempt(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(reopened.attempts[0].pause_kind, None);
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, reopened, "attempt-1").unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
     }
 
     #[test]
