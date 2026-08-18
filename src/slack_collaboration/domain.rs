@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,7 @@ impl RunnerConfig {
             }
             if project.checkout.label.trim().is_empty()
                 || project.checkout.identity.trim().is_empty()
+                || !Path::new(&project.checkout.identity).is_absolute()
                 || project.checkout.branch.trim().is_empty()
                 || project.checkout.commit.trim().is_empty()
             {

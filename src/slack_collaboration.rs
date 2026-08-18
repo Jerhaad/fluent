@@ -477,6 +477,12 @@ pub fn checkout_is_available(checkout: &Checkout) -> bool {
     if !checkout.path.is_dir() || !checkout.path.join(".git").exists() {
         return false;
     }
+    let Ok(canonical_path) = checkout.path.canonicalize() else {
+        return false;
+    };
+    if canonical_path != PathBuf::from(&checkout.identity) {
+        return false;
+    }
     // Lightweight fixtures deliberately use a .git directory without a real
     // repository. Real checkouts must match both recorded branch and commit.
     let branch = Command::new("git")
@@ -662,7 +668,12 @@ mod tests {
             checkout: Checkout {
                 label: "main".into(),
                 path: checkout.path().into(),
-                identity: "id".into(),
+                identity: checkout
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string(),
                 branch: "main".into(),
                 commit: "abc".into(),
             },
@@ -753,7 +764,12 @@ mod tests {
                 checkout: Checkout {
                     label: "other-main".into(),
                     path: available.path().into(),
-                    identity: "other".into(),
+                    identity: available
+                        .path()
+                        .canonicalize()
+                        .unwrap()
+                        .display()
+                        .to_string(),
                     branch: "main".into(),
                     commit: "def".into(),
                 },

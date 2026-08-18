@@ -17,7 +17,12 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
         checkout: Checkout {
             label: "main".into(),
             path: checkout.path().into(),
-            identity: "id".into(),
+            identity: checkout
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string(),
             branch: "main".into(),
             commit: "abc".into(),
         },
@@ -106,12 +111,32 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     let server = std::thread::spawn(move || {
         for _ in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0; 4096];
-            let count = stream.read(&mut buffer).unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
             captured
                 .lock()
                 .unwrap()
-                .push(String::from_utf8_lossy(&buffer[..count]).into_owned());
+                .push(String::from_utf8(request).unwrap());
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
                 .unwrap();
@@ -692,7 +717,13 @@ fn changed_checkout_identity_is_unavailable() {
     )
     .unwrap();
     config.projects.get_mut("app").unwrap().checkout.commit = commit.trim().into();
+    config.projects.get_mut("app").unwrap().checkout.identity =
+        path.canonicalize().unwrap().display().to_string();
     assert!(checkout_is_available(&config.projects["app"].checkout));
+    config.projects.get_mut("app").unwrap().checkout.identity = "/different/checkout".into();
+    assert!(!checkout_is_available(&config.projects["app"].checkout));
+    config.projects.get_mut("app").unwrap().checkout.identity =
+        path.canonicalize().unwrap().display().to_string();
     config.projects.get_mut("app").unwrap().checkout.commit = "different".into();
     assert!(!checkout_is_available(&config.projects["app"].checkout));
     assert!(
@@ -797,6 +828,12 @@ fn unavailable_default_offers_available_projects() {
     other.label = "other".into();
     other.checkout.label = "other-checkout".into();
     other.checkout.path = alternative.path().into();
+    other.checkout.identity = alternative
+        .path()
+        .canonicalize()
+        .unwrap()
+        .display()
+        .to_string();
     config.projects.insert("other".into(), other);
     fs::remove_dir(checkout.path().join(".git")).unwrap();
     let mut runner = CollaborationRunner::new(
@@ -827,7 +864,12 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
             checkout: Checkout {
                 label: "other-checkout".into(),
                 path: other_checkout.path().into(),
-                identity: "other-id".into(),
+                identity: other_checkout
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string(),
                 branch: "main".into(),
                 commit: "def".into(),
             },
