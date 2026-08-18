@@ -259,6 +259,9 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
     match command {
         SlackCommands::Manifest => print!("{}", slack_collaboration::SOCKET_MODE_MANIFEST),
         SlackCommands::Setup => print!("{}", include_str!("../docs/slack-runner.md")),
+        SlackCommands::CheckoutIdentity { path } => {
+            println!("{}", slack_collaboration::checkout_identity(&path)?);
+        }
         SlackCommands::Enable => {
             let home = slack_home()?;
             let executable = std::env::current_exe()?;

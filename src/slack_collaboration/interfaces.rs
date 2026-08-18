@@ -14,9 +14,10 @@ pub enum InboxState {
 /// Durable collaboration state boundary for inbox, aggregate snapshots,
 /// outbox, and recovery cursors.
 pub trait CollaborationStore {
-    fn persist_inbox(&self, event: &InboundEnvelope) -> Result<InboxState>;
+    fn persist_inbox(&self, config: &RunnerConfig, event: &InboundEnvelope) -> Result<InboxState>;
+    fn bind_inbox_event(&self, config: &RunnerConfig, id: &str, project_label: &str) -> Result<()>;
     fn mark_inbox_processed(&self, id: &str) -> Result<()>;
-    fn load_pending_inbox(&self) -> Result<Vec<InboundEnvelope>>;
+    fn load_pending_inbox(&self, config: &RunnerConfig) -> Result<Vec<InboundEnvelope>>;
     fn load_outbox(&self) -> Result<Vec<OutboundDelivery>>;
     fn save_outbox(&self, deliveries: &[OutboundDelivery]) -> Result<()>;
     fn persist_outbox(&self, delivery: OutboundDelivery) -> Result<()>;

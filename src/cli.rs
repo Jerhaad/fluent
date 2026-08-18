@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -227,6 +228,11 @@ pub enum SlackCommands {
     Manifest,
     /// Print the owner-facing local Slack runner setup instructions
     Setup,
+    /// Print the machine-local identity for a checkout
+    CheckoutIdentity {
+        /// Checkout to identify
+        path: PathBuf,
+    },
     /// Install and start the local Slack runner at login
     Enable,
     /// Start the configured local Slack runner

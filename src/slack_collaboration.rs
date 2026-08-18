@@ -12,6 +12,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 
@@ -483,41 +484,67 @@ pub fn safe_identity(project: &ConfiguredProject) -> String {
         project.label, project.checkout.label, project.checkout.branch, project.checkout.commit
     )
 }
+
+/// Derive an opaque identity for this checkout and Git directory instance.
+pub fn checkout_identity(path: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let checkout = path
+        .canonicalize()
+        .with_context(|| format!("canonicalize checkout {}", path.display()))?;
+    let checkout_metadata = fs::metadata(&checkout).context("inspect canonical checkout")?;
+    let git_dir = git_output(&checkout, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(git_dir)
+        .canonicalize()
+        .context("canonicalize Git administrative directory")?;
+    let metadata = fs::metadata(&git_dir).context("inspect Git administrative directory")?;
+    let mut digest = Sha256::new();
+    digest.update(b"fluent-checkout-v1\0");
+    digest.update(checkout.as_os_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(checkout_metadata.dev().to_le_bytes());
+    digest.update(checkout_metadata.ino().to_le_bytes());
+    digest.update(b"\0");
+    digest.update(git_dir.as_os_str().as_bytes());
+    digest.update(b"\0");
+    digest.update(metadata.dev().to_le_bytes());
+    digest.update(metadata.ino().to_le_bytes());
+    Ok(format!("checkout-v1:{:x}", digest.finalize()))
+}
+
+fn git_output(path: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!("git {} failed", args.join(" "));
+    }
+    String::from_utf8(output.stdout)
+        .context("Git returned non-UTF-8 output")
+        .map(|value| value.trim().to_owned())
+}
+
 pub fn checkout_is_available(checkout: &Checkout) -> bool {
-    if !checkout.path.is_dir() || !checkout.path.join(".git").exists() {
+    if !checkout.path.is_dir() {
         return false;
     }
-    let Ok(canonical_path) = checkout.path.canonicalize() else {
+    let Ok(identity) = checkout_identity(&checkout.path) else {
         return false;
     };
-    if canonical_path != PathBuf::from(&checkout.identity) {
+    if identity != checkout.identity {
         return false;
     }
-    // Lightweight fixtures deliberately use a .git directory without a real
-    // repository. Real checkouts must match both recorded branch and commit.
-    let branch = Command::new("git")
-        .args([
-            "-C",
-            &checkout.path.display().to_string(),
-            "branch",
-            "--show-current",
-        ])
-        .output();
-    let commit = Command::new("git")
-        .args([
-            "-C",
-            &checkout.path.display().to_string(),
-            "rev-parse",
-            "HEAD",
-        ])
-        .output();
-    match (branch, commit) {
-        (Ok(branch), Ok(commit)) if branch.status.success() && commit.status.success() => {
-            String::from_utf8_lossy(&branch.stdout).trim() == checkout.branch
-                && String::from_utf8_lossy(&commit.stdout).trim() == checkout.commit
-        }
-        _ => true,
-    }
+    let Ok(branch) = git_output(&checkout.path, &["branch", "--show-current"]) else {
+        return false;
+    };
+    let Ok(commit) = git_output(&checkout.path, &["rev-parse", "HEAD"]) else {
+        return false;
+    };
+    branch == checkout.branch && commit == checkout.commit
 }
 
 pub fn write_config(home: &Path, config: &RunnerConfig) -> Result<()> {
@@ -669,23 +696,57 @@ mod tests {
         }
     }
     use tempfile::TempDir;
+    fn initialize_checkout(path: &Path) -> (String, String) {
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "user.name", "Fluent test"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        fs::write(path.join("README"), "fixture").unwrap();
+        for args in [&["add", "README"][..], &["commit", "-m", "fixture"][..]] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        (
+            checkout_identity(path).unwrap(),
+            String::from_utf8(output.stdout).unwrap().trim().into(),
+        )
+    }
     fn setup() -> (TempDir, TempDir, RunnerConfig) {
         let home = TempDir::new().unwrap();
         let checkout = TempDir::new().unwrap();
-        fs::create_dir(checkout.path().join(".git")).unwrap();
+        let (identity, commit) = initialize_checkout(checkout.path());
         let project = ConfiguredProject {
             label: "app".into(),
             checkout: Checkout {
                 label: "main".into(),
                 path: checkout.path().into(),
-                identity: checkout
-                    .path()
-                    .canonicalize()
-                    .unwrap()
-                    .display()
-                    .to_string(),
+                identity,
                 branch: "main".into(),
-                commit: "abc".into(),
+                commit,
             },
             allowed_participants: ["U1".into()].into_iter().collect(),
         };
@@ -764,9 +825,9 @@ mod tests {
     #[test]
     fn unavailable_default_offers_available_projects_without_provider_access() {
         let (home, checkout, mut config) = setup();
-        fs::remove_dir(checkout.path().join(".git")).unwrap();
+        fs::remove_dir_all(checkout.path().join(".git")).unwrap();
         let available = TempDir::new().unwrap();
-        fs::create_dir(available.path().join(".git")).unwrap();
+        let (identity, commit) = initialize_checkout(available.path());
         config.projects.insert(
             "other".into(),
             ConfiguredProject {
@@ -774,14 +835,9 @@ mod tests {
                 checkout: Checkout {
                     label: "other-main".into(),
                     path: available.path().into(),
-                    identity: available
-                        .path()
-                        .canonicalize()
-                        .unwrap()
-                        .display()
-                        .to_string(),
+                    identity,
                     branch: "main".into(),
-                    commit: "def".into(),
+                    commit,
                 },
                 allowed_participants: ["U1".into()].into_iter().collect(),
             },
@@ -889,7 +945,7 @@ mod tests {
 
         let mut recovered = CollaborationRunner::new(
             home.path(),
-            config,
+            config.clone(),
             InMemoryProvider::default(),
             InMemorySlack::default(),
         );
@@ -908,9 +964,9 @@ mod tests {
             recovered.provider().calls[0].0.as_deref(),
             Some("session-1")
         );
-        let recovered_threads = load_threads(home.path(), &config).unwrap();
+        let recovered_thread = load_thread(home.path(), &config, "1.0").unwrap().unwrap();
         assert_eq!(
-            recovered_threads["1.0"].last_connection.as_deref(),
+            recovered_thread.last_connection.as_deref(),
             Some("2026-08-17T00:00:00Z")
         );
     }

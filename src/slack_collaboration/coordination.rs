@@ -63,7 +63,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if let Some(error) = &self.configuration_error {
             bail!("runner configuration is invalid; refusing Slack ingress: {error}");
         }
-        match self.store.persist_inbox(&event)? {
+        match self.store.persist_inbox(&self.config, &event)? {
             InboxState::Processed => return Ok(()),
             InboxState::Pending if !event.acknowledgement_id.is_empty() => {
                 self.slack.acknowledge(&event.acknowledgement_id)?
@@ -88,7 +88,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         connected_at: String,
         report_interruption: bool,
     ) -> Result<()> {
-        let mut events = self.store.load_pending_inbox()?;
+        let mut events = self.store.load_pending_inbox(&self.config)?;
         events.extend(history);
         events.sort_by(|left, right| {
             left.timestamp
@@ -138,6 +138,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .store
             .load_thread(&self.config, &event.thread_id())?
             .unwrap_or_else(|| FluentThread::new(&event));
+        if let Some(project_label) = &thread.project_label {
+            self.store
+                .bind_inbox_event(&self.config, &event.id, project_label)?;
+        }
         if thread
             .pending_turn
             .as_ref()
@@ -175,6 +179,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
         });
         if let Some(project) = available {
+            self.store
+                .bind_inbox_event(&self.config, &event.id, &project.label)?;
             thread.state = ThreadState::Active;
             thread.project_label = Some(project.label.clone());
             thread.pending_turn = Some(PendingTurn {

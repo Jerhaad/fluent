@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -38,8 +38,7 @@ impl RunnerConfig {
                 bail!("configured project labels must be non-empty map keys");
             }
             if project.checkout.label.trim().is_empty()
-                || project.checkout.identity.trim().is_empty()
-                || !Path::new(&project.checkout.identity).is_absolute()
+                || !project.checkout.identity.starts_with("checkout-v1:")
                 || project.checkout.branch.trim().is_empty()
                 || project.checkout.commit.trim().is_empty()
             {

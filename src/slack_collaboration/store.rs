@@ -84,6 +84,12 @@ fn thread_path(project: &Path, id: &str) -> Result<PathBuf> {
         .join(format!("{id}.json")))
 }
 
+fn project_inbox_path(project: &Path, id: &str) -> PathBuf {
+    project
+        .join(".fluent/work/slack/inbox")
+        .join(format!("{}.json", digest(id.as_bytes())))
+}
+
 pub(super) fn ensure_root(home: &Path) -> Result<()> {
     fs::create_dir_all(state_root(home))?;
     Ok(())
@@ -101,11 +107,42 @@ pub(super) fn read_json<T: for<'a> Deserialize<'a> + Default>(path: PathBuf) -> 
 struct InboxEntry {
     event: InboundEnvelope,
     processed: bool,
+    #[serde(default)]
+    project_label: Option<String>,
+    #[serde(default)]
+    deduplication_identity: String,
 }
 
-pub(super) fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<InboxState> {
+fn inbox_deduplication_identity(event: &InboundEnvelope) -> String {
+    digest(
+        format!(
+            "{}\0{}\0{}\0{}",
+            event.channel, event.timestamp, event.user, event.text
+        )
+        .as_bytes(),
+    )
+}
+
+fn routing_envelope(event: &InboundEnvelope) -> InboundEnvelope {
+    InboundEnvelope {
+        id: event.id.clone(),
+        acknowledgement_id: String::new(),
+        channel: event.channel.clone(),
+        timestamp: event.timestamp.clone(),
+        thread_timestamp: event.thread_timestamp.clone(),
+        user: String::new(),
+        text: String::new(),
+    }
+}
+
+pub(super) fn persist_inbox(
+    home: &Path,
+    config: &RunnerConfig,
+    event: &InboundEnvelope,
+) -> Result<InboxState> {
     ensure_root(home)?;
     let _lock = state_lock(home)?;
+    recover_thread_commits(home, config)?;
     let mut inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
     if let Some(entry) = inbox.get(&event.id) {
         return Ok(if entry.processed {
@@ -114,20 +151,42 @@ pub(super) fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<Inbo
             InboxState::Pending
         });
     }
+    let deduplication_identity = inbox_deduplication_identity(event);
     if inbox.values().any(|entry| {
         entry.processed
-            && entry.event.channel == event.channel
-            && entry.event.timestamp == event.timestamp
-            && entry.event.user == event.user
-            && entry.event.text == event.text
+            && (entry.deduplication_identity == deduplication_identity
+                || (entry.deduplication_identity.is_empty()
+                    && entry.event.channel == event.channel
+                    && entry.event.timestamp == event.timestamp
+                    && entry.event.user == event.user
+                    && entry.event.text == event.text))
     }) {
         return Ok(InboxState::Processed);
     }
+    let project_label = load_thread_index(home)?
+        .get(&event.thread_id())
+        .and_then(|thread| thread.project_label.clone());
+    let persisted_event = if let Some(label) = &project_label {
+        let project = config
+            .projects
+            .get(label)
+            .with_context(|| format!("configured project {label} is unavailable"))?;
+        let path = project_inbox_path(&project.checkout.path, &event.id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        atomic_write(&path, &serde_json::to_vec_pretty(event)?)?;
+        routing_envelope(event)
+    } else {
+        event.clone()
+    };
     inbox.insert(
         event.id.clone(),
         InboxEntry {
-            event: event.clone(),
+            event: persisted_event,
             processed: false,
+            project_label,
+            deduplication_identity,
         },
     );
     atomic_write(&inbox_path(home), &serde_json::to_vec_pretty(&inbox)?)?;
@@ -135,16 +194,20 @@ pub(super) fn persist_inbox(home: &Path, event: &InboundEnvelope) -> Result<Inbo
 }
 
 impl CollaborationStore for FileCollaborationStore {
-    fn persist_inbox(&self, event: &InboundEnvelope) -> Result<InboxState> {
-        persist_inbox(&self.home, event)
+    fn persist_inbox(&self, config: &RunnerConfig, event: &InboundEnvelope) -> Result<InboxState> {
+        persist_inbox(&self.home, config, event)
     }
 
     fn mark_inbox_processed(&self, id: &str) -> Result<()> {
         mark_inbox_processed(&self.home, id)
     }
 
-    fn load_pending_inbox(&self) -> Result<Vec<InboundEnvelope>> {
-        load_pending_inbox(&self.home)
+    fn bind_inbox_event(&self, config: &RunnerConfig, id: &str, project_label: &str) -> Result<()> {
+        bind_inbox_event(&self.home, config, id, project_label)
+    }
+
+    fn load_pending_inbox(&self, config: &RunnerConfig) -> Result<Vec<InboundEnvelope>> {
+        load_pending_inbox(&self.home, config)
     }
 
     fn load_outbox(&self) -> Result<Vec<OutboundDelivery>> {
@@ -189,6 +252,38 @@ impl CollaborationStore for FileCollaborationStore {
     }
 }
 
+pub(super) fn bind_inbox_event(
+    home: &Path,
+    config: &RunnerConfig,
+    id: &str,
+    project_label: &str,
+) -> Result<()> {
+    let _lock = state_lock(home)?;
+    let project = config
+        .projects
+        .get(project_label)
+        .with_context(|| format!("configured project {project_label} is unavailable"))?;
+    let mut inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
+    let entry = inbox
+        .get_mut(id)
+        .context("persisted inbox event is missing")?;
+    if entry.project_label.as_deref() == Some(project_label) {
+        return Ok(());
+    }
+    if entry.project_label.is_some() {
+        bail!("persisted inbox event is already bound to another project");
+    }
+    let project_path = project_inbox_path(&project.checkout.path, id);
+    if let Some(parent) = project_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_write(&project_path, &serde_json::to_vec_pretty(&entry.event)?)?;
+    entry.event = routing_envelope(&entry.event);
+    entry.project_label = Some(project_label.to_owned());
+    atomic_write(&inbox_path(home), &serde_json::to_vec_pretty(&inbox)?)?;
+    Ok(())
+}
+
 pub(super) fn mark_inbox_processed(home: &Path, id: &str) -> Result<()> {
     let _lock = state_lock(home)?;
     let mut inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
@@ -200,13 +295,26 @@ pub(super) fn mark_inbox_processed(home: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn load_pending_inbox(home: &Path) -> Result<Vec<InboundEnvelope>> {
+pub(super) fn load_pending_inbox(
+    home: &Path,
+    config: &RunnerConfig,
+) -> Result<Vec<InboundEnvelope>> {
     let inbox: BTreeMap<String, InboxEntry> = read_json(inbox_path(home))?;
-    let mut pending: Vec<_> = inbox
-        .into_values()
-        .filter(|entry| !entry.processed)
-        .map(|entry| entry.event)
-        .collect();
+    let mut pending = Vec::new();
+    for entry in inbox.into_values().filter(|entry| !entry.processed) {
+        if let Some(label) = entry.project_label {
+            let project = config
+                .projects
+                .get(&label)
+                .with_context(|| format!("configured project {label} is unavailable"))?;
+            let path = project_inbox_path(&project.checkout.path, &entry.event.id);
+            let bytes = fs::read(&path)
+                .with_context(|| format!("bound inbox event {} is unavailable", entry.event.id))?;
+            pending.push(serde_json::from_slice(&bytes)?);
+        } else {
+            pending.push(entry.event);
+        }
+    }
     pending.sort_by(|left, right| {
         left.timestamp
             .cmp(&right.timestamp)
@@ -350,6 +458,8 @@ fn save_thread_with_crash(
         private_mapping.linked_work = None;
         private_mapping.pending_question = None;
         private_mapping.processed_events.clear();
+        private_mapping.last_connection = None;
+        private_mapping.pending_turn = None;
     }
     let snapshot = if let Some(project) = thread
         .project_label

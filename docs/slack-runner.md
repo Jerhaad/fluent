@@ -31,13 +31,20 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    example:
 
    ```json
-   {"workspace":"example","projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"/canonical/checkout","branch":"main","commit":"<commit>"},"allowed_participants":["U123"]}},"channel_defaults":{"C123":"app"}}
+   {"workspace":"example","projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"]}},"channel_defaults":{"C123":"app"}}
    ```
 
-   Set `identity` to the canonical path printed by `cd /absolute/checkout &&
-   pwd -P`. Pin every checkout label, canonical identity, branch, commit, and
-   allowed participant. A checkout that resolves to another path, branch, or
-   commit fails closed.
+   Print the machine-local opaque `identity` with:
+
+   ```sh
+   fluent slack checkout-identity /absolute/checkout
+   ```
+
+   Pin every checkout label, identity, branch, commit, and allowed participant.
+   The identity binds the canonical checkout and Git administrative directory
+   to their filesystem identities. A checkout or Git directory that is
+   replaced or recreated, or whose branch or commit cannot be inspected, fails
+   closed until the runner owner records a new identity.
 6. Print this guide at any time with `fluent slack setup`. Enable the exact
    Fluent executable as an owner-scoped LaunchAgent with:
 

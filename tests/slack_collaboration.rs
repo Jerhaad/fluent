@@ -8,23 +8,58 @@ use std::sync::{Arc, Mutex};
 use fluent::slack_collaboration::*;
 use tempfile::TempDir;
 
+fn initialize_checkout(path: &std::path::Path) -> (String, String) {
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "test@example.invalid"],
+        vec!["config", "user.name", "Fluent test"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(path.join("README"), "fixture").unwrap();
+    for args in [vec!["add", "README"], vec!["commit", "-m", "fixture"]] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    (
+        checkout_identity(path).unwrap(),
+        String::from_utf8(commit.stdout).unwrap().trim().into(),
+    )
+}
+
 fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
     let home = TempDir::new().unwrap();
     let checkout = TempDir::new().unwrap();
-    fs::create_dir(checkout.path().join(".git")).unwrap();
+    let (identity, commit) = initialize_checkout(checkout.path());
     let project = ConfiguredProject {
         label: "app".into(),
         checkout: Checkout {
             label: "main".into(),
             path: checkout.path().into(),
-            identity: checkout
-                .path()
-                .canonicalize()
-                .unwrap()
-                .display()
-                .to_string(),
+            identity,
             branch: "main".into(),
-            commit: "abc".into(),
+            commit,
         },
         allowed_participants: BTreeSet::from(["U1".into()]),
     };
@@ -285,6 +320,10 @@ fn top_level_mention_uses_available_channel_default() {
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);
+    let expected = format!(
+        "branch: main; commit: {}",
+        config.projects["app"].checkout.commit
+    );
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -292,11 +331,7 @@ fn bound_thread_shows_safe_checkout_identity() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    assert!(
-        runner.slack().deliveries[0]
-            .text
-            .contains("branch: main; commit: abc")
-    );
+    assert!(runner.slack().deliveries[0].text.contains(&expected));
     assert!(runner.slack().deliveries[0].text.contains("Project: app"));
     assert!(runner.slack().deliveries[0].text.contains("checkout: main"));
     assert!(
@@ -716,70 +751,10 @@ fn durable_outbox_identity_cannot_be_rewritten() {
 fn changed_checkout_identity_is_unavailable() {
     let (_home, checkout, mut config) = setup(true);
     let path = checkout.path();
-    assert!(
-        std::process::Command::new("git")
-            .args(["-C", &path.display().to_string(), "init", "-b", "main"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        std::process::Command::new("git")
-            .args([
-                "-C",
-                &path.display().to_string(),
-                "config",
-                "user.email",
-                "test@example.invalid"
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        std::process::Command::new("git")
-            .args([
-                "-C",
-                &path.display().to_string(),
-                "config",
-                "user.name",
-                "Fluent test"
-            ])
-            .status()
-            .unwrap()
-            .success()
-    );
-    fs::write(path.join("README"), "fixture").unwrap();
-    assert!(
-        std::process::Command::new("git")
-            .args(["-C", &path.display().to_string(), "add", "README"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        std::process::Command::new("git")
-            .args(["-C", &path.display().to_string(), "commit", "-m", "fixture"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let commit = String::from_utf8(
-        std::process::Command::new("git")
-            .args(["-C", &path.display().to_string(), "rev-parse", "HEAD"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    config.projects.get_mut("app").unwrap().checkout.commit = commit.trim().into();
-    config.projects.get_mut("app").unwrap().checkout.identity =
-        path.canonicalize().unwrap().display().to_string();
     assert!(checkout_is_available(&config.projects["app"].checkout));
-    config.projects.get_mut("app").unwrap().checkout.identity = "/different/checkout".into();
+    config.projects.get_mut("app").unwrap().checkout.identity = "checkout-v1:different".into();
     assert!(!checkout_is_available(&config.projects["app"].checkout));
-    config.projects.get_mut("app").unwrap().checkout.identity =
-        path.canonicalize().unwrap().display().to_string();
+    config.projects.get_mut("app").unwrap().checkout.identity = checkout_identity(path).unwrap();
     config.projects.get_mut("app").unwrap().checkout.commit = "different".into();
     assert!(!checkout_is_available(&config.projects["app"].checkout));
     assert!(
@@ -802,6 +777,53 @@ fn changed_checkout_identity_is_unavailable() {
 }
 
 #[test]
+fn replacing_git_directory_invalidates_checkout_identity() {
+    let (_home, checkout, config) = setup(true);
+    let configured = &config.projects["app"].checkout;
+    assert!(checkout_is_available(configured));
+    fs::rename(
+        checkout.path().join(".git"),
+        checkout.path().join(".git-original"),
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args(["init", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!checkout_is_available(configured));
+}
+
+#[test]
+fn replacing_checkout_directory_invalidates_checkout_identity() {
+    let (_home, checkout, config) = setup(true);
+    let configured = &config.projects["app"].checkout;
+    let replacement = checkout.path().with_extension("original");
+    fs::rename(checkout.path(), &replacement).unwrap();
+    fs::create_dir(checkout.path()).unwrap();
+    initialize_checkout(checkout.path());
+    assert!(!checkout_is_available(configured));
+    fs::remove_dir_all(replacement).unwrap();
+}
+
+#[test]
+fn git_inspection_errors_make_checkout_unavailable() {
+    let (_home, checkout, config) = setup(true);
+    let configured = &config.projects["app"].checkout;
+    assert!(checkout_is_available(configured));
+    fs::write(
+        checkout.path().join(".git/HEAD"),
+        "ref: refs/heads/missing\n",
+    )
+    .unwrap();
+    assert!(!checkout_is_available(configured));
+}
+
+#[test]
 fn bound_thread_home_index_excludes_active_snapshot_state() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
@@ -818,6 +840,69 @@ fn bound_thread_home_index_excludes_active_snapshot_state() {
     assert_eq!(mapping.project_label.as_deref(), Some("app"));
     assert!(mapping.provider_session.is_none());
     assert!(mapping.processed_events.is_empty());
+    assert!(mapping.last_connection.is_none());
+}
+
+#[test]
+fn bound_payloads_are_persisted_only_in_project_runtime() {
+    let (home, checkout, config) = setup(true);
+    let mut thread = FluentThread {
+        id: "1.0".into(),
+        channel: "C1".into(),
+        state: ThreadState::Active,
+        project_label: Some("app".into()),
+        provider_session: None,
+        slice: None,
+        planning_stage: None,
+        linked_work: None,
+        pending_question: None,
+        processed_events: BTreeSet::from(["E1".into()]),
+        last_connection: None,
+        pending_turn: Some(PendingTurn {
+            action_id: "E1".into(),
+            contribution: "private contribution".into(),
+            actor: "U1".into(),
+            starts_session: true,
+        }),
+    };
+    let store = FileCollaborationStore::new(home.path());
+    store.save_thread(&config, &thread).unwrap();
+    let owner_index = fs::read_to_string(state_root(home.path()).join("threads.json")).unwrap();
+    assert!(!owner_index.contains("private contribution"));
+    assert!(!owner_index.contains("\"pending_turn\": {"));
+    let snapshot = checkout.path().join(".fluent/work/slack/threads/1.0.json");
+    assert!(
+        fs::read_to_string(snapshot)
+            .unwrap()
+            .contains("private contribution")
+    );
+
+    thread.pending_turn = None;
+    thread.provider_session = Some("session-1".into());
+    store.save_thread(&config, &thread).unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E2", Some("1.0"), "another private contribution"))
+        .unwrap();
+    let owner_inbox = fs::read_to_string(state_root(home.path()).join("inbox.json")).unwrap();
+    assert!(!owner_inbox.contains("another private contribution"));
+    assert!(!owner_inbox.contains("\"user\": \"U1\""));
+    let project_event = fs::read_dir(checkout.path().join(".fluent/work/slack/inbox"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(
+        fs::read_to_string(project_event)
+            .unwrap()
+            .contains("another private contribution")
+    );
 }
 
 #[test]
@@ -914,19 +999,15 @@ fn project_selection_wait_denies_checkout_access() {
 fn unavailable_default_offers_available_projects() {
     let (home, checkout, mut config) = setup(true);
     let alternative = TempDir::new().unwrap();
-    fs::create_dir(alternative.path().join(".git")).unwrap();
+    let (identity, commit) = initialize_checkout(alternative.path());
     let mut other = config.projects["app"].clone();
     other.label = "other".into();
     other.checkout.label = "other-checkout".into();
     other.checkout.path = alternative.path().into();
-    other.checkout.identity = alternative
-        .path()
-        .canonicalize()
-        .unwrap()
-        .display()
-        .to_string();
+    other.checkout.identity = identity;
+    other.checkout.commit = commit;
     config.projects.insert("other".into(), other);
-    fs::remove_dir(checkout.path().join(".git")).unwrap();
+    fs::remove_dir_all(checkout.path().join(".git")).unwrap();
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -947,7 +1028,7 @@ fn unavailable_default_offers_available_projects() {
 fn participant_cannot_start_or_continue_another_projects_thread() {
     let (home, _checkout, mut config) = setup(true);
     let other_checkout = TempDir::new().unwrap();
-    fs::create_dir(other_checkout.path().join(".git")).unwrap();
+    let (identity, commit) = initialize_checkout(other_checkout.path());
     config.projects.insert(
         "other".into(),
         ConfiguredProject {
@@ -955,14 +1036,9 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
             checkout: Checkout {
                 label: "other-checkout".into(),
                 path: other_checkout.path().into(),
-                identity: other_checkout
-                    .path()
-                    .canonicalize()
-                    .unwrap()
-                    .display()
-                    .to_string(),
+                identity,
                 branch: "main".into(),
-                commit: "def".into(),
+                commit,
             },
             allowed_participants: BTreeSet::from(["U2".into()]),
         },
@@ -1162,6 +1238,7 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         guide.contains("Socket Mode")
             && guide.contains("Keychain")
             && guide.contains("LaunchAgent")
+            && guide.contains("fluent slack checkout-identity")
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")
     );
