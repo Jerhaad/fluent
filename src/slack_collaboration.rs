@@ -878,4 +878,44 @@ mod tests {
         service.stop().unwrap();
         assert!(!service.running);
     }
+
+    #[test]
+    fn runner_restart_recovers_thread_and_reconnect_deduplicates_history() {
+        let (home, _checkout, config) = setup();
+        let start = event("E1", None, "@Fluent plan this");
+        let mut first = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        first.ingest(start.clone()).unwrap();
+
+        let mut recovered = CollaborationRunner::new(
+            home.path(),
+            config,
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        recovered
+            .reconnect(
+                vec![start, event("E2", Some("1.0"), "continue")],
+                "2026-08-17T00:00:00Z".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered.provider().calls.len(),
+            1,
+            "only the unprocessed reply reaches the recovered provider"
+        );
+        assert_eq!(
+            recovered.provider().calls[0].0.as_deref(),
+            Some("session-1")
+        );
+        let recovered_threads = load_threads(home.path()).unwrap();
+        assert_eq!(
+            recovered_threads["1.0"].last_connection.as_deref(),
+            Some("2026-08-17T00:00:00Z")
+        );
+    }
 }
