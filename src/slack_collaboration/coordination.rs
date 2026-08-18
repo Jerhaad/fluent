@@ -1,22 +1,46 @@
 use super::*;
 
 /// Coordinates one local runner. File state is written before external effects.
-pub struct CollaborationRunner<'a, P, S> {
+pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     pub(super) home: &'a Path,
     pub config: RunnerConfig,
     provider: P,
     slack: S,
+    store: C,
     configuration_error: Option<String>,
 }
 
-impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, S> {
+impl<'a, P: ConversationProvider, S: SlackTransport>
+    CollaborationRunner<'a, P, S, FileCollaborationStore>
+{
     pub fn new(home: &'a Path, config: RunnerConfig, provider: P, slack: S) -> Self {
+        Self::with_store(
+            home,
+            config,
+            provider,
+            slack,
+            FileCollaborationStore::new(home),
+        )
+    }
+}
+
+impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
+    CollaborationRunner<'a, P, S, C>
+{
+    pub fn with_store(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        store: C,
+    ) -> Self {
         let configuration_error = config.validate().err().map(|error| error.to_string());
         Self {
             home,
             config,
             provider,
             slack,
+            store,
             configuration_error,
         }
     }
@@ -35,10 +59,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
 
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
+        event.validate_thread_identity()?;
         if let Some(error) = &self.configuration_error {
             bail!("runner configuration is invalid; refusing Slack ingress: {error}");
         }
-        match persist_inbox(self.home, &event)? {
+        match self.store.persist_inbox(&event)? {
             InboxState::Processed => return Ok(()),
             InboxState::Pending if !event.acknowledgement_id.is_empty() => {
                 self.slack.acknowledge(&event.acknowledgement_id)?
@@ -46,7 +71,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             InboxState::Pending => {}
         }
         self.process(event.clone())?;
-        mark_inbox_processed(self.home, &event.id)?;
+        self.store.mark_inbox_processed(&event.id)?;
         self.deliver_pending()
     }
     pub fn reconnect(
@@ -54,7 +79,16 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         history: impl IntoIterator<Item = InboundEnvelope>,
         connected_at: String,
     ) -> Result<()> {
-        let mut events = load_pending_inbox(self.home)?;
+        self.restore_connection(history, connected_at, true)
+    }
+
+    pub(super) fn restore_connection(
+        &mut self,
+        history: impl IntoIterator<Item = InboundEnvelope>,
+        connected_at: String,
+        report_interruption: bool,
+    ) -> Result<()> {
+        let mut events = self.store.load_pending_inbox()?;
         events.extend(history);
         events.sort_by(|left, right| {
             left.timestamp
@@ -64,46 +98,44 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         for event in events {
             self.ingest(event)?;
         }
-        let thread_ids: Vec<_> = load_threads(self.home)?.into_keys().collect();
+        let thread_ids: Vec<_> = self.store.load_threads()?.into_keys().collect();
         for id in thread_ids {
-            let Some(mut thread) = load_thread(self.home, &self.config, &id)? else {
+            let Some(mut thread) = self.store.load_thread(&self.config, &id)? else {
                 continue;
             };
             thread.last_connection = Some(connected_at.clone());
-            save_thread(self.home, &self.config, &thread)?;
-            persist_outbox(
-                self.home,
-                OutboundDelivery {
-                    id: format!("{}:status", thread.id),
-                    channel: thread.channel.clone(),
-                    thread_timestamp: thread.id.clone(),
-                    text: format!("Fluent thread status: runner last connected at {connected_at}."),
-                    delivered: false,
-                },
+            self.store.save_thread(&self.config, &thread)?;
+            self.queue_thread_status(
+                &thread,
+                report_interruption.then_some("Slack connection was interrupted."),
             )?;
         }
         self.deliver_pending()
     }
 
     pub fn recovery_targets(&self) -> Result<Vec<(String, String)>> {
-        Ok(load_threads(self.home)?
+        Ok(self
+            .store
+            .load_threads()?
             .into_values()
             .filter(|thread| thread.state == ThreadState::Active)
             .map(|thread| (thread.channel, thread.id))
             .collect())
     }
     pub fn deliver_pending(&mut self) -> Result<()> {
-        let mut deliveries = load_outbox(self.home)?;
+        let mut deliveries = self.store.load_outbox()?;
         for delivery in &mut deliveries {
             if !delivery.delivered {
                 self.slack.post(delivery)?;
                 delivery.delivered = true;
             }
         }
-        save_outbox(self.home, &deliveries)
+        self.store.save_outbox(&deliveries)
     }
     fn process(&mut self, event: InboundEnvelope) -> Result<()> {
-        let mut thread = load_thread(self.home, &self.config, &event.thread_id())?
+        let mut thread = self
+            .store
+            .load_thread(&self.config, &event.thread_id())?
             .unwrap_or_else(|| FluentThread::new(&event));
         if thread
             .pending_turn
@@ -116,7 +148,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             return Ok(());
         }
         if !policy::participant_can_contribute(&self.config, &thread, &event) {
-            return save_thread(self.home, &self.config, &thread);
+            return self.store.save_thread(&self.config, &thread);
         }
         if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
@@ -127,10 +159,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
                 actor: event.user.clone(),
                 starts_session: false,
             });
-            save_thread(self.home, &self.config, &thread)?;
+            self.store.save_thread(&self.config, &thread)?;
             self.complete_pending_turn(&event, &mut thread)?;
         }
-        save_thread(self.home, &self.config, &thread)
+        self.store.save_thread(&self.config, &thread)
     }
     fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
         let default = self
@@ -150,7 +182,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
                 actor: event.user.clone(),
                 starts_session: true,
             });
-            save_thread(self.home, &self.config, thread)?;
+            self.store.save_thread(&self.config, thread)?;
+            if let Some(connected_at) =
+                read_runner_operational_state(self.home)?.last_successful_connection
+            {
+                thread.last_connection = Some(connected_at);
+                self.store.save_thread(&self.config, thread)?;
+                self.queue_thread_status(thread, None)?;
+            }
             self.complete_pending_turn(event, thread)?;
         } else {
             let projects =
@@ -207,7 +246,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
         };
         thread.pending_turn = None;
         self.queue_reply(event, &reply)?;
-        save_thread(self.home, &self.config, thread)
+        self.store.save_thread(&self.config, thread)
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let label = thread
@@ -227,6 +266,25 @@ impl<'a, P: ConversationProvider, S: SlackTransport> CollaborationRunner<'a, P, 
             text: text.into(),
             delivered: false,
         };
-        persist_outbox(self.home, delivery)
+        self.store.persist_outbox(delivery)
+    }
+
+    fn queue_thread_status(&self, thread: &FluentThread, interruption: Option<&str>) -> Result<()> {
+        let connected_at = thread
+            .last_connection
+            .as_deref()
+            .context("active thread lacks a Slack connection time")?;
+        let interruption = interruption
+            .map(|message| format!(" {message}"))
+            .unwrap_or_default();
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{}:status", thread.id),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: format!(
+                "Fluent thread status:{interruption} runner last connected at {connected_at}."
+            ),
+            delivered: false,
+        })
     }
 }

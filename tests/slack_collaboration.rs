@@ -66,6 +66,38 @@ fn socket_mode_envelope_rejects_missing_durable_identity() {
 }
 
 #[test]
+fn slack_thread_identity_rejects_filesystem_aliases() {
+    for thread_id in ["../outside", "..", ".", "/absolute", "1.0/../../outside"] {
+        let envelope = event("EV1", Some(thread_id), "continue");
+        let (home, _checkout, config) = setup(true);
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config,
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        let error = runner.ingest(envelope.clone()).unwrap_err();
+        assert!(error.to_string().contains("Slack thread identity"));
+    }
+    let (home, _checkout, config) = setup(true);
+    let mut top_level = event("EV2", None, "@Fluent continue");
+    top_level.timestamp = "../outside".into();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    assert!(
+        runner
+            .ingest(top_level)
+            .unwrap_err()
+            .to_string()
+            .contains("Slack thread identity")
+    );
+}
+
+#[test]
 fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -758,6 +790,13 @@ fn reconnect_reconciles_slack_messages_exactly_once() {
             .iter()
             .any(|d| d.id == "1.0:status" && d.text.contains("last connected at now"))
     );
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|d| d.id == "1.0:status" && d.text.contains("connection was interrupted"))
+    );
     runner.reconnect([], "later".into()).unwrap();
     assert!(
         runner
@@ -779,16 +818,28 @@ fn thread_status_shows_runner_last_connection() {
         RecoverySlack::default(),
     );
     reconcile_connected_runner(&mut runner).unwrap();
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let operational = read_runner_operational_state(home.path()).unwrap();
     let rendered = runner_status(
         &config,
         operational.connected,
-        operational.last_successful_connection,
+        operational.last_successful_connection.clone(),
         operational.failure,
     )
     .to_string();
     assert!(rendered.contains("connection: connected"));
     assert!(rendered.contains("last successful connection"));
+    let thread_status = runner
+        .slack()
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.id == "1.0:status")
+        .expect("active thread status delivery");
+    assert!(
+        thread_status
+            .text
+            .contains(operational.last_successful_connection.as_deref().unwrap())
+    );
 }
 #[test]
 fn setup_provides_socket_mode_manifest_without_public_endpoint() {
@@ -801,6 +852,8 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         guide.contains("Socket Mode")
             && guide.contains("Keychain")
             && guide.contains("LaunchAgent")
+            && guide.contains("security add-generic-password -U -a app-token")
+            && guide.contains("security add-generic-password -U -a bot-token")
     );
 }
 #[test]
@@ -812,6 +865,51 @@ fn runner_start_preflights_external_and_local_boundaries() {
         &InMemorySlack::default(),
     )
     .unwrap();
+}
+
+#[test]
+fn coordinator_uses_pinned_store_and_scheduler_boundaries() {
+    struct UnreachableScheduler;
+    impl SchedulerClient for UnreachableScheduler {
+        fn status(&self, request: &SchedulerRequest) -> anyhow::Result<SchedulerStatus> {
+            assert_eq!(request.version, 1);
+            assert_eq!(request.operation, "status");
+            Ok(SchedulerStatus { reachable: false })
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    store.save_recovery_cursor("C1", "1.0", "cursor-1").unwrap();
+    assert_eq!(
+        store.recovery_cursor("C1", "1.0").unwrap().as_deref(),
+        Some("cursor-1")
+    );
+    let mut runner = CollaborationRunner::with_store(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+        store,
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+
+    let error = preflight_with_scheduler(
+        &config,
+        &InMemoryProvider::default(),
+        &InMemorySlack::default(),
+        &UnreachableScheduler,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("scheduler boundary"));
+
+    let action = HostAction {
+        action: HostActionKind::Restart,
+        artifact_revision: "build-1".into(),
+        actor: "runner-owner".into(),
+        idempotency_identity: "restart:build-1".into(),
+    };
+    assert_eq!(action.idempotency_identity, "restart:build-1");
 }
 #[test]
 fn invalid_runtime_configuration_fails_closed() {

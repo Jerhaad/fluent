@@ -27,7 +27,7 @@ pub use coordination::*;
 pub use domain::*;
 pub use interfaces::*;
 use store::*;
-pub use store::{config_path, state_root};
+pub use store::{FileCollaborationStore, config_path, state_root};
 
 /// Slack app manifest for a local Socket Mode installation. It intentionally
 /// has no request URL because the runner never accepts public HTTP ingress.
@@ -169,6 +169,25 @@ pub trait ServiceManager {
     fn enabled(&self) -> bool;
 }
 
+impl<T: ServiceManager> HostActionExecutor for T {
+    fn execute_host_action(&mut self, action: &HostAction) -> Result<()> {
+        if action.artifact_revision.is_empty()
+            || action.actor.is_empty()
+            || action.idempotency_identity.is_empty()
+        {
+            bail!("host action identity is incomplete");
+        }
+        match &action.action {
+            HostActionKind::Enable { executable } => {
+                self.install(executable)?;
+                self.start()
+            }
+            HostActionKind::Restart => self.restart(),
+            HostActionKind::Stop => self.stop(),
+        }
+    }
+}
+
 /// Manages the owner-scoped LaunchAgent used by the local runner.
 pub struct LaunchAgentServiceManager {
     pub label: String,
@@ -279,16 +298,31 @@ impl ServiceManager for FakeServiceManager {
 
 /// Install the exact current executable, then start it under the owner account.
 pub fn enable_runner(manager: &mut impl ServiceManager, executable: &Path) -> Result<()> {
-    manager.install(executable)?;
-    manager.start()
+    manager.execute_host_action(&HostAction {
+        action: HostActionKind::Enable {
+            executable: executable.to_owned(),
+        },
+        artifact_revision: crate::version::version_string(),
+        actor: "runner-owner".into(),
+        idempotency_identity: format!("enable:{}", executable.display()),
+    })
 }
 
 /// Apply an owner-requested service lifecycle action.
 pub fn control_runner(manager: &mut impl ServiceManager, action: RunnerControl) -> Result<()> {
-    match action {
-        RunnerControl::Restart => manager.restart(),
-        RunnerControl::Stop => manager.stop(),
-    }
+    let action_name = match action {
+        RunnerControl::Restart => "restart",
+        RunnerControl::Stop => "stop",
+    };
+    manager.execute_host_action(&HostAction {
+        action: match action {
+            RunnerControl::Restart => HostActionKind::Restart,
+            RunnerControl::Stop => HostActionKind::Stop,
+        },
+        artifact_revision: crate::version::version_string(),
+        actor: "runner-owner".into(),
+        idempotency_identity: format!("{action_name}:dev.fluent.slack-runner"),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,6 +519,21 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
     provider: &P,
     slack: &S,
 ) -> Result<()> {
+    struct ReachableScheduler;
+    impl SchedulerClient for ReachableScheduler {
+        fn status(&self, _request: &SchedulerRequest) -> Result<SchedulerStatus> {
+            Ok(SchedulerStatus { reachable: true })
+        }
+    }
+    preflight_with_scheduler(config, provider, slack, &ReachableScheduler)
+}
+
+pub fn preflight_with_scheduler<P: ConversationProvider, S: SlackTransport, C: SchedulerClient>(
+    config: &RunnerConfig,
+    provider: &P,
+    slack: &S,
+    scheduler: &C,
+) -> Result<()> {
     config.validate()?;
     for project in config.projects.values() {
         if !checkout_is_available(&project.checkout) {
@@ -496,6 +545,13 @@ pub fn preflight<P: ConversationProvider, S: SlackTransport>(
     }
     provider.ready()?;
     slack.check()?;
+    let status = scheduler.status(&SchedulerRequest {
+        version: 1,
+        operation: "status".into(),
+    })?;
+    if !status.reachable {
+        bail!("scheduler boundary is unavailable");
+    }
     Ok(())
 }
 
@@ -508,10 +564,23 @@ fn connection_time() -> String {
 pub fn reconcile_connected_runner<P: ConversationProvider, S: SlackTransport>(
     runner: &mut CollaborationRunner<'_, P, S>,
 ) -> Result<()> {
+    reconcile_runner_connection(runner, false)
+}
+
+fn reconcile_interrupted_runner<P: ConversationProvider, S: SlackTransport>(
+    runner: &mut CollaborationRunner<'_, P, S>,
+) -> Result<()> {
+    reconcile_runner_connection(runner, true)
+}
+
+fn reconcile_runner_connection<P: ConversationProvider, S: SlackTransport>(
+    runner: &mut CollaborationRunner<'_, P, S>,
+    report_interruption: bool,
+) -> Result<()> {
     let targets = runner.recovery_targets()?;
     let history = runner.slack_mut().bounded_history(&targets)?;
     let connected_at = connection_time();
-    runner.reconnect(history, connected_at.clone())?;
+    runner.restore_connection(history, connected_at.clone(), report_interruption)?;
     save_runner_operational_state(
         runner.home,
         &RunnerOperationalState {
@@ -536,7 +605,13 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("codex"));
     let provider = CodexAppServerProvider::new_scoped(codex, home.to_path_buf());
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
-    preflight(&config, &provider, &slack)?;
+    let scheduler = LocalSchedulerClient::new(
+        config
+            .projects
+            .values()
+            .map(|project| project.checkout.path.clone()),
+    );
+    preflight_with_scheduler(&config, &provider, &slack, &scheduler)?;
     let mut runner = CollaborationRunner::new(home, config, provider, slack);
     reconcile_connected_runner(&mut runner)?;
     loop {
@@ -553,7 +628,7 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
                     },
                 )?;
                 runner.slack_mut().reconnect()?;
-                reconcile_connected_runner(&mut runner)?;
+                reconcile_interrupted_runner(&mut runner)?;
             }
         }
     }

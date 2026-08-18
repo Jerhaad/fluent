@@ -78,6 +78,23 @@ impl InboundEnvelope {
     pub fn is_top_level_mention(&self) -> bool {
         self.thread_timestamp.is_none() && self.text.contains("@Fluent")
     }
+
+    pub fn validate_thread_identity(&self) -> Result<()> {
+        validate_thread_identity(&self.thread_id())
+    }
+}
+
+pub(super) fn validate_thread_identity(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        bail!("Slack thread identity is not a canonical timestamp")
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

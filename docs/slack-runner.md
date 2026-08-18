@@ -15,6 +15,18 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
 4. On the runner owner's Mac, store the tokens in the login Keychain under
    service `dev.fluent.slack` and accounts `app-token` and `bot-token`. The
    runner reads those names only; it redacts token-shaped values in status.
+
+   Enter each token without placing it in shell history:
+
+   ```sh
+   read -r -s -p "Slack app token: " FLUENT_SLACK_TOKEN; echo
+   security add-generic-password -U -a app-token -s dev.fluent.slack -w "$FLUENT_SLACK_TOKEN"
+   unset FLUENT_SLACK_TOKEN
+
+   read -r -s -p "Slack bot token: " FLUENT_SLACK_TOKEN; echo
+   security add-generic-password -U -a bot-token -s dev.fluent.slack -w "$FLUENT_SLACK_TOKEN"
+   unset FLUENT_SLACK_TOKEN
+   ```
 5. Create `~/.config/fluent/slack/config.json` with the runner policy. For
    example:
 

@@ -9,8 +9,33 @@ use crate::coder::CoderKind;
 use crate::content::ContentResolver;
 
 use super::{
-    ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, SlackTransport,
+    ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, SchedulerClient,
+    SchedulerRequest, SchedulerStatus, SlackTransport,
 };
+
+pub struct LocalSchedulerClient {
+    project_roots: Vec<PathBuf>,
+}
+
+impl LocalSchedulerClient {
+    pub fn new(project_roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            project_roots: project_roots.into_iter().collect(),
+        }
+    }
+}
+
+impl SchedulerClient for LocalSchedulerClient {
+    fn status(&self, request: &SchedulerRequest) -> Result<SchedulerStatus> {
+        if request.version != 1 || request.operation != "status" {
+            bail!("unsupported scheduler request")
+        }
+        for project_root in &self.project_roots {
+            crate::scheduler::status(project_root)?;
+        }
+        Ok(SchedulerStatus { reachable: true })
+    }
+}
 
 pub struct SocketModeTransport {
     web: SlackWebApiTransport,
