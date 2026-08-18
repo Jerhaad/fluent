@@ -85,6 +85,62 @@ pub fn host_handoff(command: &str) -> String {
     format!("Host access is required. Run outside the agent sandbox: {command}")
 }
 
+/// Background-service boundary for the per-user LaunchAgent. A production
+/// adapter owns `launchctl`; the coordinator never shells out to it directly.
+pub trait ServiceManager {
+    fn install(&mut self, executable: &Path) -> Result<()>;
+    fn start(&mut self) -> Result<()>;
+    fn restart(&mut self) -> Result<()>;
+    fn stop(&mut self) -> Result<()>;
+    fn enabled(&self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerStatus {
+    pub workspace: String,
+    pub connection: String,
+    pub last_successful_connection: Option<String>,
+    pub build: String,
+    pub failure: Option<String>,
+}
+
+impl std::fmt::Display for RunnerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace: {}; connection: {}; build: {}",
+            self.workspace, self.connection, self.build
+        )?;
+        if let Some(last) = &self.last_successful_connection {
+            write!(f, "; last successful connection: {last}")?;
+        }
+        if let Some(failure) = &self.failure {
+            write!(f, "; failure: {}", redact_secrets(failure))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn runner_status(
+    config: &RunnerConfig,
+    connected: bool,
+    last_connection: Option<String>,
+    failure: Option<String>,
+) -> RunnerStatus {
+    RunnerStatus {
+        workspace: config.workspace.clone(),
+        connection: if connected {
+            "connected"
+        } else {
+            "disconnected"
+        }
+        .into(),
+        last_successful_connection: last_connection,
+        build: crate::version::version_string(),
+        failure: failure.map(|text| redact_secrets(&text)),
+    }
+}
+
 /// Root for private collaboration state. Bound thread snapshots live under the
 /// configured checkout's ignored Fluent runtime directory instead.
 pub fn state_root(home: &Path) -> PathBuf {
@@ -691,6 +747,38 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_default_offers_available_projects_without_provider_access() {
+        let (home, checkout, mut config) = setup();
+        fs::remove_dir(checkout.path().join(".git")).unwrap();
+        let available = TempDir::new().unwrap();
+        fs::create_dir(available.path().join(".git")).unwrap();
+        config.projects.insert(
+            "other".into(),
+            ConfiguredProject {
+                label: "other".into(),
+                checkout: Checkout {
+                    label: "other-main".into(),
+                    path: available.path().into(),
+                    identity: "other".into(),
+                    branch: "main".into(),
+                    commit: "def".into(),
+                },
+                allowed_participants: ["U1".into()].into_iter().collect(),
+            },
+        );
+        let mut r = CollaborationRunner::new(
+            home.path(),
+            config,
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        r.ingest(event("E1", None, "@Fluent hi")).unwrap();
+        assert!(r.provider().calls.is_empty());
+        assert!(r.slack().deliveries[0].text.contains("other"));
+        assert!(!r.slack().deliveries[0].text.contains("app,"));
+    }
+
+    #[test]
     fn credentials_stay_in_secret_store_and_redact_output() {
         let mut secrets = MemorySecrets::default();
         store_slack_credentials(&mut secrets, "xapp-secret", "xoxb-secret").unwrap();
@@ -702,5 +790,20 @@ mod tests {
             redact_secrets("failed xapp-secret xoxb-secret"),
             "failed [REDACTED] [REDACTED]"
         );
+    }
+
+    #[test]
+    fn status_reports_safe_operational_identity() {
+        let (_, _checkout, config) = setup();
+        let status = runner_status(
+            &config,
+            true,
+            Some("2026-08-17T00:00:00Z".into()),
+            Some("xapp-secret disconnected".into()),
+        );
+        let rendered = status.to_string();
+        assert!(rendered.contains("workspace: workspace"));
+        assert!(rendered.contains("last successful connection"));
+        assert!(!rendered.contains("xapp-secret"));
     }
 }
