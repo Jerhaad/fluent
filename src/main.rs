@@ -29,7 +29,7 @@ use fluent::os;
 use fluent::post_merge_review;
 use fluent::review;
 use fluent::skill_install::{self, InstallOutcome};
-use fluent::slack_collaboration::{self, LaunchAgentServiceManager, RunnerControl, ServiceManager};
+use fluent::slack_collaboration::{self, LaunchAgentServiceManager, RunnerControl};
 use fluent::update;
 use fluent::version;
 use fluent::work_attempt_loop::{self, WorkAttemptRunConfig, WorkAttemptRunOutcome};
