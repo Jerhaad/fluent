@@ -6049,16 +6049,19 @@ fn gate_writer_completion_before_reviews(
         .iter()
         .rev()
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .cloned()
         .expect("the completed Writer gate has a completed Writer");
-    let matrix_artifact = writer_completion_artifact(latest_writer);
+    let mut matrix_artifact = writer_completion_artifact(&latest_writer);
     let mut validated_matrix = None;
-    let matrix_status = if let Some(contract) = item.attempts[attempt_index]
+    let mut repaired_writer_claims = false;
+    let completion_contract = item.attempts[attempt_index]
         .writer_completion_contract
-        .as_ref()
-    {
-        let artifact = matrix_artifact
-            .as_ref()
+        .clone();
+    let matrix_status = if let Some(contract) = completion_contract.as_ref() {
+        let source_artifact = matrix_artifact
+            .clone()
             .expect("a Writer Task has an artifact area");
+        let artifact = &source_artifact;
         let path = project_root.join(&artifact.path);
         match fs::metadata(&path) {
             Ok(metadata)
@@ -6117,7 +6120,7 @@ fn gate_writer_completion_before_reviews(
                 });
             }
         };
-        let matrix =
+        let mut matrix =
             match serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&source) {
                 Ok(matrix) => matrix,
                 Err(error) => {
@@ -6136,7 +6139,47 @@ fn gate_writer_completion_before_reviews(
                 }
             };
         let findings =
-            crate::work_task_executor::writer_completion_findings(project_root, latest_writer)?;
+            crate::work_task_executor::writer_completion_findings(project_root, &latest_writer)?;
+        let repairs =
+            match matrix.repair_writer_claims_against(contract, &latest_writer.id, &findings) {
+                Ok(repairs) => repairs,
+                Err(reason) => {
+                    return pause_writer_completion_before_reviews(
+                        project_root,
+                        store,
+                        item,
+                        attempt_index,
+                        attempt_id,
+                        artifact,
+                        &reason,
+                        0,
+                        0,
+                    )
+                    .map(Some);
+                }
+            };
+        if !repairs.is_empty() {
+            repaired_writer_claims = true;
+            let (repaired_matrix, repair_evidence) = write_writer_completion_repair(
+                project_root,
+                &item.id,
+                attempt_id,
+                &latest_writer.id,
+                artifact,
+                &source,
+                &matrix,
+                &repairs,
+            )?;
+            matrix_artifact = Some(repaired_matrix.clone());
+            for repair_artifact in [repaired_matrix, repair_evidence] {
+                if !item.attempts[attempt_index]
+                    .artifacts
+                    .contains(&repair_artifact)
+                {
+                    item.attempts[attempt_index].artifacts.push(repair_artifact);
+                }
+            }
+        }
         match matrix.status_against(contract, &latest_writer.id, &findings) {
             Ok(status) => {
                 validated_matrix = Some(matrix);
@@ -6336,11 +6379,11 @@ fn gate_writer_completion_before_reviews(
     } else {
         0
     };
-    let blocked_reason = if !changed_candidate {
+    let blocked_reason = if !changed_candidate && !repaired_writer_claims {
         Some(format!(
             "Writer did not create a candidate commit while {reason}"
         ))
-    } else if regressed {
+    } else if regressed && !repaired_writer_claims {
         Some(format!(
             "Writer completion regressed from {:?} to ({}, {})",
             previous_completion.unwrap_or_default(),
@@ -6582,6 +6625,89 @@ fn write_writer_completion_handoff(
         ),
     )?;
     Ok(relative_path)
+}
+
+fn write_writer_completion_repair(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    source_artifact: &ArtifactRef,
+    source: &str,
+    matrix: &crate::work_model::WriterCompletionMatrix,
+    repairs: &[crate::work_model::WriterCompletionRepair],
+) -> Result<(ArtifactRef, ArtifactRef)> {
+    let directory = format!("writer-completion-repairs/{task_id}");
+    let matrix_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/writer-completion.json"),
+    );
+    let evidence_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/repair.json"),
+    );
+    let matrix_bytes =
+        serde_json::to_vec_pretty(matrix).context("serialize repaired Writer completion matrix")?;
+    let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let repaired_digest = format!("{:x}", Sha256::digest(&matrix_bytes));
+    let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema-version": 1,
+        "source-artifact": source_artifact.path,
+        "source-sha256": source_digest,
+        "repaired-artifact": matrix_relative,
+        "repaired-sha256": repaired_digest,
+        "repairs": repairs,
+    }))
+    .context("serialize Writer completion repair evidence")?;
+    for (relative, bytes) in [
+        (&matrix_relative, matrix_bytes.as_slice()),
+        (&evidence_relative, evidence_bytes.as_slice()),
+    ] {
+        let path = project_root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create Writer completion repair directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => bail!(
+                "Writer completion repair artifact already exists with different bytes: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                crate::atomic_write::atomic_write(&path, bytes).with_context(|| {
+                    format!(
+                        "write Writer completion repair artifact: {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect Writer completion repair artifact: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: matrix_relative,
+        },
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: evidence_relative,
+        },
+    ))
 }
 
 /// Settle a RoundCap or Uncertain review pause through a fresh, precedence-aware
@@ -13385,6 +13511,127 @@ mod tests {
                     .any(|artifact| artifact.path.ends_with("/writer-completion.json"))
             );
         }
+    }
+
+    #[test]
+    fn recoverable_writer_completion_claims_are_repaired_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let source_path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        matrix.rows[0].applicable_constraints = vec![
+            "behavior:dashboard:b1".to_string(),
+            "plan:step-1".to_string(),
+        ];
+        fs::write(&source_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let original: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        assert!(!original.rows[0].applicable_constraints.is_empty());
+        let stored = store.read_work_item("matrix-work").unwrap();
+        let repair_evidence = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/repair.json"))
+            .expect("repair evidence is attached to the Attempt");
+        let evidence: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join(&repair_evidence.path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(evidence["schema-version"], 1);
+        assert_eq!(
+            evidence["repairs"][0]["kind"],
+            "cleared-non-finding-constraints"
+        );
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(fs::read(&source_path).unwrap()))
+        );
+        let repaired_path = tmp
+            .path()
+            .join(evidence["repaired-artifact"].as_str().unwrap());
+        assert_eq!(
+            evidence["repaired-sha256"],
+            format!("{:x}", Sha256::digest(fs::read(repaired_path).unwrap()))
+        );
+        for review in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let repaired = review
+                .input_artifacts
+                .iter()
+                .find(|artifact| artifact.path.contains("writer-completion-repairs"))
+                .expect("review receives the repaired completion matrix");
+            let matrix: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_str(&fs::read_to_string(tmp.path().join(&repaired.path)).unwrap())
+                    .unwrap();
+            assert!(matrix.rows[0].applicable_constraints.is_empty());
+        }
+    }
+
+    #[test]
+    fn repaired_incomplete_claims_return_a_no_change_writer_to_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let source_path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&source_path).unwrap()).unwrap();
+        matrix.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+        fs::write(&source_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+        store
+            .mutate_work_item("matrix-work", |item| {
+                item.attempts[0].tasks[0]
+                    .output
+                    .as_mut()
+                    .unwrap()
+                    .base_commit = Some("abc123".to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let mut item = store.read_work_item("matrix-work").unwrap();
+        let outcome =
+            gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                .unwrap()
+                .expect("incomplete repaired claims plan another Writer");
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            stored.attempts[0].writer_runs[0].outcome,
+            WriterOutcome::Continue
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
     }
 
     #[test]

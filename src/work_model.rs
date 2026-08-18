@@ -1038,10 +1038,24 @@ impl WorkItem {
                 path: format!("{writer_artifact_path}/transcript.jsonl"),
             });
             if attempt.writer_completion_contract.is_some() {
-                task_input_artifacts.push(ArtifactRef {
-                    producer_id: latest_write.id.clone(),
-                    path: format!("{writer_artifact_path}/writer-completion.json"),
-                });
+                let completion = attempt
+                    .artifacts
+                    .iter()
+                    .rev()
+                    .find(|artifact| {
+                        artifact.producer_id == "writer-completion-repair"
+                            && artifact.path.contains(&format!(
+                                "/writer-completion-repairs/{}/",
+                                latest_write.id
+                            ))
+                            && artifact.path.ends_with("/writer-completion.json")
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| ArtifactRef {
+                        producer_id: latest_write.id.clone(),
+                        path: format!("{writer_artifact_path}/writer-completion.json"),
+                    });
+                task_input_artifacts.push(completion);
             }
             let progress_md_path =
                 format!("{WORK_PROGRESS_DIR}/{}/{}/progress.md", self.id, attempt_id,);
@@ -2871,6 +2885,33 @@ pub struct WriterCompletionMatrixStatus {
     pub incomplete_reason: Option<String>,
 }
 
+/// One deterministic repair to fields owned by the Writer. Host-owned row
+/// identity is validated before any repair is allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WriterCompletionRepair {
+    pub row_id: String,
+    pub kind: WriterCompletionRepairKind,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_constraints: Vec<String>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cleared_implementation_evidence: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cleared_verification_claims: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterCompletionRepairKind {
+    ClearedNonFindingConstraints,
+    ClearedPendingClaims,
+    RemovedUnknownFindingConstraints,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 impl WriterCompletionMatrixStatus {
     pub fn is_complete(&self) -> bool {
         self.complete == self.required && self.incomplete_reason.is_none()
@@ -2878,6 +2919,125 @@ impl WriterCompletionMatrixStatus {
 }
 
 impl WriterCompletionMatrix {
+    fn expected_against(
+        &self,
+        contract: &WriterCompletionContract,
+        task_id: &str,
+        findings: &[WriterCompletionFinding],
+    ) -> Result<(), String> {
+        let actual_bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize Writer completion matrix: {error}"))?;
+        if actual_bytes.len() > WRITER_COMPLETION_MATRIX_MAX_BYTES {
+            return Err(format!(
+                "Writer completion matrix is {} bytes; maximum is {} bytes",
+                actual_bytes.len(),
+                WRITER_COMPLETION_MATRIX_MAX_BYTES
+            ));
+        }
+        if self.schema_version != WRITER_COMPLETION_CONTRACT_VERSION {
+            return Err(format!(
+                "Writer completion matrix schema version {} does not match {}",
+                self.schema_version, WRITER_COMPLETION_CONTRACT_VERSION
+            ));
+        }
+        if self.task_id != task_id {
+            return Err(format!(
+                "Writer completion matrix belongs to Task {:?}, expected {:?}",
+                self.task_id, task_id
+            ));
+        }
+        let expected = Self::skeleton(contract, task_id, findings, None)?;
+        if self.rows.len() != expected.rows.len() {
+            return Err(format!(
+                "Writer completion matrix has {} rows; expected {} rows",
+                self.rows.len(),
+                expected.rows.len()
+            ));
+        }
+        for (row, expected_row) in self.rows.iter().zip(&expected.rows) {
+            if row.id != expected_row.id
+                || row.kind != expected_row.kind
+                || row.source != expected_row.source
+                || row.requirement != expected_row.requirement
+                || row.verification_refs != expected_row.verification_refs
+            {
+                return Err(format!(
+                    "Writer completion matrix immutable row {:?} was omitted, reordered, or rewritten",
+                    expected_row.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Normalize only Writer-owned completion claims. Every host-owned row field
+    /// is checked against the planning contract before a repair is allowed.
+    pub fn repair_writer_claims_against(
+        &mut self,
+        contract: &WriterCompletionContract,
+        task_id: &str,
+        findings: &[WriterCompletionFinding],
+    ) -> Result<Vec<WriterCompletionRepair>, String> {
+        self.expected_against(contract, task_id, findings)?;
+        let allowed_constraints = contract
+            .applicable_constraint_ids()
+            .collect::<std::collections::HashSet<_>>();
+        let mut repairs = Vec::new();
+        for row in &mut self.rows {
+            if row.state == WriterCompletionState::Pending
+                && (!row.implementation_evidence.is_empty()
+                    || !row.verification.is_empty()
+                    || !row.applicable_constraints.is_empty())
+            {
+                repairs.push(WriterCompletionRepair {
+                    row_id: row.id.clone(),
+                    kind: WriterCompletionRepairKind::ClearedPendingClaims,
+                    removed_constraints: std::mem::take(&mut row.applicable_constraints),
+                    cleared_implementation_evidence: row.implementation_evidence.len(),
+                    cleared_verification_claims: row.verification.len(),
+                });
+                row.implementation_evidence.clear();
+                row.verification.clear();
+                continue;
+            }
+            if row.kind != WriterCompletionRequirementKind::Finding
+                && !row.applicable_constraints.is_empty()
+            {
+                repairs.push(WriterCompletionRepair {
+                    row_id: row.id.clone(),
+                    kind: WriterCompletionRepairKind::ClearedNonFindingConstraints,
+                    removed_constraints: std::mem::take(&mut row.applicable_constraints),
+                    cleared_implementation_evidence: 0,
+                    cleared_verification_claims: 0,
+                });
+                continue;
+            }
+            if row.kind == WriterCompletionRequirementKind::Finding {
+                let mut removed = Vec::new();
+                row.applicable_constraints.retain(|reference| {
+                    let declared_none = reference
+                        .strip_prefix("none: ")
+                        .is_some_and(|reason| !reason.trim().is_empty());
+                    let keep = allowed_constraints.contains(reference.as_str()) || declared_none;
+                    if !keep {
+                        removed.push(reference.clone());
+                    }
+                    keep
+                });
+                if !removed.is_empty() {
+                    repairs.push(WriterCompletionRepair {
+                        row_id: row.id.clone(),
+                        kind: WriterCompletionRepairKind::RemovedUnknownFindingConstraints,
+                        removed_constraints: removed,
+                        cleared_implementation_evidence: 0,
+                        cleared_verification_claims: 0,
+                    });
+                }
+            }
+        }
+        Ok(repairs)
+    }
+
     pub fn skeleton(
         contract: &WriterCompletionContract,
         task_id: &str,
@@ -2910,7 +3070,6 @@ impl WriterCompletionMatrix {
                 row.state = previous.state;
                 row.implementation_evidence = previous.implementation_evidence.clone();
                 row.verification = previous.verification.clone();
-                row.applicable_constraints = previous.applicable_constraints.clone();
             }
         }
         rows.extend(findings.iter().map(|finding| WriterCompletionRow {
@@ -2950,52 +3109,13 @@ impl WriterCompletionMatrix {
         task_id: &str,
         findings: &[WriterCompletionFinding],
     ) -> Result<WriterCompletionMatrixStatus, String> {
-        let actual_bytes = serde_json::to_vec_pretty(self)
-            .map_err(|error| format!("serialize Writer completion matrix: {error}"))?;
-        if actual_bytes.len() > WRITER_COMPLETION_MATRIX_MAX_BYTES {
-            return Err(format!(
-                "Writer completion matrix is {} bytes; maximum is {} bytes",
-                actual_bytes.len(),
-                WRITER_COMPLETION_MATRIX_MAX_BYTES
-            ));
-        }
-        if self.schema_version != WRITER_COMPLETION_CONTRACT_VERSION {
-            return Err(format!(
-                "Writer completion matrix schema version {} does not match {}",
-                self.schema_version, WRITER_COMPLETION_CONTRACT_VERSION
-            ));
-        }
-        if self.task_id != task_id {
-            return Err(format!(
-                "Writer completion matrix belongs to Task {:?}, expected {:?}",
-                self.task_id, task_id
-            ));
-        }
-        let expected = Self::skeleton(contract, task_id, findings, None)?;
-        if self.rows.len() != expected.rows.len() {
-            return Err(format!(
-                "Writer completion matrix has {} rows; expected {}",
-                self.rows.len(),
-                expected.rows.len()
-            ));
-        }
+        self.expected_against(contract, task_id, findings)?;
         let allowed_constraints = contract
             .applicable_constraint_ids()
             .collect::<std::collections::HashSet<_>>();
         let mut complete = 0usize;
         let mut incomplete_reason = None;
-        for (row, expected) in self.rows.iter().zip(&expected.rows) {
-            if row.id != expected.id
-                || row.kind != expected.kind
-                || row.source != expected.source
-                || row.requirement != expected.requirement
-                || row.verification_refs != expected.verification_refs
-            {
-                return Err(format!(
-                    "Writer completion matrix immutable row {:?} was omitted, reordered, or rewritten",
-                    expected.id
-                ));
-            }
+        for row in &self.rows {
             if row.state == WriterCompletionState::Pending
                 && (!row.implementation_evidence.is_empty()
                     || !row.verification.is_empty()
@@ -8493,6 +8613,142 @@ mod tests {
                 .status_against(&contract, "attempt-1-write-2", &findings)
                 .unwrap_err()
                 .contains("pending but carries completion claims")
+        );
+    }
+
+    #[test]
+    fn writer_completion_matrix_repairs_only_writer_owned_claims() {
+        let contract = WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                id: "behavior:dashboard:b1".to_string(),
+                kind: WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#dashboard:b1".to_string(),
+                requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
+                verification_refs: vec!["tests/dashboard.rs (preserves_selection)".to_string()],
+            }],
+        };
+        let findings = vec![WriterCompletionFinding {
+            id: "finding:tests:stable-id".to_string(),
+            role: "tests".to_string(),
+            source: ".fluent/work/artifacts/review-tests/review.md".to_string(),
+            requirement: "Assert overflow navigation directly".to_string(),
+        }];
+        let mut matrix =
+            WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-2", &findings, None)
+                .unwrap();
+        for row in &mut matrix.rows {
+            row.state = WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["src/dashboard.rs".to_string()];
+            row.verification = vec![WriterVerificationClaim {
+                command: "cargo test preserves_selection".to_string(),
+                result: WriterVerificationResult::Pass,
+            }];
+        }
+        matrix.rows[0].applicable_constraints = vec![
+            "behavior:dashboard:b1".to_string(),
+            "plan:step-1".to_string(),
+        ];
+        matrix.rows[1].applicable_constraints = vec![
+            "behavior:dashboard:b1".to_string(),
+            "behavior:unknown:b9".to_string(),
+        ];
+
+        let repairs = matrix
+            .repair_writer_claims_against(&contract, "attempt-1-write-2", &findings)
+            .unwrap();
+
+        assert_eq!(repairs.len(), 2);
+        assert!(matrix.rows[0].applicable_constraints.is_empty());
+        assert_eq!(
+            matrix.rows[1].applicable_constraints,
+            vec!["behavior:dashboard:b1"]
+        );
+        assert!(
+            matrix
+                .status_against(&contract, "attempt-1-write-2", &findings)
+                .unwrap()
+                .is_complete()
+        );
+
+        let mut rewritten = matrix;
+        rewritten.rows[0].requirement = "A rewritten requirement".to_string();
+        assert!(
+            rewritten
+                .repair_writer_claims_against(&contract, "attempt-1-write-2", &findings)
+                .unwrap_err()
+                .contains("rewritten")
+        );
+    }
+
+    #[test]
+    fn writer_completion_skeleton_does_not_propagate_invalid_planning_mappings() {
+        let contract = WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                id: "behavior:dashboard:b1".to_string(),
+                kind: WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#dashboard:b1".to_string(),
+                requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
+                verification_refs: Vec::new(),
+            }],
+        };
+        let mut prior =
+            WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-1", &[], None).unwrap();
+        prior.rows[0].state = WriterCompletionState::Complete;
+        prior.rows[0].implementation_evidence = vec!["src/dashboard.rs".to_string()];
+        prior.rows[0].verification = vec![WriterVerificationClaim {
+            command: "cargo test preserves_selection".to_string(),
+            result: WriterVerificationResult::Pass,
+        }];
+        prior.rows[0].applicable_constraints = vec!["behavior:dashboard:b1".to_string()];
+
+        let next =
+            WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-2", &[], Some(&prior))
+                .unwrap();
+
+        assert!(next.rows[0].applicable_constraints.is_empty());
+        assert_eq!(next.rows[0].state, WriterCompletionState::Complete);
+    }
+
+    #[test]
+    fn writer_completion_repair_resets_contradictory_pending_claims() {
+        let contract = WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                id: "behavior:dashboard:b1".to_string(),
+                kind: WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#dashboard:b1".to_string(),
+                requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
+                verification_refs: Vec::new(),
+            }],
+        };
+        let mut matrix =
+            WriterCompletionMatrix::skeleton(&contract, "attempt-1-write-1", &[], None).unwrap();
+        matrix.rows[0].implementation_evidence = vec!["src/dashboard.rs".to_string()];
+        matrix.rows[0].verification = vec![WriterVerificationClaim {
+            command: "cargo test preserves_selection".to_string(),
+            result: WriterVerificationResult::Pass,
+        }];
+        matrix.rows[0].applicable_constraints = vec!["behavior:dashboard:b1".to_string()];
+
+        let repairs = matrix
+            .repair_writer_claims_against(&contract, "attempt-1-write-1", &[])
+            .unwrap();
+
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(
+            repairs[0].kind,
+            WriterCompletionRepairKind::ClearedPendingClaims
+        );
+        assert!(matrix.rows[0].implementation_evidence.is_empty());
+        assert!(matrix.rows[0].verification.is_empty());
+        assert!(matrix.rows[0].applicable_constraints.is_empty());
+        assert!(
+            !matrix
+                .status_against(&contract, "attempt-1-write-1", &[])
+                .unwrap()
+                .is_complete()
         );
     }
 
