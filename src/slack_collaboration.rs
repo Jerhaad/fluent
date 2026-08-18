@@ -95,6 +95,45 @@ pub trait ServiceManager {
     fn enabled(&self) -> bool;
 }
 
+/// Deterministic service-manager double for lifecycle tests.
+#[derive(Debug, Default)]
+pub struct FakeServiceManager {
+    pub installed: bool,
+    pub running: bool,
+    pub executable: Option<PathBuf>,
+}
+impl ServiceManager for FakeServiceManager {
+    fn install(&mut self, executable: &Path) -> Result<()> {
+        self.installed = true;
+        self.executable = Some(executable.into());
+        Ok(())
+    }
+    fn start(&mut self) -> Result<()> {
+        if !self.installed {
+            bail!("Slack runner is not installed");
+        }
+        self.running = true;
+        Ok(())
+    }
+    fn restart(&mut self) -> Result<()> {
+        self.stop()?;
+        self.start()
+    }
+    fn stop(&mut self) -> Result<()> {
+        self.running = false;
+        Ok(())
+    }
+    fn enabled(&self) -> bool {
+        self.installed
+    }
+}
+
+/// Install the exact current executable, then start it under the owner account.
+pub fn enable_runner(manager: &mut impl ServiceManager, executable: &Path) -> Result<()> {
+    manager.install(executable)?;
+    manager.start()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerStatus {
     pub workspace: String,
@@ -827,5 +866,16 @@ mod tests {
         let (home, _checkout, mut config) = setup();
         config.workspace.clear();
         assert!(write_config(home.path(), &config).is_err());
+    }
+
+    #[test]
+    fn enable_installs_controllable_login_service() {
+        let mut service = FakeServiceManager::default();
+        enable_runner(&mut service, Path::new("/Applications/fluent")).unwrap();
+        assert!(service.enabled() && service.running);
+        service.restart().unwrap();
+        assert!(service.running);
+        service.stop().unwrap();
+        assert!(!service.running);
     }
 }
