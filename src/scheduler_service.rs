@@ -27,6 +27,17 @@ pub const PROTOCOL_GENERATION: u32 = 1;
 /// declare or carry more than this many bytes are rejected before allocation.
 pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 
+static SERVICE_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Install the scheduler service's graceful signal boundary before identity,
+/// registry, or executable hashing can delay entry into the service loop.
+pub fn prepare_run_signal_handler() {
+    SERVICE_SHUTDOWN.store(false, Ordering::Release);
+    let _ = ctrlc::set_handler(|| {
+        SERVICE_SHUTDOWN.store(true, Ordering::Release);
+    });
+}
+
 // ─────────────────────────────────────────────────
 // Filesystem layout
 // ─────────────────────────────────────────────────
@@ -34,6 +45,25 @@ pub const MAX_FRAME_SIZE: usize = 64 * 1024;
 /// Private user-state root: `~/.config/fluent/scheduler/`.
 pub fn service_state_root(home_dir: &Path) -> PathBuf {
     home_dir.join(".config/fluent/scheduler")
+}
+
+/// Resolve the scheduler service's writable home for this process.
+///
+/// Production always uses the operator's home. A test-support binary with the
+/// explicit host-preflight seam runs inside the configured Tester sandbox, which
+/// grants the fixture checkout but intentionally withholds the operator's home.
+/// Keep that service state inside the fixture so parallel scheduler tests neither
+/// escape their sandbox nor share a singleton socket.
+pub fn runtime_home(_project_root: &Path) -> Result<PathBuf> {
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
+        // Keep state relative to the fixture checkout so parallel tests remain
+        // isolated without writing the operator's home.
+        return Ok(PathBuf::from(".fluent/work/scheduler/service-home"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("scheduler service requires a home directory")
 }
 
 fn registry_path(home_dir: &Path) -> PathBuf {
@@ -764,6 +794,7 @@ pub struct SchedulerService {
     prepared_projects: HashSet<PathBuf>,
     stopping_projects: HashSet<PathBuf>,
     prepare_host_execution: bool,
+    reused_coordinator: Option<crate::scheduler::CoordinatorMetadata>,
 }
 
 impl SchedulerService {
@@ -781,6 +812,7 @@ impl SchedulerService {
             prepared_projects: HashSet::new(),
             stopping_projects: HashSet::new(),
             prepare_host_execution: false,
+            reused_coordinator: None,
         }
     }
 
@@ -930,7 +962,10 @@ impl SchedulerService {
                         }
                         self.coordinators.insert(project.clone(), coordinator);
                     }
-                    crate::scheduler::CoordinatorStart::Reused(_) => continue,
+                    crate::scheduler::CoordinatorStart::Reused(metadata) => {
+                        self.reused_coordinator = Some(metadata);
+                        continue;
+                    }
                 }
             }
             let capacity = crate::scheduler::configured_capacity(&project)?;
@@ -1003,6 +1038,16 @@ impl SchedulerService {
         }
         Ok(())
     }
+
+    #[cfg(feature = "test-support")]
+    fn take_reused_coordinator(&mut self) -> Option<crate::scheduler::CoordinatorMetadata> {
+        self.reused_coordinator.take()
+    }
+
+    #[cfg(feature = "test-support")]
+    fn owns_coordinator(&self) -> bool {
+        !self.coordinators.is_empty()
+    }
 }
 
 impl Drop for SchedulerService {
@@ -1017,9 +1062,17 @@ impl Drop for SchedulerService {
 /// Serve the production scheduler socket until the owning process exits.
 /// The scheduler command runs this listener alongside its queue coordinator.
 pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
+        return run_transportless_service(home_dir, build, poll_seconds);
+    }
     let path = socket_path(home_dir);
-    if send_health_request(&path).is_ok() {
-        bail!("scheduler service is already running");
+    if let Ok(health) = send_health_request(&path) {
+        eprintln!(
+            "[scheduler] reusing live coordinator running {} ({})",
+            health.build.version, health.build.hash
+        );
+        return Ok(());
     }
     let _ = fs::remove_file(&path);
     if let Some(parent) = path.parent() {
@@ -1051,6 +1104,52 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
         if Instant::now() >= next_poll {
             service.poll_once()?;
             next_poll = Instant::now() + poll_interval;
+        }
+        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Run the production service coordinator without its Unix socket when the
+/// configured test-support sandbox explicitly controls host preflight. The
+/// outer Tester sandbox forbids `bind(2)`, while the scheduler behavior under
+/// test needs the real registry, host gate, claims, capacity, workers, stop
+/// requests, and durable queue reconciliation.
+#[cfg(feature = "test-support")]
+fn run_transportless_service(
+    home_dir: &Path,
+    build: BuildIdentity,
+    poll_seconds: u64,
+) -> Result<()> {
+    let mut service = SchedulerService::new_production(
+        home_dir,
+        build,
+        Arc::new(crate::scheduler::CliAttemptRunner),
+    );
+    let poll_interval = Duration::from_secs(poll_seconds.max(1));
+    let mut next_poll = Instant::now();
+    let mut owned_coordinator = false;
+    loop {
+        service.reconcile_stops()?;
+        if owned_coordinator && !service.owns_coordinator() {
+            return Ok(());
+        }
+        if Instant::now() >= next_poll {
+            service.poll_once()?;
+            if let Some(metadata) = service.take_reused_coordinator() {
+                eprintln!(
+                    "[scheduler] reusing live coordinator {} running {} ({})",
+                    metadata.instance_id, metadata.build.version, metadata.build.hash
+                );
+                return Ok(());
+            }
+            owned_coordinator |= service.owns_coordinator();
+            next_poll = Instant::now() + poll_interval;
+        }
+        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

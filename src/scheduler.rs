@@ -78,15 +78,28 @@ impl AttemptRunner for CliAttemptRunner {
                 "[scheduler] approving one unsandboxed retry of the paused Tester for {attempt_id}"
             );
         }
-        let _run_status = attempt_run_command(
+        let mut command = attempt_run_command(
             &fluent_bin,
             project_root,
             work_item_id,
             attempt_id,
             scheduler_baseline_session(),
             tester_no_sandbox,
-        )
-        .status()?;
+        );
+        // The configured test-support service runs inside an outer Fluent
+        // sandbox that forbids applying a nested Seatbelt profile. Its real
+        // service coordinator already passed the host gate before claiming;
+        // keep only hermetic fixture providers unsandboxed in that test binary.
+        // Production builds cannot enter this branch.
+        #[cfg(feature = "test-support")]
+        if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some()
+            && std::env::var_os("FLUENT_TEST_HERMETIC_PROVIDERS").is_some()
+        {
+            command
+                .arg("--no-sandbox")
+                .env("FLUENT_TEST_HERMETIC_NO_SANDBOX", "1");
+        }
+        let _run_status = command.status()?;
 
         // Durable Attempt state is authoritative even when the child exits
         // non-zero. In particular, a resume can fail closed while preserving

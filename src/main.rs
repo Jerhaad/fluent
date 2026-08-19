@@ -1518,7 +1518,8 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
     match command {
         SchedulerCommands::Run { poll_seconds } => {
             let poll = poll_seconds.unwrap_or(30);
-            let home = slack_home().context("resolve home for scheduler service")?;
+            fluent::scheduler_service::prepare_run_signal_handler();
+            let home = fluent::scheduler_service::runtime_home(project_root)?;
             let identity = fluent::scheduler_service::assign_checkout_identity(project_root)?;
             fluent::scheduler_service::register_checkout(&home, project_root, &identity)?;
             let build = fluent::scheduler_service::executable_build_identity(

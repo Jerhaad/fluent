@@ -8908,7 +8908,7 @@ fn local_preview_walking_skeleton_closes_learning_flywheel() {
     let reached_terminal = poll_until(std::time::Duration::from_secs(60), || {
         matches!(
             latest_dispatch_status(&main_dir, DERIVED_FU1).as_str(),
-            "candidate-ready" | "failed" | "needs-user"
+            "candidate-ready" | "failed" | "needs-user" | "blocked"
         )
     });
     let terminal_status = latest_dispatch_status(&main_dir, DERIVED_FU1);
@@ -22274,6 +22274,8 @@ fn attempt_run_checks_host_sandbox_before_provider_or_state_change() {
 #[test]
 fn scheduler_checks_host_sandbox_before_claiming_queued_work() {
     let tmp = TempDir::new().unwrap();
+    let inaccessible_home = tmp.path().join("nested-sandbox-home");
+    fs::write(&inaccessible_home, "outer sandbox owns this path").unwrap();
     write_work_item_json(tmp.path(), "host-boundary", "Host boundary");
     fluent_cmd()
         .current_dir(tmp.path())
@@ -22283,6 +22285,7 @@ fn scheduler_checks_host_sandbox_before_claiming_queued_work() {
 
     fluent_cmd()
         .current_dir(tmp.path())
+        .env("HOME", &inaccessible_home)
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
         .args(["scheduler", "run", "--poll-seconds", "1"])
         .assert()
@@ -22318,10 +22321,11 @@ fn work_scheduler_run_exits_clean_on_sigterm_when_idle() {
 
     std::thread::sleep(std::time::Duration::from_secs(2));
     send_signal(child.id(), "TERM");
-    let status = child.wait().unwrap();
+    let output = child.wait_with_output().unwrap();
     assert!(
-        status.success(),
-        "scheduler should exit cleanly on SIGTERM when idle"
+        output.status.success(),
+        "scheduler should exit cleanly on SIGTERM when idle: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -22826,10 +22830,15 @@ fn idle_scheduler_shutdown_exits_immediately() {
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let signalled = std::time::Instant::now();
     send_signal(child.id(), "TERM");
-    let status = child.wait().unwrap();
+    let output = child.wait_with_output().unwrap();
     let elapsed = signalled.elapsed();
 
-    assert!(status.success(), "idle scheduler exits cleanly");
+    assert!(
+        output.status.success(),
+        "idle scheduler exits cleanly with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         elapsed < std::time::Duration::from_secs(10),
         "idle scheduler exits without waiting the poll interval, took {elapsed:?}"
