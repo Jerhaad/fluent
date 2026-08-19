@@ -41,7 +41,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    For example, write this policy to `config.json`:
 
    ```json
-   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
+   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex","claude"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
    ```
 
    Print the machine-local opaque `identity` with:
@@ -73,7 +73,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    Inspect its safe status with `fluent slack status`, restart it with
    `fluent slack restart`, and stop it with `fluent slack stop`.
 
-   `fluent slack run` preflights the local Slack, checkout, and Codex provider
+   `fluent slack run` preflights the local Slack, checkout, and provider
    boundaries, opens Socket Mode, and keeps receiving events until stopped.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
@@ -163,11 +163,13 @@ deliver `message.im` events and grant the `im:history` scope.
 ## Provider policy and recovery
 
 `default_provider` selects the provider for a new thread; omit a selection to
-use it. `enabled_providers` is an allowlist. The currently supported runner
-adapter is `codex`; do not list `claude` until a Claude adapter is installed
-for this runner. `project_approvers` reserves the approver role for a future
-interrupted-thread provider-switch action; it does not grant a Slack command
-in the current runner.
+use it. `enabled_providers` is an allowlist. The runner supports `codex` and
+`claude`; enable only adapters whose local executable is installed and
+authenticated for the runner owner. Override their executable paths with
+`FLUENT_CODEX_APP_SERVER` and `FLUENT_CLAUDE`. Both adapters run with the exact
+bound checkout and private provider state beneath the Slice draft. Set the
+fair cross-thread provider capacity with `FLUENT_SLACK_TURN_CAPACITY` (default
+four).
 
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:
@@ -177,9 +179,13 @@ mention. For example:
 ```
 
 The requested name must appear in the project's `enabled_providers` list. The
-runner validates it before binding a thread. The current runner does not expose
-a Slack provider-switch action or automatic provider retry. If a provider
-cannot continue, preserve the thread and ask the runner owner to restore the
-provider before continuing. If the exact bound checkout disappears or its
-identity changes, Fluent stops provider access, reports the unavailable binding,
-and never substitutes another checkout automatically.
+runner validates it before binding a thread. When a turn is interrupted, a
+configured project approver can post `@Fluent [provider=claude]` (or `codex`)
+in that thread. Fluent switches adapters and immediately sends the preserved
+turn through the selected provider without changing scheduler-owned Work.
+Rate-limited turns retain the provider's retry deadline and resume
+automatically; replies received meanwhile are acknowledged, retained in Slack
+order, and sent together as the next attributed turn. If the exact bound
+checkout disappears or its identity changes, Fluent stops provider access,
+reports the unavailable binding, and never substitutes another checkout
+automatically.
