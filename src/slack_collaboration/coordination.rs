@@ -381,16 +381,16 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         {
         } else if thread.state == ThreadState::Active
             && event.thread_timestamp.is_some()
+            && self.offer_linked_thread_if_requested(&event, &mut thread)?
+        {
+        } else if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
             && thread.pending_artifact_revision.is_some()
         {
             self.queue_reply(
                 &event,
                 "Planning is waiting for approval of the presented revision.",
             )?;
-        } else if thread.state == ThreadState::Active
-            && event.thread_timestamp.is_some()
-            && self.offer_linked_thread_if_requested(&event, &mut thread)?
-        {
         } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {

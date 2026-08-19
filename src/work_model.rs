@@ -577,11 +577,20 @@ impl WorkItem {
                 reason: format!("unknown planning stage {stage:?}"),
             })?;
         let approved_index = self.planning_context.as_ref().and_then(|context| {
-            context
+            let recorded = context
                 .approved_revisions
                 .keys()
                 .filter_map(|approved| stages.iter().position(|candidate| *candidate == approved))
-                .max()
+                .max();
+            let legacy = [
+                context.brief.as_ref(),
+                context.behaviors.as_ref(),
+                context.approach.as_ref(),
+                context.plan.as_ref(),
+            ]
+            .iter()
+            .rposition(|artifact| artifact.is_some());
+            recorded.into_iter().chain(legacy).max()
         });
         let can_replace_current = approved_index == Some(stage_index);
         let is_next_stage =

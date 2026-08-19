@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
-use fluent::work_model::{WorkItem, WorkModelStore};
+use fluent::work_model::{PlanningContext, WorkItem, WorkModelStore};
 use tempfile::TempDir;
 
 fn initialize_checkout(path: &std::path::Path) -> (String, String) {
@@ -117,7 +117,7 @@ fn large_planning_artifact_preserves_exact_content_across_messages() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner
+    let revision = runner
         .present_planning_artifact("1.0", "brief", &source)
         .unwrap();
     let deliveries: Vec<_> = runner
@@ -132,6 +132,14 @@ fn large_planning_artifact_preserves_exact_content_across_messages() {
             .iter()
             .all(|delivery| delivery.text.len() <= SLACK_MESSAGE_CONTENT_LIMIT)
     );
+    for (index, delivery) in deliveries.iter().enumerate() {
+        assert!(delivery.text.starts_with(&format!(
+            "Planning revision {} ({}/{})\n\n",
+            revision.id,
+            index + 1,
+            deliveries.len()
+        )));
+    }
     assert_eq!(reassemble_artifact_parts(&deliveries).unwrap(), source);
 }
 
@@ -341,6 +349,30 @@ fn planning_approval_requires_order_and_an_unstarted_work_item() {
 }
 
 #[test]
+fn legacy_planning_context_preserves_its_implied_stage() {
+    let mut work_item = WorkItem::planned("work-1", "Legacy planning");
+    work_item.planning_context = Some(PlanningContext {
+        brief: Some("# Brief\n".into()),
+        behaviors: Some("# Behaviors\n".into()),
+        approach: Some("# Approach\n".into()),
+        plan: Some("# Plan\n".into()),
+        ..Default::default()
+    });
+    let brief = ArtifactRevision::new("brief", "# Revised brief\n");
+    assert!(
+        work_item
+            .approve_planning_revision(&brief.kind, &brief.id, brief.markdown.clone())
+            .is_err()
+    );
+    let plan = ArtifactRevision::new("plan", "# Revised plan\n");
+    assert!(
+        work_item
+            .approve_planning_revision(&plan.kind, &plan.id, plan.markdown.clone())
+            .is_ok()
+    );
+}
+
+#[test]
 fn slack_planning_presentation_rejects_started_work_item() {
     let (home, checkout, config) = setup(true);
     let mut work_item = WorkItem::planned("work-1", "Started planning");
@@ -425,7 +457,13 @@ fn queued_message_edit_replaces_unprocessed_content() {
 
 #[test]
 fn processed_message_edit_becomes_attributed_correction() {
-    let (home, _checkout, config) = setup(true);
+    let (home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
     let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
         home.path(),
@@ -435,6 +473,7 @@ fn processed_message_edit_becomes_attributed_correction() {
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut edit = event("E2", Some("1.0"), "correction");
+    edit.user = "U2".into();
     edit.change = InboundChange::Edit;
     runner.ingest(edit).unwrap();
     let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
@@ -443,6 +482,11 @@ fn processed_message_edit_becomes_attributed_correction() {
         reloaded.conversation_inputs[0].corrections[0].content,
         "correction"
     );
+    assert_eq!(
+        reloaded.conversation_inputs[0].corrections[0].event_id,
+        "E2"
+    );
+    assert_eq!(reloaded.conversation_inputs[0].corrections[0].actor, "U2");
 }
 
 #[test]
@@ -623,12 +667,19 @@ fn project_change_preserves_binding_and_offers_linked_thread() {
     runner
         .ingest(event("E1", None, "@Fluent app work"))
         .unwrap();
+    let revision = runner
+        .present_planning_artifact("1.0", "brief", "# Brief\n")
+        .unwrap();
     runner
         .ingest(event("E2", Some("1.0"), "project: other"))
         .unwrap();
     let thread = store.load_thread(&config, "1.0").unwrap().unwrap();
     assert_eq!(thread.project_label.as_deref(), Some("app"));
     assert_eq!(thread.linked_thread_intent.as_deref(), Some("other"));
+    assert_eq!(
+        thread.pending_artifact_revision.as_deref(),
+        Some(revision.id.as_str())
+    );
     assert_eq!(runner.provider().calls.len(), 1);
     assert!(
         runner
