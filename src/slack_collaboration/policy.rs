@@ -62,8 +62,8 @@ pub(super) fn is_approval_response(thread: &FluentThread, event: &InboundEnvelop
         return false;
     };
     let answer = event.text.trim().to_ascii_lowercase();
-    (event.approval_action_id.is_some() || event.approval_artifact_revision.is_some())
-        && event.text == "fluent_approval"
+    ((event.approval_action_id.is_some() || event.approval_artifact_revision.is_some())
+        && event.text == "fluent_approval")
         || answer == "y"
         || answer == "yes"
         || answer == action.id.to_ascii_lowercase()
@@ -71,12 +71,31 @@ pub(super) fn is_approval_response(thread: &FluentThread, event: &InboundEnvelop
             .labels
             .iter()
             .any(|label| label.eq_ignore_ascii_case(&answer))
-        || match action.kind {
-            PendingActionKind::Planning => answer.contains("plan"),
-            PendingActionKind::Execution => answer.contains("execut"),
-            PendingActionKind::Resume => answer.contains("resume"),
-            PendingActionKind::Landing => answer.contains("land"),
-        }
+        || is_explicit_action_request(&action.kind, &answer)
+}
+
+fn is_explicit_action_request(kind: &PendingActionKind, answer: &str) -> bool {
+    let verb = match kind {
+        PendingActionKind::Planning => "plan",
+        PendingActionKind::Execution => "execute",
+        PendingActionKind::Resume => "resume",
+        PendingActionKind::Landing => "land",
+    };
+    let answer = answer
+        .trim_end_matches(|character| character == '.' || character == '!')
+        .trim();
+    [
+        verb.to_owned(),
+        format!("{verb} it"),
+        format!("{verb} this"),
+        format!("{verb} this work"),
+        format!("please {verb}"),
+        format!("please {verb} it"),
+        format!("please {verb} this"),
+        format!("please {verb} this work"),
+    ]
+    .iter()
+    .any(|request| request == answer)
 }
 
 /// Evaluate a pending approval using only the thread, an authority snapshot,

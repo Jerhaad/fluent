@@ -915,6 +915,80 @@ fn explicit_approver_request_authorizes_eligible_action() {
 }
 
 #[test]
+fn explicit_action_requests_authorize_each_eligible_action() {
+    for (kind, request) in [
+        (PendingActionKind::Planning, "plan this work"),
+        (PendingActionKind::Execution, "execute this work"),
+        (PendingActionKind::Resume, "resume this work"),
+        (PendingActionKind::Landing, "land this work"),
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+        runner
+            .request_approval("1.0", pending_action(kind))
+            .unwrap();
+
+        runner.ingest(event("E2", Some("1.0"), request)).unwrap();
+
+        let thread = FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.approvals.len(), 1, "request: {request}");
+        assert!(thread.pending_action.is_none(), "request: {request}");
+    }
+}
+
+#[test]
+fn contextual_action_mentions_do_not_authorize_pending_actions() {
+    for (kind, contribution) in [
+        (PendingActionKind::Planning, "the plan needs more work"),
+        (PendingActionKind::Execution, "I cannot execute it today"),
+        (PendingActionKind::Execution, "should we execute this work?"),
+        (PendingActionKind::Resume, "do not resume this yet"),
+        (PendingActionKind::Landing, "do not land this yet"),
+        (PendingActionKind::Landing, "landing will happen tomorrow"),
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+        runner
+            .request_approval("1.0", pending_action(kind))
+            .unwrap();
+
+        runner
+            .ingest(event("E2", Some("1.0"), contribution))
+            .unwrap();
+
+        let thread = FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap();
+        assert!(thread.approvals.is_empty(), "contribution: {contribution}");
+        assert!(
+            thread.pending_action.is_some(),
+            "contribution: {contribution}"
+        );
+        assert_eq!(
+            runner.provider().calls.len(),
+            2,
+            "contribution: {contribution}"
+        );
+    }
+}
+
+#[test]
 fn duplicate_approval_event_is_idempotent() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
