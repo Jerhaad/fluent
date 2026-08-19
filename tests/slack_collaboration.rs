@@ -1606,6 +1606,8 @@ fn default_project_change_does_not_rebind_existing_threads() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U1".into()]),
+            default_provider: "codex".into(),
+            enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
         },
     );
@@ -2788,6 +2790,105 @@ fn queued_replies_form_one_ordered_attributed_turn() {
 }
 
 #[test]
+fn edit_during_active_turn_updates_queued_attributed_contribution() {
+    #[derive(Clone)]
+    struct EditingProvider {
+        calls: Arc<Mutex<Vec<String>>>,
+        gate: Arc<(Mutex<(usize, bool)>, Condvar)>,
+    }
+    impl ConversationProvider for EditingProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            self.calls.lock().unwrap().push(contribution.into());
+            let (lock, changed) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+            Ok(("session".into(), "initial reply".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            self.calls.lock().unwrap().push(contribution.into());
+            let (lock, changed) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            changed.notify_all();
+            Ok("follow-up".into())
+        }
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new((Mutex::new((0, false)), Condvar::new()));
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        EditingProvider {
+            calls: calls.clone(),
+            gate: gate.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while state.0 == 0 {
+            state = changed.wait(state).unwrap();
+        }
+    }
+    let mut queued = event("E2", Some("1.0"), "draft queued reply");
+    queued.timestamp = "2.0".into();
+    runner.ingest(queued).unwrap();
+    let mut edit = event("E3", Some("1.0"), "safe edited reply");
+    edit.timestamp = "2.0".into();
+    edit.change = InboundChange::Edit;
+    runner.ingest(edit).unwrap();
+
+    let durable = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(
+        durable.queued_contributions[0].contribution,
+        "safe edited reply"
+    );
+    assert_eq!(durable.queued_contributions[0].actor, "U1");
+
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        changed.notify_all();
+    }
+    runner.wait_for_completion().unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while state.0 < 2 {
+            state = changed.wait(state).unwrap();
+        }
+    }
+    assert_eq!(
+        calls.lock().unwrap().last().unwrap(),
+        "Slack user U1: safe edited reply"
+    );
+}
+
+#[test]
 fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
     #[derive(Clone)]
     struct FairProvider {
@@ -3750,6 +3851,7 @@ fn missing_accepted_provider_turn_preserves_incompatible_protocol_state() {
     let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
     thread.pending_turn = Some(PendingTurn {
         action_id: "E2".into(),
+        source_timestamp: "2.0".into(),
         contribution: "keep accepted turn".into(),
         actor: "U1".into(),
         starts_session: false,

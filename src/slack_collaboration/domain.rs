@@ -249,6 +249,8 @@ pub struct FluentThread {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedContribution {
     pub action_id: String,
+    #[serde(default)]
+    pub source_timestamp: String,
     pub contribution: String,
     pub actor: String,
 }
