@@ -1524,14 +1524,7 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
             let build = fluent::scheduler_service::executable_build_identity(
                 &std::env::current_exe().context("resolve scheduler executable")?,
             )?;
-            let service_home = home.clone();
-            thread::spawn(move || {
-                if let Err(error) = fluent::scheduler_service::run_service(&service_home, build) {
-                    eprintln!("Scheduler service stopped: {error:#}");
-                }
-            });
-            let runner = fluent::scheduler::CliAttemptRunner;
-            fluent::scheduler::run(project_root, poll, &runner)?;
+            fluent::scheduler_service::run_service(&home, build, poll)?;
         }
         SchedulerCommands::Status => match fluent::scheduler::status(project_root)? {
             fluent::scheduler::SchedulerStatus::Stopped => {

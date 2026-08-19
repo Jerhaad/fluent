@@ -6469,27 +6469,36 @@ fn coordinator_uses_pinned_store_and_scheduler_boundaries() {
 
 #[test]
 fn approved_plan_creates_reported_work_without_execution() {
-    let (_home, checkout, _config) = setup(true);
-    let control = WorkControl::new(checkout.path());
-
-    let report = control
-        .approve_plan(
-            "slice-1",
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    let report = runner
+        .approve_thread_plan(
+            "1.0",
             "U1",
+            "slice-1",
             &[PlannedWork::new("work-1", "Implement control")],
         )
         .unwrap();
 
     assert_eq!(report.work_item_ids, vec!["work-1"]);
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("Planned Work Items: work-1")
+            && delivery.text.contains("Execution has not started")
+    }));
     let work = fluent::work_model::WorkModelStore::new(checkout.path())
         .read_work_item("work-1")
         .unwrap();
     assert!(work.authorization.is_proposed());
     assert!(work.attempts.is_empty());
-    assert_eq!(
-        control.slice("slice-1").unwrap().unwrap().work_item_ids,
-        report.work_item_ids
-    );
 }
 
 #[test]
@@ -6603,12 +6612,21 @@ fn execution_approval_queues_each_planned_work_item() {
         }
     }
 
-    let (_home, checkout, _config) = setup(true);
-    let control = WorkControl::new(checkout.path());
-    control
-        .approve_plan(
-            "slice-1",
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
             "U1",
+            "slice-1",
             &[
                 PlannedWork::new("work-1", "First"),
                 PlannedWork::new("work-2", "Second"),
@@ -6617,8 +6635,8 @@ fn execution_approval_queues_each_planned_work_item() {
         .unwrap();
     let scheduler = FakeScheduler::default();
 
-    let report = control
-        .authorize_execution("slice-1", "U2", &scheduler)
+    let report = runner
+        .authorize_thread_execution("1.0", "U1", &scheduler)
         .unwrap();
 
     assert_eq!(report.outcomes.len(), 2);
@@ -6629,10 +6647,16 @@ fn execution_approval_queues_each_planned_work_item() {
             .unwrap();
         assert!(work.authorization.is_execution_ready());
         assert!(work.attempts.is_empty());
+        assert!(runner.slack().deliveries.iter().any(|delivery| {
+            delivery.thread_timestamp == "1.0"
+                && delivery
+                    .text
+                    .contains(&format!("Work Item {work_id} queue outcome: Queued"))
+        }));
     }
     assert_eq!(
-        control
-            .authorize_execution("slice-1", "U2", &scheduler)
+        runner
+            .authorize_thread_execution("1.0", "U1", &scheduler)
             .unwrap()
             .outcomes,
         report.outcomes
@@ -6682,7 +6706,7 @@ fn execution_approval_retries_the_same_request_after_scheduler_failure() {
 }
 
 #[test]
-fn runner_delivers_plan_execution_and_durable_work_updates() {
+fn durable_work_transition_posts_detailed_thread_reply() {
     struct Scheduler;
     impl WorkScheduler for Scheduler {
         fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
@@ -6835,24 +6859,37 @@ fn allowed_participant_cannot_approve_without_project_authority() {
 
 #[test]
 fn status_request_reports_authoritative_work_state_and_actions() {
-    let (_home, checkout, _config) = setup(true);
-    let control = WorkControl::new(checkout.path());
-    control
-        .approve_plan("slice-1", "U1", &[PlannedWork::new("work-1", "First")])
-        .unwrap();
-
-    assert_eq!(
-        control.status("slice-1").unwrap(),
-        vec![SliceWorkStatus {
-            work_item_id: "work-1".into(),
-            state: "planned".into(),
-            next_action: "Await execution approval".into(),
-        }]
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-status-request",
+            &[PlannedWork::new("work-status-request", "Status")],
+        )
+        .unwrap();
+    let before = runner.slack().deliveries.len();
+    runner
+        .ingest(event("E2", Some("1.0"), "work status"))
+        .unwrap();
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("work-status-request: planned")
+            && delivery.text.contains("Await execution approval")
+    }));
 }
 
 #[test]
-fn runner_updates_first_reply_from_authoritative_work_status() {
+fn status_message_tracks_current_slice_state() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
@@ -7080,7 +7117,7 @@ fn planned_control<'a>(checkout: &'a TempDir, slice: &str, work: &str) -> WorkCo
 }
 
 #[test]
-fn durable_work_transition_posts_detailed_thread_reply() {
+fn transition_renderer_includes_detailed_work_identity() {
     let (_home, checkout, _config) = setup(true);
     let control = planned_control(&checkout, "slice-detail", "work-detail");
     let transition = control
@@ -7145,7 +7182,7 @@ fn external_work_transition_updates_linked_thread() {
 }
 
 #[test]
-fn status_message_tracks_current_slice_state() {
+fn status_renderer_tracks_current_slice_state() {
     let (_home, checkout, _config) = setup(true);
     let control = planned_control(&checkout, "slice-status-direct", "work-status-direct");
     let status = control
@@ -7185,29 +7222,39 @@ fn append_attempt_state(
 
 #[test]
 fn needs_user_transition_posts_actionable_request() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-question", "work-question");
-    control
-        .reconcile_durable_transitions("slice-question")
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-question",
+            &[PlannedWork::new("work-question", "Question")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+    let before = runner.slack().deliveries.len();
     append_attempt_state(
         &checkout,
         "work-question",
         fluent::work_model::AttemptStatus::NeedsUser,
         "choose retry or stop",
     );
-    let transition = control
-        .reconcile_durable_transitions("slice-question")
-        .unwrap()
-        .pop()
-        .unwrap();
-    let reply = control.render_actionable_transition(
-        &transition,
-        &[transition.evidence_ref.clone().unwrap()],
-        None,
-    );
-    assert!(reply.contains("choose retry or stop"));
-    assert!(reply.contains("requested recovery decision"));
+    runner.report_thread_work("1.0").unwrap();
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("work-question")
+            && delivery.text.contains("choose retry or stop")
+            && delivery.text.contains("requested recovery decision")
+    }));
 }
 
 fn ready_transition() -> WorkTransition {
@@ -7231,7 +7278,7 @@ fn ready_transition() -> WorkTransition {
 }
 
 #[test]
-fn ready_candidate_posts_reviewable_evidence_summary() {
+fn ready_candidate_renderer_includes_reviewable_evidence_summary() {
     let (_home, checkout, _config) = setup(true);
     let reply = WorkControl::new(checkout.path()).render_actionable_transition(
         &ready_transition(),
@@ -7244,7 +7291,7 @@ fn ready_candidate_posts_reviewable_evidence_summary() {
 }
 
 #[test]
-fn ready_candidate_offers_github_review_without_creating_pr() {
+fn ready_candidate_renderer_offers_github_review_without_creating_pr() {
     let (_home, checkout, _config) = setup(true);
     let reply = WorkControl::new(checkout.path()).render_actionable_transition(
         &ready_transition(),
@@ -7256,8 +7303,7 @@ fn ready_candidate_offers_github_review_without_creating_pr() {
     assert!(reply.contains("Optionally create a pull request"));
 }
 
-#[test]
-fn runner_posts_durable_ready_candidate_evidence_and_links() {
+fn assert_runner_posts_durable_ready_candidate_evidence_and_links() {
     use fluent::work_model::{
         ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, MergeCandidate,
         MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
@@ -7425,27 +7471,51 @@ fn runner_posts_durable_ready_candidate_evidence_and_links() {
 }
 
 #[test]
+fn ready_candidate_posts_reviewable_evidence_summary() {
+    assert_runner_posts_durable_ready_candidate_evidence_and_links();
+}
+
+#[test]
+fn ready_candidate_offers_github_review_without_creating_pr() {
+    assert_runner_posts_durable_ready_candidate_evidence_and_links();
+}
+
+#[test]
 fn failed_work_posts_evidence_and_permitted_recovery() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-failed", "work-failed");
-    control
-        .reconcile_durable_transitions("slice-failed")
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-failed",
+            &[PlannedWork::new("work-failed", "Failed")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+    let before = runner.slack().deliveries.len();
     append_attempt_state(
         &checkout,
         "work-failed",
         fluent::work_model::AttemptStatus::Failed,
         "retry after fixing credentials",
     );
-    let transition = control
-        .reconcile_durable_transitions("slice-failed")
-        .unwrap()
-        .pop()
-        .unwrap();
-    let reply = control.render_actionable_transition(&transition, &["failure.log".into()], None);
-    assert!(reply.contains("retry after fixing credentials"));
-    assert!(reply.contains("Evidence: failure.log"));
-    assert!(reply.contains("permitted recovery action"));
+    runner.report_thread_work("1.0").unwrap();
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("work-failed")
+            && delivery.text.contains("retry after fixing credentials")
+            && delivery.text.contains("Evidence: evidence:work-failed")
+            && delivery.text.contains("permitted recovery action")
+    }));
 }
 
 #[test]
@@ -7696,6 +7766,33 @@ fn finished_planned_work_marks_slice_complete() {
     assert_eq!(
         control.slice_stage("slice-finished").unwrap(),
         SliceStage::Complete
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-finished", |item| {
+            item.attempts.push(fluent::work_model::Attempt {
+                id: "attempt-latest-required".into(),
+                work_item_id: item.id.clone(),
+                status: fluent::work_model::AttemptStatus::Failed,
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-finished").unwrap(),
+        SliceStage::Active,
+        "a failed latest required Attempt keeps the Slice active"
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-finished", |item| {
+            item.attempts.last_mut().unwrap().status = fluent::work_model::AttemptStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-finished").unwrap(),
+        SliceStage::Active,
+        "a needs-user latest required Attempt keeps the Slice active"
     );
 }
 

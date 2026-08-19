@@ -253,6 +253,12 @@ Items without starting them. A later execution approval submits the same
 versioned request identity for each Work Item to the local scheduler, so a
 retry cannot create another execution request.
 
+The versioned scheduler service validates the registered checkout and running
+build before it admits that request to Fluent's real durable queue. It owns
+capacity-limited claims and Attempt workers across registered projects, and
+reports status from the bound queue dispatch rather than from an unconsumed
+submission token.
+
 The runner posts scheduler outcomes and authoritative Work lifecycle changes
 back to the originating thread. Transition replies identify the Work object,
 origin, reason, elapsed time, and bounded evidence reference. Ready-candidate
@@ -264,5 +270,7 @@ Status comes from persisted Work rather than chat text. The thread projection
 shows the project and checkout, Slice stage, provider state, each Work state,
 and the next action. After a runner restart, Fluent replays only transitions
 whose stable delivery identities have not already been scheduled. A Slice
-becomes complete only after its authoritative attempts are terminal and every
-candidate has landed successfully; a post-land failure makes it active again.
+becomes complete only when every Work Item's latest required Attempt is
+`complete`, every candidate has landed successfully, and all required
+post-land processing has passed. A failed or `needs-user` latest Attempt, an
+unlanded candidate, or a post-land failure keeps the Slice active.

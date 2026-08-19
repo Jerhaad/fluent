@@ -1,7 +1,10 @@
 use fluent::scheduler_service::{self, BuildIdentity, FakeServiceManager, ServiceManager};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use tempfile::TempDir;
 
 // ─────────────────────────────────────────────────
@@ -33,6 +36,138 @@ fn make_event(seq: u64, attempt_id: &str, kind: &str) -> fluent::scheduler_servi
         attempt_id: attempt_id.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         detail: None,
+    }
+}
+
+fn create_execution_ready_work(project: &std::path::Path, id: &str) {
+    let item = fluent::work_model::WorkItem {
+        id: id.into(),
+        title: format!("Execute {id}"),
+        authorization: fluent::work_model::ExecutionAuthorization::execution_ready(
+            fluent::work_model::ExecutionAuthority::Human,
+        ),
+        ..Default::default()
+    };
+    fluent::work_model::WorkModelStore::new(project)
+        .create_work_item(&item)
+        .unwrap();
+}
+
+fn registered_service(
+    home: &std::path::Path,
+    project: &std::path::Path,
+    runner: Arc<dyn fluent::scheduler::AttemptRunner>,
+) -> scheduler_service::SchedulerService {
+    let identity = scheduler_service::assign_checkout_identity(project).unwrap();
+    scheduler_service::register_checkout(home, project, &identity).unwrap();
+    scheduler_service::SchedulerService::new(home, fake_build(), runner)
+}
+
+fn framed_exchange(
+    service: &mut scheduler_service::SchedulerService,
+    request: serde_json::Value,
+) -> serde_json::Value {
+    let (mut server, mut client) = UnixStream::pair().unwrap();
+    let payload = serde_json::to_vec(&request).unwrap();
+    client
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    client.write_all(&payload).unwrap();
+    service.serve_connection(&mut server).unwrap();
+    let mut length = [0_u8; 4];
+    client.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_le_bytes(length) as usize];
+    client.read_exact(&mut response).unwrap();
+    serde_json::from_slice(&response).unwrap()
+}
+
+fn execution_request(
+    generation: u32,
+    project: &std::path::Path,
+    build: &BuildIdentity,
+    request_id: &str,
+    work_item_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "submit_execution",
+        "generation": generation,
+        "build": build,
+        "project_root": project,
+        "request": {
+            "id": request_id,
+            "work_item_id": work_item_id,
+            "attempt_id": format!("requested-{request_id}"),
+            "created_at": "2026-08-18T00:00:00Z"
+        }
+    })
+}
+
+#[derive(Default)]
+struct NeedsUserRunner {
+    calls: Mutex<Vec<String>>,
+}
+
+impl fluent::scheduler::AttemptRunner for NeedsUserRunner {
+    fn run(
+        &self,
+        _project_root: &std::path::Path,
+        work_item_id: &str,
+        _attempt_id: &str,
+        _tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        self.calls.lock().unwrap().push(work_item_id.into());
+        Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
+    }
+}
+
+#[derive(Default)]
+struct BlockingState {
+    started: usize,
+    releases: usize,
+}
+
+#[derive(Default)]
+struct BlockingRunner {
+    state: Arc<(Mutex<BlockingState>, Condvar)>,
+}
+
+impl BlockingRunner {
+    fn wait_for_started(&self, expected: usize) {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().unwrap();
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                state.started < expected
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "worker did not start");
+        assert_eq!(state.started, expected);
+    }
+
+    fn release_one(&self) {
+        let (lock, changed) = &*self.state;
+        lock.lock().unwrap().releases += 1;
+        changed.notify_all();
+    }
+}
+
+impl fluent::scheduler::AttemptRunner for BlockingRunner {
+    fn run(
+        &self,
+        _project_root: &std::path::Path,
+        _work_item_id: &str,
+        _attempt_id: &str,
+        _tester_no_sandbox: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.started += 1;
+        changed.notify_all();
+        while state.releases == 0 {
+            state = changed.wait(state).unwrap();
+        }
+        state.releases -= 1;
+        Ok(fluent::scheduler::AttemptOutcome::NeedsUser)
     }
 }
 
@@ -418,6 +553,7 @@ fn attempt_execution_request_has_nonempty_generated_id() {
 #[test]
 fn dispatch_submission_is_exact_bound_and_idempotent() {
     let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-1");
     let request =
         fluent::scheduler_service::AttemptExecutionRequest::new("wi-1", "attempt-1").unwrap();
     scheduler_service::persist_request(project.path(), &request).unwrap();
@@ -425,10 +561,9 @@ fn dispatch_submission_is_exact_bound_and_idempotent() {
     let token1 = scheduler_service::submit_dispatch(project.path(), &request).unwrap();
     let token2 = scheduler_service::submit_dispatch(project.path(), &request).unwrap();
 
-    assert_eq!(
-        token1, token2,
-        "idempotent dispatch must return the same token"
-    );
+    assert_eq!(token1.dispatch_id, token2.dispatch_id);
+    assert!(!token1.already_queued);
+    assert!(token2.already_queued);
     assert_eq!(token1.work_item_id, "wi-1");
     assert_eq!(token1.attempt_id, "attempt-1");
     assert_eq!(token1.request_id, request.id);
@@ -899,6 +1034,354 @@ fn concurrent_registry_mutations_preserve_every_successful_change() {
     }
 }
 
+#[test]
+fn execution_protocol_rejects_unsupported_generation() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-version");
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+
+    let response = framed_exchange(
+        &mut service,
+        execution_request(
+            99,
+            project.path(),
+            &fake_build(),
+            "request-version",
+            "wi-version",
+        ),
+    );
+
+    assert_eq!(response["kind"], "error");
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("protocol generation")
+    );
+    assert!(fluent::queue::list(project.path()).unwrap().is_empty());
+}
+
+#[test]
+fn execution_status_reports_missing_request() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+
+    let response = framed_exchange(
+        &mut service,
+        serde_json::json!({
+            "kind": "execution_status",
+            "generation": scheduler_service::PROTOCOL_GENERATION,
+            "build": fake_build(),
+            "project_root": project.path(),
+            "request_id": "missing-request"
+        }),
+    );
+
+    assert_eq!(response["kind"], "error");
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing-request")
+    );
+}
+
+#[test]
+fn execution_submission_replays_one_real_queue_dispatch() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-replay");
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    let request = execution_request(
+        scheduler_service::PROTOCOL_GENERATION,
+        project.path(),
+        &fake_build(),
+        "request-replay",
+        "wi-replay",
+    );
+
+    let first = framed_exchange(&mut service, request.clone());
+    let replay = framed_exchange(&mut service, request);
+
+    assert_eq!(first["kind"], "execution_submitted");
+    assert_eq!(first["token"]["already_queued"], false);
+    assert_eq!(replay["token"]["already_queued"], true);
+    assert_eq!(
+        first["token"]["dispatch_id"],
+        replay["token"]["dispatch_id"]
+    );
+    assert_eq!(fluent::queue::list(project.path()).unwrap().len(), 1);
+}
+
+#[test]
+fn execution_submission_rejects_unregistered_project_and_stale_build() {
+    let home = TempDir::new().unwrap();
+    let registered = TempDir::new().unwrap();
+    let unregistered = TempDir::new().unwrap();
+    create_execution_ready_work(registered.path(), "wi-build");
+    create_execution_ready_work(unregistered.path(), "wi-project");
+    let mut service = registered_service(
+        home.path(),
+        registered.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+
+    let invalid_project = framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            unregistered.path(),
+            &fake_build(),
+            "request-project",
+            "wi-project",
+        ),
+    );
+    let stale_build = framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            registered.path(),
+            &BuildIdentity {
+                version: "stale".into(),
+                hash: "stale".into(),
+            },
+            "request-build",
+            "wi-build",
+        ),
+    );
+    scheduler_service::record_desired_build(
+        home.path(),
+        &BuildIdentity {
+            version: "new".into(),
+            hash: "new-build".into(),
+        },
+    )
+    .unwrap();
+    let stale_service = framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            registered.path(),
+            &fake_build(),
+            "request-stale-service",
+            "wi-build",
+        ),
+    );
+
+    assert!(
+        invalid_project["message"]
+            .as_str()
+            .unwrap()
+            .contains("registered")
+    );
+    assert!(stale_build["message"].as_str().unwrap().contains("build"));
+    assert!(
+        stale_service["message"]
+            .as_str()
+            .unwrap()
+            .contains("desired build")
+    );
+    assert!(fluent::queue::list(registered.path()).unwrap().is_empty());
+    assert!(fluent::queue::list(unregistered.path()).unwrap().is_empty());
+}
+
+#[test]
+fn scheduler_service_applies_capacity_before_consuming_real_dispatches() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    fs::create_dir_all(project.path().join(".fluent")).unwrap();
+    fs::write(
+        project.path().join(".fluent/config.yaml"),
+        "scheduler:\n  local-concurrency: 1\n",
+    )
+    .unwrap();
+    create_execution_ready_work(project.path(), "wi-capacity-1");
+    create_execution_ready_work(project.path(), "wi-capacity-2");
+    let runner = Arc::new(BlockingRunner::default());
+    let mut service = registered_service(home.path(), project.path(), runner.clone());
+    for (request_id, work_item_id) in [
+        ("request-capacity-1", "wi-capacity-1"),
+        ("request-capacity-2", "wi-capacity-2"),
+    ] {
+        let response = framed_exchange(
+            &mut service,
+            execution_request(
+                scheduler_service::PROTOCOL_GENERATION,
+                project.path(),
+                &fake_build(),
+                request_id,
+                work_item_id,
+            ),
+        );
+        assert_eq!(response["kind"], "execution_submitted");
+    }
+
+    service.poll_once().unwrap();
+    runner.wait_for_started(1);
+    assert!(matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Running(_)
+    ));
+    let statuses = fluent::queue::list(project.path()).unwrap();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|dispatch| matches!(
+                dispatch.status,
+                fluent::queue::DispatchStatus::Claimed | fluent::queue::DispatchStatus::Running
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|dispatch| dispatch.status == fluent::queue::DispatchStatus::Queued)
+            .count(),
+        1
+    );
+    runner.release_one();
+    service.join_workers().unwrap();
+
+    service.poll_once().unwrap();
+    runner.wait_for_started(2);
+    runner.release_one();
+    service.join_workers().unwrap();
+    assert!(
+        fluent::queue::list(project.path())
+            .unwrap()
+            .iter()
+            .all(|dispatch| { dispatch.status == fluent::queue::DispatchStatus::NeedsUser })
+    );
+    let first = fluent::work_model::WorkModelStore::new(project.path())
+        .read_work_item("wi-capacity-1")
+        .unwrap();
+    let second = fluent::work_model::WorkModelStore::new(project.path())
+        .read_work_item("wi-capacity-2")
+        .unwrap();
+    assert_eq!(first.attempts.len(), 1);
+    assert_eq!(second.attempts.len(), 1);
+    drop(service);
+    assert!(matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ));
+}
+
+#[test]
+fn scheduler_service_honors_project_stop_until_new_submission() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-restart-service");
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    service.poll_once().unwrap();
+    assert!(matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Running(_)
+    ));
+
+    let project_path = project.path().to_path_buf();
+    let stop = std::thread::spawn(move || fluent::scheduler::stop(&project_path).unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ) {
+        service.poll_once().unwrap();
+        assert!(std::time::Instant::now() < deadline, "service did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.join().unwrap();
+    service.poll_once().unwrap();
+    assert!(matches!(
+        fluent::scheduler::status(project.path()).unwrap(),
+        fluent::scheduler::SchedulerStatus::Stopped
+    ));
+
+    let response = framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            project.path(),
+            &fake_build(),
+            "request-restart-service",
+            "wi-restart-service",
+        ),
+    );
+    assert_eq!(response["kind"], "execution_submitted");
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+    assert_eq!(
+        fluent::queue::show(project.path(), "wi-restart-service")
+            .unwrap()
+            .status,
+        fluent::queue::DispatchStatus::NeedsUser
+    );
+}
+
+#[test]
+fn execution_status_reads_authoritative_queue_outcome() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-status");
+    let mut service = registered_service(
+        home.path(),
+        project.path(),
+        Arc::new(NeedsUserRunner::default()),
+    );
+    framed_exchange(
+        &mut service,
+        execution_request(
+            scheduler_service::PROTOCOL_GENERATION,
+            project.path(),
+            &fake_build(),
+            "request-status",
+            "wi-status",
+        ),
+    );
+    service.poll_once().unwrap();
+    service.join_workers().unwrap();
+
+    let response = framed_exchange(
+        &mut service,
+        serde_json::json!({
+            "kind": "execution_status",
+            "generation": scheduler_service::PROTOCOL_GENERATION,
+            "build": fake_build(),
+            "project_root": project.path(),
+            "request_id": "request-status"
+        }),
+    );
+
+    assert_eq!(response["kind"], "execution_status");
+    assert_eq!(response["status"], "needs-user");
+    assert_eq!(response["work_item_id"], "wi-status");
+    assert!(
+        response["attempt_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("attempt-")
+    );
+}
+
 // ─────────────────────────────────────────────────
 // Step 2 (contract closure): request immutability and dispatch exact binding
 // ─────────────────────────────────────────────────
@@ -939,6 +1422,7 @@ fn request_persistence_is_immutable_and_idempotent() {
 #[test]
 fn dispatch_rejects_request_or_token_identity_mismatch() {
     let project = TempDir::new().unwrap();
+    create_execution_ready_work(project.path(), "wi-bound");
 
     // Persist a valid request.
     let request =
@@ -969,10 +1453,8 @@ fn dispatch_rejects_request_or_token_identity_mismatch() {
 
     // Idempotent re-submission with correct request: returns the same token.
     let token2 = scheduler_service::submit_dispatch(project.path(), &request).unwrap();
-    assert_eq!(
-        token, token2,
-        "idempotent dispatch must return the same token"
-    );
+    assert_eq!(token.dispatch_id, token2.dispatch_id);
+    assert!(token2.already_queued);
 
     // Corrupt the on-disk token to simulate tampering.
     let token_path = project
@@ -983,6 +1465,8 @@ fn dispatch_rejects_request_or_token_identity_mismatch() {
         request_id: request.id.clone(),
         work_item_id: "wi-corrupted".to_string(),
         attempt_id: "attempt-1".to_string(),
+        dispatch_id: "dispatch-1".to_string(),
+        already_queued: false,
     };
     fs::write(&token_path, serde_json::to_vec_pretty(&corrupted).unwrap()).unwrap();
 

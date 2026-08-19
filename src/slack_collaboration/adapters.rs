@@ -110,9 +110,15 @@ impl WorkScheduler for LocalSchedulerClient {
             project_root,
             &scheduler_request,
         )?;
-        Ok(WorkQueueOutcome::Queued {
-            request_id: token.request_id,
-        })
+        if token.already_queued {
+            Ok(WorkQueueOutcome::AlreadyQueued {
+                request_id: token.request_id,
+            })
+        } else {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: token.request_id,
+            })
+        }
     }
 }
 

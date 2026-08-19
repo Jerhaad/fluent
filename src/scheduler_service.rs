@@ -2,7 +2,7 @@
 //! service-manager boundary, versioned socket health, immutable Attempt
 //! execution requests, sequenced events, and a private executor contract.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -10,6 +10,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{FlockOperation, flock};
@@ -514,11 +516,13 @@ enum SocketRequest {
     },
     SubmitExecution {
         generation: u32,
+        build: BuildIdentity,
         project_root: PathBuf,
         request: AttemptExecutionRequest,
     },
     ExecutionStatus {
         generation: u32,
+        build: BuildIdentity,
         project_root: PathBuf,
         request_id: String,
     },
@@ -537,8 +541,11 @@ enum SocketResponse {
     },
     ExecutionStatus {
         generation: u32,
-        request: AttemptExecutionRequest,
-        dispatched: bool,
+        request_id: String,
+        work_item_id: String,
+        dispatch_id: String,
+        status: String,
+        attempt_id: Option<String>,
     },
     Error {
         generation: u32,
@@ -551,6 +558,17 @@ enum SocketResponse {
 pub struct HealthResponse {
     pub generation: u32,
     pub build: BuildIdentity,
+}
+
+/// Authoritative state of the real queue dispatch created for one service
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionStatus {
+    pub request_id: String,
+    pub work_item_id: String,
+    pub dispatch_id: String,
+    pub status: String,
+    pub attempt_id: Option<String>,
 }
 
 /// Send a health request over the Unix socket and return the response.
@@ -576,10 +594,12 @@ pub fn send_execution_request(
     project_root: &Path,
     request: &AttemptExecutionRequest,
 ) -> Result<DispatchToken> {
+    let build = send_health_request(sock_path)?.build;
     let response = exchange(
         sock_path,
         &SocketRequest::SubmitExecution {
             generation: PROTOCOL_GENERATION,
+            build,
             project_root: project_root.to_path_buf(),
             request: request.clone(),
         },
@@ -600,11 +620,13 @@ pub fn send_execution_status(
     sock_path: &Path,
     project_root: &Path,
     request_id: &str,
-) -> Result<(AttemptExecutionRequest, bool)> {
+) -> Result<ExecutionStatus> {
+    let build = send_health_request(sock_path)?.build;
     let response = exchange(
         sock_path,
         &SocketRequest::ExecutionStatus {
             generation: PROTOCOL_GENERATION,
+            build,
             project_root: project_root.to_path_buf(),
             request_id: request_id.to_owned(),
         },
@@ -612,9 +634,18 @@ pub fn send_execution_status(
     match response {
         SocketResponse::ExecutionStatus {
             generation,
-            request,
-            dispatched,
-        } if generation == PROTOCOL_GENERATION => Ok((request, dispatched)),
+            request_id,
+            work_item_id,
+            dispatch_id,
+            status,
+            attempt_id,
+        } if generation == PROTOCOL_GENERATION => Ok(ExecutionStatus {
+            request_id,
+            work_item_id,
+            dispatch_id,
+            status,
+            attempt_id,
+        }),
         SocketResponse::Error { message, .. } => bail!("scheduler service: {message}"),
         _ => bail!("scheduler service returned an unexpected status response"),
     }
@@ -695,11 +726,11 @@ fn run_fake_listener(listener: UnixListener, build: BuildIdentity, stop_flag: Ar
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
-        let _ = serve_connection(&mut stream, &build);
+        let _ = serve_health_connection(&mut stream, &build);
     }
 }
 
-fn serve_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()> {
+fn serve_health_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()> {
     let payload = frame_read(stream)?;
     let resp = match serde_json::from_slice::<SocketRequest>(&payload) {
         Ok(SocketRequest::Health { generation }) if generation == PROTOCOL_GENERATION => {
@@ -708,42 +739,9 @@ fn serve_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()
                 build: build.clone(),
             }
         }
-        Ok(SocketRequest::SubmitExecution {
-            generation,
-            project_root,
-            request,
-        }) if generation == PROTOCOL_GENERATION => {
-            match persist_request(&project_root, &request)
-                .and_then(|()| submit_dispatch(&project_root, &request))
-            {
-                Ok(token) => SocketResponse::ExecutionSubmitted {
-                    generation: PROTOCOL_GENERATION,
-                    token,
-                },
-                Err(error) => SocketResponse::Error {
-                    generation: PROTOCOL_GENERATION,
-                    message: error.to_string(),
-                },
-            }
-        }
-        Ok(SocketRequest::ExecutionStatus {
-            generation,
-            project_root,
-            request_id,
-        }) if generation == PROTOCOL_GENERATION => match load_request(&project_root, &request_id) {
-            Ok(request) => SocketResponse::ExecutionStatus {
-                generation: PROTOCOL_GENERATION,
-                dispatched: dispatch_token_path(&project_root, &request_id).exists(),
-                request,
-            },
-            Err(error) => SocketResponse::Error {
-                generation: PROTOCOL_GENERATION,
-                message: error.to_string(),
-            },
-        },
         Ok(_) => SocketResponse::Error {
             generation: PROTOCOL_GENERATION,
-            message: "unsupported scheduler protocol generation".into(),
+            message: "fake scheduler listener supports health requests only".into(),
         },
         Err(error) => SocketResponse::Error {
             generation: PROTOCOL_GENERATION,
@@ -754,9 +752,271 @@ fn serve_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()
     Ok(())
 }
 
+/// Production scheduler service state. It validates every project and build,
+/// admits requests to the real durable queue, and owns capacity-limited
+/// Attempt workers for every registered checkout.
+pub struct SchedulerService {
+    home_dir: PathBuf,
+    build: BuildIdentity,
+    runner: Arc<dyn crate::scheduler::AttemptRunner>,
+    workers: Vec<(PathBuf, JoinHandle<Result<()>>)>,
+    coordinators: HashMap<PathBuf, crate::scheduler::CoordinatorLease>,
+    prepared_projects: HashSet<PathBuf>,
+    stopping_projects: HashSet<PathBuf>,
+    prepare_host_execution: bool,
+}
+
+impl SchedulerService {
+    pub fn new(
+        home_dir: &Path,
+        build: BuildIdentity,
+        runner: Arc<dyn crate::scheduler::AttemptRunner>,
+    ) -> Self {
+        Self {
+            home_dir: home_dir.to_path_buf(),
+            build,
+            runner,
+            workers: Vec::new(),
+            coordinators: HashMap::new(),
+            prepared_projects: HashSet::new(),
+            stopping_projects: HashSet::new(),
+            prepare_host_execution: false,
+        }
+    }
+
+    fn new_production(
+        home_dir: &Path,
+        build: BuildIdentity,
+        runner: Arc<dyn crate::scheduler::AttemptRunner>,
+    ) -> Self {
+        let mut service = Self::new(home_dir, build, runner);
+        service.prepare_host_execution = true;
+        service
+    }
+
+    /// Serve one bounded protocol exchange.
+    pub fn serve_connection(&mut self, stream: &mut UnixStream) -> Result<()> {
+        let payload = frame_read(stream)?;
+        let response = match serde_json::from_slice::<SocketRequest>(&payload) {
+            Ok(SocketRequest::Health { generation }) if generation == PROTOCOL_GENERATION => {
+                SocketResponse::HealthOk {
+                    generation: PROTOCOL_GENERATION,
+                    build: self.build.clone(),
+                }
+            }
+            Ok(SocketRequest::SubmitExecution {
+                generation,
+                build,
+                project_root,
+                request,
+            }) if generation == PROTOCOL_GENERATION => {
+                let submission = (|| {
+                    let project = self.validate_project(&project_root, &build)?;
+                    persist_request(&project, &request)?;
+                    let token = submit_dispatch(&project, &request)?;
+                    Ok::<_, anyhow::Error>((project, token))
+                })();
+                match submission {
+                    Ok((project, token)) => {
+                        self.stopping_projects.remove(&project);
+                        SocketResponse::ExecutionSubmitted {
+                            generation: PROTOCOL_GENERATION,
+                            token,
+                        }
+                    }
+                    Err(error) => SocketResponse::Error {
+                        generation: PROTOCOL_GENERATION,
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Ok(SocketRequest::ExecutionStatus {
+                generation,
+                build,
+                project_root,
+                request_id,
+            }) if generation == PROTOCOL_GENERATION => {
+                match self
+                    .validate_project(&project_root, &build)
+                    .and_then(|project| execution_status(&project, &request_id))
+                {
+                    Ok(status) => SocketResponse::ExecutionStatus {
+                        generation: PROTOCOL_GENERATION,
+                        request_id: status.request_id,
+                        work_item_id: status.work_item_id,
+                        dispatch_id: status.dispatch_id,
+                        status: status.status,
+                        attempt_id: status.attempt_id,
+                    },
+                    Err(error) => SocketResponse::Error {
+                        generation: PROTOCOL_GENERATION,
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Ok(_) => SocketResponse::Error {
+                generation: PROTOCOL_GENERATION,
+                message: "unsupported scheduler protocol generation".into(),
+            },
+            Err(error) => SocketResponse::Error {
+                generation: PROTOCOL_GENERATION,
+                message: format!("invalid scheduler request: {error}"),
+            },
+        };
+        frame_write(stream, &serde_json::to_vec(&response)?)?;
+        Ok(())
+    }
+
+    fn validate_project(&self, project_root: &Path, build: &BuildIdentity) -> Result<PathBuf> {
+        if build != &self.build {
+            bail!(
+                "scheduler request build {} ({}) does not match service build {} ({})",
+                build.version,
+                build.hash,
+                self.build.version,
+                self.build.hash
+            );
+        }
+        if let Some(desired) = read_desired_build(&self.home_dir)? {
+            if desired != self.build {
+                bail!(
+                    "scheduler service build {} ({}) is stale; desired build is {} ({})",
+                    self.build.version,
+                    self.build.hash,
+                    desired.version,
+                    desired.hash
+                );
+            }
+        }
+        let canonical = project_root.canonicalize().with_context(|| {
+            format!("canonicalize scheduler project {}", project_root.display())
+        })?;
+        let registry = read_registry(&self.home_dir)?;
+        let expected = registry.get(&canonical).with_context(|| {
+            format!(
+                "scheduler project {} is not registered",
+                canonical.display()
+            )
+        })?;
+        let actual = fs::read_to_string(checkout_identity_path(&canonical))
+            .with_context(|| format!("read checkout identity for {}", canonical.display()))?;
+        if actual.trim() != expected.0 {
+            bail!(
+                "scheduler project {} has stale checkout identity",
+                canonical.display()
+            );
+        }
+        Ok(canonical)
+    }
+
+    /// Fill every registered project's configured capacity with claims from
+    /// the real queue and launch those claims on service-owned workers.
+    pub fn poll_once(&mut self) -> Result<()> {
+        self.reconcile_stops()?;
+        let mut projects = read_registry(&self.home_dir)?
+            .into_keys()
+            .collect::<Vec<_>>();
+        projects.sort();
+        for project in projects {
+            if self.stopping_projects.contains(&project) {
+                continue;
+            }
+            if !self.coordinators.contains_key(&project) {
+                match crate::scheduler::start_or_reuse(&project, &self.build)? {
+                    crate::scheduler::CoordinatorStart::Elected(coordinator) => {
+                        if self.prepare_host_execution {
+                            crate::scheduler::prepare_service_execution(&project)?;
+                            self.prepared_projects.insert(project.clone());
+                        }
+                        self.coordinators.insert(project.clone(), coordinator);
+                    }
+                    crate::scheduler::CoordinatorStart::Reused(_) => continue,
+                }
+            }
+            let capacity = crate::scheduler::configured_capacity(&project)?;
+            for (token, lease) in crate::scheduler::claim_available(&project, capacity)? {
+                let runner = self.runner.clone();
+                let worker_project = project.clone();
+                let worker = std::thread::spawn(move || {
+                    crate::scheduler::run_claimed_dispatch(
+                        &worker_project,
+                        token,
+                        lease,
+                        runner.as_ref(),
+                    )
+                });
+                self.workers.push((project.clone(), worker));
+            }
+        }
+        Ok(())
+    }
+
+    fn reap_finished(&mut self) -> Result<()> {
+        let mut pending = Vec::new();
+        for (project, worker) in self.workers.drain(..) {
+            if worker.is_finished() {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("scheduler worker panicked"))??;
+            } else {
+                pending.push((project, worker));
+            }
+        }
+        self.workers = pending;
+        Ok(())
+    }
+
+    fn reconcile_stops(&mut self) -> Result<()> {
+        self.reap_finished()?;
+        let projects = self.coordinators.keys().cloned().collect::<Vec<_>>();
+        for project in projects {
+            let stop_requested = crate::scheduler::service_stop_requested(
+                &project,
+                self.coordinators
+                    .get_mut(&project)
+                    .expect("known coordinator"),
+            )?;
+            let has_workers = self
+                .workers
+                .iter()
+                .any(|(worker_project, _)| worker_project == &project);
+            if stop_requested {
+                self.stopping_projects.insert(project.clone());
+            }
+            if self.stopping_projects.contains(&project) && !has_workers {
+                if self.prepared_projects.remove(&project) {
+                    crate::scheduler::finish_service_execution(&project)?;
+                }
+                self.coordinators.remove(&project);
+            }
+        }
+        Ok(())
+    }
+
+    /// Join all current workers. Integration tests use this to observe the
+    /// durable terminal dispatch after a deterministic fake runner returns.
+    pub fn join_workers(&mut self) -> Result<()> {
+        for (_, worker) in self.workers.drain(..) {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("scheduler worker panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SchedulerService {
+    fn drop(&mut self) {
+        let _ = self.join_workers();
+        for project in self.prepared_projects.drain() {
+            let _ = crate::scheduler::finish_service_execution(&project);
+        }
+    }
+}
+
 /// Serve the production scheduler socket until the owning process exits.
 /// The scheduler command runs this listener alongside its queue coordinator.
-pub fn run_service(home_dir: &Path, build: BuildIdentity) -> Result<()> {
+pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> Result<()> {
     let path = socket_path(home_dir);
     if send_health_request(&path).is_ok() {
         bail!("scheduler service is already running");
@@ -769,17 +1029,31 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity) -> Result<()> {
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind scheduler service {}", path.display()))?;
+    listener.set_nonblocking(true)?;
     #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                let _ = serve_connection(&mut stream, &build);
+    let mut service = SchedulerService::new_production(
+        home_dir,
+        build,
+        Arc::new(crate::scheduler::CliAttemptRunner),
+    );
+    let poll_interval = Duration::from_secs(poll_seconds.max(1));
+    let mut next_poll = Instant::now();
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = service.serve_connection(&mut stream);
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error).context("accept scheduler service connection"),
         }
+        service.reconcile_stops()?;
+        if Instant::now() >= next_poll {
+            service.poll_once()?;
+            next_poll = Instant::now() + poll_interval;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────
@@ -915,6 +1189,11 @@ pub struct DispatchToken {
     pub request_id: String,
     pub work_item_id: String,
     pub attempt_id: String,
+    /// Identity of the real durable queue dispatch admitted for this request.
+    pub dispatch_id: String,
+    /// True when an identical request replay found its existing dispatch.
+    #[serde(default)]
+    pub already_queued: bool,
 }
 
 fn dispatch_token_path(project_root: &Path, request_id: &str) -> PathBuf {
@@ -969,6 +1248,7 @@ pub fn submit_dispatch(
         if token.request_id != persisted.id
             || token.work_item_id != persisted.work_item_id
             || token.attempt_id != persisted.attempt_id
+            || token.dispatch_id.is_empty()
         {
             bail!(
                 "existing dispatch token does not match persisted request {} \
@@ -976,19 +1256,68 @@ pub fn submit_dispatch(
                 persisted.id
             );
         }
-        return Ok(token);
+        let ledger = crate::queue::read_ledger(project_root, &persisted.work_item_id)?
+            .context("real queue ledger is missing for persisted scheduler request")?;
+        if !ledger
+            .dispatches
+            .iter()
+            .any(|dispatch| dispatch.dispatch_id == token.dispatch_id)
+        {
+            bail!(
+                "real queue dispatch {} is missing for scheduler request {}",
+                token.dispatch_id,
+                persisted.id
+            );
+        }
+        return Ok(DispatchToken {
+            already_queued: true,
+            ..token
+        });
     }
 
+    crate::queue::add(project_root, &persisted.work_item_id, None)?;
+    let dispatch = crate::queue::show(project_root, &persisted.work_item_id)?;
     let token = DispatchToken {
         request_id: persisted.id.clone(),
         work_item_id: persisted.work_item_id.clone(),
         attempt_id: persisted.attempt_id.clone(),
+        dispatch_id: dispatch.dispatch_id,
+        already_queued: false,
     };
     if let Some(parent) = token_path.parent() {
         fs::create_dir_all(parent)?;
     }
     atomic_write(&token_path, &serde_json::to_vec_pretty(&token)?)?;
     Ok(token)
+}
+
+fn execution_status(project_root: &Path, request_id: &str) -> Result<ExecutionStatus> {
+    let request = load_request(project_root, request_id)?;
+    let token_path = dispatch_token_path(project_root, request_id);
+    let token: DispatchToken = serde_json::from_slice(
+        &fs::read(&token_path)
+            .with_context(|| format!("read dispatch token {}", token_path.display()))?,
+    )
+    .with_context(|| format!("parse dispatch token {}", token_path.display()))?;
+    let ledger = crate::queue::read_ledger(project_root, &request.work_item_id)?
+        .context("real queue ledger is missing for scheduler request")?;
+    let dispatch = ledger
+        .dispatches
+        .iter()
+        .find(|dispatch| dispatch.dispatch_id == token.dispatch_id)
+        .with_context(|| {
+            format!(
+                "real queue dispatch {} is missing for scheduler request {request_id}",
+                token.dispatch_id
+            )
+        })?;
+    Ok(ExecutionStatus {
+        request_id: request.id,
+        work_item_id: request.work_item_id,
+        dispatch_id: dispatch.dispatch_id.clone(),
+        status: dispatch.status.as_str().into(),
+        attempt_id: dispatch.bound_attempt_id.clone(),
+    })
 }
 
 // ─────────────────────────────────────────────────
@@ -1100,66 +1429,4 @@ pub(crate) fn generate_random_hex(n_bytes: usize) -> Result<String> {
     let mut f = fs::File::open("/dev/urandom").context("open /dev/urandom")?;
     f.read_exact(&mut buf).context("read random bytes")?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-#[cfg(test)]
-mod socket_execution_tests {
-    use super::*;
-
-    #[test]
-    fn execution_protocol_owns_persistence_and_status() {
-        let project = tempfile::TempDir::new().unwrap();
-        let request = AttemptExecutionRequest {
-            id: "request-1".into(),
-            work_item_id: "work-1".into(),
-            attempt_id: "attempt-1".into(),
-            created_at: "2026-08-18T00:00:00Z".into(),
-        };
-        let build = BuildIdentity {
-            version: "test".into(),
-            hash: "build".into(),
-        };
-        let (mut client, mut service) = UnixStream::pair().unwrap();
-        let service_build = build.clone();
-        let handle = std::thread::spawn(move || {
-            serve_connection(&mut service, &service_build).unwrap();
-        });
-        let response = exchange_stream(
-            &mut client,
-            &SocketRequest::SubmitExecution {
-                generation: PROTOCOL_GENERATION,
-                project_root: project.path().to_path_buf(),
-                request: request.clone(),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap();
-        assert!(matches!(
-            response,
-            SocketResponse::ExecutionSubmitted { token, .. } if token.request_id == "request-1"
-        ));
-        assert_eq!(load_request(project.path(), "request-1").unwrap(), request);
-
-        let (mut client, mut service) = UnixStream::pair().unwrap();
-        let handle = std::thread::spawn(move || {
-            serve_connection(&mut service, &build).unwrap();
-        });
-        let response = exchange_stream(
-            &mut client,
-            &SocketRequest::ExecutionStatus {
-                generation: PROTOCOL_GENERATION,
-                project_root: project.path().to_path_buf(),
-                request_id: "request-1".into(),
-            },
-        )
-        .unwrap();
-        handle.join().unwrap();
-        assert!(matches!(
-            response,
-            SocketResponse::ExecutionStatus {
-                dispatched: true,
-                ..
-            }
-        ));
-    }
 }

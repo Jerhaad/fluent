@@ -848,7 +848,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 "status" | "work status"
             ) {
                 self.store.save_thread(&self.config, &thread)?;
-                return self.queue_thread_status(&thread, None);
+                let status = self.render_thread_status(&thread, None)?;
+                return self.queue_reply(&event, &status);
             }
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
@@ -1741,10 +1742,29 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 artifact_revision: action.artifact_revision.clone(),
                 label: "Approve".into(),
             }),
+            update_timestamp: None,
         })
     }
 
     fn queue_thread_status(&self, thread: &FluentThread, interruption: Option<&str>) -> Result<()> {
+        let text = self.render_thread_status(thread, interruption)?;
+        let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{}:status:{}", thread.id, &digest[..16]),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text,
+            delivered: false,
+            approval_control: None,
+            update_timestamp: thread.first_reply_timestamp.clone(),
+        })
+    }
+
+    fn render_thread_status(
+        &self,
+        thread: &FluentThread,
+        interruption: Option<&str>,
+    ) -> Result<String> {
         let interruption = interruption
             .map(|message| format!(" {message}"))
             .unwrap_or_default();
@@ -1775,16 +1795,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if let Some(connected_at) = &thread.last_connection {
             text.push_str(&format!(" Runner last connected at {connected_at}."));
         }
-        let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
-        self.store.persist_outbox(OutboundDelivery {
-            id: format!("{}:status:{}", thread.id, &digest[..16]),
-            channel: thread.channel.clone(),
-            thread_timestamp: thread.id.clone(),
-            text,
-            delivered: false,
-            approval_control: None,
-            update_timestamp: thread.first_reply_timestamp.clone(),
-        })
+        Ok(text)
     }
 }
 

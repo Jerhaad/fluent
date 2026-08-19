@@ -495,7 +495,9 @@ impl WorkControl {
         Ok(pending)
     }
 
-    /// Derive the current Slice stage from persisted Work and landing state.
+    /// Complete a Slice only when every Work Item's latest required Attempt is
+    /// complete and every candidate has landed without a pending post-land
+    /// failure. Failed and needs-user Attempts keep the Slice active.
     pub fn slice_stage(&self, slice_id: &str) -> Result<SliceStage> {
         let slice = self
             .slice(slice_id)?

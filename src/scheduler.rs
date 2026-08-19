@@ -107,6 +107,19 @@ fn scheduler_baseline_session() -> &'static str {
     })
 }
 
+/// Prepare the same host and baseline gates for a service-owned project
+/// coordinator that `scheduler run` prepares for a project-local coordinator.
+pub fn prepare_service_execution(project_root: &Path) -> Result<()> {
+    let resolver = crate::content::ContentResolver::new(Some(project_root));
+    crate::os::preflight_host_execution(project_root, &resolver)?;
+    crate::baseline_cache::prepare_scheduler_session(project_root, scheduler_baseline_session())
+}
+
+/// Release baseline state prepared for a service-owned project coordinator.
+pub fn finish_service_execution(project_root: &Path) -> Result<()> {
+    crate::baseline_cache::finish_scheduler_session(project_root, scheduler_baseline_session())
+}
+
 fn attempt_run_command(
     fluent_bin: &Path,
     project_root: &Path,
@@ -194,7 +207,7 @@ pub fn run(project_root: &Path, poll_seconds: u64, runner: &dyn AttemptRunner) -
             // execution and therefore does not need this process-local probe.
             let resolver = crate::content::ContentResolver::new(Some(project_root));
             crate::os::preflight_host_execution(project_root, &resolver)?;
-            let capacity = resolve_capacity(project_root)?;
+            let capacity = configured_capacity(project_root)?;
             let baseline_session = scheduler_baseline_session();
             crate::baseline_cache::prepare_scheduler_session(project_root, baseline_session)?;
             let result = run_coordinator_controlled(
@@ -250,7 +263,7 @@ fn run_coordinator_controlled(
             let mut spawned = false;
             for (token, lease) in claim_available(project_root, capacity)? {
                 let handle = scope.spawn(move || {
-                    if let Err(error) = run_claimed(project_root, token, lease, runner) {
+                    if let Err(error) = run_claimed_dispatch(project_root, token, lease, runner) {
                         eprintln!("[scheduler] worker error: {error}");
                     }
                 });
@@ -302,7 +315,8 @@ pub fn coordinator_is_live(project_root: &Path) -> bool {
     lease::is_leased(&coordinator_lock_path(project_root))
 }
 
-fn resolve_capacity(project_root: &Path) -> Result<usize> {
+/// Resolve the capacity that the scheduler service applies to one project.
+pub fn configured_capacity(project_root: &Path) -> Result<usize> {
     let config = crate::config::resolve_scheduler_config(project_root)?;
     Ok(config.max_local_concurrency.value as usize)
 }
@@ -538,13 +552,15 @@ pub fn dispatch_one(
     // Hold the whole-Attempt lease for the life of this dispatch so the claim
     // reads as live to capacity counting and duplicate-dispatch prevention.
     let lease = acquire_dispatch_lease(project_root, work_item_id)?;
-    run_claimed(project_root, token, lease, runner)
+    run_claimed_dispatch(project_root, token, lease, runner)
 }
 
 /// Run an already-claimed dispatch on the current thread: ensure its bound
 /// Attempt, transition to running, drive it, and reconcile. Holds the passed
 /// lease for the full lifetime of the dispatch.
-fn run_claimed(
+/// Run a service-owned real queue claim through the existing Attempt executor
+/// and reconcile its authoritative queue outcome.
+pub fn run_claimed_dispatch(
     project_root: &Path,
     token: DispatchToken,
     lease: TaskLease,
@@ -986,6 +1002,15 @@ fn shutdown_requested(
             Ok(false)
         }
     }
+}
+
+/// Observe and acknowledge a stop request for a service-owned coordinator.
+/// The caller stops claiming and drops the lease after its workers drain.
+pub fn service_stop_requested(
+    project_root: &Path,
+    coordinator: &mut CoordinatorLease,
+) -> Result<bool> {
+    shutdown_requested(project_root, &AtomicBool::new(false), Some(coordinator))
 }
 
 /// Sleep up to `duration`, checking the shutdown signal each second so a
