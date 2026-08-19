@@ -1090,23 +1090,74 @@ fn reopen_resumable_attempt(
     attempt_id: &str,
 ) -> Result<()> {
     store.mutate_work_item(work_item_id, |item| {
-        let attempt = item
+        let attempt_index = item
             .attempts
-            .iter_mut()
-            .find(|attempt| attempt.id == attempt_id)
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
             .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
+        let attempt = &item.attempts[attempt_index];
         attempt.ensure_resume_ready()?;
         if attempt.pause_kind == Some(PauseKind::RoundCap) {
             return Err(round_cap_ineligible(
                 "the pause changed to round-cap before the recovery transaction",
             ));
         }
-        crate::work_model::reopen_attempt(attempt);
+        let writer_completion_artifacts = (attempt.pause_kind == Some(PauseKind::WriterCompletion))
+            .then(|| writer_completion_resume_artifacts(attempt));
+        crate::work_model::reopen_attempt(&mut item.attempts[attempt_index]);
+        if let Some(artifacts) = writer_completion_artifacts {
+            item.add_next_write_round(attempt_id, artifacts)?;
+            let attempt = &mut item.attempts[attempt_index];
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at = None;
+        }
         Ok(())
     })?;
     Ok(())
+}
+
+fn writer_completion_resume_artifacts(attempt: &Attempt) -> Vec<ArtifactRef> {
+    let mut artifacts = Vec::new();
+    if attempt.progress_contract.is_some() {
+        artifacts.push(required_progress_artifact(attempt));
+    }
+
+    if let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+    {
+        let repaired_fragment = format!(
+            "/writer-completion-repairs/{}/{}",
+            writer.id,
+            crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+        );
+        let matrix = attempt
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.producer_id == "writer-completion-repair"
+                    && artifact.path.ends_with(&repaired_fragment)
+            })
+            .cloned()
+            .or_else(|| writer_completion_artifact(writer));
+        if let Some(matrix) = matrix {
+            artifacts.push(matrix);
+        }
+    }
+
+    if let Some(handoff) = attempt.artifacts.iter().rev().find(|artifact| {
+        artifact.path.ends_with("required-progress-needs-user.md")
+            || artifact.path.ends_with("writer-completion-needs-user.md")
+    }) {
+        artifacts.push(handoff.clone());
+    }
+    artifacts
 }
 
 /// Reopen only the latest reviewer roles whose durable verdict is uncertain.
@@ -15398,6 +15449,58 @@ mod tests {
         let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
         assert!(handoff.contains("malformed required-progress line"));
         assert!(handoff.contains("before Tester and review planning"));
+    }
+
+    #[test]
+    fn writer_completion_resume_plans_a_follow_up_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_progress_matrix_fixture(tmp.path());
+        let handoff = ArtifactRef {
+            producer_id: "required-progress".to_string(),
+            path: ".fluent/work/artifacts/matrix-progress-work/attempt-1/required-progress-needs-user.md"
+                .to_string(),
+        };
+        store
+            .mutate_work_item("matrix-progress-work", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                attempt.completed_at = Some("2026-08-19T00:00:00Z".to_string());
+                attempt.artifacts.push(handoff.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        reopen_resumable_attempt(&store, "matrix-progress-work", "attempt-1").unwrap();
+
+        let stored = store.read_work_item("matrix-progress-work").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert!(attempt.pause_kind.is_none());
+        assert!(attempt.completed_at.is_none());
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        let follow_up = attempt.tasks.last().unwrap();
+        assert_eq!(follow_up.id, "attempt-1-write-2");
+        assert_eq!(follow_up.status, TaskStatus::Planned);
+        assert!(
+            follow_up
+                .input_artifacts
+                .contains(&required_progress_artifact(attempt))
+        );
+        assert!(follow_up.input_artifacts.contains(&handoff));
+        assert!(follow_up.input_artifacts.iter().any(|artifact| {
+            artifact
+                .path
+                .ends_with("attempt-1-write-1/writer-completion.json")
+        }));
     }
 
     #[test]
