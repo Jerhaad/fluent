@@ -7505,7 +7505,10 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
             "1.0",
             "U1",
             "slice-reconnect-runner",
-            &[PlannedWork::new("work-reconnect-runner", "Reconnect")],
+            &[
+                PlannedWork::new("work-reconnect-runner", "Reconnect"),
+                PlannedWork::new("work-reconnect-candidate", "Candidate"),
+            ],
         )
         .unwrap();
     first.report_thread_work("1.0").unwrap();
@@ -7529,6 +7532,76 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
         })
         .unwrap();
 
+    let source = fluent::work_model::WorkspaceRef {
+        id: "reconnect-source".into(),
+        path: "/tmp/reconnect-source".into(),
+    };
+    let target = fluent::work_model::WorkspaceRef {
+        id: "reconnect-target".into(),
+        path: checkout.path().display().to_string(),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition("work-reconnect-candidate", Some(&metadata), |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            item.attempts.push(fluent::work_model::Attempt {
+                id: "attempt-reconnect-candidate".into(),
+                work_item_id: item.id.clone(),
+                status: fluent::work_model::AttemptStatus::Complete,
+                review_state: Some(fluent::work_model::AttemptReviewState::Passed),
+                tasks: vec![fluent::work_model::Task {
+                    id: "task-reconnect-write".into(),
+                    kind: fluent::work_model::TaskKind::Write,
+                    status: fluent::work_model::TaskStatus::Complete,
+                    role: "writer".into(),
+                    instructions: None,
+                    work_item_id: item.id.clone(),
+                    attempt_id: Some("attempt-reconnect-candidate".into()),
+                    workspace_access: fluent::work_model::WorkspaceAccess {
+                        reads: vec![target.clone()],
+                        writes: vec![source.clone()],
+                    },
+                    artifact_area: None,
+                    review_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: Some(fluent::work_model::TaskOutput {
+                        workspace_id: source.id.clone(),
+                        workspace_path: source.path.clone(),
+                        source_branch: "main".into(),
+                        base_commit: Some("base-reconnect".into()),
+                        commit: "commit-reconnect".into(),
+                        no_change: None,
+                        learner_canonicalization: None,
+                    }),
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                }],
+                ..Default::default()
+            });
+            item.merge_candidates
+                .push(fluent::work_model::MergeCandidate {
+                    id: "candidate-reconnect".into(),
+                    attempt_id: "attempt-reconnect-candidate".into(),
+                    source_workspace: source.clone(),
+                    target_workspace: target.clone(),
+                    source_branch: "main".into(),
+                    target_branch: "main".into(),
+                    candidate_commit: "commit-reconnect".into(),
+                    merge_review_state: fluent::work_model::MergeReviewState::Passed,
+                    merge_state: fluent::work_model::MergeCandidateMergeState::default(),
+                    created_at: None,
+                    ready_at: None,
+                    started_at: None,
+                    completed_at: None,
+                });
+            Ok(())
+        })
+        .unwrap();
+
     let mut recovered = CollaborationRunner::new(
         home.path(),
         config,
@@ -7542,7 +7615,7 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
         .iter()
         .filter(|delivery| delivery.id.contains(":work-transition:"))
         .collect::<Vec<_>>();
-    assert_eq!(transition_deliveries.len(), 3);
+    assert_eq!(transition_deliveries.len(), 7);
     assert!(transition_deliveries[0].text.contains("is now authorized"));
     assert!(transition_deliveries[1].text.contains("is now executing"));
     assert!(transition_deliveries[2].text.contains("is now needs-user"));
@@ -7550,6 +7623,25 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
         transition_deliveries[2]
             .text
             .contains("operator decision required")
+    );
+    let task_position = transition_deliveries
+        .iter()
+        .position(|delivery| delivery.text.contains("task-reconnect-write"))
+        .unwrap();
+    let candidate_position = transition_deliveries
+        .iter()
+        .position(|delivery| delivery.text.contains("candidate-reconnect"))
+        .unwrap();
+    assert!(task_position < candidate_position);
+    assert!(
+        transition_deliveries[task_position]
+            .text
+            .contains("Work Item work-reconnect-candidate")
+    );
+    assert!(
+        transition_deliveries[candidate_position]
+            .text
+            .contains("is now ready")
     );
 
     let delivered = recovered.slack().deliveries.len();
