@@ -11,9 +11,51 @@ use crate::content::ContentResolver;
 
 use super::{
     ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderError,
-    ProviderFailure, ProviderResult, ProviderScope, ProviderTurnRecovery, RecoveryTarget,
-    SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
+    ProviderFailure, ProviderOutput, ProviderResult, ProviderScope, ProviderTurnRecovery,
+    RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
 };
+
+const STRUCTURED_REPLY_INSTRUCTION: &str = "Return exactly one JSON object. Use {\"type\":\"message\",\"text\":\"...\",\"references\":[{\"path\":\"src/lib.rs\",\"line\":1}]} for a conversational reply. Every reference must name an existing repository-relative file and a one-based line; use an empty references array when no source location supports the reply. When you complete or revise a planning artifact, use {\"type\":\"planning_artifact\",\"kind\":\"brief|behaviors|approach|plan\",\"markdown\":\"...\"} with the complete Markdown.";
+
+fn validate_structured_provider_output(raw: &str, scope: &ProviderScope) -> Result<String> {
+    let output: ProviderOutput = serde_json::from_str(raw)
+        .context("incompatible provider protocol: turn result was not structured JSON")?;
+    if let ProviderOutput::Message { references, .. } = &output {
+        let checkout = scope
+            .checkout
+            .canonicalize()
+            .context("incompatible provider protocol: canonicalize bound checkout")?;
+        for reference in references {
+            if reference.line == 0
+                || reference.path.is_absolute()
+                || reference
+                    .path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "incompatible provider protocol: code reference must contain a repository-relative path and one-based line"
+                );
+            }
+            let referenced = scope
+                .checkout
+                .join(&reference.path)
+                .canonicalize()
+                .context("incompatible provider protocol: referenced code does not exist")?;
+            if !referenced.is_file() || referenced.strip_prefix(&checkout).is_err() {
+                bail!(
+                    "incompatible provider protocol: code reference is outside the bound checkout"
+                );
+            }
+            let source = fs::read_to_string(&referenced)
+                .context("incompatible provider protocol: referenced code is not text")?;
+            if source.lines().nth(reference.line - 1).is_none() {
+                bail!("incompatible provider protocol: code reference line does not exist");
+            }
+        }
+    }
+    serde_json::to_string(&output).context("serialize structured provider result")
+}
 
 pub struct LocalSchedulerClient {
     project_roots: Vec<PathBuf>,
@@ -607,7 +649,11 @@ impl CodexAppServerProvider {
         Ok(())
     }
 
-    fn recovered_turn(result: &serde_json::Value, action_id: &str) -> Result<ProviderTurnRecovery> {
+    fn recovered_turn(
+        result: &serde_json::Value,
+        action_id: &str,
+        scope: &ProviderScope,
+    ) -> Result<ProviderTurnRecovery> {
         for turn in result["thread"]["turns"].as_array().into_iter().flatten() {
             let matches = turn["items"].as_array().into_iter().flatten().any(|item| {
                 item["type"] == "userMessage" && item["clientId"].as_str() == Some(action_id)
@@ -628,6 +674,7 @@ impl CodexAppServerProvider {
                 .and_then(|item| item["text"].as_str())
                 .context("incompatible Codex provider protocol: completed turn omitted reply")?
                 .to_owned();
+            let reply = validate_structured_provider_output(&reply, scope)?;
             return Ok(ProviderTurnRecovery::Completed { turn_id, reply });
         }
         Ok(ProviderTurnRecovery::Missing)
@@ -709,7 +756,7 @@ impl ConversationProvider for CodexAppServerProvider {
             "thread/read",
             serde_json::json!({"threadId": session, "includeTurns": true}),
         )?;
-        Ok(Self::recovered_turn(&result, action_id)?)
+        Ok(Self::recovered_turn(&result, action_id, scope)?)
     }
 
     fn run_turn(
@@ -730,7 +777,7 @@ impl ConversationProvider for CodexAppServerProvider {
                 "threadId": session,
                 "clientUserMessageId": action_id,
                 "input": [{"type": "text", "text": format!(
-                    "Slack user {actor}: {contribution}\n\nReturn exactly one JSON object. Use {{\"type\":\"message\",\"text\":\"...\"}} for a conversational reply. When you complete or revise a planning artifact, use {{\"type\":\"planning_artifact\",\"kind\":\"brief|behaviors|approach|plan\",\"markdown\":\"...\"}} with the complete Markdown."
+                    "Slack user {actor}: {contribution}\n\n{STRUCTURED_REPLY_INSTRUCTION}"
                 )}],
             }),
         )?;
@@ -757,12 +804,10 @@ impl ConversationProvider for CodexAppServerProvider {
                         format!("Codex turn {turn_id} did not complete successfully"),
                     ));
                 }
-                return Ok((
-                    None,
-                    reply.context(
-                        "incompatible Codex provider protocol: completed turn omitted agent message",
-                    )?,
-                ));
+                let reply = reply.context(
+                    "incompatible Codex provider protocol: completed turn omitted agent message",
+                )?;
+                return Ok((None, validate_structured_provider_output(&reply, scope)?));
             }
         }
     }
@@ -881,7 +926,9 @@ impl ClaudeStructuredSessionProvider {
         if let Some(session) = session {
             command.args(["--resume", session]);
         }
-        command.arg(format!("Slack user {actor}: {contribution}"));
+        command.arg(format!(
+            "Slack user {actor}: {contribution}\n\n{STRUCTURED_REPLY_INSTRUCTION}"
+        ));
         let output = command
             .output()
             .context("invoke Claude structured session")?;
@@ -898,10 +945,12 @@ impl ClaudeStructuredSessionProvider {
                 .as_str()
                 .context("incompatible Claude provider protocol: response omitted session_id")?
                 .into(),
-            value["result"]
-                .as_str()
-                .context("incompatible Claude provider protocol: response omitted result")?
-                .into(),
+            validate_structured_provider_output(
+                value["result"]
+                    .as_str()
+                    .context("incompatible Claude provider protocol: response omitted result")?,
+                scope,
+            )?,
         ))
     }
 }
@@ -1033,13 +1082,6 @@ impl ConversationProvider for ProviderRegistry {
         accepted: &mut dyn FnMut(&str) -> Result<()>,
     ) -> ProviderResult<(Option<String>, String)> {
         self.current()?.run_turn(a, id, s, c, u, accepted)
-    }
-    fn code_references(
-        &mut self,
-        s: &ProviderScope,
-        c: &str,
-    ) -> ProviderResult<Vec<super::CodeReference>> {
-        self.current()?.code_references(s, c)
     }
     fn ready(&self) -> ProviderResult<()> {
         self.providers

@@ -1263,10 +1263,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         let output = serde_json::from_str::<ProviderOutput>(&raw_reply).unwrap_or_else(|_| {
             ProviderOutput::Message {
                 text: raw_reply.clone(),
+                references: Vec::new(),
             }
         });
-        let raw_reply = match output {
-            ProviderOutput::Message { text } => text,
+        let (raw_reply, provider_references) = match output {
+            ProviderOutput::Message { text, references } => (text, references),
             ProviderOutput::PlanningArtifact { kind, markdown } => {
                 turn.completed_reply = Some(raw_reply);
                 thread.pending_turn = Some(turn);
@@ -1278,16 +1279,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
         };
         let provider_reply = raw_reply.clone();
-        let mut provider_references =
-            match self.provider.code_references(&scope, &turn.contribution) {
-                Ok(references) => references,
-                Err(error) => return self.preserve_provider_failure(event, thread, error),
-            };
-        for reference in code_references_in_reply(&raw_reply, &scope.checkout) {
-            if !provider_references.contains(&reference) {
-                provider_references.push(reference);
-            }
-        }
         let mut references = Vec::with_capacity(provider_references.len());
         for reference in provider_references {
             if reference.path.is_absolute()
@@ -1912,32 +1903,6 @@ fn recovery_event(thread: &FluentThread, suffix: &str) -> InboundEnvelope {
         approval_action_id: None,
         approval_artifact_revision: None,
     }
-}
-
-fn code_references_in_reply(reply: &str, checkout: &Path) -> Vec<CodeReference> {
-    reply
-        .split_whitespace()
-        .filter_map(|token| {
-            let token = token.trim_matches(|character: char| {
-                matches!(
-                    character,
-                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | '.' | ';'
-                )
-            });
-            let (path, line) = token.rsplit_once(':')?;
-            let line = line.parse().ok()?;
-            let path = PathBuf::from(path);
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|component| matches!(component, std::path::Component::ParentDir))
-                || !checkout.join(&path).is_file()
-            {
-                return None;
-            }
-            Some(CodeReference { path, line })
-        })
-        .collect()
 }
 
 fn work_item_id_from_request(text: &str) -> Option<&str> {

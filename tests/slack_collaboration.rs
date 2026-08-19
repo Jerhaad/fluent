@@ -2114,6 +2114,14 @@ for line in sys.stdin:
     elif method == "turn/start":
         action_id = request["params"]["clientUserMessageId"]
         held = os.path.exists(sys.argv[0] + ".hold")
+        reply = json.dumps({
+            "type": "message",
+            "text": "provider reply",
+            "references": [{"path": "README", "line": 1}]
+        })
+        if os.path.exists(sys.argv[0] + ".reply"):
+            with open(sys.argv[0] + ".reply") as source:
+                reply = source.read()
         turn = {
             "id": "turn-" + action_id,
             "status": "inProgress" if held else "completed",
@@ -2123,8 +2131,11 @@ for line in sys.stdin:
             ]
         }
         if not held:
-            turn["items"].append(
-                {"id": "agent-1", "type": "agentMessage", "text": "provider reply"})
+            turn["items"].append({
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": reply
+            })
         state["turns"].append(turn)
         save_state(state)
         result = {"turn": {"id": turn["id"], "status": "inProgress", "items": []}}
@@ -2183,6 +2194,7 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
     let fixture = TempDir::new().unwrap();
     let executable = codex_fixture(&fixture);
     let checkout = TempDir::new().unwrap();
+    fs::write(checkout.path().join("README"), "fixture\n").unwrap();
     let scope = ProviderScope {
         checkout: checkout.path().into(),
         slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
@@ -2191,7 +2203,16 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
     provider.ready().unwrap();
     let (session, reply) = provider.start("action-1", &scope, "hello", "U1").unwrap();
     assert_eq!(session, "thread-1");
-    assert_eq!(reply, "provider reply");
+    assert_eq!(
+        serde_json::from_str::<ProviderOutput>(&reply).unwrap(),
+        ProviderOutput::Message {
+            text: "provider reply".into(),
+            references: vec![CodeReference {
+                path: "README".into(),
+                line: 1,
+            }],
+        }
+    );
     let requests = codex_requests(&executable);
     let methods: Vec<_> = requests
         .iter()
@@ -2218,6 +2239,8 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
     let input = turn["params"]["input"][0]["text"].as_str().unwrap();
     assert!(input.contains("Slack user U1: hello"));
     assert!(input.contains(r#""type":"planning_artifact""#));
+    assert!(input.contains(r#""references""#));
+    assert!(input.contains("repository-relative"));
     assert!(input.contains("complete Markdown"));
 }
 
@@ -2378,7 +2401,13 @@ fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({
-                "id": "agent-1", "type": "agentMessage", "text": "provider reply"
+                "id": "agent-1",
+                "type": "agentMessage",
+                "text": serde_json::json!({
+                    "type": "message",
+                    "text": "provider reply",
+                    "references": [{"path": "README", "line": 1}]
+                }).to_string()
             }));
         fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
         recovered = CollaborationRunner::new(
@@ -2415,6 +2444,14 @@ fn assert_codex_turn_recovers_without_resubmission(crash: ThreadCommitCrashPoint
             .count(),
         1
     );
+    let reply = recovered
+        .slack()
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.id == "E1:reply")
+        .unwrap();
+    assert!(reply.text.contains("README:1"));
+    assert!(!reply.text.contains(&_checkout.path().display().to_string()));
 }
 
 #[test]
@@ -2592,11 +2629,12 @@ fn claude_structured_session_starts_and_resumes() {
     let executable = fixture.path().join("claude");
     fs::write(
         &executable,
-        "#!/bin/sh\nset -eu\nprintf '%s|%s|%s\\n' \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$*\" >> \"$0.log\"\nprintf '%s\\n' '{\"session_id\":\"claude-session\",\"result\":\"provider reply\"}'\n",
+        "#!/bin/sh\nset -eu\nprintf '%s|%s|%s\\n' \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$*\" >> \"$0.log\"\nprintf '%s\\n' '{\"session_id\":\"claude-session\",\"result\":\"{\\\"type\\\":\\\"message\\\",\\\"text\\\":\\\"provider reply\\\",\\\"references\\\":[{\\\"path\\\":\\\"README\\\",\\\"line\\\":1}]}\"}'\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
     let checkout = TempDir::new().unwrap();
+    fs::write(checkout.path().join("README"), "fixture\n").unwrap();
     let scope = ProviderScope {
         checkout: checkout.path().into(),
         slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
@@ -2610,12 +2648,22 @@ fn claude_structured_session_starts_and_resumes() {
         .start("action-1", &scope, "inspect this", "U1")
         .unwrap();
     assert_eq!(session, "claude-session");
-    assert_eq!(reply, "provider reply");
+    let expected = ProviderOutput::Message {
+        text: "provider reply".into(),
+        references: vec![CodeReference {
+            path: "README".into(),
+            line: 1,
+        }],
+    };
+    assert_eq!(
+        serde_json::from_str::<ProviderOutput>(&reply).unwrap(),
+        expected
+    );
     assert_eq!(
         provider
             .resume("action-2", &session, &scope, "continue", "U2")
             .unwrap(),
-        "provider reply"
+        serde_json::to_string(&expected).unwrap()
     );
 
     let invocations = fs::read_to_string(executable.with_extension("log")).unwrap();
@@ -2631,7 +2679,50 @@ fn claude_structured_session_starts_and_resumes() {
     assert!(invocations.contains(&scope.slice_draft.join(".claude-home").display().to_string()));
     assert!(invocations.contains("--print --output-format json --permission-mode plan"));
     assert!(invocations.contains("Slack user U1: inspect this"));
+    assert!(invocations.contains("repository-relative"));
+    assert!(invocations.contains("references"));
     assert!(invocations.contains("--resume claude-session Slack user U2: continue"));
+}
+
+#[test]
+fn production_adapters_reject_unsafe_structured_references() {
+    let fixture = TempDir::new().unwrap();
+    let checkout = TempDir::new().unwrap();
+    fs::write(checkout.path().join("README"), "fixture\n").unwrap();
+    let scope = ProviderScope {
+        checkout: checkout.path().into(),
+        slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
+    };
+    let unsafe_reply = serde_json::json!({
+        "type": "message",
+        "text": "unsafe",
+        "references": [{"path": "../secret", "line": 1}]
+    })
+    .to_string();
+
+    let codex = codex_fixture(&fixture);
+    fs::write(format!("{}.reply", codex.display()), &unsafe_reply).unwrap();
+    let mut codex_provider = CodexAppServerProvider::new(codex);
+    let codex_error = codex_provider
+        .start("action-1", &scope, "inspect", "U1")
+        .unwrap_err();
+    assert_eq!(codex_error.failure, ProviderFailure::IncompatibleProtocol);
+
+    let claude = fixture.path().join("claude-unsafe-reference");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            serde_json::json!({"session_id": "claude-session", "result": unsafe_reply})
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut claude_provider = ClaudeStructuredSessionProvider::new(claude);
+    let claude_error = claude_provider
+        .start("action-2", &scope, "inspect", "U1")
+        .unwrap_err();
+    assert_eq!(claude_error.failure, ProviderFailure::IncompatibleProtocol);
 }
 
 #[test]
@@ -3901,7 +3992,15 @@ fn provider_reference_failure_preserves_typed_state_and_pending_turn() {
             _: &str,
             _: &str,
         ) -> ProviderResult<(String, String)> {
-            Ok(("session".into(), "reply".into()))
+            Ok((
+                "session".into(),
+                serde_json::json!({
+                    "type": "message",
+                    "text": "reply",
+                    "references": [{"path": "../secret", "line": 1}]
+                })
+                .to_string(),
+            ))
         }
         fn resume(
             &mut self,
@@ -3912,16 +4011,6 @@ fn provider_reference_failure_preserves_typed_state_and_pending_turn() {
             _: &str,
         ) -> ProviderResult<String> {
             Ok("reply".into())
-        }
-        fn code_references(
-            &mut self,
-            _: &ProviderScope,
-            _: &str,
-        ) -> ProviderResult<Vec<CodeReference>> {
-            Err(ProviderError::new(
-                ProviderFailure::IncompatibleProtocol,
-                "reference response schema changed",
-            ))
         }
     }
 
@@ -4433,7 +4522,14 @@ fn code_question_uses_bound_checkout_and_relative_references() {
             self.scopes.lock().unwrap().push(scope.checkout.clone());
             Ok((
                 "session".into(),
-                "Inspect `README:1` for the binding.".into(),
+                serde_json::to_string(&ProviderOutput::Message {
+                    text: "Inspect the README for the binding.".into(),
+                    references: vec![CodeReference {
+                        path: "README".into(),
+                        line: 1,
+                    }],
+                })
+                .unwrap(),
             ))
         }
         fn resume(
@@ -4478,7 +4574,17 @@ fn code_question_posts_provider_reference_in_slack_thread() {
             _contribution: &str,
             _actor: &str,
         ) -> ProviderResult<(String, String)> {
-            Ok(("session".into(), "The implementation is here.".into()))
+            Ok((
+                "session".into(),
+                serde_json::to_string(&ProviderOutput::Message {
+                    text: "The implementation is here.".into(),
+                    references: vec![CodeReference {
+                        path: "README".into(),
+                        line: 1,
+                    }],
+                })
+                .unwrap(),
+            ))
         }
         fn resume(
             &mut self,
@@ -4489,16 +4595,6 @@ fn code_question_posts_provider_reference_in_slack_thread() {
             _actor: &str,
         ) -> ProviderResult<String> {
             unreachable!()
-        }
-        fn code_references(
-            &mut self,
-            _scope: &ProviderScope,
-            _contribution: &str,
-        ) -> ProviderResult<Vec<CodeReference>> {
-            Ok(vec![CodeReference {
-                path: "README".into(),
-                line: 1,
-            }])
         }
     }
     let (home, checkout, config) = setup(true);
@@ -4527,7 +4623,15 @@ fn malformed_provider_reference_preserves_typed_state_and_pending_turn() {
             _contribution: &str,
             _actor: &str,
         ) -> ProviderResult<(String, String)> {
-            Ok(("session".into(), "answer".into()))
+            Ok((
+                "session".into(),
+                serde_json::json!({
+                    "type": "message",
+                    "text": "answer",
+                    "references": [{"path": "../secret", "line": 1}]
+                })
+                .to_string(),
+            ))
         }
         fn resume(
             &mut self,
@@ -4538,16 +4642,6 @@ fn malformed_provider_reference_preserves_typed_state_and_pending_turn() {
             _actor: &str,
         ) -> ProviderResult<String> {
             unreachable!()
-        }
-        fn code_references(
-            &mut self,
-            _scope: &ProviderScope,
-            _contribution: &str,
-        ) -> ProviderResult<Vec<CodeReference>> {
-            Ok(vec![CodeReference {
-                path: "../secret".into(),
-                line: 1,
-            }])
         }
     }
     let (home, _checkout, config) = setup(true);
@@ -4590,7 +4684,15 @@ fn unformattable_provider_reference_preserves_typed_state_and_pending_turn() {
             _: &str,
             _: &str,
         ) -> ProviderResult<(String, String)> {
-            Ok(("session".into(), "answer".into()))
+            Ok((
+                "session".into(),
+                serde_json::json!({
+                    "type": "message",
+                    "text": "answer",
+                    "references": [{"path": "missing.rs", "line": 1}]
+                })
+                .to_string(),
+            ))
         }
         fn resume(
             &mut self,
@@ -4601,16 +4703,6 @@ fn unformattable_provider_reference_preserves_typed_state_and_pending_turn() {
             _: &str,
         ) -> ProviderResult<String> {
             unreachable!()
-        }
-        fn code_references(
-            &mut self,
-            _: &ProviderScope,
-            _: &str,
-        ) -> ProviderResult<Vec<CodeReference>> {
-            Ok(vec![CodeReference {
-                path: "missing.rs".into(),
-                line: 1,
-            }])
         }
     }
     let (home, _checkout, config) = setup(true);

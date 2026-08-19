@@ -193,8 +193,14 @@ pub enum ProviderEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderOutput {
-    Message { text: String },
-    PlanningArtifact { kind: String, markdown: String },
+    Message {
+        text: String,
+        references: Vec<CodeReference>,
+    },
+    PlanningArtifact {
+        kind: String,
+        markdown: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +212,7 @@ pub enum ProviderTurnRecovery {
 
 /// A provider-reported source location. The coordinator validates and renders
 /// it at the Slack boundary so providers never expose host checkout paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeReference {
     pub path: PathBuf,
     pub line: usize,
@@ -414,14 +420,6 @@ pub trait ConversationProvider: Send {
     }
 
     fn structured_events(&mut self, _session: &str) -> ProviderResult<Vec<ProviderEvent>> {
-        Ok(Vec::new())
-    }
-
-    fn code_references(
-        &mut self,
-        _scope: &ProviderScope,
-        _contribution: &str,
-    ) -> ProviderResult<Vec<CodeReference>> {
         Ok(Vec::new())
     }
 
