@@ -2728,32 +2728,84 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
 
 #[test]
 fn approver_switches_provider_without_changing_work() {
+    struct SwitchingProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<(String, String)>>>,
+        unavailable: bool,
+    }
+    impl ConversationProvider for SwitchingProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            actor: &str,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.lock().unwrap().push((
+                self.name.into(),
+                format!("Slack user {actor}: {contribution}"),
+            ));
+            if self.unavailable {
+                anyhow::bail!("provider runtime unavailable")
+            }
+            Ok((format!("{}-session", self.name), "continued reply".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry = ProviderRegistry::new([
+        Box::new(SwitchingProvider {
+            name: "codex",
+            calls: calls.clone(),
+            unavailable: true,
+        }) as Box<dyn ConversationProvider>,
+        Box::new(SwitchingProvider {
+            name: "claude",
+            calls: calls.clone(),
+            unavailable: false,
+        }) as Box<dyn ConversationProvider>,
+    ])
+    .unwrap();
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(
-        home.path(),
-        config,
-        InMemoryProvider::default(),
-        InMemorySlack::default(),
-    );
+    let mut runner =
+        CollaborationRunner::new(home.path(), config, registry, InMemorySlack::default());
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    let store = FileCollaborationStore::new(home.path());
-    let mut interrupted = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
-    interrupted.pending_turn = Some(PendingTurn {
-        action_id: "E2".into(),
-        contribution: "resume this conversation".into(),
-        actor: "U1".into(),
-        starts_session: false,
-        provider_turn_id: None,
-        completed_reply: None,
-    });
-    store.save_thread(&runner.config, &interrupted).unwrap();
-    runner.switch_provider("1.0", "U1", "claude").unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "@Fluent [provider=claude]"))
+        .unwrap();
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
         .unwrap()
         .unwrap();
     assert_eq!(thread.provider.as_deref(), Some("claude"));
     assert!(thread.linked_work.is_none());
+    assert!(thread.pending_turn.is_none());
+    assert_eq!(
+        &*calls.lock().unwrap(),
+        &[
+            ("codex".into(), "Slack user U1: @Fluent hello".into()),
+            ("claude".into(), "Slack user U1: @Fluent hello".into())
+        ]
+    );
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("continued reply"))
+    );
 }
 
 #[test]

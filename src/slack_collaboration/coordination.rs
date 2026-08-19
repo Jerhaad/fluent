@@ -233,8 +233,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .with_context(|| format!("approve planning Work Item {work_item_id}"))
     }
 
-    /// Switch only an interrupted conversation's provider metadata. Scheduler
-    /// Work is deliberately not represented or mutated at this boundary.
+    /// Switch an interrupted conversation and run its preserved turn through
+    /// the selected provider. Scheduler Work is not represented or mutated at
+    /// this boundary.
     pub fn switch_provider(&mut self, thread_id: &str, actor: &str, provider: &str) -> Result<()> {
         let mut thread = self
             .store
@@ -257,7 +258,21 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false,
             approval_control: None,
-        })
+        })?;
+        let event = InboundEnvelope {
+            id: format!("{}:provider-switch:{}", thread.id, provider),
+            acknowledgement_id: String::new(),
+            channel: thread.channel.clone(),
+            timestamp: thread.id.clone(),
+            thread_timestamp: Some(thread.id.clone()),
+            user: actor.into(),
+            text: format!("[provider={provider}]"),
+            change: InboundChange::Message,
+            approval_action_id: None,
+            approval_artifact_revision: None,
+        };
+        self.complete_pending_turn(&event, &mut thread)?;
+        self.store.save_thread(&self.config, &thread)
     }
 
     /// Persist first, then acknowledge exactly once, then process and send.
@@ -409,6 +424,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if let Some(project_label) = &thread.project_label {
             self.store
                 .bind_inbox_event(&self.config, &event.id, project_label)?;
+        }
+        if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
+            && let Some(provider) = selected_provider(&event.text)
+        {
+            return self.switch_provider(&thread.id, &event.user, provider);
         }
         if thread
             .pending_turn
