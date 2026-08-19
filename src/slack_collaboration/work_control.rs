@@ -227,6 +227,8 @@ impl WorkControl {
         for id in &ids {
             validate_work_item_id(id)?;
         }
+        let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
+            .with_context(|| format!("lock approved Slice {slice_id}"))?;
         let mut slice = if let Some(existing) = self.slice(slice_id)? {
             let same_plan = existing.work_item_ids == ids
                 && existing.approved_by == approver
@@ -762,6 +764,14 @@ impl WorkControl {
             .project_root
             .join(".fluent/work/slack/slices")
             .join(format!("{slice_id}.json")))
+    }
+
+    fn slice_lock_path(&self, slice_id: &str) -> Result<PathBuf> {
+        validate_slice_id(slice_id)?;
+        Ok(self
+            .project_root
+            .join(".fluent/work/slack/locks")
+            .join(format!("{slice_id}.lock")))
     }
 }
 

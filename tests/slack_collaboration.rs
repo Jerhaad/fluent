@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+use std::time::Duration;
 
 use fluent::slack_collaboration::*;
 use fluent::work_model::{PlanningContext, WorkItem, WorkModelStore};
@@ -6734,6 +6736,84 @@ fn plan_approval_detects_conflicts_before_publishing_work() {
     assert_eq!(store.list_work_items().unwrap().len(), 1);
     let staged = control.slice("slice-conflict").unwrap().unwrap();
     assert_eq!(staged.approval_state, PlanApprovalState::Materializing);
+}
+
+#[test]
+fn conflicting_plan_approvals_share_one_slice_transaction() {
+    let (_home, checkout, _config) = setup(true);
+    let slice_id = "slice-concurrent-plan";
+    let lock_path = checkout
+        .path()
+        .join(".fluent/work/slack/locks")
+        .join(format!("{slice_id}.lock"));
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for planned_work in [
+            vec![
+                PlannedWork::new("work-concurrent-a1", "A1"),
+                PlannedWork::new("work-concurrent-a2", "A2"),
+            ],
+            vec![
+                PlannedWork::new("work-concurrent-b1", "B1"),
+                PlannedWork::new("work-concurrent-b2", "B2"),
+            ],
+        ] {
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            let project_root = checkout.path().to_path_buf();
+            scope.spawn(move || {
+                barrier.wait();
+                let result = WorkControl::new(project_root)
+                    .approve_plan(slice_id, "U1", &planned_work)
+                    .map(|report| report.work_item_ids)
+                    .map_err(|error| error.to_string());
+                sender.send(result).unwrap();
+            });
+        }
+        drop(sender);
+        barrier.wait();
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            "both approvals must wait for the shared Slice transaction lock"
+        );
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    });
+
+    let outcomes = receiver.into_iter().collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 2);
+    let approved = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().ok())
+        .expect("one approval must win");
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert!(
+        outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .any(|error| error.contains("already has a different approved plan"))
+    );
+
+    let stored = WorkControl::new(checkout.path())
+        .slice(slice_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&stored.work_item_ids, approved);
+    let work_ids = WorkModelStore::new(checkout.path())
+        .list_work_items()
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    assert_eq!(&work_ids, approved);
 }
 
 #[test]
