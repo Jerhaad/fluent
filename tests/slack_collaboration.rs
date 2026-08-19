@@ -2696,6 +2696,15 @@ fn code_reference_rejects_directory_targets() {
 }
 
 #[test]
+fn code_reference_rejects_missing_target_without_host_path() {
+    let (_home, checkout, config) = setup(true);
+    let missing = checkout.path().join("missing.rs");
+    let error = format_code_reference(&config.projects["app"].checkout, &missing, 1).unwrap_err();
+    assert!(error.to_string().contains("canonicalize referenced code"));
+    assert!(!error.to_string().contains(&missing.display().to_string()));
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
