@@ -6560,6 +6560,19 @@ fn approved_plan_creates_reported_work_without_execution() {
 
 #[test]
 fn plan_approval_resumes_after_partial_materialization() {
+    #[derive(Default)]
+    struct RecordingScheduler {
+        requests: std::cell::RefCell<Vec<String>>,
+    }
+    impl WorkScheduler for RecordingScheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            self.requests.borrow_mut().push(request.id.clone());
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
     let (_home, checkout, _config) = setup(true);
     let control = WorkControl::new(checkout.path());
     let store = fluent::work_model::WorkModelStore::new(checkout.path());
@@ -6602,6 +6615,19 @@ fn plan_approval_resumes_after_partial_materialization() {
         .unwrap();
     assert_eq!(first_report.len(), 1);
     assert_eq!(first_report[0].work_item_id, "work-retry-first");
+    let scheduler = RecordingScheduler::default();
+    let authorization_error = control
+        .authorize_execution("slice-retry-plan", "U1", &scheduler)
+        .unwrap_err();
+    assert!(
+        authorization_error
+            .to_string()
+            .contains("still materializing its planned Work")
+    );
+    assert!(scheduler.requests.borrow().is_empty());
+    let gated_first = store.read_work_item("work-retry-first").unwrap();
+    assert!(gated_first.authorization.is_proposed());
+    assert_eq!(gated_first.transitions, first.transitions);
     let changed_retry = control
         .approve_plan(
             "slice-retry-plan",
