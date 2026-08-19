@@ -701,7 +701,9 @@ impl ConversationProvider for CodexAppServerProvider {
             serde_json::json!({
                 "threadId": session,
                 "clientUserMessageId": action_id,
-                "input": [{"type": "text", "text": format!("Slack user {actor}: {contribution}")}],
+                "input": [{"type": "text", "text": format!(
+                    "Slack user {actor}: {contribution}\n\nReturn exactly one JSON object. Use {{\"type\":\"message\",\"text\":\"...\"}} for a conversational reply. When you complete or revise a planning artifact, use {{\"type\":\"planning_artifact\",\"kind\":\"brief|behaviors|approach|plan\",\"markdown\":\"...\"}} with the complete Markdown."
+                )}],
             }),
         )?;
         let turn_id = result["turn"]["id"]

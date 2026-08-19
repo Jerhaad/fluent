@@ -68,13 +68,28 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .store
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
+        self.present_planning_artifact_for_thread(&mut thread, kind, markdown)
+    }
+
+    fn present_planning_artifact_for_thread(
+        &mut self,
+        thread: &mut FluentThread,
+        kind: &str,
+        markdown: &str,
+    ) -> Result<ArtifactRevision> {
         if let Some(work_item_id) = thread.linked_work.as_deref() {
             WorkModelStore::new(&self.bound_project(&thread)?.checkout.path)
                 .read_work_item(work_item_id)?
                 .ensure_planning_revision_can_advance(kind)?;
         }
         let revision = ArtifactRevision::new(kind, markdown);
-        thread.artifact_revisions.push(revision.clone());
+        if !thread
+            .artifact_revisions
+            .iter()
+            .any(|existing| existing.id == revision.id)
+        {
+            thread.artifact_revisions.push(revision.clone());
+        }
         thread.pending_artifact_revision = Some(revision.id.clone());
         thread.planning_stage = Some(revision.kind.clone());
         thread.pending_question = Some(format!(
@@ -706,20 +721,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("provider turn completed without a reply")?;
         let raw_reply = redact_secrets(&raw_reply);
-        let reply = if previously_completed {
-            raw_reply
-        } else if turn.starts_session {
-            format!(
-                "Bound to {}.\n{}",
-                safe_identity(self.bound_project(thread)?),
-                raw_reply
-            )
-        } else {
-            raw_reply
-        };
-        turn.completed_reply = Some(reply.clone());
+        let output = serde_json::from_str::<ProviderOutput>(&raw_reply).unwrap_or_else(|_| {
+            ProviderOutput::Message {
+                text: raw_reply.clone(),
+            }
+        });
         let accepted_contribution = turn.contribution.clone();
-        thread.pending_turn = Some(turn);
         if !thread
             .conversation_inputs
             .iter()
@@ -734,10 +741,35 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 source_deleted: false,
             });
         }
-        self.store.save_thread(&self.config, thread)?;
-        self.queue_reply(event, &reply)?;
-        thread.pending_turn = None;
-        self.store.save_thread(&self.config, thread)
+        match output {
+            ProviderOutput::Message { text } => {
+                let reply = if previously_completed {
+                    text
+                } else if turn.starts_session {
+                    format!(
+                        "Bound to {}.\n{}",
+                        safe_identity(self.bound_project(thread)?),
+                        text
+                    )
+                } else {
+                    text
+                };
+                turn.completed_reply = Some(reply.clone());
+                thread.pending_turn = Some(turn);
+                self.store.save_thread(&self.config, thread)?;
+                self.queue_reply(event, &reply)?;
+                thread.pending_turn = None;
+                self.store.save_thread(&self.config, thread)
+            }
+            ProviderOutput::PlanningArtifact { kind, markdown } => {
+                turn.completed_reply = Some(raw_reply);
+                thread.pending_turn = Some(turn);
+                self.store.save_thread(&self.config, thread)?;
+                self.present_planning_artifact_for_thread(thread, &kind, &markdown)?;
+                thread.pending_turn = None;
+                self.store.save_thread(&self.config, thread)
+            }
+        }
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let label = thread

@@ -166,6 +166,15 @@ pub enum ProviderEvent {
     Interrupted,
 }
 
+/// Structured result returned by a provider turn. Plain-text provider replies
+/// remain compatible and are interpreted as messages by the coordinator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderOutput {
+    Message { text: String },
+    PlanningArtifact { kind: String, markdown: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderTurnRecovery {
     Missing,

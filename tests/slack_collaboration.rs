@@ -103,6 +103,95 @@ fn planning_artifact_renders_exact_revision_in_thread() {
 }
 
 #[test]
+fn provider_planning_output_is_presented_for_approval() {
+    #[derive(Default)]
+    struct PlanningProvider;
+
+    impl ConversationProvider for PlanningProvider {
+        fn start(
+            &mut self,
+            _action_id: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<(String, String)> {
+            Ok((
+                "session-1".into(),
+                serde_json::json!({
+                    "type": "planning_artifact",
+                    "kind": "brief",
+                    "markdown": "# Brief\n\nBuild the requested change.\n"
+                })
+                .to_string(),
+            ))
+        }
+
+        fn resume(
+            &mut self,
+            _action_id: &str,
+            _session: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!("the first planning turn starts a provider session")
+        }
+    }
+
+    let (home, checkout, config) = setup(true);
+    WorkModelStore::new(checkout.path())
+        .create_work_item(&WorkItem::planned("work-1", "Plan from Slack"))
+        .unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        PlanningProvider,
+        InMemorySlack::default(),
+    );
+
+    runner
+        .ingest(event(
+            "E1",
+            None,
+            "@Fluent work-item:work-1 draft the Brief",
+        ))
+        .unwrap();
+
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    let revision = thread.artifact_revisions.last().unwrap();
+    assert_eq!(revision.kind, "brief");
+    assert_eq!(
+        revision.markdown,
+        "# Brief\n\nBuild the requested change.\n"
+    );
+    assert_eq!(
+        thread.pending_artifact_revision.as_deref(),
+        Some(revision.id.as_str())
+    );
+    assert_eq!(
+        thread.pending_question.as_deref(),
+        Some(format!("approve brief revision {}", revision.id).as_str())
+    );
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.id.contains(":artifact:brief:"))
+    );
+    assert!(
+        WorkModelStore::new(checkout.path())
+            .read_work_item("work-1")
+            .unwrap()
+            .planning_context
+            .is_none()
+    );
+}
+
+#[test]
 fn same_markdown_planning_stages_use_distinct_delivery_ids() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
@@ -2121,6 +2210,10 @@ fn codex_app_server_provider_exchanges_a_stable_turn() {
         .unwrap();
     assert_eq!(turn["params"]["clientUserMessageId"], "action-1");
     assert_eq!(turn["params"]["threadId"], "thread-1");
+    let input = turn["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(input.contains("Slack user U1: hello"));
+    assert!(input.contains(r#""type":"planning_artifact""#));
+    assert!(input.contains("complete Markdown"));
 }
 
 #[test]
