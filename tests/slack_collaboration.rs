@@ -3604,6 +3604,30 @@ fn async_provider_login_recovery_rechecks_scope_before_resuming() {
         "{}",
         String::from_utf8_lossy(&authenticated.stderr)
     );
+    let mut revoked = config.clone();
+    let project = revoked.projects.get_mut("app").unwrap();
+    project.default_provider = "claude".into();
+    project.enabled_providers = BTreeSet::from(["claude".into()]);
+    write_config(home.path(), &revoked).unwrap();
+    assert!(
+        runner
+            .drive_once(std::time::Duration::from_millis(1))
+            .unwrap_err()
+            .to_string()
+            .contains("no longer enabled")
+    );
+    assert_eq!(preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(turns.load(Ordering::SeqCst), 0);
+    let paused = FileCollaborationStore::new(home.path())
+        .load_thread(&revoked, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        paused.pending_turn.unwrap().dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+
+    write_config(home.path(), &config).unwrap();
     runner
         .drive_once(std::time::Duration::from_millis(1))
         .unwrap();
@@ -4227,6 +4251,80 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             .dispatch_state,
         PendingTurnDispatchState::RateLimitedUntilDeadline
     );
+}
+
+#[test]
+fn rate_limit_retry_rechecks_provider_policy_before_dispatch() {
+    #[derive(Clone)]
+    struct RateLimitedProvider {
+        attempts: Arc<AtomicUsize>,
+    }
+    impl ConversationProvider for RateLimitedProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::new(
+                ProviderFailure::RateLimited {
+                    retry_after_seconds: 17,
+                },
+                "provider rate limit; retry-after=17",
+            ))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+    }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        RateLimitedProvider {
+            attempts: attempts.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.set_clock_for_test(|| 1_000);
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner.wait_for_completion().unwrap();
+
+    let mut revoked = config.clone();
+    let project = revoked.projects.get_mut("app").unwrap();
+    project.default_provider = "claude".into();
+    project.enabled_providers = BTreeSet::from(["claude".into()]);
+    write_config(home.path(), &revoked).unwrap();
+    assert!(
+        runner
+            .wake_due_retries(1_017)
+            .unwrap_err()
+            .to_string()
+            .contains("no longer enabled")
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let paused = FileCollaborationStore::new(home.path())
+        .load_thread(&revoked, "1.0")
+        .unwrap()
+        .unwrap()
+        .pending_turn
+        .unwrap();
+    assert_eq!(
+        paused.dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    assert_eq!(paused.retry_at_unix_seconds, None);
 }
 
 #[test]

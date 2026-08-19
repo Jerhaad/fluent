@@ -399,6 +399,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     /// Recheck the selected provider after the runner owner completes its
     /// scoped login flow, then resume the preserved turn.
     pub fn resume_after_provider_login(&mut self, thread_id: &str) -> Result<()> {
+        self.config = self.current_authority_config()?;
         let mut thread = self
             .store
             .load_thread(&self.config, thread_id)?
@@ -453,11 +454,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         ) {
             bail!("provider failure requires a different recovery action");
         }
-        let selected = thread
-            .provider
-            .as_deref()
-            .context("thread has no selected provider")?;
-        self.provider.select(selected)?;
+        let selected = self.authorized_thread_provider(thread)?;
+        self.provider.select(&selected)?;
         let checkout = self.bound_project(thread)?.checkout.path.clone();
         let scope = ProviderScope {
             slice_draft: checkout.join(".fluent/work/slack/drafts").join(&thread.id),
@@ -1130,11 +1128,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("thread has no pending provider turn")?;
         let original_turn = turn.clone();
-        let selected_provider = thread
-            .provider
-            .as_deref()
-            .context("thread has no selected provider")?;
-        if let Err(error) = self.provider.select(selected_provider) {
+        let selected_provider = self.authorized_thread_provider(thread)?;
+        if let Err(error) = self.provider.select(&selected_provider) {
             return self.preserve_provider_failure(event, thread, error);
         }
         let previously_completed = turn.completed_reply.is_some();
@@ -1443,19 +1438,41 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         self.store.save_thread(&self.config, thread)
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
-        let label = thread
-            .project_label
-            .as_deref()
-            .context("thread is unbound")?;
-        let project = self
-            .config
-            .projects
-            .get(label)
-            .context("thread project no longer configured")?;
+        let project = self.configured_bound_project(thread)?;
         if !checkout_is_available(&project.checkout) {
             bail!("bound checkout is unavailable; provider access stopped without rebinding");
         }
         Ok(project)
+    }
+    fn configured_bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
+        let label = thread
+            .project_label
+            .as_deref()
+            .context("thread is unbound")?;
+        self.config
+            .projects
+            .get(label)
+            .context("thread project no longer configured")
+    }
+    fn authorized_thread_provider(&self, thread: &mut FluentThread) -> Result<String> {
+        let provider = thread
+            .provider
+            .as_deref()
+            .context("thread has no selected provider")?
+            .to_owned();
+        if !self
+            .configured_bound_project(thread)?
+            .enabled_providers
+            .contains(&provider)
+        {
+            if let Some(turn) = thread.pending_turn.as_mut() {
+                turn.dispatch_state = PendingTurnDispatchState::PausedForRecovery;
+                turn.retry_at_unix_seconds = None;
+            }
+            self.store.save_thread(&self.config, thread)?;
+            bail!("thread provider is no longer enabled for the bound project");
+        }
+        Ok(provider)
     }
     fn queue_reply(&self, event: &InboundEnvelope, text: &str) -> Result<()> {
         let delivery = OutboundDelivery {
@@ -1601,6 +1618,7 @@ where
     }
 
     pub fn resume_after_provider_login(&mut self, thread_id: &str) -> Result<()> {
+        self.runner.config = self.runner.current_authority_config()?;
         let mut thread = self
             .runner
             .store
@@ -1724,7 +1742,8 @@ where
     }
 
     fn dispatch_if_ready(&mut self, thread_id: &str) -> Result<()> {
-        let Some(thread) = self
+        self.runner.config = self.runner.current_authority_config()?;
+        let Some(mut thread) = self
             .runner
             .store
             .load_thread(&self.runner.config, thread_id)?
@@ -1738,6 +1757,9 @@ where
             .provider_failure
             .as_ref()
             .is_some_and(|failure| !matches!(failure, ProviderFailure::RateLimited { .. }));
+        if ready {
+            self.runner.authorized_thread_provider(&mut thread)?;
+        }
         if ready && self.pool.request(thread_id) {
             if let Err(error) = self.mark_in_flight(thread) {
                 self.pool.finish(thread_id);
