@@ -127,8 +127,16 @@ pub struct InitializationReview {
     pub expected_head: String,
     pub expected_index_sha256: String,
     pub preexisting_status: String,
+    pub preexisting_paths: Vec<String>,
     pub generated_changes: Vec<InitGeneratedChange>,
     pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitializationCommit {
+    pub commit: String,
+    pub slack_approver: String,
+    pub reviewed_revision: String,
 }
 
 /// Existing configured-initialization boundary used by Slack setup. Its
@@ -252,6 +260,7 @@ pub fn approve_slack_project_setup(
         &["status", "--porcelain=v1", "--untracked-files=all"],
         "record pre-existing checkout changes",
     )?;
+    let preexisting_paths = preexisting_paths(&entry.path)?;
     match boundary.initialize(&entry.path, &proposal.choices) {
         Ok(report) => {
             let after = snapshot_checkout(&entry.path)?;
@@ -261,6 +270,7 @@ pub fn approve_slack_project_setup(
                 expected_head,
                 expected_index_sha256,
                 preexisting_status,
+                preexisting_paths,
                 generated_changes,
                 revision: String::new(),
             };
@@ -278,6 +288,169 @@ pub fn approve_slack_project_setup(
             })
         }
     }
+}
+
+pub fn commit_reviewed_initialization(
+    current_index: &ProjectDiscoveryIndex,
+    selection_id: &str,
+    review: &InitializationReview,
+    reviewed_revision: &str,
+    actor: &str,
+) -> Result<InitializationCommit> {
+    let entry = current_index
+        .entry(selection_id)
+        .context("selected checkout is no longer available")?;
+    if !entry.approvers.contains(actor) {
+        anyhow::bail!("current project authority does not permit the initialization commit")
+    }
+    let mut exact_review = review.clone();
+    exact_review.revision.clear();
+    let actual_revision = format!(
+        "init-review-v1:{:x}",
+        Sha256::digest(serde_json::to_vec(&exact_review)?)
+    );
+    if reviewed_revision != review.revision || actual_revision != review.revision {
+        anyhow::bail!("initialization commit approval is stale; review the exact changes again")
+    }
+    if checkout_identity(&entry.path)? != entry.identity {
+        anyhow::bail!("selected checkout identity changed; resolve the checkout locally")
+    }
+    let head = crate::git::run_stdout(
+        &entry.path,
+        &["rev-parse", "HEAD"],
+        "revalidate initialization HEAD",
+    )?;
+    if head != review.expected_head {
+        anyhow::bail!("checkout HEAD changed; resolve the checkout locally")
+    }
+    if index_sha256(&entry.path)? != review.expected_index_sha256 {
+        anyhow::bail!("checkout index changed; resolve the checkout locally")
+    }
+    let current = snapshot_checkout(&entry.path)?;
+    for change in &review.generated_changes {
+        let path = PathBuf::from(&change.path);
+        if review.preexisting_paths.contains(&change.path) {
+            anyhow::bail!(
+                "initialization overlaps pre-existing change {}; resolve the checkout locally",
+                change.path
+            )
+        }
+        if current.get(&path).cloned() != change.after {
+            anyhow::bail!(
+                "reviewed initialization bytes changed at {}; resolve the checkout locally",
+                change.path
+            )
+        }
+    }
+    if review.generated_changes.is_empty() {
+        anyhow::bail!("initialization produced no changes to commit")
+    }
+
+    let temporary = tempfile::tempdir().context("create temporary initialization index")?;
+    let temporary_index = temporary.path().join("index");
+    let environment = ("GIT_INDEX_FILE", temporary_index.as_path());
+    crate::git::run_stdout_with_env(
+        &entry.path,
+        &["read-tree", &review.expected_head],
+        environment,
+        "seed temporary initialization index",
+    )?;
+    for change in &review.generated_changes {
+        match &change.after {
+            Some(bytes) => {
+                let blob = crate::git::run_stdout_with_stdin_and_env(
+                    &entry.path,
+                    &["hash-object", "-w", "--stdin"],
+                    bytes,
+                    environment,
+                    "write reviewed initialization blob",
+                )?;
+                crate::git::run_stdout_with_env(
+                    &entry.path,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "100644",
+                        &blob,
+                        &change.path,
+                    ],
+                    environment,
+                    "add reviewed initialization blob",
+                )?;
+            }
+            None => {
+                crate::git::run_stdout_with_env(
+                    &entry.path,
+                    &["update-index", "--force-remove", "--", &change.path],
+                    environment,
+                    "remove reviewed initialization path",
+                )?;
+            }
+        }
+    }
+    let tree = crate::git::run_stdout_with_env(
+        &entry.path,
+        &["write-tree"],
+        environment,
+        "write exact initialization tree",
+    )?;
+    let commit = crate::git::run_stdout(
+        &entry.path,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &review.expected_head,
+            "-m",
+            "Initialize Fluent",
+        ],
+        "create initialization commit",
+    )?;
+    let reference = crate::git::run_stdout(
+        &entry.path,
+        &["symbolic-ref", "-q", "HEAD"],
+        "resolve initialization branch",
+    )?;
+    crate::git::run(
+        &entry.path,
+        &["update-ref", &reference, &commit, &review.expected_head],
+        "advance initialization branch with compare-and-swap",
+    )?;
+    Ok(InitializationCommit {
+        commit,
+        slack_approver: actor.into(),
+        reviewed_revision: review.revision.clone(),
+    })
+}
+
+fn preexisting_paths(checkout: &Path) -> Result<Vec<String>> {
+    let output = crate::git::run_raw(
+        checkout,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !output.status.success() {
+        anyhow::bail!("git status failed while recording pre-existing paths")
+    }
+    let mut paths = Vec::new();
+    let mut fields = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty());
+    while let Some(field) = fields.next() {
+        let field = String::from_utf8(field.to_vec()).context("Git returned a non-UTF-8 path")?;
+        let status = field.get(..2).unwrap_or_default();
+        let path = field
+            .get(3..)
+            .context("Git returned malformed porcelain status")?;
+        paths.push(path.to_owned());
+        if status.starts_with('R') || status.starts_with('C') {
+            let _ = fields.next();
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 fn snapshot_checkout(checkout: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {

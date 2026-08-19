@@ -421,6 +421,231 @@ fn successful_slack_init_separates_and_offers_generated_changes() {
     );
 }
 
+fn initialized_review(checkout: &std::path::Path) -> (ProjectDiscoveryIndex, InitializationReview) {
+    struct Boundary;
+    impl ConfiguredInitBoundary for Boundary {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            fs::create_dir(checkout.join(".fluent"))?;
+            fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "initialized".into(),
+            })
+        }
+    }
+    let index = discovery_for_checkout(checkout, &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &index,
+        &index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+    let SlackSetupOutcome::Initialized(review) =
+        approve_slack_project_setup(&index, &proposal, &proposal.revision, "U1", &mut Boundary)
+            .unwrap()
+    else {
+        panic!("expected initialization review")
+    };
+    (index, review)
+}
+
+#[test]
+fn approved_init_commit_uses_exact_generated_changes_and_git_identity() {
+    let checkout = TempDir::new().unwrap();
+    let (_, parent) = initialize_checkout(checkout.path());
+    fs::write(checkout.path().join("README"), "user staged edit").unwrap();
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["add", "README"])
+        .status()
+        .unwrap();
+    fs::write(checkout.path().join("notes.txt"), "untracked user work").unwrap();
+    let (index, review) = initialized_review(checkout.path());
+    let selection = index.offers()[0].selection_id.clone();
+    let git_dir = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .unwrap();
+    let ordinary_index =
+        std::path::PathBuf::from(String::from_utf8(git_dir.stdout).unwrap().trim()).join("index");
+    let index_before = fs::read(&ordinary_index).unwrap();
+
+    let committed =
+        commit_reviewed_initialization(&index, &selection, &review, &review.revision, "U1")
+            .unwrap();
+
+    assert_eq!(committed.slack_approver, "U1");
+    assert_eq!(fs::read(&ordinary_index).unwrap(), index_before);
+    let parent_after = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD^"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(parent_after.stdout).unwrap().trim(),
+        parent
+    );
+    let tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
+        .output()
+        .unwrap();
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    assert!(tree.contains(".fluent/config.yaml"));
+    assert!(tree.contains("README"));
+    assert!(!tree.contains("notes.txt"));
+    let author = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["show", "-s", "--format=%an <%ae>", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(author.stdout).unwrap().trim(),
+        "Fluent test <test@example.invalid>"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("README")).unwrap(),
+        "user staged edit"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("notes.txt")).unwrap(),
+        "untracked user work"
+    );
+}
+
+#[test]
+fn init_commit_rejects_overlap_or_changed_reviewed_bytes() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let (index, review) = initialized_review(checkout.path());
+    let selection = index.offers()[0].selection_id.clone();
+    fs::write(
+        checkout.path().join(".fluent/config.yaml"),
+        "changed after review\n",
+    )
+    .unwrap();
+    let head_before = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+
+    let error = commit_reviewed_initialization(&index, &selection, &review, &review.revision, "U1")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("reviewed initialization bytes changed")
+    );
+    let head_after = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(head_after, head_before);
+    assert_eq!(
+        fs::read_to_string(checkout.path().join(".fluent/config.yaml")).unwrap(),
+        "changed after review\n"
+    );
+
+    struct OverlapBoundary;
+    impl ConfiguredInitBoundary for OverlapBoundary {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            fs::write(checkout.join("AGENTS.md"), "initialization replacement\n")?;
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "initialized".into(),
+            })
+        }
+    }
+    let overlap = TempDir::new().unwrap();
+    initialize_checkout(overlap.path());
+    fs::write(overlap.path().join("AGENTS.md"), "pre-existing user work\n").unwrap();
+    let overlap_index = discovery_for_checkout(overlap.path(), &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &overlap_index,
+        &overlap_index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+    let SlackSetupOutcome::Initialized(overlap_review) = approve_slack_project_setup(
+        &overlap_index,
+        &proposal,
+        &proposal.revision,
+        "U1",
+        &mut OverlapBoundary,
+    )
+    .unwrap() else {
+        panic!("expected overlap review")
+    };
+    let overlap_error = commit_reviewed_initialization(
+        &overlap_index,
+        &proposal.selection_id,
+        &overlap_review,
+        &overlap_review.revision,
+        "U1",
+    )
+    .unwrap_err();
+    assert!(overlap_error.to_string().contains("overlaps pre-existing"));
+
+    let head_race = TempDir::new().unwrap();
+    initialize_checkout(head_race.path());
+    let (head_index, head_review) = initialized_review(head_race.path());
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(head_race.path())
+        .args(["commit", "--allow-empty", "-m", "race"])
+        .status()
+        .unwrap();
+    let error = commit_reviewed_initialization(
+        &head_index,
+        &head_index.offers()[0].selection_id,
+        &head_review,
+        &head_review.revision,
+        "U1",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("HEAD changed"));
+
+    let index_race = TempDir::new().unwrap();
+    initialize_checkout(index_race.path());
+    let (race_index, race_review) = initialized_review(index_race.path());
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(index_race.path())
+        .args(["add", ".fluent/config.yaml"])
+        .status()
+        .unwrap();
+    let error = commit_reviewed_initialization(
+        &race_index,
+        &race_index.offers()[0].selection_id,
+        &race_review,
+        &race_review.revision,
+        "U1",
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("index changed"));
+}
+
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     fn collect(
         root: &std::path::Path,

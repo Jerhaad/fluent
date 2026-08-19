@@ -105,6 +105,63 @@ pub fn run_stdout(cwd: &Path, args: &[&str], action: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run Git with one host-owned environment override through the central
+/// non-interactive command boundary.
+pub fn run_stdout_with_env(
+    cwd: &Path,
+    args: &[&str],
+    environment: (&str, &Path),
+    action: &str,
+) -> Result<String> {
+    let output = run_with_lock_retry(|| {
+        let mut command = build_command(cwd, args);
+        command.env(environment.0, environment.1);
+        command
+    })?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed (exit {}) while {action}\n  cwd: {}\n{}",
+            args.join(" "),
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn run_stdout_with_stdin_and_env(
+    cwd: &Path,
+    args: &[&str],
+    input: &[u8],
+    environment: (&str, &Path),
+    action: &str,
+) -> Result<String> {
+    let mut command = build_command(cwd, args);
+    command
+        .env(environment.0, environment.1)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("Failed to invoke git")?;
+    child
+        .stdin
+        .take()
+        .context("Failed to open git stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output().context("Failed to wait for git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed (exit {}) while {action}\n  cwd: {}\n{}",
+            args.join(" "),
+            exit_code_display(&output),
+            cwd.display(),
+            format_output(&output)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Run `git <args>` in `cwd`, return the raw `Output`.
 pub fn run_raw(cwd: &Path, args: &[&str]) -> Result<Output> {
     run_with_lock_retry(|| build_command(cwd, args))
