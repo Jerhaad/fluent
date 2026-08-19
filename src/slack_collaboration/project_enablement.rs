@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::checkout_identity;
+use super::{
+    Checkout, CollaborationStore, ConfiguredProject, FileCollaborationStore, FluentThread,
+    RunnerConfig, ThreadState, write_config,
+};
 use crate::setup::{ConfiguredSetup, InitSetupInputs};
 
 /// One runner-owner-approved directory that may contain project checkouts.
@@ -34,6 +38,7 @@ struct DiscoveredCheckout {
     path: PathBuf,
     identity: String,
     approvers: BTreeSet<String>,
+    allowed_participants: BTreeSet<String>,
 }
 
 /// A point-in-time, owner-bounded discovery result. Public offers contain no
@@ -589,6 +594,7 @@ pub fn discover_project_checkouts(
                         path: canonical.clone(),
                         identity,
                         approvers: root.project_approvers.clone(),
+                        allowed_participants: root.allowed_participants.clone(),
                     },
                 );
             }
@@ -612,6 +618,88 @@ pub fn discover_project_checkouts(
         }
     }
     Ok(index)
+}
+
+/// Publish the committed checkout to the runner registry and promote the
+/// original setup thread when it also carried a product goal.
+pub fn complete_project_enablement(
+    home: &Path,
+    config: &mut RunnerConfig,
+    current_index: &ProjectDiscoveryIndex,
+    selection_id: &str,
+    committed: &InitializationCommit,
+    thread: &mut FluentThread,
+    original_goal: Option<&str>,
+) -> Result<()> {
+    let entry = current_index
+        .entry(selection_id)
+        .context("selected checkout is no longer available")?;
+    if !entry.approvers.contains(&committed.slack_approver) {
+        anyhow::bail!("initialization commit approver no longer has project authority")
+    }
+    let head = crate::git::run_stdout(
+        &entry.path,
+        &["rev-parse", "HEAD"],
+        "verify committed initialization",
+    )?;
+    if head != committed.commit || !entry.path.join(".fluent").is_dir() {
+        anyhow::bail!("reviewed initialization is not the checkout's current commit")
+    }
+    let branch = crate::git::run_stdout(
+        &entry.path,
+        &["branch", "--show-current"],
+        "record enabled checkout branch",
+    )?;
+    let default_provider = if config.enabled_providers.contains("codex") {
+        "codex".to_owned()
+    } else {
+        config
+            .enabled_providers
+            .iter()
+            .next()
+            .context("Slack runner has no enabled conversation provider")?
+            .clone()
+    };
+    config.projects.insert(
+        entry.offer.project_label.clone(),
+        ConfiguredProject {
+            label: entry.offer.project_label.clone(),
+            checkout: Checkout {
+                label: entry.offer.checkout_label.clone(),
+                path: entry.path.clone(),
+                identity: checkout_identity(&entry.path)?,
+                branch,
+                commit: committed.commit.clone(),
+            },
+            allowed_participants: entry.allowed_participants.clone(),
+            default_provider: default_provider.clone(),
+            enabled_providers: BTreeSet::from([default_provider.clone()]),
+            project_approvers: entry.approvers.clone(),
+            github_remote: None,
+        },
+    );
+    write_config(home, config)?;
+
+    thread.state = ThreadState::Active;
+    thread.project_label = Some(entry.offer.project_label.clone());
+    thread.provider = Some(default_provider);
+    thread.pending_question = None;
+    if let Some(goal) = original_goal.filter(|goal| !goal.trim().is_empty()) {
+        thread.slice = Some(format!("slack-{}", thread.id.replace('.', "-")));
+        thread.planning_stage = Some("brief".into());
+        thread.conversation_inputs.push(super::ConversationInput {
+            event_id: format!("setup-goal:{}", committed.commit),
+            source_timestamp: thread.id.clone(),
+            actor: committed.slack_approver.clone(),
+            content: goal.to_owned(),
+            corrections: Vec::new(),
+            source_deleted: false,
+        });
+    } else {
+        thread.slice = None;
+        thread.planning_stage = None;
+    }
+    FileCollaborationStore::new(home).save_thread(config, thread)
 }
 
 fn git_root_is_exact(path: &Path) -> bool {

@@ -646,6 +646,126 @@ fn init_commit_rejects_overlap_or_changed_reviewed_bytes() {
     assert!(error.to_string().contains("index changed"));
 }
 
+fn committed_setup_fixture() -> (
+    TempDir,
+    TempDir,
+    RunnerConfig,
+    ProjectDiscoveryIndex,
+    InitializationCommit,
+    FluentThread,
+) {
+    let (home, _existing, config) = setup(false);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("SETUP1", None, "@Fluent enable a project"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    let config = runner.config;
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let (index, review) = initialized_review(checkout.path());
+    let committed = commit_reviewed_initialization(
+        &index,
+        &index.offers()[0].selection_id,
+        &review,
+        &review.revision,
+        "U1",
+    )
+    .unwrap();
+    (home, checkout, config, index, committed, thread)
+}
+
+#[test]
+fn committed_initialization_enables_checkout_for_slack_binding() {
+    let (home, checkout, mut config, index, committed, mut thread) = committed_setup_fixture();
+    let selection = index.offers()[0].selection_id.clone();
+
+    complete_project_enablement(
+        home.path(),
+        &mut config,
+        &index,
+        &selection,
+        &committed,
+        &mut thread,
+        None,
+    )
+    .unwrap();
+
+    let reloaded = read_config(home.path()).unwrap();
+    let enabled = reloaded.projects.get("app").unwrap();
+    assert_eq!(
+        enabled.checkout.path,
+        checkout.path().canonicalize().unwrap()
+    );
+    assert_eq!(enabled.checkout.commit, committed.commit);
+    assert!(checkout_is_available(&enabled.checkout));
+    let rebound = FileCollaborationStore::new(home.path())
+        .load_thread(&reloaded, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebound.project_label.as_deref(), Some("app"));
+    assert_eq!(rebound.state, ThreadState::Active);
+}
+
+#[test]
+fn enablement_with_goal_promotes_setup_thread_to_first_slice() {
+    let (home, _checkout, mut config, index, committed, mut thread) = committed_setup_fixture();
+    let history_before = thread.conversation.clone();
+
+    complete_project_enablement(
+        home.path(),
+        &mut config,
+        &index,
+        &index.offers()[0].selection_id,
+        &committed,
+        &mut thread,
+        Some("Add audit logging to payments"),
+    )
+    .unwrap();
+
+    assert_eq!(thread.conversation, history_before);
+    assert!(
+        thread
+            .slice
+            .as_deref()
+            .is_some_and(|slice| slice.starts_with("slack-"))
+    );
+    assert_eq!(thread.planning_stage.as_deref(), Some("brief"));
+    assert_eq!(
+        thread.conversation_inputs.last().unwrap().content,
+        "Add audit logging to payments"
+    );
+}
+
+#[test]
+fn enablement_only_request_creates_no_slice() {
+    let (home, _checkout, mut config, index, committed, mut thread) = committed_setup_fixture();
+
+    complete_project_enablement(
+        home.path(),
+        &mut config,
+        &index,
+        &index.offers()[0].selection_id,
+        &committed,
+        &mut thread,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(thread.state, ThreadState::Active);
+    assert!(thread.slice.is_none());
+    assert!(thread.planning_stage.is_none());
+    assert!(thread.conversation_inputs.is_empty());
+}
+
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     fn collect(
         root: &std::path::Path,
