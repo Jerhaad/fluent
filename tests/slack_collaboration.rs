@@ -2727,7 +2727,13 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
         calls: calls.clone(),
         gate: gate.clone(),
     };
-    let (home, _checkout, config) = setup(true);
+    let (home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
     let mut runner =
         AsyncCollaborationRunner::new(home.path(), config, provider, InMemorySlack::default(), 1);
     runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
@@ -2741,9 +2747,9 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
     runner
         .ingest(event("E2", Some("1.0"), "first queued"))
         .unwrap();
-    runner
-        .ingest(event("E3", Some("1.0"), "second queued"))
-        .unwrap();
+    let mut second = event("E3", Some("1.0"), "second queued");
+    second.user = "U2".into();
+    runner.ingest(second).unwrap();
     {
         let (lock, changed) = &*gate;
         let mut state = lock.lock().unwrap();
@@ -2777,7 +2783,7 @@ fn queued_replies_form_one_ordered_attributed_turn() {
     let (calls, _) = queued_runner_scenario();
     assert_eq!(
         calls.last().unwrap(),
-        "Slack user U1: first queued\nSlack user U1: second queued"
+        "Slack user U1: first queued\nSlack user U2: second queued"
     );
 }
 
@@ -3466,10 +3472,9 @@ fn provider_reference_failure_preserves_typed_state_and_pending_turn() {
         thread.provider_failure,
         Some(ProviderFailure::IncompatibleProtocol)
     );
-    assert_eq!(
-        thread.pending_turn.unwrap().contribution,
-        "@Fluent inspect code"
-    );
+    let pending = thread.pending_turn.unwrap();
+    assert_eq!(pending.contribution, "@Fluent inspect code");
+    assert!(pending.provider_turn_id.is_some());
     assert!(
         runner.slack().deliveries[0]
             .text
@@ -4009,7 +4014,7 @@ fn code_question_posts_provider_reference_in_slack_thread() {
 }
 
 #[test]
-fn code_question_rejects_provider_reference_outside_bound_checkout() {
+fn malformed_provider_reference_preserves_typed_state_and_pending_turn() {
     struct EscapingProvider;
     impl ConversationProvider for EscapingProvider {
         fn start(
@@ -4049,11 +4054,150 @@ fn code_question_rejects_provider_reference_outside_bound_checkout() {
         EscapingProvider,
         InMemorySlack::default(),
     );
-    let error = runner
+    runner
         .ingest(event("E1", None, "@Fluent inspect code"))
-        .unwrap_err();
-    assert!(error.to_string().contains("outside the bound checkout"));
-    assert!(runner.slack().deliveries.is_empty());
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::IncompatibleProtocol)
+    );
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "@Fluent inspect code"
+    );
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("protocol is incompatible")
+    );
+}
+
+#[test]
+fn unformattable_provider_reference_preserves_typed_state_and_pending_turn() {
+    struct MissingReferenceProvider;
+    impl ConversationProvider for MissingReferenceProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            Ok(("session".into(), "answer".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+        fn code_references(
+            &mut self,
+            _: &ProviderScope,
+            _: &str,
+        ) -> ProviderResult<Vec<CodeReference>> {
+            Ok(vec![CodeReference {
+                path: "missing.rs".into(),
+                line: 1,
+            }])
+        }
+    }
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        MissingReferenceProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent inspect missing code"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::IncompatibleProtocol)
+    );
+    let pending = thread.pending_turn.unwrap();
+    assert_eq!(pending.contribution, "@Fluent inspect missing code");
+    assert!(pending.provider_turn_id.is_some());
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("protocol is incompatible")
+    );
+}
+
+#[test]
+fn provider_reply_sanitizes_host_paths_before_persistence_and_delivery() {
+    struct HostPathProvider;
+    impl ConversationProvider for HostPathProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            scope: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            Ok((
+                "session".into(),
+                format!(
+                    "Inspect {} and /Users/runner/private/credentials.txt; keep src/module.rs and https://example.test/docs",
+                    scope.checkout.join("README:1").display()
+                ),
+            ))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+    }
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        HostPathProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent inspect paths"))
+        .unwrap();
+
+    let delivery = &runner.slack().deliveries[0].text;
+    assert!(delivery.contains("README:1"));
+    assert!(delivery.contains("[REDACTED_PATH]"));
+    assert!(delivery.contains("src/module.rs"));
+    assert!(delivery.contains("https://example.test/docs"));
+    assert!(!delivery.contains(&checkout.path().display().to_string()));
+    assert!(!delivery.contains("/Users/runner/private"));
+
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    let persisted = &thread.conversation.last().unwrap().contribution;
+    assert!(persisted.contains("README:1"));
+    assert!(persisted.contains("[REDACTED_PATH]"));
+    assert!(persisted.contains("src/module.rs"));
+    assert!(persisted.contains("https://example.test/docs"));
+    assert!(!persisted.contains(&checkout.path().display().to_string()));
+    assert!(!persisted.contains("/Users/runner/private"));
 }
 
 #[test]

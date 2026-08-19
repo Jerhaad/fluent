@@ -1,6 +1,65 @@
 use super::*;
 use std::collections::{BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
+
+fn sanitize_provider_reply(reply: &str, checkout: &Path) -> String {
+    let reply = redact_secrets(reply);
+    let configured_root = checkout.to_string_lossy().trim_end_matches('/').to_owned();
+    let canonical_root = checkout
+        .canonicalize()
+        .ok()
+        .map(|path| path.to_string_lossy().trim_end_matches('/').to_owned());
+    let mut roots = vec![configured_root];
+    if let Some(root) = canonical_root
+        && !roots.contains(&root)
+    {
+        roots.push(root);
+    }
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+
+    reply
+        .split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let body_len = piece.trim_end_matches(char::is_whitespace).len();
+            let (body, whitespace) = piece.split_at(body_len);
+            let Some(slash) = body.char_indices().find_map(|(index, character)| {
+                if character != '/' {
+                    return None;
+                }
+                let begins_absolute_path = index == 0
+                    || body[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|character| "=([{:'\"".contains(character));
+                begins_absolute_path.then_some(index)
+            }) else {
+                return piece.to_owned();
+            };
+            let prefix = &body[..slash];
+            if prefix.ends_with("http:") || prefix.ends_with("https:") {
+                return piece.to_owned();
+            }
+            let candidate_with_punctuation = &body[slash..];
+            let candidate =
+                candidate_with_punctuation.trim_end_matches([')', ']', '}', ',', ';', '\'', '"']);
+            let punctuation = &candidate_with_punctuation[candidate.len()..];
+            let replacement = roots
+                .iter()
+                .find_map(|root| {
+                    candidate.strip_prefix(root).and_then(|suffix| {
+                        if suffix.is_empty() {
+                            Some(".".to_owned())
+                        } else {
+                            suffix.strip_prefix('/').map(ToOwned::to_owned)
+                        }
+                    })
+                })
+                .unwrap_or_else(|| "[REDACTED_PATH]".to_owned());
+            format!("{prefix}{replacement}{punctuation}{whitespace}")
+        })
+        .collect()
+}
 
 /// Fair, bounded admission for provider turns. A thread may hold at most one
 /// slot, and waiting threads are admitted in first-ready order.
@@ -620,7 +679,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     }
                     ProviderTurnRecovery::Completed { turn_id, reply } => {
                         turn.provider_turn_id = Some(turn_id);
-                        turn.completed_reply = Some(redact_secrets(&reply));
+                        turn.completed_reply =
+                            Some(sanitize_provider_reply(&reply, &scope.checkout));
                     }
                 }
             }
@@ -666,13 +726,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread.provider_session = Some(session);
             }
             turn = thread.pending_turn.clone().unwrap_or(turn);
-            turn.completed_reply = Some(redact_secrets(&reply));
+            turn.completed_reply = Some(sanitize_provider_reply(&reply, &scope.checkout));
         }
         let raw_reply = turn
             .completed_reply
             .clone()
             .context("provider turn completed without a reply")?;
-        let raw_reply = redact_secrets(&raw_reply);
+        let raw_reply = sanitize_provider_reply(&raw_reply, &scope.checkout);
         let provider_reply = raw_reply.clone();
         let mut provider_references =
             match self.provider.code_references(&scope, &turn.contribution) {
@@ -684,24 +744,42 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 provider_references.push(reference);
             }
         }
-        let references = provider_references
-            .into_iter()
-            .map(|reference| {
-                if reference.path.is_absolute()
-                    || reference
-                        .path
-                        .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    bail!("provider code reference is outside the bound checkout");
+        let mut references = Vec::with_capacity(provider_references.len());
+        for reference in provider_references {
+            if reference.path.is_absolute()
+                || reference
+                    .path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return self.preserve_provider_failure(
+                    event,
+                    thread,
+                    ProviderError::new(
+                        ProviderFailure::IncompatibleProtocol,
+                        "provider returned a code reference outside the bound checkout",
+                    ),
+                );
+            }
+            let formatted = match crate::slack_collaboration::format_code_reference(
+                &self.bound_project(thread)?.checkout,
+                &scope.checkout.join(reference.path),
+                reference.line,
+            ) {
+                Ok(formatted) => formatted,
+                Err(error) => {
+                    return self.preserve_provider_failure(
+                        event,
+                        thread,
+                        ProviderError::new(
+                            ProviderFailure::IncompatibleProtocol,
+                            format!("provider returned an invalid code reference: {error}"),
+                        ),
+                    );
                 }
-                crate::slack_collaboration::format_code_reference(
-                    &self.bound_project(thread)?.checkout,
-                    &scope.checkout.join(reference.path),
-                    reference.line,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+            };
+            references.push(formatted);
+        }
         let reply = if previously_completed {
             raw_reply
         } else if turn.starts_session {
