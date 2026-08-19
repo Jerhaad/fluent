@@ -381,6 +381,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         if thread.state == ThreadState::Active
             && event.thread_timestamp.is_some()
+            && self.approve_revision_if_requested(&event, &mut thread)?
+        {
+        } else if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
             && self.offer_linked_thread_if_requested(&event, &mut thread)?
         {
         } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
@@ -539,6 +543,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 .bind_inbox_event(&self.config, &event.id, &project.label)?;
             thread.state = ThreadState::Active;
             thread.project_label = Some(project.label.clone());
+            if let Some(work_item_id) = work_item_id_from_request(&event.text) {
+                WorkModelStore::new(&project.checkout.path)
+                    .read_work_item(work_item_id)
+                    .with_context(|| format!("read linked Work Item {work_item_id}"))?;
+                thread.linked_work = Some(work_item_id.to_owned());
+            }
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
                 contribution: event.text.clone(),
@@ -571,6 +581,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             )?;
         }
         Ok(())
+    }
+
+    fn approve_revision_if_requested(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+    ) -> Result<bool> {
+        let Some(revision_id) = event.text.trim().strip_prefix("approve ") else {
+            return Ok(false);
+        };
+        if revision_id.trim().is_empty() {
+            return Ok(false);
+        }
+        self.approve_planning_revision(&thread.id, revision_id.trim(), &event.user)?;
+        thread.pending_artifact_revision = None;
+        thread.pending_question = None;
+        self.queue_reply(
+            event,
+            &format!("Approved planning revision {}.", revision_id.trim()),
+        )?;
+        Ok(true)
     }
 
     fn offer_linked_thread_if_requested(
@@ -766,4 +797,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             approval_control: None,
         })
     }
+}
+
+fn work_item_id_from_request(text: &str) -> Option<&str> {
+    text.split_once("work-item:")
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .filter(|id| !id.is_empty())
 }

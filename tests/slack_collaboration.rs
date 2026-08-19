@@ -242,6 +242,48 @@ fn planning_artifact_reloads_exact_revisions_for_all_stages() {
 }
 
 #[test]
+fn slack_approval_reply_advances_the_bound_work_item() {
+    let (home, checkout, config) = setup(true);
+    WorkModelStore::new(checkout.path())
+        .create_work_item(&WorkItem::planned("work-1", "Slack planning"))
+        .unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan this work-item: work-1"))
+        .unwrap();
+    let revision = runner
+        .present_planning_artifact("1.0", "brief", "# Brief\n")
+        .unwrap();
+    runner
+        .ingest(event(
+            "E2",
+            Some("1.0"),
+            &format!("approve {}", revision.id),
+        ))
+        .unwrap();
+    assert_eq!(
+        WorkModelStore::new(checkout.path())
+            .read_work_item("work-1")
+            .unwrap()
+            .planning_context
+            .unwrap()
+            .brief
+            .as_deref(),
+        Some("# Brief\n")
+    );
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert!(thread.pending_artifact_revision.is_none());
+}
+
+#[test]
 fn queued_message_edit_replaces_unprocessed_content() {
     let (home, _checkout, config) = setup(true);
     let store = FileCollaborationStore::new(home.path());
