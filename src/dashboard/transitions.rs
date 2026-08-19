@@ -57,7 +57,13 @@ impl DashboardTransitionProjection {
         let path = self.path();
         let mut stored = self.read()?;
         let mut applied = Vec::new();
-        for item in WorkModelStore::new(&self.project_root).list_work_items()? {
+        for result in WorkModelStore::new(&self.project_root).list_work_item_results()? {
+            let Ok(item) = result else {
+                // Work status reports this per-item read failure. Keep projecting
+                // every readable ledger so one malformed aggregate cannot hide
+                // valid Work from the dashboard.
+                continue;
+            };
             let cursor = stored.cursors.get(&item.id).copied().unwrap_or(0);
             for transition in item
                 .transitions
