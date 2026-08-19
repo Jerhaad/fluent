@@ -2448,6 +2448,25 @@ fn thread_can_select_enabled_nondefault_provider() {
             .contains("provider: claude")
     );
 }
+
+#[test]
+fn reply_during_active_turn_shows_queued_state() {
+    let mut pool = FairTurnPool::new(1);
+    assert!(pool.request("1.0"));
+    assert!(!pool.request("2.0"));
+    assert_eq!(pool.finish("1.0").as_deref(), Some("2.0"));
+}
+
+#[test]
+fn queued_replies_form_one_ordered_attributed_turn() {
+    assert_eq!(
+        coalesce_contributions([
+            (String::from("U1"), String::from("first")),
+            (String::from("U2"), String::from("second"))
+        ]),
+        "Slack user U1: first\nSlack user U2: second"
+    );
+}
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);

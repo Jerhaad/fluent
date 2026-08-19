@@ -1,5 +1,58 @@
 use super::*;
 use crate::work_model::WorkModelStore;
+use std::collections::{BTreeSet, VecDeque};
+
+/// Fair, bounded admission for provider turns. A thread may hold at most one
+/// slot, and waiting threads are admitted in first-ready order.
+#[derive(Debug)]
+pub struct FairTurnPool {
+    capacity: usize,
+    active: BTreeSet<String>,
+    waiting: VecDeque<String>,
+}
+
+impl FairTurnPool {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            active: BTreeSet::new(),
+            waiting: VecDeque::new(),
+        }
+    }
+
+    pub fn request(&mut self, thread: impl Into<String>) -> bool {
+        let thread = thread.into();
+        if self.active.contains(&thread) || self.waiting.contains(&thread) {
+            return false;
+        }
+        if self.active.len() < self.capacity {
+            self.active.insert(thread);
+            true
+        } else {
+            self.waiting.push_back(thread);
+            false
+        }
+    }
+
+    pub fn finish(&mut self, thread: &str) -> Option<String> {
+        self.active.remove(thread);
+        if let Some(next) = self.waiting.pop_front() {
+            self.active.insert(next.clone());
+            Some(next)
+        } else {
+            None
+        }
+    }
+}
+
+/// Preserve Slack ordering and attribution when several replies form one turn.
+pub fn coalesce_contributions(replies: impl IntoIterator<Item = (String, String)>) -> String {
+    replies
+        .into_iter()
+        .map(|(actor, text)| format!("Slack user {actor}: {text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Coordinates one local runner. File state is written before external effects.
 pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
