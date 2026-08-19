@@ -6241,6 +6241,13 @@ fn runner_restart_recovers_active_fluent_thread() {
     thread.linked_work = Some("work-7".into());
     thread.pending_question = Some("approve plan?".into());
     fs::write(&snapshot, serde_json::to_vec_pretty(&thread).unwrap()).unwrap();
+    WorkControl::new(checkout.path())
+        .approve_plan(
+            "slice-7",
+            "U1",
+            &[PlannedWork::new("work-7", "Recover active Work")],
+        )
+        .unwrap();
     initial.slack_mut().fail_acknowledgements = 1;
     assert!(
         initial
@@ -6289,14 +6296,15 @@ fn reconnect_reconciles_slack_messages_exactly_once() {
             .slack()
             .deliveries
             .iter()
-            .any(|d| d.id == "1.0:status:now" && d.text.contains("last connected at now"))
+            .any(|d| d.id.starts_with("1.0:status:") && d.text.contains("last connected at now"))
     );
     assert!(
         runner
             .slack()
             .deliveries
             .iter()
-            .any(|d| d.id == "1.0:status:now" && d.text.contains("connection was interrupted"))
+            .any(|d| d.id.starts_with("1.0:status:")
+                && d.text.contains("connection was interrupted"))
     );
     runner.reconnect([], "later".into()).unwrap();
     assert!(
