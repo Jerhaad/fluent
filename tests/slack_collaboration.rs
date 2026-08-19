@@ -85,6 +85,83 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
 }
 
 #[test]
+fn project_setup_lists_only_safely_labeled_allowed_checkouts() {
+    let allowed = TempDir::new().unwrap();
+    let nested = allowed.path().join("team/app");
+    fs::create_dir_all(&nested).unwrap();
+    initialize_checkout(&nested);
+    let too_deep = allowed.path().join("one/two/hidden");
+    fs::create_dir_all(&too_deep).unwrap();
+    initialize_checkout(&too_deep);
+    let outside = TempDir::new().unwrap();
+    initialize_checkout(outside.path());
+    std::os::unix::fs::symlink(outside.path(), allowed.path().join("outside-link")).unwrap();
+    let roots = [ProjectDiscoveryRoot {
+        label: "products".into(),
+        path: allowed.path().into(),
+        maximum_depth: 2,
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+    }];
+
+    let offers = discover_project_checkouts(&roots, "U1").unwrap().offers();
+
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].project_label, "products");
+    assert_eq!(offers[0].checkout_label, "app");
+    let rendered = serde_json::to_string(&offers).unwrap();
+    assert!(!rendered.contains(&allowed.path().display().to_string()));
+    assert!(!rendered.contains(&outside.path().display().to_string()));
+}
+
+#[test]
+fn unauthorized_project_setup_hides_checkouts_and_preserves_state() {
+    let allowed = TempDir::new().unwrap();
+    initialize_checkout(allowed.path());
+    let before = directory_snapshot(allowed.path());
+    let roots = [ProjectDiscoveryRoot {
+        label: "secret".into(),
+        path: allowed.path().into(),
+        maximum_depth: 0,
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+    }];
+
+    let offers = discover_project_checkouts(&roots, "U2").unwrap().offers();
+
+    assert!(offers.is_empty());
+    assert_eq!(directory_snapshot(allowed.path()), before);
+}
+
+fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn collect(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        files: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let mut children = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            if child.file_type().unwrap().is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root).unwrap().into(),
+                    fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files);
+    files
+}
+
+#[test]
 fn planning_artifact_renders_exact_revision_in_thread() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(

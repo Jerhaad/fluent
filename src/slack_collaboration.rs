@@ -21,6 +21,7 @@ mod coordination;
 mod domain;
 mod interfaces;
 mod policy;
+mod project_enablement;
 mod store;
 mod work_control;
 
@@ -28,6 +29,7 @@ pub use adapters::*;
 pub use coordination::*;
 pub use domain::*;
 pub use interfaces::*;
+pub use project_enablement::*;
 use store::*;
 pub use store::{FileCollaborationStore, ThreadCommitCrashPoint, config_path, state_root};
 pub use work_control::*;
