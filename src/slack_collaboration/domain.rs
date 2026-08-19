@@ -136,6 +136,8 @@ pub struct OutboundDelivery {
     pub delivered: bool,
     #[serde(default)]
     pub approval_control: Option<ApprovalControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_timestamp: Option<String>,
 }
 
 /// A revision-bound Slack button that authorizes one pending action.
@@ -238,6 +240,8 @@ pub struct FluentThread {
     pub approvals: Vec<ApprovalRecord>,
     pub processed_events: BTreeSet<String>,
     pub last_connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_reply_timestamp: Option<String>,
     #[serde(default)]
     pub pending_turn: Option<PendingTurn>,
     #[serde(default)]
@@ -325,6 +329,7 @@ impl FluentThread {
             approvals: Vec::new(),
             processed_events: BTreeSet::new(),
             last_connection: None,
+            first_reply_timestamp: None,
             pending_turn: None,
             queued_contributions: Vec::new(),
             conversation: Vec::new(),

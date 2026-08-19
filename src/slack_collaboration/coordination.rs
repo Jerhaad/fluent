@@ -530,6 +530,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         self.process(event.clone(), run_now)?;
         self.store.mark_inbox_processed(&event.id)?;
+        if self
+            .store
+            .load_thread(&self.config, &event.thread_id())?
+            .is_some_and(|thread| thread.slice.is_some())
+        {
+            self.report_thread_work(&event.thread_id())?;
+        }
         self.deliver_pending()
     }
 
@@ -605,6 +612,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             };
             thread.last_connection = Some(connected_at.clone());
             self.store.save_thread(&self.config, &thread)?;
+            if thread.slice.is_some() {
+                self.report_thread_work(&id)?;
+                thread = self
+                    .store
+                    .load_thread(&self.config, &id)?
+                    .context("Fluent thread disappeared during Work reconciliation")?;
+            }
             self.queue_thread_status(
                 &thread,
                 report_interruption.then_some("Slack connection was interrupted."),
@@ -635,9 +649,25 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         let mut deliveries = self.store.load_outbox()?;
         for index in 0..deliveries.len() {
             if !deliveries[index].delivered {
-                self.slack.post(&deliveries[index])?;
+                let posted_timestamp = if deliveries[index].update_timestamp.is_some() {
+                    self.slack.update(&deliveries[index])?;
+                    None
+                } else {
+                    Some(self.slack.post_with_identity(&deliveries[index])?)
+                };
                 deliveries[index].delivered = true;
                 self.store.save_outbox(&deliveries)?;
+                if let Some(timestamp) = posted_timestamp {
+                    if let Some(mut thread) = self
+                        .store
+                        .load_thread(&self.config, &deliveries[index].thread_timestamp)?
+                    {
+                        if thread.first_reply_timestamp.is_none() {
+                            thread.first_reply_timestamp = Some(timestamp);
+                            self.store.save_thread(&self.config, &thread)?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -792,6 +822,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.store.save_thread(&self.config, &thread)?;
             self.queue_queued_acknowledgement(&event)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
+            if matches!(
+                event.text.trim().to_ascii_lowercase().as_str(),
+                "status" | "work status"
+            ) {
+                self.store.save_thread(&self.config, &thread)?;
+                return self.queue_thread_status(&thread, None);
+            }
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
                 source_timestamp: event.timestamp.clone(),
@@ -1471,7 +1508,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 report.work_item_ids.join(", ")
             ),
             delivered: false,
+            update_timestamp: None,
         })?;
+        self.queue_thread_status(&thread, None)?;
         self.deliver_pending()?;
         Ok(report)
     }
@@ -1505,6 +1544,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread_timestamp: thread.id.clone(),
                 text: format!("Work Item {work_item_id} queue outcome: {outcome:?}."),
                 delivered: false,
+                update_timestamp: None,
             })?;
         }
         self.deliver_pending()?;
@@ -1552,8 +1592,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread_timestamp: thread.id.clone(),
                 text: control.render_actionable_transition(transition, &evidence, None),
                 delivered: false,
+                update_timestamp: None,
             })
         })?;
+        let refreshed = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable after Work reconciliation")?;
+        self.queue_thread_status(&refreshed, None)?;
         self.deliver_pending()?;
         Ok(transitions)
     }
@@ -1603,6 +1649,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             text: redact_secrets(text),
             delivered: false,
             approval_control: None,
+            update_timestamp: None,
         };
         self.store.persist_outbox(delivery)
     }
@@ -1615,6 +1662,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             text: "Reply queued for the next conversation turn.".into(),
             delivered: false,
             approval_control: None,
+            update_timestamp: None,
         })
     }
 
@@ -1641,22 +1689,45 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     }
 
     fn queue_thread_status(&self, thread: &FluentThread, interruption: Option<&str>) -> Result<()> {
-        let connected_at = thread
-            .last_connection
-            .as_deref()
-            .context("active thread lacks a Slack connection time")?;
         let interruption = interruption
             .map(|message| format!(" {message}"))
             .unwrap_or_default();
+        let provider_state = if thread.provider_session.is_some() {
+            "connected"
+        } else {
+            "idle"
+        };
+        let project = thread
+            .project_label
+            .as_deref()
+            .and_then(|label| self.config.projects.get(label));
+        let mut text = match (project, thread.slice.as_deref()) {
+            (Some(project), Some(slice_id)) => WorkControl::new(&project.checkout.path)
+                .render_status_message(
+                    slice_id,
+                    &project.label,
+                    &project.checkout.label,
+                    provider_state,
+                )?,
+            (Some(project), None) => format!(
+                "Project: {}; checkout: {}; Slice: planning; provider: {provider_state}. Next action: complete the Implementation Plan.",
+                project.label, project.checkout.label
+            ),
+            _ => format!("Fluent thread status; provider: {provider_state}."),
+        };
+        text.push_str(&interruption);
+        if let Some(connected_at) = &thread.last_connection {
+            text.push_str(&format!(" Runner last connected at {connected_at}."));
+        }
+        let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
         self.store.persist_outbox(OutboundDelivery {
-            id: format!("{}:status:{connected_at}", thread.id),
+            id: format!("{}:status:{}", thread.id, &digest[..16]),
             channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(),
-            text: format!(
-                "Fluent thread status:{interruption} runner last connected at {connected_at}."
-            ),
+            text,
             delivered: false,
             approval_control: None,
+            update_timestamp: thread.first_reply_timestamp.clone(),
         })
     }
 }

@@ -436,6 +436,11 @@ pub trait SlackTransport {
     fn acknowledge(&mut self, event_id: &str) -> Result<()>;
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()>;
 
+    fn post_with_identity(&mut self, delivery: &OutboundDelivery) -> Result<String> {
+        self.post(delivery)?;
+        Ok(delivery.id.clone())
+    }
+
     fn update(&mut self, delivery: &OutboundDelivery) -> Result<()> {
         self.post(delivery)
     }

@@ -455,6 +455,39 @@ impl SlackTransport for SlackWebApiTransport {
         )
     }
 
+    fn post_with_identity(&mut self, delivery: &OutboundDelivery) -> Result<String> {
+        let value = self.call_value(
+            "chat.postMessage",
+            &self.bot_token,
+            serde_json::json!({
+                "channel": delivery.channel,
+                "thread_ts": delivery.thread_timestamp,
+                "text": delivery.text,
+                "client_msg_id": slack_client_message_id(delivery)
+            }),
+        )?;
+        value["ts"]
+            .as_str()
+            .map(str::to_owned)
+            .context("Slack chat.postMessage omitted message timestamp")
+    }
+
+    fn update(&mut self, delivery: &OutboundDelivery) -> Result<()> {
+        let timestamp = delivery
+            .update_timestamp
+            .as_deref()
+            .context("Slack update omitted message timestamp")?;
+        self.call(
+            "chat.update",
+            &self.bot_token,
+            serde_json::json!({
+                "channel": delivery.channel,
+                "ts": timestamp,
+                "text": delivery.text
+            }),
+        )
+    }
+
     fn respond_private(&mut self, channel: &str, user: &str, text: &str) -> Result<()> {
         self.call(
             "chat.postEphemeral",

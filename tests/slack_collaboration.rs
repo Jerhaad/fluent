@@ -2022,6 +2022,7 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
         text: "connected at first".into(),
         delivered: false,
         approval_control: None,
+        update_timestamp: None,
     };
     slack.post(&delivery).unwrap();
     slack.post(&delivery).unwrap();
@@ -5717,6 +5718,7 @@ fn outbound_progress_is_persisted_after_each_accepted_delivery() {
                 text: id.into(),
                 delivered: false,
                 approval_control: None,
+                update_timestamp: None,
             })
             .unwrap();
     }
@@ -5746,6 +5748,7 @@ fn durable_outbox_identity_cannot_be_rewritten() {
         text: "connected at first".into(),
         delivered: false,
         approval_control: None,
+        update_timestamp: None,
     };
     store.persist_outbox(original.clone()).unwrap();
     let error = store
@@ -5917,6 +5920,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),
         last_connection: None,
+        first_reply_timestamp: None,
         queued_contributions: Vec::new(),
         conversation: Vec::new(),
         pending_turn: Some(PendingTurn {
@@ -6838,6 +6842,48 @@ fn status_request_reports_authoritative_work_state_and_actions() {
 }
 
 #[test]
+fn runner_updates_first_reply_from_authoritative_work_status() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    let first_reply = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap()
+        .first_reply_timestamp
+        .unwrap();
+    assert_eq!(first_reply, "E1:reply");
+
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-pinned",
+            &[PlannedWork::new("work-pinned", "Pinned")],
+        )
+        .unwrap();
+
+    let update = runner
+        .slack()
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.update_timestamp.as_deref() == Some(first_reply.as_str()))
+        .unwrap();
+    assert!(update.text.contains("Project: app"));
+    assert!(update.text.contains("checkout: main"));
+    assert!(update.text.contains("Slice: Active"));
+    assert!(update.text.contains("work-pinned: planned"));
+    assert!(update.text.contains("Await execution approval"));
+}
+
+#[test]
 fn durable_transition_ledger_replays_once_per_slack_cursor() {
     struct Scheduler;
     impl WorkScheduler for Scheduler {
@@ -7248,6 +7294,81 @@ fn reconnect_reconciles_work_transitions_exactly_once() {
             .reconcile_durable_transitions("slice-reconnect-direct")
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn runner_reconnect_delivers_missed_work_in_order_once() {
+    let (home, checkout, config) = setup(true);
+    let mut first = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    first
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    first
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-reconnect-runner",
+            &[PlannedWork::new("work-reconnect-runner", "Reconnect")],
+        )
+        .unwrap();
+    first.report_thread_work("1.0").unwrap();
+    drop(first);
+
+    append_attempt_state(
+        &checkout,
+        "work-reconnect-runner",
+        fluent::work_model::AttemptStatus::Executing,
+        "worker started",
+    );
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some("operator decision required".into()),
+        evidence_ref: Some("recovery.json".into()),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition("work-reconnect-runner", Some(&metadata), |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    recovered.reconnect([], "reconnected".into()).unwrap();
+    let transition_deliveries = recovered
+        .slack()
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.id.contains(":work-transition:"))
+        .collect::<Vec<_>>();
+    assert_eq!(transition_deliveries.len(), 3);
+    assert!(transition_deliveries[0].text.contains("is now authorized"));
+    assert!(transition_deliveries[1].text.contains("is now executing"));
+    assert!(transition_deliveries[2].text.contains("is now needs-user"));
+    assert!(
+        transition_deliveries[2]
+            .text
+            .contains("operator decision required")
+    );
+
+    let delivered = recovered.slack().deliveries.len();
+    recovered.reconnect([], "reconnected-again".into()).unwrap();
+    assert_eq!(
+        recovered.slack().deliveries[delivered..]
+            .iter()
+            .filter(|delivery| delivery.id.contains(":work-transition:"))
+            .count(),
+        0
     );
 }
 
