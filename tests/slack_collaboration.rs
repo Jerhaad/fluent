@@ -117,7 +117,7 @@ fn provider_planning_output_is_presented_for_approval() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             Ok((
                 "session-1".into(),
                 serde_json::json!({
@@ -136,7 +136,7 @@ fn provider_planning_output_is_presented_for_approval() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!("the first planning turn starts a provider session")
         }
     }
@@ -548,6 +548,9 @@ fn queued_message_edit_replaces_unprocessed_content() {
         starts_session: false,
         provider_turn_id: None,
         completed_reply: None,
+        dispatch_state: PendingTurnDispatchState::Runnable,
+        retry_at_unix_seconds: None,
+        delivery_attempt: 0,
     });
     thread.processed_events.insert(original.id.clone());
     store.save_thread(&config, &thread).unwrap();
@@ -730,6 +733,8 @@ fn single_workspace_runner_routes_multiple_projects_and_conversations() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U1".into()]),
+            default_provider: "codex".into(),
+            enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
         },
     );
@@ -776,6 +781,8 @@ fn project_change_preserves_binding_and_offers_linked_thread() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U1".into()]),
+            default_provider: "codex".into(),
+            enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
         },
     );
