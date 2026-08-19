@@ -43,6 +43,7 @@ const NO_CHANGE_DECLARATION_FILE: &str = "no-change.json";
 pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const REVIEW_ARTIFACT_WARN_BYTES: u64 = 16 * 1024 * 1024;
 const EXECUTION_CONTEXT_MAX_BYTES: usize = 128 * 1024;
+const EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES: usize = 300;
 const EXECUTION_CONTEXT_MAX_CHANGED_FILES: usize = 100;
 const EXECUTION_CONTEXT_MAX_EVIDENCE: usize = 25;
 const EXECUTION_CONTEXT_MAX_COMMANDS: usize = 25;
@@ -4879,8 +4880,8 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
                 .or_insert(ExecutionContextFinding {
                     role: truncate_utf8(&role, 64),
                     identity: truncate_utf8(&identity, 128),
-                    title: truncate_utf8(&title, 400),
-                    artifact: truncate_utf8(&path.display().to_string(), 240),
+                    title: truncate_utf8(&title, EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES),
+                    artifact: path.display().to_string(),
                 });
         }
     }
@@ -4910,8 +4911,8 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
                     ExecutionContextFinding {
                         role: role.clone(),
                         identity,
-                        title: truncate_utf8(&title, 400),
-                        artifact: truncate_utf8(&path.display().to_string(), 240),
+                        title: truncate_utf8(&title, EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES),
+                        artifact: path.display().to_string(),
                     },
                 );
             }
@@ -4958,7 +4959,7 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
                     role: role.clone(),
                     identity,
                     title,
-                    artifact: truncate_utf8(&path.display().to_string(), 240),
+                    artifact: path.display().to_string(),
                 });
         }
     }
@@ -15372,7 +15373,9 @@ mod tests {
     #[test]
     fn tests_reviewer_prompt_indexes_failed_tester_correction_evidence() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let project_root = tmp.path();
+        let project_root_storage = tmp.path().join("candidate-correction-evidence/".repeat(12));
+        fs::create_dir_all(&project_root_storage).unwrap();
+        let project_root = project_root_storage.as_path();
         let workspace = project_root.join("candidate");
         let tester_dir =
             project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester");
