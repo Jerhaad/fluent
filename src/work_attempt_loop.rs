@@ -16,10 +16,11 @@ use crate::review_diff_command;
 use crate::review_only_worktree;
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMappingInputs,
-    EvidenceRecoveryState, LearnerCommitCanonicalization, MergeCandidateMergeStatus, PauseKind,
-    PauseRecovery, RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task,
-    TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError,
-    WorkModelStore, WriterOutcome, WriterRun, WriterRunKind, normalize_round_cap_resolution,
+    DurableTransitionMetadata, DurableTransitionOrigin, EvidenceRecoveryState,
+    LearnerCommitCanonicalization, MergeCandidateMergeStatus, PauseKind, PauseRecovery,
+    RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind,
+    TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError, WorkModelStore,
+    WriterOutcome, WriterRun, WriterRunKind, normalize_round_cap_resolution,
     resolve_managed_sibling_workspace_path, round_cap_resolution_digest, work_artifact_path,
 };
 use crate::work_task_executor::{self, WorkTaskRunConfig};
@@ -27,6 +28,29 @@ use crate::work_task_executor::{self, WorkTaskRunConfig};
 const DEFAULT_MAX_PARALLEL_REVIEWERS: usize = 5;
 const DEFAULT_MAX_TOTAL_WRITE_ROUNDS: usize = 10;
 const DEFAULT_MAX_NO_PROGRESS_ROUNDS: usize = 2;
+
+fn attempt_executor_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("advance Attempt execution".to_string()),
+        evidence_ref: None,
+    }
+}
+
+fn write_attempt_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &attempt_executor_transition())
+}
+
+fn mutate_attempt_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &attempt_executor_transition(), reducer)
+}
 
 /// The reviewer-parallelism limit applied within a single Attempt. This is
 /// independent of the local scheduler's Work-Item concurrency: one scheduled
@@ -62,7 +86,7 @@ pub fn extend_round_cap(
     let base_cap = max_total_write_rounds();
     let human_resolution = normalize_round_cap_resolution(human_resolution)?;
     let human_resolution_digest = round_cap_resolution_digest(&human_resolution);
-    Ok(store.mutate_work_item(work_item_id, |item| {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt_index = item
             .attempts
             .iter()
@@ -86,7 +110,9 @@ pub fn extend_round_cap(
                 TaskStatus::Planned | TaskStatus::Executing | TaskStatus::Failed
             )
         }) {
-            return Err(round_cap_ineligible("a live or failed Task owns this Attempt"));
+            return Err(round_cap_ineligible(
+                "a live or failed Task owns this Attempt",
+            ));
         }
         if attempt.status != AttemptStatus::NeedsUser
             || attempt.pause_kind != Some(PauseKind::RoundCap)
@@ -96,11 +122,12 @@ pub fn extend_round_cap(
                 "the Attempt is not paused at a failed-correction write-round cap",
             ));
         }
-        let failed_reviews = round_cap_failure_frontier(project_root, attempt).map_err(|error| {
-            round_cap_ineligible(format!(
-                "failed correction artifacts cannot be resolved: {error:#}"
-            ))
-        })?;
+        let failed_reviews =
+            round_cap_failure_frontier(project_root, attempt).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "failed correction artifacts cannot be resolved: {error:#}"
+                ))
+            })?;
         if failed_reviews.is_empty() {
             return Err(round_cap_ineligible(
                 "the paused frontier has no failed correction artifacts",
@@ -129,9 +156,7 @@ pub fn extend_round_cap(
             &["status", "--porcelain", "--untracked-files=all", "--", "."],
             "check round-cap candidate cleanliness",
         )
-        .map_err(|error| {
-            round_cap_ineligible(format!("candidate cannot be checked: {error:#}"))
-        })?;
+        .map_err(|error| round_cap_ineligible(format!("candidate cannot be checked: {error:#}")))?;
         if !status.is_empty() {
             return Err(round_cap_ineligible("the candidate workspace is dirty"));
         }
@@ -555,7 +580,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                     // window the release correction closes. Other modes persist inside
                     // run_learner_step and this write is their durable refresh.
                     if !mode.is_pre_land_no_expertise() {
-                        config.store.write_work_item(&item)?;
+                        write_attempt_work_item(config.store, &item)?;
                     }
                     if handoff_only
                         && item.attempts[attempt_index]
@@ -616,7 +641,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                     }
                 }
             } else {
-                config.store.write_work_item(&item)?;
+                write_attempt_work_item(config.store, &item)?;
             }
             // Advancement gate: a non-succeeded Learner blocks readiness with the same
             // durable reason as Merge Candidate validation and landing, so a failed or
@@ -629,9 +654,8 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 });
                 return Ok(WorkAttemptRunResult { outcomes });
             }
-            let candidate_id = config
-                .store
-                .mutate_work_item(config.work_item_id, |fresh| {
+            let candidate_id =
+                mutate_attempt_work_item(config.store, config.work_item_id, |fresh| {
                     fresh.mark_merge_candidate_ready(config.attempt_id)
                 })?;
             outcomes.push(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
@@ -724,7 +748,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                         task.status = TaskStatus::Planned;
                     }
                 }
-                config.store.write_work_item(&item)?;
+                write_attempt_work_item(config.store, &item)?;
                 continue;
             }
         }
@@ -1089,7 +1113,7 @@ fn reopen_resumable_attempt(
     work_item_id: &str,
     attempt_id: &str,
 ) -> Result<()> {
-    store.mutate_work_item(work_item_id, |item| {
+    mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt_index = item
             .attempts
             .iter()
@@ -1177,7 +1201,7 @@ fn reopen_uncertain_review_attempt(
         attempt_id,
     )?;
 
-    let task_ids = store.mutate_work_item(work_item_id, |fresh| {
+    let task_ids = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let current = crate::lifecycle_recovery::inspect_uncertain_review_recovery(
             project_root,
             fresh,
@@ -1312,7 +1336,7 @@ fn reopen_candidate_gate_attempt(
     let latest_writer_id = latest_writer.id.clone();
     let latest_commit = output.commit.clone();
     let disposition = evidence.disposition;
-    let outcome = store.mutate_work_item(work_item_id, |fresh| {
+    let outcome = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt_index = fresh
             .attempts
             .iter()
@@ -1465,7 +1489,7 @@ fn reopen_approved_round_cap_attempt(
     attempt_id: &str,
 ) -> Result<()> {
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
-    store.mutate_work_item(work_item_id, |item| {
+    mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt = item
             .attempts
             .iter_mut()
@@ -1518,7 +1542,7 @@ fn reopen_baseline_covered_round_cap_attempt(
     attempt_id: &str,
 ) -> Result<bool> {
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
-    Ok(store.mutate_work_item(work_item_id, |item| {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt = item
             .attempts
             .iter_mut()
@@ -1713,7 +1737,7 @@ fn reclassify_legacy_provider_pause(
     work_item_id: &str,
     attempt_id: &str,
 ) -> Result<LegacyProviderPauseRecovery> {
-    Ok(store.mutate_work_item(work_item_id, |item| {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
         let Some(attempt) = item
             .attempts
             .iter_mut()
@@ -2182,7 +2206,7 @@ fn reserve_learner_run(
     attempt_id: &str,
     expected_coder: CoderKind,
 ) -> Result<LearnerReservation> {
-    let reservation = store.mutate_work_item(work_item_id, |fresh| {
+    let reservation = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -2284,7 +2308,7 @@ fn run_learner_step(
         Ok(prepared) => prepared,
         Err(error) => {
             if let Some(host) = error.downcast_ref::<crate::os::HostSandboxPreflightError>() {
-                store.mutate_work_item(&work_item_id, |fresh| {
+                mutate_attempt_work_item(store, &work_item_id, |fresh| {
                     let index = attempt_index_by_id(fresh, &attempt_id)?;
                     crate::work_model::transition_attempt(
                         &mut fresh.attempts[index],
@@ -2831,7 +2855,7 @@ fn settle_no_expertise_failure(
 ) -> Result<()> {
     let kind = classify_learning_failure(&error);
     let diagnostic = format!("{error:#}");
-    if let Err(store_err) = store.mutate_work_item(work_item_id, |fresh| {
+    if let Err(store_err) = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         if !learning_frontier_is(
             fresh,
@@ -2910,7 +2934,7 @@ fn prepare_no_expertise_handoff(
     check_identity: &NoExpertiseIdentityChecker,
 ) -> Result<NoExpertisePreparation> {
     let triggering: RefCell<Option<anyhow::Error>> = RefCell::new(None);
-    let committed = store.mutate_work_item(work_item_id, |fresh| {
+    let committed = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this runner's exact in-progress reservation may advance; a peer that
         // already moved the frontier is honored rather than revived.
@@ -2988,7 +3012,7 @@ fn publish_no_expertise_handoff(
 ) -> Result<()> {
     let triggering: RefCell<Option<anyhow::Error>> = RefCell::new(None);
     let publish: RefCell<Option<_>> = RefCell::new(Some(publish));
-    let committed = store.mutate_work_item(work_item_id, |fresh| {
+    let committed = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let idx = attempt_index_by_id(fresh, attempt_id)?;
         // Only this run's exact HandoffPending frontier may publish; a newer frontier
         // or a peer's terminal record is honored, not overwritten.
@@ -3101,12 +3125,12 @@ fn finalize_learning(
             // handoff with no learning state, and advancement stays blocked until the
             // terminal Succeeded is persisted afterward with its reference.
             item.attempts[attempt_index].learning = Some(AttemptLearning::handoff_pending(runs));
-            store.write_work_item(item)?;
+            write_attempt_work_item(store, item)?;
             match write_handoff(&handoff) {
                 Ok(handoff_ref) => {
                     item.attempts[attempt_index].learning =
                         Some(AttemptLearning::succeeded(runs, handoff_ref));
-                    store.write_work_item(item)?;
+                    write_attempt_work_item(store, item)?;
                 }
                 Err(err) => {
                     // The Learner produced a valid handoff, but writing the canonical
@@ -3123,7 +3147,7 @@ fn finalize_learning(
                             format!("learner produced a handoff but persisting it failed: {err:#}"),
                             kind,
                         ));
-                    if let Err(store_err) = store.write_work_item(item) {
+                    if let Err(store_err) = write_attempt_work_item(store, item) {
                         // The handoff-write failure is the primary fault. The store
                         // failure is retained STRUCTURALLY as a secondary (still
                         // downcastable), not flattened to a string, so both typed
@@ -3146,7 +3170,7 @@ fn finalize_learning(
                 format!("{err:#}"),
                 kind,
             ));
-            if let Err(store_err) = store.write_work_item(item) {
+            if let Err(store_err) = write_attempt_work_item(store, item) {
                 // The coder/confinement/handoff failure is the PRIMARY. The store
                 // failure is retained STRUCTURALLY as a secondary (still downcastable),
                 // not flattened to a string, so the typed primary is never masked.
@@ -4012,7 +4036,7 @@ pub fn cancel_local_attempt(
         .iter()
         .map(|task| task.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let canceled = store.mutate_work_item(work_item_id, |item| {
+    let canceled = mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt = item
             .attempts
             .iter_mut()
@@ -5737,7 +5761,7 @@ fn recover_legacy_learner_tester_evidence_failure(
             .as_deref()
             .expect("the normalized gate required Tester evidence"),
     )?;
-    let task_id = store.mutate_work_item(&item.id, |fresh| {
+    let task_id = mutate_attempt_work_item(store, &item.id, |fresh| {
         if fresh != &expected {
             return Err(WorkModelError::LegacyLifecycleRecoveryConflict {
                 attempt_id: attempt_id.to_string(),
@@ -5880,7 +5904,7 @@ fn plan_after_completed_writer(
     let invalidated_roles = review_roles_invalidated_after_latest_write(project_root, attempt);
     let review_roles = merge_review_roles(&requested_roles, &invalidated_roles);
     let task_ids = item.add_next_review_tasks(attempt_id, &review_roles)?;
-    store.write_work_item(&item)?;
+    write_attempt_work_item(store, &item)?;
     Ok(WorkAttemptRunOutcome::PlannedReviews { task_ids })
 }
 
@@ -5911,7 +5935,7 @@ fn advance_failed_command_recheck(
         .cloned();
     let Some(recheck) = existing else {
         let task_id = item.add_failed_command_recheck_task(attempt_id, source_results.clone())?;
-        store.write_work_item(item)?;
+        write_attempt_work_item(store, item)?;
         return Ok(Some(WorkAttemptRunOutcome::PlannedFailedCommandRecheck {
             task_id,
         }));
@@ -5946,7 +5970,7 @@ fn advance_failed_command_recheck(
     if can_advance_loop(project_root, &item.attempts[attempt_index])? {
         item.attempts[attempt_index].status = AttemptStatus::Planned;
         let task_id = item.add_next_write_round(attempt_id, correction)?;
-        store.write_work_item(item)?;
+        write_attempt_work_item(store, item)?;
         return Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }));
     }
 
@@ -6100,7 +6124,7 @@ fn gate_candidate_after_writer(
             item.attempts[attempt_index].status = AttemptStatus::Planned;
             item.attempts[attempt_index].pause_kind = None;
             let task_id = item.add_next_write_round(attempt_id, vec![artifact])?;
-            store.write_work_item(item)?;
+            write_attempt_work_item(store, item)?;
             Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
         }
         crate::candidate_gate::CandidateGateDisposition::Blocked => {
@@ -6211,10 +6235,10 @@ fn pause_candidate_gate_after_tester(
     item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
     item.attempts[attempt_index].pause_kind = Some(PauseKind::CandidateGate);
     item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
-    store.write_work_item(item)?;
+    write_attempt_work_item(store, item)?;
     let handoff_path =
         write_candidate_gate_handoff(project_root, &item.id, attempt_id, &artifact.path, evidence)?;
-    store.mutate_work_item(&item.id, |fresh| {
+    mutate_attempt_work_item(store, &item.id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -6259,10 +6283,10 @@ fn pause_candidate_gate_before_reviews(
             .artifacts
             .push(artifact.clone());
     }
-    store.write_work_item(item)?;
+    write_attempt_work_item(store, item)?;
     let handoff_path =
         write_candidate_gate_handoff(project_root, &item.id, attempt_id, &artifact.path, evidence)?;
-    store.mutate_work_item(&item.id, |fresh| {
+    mutate_attempt_work_item(store, &item.id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -6762,7 +6786,7 @@ fn gate_writer_completion_before_reviews(
         continuation_artifacts.push(artifact);
     }
     let task_id = item.add_next_write_round(attempt_id, continuation_artifacts)?;
-    store.write_work_item(item)?;
+    write_attempt_work_item(store, item)?;
     Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
 }
 
@@ -6789,7 +6813,7 @@ fn pause_writer_completion_before_reviews(
     item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
     item.attempts[attempt_index].pause_kind = Some(PauseKind::WriterCompletion);
     item.attempts[attempt_index].review_state = Some(AttemptReviewState::NotReviewed);
-    store.write_work_item(item)?;
+    write_attempt_work_item(store, item)?;
     let handoff_path = write_writer_completion_handoff(
         project_root,
         &item.id,
@@ -6797,7 +6821,7 @@ fn pause_writer_completion_before_reviews(
         reason,
         &artifact.path,
     )?;
-    store.mutate_work_item(&item.id, |fresh| {
+    mutate_attempt_work_item(store, &item.id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -7063,7 +7087,7 @@ fn settle_review_pause(
     //    by the RESULTING state — this frontier owns the pause when the attempt ends
     //    in exactly our pause. A crash-retry that finds the pause already ours still
     //    owns it (so the handoff attach can complete); a harder peer does not.
-    let owns_pause = store.mutate_work_item(work_item_id, |fresh| {
+    let owns_pause = mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -7100,7 +7124,7 @@ fn settle_review_pause(
     //    same frontier still owns the pause, and only once, so a repeated or
     //    interleaved settle attaches at most one reference and never overwrites a
     //    newer peer artifact from a stale snapshot.
-    store.mutate_work_item(work_item_id, |fresh| {
+    mutate_attempt_work_item(store, work_item_id, |fresh| {
         let attempt = fresh
             .attempts
             .iter_mut()
@@ -7186,7 +7210,7 @@ fn interpret_reviews(
                             .state = EvidenceRecoveryState::NeedsEvidence;
                         item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
                         item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
-                        store.write_work_item(&item)?;
+                        write_attempt_work_item(store, &item)?;
                         return Ok(WorkAttemptRunOutcome::NeedsUser {
                             handoff_path: recovery.attachment.snapshot_path,
                         });
@@ -7208,13 +7232,13 @@ fn interpret_reviews(
                         item.attempts[attempt_index].status = AttemptStatus::Planned;
                         item.attempts[attempt_index].pause_kind = None;
                         let task_id = item.add_next_write_round(attempt_id, vec![artifact])?;
-                        store.write_work_item(&item)?;
+                        write_attempt_work_item(store, &item)?;
                         return Ok(WorkAttemptRunOutcome::PlannedWriteRound { task_id });
                     }
                     None => {
                         item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
                         item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
-                        store.write_work_item(&item)?;
+                        write_attempt_work_item(store, &item)?;
                         return Ok(WorkAttemptRunOutcome::NeedsUser {
                             handoff_path: recovery.attachment.snapshot_path,
                         });
@@ -7234,7 +7258,7 @@ fn interpret_reviews(
             stale_review_roles_after_latest_write(project_root, &item.attempts[attempt_index]);
         if !stale_roles.is_empty() {
             let task_ids = item.add_next_review_tasks(attempt_id, &stale_roles)?;
-            store.write_work_item(&item)?;
+            write_attempt_work_item(store, &item)?;
             return Ok(WorkAttemptRunOutcome::PlannedReviews { task_ids });
         }
     }
@@ -7311,7 +7335,7 @@ fn interpret_reviews(
         && latest_tester_results_path(project_root, &item.attempts[attempt_index]).is_none()
     {
         let task_id = item.add_final_tester_task(attempt_id)?;
-        store.write_work_item(&item)?;
+        write_attempt_work_item(store, &item)?;
         return Ok(WorkAttemptRunOutcome::PlannedFinalTester { task_id });
     }
 
@@ -7406,7 +7430,7 @@ fn interpret_reviews(
                 &mut item.attempts[attempt_index],
                 AttemptStatus::Failed,
             );
-            store.write_work_item(&item)?;
+            write_attempt_work_item(store, &item)?;
             return Ok(WorkAttemptRunOutcome::ReviewOnlyFailed);
         }
         if !followup_budget_available {
@@ -7443,7 +7467,7 @@ fn interpret_reviews(
         }
         item.attempts[attempt_index].status = AttemptStatus::Planned;
         let task_id = item.add_next_write_round(attempt_id, failed)?;
-        store.write_work_item(&item)?;
+        write_attempt_work_item(store, &item)?;
         return Ok(WorkAttemptRunOutcome::PlannedWriteRound { task_id });
     }
 
@@ -7471,7 +7495,7 @@ fn interpret_reviews(
         AttemptStatus::Complete,
     );
     if item.attempts[attempt_index].kind.is_review_only_like() {
-        store.write_work_item(&item)?;
+        write_attempt_work_item(store, &item)?;
         return Ok(WorkAttemptRunOutcome::ReviewOnlyComplete);
     }
     // A production code-producing Attempt is structurally Complete after reviews,
@@ -7487,7 +7511,7 @@ fn interpret_reviews(
     // Persist the terminal Passed/Complete state and the Merge Candidate identity
     // BEFORE the Learner runs, so the Learner's fresh, landing-validated reservation
     // reads an eligible durable target rather than this pre-terminal snapshot.
-    store.write_work_item(&item)?;
+    write_attempt_work_item(store, &item)?;
     // Run the Learner for every code-producing Attempt, whether or not a
     // reviewer raised a finding.
     // Each Learner mode persists its own outcome. The final readiness stamp below
@@ -7517,12 +7541,12 @@ fn interpret_reviews(
                 relaunchable: learner_relaunchable(&item, attempt_id),
             });
         }
-        let candidate_id = store.mutate_work_item(&item.id, |fresh| {
+        let candidate_id = mutate_attempt_work_item(store, &item.id, |fresh| {
             fresh.mark_merge_candidate_ready(attempt_id)
         })?;
         return Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id });
     }
-    store.write_work_item(&item)?;
+    write_attempt_work_item(store, &item)?;
     Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id })
 }
 
@@ -7930,6 +7954,39 @@ mod tests {
     use crate::work_model::{
         Attempt, CoderMapping, LearningFailureKind, TaskArtifactArea, WorkspaceAccess,
     };
+
+    #[test]
+    fn attempt_executor_mutations_record_the_owned_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem {
+            id: "work-origin".to_string(),
+            title: "Track Attempt origin".to_string(),
+            ..Default::default()
+        };
+        item.add_initial_attempt("attempt-origin").unwrap();
+        store.create_work_item(&item).unwrap();
+
+        mutate_attempt_work_item(&store, "work-origin", |item| {
+            item.attempts[0].status = AttemptStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+
+        let transition = store
+            .read_work_item("work-origin")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "attempt");
+        assert_eq!(transition.origin, DurableTransitionOrigin::AttemptExecutor);
+        assert_eq!(
+            transition.reason.as_deref(),
+            Some("advance Attempt execution")
+        );
+    }
 
     #[test]
     fn tester_only_no_sandbox_capability_does_not_apply_to_other_tasks() {

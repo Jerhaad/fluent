@@ -16,9 +16,25 @@ use crate::config::{self, CorrectionSource, FrozenFollowUpPolicy};
 use crate::observations::{self, LEARNER_FOLLOW_UP_KIND, ObservationFrontmatter};
 use crate::work_model::{
     CorrectiveAuditContext, CorrectiveAuthorityReference, CorrectiveContext,
-    CorrectiveEvidenceReference, DerivedProvenance, ExecutionAuthority, WorkItem, WorkLineage,
-    WorkModelStorageError, WorkModelStore,
+    CorrectiveEvidenceReference, DerivedProvenance, DurableTransitionMetadata,
+    DurableTransitionOrigin, ExecutionAuthority, WorkItem, WorkLineage, WorkModelStorageError,
+    WorkModelStore,
 };
+
+fn post_land_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::PostLand,
+        reason: Some("apply post-land follow-up".to_string()),
+        evidence_ref: None,
+    }
+}
+
+fn write_post_land_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &post_land_transition())
+}
 
 /// Content-addressed pointer to a file within a learner handoff. The path is
 /// always relative to the handoff root; the digest lets a consumer verify the
@@ -1693,7 +1709,7 @@ fn ensure_derived_work(
         Err(error) => return Err(error.into()),
     }
 
-    store.create_work_item(&item)?;
+    store.create_work_item_with_transition(&item, &post_land_transition())?;
     Ok(true)
 }
 
@@ -1723,7 +1739,7 @@ fn reconcile_reusable_derived_work(
     if existing.corrective_audit.is_none() {
         let mut reconciled = existing.clone();
         reconciled.corrective_audit = expected.corrective_audit.clone();
-        store.write_work_item(&reconciled)?;
+        write_post_land_work_item(store, &reconciled)?;
     }
     Ok(())
 }
@@ -1778,6 +1794,8 @@ pub fn authorize_derived_work_item(
         .pending_enqueue
         .clone()
         .expect("enqueue intent was just ensured");
+    // A later human authorization is a generic host mutation, not the landed
+    // operation that originally derived this Work Item.
     store.write_work_item(&item)?;
     drop(work_lock);
     drop(lineage_lock);
@@ -3741,6 +3759,13 @@ mod tests {
             1,
             "exactly one queue entry survives replay"
         );
+        let derived = WorkModelStore::new(tmp.path())
+            .read_work_item(DERIVED_ID)
+            .unwrap();
+        assert!(derived.transitions.iter().all(|transition| {
+            transition.origin == DurableTransitionOrigin::PostLand
+                && transition.reason.as_deref() == Some("apply post-land follow-up")
+        }));
     }
 
     #[test]

@@ -13,11 +13,11 @@ use crate::os;
 use crate::prep;
 use crate::review_diff_command::render_review_diff_command;
 use crate::work_model::{
-    ArtifactRef, AttemptKind, AttemptStatus, NoChangeOutput, NoChangeVerification,
-    NoChangeVerificationResult, PauseKind, PauseRecovery, Task, TaskKind, TaskOutput, TaskStatus,
-    WorkItem, WorkModelStorageError, WorkModelStore, WorkspaceRef,
-    resolve_expected_candidate_workspace_path, resolve_managed_sibling_workspace_path,
-    to_json_pretty, work_artifact_path,
+    ArtifactRef, AttemptKind, AttemptStatus, DurableTransitionMetadata, DurableTransitionOrigin,
+    NoChangeOutput, NoChangeVerification, NoChangeVerificationResult, PauseKind, PauseRecovery,
+    Task, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError, WorkModelStorageError,
+    WorkModelStore, WorkspaceRef, resolve_expected_candidate_workspace_path,
+    resolve_managed_sibling_workspace_path, to_json_pretty, work_artifact_path,
 };
 use crate::worktree;
 
@@ -49,6 +49,29 @@ const EXECUTION_CONTEXT_MAX_EVIDENCE: usize = 25;
 const EXECUTION_CONTEXT_MAX_COMMANDS: usize = 25;
 const TESTER_CANDIDATE_MUTATION_FILE: &str = "candidate-mutation.json";
 const TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION: u32 = 1;
+
+fn task_executor_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::TaskExecutor,
+        reason: Some("advance Task execution".to_string()),
+        evidence_ref: None,
+    }
+}
+
+fn write_task_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &task_executor_transition())
+}
+
+fn mutate_task_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &task_executor_transition(), reducer)
+}
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -324,7 +347,7 @@ fn reserve_task_start(
         Rejected,
     }
 
-    let decision = store.mutate_work_item(work_item_id, |item| {
+    let decision = mutate_task_work_item(store, work_item_id, |item| {
         // Revalidate the abandonment and identity/kind contracts under the model
         // lock, not just the read-only plan, so a concurrent change since the plan
         // cannot slip a mismatched Task into an Executing reservation.
@@ -436,7 +459,7 @@ fn rollback_reservation(
             source: std::io::Error::other("test-injected Tester rollback persistence failure"),
         });
     }
-    store.mutate_work_item(work_item_id, |item| {
+    mutate_task_work_item(store, work_item_id, |item| {
         // The reservation wrote this exact Attempt/Task, so a structurally missing
         // entity during rollback is a model-integrity fault, not a tolerable
         // concurrent state — fail rather than silently reporting a clean rollback.
@@ -1037,7 +1060,7 @@ fn complete_write_task(
         next_status,
         next_pause,
     );
-    config.store.write_work_item(&completed_item)?;
+    write_task_work_item(config.store, &completed_item)?;
 
     Ok(WorkTaskRunResult {
         task_id: config.task_id.to_string(),
@@ -1815,7 +1838,7 @@ fn complete_review_task(
             next_status,
             None,
         );
-        config.store.write_work_item(&completed_item)?;
+        write_task_work_item(config.store, &completed_item)?;
     }
 
     Ok(WorkTaskRunResult {
@@ -2475,7 +2498,7 @@ fn complete_tester_task(
             next_status,
             None,
         );
-        config.store.write_work_item(&completed_item)?;
+        write_task_work_item(config.store, &completed_item)?;
     }
 
     Ok(WorkTaskRunResult {
@@ -2699,7 +2722,7 @@ fn mark_task_failed(
             &mut item.attempts[attempt_index],
             AttemptStatus::Failed,
         );
-        store.write_work_item(&item)?;
+        write_task_work_item(store, &item)?;
     }
     Ok(())
 }
@@ -2983,7 +3006,7 @@ fn mark_task_failed_attempt_needs_user(
 ) -> Result<()> {
     let pause_kind = task_failure_pause_kind(failure);
     let pause_recovery = task_failure_pause_recovery(failure);
-    let (transitioned, owns_pause) = store.mutate_work_item(work_item_id, |item| {
+    let (transitioned, owns_pause) = mutate_task_work_item(store, work_item_id, |item| {
         let Some((attempt_index, task_index)) =
             find_attempt_task_indexes(item, attempt_id, task_id)
         else {
@@ -3047,7 +3070,7 @@ fn mark_task_failed_attempt_needs_user(
                 // the notification effect below) is preserved instead of clobbered.
                 // The attach is idempotent — the reference is added only when absent
                 // — so a supported resume that re-runs this path never duplicates it.
-                let attach = store.mutate_work_item(work_item_id, |item| {
+                let attach = mutate_task_work_item(store, work_item_id, |item| {
                     let Some((attempt_index, _task_index)) =
                         find_attempt_task_indexes(item, attempt_id, task_id)
                     else {
@@ -14400,6 +14423,17 @@ mod tests {
             !reservation.is_first_write,
             "a corrective Writer must reuse the Attempt baseline even when no final Tester exists"
         );
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "task");
+        assert_eq!(transition.object_id, task_id);
+        assert_eq!(transition.origin, DurableTransitionOrigin::TaskExecutor);
+        assert_eq!(transition.reason.as_deref(), Some("advance Task execution"));
     }
 
     fn corrective_review_item(role: &str) -> WorkItem {

@@ -8,13 +8,44 @@ use crate::content::ContentResolver;
 use crate::git;
 use crate::hooks::{self, HookContext, HookOutcome};
 use crate::work_model::{
-    ArtifactRef, MergeCandidate, MergeCandidateMergeState, MergeCandidateMergeStatus,
-    MergeReviewState, Task, TaskKind, TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError,
-    WorkModelStorageError, WorkModelStore, WorkspaceAccess,
-    resolve_expected_candidate_workspace_path, work_artifact_path,
+    ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, MergeCandidate,
+    MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
+    TaskStatus, WORK_ARTIFACTS_DIR, WorkItem, WorkModelError, WorkModelStorageError,
+    WorkModelStore, WorkspaceAccess, resolve_expected_candidate_workspace_path, work_artifact_path,
 };
 use crate::worktree;
 use crate::{credential, os};
+
+fn landing_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::Landing,
+        reason: Some("advance merge landing".to_string()),
+        evidence_ref: None,
+    }
+}
+
+fn post_land_transition() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::PostLand,
+        reason: Some("record post-land processing".to_string()),
+        evidence_ref: None,
+    }
+}
+
+fn write_landing_work_item(
+    store: &WorkModelStore,
+    item: &WorkItem,
+) -> Result<(), WorkModelStorageError> {
+    store.write_work_item_with_transition(item, &landing_transition())
+}
+
+fn mutate_landing_work_item<T>(
+    store: &WorkModelStore,
+    id: &str,
+    reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+) -> Result<T, WorkModelStorageError> {
+    store.mutate_work_item_with_transition(id, &landing_transition(), reducer)
+}
 
 #[derive(Clone, Copy)]
 pub struct WorkMergeConfig<'a> {
@@ -712,7 +743,7 @@ fn record_follow_up_failure(
                 message: message.to_string(),
                 next_action: next_action.to_string(),
             });
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(&item, &post_land_transition())?;
     }
     Ok(())
 }
@@ -731,7 +762,7 @@ fn clear_follow_up_failure(
         && candidate.merge_state.follow_up_failure.is_some()
     {
         candidate.merge_state.follow_up_failure = None;
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(&item, &post_land_transition())?;
     }
     Ok(())
 }
@@ -1941,7 +1972,7 @@ fn update_candidate(
             )
         })?;
     update(candidate);
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -2427,7 +2458,7 @@ fn add_rebase_task_to_attempt(
         .find(|a| a.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
     attempt.tasks.push(task);
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -2515,78 +2546,71 @@ fn settle_reserved_rebase_together(
     let rebase_task_id = rebase_task_id.to_string();
     let candidate_id = candidate_id.to_string();
     let diagnostic = diagnostic.to_string();
-    config
-        .store
-        .mutate_work_item(config.work_item_id, move |item| {
-            let attempt_idx = item
-                .attempts
-                .iter()
-                .position(|a| a.id == attempt_id)
-                .ok_or(WorkModelError::AttemptNotFound {
-                    id: attempt_id.clone(),
-                })?;
-            let task_idx = item.attempts[attempt_idx]
-                .tasks
-                .iter()
-                .position(|t| t.id == rebase_task_id)
-                .ok_or(WorkModelError::TaskNotFound {
-                    id: rebase_task_id.clone(),
-                })?;
-            let candidate_idx = item
-                .merge_candidates
-                .iter()
-                .position(|c| c.id == candidate_id)
-                .ok_or(WorkModelError::MergeCandidateNotFound {
-                    candidate_id: candidate_id.clone(),
-                })?;
+    mutate_landing_work_item(config.store, config.work_item_id, move |item| {
+        let attempt_idx = item
+            .attempts
+            .iter()
+            .position(|a| a.id == attempt_id)
+            .ok_or(WorkModelError::AttemptNotFound {
+                id: attempt_id.clone(),
+            })?;
+        let task_idx = item.attempts[attempt_idx]
+            .tasks
+            .iter()
+            .position(|t| t.id == rebase_task_id)
+            .ok_or(WorkModelError::TaskNotFound {
+                id: rebase_task_id.clone(),
+            })?;
+        let candidate_idx = item
+            .merge_candidates
+            .iter()
+            .position(|c| c.id == candidate_id)
+            .ok_or(WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate_id.clone(),
+            })?;
 
-            // Decide ONE joint disposition from both peers' current states first.
-            let candidate_state = &item.merge_candidates[candidate_idx].merge_state;
-            let candidate_merged = candidate_state.status == MergeCandidateMergeStatus::Merged
-                && candidate_state.merged_commit.is_some();
-            let candidate_failed = candidate_state.status == MergeCandidateMergeStatus::Failed;
-            let task_failed =
-                item.attempts[attempt_idx].tasks[task_idx].status == TaskStatus::Failed;
-            let settlement = if candidate_merged {
-                RebaseSettlement::Merged
-            } else if hard_failure || task_failed || candidate_failed {
-                RebaseSettlement::Failed
-            } else {
-                RebaseSettlement::NeedsUser
-            };
+        // Decide ONE joint disposition from both peers' current states first.
+        let candidate_state = &item.merge_candidates[candidate_idx].merge_state;
+        let candidate_merged = candidate_state.status == MergeCandidateMergeStatus::Merged
+            && candidate_state.merged_commit.is_some();
+        let candidate_failed = candidate_state.status == MergeCandidateMergeStatus::Failed;
+        let task_failed = item.attempts[attempt_idx].tasks[task_idx].status == TaskStatus::Failed;
+        let settlement = if candidate_merged {
+            RebaseSettlement::Merged
+        } else if hard_failure || task_failed || candidate_failed {
+            RebaseSettlement::Failed
+        } else {
+            RebaseSettlement::NeedsUser
+        };
 
-            // Apply the SAME joint disposition to both entities. Only the Merged arm may
-            // leave (or complete) the Task in a preserved state; a non-Merged disposition
-            // FORCES the Task to match its Candidate — including downgrading an
-            // inconsistent pre-existing `Complete`, which is only ever valid beside a
-            // Merged Candidate — so the peers can never be persisted as a split.
-            let task = &mut item.attempts[attempt_idx].tasks[task_idx];
-            match settlement {
-                RebaseSettlement::Merged => settle_task_terminal(task, TaskStatus::Complete),
-                RebaseSettlement::Failed => {
-                    force_non_merged_task_terminal(task, TaskStatus::Failed)
-                }
-                RebaseSettlement::NeedsUser => {
-                    force_non_merged_task_terminal(task, TaskStatus::NeedsUser)
-                }
+        // Apply the SAME joint disposition to both entities. Only the Merged arm may
+        // leave (or complete) the Task in a preserved state; a non-Merged disposition
+        // FORCES the Task to match its Candidate — including downgrading an
+        // inconsistent pre-existing `Complete`, which is only ever valid beside a
+        // Merged Candidate — so the peers can never be persisted as a split.
+        let task = &mut item.attempts[attempt_idx].tasks[task_idx];
+        match settlement {
+            RebaseSettlement::Merged => settle_task_terminal(task, TaskStatus::Complete),
+            RebaseSettlement::Failed => force_non_merged_task_terminal(task, TaskStatus::Failed),
+            RebaseSettlement::NeedsUser => {
+                force_non_merged_task_terminal(task, TaskStatus::NeedsUser)
             }
-            let candidate = &mut item.merge_candidates[candidate_idx];
-            match settlement {
-                // A landed Candidate is left exactly as it merged.
-                RebaseSettlement::Merged => {}
-                RebaseSettlement::Failed => settle_candidate_terminal(
-                    candidate,
-                    MergeCandidateMergeStatus::Failed,
-                    &diagnostic,
-                ),
-                RebaseSettlement::NeedsUser => settle_candidate_terminal(
-                    candidate,
-                    MergeCandidateMergeStatus::NeedsUser,
-                    &diagnostic,
-                ),
+        }
+        let candidate = &mut item.merge_candidates[candidate_idx];
+        match settlement {
+            // A landed Candidate is left exactly as it merged.
+            RebaseSettlement::Merged => {}
+            RebaseSettlement::Failed => {
+                settle_candidate_terminal(candidate, MergeCandidateMergeStatus::Failed, &diagnostic)
             }
-            Ok(())
-        })?;
+            RebaseSettlement::NeedsUser => settle_candidate_terminal(
+                candidate,
+                MergeCandidateMergeStatus::NeedsUser,
+                &diagnostic,
+            ),
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2693,7 +2717,7 @@ fn update_rebase_task_status(
     } else {
         task.status = status;
     }
-    store.write_work_item(&item)?;
+    write_landing_work_item(store, &item)?;
     Ok(())
 }
 
@@ -2858,7 +2882,7 @@ fn regenerate_provenance(
         )),
     };
 
-    store.mutate_work_item(work_item_id, |item| {
+    mutate_landing_work_item(store, work_item_id, |item| {
         let canonical_writer_id = {
             let attempt = item
                 .attempts
@@ -4168,6 +4192,17 @@ mod tests {
             }],
         )
         .unwrap();
+
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "merge-candidate");
+        assert_eq!(transition.object_id, candidate_id);
+        assert_eq!(transition.origin, DurableTransitionOrigin::Landing);
 
         (
             tmp,

@@ -7689,18 +7689,18 @@ fn external_work_transition_updates_linked_thread() {
         .unwrap();
     runner.report_thread_work("1.0").unwrap();
     let delivered_before_idle_tick = runner.slack().deliveries.len();
-    let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
-        reason: Some("capacity available".into()),
-        evidence_ref: Some("scheduler:42".into()),
-    };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition("work-external", &metadata, |item| {
-            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
-                fluent::work_model::ExecutionAuthority::Human,
-            );
-            Ok(())
-        })
+        .mutate_work_item_from_external(
+            "work-external",
+            "external controller approved execution",
+            Some("external:request-42".into()),
+            |item| {
+                item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                    fluent::work_model::ExecutionAuthority::Human,
+                );
+                Ok(())
+            },
+        )
         .unwrap();
     runner.poll_linked_work().unwrap();
     let delivery = runner.slack().deliveries[delivered_before_idle_tick..]
@@ -7713,8 +7713,91 @@ fn external_work_transition_updates_linked_thread() {
             )
         });
     assert!(delivery.text.contains("Work Item work-external"));
-    assert!(delivery.text.contains("Origin: scheduler"));
-    assert!(delivery.text.contains("Evidence: scheduler:42"));
+    assert!(delivery.text.contains("Origin: external"));
+    assert!(
+        delivery
+            .text
+            .contains("Next action: external controller approved execution")
+    );
+    assert!(delivery.text.contains("Evidence: external:request-42"));
+}
+
+#[test]
+fn typed_lifecycle_origins_replay_to_the_linked_slack_thread() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    let owners = [
+        ("work-scheduler", "Scheduler"),
+        ("work-attempt", "AttemptExecutor"),
+        ("work-task", "TaskExecutor"),
+        ("work-landing", "Landing"),
+        ("work-post-land", "PostLand"),
+    ];
+    let planned = owners
+        .iter()
+        .map(|(id, _)| PlannedWork::new(*id, *id))
+        .collect::<Vec<_>>();
+    runner
+        .approve_thread_plan("1.0", "U1", "slice-origins", &planned)
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    for (work_item_id, variant) in owners {
+        let origin = match variant {
+            "Scheduler" => fluent::work_model::DurableTransitionOrigin::Scheduler,
+            "AttemptExecutor" => fluent::work_model::DurableTransitionOrigin::AttemptExecutor,
+            "TaskExecutor" => fluent::work_model::DurableTransitionOrigin::TaskExecutor,
+            "Landing" => fluent::work_model::DurableTransitionOrigin::Landing,
+            "PostLand" => fluent::work_model::DurableTransitionOrigin::PostLand,
+            _ => unreachable!(),
+        };
+        store
+            .mutate_work_item_with_transition(
+                work_item_id,
+                &fluent::work_model::DurableTransitionMetadata {
+                    origin,
+                    reason: Some(format!("{variant} changed durable state")),
+                    evidence_ref: Some(format!("owner:{work_item_id}")),
+                },
+                |item| {
+                    item.authorization =
+                        fluent::work_model::ExecutionAuthorization::execution_ready(
+                            fluent::work_model::ExecutionAuthority::Human,
+                        );
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    runner.poll_linked_work().unwrap();
+    for (work_item_id, variant) in owners {
+        let rendered =
+            variant
+                .chars()
+                .enumerate()
+                .fold(String::new(), |mut value, (index, character)| {
+                    if character.is_ascii_uppercase() && index > 0 {
+                        value.push('-');
+                    }
+                    value.push(character.to_ascii_lowercase());
+                    value
+                });
+        assert!(runner.slack().deliveries.iter().any(|delivery| {
+            delivery.text.contains(work_item_id)
+                && delivery.text.contains(&format!("Origin: {rendered}"))
+                && delivery.text.contains(&format!("owner:{work_item_id}"))
+        }));
+    }
 }
 
 #[test]

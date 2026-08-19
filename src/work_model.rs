@@ -7356,6 +7356,37 @@ impl WorkModelStore {
         self.write_work_item_file(work_item, false, Some(&fluent_transition_metadata()))
     }
 
+    /// Replace an aggregate and atomically attribute any derived transitions.
+    pub fn write_work_item_with_transition(
+        &self,
+        work_item: &WorkItem,
+        metadata: &DurableTransitionMetadata,
+    ) -> Result<(), WorkModelStorageError> {
+        self.write_work_item_file(work_item, false, Some(metadata))
+    }
+
+    /// Mutate an aggregate on behalf of an explicitly identified external caller.
+    ///
+    /// Keeping this provenance on a named API prevents internal lifecycle owners
+    /// from being mislabeled as external merely because they use typed metadata.
+    pub fn mutate_work_item_from_external<T>(
+        &self,
+        id: &str,
+        reason: impl Into<String>,
+        evidence_ref: Option<String>,
+        reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+    ) -> Result<T, WorkModelStorageError> {
+        self.mutate_work_item_with_transition(
+            id,
+            &DurableTransitionMetadata {
+                origin: DurableTransitionOrigin::External,
+                reason: Some(reason.into()),
+                evidence_ref,
+            },
+            reducer,
+        )
+    }
+
     /// Atomically mutate a Work Item under its per-Work-Item model lock.
     ///
     /// Acquires the stable model lock once, recovers any pending transaction,

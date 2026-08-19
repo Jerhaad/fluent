@@ -957,15 +957,20 @@ fn resolve_bound_attempt_id(project_root: &Path, work_item_id: &str) -> Result<S
 /// Ensure exactly the bound Attempt exists, creating it once when absent.
 fn ensure_bound_attempt(project_root: &Path, work_item_id: &str, attempt_id: &str) -> Result<()> {
     let store = WorkModelStore::new(project_root);
-    let mut item = store.read_work_item(work_item_id)?;
-    if item.attempts.iter().any(|a| a.id == attempt_id) {
-        return Ok(());
-    }
     let coder_mapping = crate::work_model::resolve_coder_mapping(
         &crate::config::attempt_creation_inputs(project_root)?,
     )?;
-    item.add_initial_attempt_with_coder_mapping(attempt_id, coder_mapping)?;
-    store.write_work_item(&item)?;
+    let metadata = crate::work_model::DurableTransitionMetadata {
+        origin: crate::work_model::DurableTransitionOrigin::Scheduler,
+        reason: Some("bind queued Work to an Attempt".to_string()),
+        evidence_ref: Some(format!("queue:{}", work_item_id)),
+    };
+    store.mutate_work_item_with_transition(work_item_id, &metadata, |item| {
+        if item.attempts.iter().any(|attempt| attempt.id == attempt_id) {
+            return Ok(());
+        }
+        item.add_initial_attempt_with_coder_mapping(attempt_id, coder_mapping)
+    })?;
     Ok(())
 }
 
@@ -2456,6 +2461,25 @@ mod tests {
                     crate::coder::CoderKind::Pi
                 );
                 assert_eq!(attempt.coder_mapping.review.model, "scheduled-review");
+                let attempt_transition = item
+                    .transitions
+                    .iter()
+                    .find(|transition| {
+                        transition.object_kind == "attempt" && transition.object_id == attempt_id
+                    })
+                    .unwrap();
+                assert_eq!(
+                    attempt_transition.origin,
+                    crate::work_model::DurableTransitionOrigin::Scheduler
+                );
+                assert_eq!(
+                    attempt_transition.reason.as_deref(),
+                    Some("bind queued Work to an Attempt")
+                );
+                assert_eq!(
+                    item.transitions.last().unwrap().origin,
+                    crate::work_model::DurableTransitionOrigin::Scheduler
+                );
                 Ok(AttemptOutcome::CandidateReady)
             }
         }

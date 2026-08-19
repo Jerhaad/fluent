@@ -224,7 +224,14 @@ fn mark_auto_merge_skipped(store: &WorkModelStore, work_item_id: &str, candidate
         {
             candidate.merge_state.auto_merge_skipped = Some(true);
         }
-        store.write_work_item(&item)?;
+        store.write_work_item_with_transition(
+            &item,
+            &crate::work_model::DurableTransitionMetadata {
+                origin: crate::work_model::DurableTransitionOrigin::Landing,
+                reason: Some("skip automatic landing".to_string()),
+                evidence_ref: None,
+            },
+        )?;
         Ok(())
     })();
     if let Err(err) = result {
