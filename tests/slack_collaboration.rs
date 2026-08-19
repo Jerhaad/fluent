@@ -484,6 +484,25 @@ fn setup_validates_complete_collaboration_authority() {
             .to_string()
             .contains("participant or approver")
     );
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .project_approvers
+        .remove("U9");
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("invalid user".into());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("Slack identity")
+    );
 }
 
 #[test]

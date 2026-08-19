@@ -58,6 +58,17 @@ impl RunnerConfig {
             {
                 bail!("project {key} has incomplete participant or approver authority");
             }
+            if !project
+                .allowed_participants
+                .iter()
+                .chain(project.project_approvers.iter())
+                .all(|identity| {
+                    !identity.is_empty()
+                        && identity.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+            {
+                bail!("project {key} has an invalid Slack identity");
+            }
         }
         if self.enabled_providers.is_empty() {
             bail!("at least one conversation provider is required");
