@@ -2666,6 +2666,20 @@ fn approver_switches_provider_without_changing_work() {
 }
 
 #[test]
+fn approver_cannot_switch_a_completed_thread() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let error = runner.switch_provider("1.0", "U1", "claude").unwrap_err();
+    assert!(error.to_string().contains("interrupted Fluent thread"));
+}
+
+#[test]
 fn committed_code_reference_uses_commit_pinned_github_link() {
     let (_home, checkout, config) = setup(true);
     std::process::Command::new("git")
