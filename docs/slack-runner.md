@@ -51,15 +51,14 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Pin every checkout label, identity, branch, commit, and allowed participant.
-    Set `enabled_providers` to the locally enabled conversation providers. Set
-   `project_approvers` to the allowed participants who may authorize planning,
-    execution, resume, and landing actions; it must be a subset of
-    `allowed_participants`.
-    Set `project_approvers` to the allowed participants who may approve Brief,
-   Behaviors, Approach, and Plan revisions. Every project approver must also
-   appear in `allowed_participants`; add a person's `U...` member ID to both
-    lists when they may contribute and advance planning. A valid policy may omit
-    project approvers, but then no one can advance a planning revision.
+   Set `enabled_providers` to the locally enabled conversation providers. Set
+   `project_approvers` to the allowed participants who may approve Brief,
+   Behaviors, Approach, and Plan revisions or authorize execution, resume, and
+   landing actions. Every project approver must also appear in
+   `allowed_participants`; add a person's `U...` member ID to both lists when
+   they may contribute and approve actions. A valid policy may omit project
+   approvers, but then no one can approve a planning revision or authorize the
+   other lifecycle actions.
    The identity binds the canonical checkout and Git administrative directory
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
@@ -101,10 +100,12 @@ channel has no available default project, Fluent keeps the thread unbound and
 offers the configured projects; it does not grant provider checkout access
 until an allowed participant selects an available project.
 
-Fluent presents approvers with a revision-bound **Approve** control for each
-planning, execution, resume, or landing request. The control authorizes only
-the displayed action and revision. A participant may contribute context, but
-only a configured project approver may use that control or confirm the action.
+Fluent presents approvers with a revision-bound **Approve** control when it
+requests authorization for a lifecycle action. The control authorizes only the
+displayed action and revision. Completed or revised planning artifacts follow
+the separate thread reply flow described below. A participant may contribute
+context, but only a configured project approver may use the control or approve
+a planning revision.
 
 ## Review planning artifacts
 
