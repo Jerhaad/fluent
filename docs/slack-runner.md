@@ -160,6 +160,16 @@ the thread under the same checkout, allowed-participant, and project-approver
 policy as a channel. Reinstall the app after updating its manifest so Slack can
 deliver `message.im` events and grant the `im:history` scope.
 
+## Ask about code
+
+Participants can ask code questions in a bound Fluent thread. Fluent keeps
+source locations repository-relative and includes line numbers. When the code
+is committed and the checkout has a supported GitHub remote, Fluent posts a
+permalink pinned to the exact commit. For uncommitted code or repositories
+without a supported remote, Fluent labels the reference as local-only and
+posts a bounded excerpt or diff instead of claiming a durable link. Replies
+never expose the runner's absolute checkout path.
+
 ## Provider policy and recovery
 
 `default_provider` selects the provider for a new thread; omit a selection to
@@ -181,8 +191,9 @@ mention. For example:
 The requested name must appear in the project's `enabled_providers` list. The
 runner validates it before binding a thread. When a turn is interrupted, a
 configured project approver can post `@Fluent [provider=claude]` (or `codex`)
-in that thread. Fluent switches adapters and immediately sends the preserved
-turn through the selected provider without changing scheduler-owned Work.
+in that thread. Fluent switches adapters, queues the preserved turn, and
+resumes it when fair provider capacity is available without changing
+scheduler-owned Work.
 Rate-limited turns retain the provider's retry deadline and resume
 automatically; replies received meanwhile are acknowledged, retained in Slack
 order, and sent together as the next attributed turn. If the exact bound
