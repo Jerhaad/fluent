@@ -499,6 +499,7 @@ impl ConversationProvider for InMemoryProvider {
 pub struct InMemorySlack {
     pub acknowledgements: Vec<String>,
     pub deliveries: Vec<OutboundDelivery>,
+    pub private_responses: Vec<(String, String, String)>,
 }
 impl SlackTransport for InMemorySlack {
     fn acknowledge(&mut self, event_id: &str) -> Result<()> {
@@ -507,6 +508,10 @@ impl SlackTransport for InMemorySlack {
     }
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
         self.deliveries.push(delivery.clone());
+        Ok(())
+    }
+    fn respond_private(&mut self, channel: &str, user: &str, text: &str) -> Result<()> {
+        self.private_responses.push((channel.into(), user.into(), text.into()));
         Ok(())
     }
 }
@@ -748,11 +753,13 @@ mod tests {
                 commit,
             },
             allowed_participants: ["U1".into()].into_iter().collect(),
+            project_approvers: ["U1".into()].into_iter().collect(),
         };
         let mut config = RunnerConfig {
             workspace: "workspace".into(),
             projects: BTreeMap::new(),
             channel_defaults: BTreeMap::new(),
+            enabled_providers: ["codex".into()].into_iter().collect(),
         };
         config.projects.insert("app".into(), project);
         config.channel_defaults.insert("C1".into(), "app".into());
@@ -839,6 +846,7 @@ mod tests {
                     commit,
                 },
                 allowed_participants: ["U1".into()].into_iter().collect(),
+                project_approvers: ["U1".into()].into_iter().collect(),
             },
         );
         let mut r = CollaborationRunner::new(

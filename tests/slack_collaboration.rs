@@ -190,6 +190,29 @@ fn non_approver_gets_private_explanation_while_thread_waits() {
 }
 
 #[test]
+fn reconnect_applies_still_current_planning_approval() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    runner.reconnect([event("E2", Some("1.0"), "y")], "reconnected".into()).unwrap();
+    assert_eq!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap().approvals.len(), 1);
+}
+
+#[test]
+fn reconnect_reconfirms_delayed_consequential_action() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Landing)).unwrap();
+    runner.reconnect([event("E2", Some("1.0"), "y")], "reconnected".into()).unwrap();
+    let thread = FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap();
+    assert!(thread.approvals.is_empty());
+    assert!(thread.pending_question.as_deref().unwrap().contains("fresh confirmation"));
+    assert!(runner.slack().deliveries.iter().any(|delivery| delivery.text.contains("Fresh confirmation")));
+}
+
+#[test]
 fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
     let envelope = decode_socket_mode_envelope(
         r#"{"envelope_id":"ENV1","payload":{"event_id":"EV1","event":{"channel":"C1","ts":"1.0","thread_ts":"0.9","user":"U1","text":"continue"}}}"#,
