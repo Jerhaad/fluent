@@ -992,8 +992,8 @@ mod tests {
 
         let sandbox_usable = Command::new("/usr/bin/sandbox-exec")
             .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
-            .status()
-            .map(|status| status.success())
+            .output()
+            .map(|output| output.status.success())
             .unwrap_or(false);
         if sandbox_usable {
             let own_session = own_temp.join("session");
@@ -1003,9 +1003,12 @@ mod tests {
                 .arg("/bin/mkdir")
                 .arg("-p")
                 .arg(&own_session)
-                .status()
+                .output()
                 .unwrap();
-            assert!(own.success(), "the task-owned Claude temp must be writable");
+            assert!(
+                own.status.success(),
+                "the task-owned Claude temp must be writable"
+            );
 
             let sibling = Command::new("/usr/bin/sandbox-exec")
                 .arg("-f")
@@ -1013,10 +1016,10 @@ mod tests {
                 .arg("/bin/mkdir")
                 .arg("-p")
                 .arg(sibling_temp.join("session"))
-                .status()
+                .output()
                 .unwrap();
             assert!(
-                !sibling.success(),
+                !sibling.status.success(),
                 "a sibling Claude temp namespace must remain denied"
             );
         }
