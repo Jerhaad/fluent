@@ -41,7 +41,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    For example, write this policy to `config.json`:
 
    ```json
-   {"workspace":"example","enabled_providers":["codex","claude"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex","claude"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
+   {"workspace":"example","enabled_providers":["codex","claude"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex","claude"],"project_approvers":["U123"],"github_remote":"https://github.com/example/app"}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
    ```
 
    Print the machine-local opaque `identity` with:

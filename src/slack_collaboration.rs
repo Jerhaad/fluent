@@ -1044,6 +1044,7 @@ mod tests {
             default_provider: "codex".into(),
             enabled_providers: ["codex".into()].into_iter().collect(),
             project_approvers: ["U1".into()].into_iter().collect(),
+            github_remote: None,
         };
         let mut config = RunnerConfig {
             workspace: "workspace".into(),
@@ -1143,6 +1144,7 @@ mod tests {
                 default_provider: "codex".into(),
                 enabled_providers: ["codex".into()].into_iter().collect(),
                 project_approvers: ["U1".into()].into_iter().collect(),
+                github_remote: None,
             },
         );
         let mut r = CollaborationRunner::new(

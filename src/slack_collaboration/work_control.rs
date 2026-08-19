@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 use crate::work_model::{
-    DurableTransitionMetadata, ExecutionAuthority, ExecutionAuthorization, WorkItem,
-    WorkModelStore, validate_work_item_id,
+    DurableTransitionMetadata, DurableWorkTransition, ExecutionAuthority, ExecutionAuthorization,
+    WorkItem, WorkModelStore, validate_work_item_id,
 };
 
 /// A Work Item approved as part of one Slack Slice plan.
@@ -433,23 +433,7 @@ impl WorkControl {
                 .iter()
                 .filter(|entry| entry.sequence > cursor)
             {
-                reported.push(WorkTransition {
-                    sequence: entry.sequence,
-                    work_item_id: work_item_id.clone(),
-                    object_id: entry.object_id.clone(),
-                    old_state: entry.old_state.clone(),
-                    new_state: entry.new_state.clone(),
-                    origin: entry.origin.clone(),
-                    reason: entry.reason.clone(),
-                    evidence_ref: entry.evidence_ref.clone(),
-                    object_kind: entry.object_kind.clone(),
-                    occurred_at: Some(entry.occurred_at.clone()),
-                    elapsed_seconds: entry.elapsed_seconds,
-                    candidate_commit: None,
-                    comparison_base: None,
-                    completed_tests: Vec::new(),
-                    completed_reviews: Vec::new(),
-                });
+                reported.push(project_durable_transition(work_item_id, &item, entry));
                 slice
                     .transition_cursors
                     .insert(work_item_id.clone(), entry.sequence);
@@ -490,23 +474,7 @@ impl WorkControl {
                 item.transitions
                     .iter()
                     .filter(|entry| entry.sequence > cursor)
-                    .map(|entry| WorkTransition {
-                        sequence: entry.sequence,
-                        work_item_id: work_item_id.clone(),
-                        object_id: entry.object_id.clone(),
-                        old_state: entry.old_state.clone(),
-                        new_state: entry.new_state.clone(),
-                        origin: entry.origin.clone(),
-                        reason: entry.reason.clone(),
-                        evidence_ref: entry.evidence_ref.clone(),
-                        object_kind: entry.object_kind.clone(),
-                        occurred_at: Some(entry.occurred_at.clone()),
-                        elapsed_seconds: entry.elapsed_seconds,
-                        candidate_commit: None,
-                        comparison_base: None,
-                        completed_tests: Vec::new(),
-                        completed_reviews: Vec::new(),
-                    }),
+                    .map(|entry| project_durable_transition(work_item_id, &item, entry)),
             );
         }
         pending.sort_by(|left, right| {
@@ -673,6 +641,55 @@ impl WorkControl {
             .project_root
             .join(".fluent/work/slack/slices")
             .join(format!("{slice_id}.json")))
+    }
+}
+
+fn project_durable_transition(
+    work_item_id: &str,
+    item: &WorkItem,
+    entry: &DurableWorkTransition,
+) -> WorkTransition {
+    let candidate = (entry.object_kind == "merge-candidate")
+        .then(|| {
+            item.merge_candidates
+                .iter()
+                .find(|candidate| candidate.id == entry.object_id)
+        })
+        .flatten();
+    WorkTransition {
+        sequence: entry.sequence,
+        work_item_id: work_item_id.to_owned(),
+        object_id: entry.object_id.clone(),
+        old_state: entry.old_state.clone(),
+        new_state: entry.new_state.clone(),
+        origin: entry.origin.clone(),
+        reason: entry.reason.clone(),
+        evidence_ref: entry.evidence_ref.clone(),
+        object_kind: entry.object_kind.clone(),
+        occurred_at: Some(entry.occurred_at.clone()),
+        elapsed_seconds: entry.elapsed_seconds,
+        candidate_commit: candidate.map(|value| value.candidate_commit.clone()),
+        comparison_base: candidate.map(|value| value.target_branch.clone()),
+        completed_tests: candidate
+            .map(|value| {
+                value
+                    .merge_state
+                    .check_artifacts
+                    .iter()
+                    .map(|artifact| artifact.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        completed_reviews: candidate
+            .map(|value| {
+                value
+                    .merge_state
+                    .review_artifacts
+                    .iter()
+                    .map(|artifact| artifact.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

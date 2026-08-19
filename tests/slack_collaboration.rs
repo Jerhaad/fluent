@@ -67,6 +67,7 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
         default_provider: "codex".into(),
         enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
         project_approvers: BTreeSet::from(["U1".into()]),
+        github_remote: Some("https://github.com/acme/app".into()),
     };
     let mut config = RunnerConfig {
         workspace: "workspace".into(),
@@ -6127,6 +6128,7 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
             default_provider: "codex".into(),
             enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U2".into()]),
+            github_remote: None,
         },
     );
     let mut runner = CollaborationRunner::new(
@@ -7223,6 +7225,140 @@ fn ready_candidate_offers_github_review_without_creating_pr() {
     assert!(reply.contains("/commit/abc123"));
     assert!(reply.contains("/compare/base123...abc123"));
     assert!(reply.contains("Optionally create a pull request"));
+}
+
+#[test]
+fn runner_posts_durable_ready_candidate_evidence_and_links() {
+    use fluent::work_model::{
+        ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, MergeCandidate,
+        MergeCandidateMergeState, MergeCandidateMergeStatus, MergeReviewState, Task, TaskKind,
+        TaskOutput, TaskStatus, WorkspaceAccess, WorkspaceRef,
+    };
+
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-ready-runner",
+            &[PlannedWork::new("work-ready-runner", "Ready")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+
+    let workspace = WorkspaceRef {
+        id: "workspace-ready".into(),
+        path: "/tmp/workspace-ready".into(),
+    };
+    let target = WorkspaceRef {
+        id: "target-ready".into(),
+        path: checkout.path().display().to_string(),
+    };
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("fluent".into()),
+        reason: Some("candidate passed required gates".into()),
+        evidence_ref: Some("candidate/evidence.json".into()),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition("work-ready-runner", Some(&metadata), |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            item.attempts.push(Attempt {
+                id: "attempt-ready".into(),
+                work_item_id: item.id.clone(),
+                status: AttemptStatus::Complete,
+                review_state: Some(AttemptReviewState::Passed),
+                tasks: vec![Task {
+                    id: "write-ready".into(),
+                    kind: TaskKind::Write,
+                    status: TaskStatus::Complete,
+                    role: "writer".into(),
+                    instructions: None,
+                    work_item_id: item.id.clone(),
+                    attempt_id: Some("attempt-ready".into()),
+                    workspace_access: WorkspaceAccess {
+                        reads: vec![target.clone()],
+                        writes: vec![workspace.clone()],
+                    },
+                    artifact_area: None,
+                    review_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: Some(TaskOutput {
+                        workspace_id: workspace.id.clone(),
+                        workspace_path: workspace.path.clone(),
+                        source_branch: "main".into(),
+                        base_commit: Some("base123".into()),
+                        commit: "abc123".into(),
+                        no_change: None,
+                        learner_canonicalization: None,
+                    }),
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                }],
+                ..Default::default()
+            });
+            item.merge_candidates.push(MergeCandidate {
+                id: "candidate-ready-runner".into(),
+                attempt_id: "attempt-ready".into(),
+                source_workspace: workspace.clone(),
+                target_workspace: target.clone(),
+                source_branch: "main".into(),
+                target_branch: "main".into(),
+                candidate_commit: "abc123".into(),
+                merge_review_state: MergeReviewState::Passed,
+                merge_state: MergeCandidateMergeState {
+                    status: MergeCandidateMergeStatus::Pending,
+                    check_artifacts: vec![ArtifactRef {
+                        producer_id: "tester".into(),
+                        path: "tester/result.json".into(),
+                    }],
+                    review_artifacts: vec![ArtifactRef {
+                        producer_id: "reviews".into(),
+                        path: "reviews/result.json".into(),
+                    }],
+                    ..Default::default()
+                },
+                created_at: None,
+                ready_at: None,
+                started_at: None,
+                completed_at: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+    runner.report_thread_work("1.0").unwrap();
+    let reply = runner
+        .slack()
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.text.contains("candidate-ready-runner"))
+        .unwrap();
+    assert!(reply.text.contains("is now ready"));
+    assert!(reply.text.contains("Commit: abc123"));
+    assert!(reply.text.contains("Tests: tester/result.json"));
+    assert!(reply.text.contains("Reviews: reviews/result.json"));
+    assert!(reply.text.contains("Evidence: candidate/evidence.json"));
+    assert!(
+        reply
+            .text
+            .contains("https://github.com/acme/app/commit/abc123")
+    );
+    assert!(reply.text.contains("/compare/main...abc123"));
+    assert!(reply.text.contains("Optionally create a pull request"));
 }
 
 #[test]

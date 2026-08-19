@@ -27,6 +27,8 @@ pub struct ConfiguredProject {
     pub enabled_providers: BTreeSet<String>,
     #[serde(default)]
     pub project_approvers: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_remote: Option<String>,
 }
 
 fn default_conversation_provider() -> String {
@@ -98,6 +100,13 @@ impl RunnerConfig {
             {
                 bail!("project {key} has an invalid Slack identity");
             }
+            if project
+                .github_remote
+                .as_deref()
+                .is_some_and(|remote| !supported_github_remote(remote))
+            {
+                bail!("project {key} has an unsupported GitHub remote");
+            }
         }
         for (channel, project) in &self.channel_defaults {
             if channel.trim().is_empty() || !self.projects.contains_key(project) {
@@ -111,6 +120,15 @@ impl RunnerConfig {
         }
         Ok(())
     }
+}
+
+fn supported_github_remote(remote: &str) -> bool {
+    let Some(path) = remote.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty() && owner.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)) && repo.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)))
 }
 
 /// Filesystem authority resolved at the provider interface boundary.

@@ -1590,7 +1590,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 ),
                 channel: thread.channel.clone(),
                 thread_timestamp: thread.id.clone(),
-                text: control.render_actionable_transition(transition, &evidence, None),
+                text: control.render_actionable_transition(
+                    transition,
+                    &evidence,
+                    project.github_remote.as_deref(),
+                ),
                 delivered: false,
                 update_timestamp: None,
             })

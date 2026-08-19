@@ -8191,10 +8191,17 @@ fn durable_object_states(work_item: &WorkItem) -> Vec<(String, String, String, O
         })
     }));
     states.extend(work_item.merge_candidates.iter().map(|candidate| {
+        let state = if candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+            && candidate.merge_review_state == MergeReviewState::Passed
+        {
+            "ready".to_owned()
+        } else {
+            format!("{:?}", candidate.merge_state.status).to_lowercase()
+        };
         (
             "merge-candidate".into(),
             candidate.id.clone(),
-            format!("{:?}", candidate.merge_state.status).to_lowercase(),
+            state,
             candidate.merge_state.failure_reason.clone(),
         )
     }));
