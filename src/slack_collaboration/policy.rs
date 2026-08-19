@@ -13,7 +13,7 @@ pub(super) fn participant_can_contribute(
             .projects
             .get(project_label)
             .is_some_and(|project| project.allowed_participants.contains(&event.user)),
-        None => match config.channel_defaults.get(&event.channel) {
+        None => match default_project(config, &event.channel) {
             Some(project_label) => config
                 .projects
                 .get(project_label)
@@ -269,4 +269,11 @@ mod tests {
                 .is_some_and(|question| question.contains("fresh confirmation"))
         );
     }
+
+pub(super) fn default_project<'a>(config: &'a RunnerConfig, destination: &str) -> Option<&'a str> {
+    config
+        .channel_defaults
+        .get(destination)
+        .or_else(|| config.direct_message_defaults.get(destination))
+        .map(String::as_str)
 }

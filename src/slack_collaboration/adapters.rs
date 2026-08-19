@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::content::ContentResolver;
 
 use super::{
-    ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderScope, ProviderTurnRecovery,
-    RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
+    ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderScope,
+    ProviderTurnRecovery, RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus,
+    SlackTransport,
 };
 
 pub struct LocalSchedulerClient {

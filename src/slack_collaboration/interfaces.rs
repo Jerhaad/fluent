@@ -31,6 +31,7 @@ pub struct RunnerConfig {
     pub projects: BTreeMap<String, ConfiguredProject>,
     pub channel_defaults: BTreeMap<String, String>,
     #[serde(default)]
+    pub direct_message_defaults: BTreeMap<String, String>,
     pub enabled_providers: BTreeSet<String>,
 }
 
@@ -76,6 +77,11 @@ impl RunnerConfig {
         for (channel, project) in &self.channel_defaults {
             if channel.trim().is_empty() || !self.projects.contains_key(project) {
                 bail!("channel default references an unavailable configured project");
+            }
+        }
+        for (conversation, project) in &self.direct_message_defaults {
+            if conversation.trim().is_empty() || !self.projects.contains_key(project) {
+                bail!("direct-message default references an unavailable configured project");
             }
         }
         Ok(())

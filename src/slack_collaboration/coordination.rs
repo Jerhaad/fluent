@@ -291,7 +291,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             InboundChange::Delete => return self.apply_deletion(event, thread),
             InboundChange::Message => {}
         }
-        if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
+        if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
+            && self.offer_linked_thread_if_requested(&event, &mut thread)?
+        {
+        } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
             thread.pending_turn = Some(PendingTurn {
@@ -393,7 +397,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     }
 
     fn apply_edit(&mut self, event: InboundEnvelope, mut thread: FluentThread) -> Result<()> {
-        if let Some(turn) = thread.pending_turn.as_mut().filter(|turn| turn.action_id == event.timestamp) {
+        if let Some(turn) = thread
+            .pending_turn
+            .as_mut()
+            .filter(|turn| turn.action_id == event.timestamp)
+        {
             turn.contribution = event.text;
             return self.store.save_thread(&self.config, &thread);
         }
@@ -433,11 +441,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(config)
     }
     fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
-        let default = self
-            .config
-            .channel_defaults
-            .get(&event.channel)
-            .and_then(|p| self.config.projects.get(p));
+        let default = policy::default_project(&self.config, &event.channel)
+            .and_then(|project| self.config.projects.get(project));
         let available = default.filter(|p| {
             p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
         });
@@ -478,6 +483,28 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             )?;
         }
         Ok(())
+    }
+
+    fn offer_linked_thread_if_requested(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+    ) -> Result<bool> {
+        let Some(project) = event.text.strip_prefix("project: ").map(str::trim) else {
+            return Ok(false);
+        };
+        if !self.config.projects.contains_key(project)
+            || thread.project_label.as_deref() == Some(project)
+        {
+            return Ok(false);
+        }
+        thread.linked_thread_intent = Some(project.into());
+        self.store.save_thread(&self.config, thread)?;
+        self.queue_reply(
+            event,
+            &format!("This thread remains bound to its original project. Start a linked Fluent thread for project {project}."),
+        )?;
+        Ok(true)
     }
     fn complete_pending_turn(
         &mut self,

@@ -68,6 +68,7 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
         workspace: "workspace".into(),
         projects: BTreeMap::from([("app".into(), project)]),
         channel_defaults: BTreeMap::new(),
+        direct_message_defaults: BTreeMap::new(),
         enabled_providers: BTreeSet::from(["codex".into()]),
     };
     if default {
@@ -80,7 +81,10 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
 fn planning_artifact_renders_exact_revision_in_thread() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
-        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let source = "# Brief\n\nUse `exact` Markdown.\n";
@@ -99,10 +103,18 @@ fn planning_artifact_renders_exact_revision_in_thread() {
 
 #[test]
 fn large_planning_artifact_preserves_exact_content_across_messages() {
-    let source = format!("{}🙂{}", "a".repeat(SLACK_MESSAGE_CONTENT_LIMIT - 2), "b".repeat(8));
+    let source = format!(
+        "{}🙂{}",
+        "a".repeat(SLACK_MESSAGE_CONTENT_LIMIT - 2),
+        "b".repeat(8)
+    );
     let parts = split_artifact_markdown(&source, SLACK_MESSAGE_CONTENT_LIMIT);
     assert!(parts.len() > 1);
-    assert!(parts.iter().all(|part| part.len() <= SLACK_MESSAGE_CONTENT_LIMIT));
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.len() <= SLACK_MESSAGE_CONTENT_LIMIT)
+    );
     assert_eq!(parts.concat(), source);
 }
 
@@ -110,14 +122,23 @@ fn large_planning_artifact_preserves_exact_content_across_messages() {
 fn planning_artifact_waits_for_existing_approval_gate() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
-        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let revision = runner
         .present_planning_artifact("1.0", "plan", "# Plan\n")
         .unwrap();
-    assert!(runner.approve_planning_revision("1.0", "different", "U1").is_err());
-    runner.approve_planning_revision("1.0", &revision.id, "U1").unwrap();
+    assert!(
+        runner
+            .approve_planning_revision("1.0", "different", "U1")
+            .is_err()
+    );
+    runner
+        .approve_planning_revision("1.0", &revision.id, "U1")
+        .unwrap();
 }
 
 #[test]
@@ -125,13 +146,20 @@ fn queued_message_edit_replaces_unprocessed_content() {
     let (home, _checkout, config) = setup(true);
     let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
-        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
     thread.pending_turn = Some(PendingTurn {
-        action_id: "2.0".into(), contribution: "before".into(), actor: "U1".into(),
-        starts_session: false, provider_turn_id: None, completed_reply: None,
+        action_id: "2.0".into(),
+        contribution: "before".into(),
+        actor: "U1".into(),
+        starts_session: false,
+        provider_turn_id: None,
+        completed_reply: None,
     });
     store.save_thread(&config, &thread).unwrap();
     let mut edit = event("E2", Some("1.0"), "after");
@@ -147,7 +175,10 @@ fn processed_message_edit_becomes_attributed_correction() {
     let (home, _checkout, config) = setup(true);
     let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
-        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut edit = event("E2", Some("1.0"), "correction");
@@ -155,7 +186,10 @@ fn processed_message_edit_becomes_attributed_correction() {
     runner.ingest(edit).unwrap();
     let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
     assert_eq!(reloaded.conversation_inputs[0].content, "@Fluent hello");
-    assert_eq!(reloaded.conversation_inputs[0].corrections[0].content, "correction");
+    assert_eq!(
+        reloaded.conversation_inputs[0].corrections[0].content,
+        "correction"
+    );
 }
 
 #[test]
@@ -163,7 +197,10 @@ fn processed_message_deletion_preserves_audited_context() {
     let (home, _checkout, config) = setup(true);
     let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
-        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut deletion = event("E2", Some("1.0"), "");
@@ -178,7 +215,10 @@ fn processed_message_deletion_preserves_audited_context() {
 fn unauthorized_thread_reply_receives_private_refusal() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
-        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut reply = event("E2", Some("1.0"), "private thought");
@@ -193,7 +233,10 @@ fn unauthorized_thread_reply_does_not_reach_agent() {
     let (home, _checkout, config) = setup(true);
     let store = FileCollaborationStore::new(home.path());
     let mut runner = CollaborationRunner::new(
-        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let before = store.load_thread(&config, "1.0").unwrap().unwrap();
@@ -203,6 +246,126 @@ fn unauthorized_thread_reply_does_not_reach_agent() {
     runner.ingest(reply).unwrap();
     assert_eq!(runner.provider().calls.len(), calls);
     assert_eq!(store.load_thread(&config, "1.0").unwrap().unwrap(), before);
+}
+
+#[test]
+fn direct_message_uses_same_fluent_thread_contract() {
+    let (home, checkout, mut config) = setup(false);
+    config
+        .direct_message_defaults
+        .insert("D1".into(), "app".into());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    let mut request = event("E1", None, "@Fluent plan this");
+    request.channel = "D1".into();
+    runner.ingest(request).unwrap();
+    assert_eq!(runner.provider().calls[0].1, checkout.path());
+    assert_eq!(runner.slack().deliveries[0].channel, "D1");
+}
+
+#[test]
+fn single_workspace_runner_routes_multiple_projects_and_conversations() {
+    let (home, _checkout, mut config) = setup(true);
+    let other = TempDir::new().unwrap();
+    let (identity, commit) = initialize_checkout(other.path());
+    config.projects.insert(
+        "other".into(),
+        ConfiguredProject {
+            label: "other".into(),
+            checkout: Checkout {
+                label: "other-main".into(),
+                path: other.path().into(),
+                identity,
+                branch: "main".into(),
+                commit,
+            },
+            allowed_participants: BTreeSet::from(["U1".into()]),
+        },
+    );
+    config.channel_defaults.insert("C2".into(), "other".into());
+    config
+        .direct_message_defaults
+        .insert("D1".into(), "other".into());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent app work"))
+        .unwrap();
+    let mut second = event("E2", None, "@Fluent other work");
+    second.channel = "C2".into();
+    second.timestamp = "2.0".into();
+    runner.ingest(second).unwrap();
+    let mut dm = event("E3", None, "@Fluent dm work");
+    dm.channel = "D1".into();
+    dm.timestamp = "3.0".into();
+    runner.ingest(dm).unwrap();
+    assert_eq!(runner.provider().calls.len(), 3);
+    assert_ne!(runner.provider().calls[0].1, runner.provider().calls[1].1);
+    assert_eq!(runner.provider().calls[1].1, runner.provider().calls[2].1);
+}
+
+#[test]
+fn project_change_preserves_binding_and_offers_linked_thread() {
+    let (home, checkout, mut config) = setup(true);
+    let other = TempDir::new().unwrap();
+    let (identity, commit) = initialize_checkout(other.path());
+    config.projects.insert(
+        "other".into(),
+        ConfiguredProject {
+            label: "other".into(),
+            checkout: Checkout {
+                label: "other-main".into(),
+                path: other.path().into(),
+                identity,
+                branch: "main".into(),
+                commit,
+            },
+            allowed_participants: BTreeSet::from(["U1".into()]),
+        },
+    );
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent app work"))
+        .unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "project: other"))
+        .unwrap();
+    let thread = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(thread.project_label.as_deref(), Some("app"));
+    assert_eq!(thread.linked_thread_intent.as_deref(), Some("other"));
+    assert_eq!(runner.provider().calls.len(), 1);
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains("linked Fluent thread")
+    );
+    assert!(
+        !runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains(&checkout.path().display().to_string())
+    );
 }
 fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
     InboundEnvelope {
@@ -2521,6 +2684,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         pending_question: None,
         artifact_revisions: Vec::new(),
         pending_artifact_revision: None,
+        linked_thread_intent: None,
         conversation_inputs: Vec::new(),
         pending_action: None,
         approvals: Vec::new(),

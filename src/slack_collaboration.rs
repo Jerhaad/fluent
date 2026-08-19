@@ -762,6 +762,7 @@ mod tests {
             workspace: "workspace".into(),
             projects: BTreeMap::new(),
             channel_defaults: BTreeMap::new(),
+            direct_message_defaults: BTreeMap::new(),
             enabled_providers: ["codex".into()].into_iter().collect(),
         };
         config.projects.insert("app".into(), project);

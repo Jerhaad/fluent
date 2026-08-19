@@ -227,6 +227,8 @@ pub struct FluentThread {
     #[serde(default)]
     pub pending_artifact_revision: Option<String>,
     #[serde(default)]
+    pub linked_thread_intent: Option<String>,
+    #[serde(default)]
     pub conversation_inputs: Vec<ConversationInput>,
     pub pending_action: Option<PendingAction>,
     #[serde(default)]
@@ -263,6 +265,7 @@ impl FluentThread {
             pending_question: None,
             artifact_revisions: Vec::new(),
             pending_artifact_revision: None,
+            linked_thread_intent: None,
             conversation_inputs: Vec::new(),
             pending_action: None,
             approvals: Vec::new(),

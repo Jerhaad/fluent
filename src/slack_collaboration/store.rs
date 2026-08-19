@@ -464,6 +464,7 @@ fn save_thread_with_crash(
         private_mapping.pending_question = None;
         private_mapping.artifact_revisions.clear();
         private_mapping.pending_artifact_revision = None;
+        private_mapping.linked_thread_intent = None;
         private_mapping.conversation_inputs.clear();
         private_mapping.processed_events.clear();
         private_mapping.last_connection = None;
