@@ -491,6 +491,14 @@ pub struct DurableTransitionMetadata {
 pub const MAX_TRANSITION_REASON_BYTES: usize = 1_024;
 pub const MAX_TRANSITION_EVIDENCE_BYTES: usize = 512;
 
+fn fluent_transition_metadata() -> DurableTransitionMetadata {
+    DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::Fluent,
+        reason: None,
+        evidence_ref: None,
+    }
+}
+
 impl WorkItem {
     pub fn compatibility_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -7152,7 +7160,16 @@ impl WorkModelStore {
     }
 
     pub fn create_work_item(&self, work_item: &WorkItem) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file(work_item, true)
+        self.write_work_item_file(work_item, true, &fluent_transition_metadata())
+    }
+
+    /// Create a Work Item and atomically attribute its initial lifecycle state.
+    pub fn create_work_item_with_transition(
+        &self,
+        work_item: &WorkItem,
+        metadata: &DurableTransitionMetadata,
+    ) -> Result<(), WorkModelStorageError> {
+        self.write_work_item_file(work_item, true, metadata)
     }
 
     /// Preserve approved managed input files and publish their Work Item through
@@ -7291,6 +7308,7 @@ impl WorkModelStore {
             }
         }
 
+        append_durable_transitions(None, &mut target, &fluent_transition_metadata());
         if let Err(error) = self.write_work_item_file_unchecked(&target, true) {
             let transaction_path = self.work_transaction_path(&target.id)?;
             if !item_path.exists() && !transaction_path.exists() && artifact_root.exists() {
@@ -7308,7 +7326,7 @@ impl WorkModelStore {
     }
 
     pub fn write_work_item(&self, work_item: &WorkItem) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file(work_item, false)
+        self.write_work_item_file(work_item, false, &fluent_transition_metadata())
     }
 
     /// Atomically mutate a Work Item under its per-Work-Item model lock.
@@ -7328,15 +7346,7 @@ impl WorkModelStore {
         id: &str,
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
-        self.mutate_work_item_with_transition(
-            id,
-            &DurableTransitionMetadata {
-                origin: DurableTransitionOrigin::Fluent,
-                reason: None,
-                evidence_ref: None,
-            },
-            reducer,
-        )
+        self.mutate_work_item_with_transition(id, &fluent_transition_metadata(), reducer)
     }
 
     /// Mutate an aggregate and atomically attribute any derived transitions.
@@ -7374,6 +7384,7 @@ impl WorkModelStore {
         &self,
         work_item: &WorkItem,
         create_new: bool,
+        metadata: &DurableTransitionMetadata,
     ) -> Result<(), WorkModelStorageError> {
         let path = self.work_item_path(&work_item.id)?;
         if !create_new {
@@ -7407,15 +7418,7 @@ impl WorkModelStore {
         if let Some(prior) = prior.as_ref() {
             reject_transition_history_change(prior, &target, &path)?;
         }
-        append_durable_transitions(
-            prior.as_ref(),
-            &mut target,
-            &DurableTransitionMetadata {
-                origin: DurableTransitionOrigin::Fluent,
-                reason: None,
-                evidence_ref: None,
-            },
-        );
+        append_durable_transitions(prior.as_ref(), &mut target, metadata);
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
             .storage_revision

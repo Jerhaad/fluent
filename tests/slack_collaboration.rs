@@ -6527,6 +6527,35 @@ fn approved_plan_creates_reported_work_without_execution() {
         .unwrap();
     assert!(work.authorization.is_proposed());
     assert!(work.attempts.is_empty());
+    assert_eq!(work.transitions.len(), 1);
+    assert_eq!(work.transitions[0].object_kind, "work-item");
+    assert_eq!(work.transitions[0].object_id, "work-1");
+    assert_eq!(work.transitions[0].new_state, "planned");
+    assert_eq!(
+        work.transitions[0].origin,
+        fluent::work_model::DurableTransitionOrigin::SlackThread
+    );
+    let planned_replies = runner
+        .slack()
+        .deliveries
+        .iter()
+        .filter(|delivery| {
+            delivery.id.contains(":work-transition:work-1:")
+                && delivery.text.contains("is now planned")
+                && delivery.text.contains("Origin: slack-thread")
+        })
+        .count();
+    assert_eq!(planned_replies, 1);
+    assert!(runner.report_thread_work("1.0").unwrap().is_empty());
+    assert_eq!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.id.contains(":work-transition:work-1:"))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -6771,6 +6800,18 @@ fn durable_work_transition_posts_detailed_thread_reply() {
         delivery.text.contains("Planned Work Items: work-runner")
             && delivery.text.contains("Execution has not started")
     }));
+    let planned = runner.report_thread_work("1.0").unwrap();
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].object_kind, "work-item");
+    assert_eq!(planned[0].object_id, "work-runner");
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("work-item work-runner")
+            && delivery.text.contains("is now planned")
+            && delivery.text.contains("Origin: slack-thread")
+            && delivery.text.contains("Next action: Plan approved by U1")
+            && delivery.text.contains("Evidence: slack-slice:slice-runner")
+    }));
+    assert!(runner.report_thread_work("1.0").unwrap().is_empty());
 
     runner
         .authorize_thread_execution("1.0", "U1", &Scheduler)
@@ -6838,6 +6879,105 @@ fn durable_work_transition_posts_detailed_thread_reply() {
             && delivery.text.contains("Elapsed:")
             && delivery.text.contains("requested recovery decision")
     }));
+
+    let source = fluent::work_model::WorkspaceRef {
+        id: "b4-source".into(),
+        path: "/tmp/b4-source".into(),
+    };
+    let target = fluent::work_model::WorkspaceRef {
+        id: "b4-target".into(),
+        path: checkout.path().display().to_string(),
+    };
+    let landed = fluent::work_model::DurableTransitionMetadata {
+        origin: fluent::work_model::DurableTransitionOrigin::Landing,
+        reason: Some("candidate passed required gates".into()),
+        evidence_ref: Some("candidate/evidence.json".into()),
+    };
+    store
+        .mutate_work_item_with_transition("work-runner", &landed, |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::Complete;
+            item.attempts[0].review_state = Some(fluent::work_model::AttemptReviewState::Passed);
+            item.attempts[0].tasks.push(fluent::work_model::Task {
+                id: "task-runner".into(),
+                kind: fluent::work_model::TaskKind::Write,
+                status: fluent::work_model::TaskStatus::Complete,
+                role: "writer".into(),
+                instructions: None,
+                work_item_id: item.id.clone(),
+                attempt_id: Some("attempt-runner".into()),
+                workspace_access: fluent::work_model::WorkspaceAccess {
+                    reads: vec![target.clone()],
+                    writes: vec![source.clone()],
+                },
+                artifact_area: None,
+                review_context: None,
+                evidence_review_context: None,
+                input_artifacts: Vec::new(),
+                depends_on: None,
+                output: Some(fluent::work_model::TaskOutput {
+                    workspace_id: source.id.clone(),
+                    workspace_path: source.path.clone(),
+                    source_branch: "main".into(),
+                    base_commit: Some("base-b4".into()),
+                    commit: "commit-b4".into(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                }),
+                created_at: None,
+                started_at: None,
+                completed_at: None,
+            });
+            item.merge_candidates
+                .push(fluent::work_model::MergeCandidate {
+                    id: "candidate-runner".into(),
+                    attempt_id: "attempt-runner".into(),
+                    source_workspace: source.clone(),
+                    target_workspace: target.clone(),
+                    source_branch: "main".into(),
+                    target_branch: "main".into(),
+                    candidate_commit: "commit-b4".into(),
+                    merge_review_state: fluent::work_model::MergeReviewState::Passed,
+                    merge_state: fluent::work_model::MergeCandidateMergeState::default(),
+                    created_at: None,
+                    ready_at: None,
+                    started_at: None,
+                    completed_at: None,
+                });
+            Ok(())
+        })
+        .unwrap();
+
+    let before = runner.slack().deliveries.len();
+    let transitions = runner.report_thread_work("1.0").unwrap();
+    assert!(transitions.iter().any(|transition| {
+        transition.object_kind == "task"
+            && transition.object_id == "task-runner"
+            && transition.new_state == "complete"
+    }));
+    assert!(transitions.iter().any(|transition| {
+        transition.object_kind == "merge-candidate"
+            && transition.object_id == "candidate-runner"
+            && transition.new_state == "ready"
+    }));
+    let replies = &runner.slack().deliveries[before..];
+    for (kind, id, state) in [
+        ("task", "task-runner", "complete"),
+        ("merge-candidate", "candidate-runner", "ready"),
+    ] {
+        assert!(replies.iter().any(|delivery| {
+            delivery.text.contains(&format!("{kind} {id}"))
+                && delivery.text.contains(&format!("is now {state}"))
+                && delivery.text.contains("Work Item work-runner")
+                && delivery.text.contains("Origin: landing")
+                && delivery
+                    .text
+                    .contains("Next action: candidate passed required gates")
+                && delivery.text.contains("Evidence: candidate/evidence.json")
+        }));
+    }
+    let delivered = runner.slack().deliveries.len();
+    assert!(runner.report_thread_work("1.0").unwrap().is_empty());
+    assert_eq!(runner.slack().deliveries.len(), delivered);
 }
 
 #[test]

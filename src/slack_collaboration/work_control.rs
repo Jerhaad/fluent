@@ -216,6 +216,11 @@ impl WorkControl {
         }
 
         let store = WorkModelStore::new(&self.project_root);
+        let metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::SlackThread,
+            reason: Some(format!("Plan approved by {approver}")),
+            evidence_ref: Some(format!("slack-slice:{slice_id}")),
+        };
         for work in planned_work {
             let item = WorkItem {
                 id: work.id.clone(),
@@ -223,9 +228,11 @@ impl WorkControl {
                 authorization: ExecutionAuthorization::Proposed,
                 ..WorkItem::default()
             };
-            store.create_work_item(&item).with_context(|| {
-                format!("create planned Work Item {} for Slice {slice_id}", work.id)
-            })?;
+            store
+                .create_work_item_with_transition(&item, &metadata)
+                .with_context(|| {
+                    format!("create planned Work Item {} for Slice {slice_id}", work.id)
+                })?;
         }
         let slice = SliceWork {
             id: slice_id.into(),
