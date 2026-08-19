@@ -985,6 +985,10 @@ mod tests {
             !content.contains(&sibling_rule),
             "the profile must not grant a sibling Claude temp namespace"
         );
+        assert!(
+            !content.contains("(allow file-write* (subpath \"/private/tmp\"))"),
+            "the profile must not grant the shared temp namespace"
+        );
 
         let sandbox_usable = Command::new("/usr/bin/sandbox-exec")
             .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
