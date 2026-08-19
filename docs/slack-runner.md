@@ -194,6 +194,12 @@ configured project approver can post `@Fluent [provider=claude]` (or `codex`)
 in that thread. Fluent switches adapters, queues the preserved turn, and
 resumes it when fair provider capacity is available without changing
 scheduler-owned Work.
+Fluent reports authentication requirements, denied runner-host credential
+access, unavailable runtimes, incompatible provider protocols, and rate
+limits as distinct recovery states. Failed turns stay durable, and the status
+offers provider switching when the project has a configured approver. Restore
+host credentials for access denials; update Fluent or the provider executable
+when their structured-session protocols are incompatible.
 Rate-limited turns retain the provider's retry deadline and resume
 automatically; replies received meanwhile are acknowledged, retained in Slack
 order, and sent together as the next attributed turn. If the exact bound
