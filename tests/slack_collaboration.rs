@@ -690,7 +690,7 @@ fn committed_setup_fixture() -> (
         .load_thread(&runner.config, "1.0")
         .unwrap()
         .unwrap();
-    let config = runner.config;
+    let config = runner.config.clone();
     let checkout = TempDir::new().unwrap();
     initialize_checkout(checkout.path());
     let (index, review) = initialized_review(checkout.path());
@@ -702,6 +702,7 @@ fn committed_setup_fixture() -> (
         "U1",
     )
     .unwrap();
+    drop(runner);
     (home, checkout, config, index, committed, thread)
 }
 
@@ -754,12 +755,14 @@ fn enablement_with_goal_promotes_setup_thread_to_first_slice() {
     .unwrap();
 
     assert_eq!(thread.conversation, history_before);
+    assert!(thread.slice.is_none());
     assert!(
         thread
-            .slice
+            .linked_thread_intent
             .as_deref()
             .is_some_and(|slice| slice.starts_with("slack-"))
     );
+    assert!(thread.pending_turn.is_some());
     assert_eq!(thread.planning_stage.as_deref(), Some("brief"));
     assert_eq!(
         thread.conversation_inputs.last().unwrap().content,
@@ -786,6 +789,253 @@ fn enablement_only_request_creates_no_slice() {
     assert!(thread.slice.is_none());
     assert!(thread.planning_stage.is_none());
     assert!(thread.conversation_inputs.is_empty());
+}
+
+#[test]
+fn slack_enablement_request_drives_init_review_commit_and_binding() {
+    struct SlackInit;
+    impl ConfiguredInitBoundary for SlackInit {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            fs::create_dir(checkout.join(".fluent"))?;
+            fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "initialized through Slack".into(),
+            })
+        }
+    }
+
+    let home = TempDir::new().unwrap();
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let config = RunnerConfig {
+        workspace: "workspace".into(),
+        projects: BTreeMap::new(),
+        channel_defaults: BTreeMap::new(),
+        direct_message_defaults: BTreeMap::new(),
+        enabled_providers: BTreeSet::from(["codex".into()]),
+    };
+    let root = ProjectDiscoveryRoot {
+        label: "payments".into(),
+        path: checkout.path().into(),
+        maximum_depth: 0,
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+    };
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.configure_project_enablement(vec![root], Box::new(SlackInit));
+
+    runner
+        .ingest(event(
+            "ENABLE1",
+            None,
+            "@Fluent enable project goal: add payment audit logging",
+        ))
+        .unwrap();
+    let offer = runner
+        .slack()
+        .deliveries
+        .last()
+        .unwrap()
+        .text
+        .lines()
+        .find(|line| line.contains(" — project payments; checkout "))
+        .unwrap()
+        .split_once(" —")
+        .unwrap()
+        .0
+        .to_owned();
+    assert!(
+        !runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains(&checkout.path().display().to_string())
+    );
+
+    runner
+        .ingest(event(
+            "ENABLE2",
+            Some("1.0"),
+            &format!("select checkout {offer} profile codex-balanced mode propose"),
+        ))
+        .unwrap();
+    let setup_reply = &runner.slack().deliveries.last().unwrap().text;
+    let setup_revision = setup_reply
+        .split("approve setup ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(['`', '.'])
+        .to_owned();
+    assert!(setup_reply.contains("No checkout changes have been made"));
+
+    runner
+        .ingest(event(
+            "ENABLE3",
+            Some("1.0"),
+            &format!("approve setup {setup_revision}"),
+        ))
+        .unwrap();
+    let review_reply = &runner.slack().deliveries.last().unwrap().text;
+    assert!(review_reply.contains(".fluent/config.yaml"));
+    let review_revision = review_reply
+        .split("commit initialization ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(['`', '.'])
+        .to_owned();
+
+    runner
+        .ingest(event(
+            "ENABLE4",
+            Some("1.0"),
+            &format!("commit initialization {review_revision}"),
+        ))
+        .unwrap();
+
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains("enablement is complete")
+    );
+    let reloaded = read_config(home.path()).unwrap();
+    assert!(checkout_is_available(
+        &reloaded.projects["payments"].checkout
+    ));
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&reloaded, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.project_label.as_deref(), Some("payments"));
+    assert_eq!(thread.planning_stage.as_deref(), Some("brief"));
+    assert_eq!(
+        thread.conversation_inputs.last().unwrap().content,
+        "add payment audit logging"
+    );
+}
+
+#[test]
+fn slack_enablement_route_reuses_initialized_and_hides_unauthorized_checkout() {
+    struct NoInit;
+    impl ConfiguredInitBoundary for NoInit {
+        fn initialize(
+            &mut self,
+            _: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            panic!("initialized checkout must be reused")
+        }
+    }
+    let home = TempDir::new().unwrap();
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    fs::create_dir(checkout.path().join(".fluent")).unwrap();
+    fs::write(
+        checkout.path().join(".fluent/config.yaml"),
+        "follow-up: execute\n",
+    )
+    .unwrap();
+    let config = RunnerConfig {
+        workspace: "workspace".into(),
+        projects: BTreeMap::new(),
+        channel_defaults: BTreeMap::new(),
+        direct_message_defaults: BTreeMap::new(),
+        enabled_providers: BTreeSet::from(["codex".into()]),
+    };
+    let root = ProjectDiscoveryRoot {
+        label: "existing".into(),
+        path: checkout.path().into(),
+        maximum_depth: 0,
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+    };
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.configure_project_enablement(vec![root], Box::new(NoInit));
+    let before = directory_snapshot(checkout.path());
+    let mut denied = event("DENIED", None, "@Fluent enable project");
+    denied.user = "U2".into();
+    runner.ingest(denied).unwrap();
+    assert!(runner.slack().deliveries.is_empty());
+    assert_eq!(runner.slack().private_responses.len(), 1);
+    assert!(!runner.slack().private_responses[0].2.contains("existing"));
+    assert_eq!(directory_snapshot(checkout.path()), before);
+
+    runner
+        .ingest(event("REUSE1", None, "@Fluent enable project"))
+        .unwrap();
+    let offer = runner
+        .slack()
+        .deliveries
+        .last()
+        .unwrap()
+        .text
+        .lines()
+        .find(|line| line.contains(" — project existing; checkout "))
+        .unwrap()
+        .split_once(" —")
+        .unwrap()
+        .0
+        .to_owned();
+    runner
+        .ingest(event(
+            "REUSE2",
+            Some("1.0"),
+            &format!("select checkout {offer} profile codex-balanced mode execute"),
+        ))
+        .unwrap();
+    let revision = runner
+        .slack()
+        .deliveries
+        .last()
+        .unwrap()
+        .text
+        .split("approve setup ")
+        .nth(1)
+        .unwrap()
+        .trim_end_matches(['`', '.'])
+        .to_owned();
+    runner
+        .ingest(event(
+            "REUSE3",
+            Some("1.0"),
+            &format!("approve setup {revision}"),
+        ))
+        .unwrap();
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .last()
+            .unwrap()
+            .text
+            .contains("existing Fluent configuration is ready")
+    );
+    assert!(
+        read_config(home.path())
+            .unwrap()
+            .projects
+            .contains_key("existing")
+    );
 }
 
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {

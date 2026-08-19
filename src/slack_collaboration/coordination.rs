@@ -61,6 +61,61 @@ fn sanitize_provider_reply(reply: &str, checkout: &Path) -> String {
         .collect()
 }
 
+fn project_enablement_request(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("enable project") || normalized.contains("enable an existing project")
+}
+
+fn enablement_goal(text: &str) -> Option<String> {
+    text.split_once("goal:")
+        .map(|(_, goal)| goal.trim().to_owned())
+        .filter(|goal| !goal.is_empty())
+}
+
+fn parse_checkout_selection(text: &str) -> Option<(&str, &str, &str)> {
+    let fields = text.split_whitespace().collect::<Vec<_>>();
+    match fields.as_slice() {
+        [
+            "select",
+            "checkout",
+            selection,
+            "profile",
+            profile,
+            "mode",
+            mode,
+        ] => Some((selection, profile, mode)),
+        _ => None,
+    }
+}
+
+fn render_initialization_review(review: &InitializationReview) -> String {
+    review
+        .generated_changes
+        .iter()
+        .map(|change| {
+            let before = change
+                .before
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_else(|| "<absent>".into());
+            let after = change
+                .after
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_else(|| "<deleted>".into());
+            format!(
+                "{} ({} -> {})\n--- before\n{}\n+++ after\n{}",
+                change.path,
+                change.before_mode.as_deref().unwrap_or("absent"),
+                change.after_mode.as_deref().unwrap_or("deleted"),
+                before,
+                after
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Fair, bounded admission for provider turns. A thread may hold at most one
 /// slot, and waiting threads are admitted in first-ready order.
 #[derive(Debug)]
@@ -129,6 +184,8 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     recovering_event: bool,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     turn_pool: FairTurnPool,
+    project_discovery_roots: Vec<ProjectDiscoveryRoot>,
+    configured_init: Option<Box<dyn ConfiguredInitBoundary + 'a>>,
 }
 
 impl<'a, P: ConversationProvider, S: SlackTransport>
@@ -191,7 +248,18 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .as_secs()
             }),
             turn_pool: FairTurnPool::new(capacity),
+            project_discovery_roots: Vec::new(),
+            configured_init: None,
         }
+    }
+
+    pub fn configure_project_enablement(
+        &mut self,
+        roots: Vec<ProjectDiscoveryRoot>,
+        boundary: Box<dyn ConfiguredInitBoundary + 'a>,
+    ) {
+        self.project_discovery_roots = roots;
+        self.configured_init = Some(boundary);
     }
     pub fn provider(&self) -> &P {
         &self.provider
@@ -764,6 +832,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 &FluentThread::new(&event),
                 &event,
             )
+            && !(project_enablement_request(&event.text)
+                && self.participant_can_setup_project(&event.user))
         {
             return self.slack.respond_private(
                 &event.channel,
@@ -776,7 +846,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.store
                 .bind_inbox_event(&self.config, &event.id, project_label)?;
         }
-        if !policy::participant_can_contribute(&self.config, &thread, &event) {
+        let setup_event = project_enablement_request(&event.text)
+            || decode_project_setup_state(thread.pending_question.as_deref())?.is_some();
+        if !policy::participant_can_contribute(&self.config, &thread, &event)
+            && !(setup_event && self.participant_can_setup_project(&event.user))
+        {
             return self.slack.respond_private(
                 &event.channel,
                 &event.user,
@@ -842,6 +916,17 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             } else {
                 Ok(())
             };
+        }
+        if thread.state == ThreadState::WaitingForProject
+            && (project_enablement_request(&event.text)
+                || decode_project_setup_state(thread.pending_question.as_deref())?.is_some())
+        {
+            if !thread.processed_events.insert(event.id.clone()) {
+                return Ok(());
+            }
+            if self.handle_project_enablement(&event, &mut thread)? {
+                return self.store.save_thread(&self.config, &thread);
+            }
         }
         if !thread.processed_events.insert(event.id.clone()) {
             return Ok(());
@@ -1158,6 +1243,228 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             )?;
         }
         Ok(())
+    }
+
+    fn participant_can_setup_project(&self, participant: &str) -> bool {
+        self.project_discovery_roots
+            .iter()
+            .any(|root| root.allowed_participants.contains(participant))
+    }
+
+    fn handle_project_enablement(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+    ) -> Result<bool> {
+        let state = decode_project_setup_state(thread.pending_question.as_deref())?;
+        if project_enablement_request(&event.text) {
+            let index = discover_project_checkouts(&self.project_discovery_roots, &event.user)?;
+            let offers = index.offers();
+            if offers.is_empty() {
+                self.slack.respond_private(
+                    &event.channel,
+                    &event.user,
+                    "No project checkout is available to you.",
+                )?;
+                return Ok(true);
+            }
+            let goal = enablement_goal(&event.text);
+            thread.pending_question = Some(encode_project_setup_state(
+                &SlackProjectSetupState::Selecting { goal },
+            )?);
+            self.store.save_thread(&self.config, thread)?;
+            let labels = offers
+                .iter()
+                .map(|offer| {
+                    format!(
+                        "{} — project {}; checkout {}",
+                        offer.selection_id, offer.project_label, offer.checkout_label
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.queue_reply(
+                event,
+                &format!(
+                    "Available project checkouts:\n{labels}\nReply `select checkout <id> profile <profile> mode <propose|execute>`."
+                ),
+            )?;
+            return Ok(true);
+        }
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        match state {
+            SlackProjectSetupState::Selecting { goal } => {
+                let Some((selection, profile, mode)) = parse_checkout_selection(&event.text) else {
+                    self.queue_reply(
+                        event,
+                        "Choose a checkout with `select checkout <id> profile <profile> mode <propose|execute>`.",
+                    )?;
+                    return Ok(true);
+                };
+                let index = discover_project_checkouts(&self.project_discovery_roots, &event.user)?;
+                let proposal = prepare_slack_project_setup(
+                    &index,
+                    selection,
+                    SlackInitChoices {
+                        coder_profile: profile.into(),
+                        follow_up_mode: mode.into(),
+                        write_coder: None,
+                        write_model: None,
+                        write_effort: None,
+                        review_coder: None,
+                        review_model: None,
+                        review_effort: None,
+                    },
+                )?;
+                thread.pending_question = Some(encode_project_setup_state(
+                    &SlackProjectSetupState::AwaitingSetupApproval {
+                        proposal: proposal.clone(),
+                        goal,
+                    },
+                )?);
+                self.store.save_thread(&self.config, thread)?;
+                self.queue_reply(
+                    event,
+                    &format!(
+                        "Proposed setup: project {}; checkout {}; profile {}; follow-up mode {}. No checkout changes have been made. A project approver may reply `approve setup {}`.",
+                        proposal.project_label,
+                        proposal.checkout_label,
+                        proposal.choices.coder_profile,
+                        proposal.choices.follow_up_mode,
+                        proposal.revision
+                    ),
+                )?;
+            }
+            SlackProjectSetupState::AwaitingSetupApproval { proposal, goal } => {
+                let Some(revision) = event.text.trim().strip_prefix("approve setup ") else {
+                    self.queue_reply(
+                        event,
+                        "Project setup is waiting for its exact approval revision.",
+                    )?;
+                    return Ok(true);
+                };
+                if self.recovering_event {
+                    self.queue_reply(
+                        event,
+                        "Fresh confirmation is required before Fluent can initialize this checkout.",
+                    )?;
+                    return Ok(true);
+                }
+                let index = discover_project_checkouts(&self.project_discovery_roots, &event.user)?;
+                let boundary = self
+                    .configured_init
+                    .as_deref_mut()
+                    .context("Slack project setup has no configured initialization boundary")?;
+                match approve_slack_project_setup(
+                    &index,
+                    &proposal,
+                    revision.trim(),
+                    &event.user,
+                    boundary,
+                )? {
+                    SlackSetupOutcome::AlreadyInitialized { configuration } => {
+                        let checkout = index
+                            .entry(&proposal.selection_id)
+                            .context("selected checkout is unavailable")?;
+                        let commit = crate::git::run_stdout(
+                            &checkout.path,
+                            &["rev-parse", "HEAD"],
+                            "record existing Fluent checkout",
+                        )?;
+                        complete_project_enablement(
+                            self.home,
+                            &mut self.config,
+                            &index,
+                            &proposal.selection_id,
+                            &InitializationCommit {
+                                commit,
+                                slack_approver: event.user.clone(),
+                                reviewed_revision: proposal.revision.clone(),
+                            },
+                            thread,
+                            goal.as_deref(),
+                        )?;
+                        self.queue_reply(
+                            event,
+                            &format!(
+                                "The existing Fluent configuration is ready:\n{configuration}"
+                            ),
+                        )?;
+                    }
+                    SlackSetupOutcome::Initialized(review) => {
+                        let rendered = render_initialization_review(&review);
+                        thread.pending_question = Some(encode_project_setup_state(
+                            &SlackProjectSetupState::AwaitingCommitApproval {
+                                selection_id: proposal.selection_id,
+                                review: review.clone(),
+                                goal,
+                            },
+                        )?);
+                        self.store.save_thread(&self.config, thread)?;
+                        self.queue_reply(
+                            event,
+                            &format!(
+                                "Initialization produced these separate changes:\n{rendered}\nA project approver may reply `commit initialization {}`.",
+                                review.revision
+                            ),
+                        )?;
+                    }
+                    SlackSetupOutcome::PreflightFailed { boundary, recovery } => {
+                        self.queue_reply(
+                            event,
+                            &format!(
+                                "Configured initialization failed at the {boundary} boundary. {recovery}"
+                            ),
+                        )?;
+                    }
+                }
+            }
+            SlackProjectSetupState::AwaitingCommitApproval {
+                selection_id,
+                review,
+                goal,
+            } => {
+                let Some(revision) = event.text.trim().strip_prefix("commit initialization ")
+                else {
+                    self.queue_reply(
+                        event,
+                        "Initialization changes are waiting for a distinct commit approval.",
+                    )?;
+                    return Ok(true);
+                };
+                if self.recovering_event {
+                    self.queue_reply(
+                        event,
+                        "Fresh confirmation is required before Fluent can commit initialization changes.",
+                    )?;
+                    return Ok(true);
+                }
+                let index = discover_project_checkouts(&self.project_discovery_roots, &event.user)?;
+                let committed = commit_reviewed_initialization(
+                    &index,
+                    &selection_id,
+                    &review,
+                    revision.trim(),
+                    &event.user,
+                )?;
+                complete_project_enablement(
+                    self.home,
+                    &mut self.config,
+                    &index,
+                    &selection_id,
+                    &committed,
+                    thread,
+                    goal.as_deref(),
+                )?;
+                self.queue_reply(
+                    event,
+                    "Project enablement is complete. The checkout is ready.",
+                )?;
+            }
+        }
+        Ok(true)
     }
 
     fn approve_revision_if_requested(
@@ -2100,6 +2407,14 @@ where
 
     pub fn slack_mut(&mut self) -> &mut S {
         self.runner.slack_mut()
+    }
+
+    pub fn configure_project_enablement(
+        &mut self,
+        roots: Vec<ProjectDiscoveryRoot>,
+        boundary: Box<dyn ConfiguredInitBoundary + 'a>,
+    ) {
+        self.runner.configure_project_enablement(roots, boundary);
     }
 
     #[doc(hidden)]

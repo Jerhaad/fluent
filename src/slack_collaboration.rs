@@ -796,6 +796,13 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
             .expect("static provider registry is valid")
         },
     );
+    let discovery_roots = read_project_discovery_roots(home)?;
+    if !discovery_roots.is_empty() {
+        runner.configure_project_enablement(
+            discovery_roots,
+            Box::new(ExistingConfiguredInitBoundary::new(std::env::current_exe()?)),
+        );
+    }
     let targets = runner.recovery_targets()?;
     let history = runner.slack_mut().bounded_history(&targets)?;
     let connected_at = connection_time();

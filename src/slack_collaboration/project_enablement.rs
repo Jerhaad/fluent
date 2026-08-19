@@ -15,13 +15,69 @@ use super::{
 use crate::setup::{ConfiguredSetup, InitSetupInputs};
 
 /// One runner-owner-approved directory that may contain project checkouts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectDiscoveryRoot {
     pub label: String,
     pub path: PathBuf,
     pub maximum_depth: usize,
     pub allowed_participants: BTreeSet<String>,
     pub project_approvers: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlackProjectSetupState {
+    Selecting {
+        goal: Option<String>,
+    },
+    AwaitingSetupApproval {
+        proposal: SlackSetupProposal,
+        goal: Option<String>,
+    },
+    AwaitingCommitApproval {
+        selection_id: String,
+        review: InitializationReview,
+        goal: Option<String>,
+    },
+}
+
+const SETUP_STATE_PREFIX: &str = "project-setup-v1:";
+
+pub fn encode_project_setup_state(state: &SlackProjectSetupState) -> Result<String> {
+    Ok(format!(
+        "{SETUP_STATE_PREFIX}{}",
+        serde_json::to_string(state)?
+    ))
+}
+
+pub fn decode_project_setup_state(value: Option<&str>) -> Result<Option<SlackProjectSetupState>> {
+    value
+        .and_then(|value| value.strip_prefix(SETUP_STATE_PREFIX))
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(Into::into)
+}
+
+pub fn project_discovery_roots_path(home: &Path) -> PathBuf {
+    home.join(".config/fluent/slack-project-roots.json")
+}
+
+pub fn read_project_discovery_roots(home: &Path) -> Result<Vec<ProjectDiscoveryRoot>> {
+    let path = project_discovery_roots_path(home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let roots: Vec<ProjectDiscoveryRoot> =
+        serde_json::from_slice(&fs::read(path)?).context("read Slack project discovery roots")?;
+    for root in &roots {
+        if root.label.trim().is_empty()
+            || root.maximum_depth > 8
+            || root.allowed_participants.is_empty()
+            || !root.project_approvers.is_subset(&root.allowed_participants)
+        {
+            anyhow::bail!("Slack project discovery root policy is invalid")
+        }
+    }
+    Ok(roots)
 }
 
 /// A path-free checkout choice safe to render in Slack.
@@ -33,9 +89,9 @@ pub struct ProjectCheckoutOffer {
 }
 
 #[derive(Debug, Clone)]
-struct DiscoveredCheckout {
+pub(super) struct DiscoveredCheckout {
     offer: ProjectCheckoutOffer,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     identity: String,
     approvers: BTreeSet<String>,
     allowed_participants: BTreeSet<String>,
@@ -56,7 +112,7 @@ impl ProjectDiscoveryIndex {
             .collect()
     }
 
-    fn entry(&self, selection_id: &str) -> Option<&DiscoveredCheckout> {
+    pub(super) fn entry(&self, selection_id: &str) -> Option<&DiscoveredCheckout> {
         self.entries.get(selection_id)
     }
 }
@@ -772,19 +828,35 @@ pub fn complete_project_enablement(
     thread.provider = Some(default_provider);
     thread.pending_question = None;
     if let Some(goal) = original_goal.filter(|goal| !goal.trim().is_empty()) {
-        thread.slice = Some(format!("slack-{}", thread.id.replace('.', "-")));
+        thread.slice = None;
+        thread.linked_thread_intent = Some(format!("slack-{}", thread.id.replace('.', "-")));
         thread.planning_stage = Some("brief".into());
+        let action_id = format!("setup-goal:{}", committed.commit);
         thread.conversation_inputs.push(super::ConversationInput {
-            event_id: format!("setup-goal:{}", committed.commit),
+            event_id: action_id.clone(),
             source_timestamp: thread.id.clone(),
             actor: committed.slack_approver.clone(),
             content: goal.to_owned(),
             corrections: Vec::new(),
             source_deleted: false,
         });
+        thread.pending_turn = Some(super::PendingTurn {
+            action_id,
+            source_timestamp: thread.id.clone(),
+            contribution: goal.to_owned(),
+            actor: committed.slack_approver.clone(),
+            starts_session: true,
+            provider_turn_id: None,
+            completed_reply: None,
+            dispatch_state: super::PendingTurnDispatchState::Runnable,
+            retry_at_unix_seconds: None,
+            delivery_attempt: 0,
+        });
     } else {
         thread.slice = None;
+        thread.linked_thread_intent = None;
         thread.planning_stage = None;
+        thread.pending_turn = None;
     }
     FileCollaborationStore::new(home).save_thread(config, thread)
 }
