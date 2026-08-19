@@ -251,8 +251,8 @@ gh auth status --hostname github.com
 
 Keep GitHub credentials in the runner owner's `gh` credential store. Do not add
 tokens to Fluent configuration, Slack messages, or provider environments. The
-runner invokes the host-owned `gh` login and pushes the exact reviewed commit to
-the Slice's managed review branch.
+runner uses the host-owned `gh` authentication and pushes the exact reviewed
+commit to the Slice's managed review branch.
 
 After Fluent reports a ready candidate, a project approver requests publication
 in the same thread with `create pull request <candidate-id>`. Fluent polls an
