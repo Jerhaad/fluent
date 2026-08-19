@@ -948,6 +948,31 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
     assert_ne!(client_message_ids[1], client_message_ids[2]);
 }
 
+#[test]
+fn slack_web_api_sends_private_refusals_ephemerally() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let request = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0; 4096];
+        let count = stream.read(&mut buffer).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+            .unwrap();
+        String::from_utf8(buffer[..count].to_vec()).unwrap()
+    });
+    let mut slack = SlackWebApiTransport::new(
+        format!("http://{address}"),
+        "xapp-test".into(),
+        "xoxb-test".into(),
+    );
+    slack.respond_private("C1", "U1", "not allowed").unwrap();
+    let request = request.join().unwrap();
+    assert!(request.contains("POST /chat.postEphemeral"));
+    assert!(request.contains("\"channel\":\"C1\""));
+    assert!(request.contains("\"user\":\"U1\""));
+}
+
 const CODEX_APP_SERVER_FIXTURE: &str = r#"#!/usr/bin/env python3
 import json
 import os
