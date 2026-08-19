@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,13 @@ pub struct ConfiguredInitReport {
     pub summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackSetupOutcome {
+    AlreadyInitialized { configuration: String },
+    Initialized(ConfiguredInitReport),
+    PreflightFailed { boundary: String, recovery: String },
+}
+
 /// Existing configured-initialization boundary used by Slack setup. Its
 /// implementation owns repository, durable-path, host, and provider preflights.
 pub trait ConfiguredInitBoundary {
@@ -114,6 +122,56 @@ pub trait ConfiguredInitBoundary {
         checkout: &Path,
         choices: &SlackInitChoices,
     ) -> Result<ConfiguredInitReport>;
+}
+
+/// Invoke the same configured `fluent init` route used by local setup.
+pub struct ExistingConfiguredInitBoundary {
+    executable: PathBuf,
+}
+
+impl ExistingConfiguredInitBoundary {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+}
+
+impl ConfiguredInitBoundary for ExistingConfiguredInitBoundary {
+    fn initialize(
+        &mut self,
+        checkout: &Path,
+        choices: &SlackInitChoices,
+    ) -> Result<ConfiguredInitReport> {
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(checkout)
+            .arg("init")
+            .args(["--coder-profile", &choices.coder_profile])
+            .args(["--follow-up-mode", &choices.follow_up_mode]);
+        for (flag, value) in [
+            ("--write-coder", &choices.write_coder),
+            ("--write-model", &choices.write_model),
+            ("--write-effort", &choices.write_effort),
+            ("--review-coder", &choices.review_coder),
+            ("--review-model", &choices.review_model),
+            ("--review-effort", &choices.review_effort),
+        ] {
+            if let Some(value) = value {
+                command.args([flag, value]);
+            }
+        }
+        let output = command
+            .output()
+            .context("invoke configured initialization")?;
+        if !output.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(ConfiguredInitReport {
+            already_initialized: false,
+            summary: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
 }
 
 pub fn prepare_slack_project_setup(
@@ -142,7 +200,7 @@ pub fn approve_slack_project_setup(
     reviewed_revision: &str,
     actor: &str,
     boundary: &mut dyn ConfiguredInitBoundary,
-) -> Result<ConfiguredInitReport> {
+) -> Result<SlackSetupOutcome> {
     if reviewed_revision != proposal.revision || setup_revision(proposal)? != proposal.revision {
         anyhow::bail!("project setup approval is stale; review the current proposal")
     }
@@ -159,7 +217,42 @@ pub fn approve_slack_project_setup(
     if checkout_identity(&entry.path)? != entry.identity {
         anyhow::bail!("selected checkout identity changed; select it again")
     }
-    boundary.initialize(&entry.path, &proposal.choices)
+    let fluent_dir = entry.path.join(".fluent");
+    if fluent_dir.is_dir() {
+        let configuration = fs::read_to_string(fluent_dir.join("config.yaml"))
+            .unwrap_or_else(|_| "Fluent is initialized with default project configuration.".into());
+        return Ok(SlackSetupOutcome::AlreadyInitialized { configuration });
+    }
+    match boundary.initialize(&entry.path, &proposal.choices) {
+        Ok(report) => Ok(SlackSetupOutcome::Initialized(report)),
+        Err(error) => {
+            let diagnostic = error.to_string();
+            Ok(SlackSetupOutcome::PreflightFailed {
+                boundary: classify_init_boundary(&diagnostic).into(),
+                recovery: diagnostic,
+            })
+        }
+    }
+}
+
+fn classify_init_boundary(diagnostic: &str) -> &'static str {
+    let diagnostic = diagnostic.to_ascii_lowercase();
+    if diagnostic.contains("repository") || diagnostic.contains("git root") {
+        "repository"
+    } else if diagnostic.contains("durable") || diagnostic.contains("ignore") {
+        "durable-path"
+    } else if diagnostic.contains("sandbox") || diagnostic.contains("host") {
+        "host"
+    } else if diagnostic.contains("provider")
+        || diagnostic.contains("codex")
+        || diagnostic.contains("claude")
+    {
+        "provider"
+    } else if diagnostic.contains("config") {
+        "configuration"
+    } else {
+        "configured-init"
+    }
 }
 
 fn setup_revision(proposal: &SlackSetupProposal) -> Result<String> {

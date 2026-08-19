@@ -226,13 +226,130 @@ fn approved_slack_setup_uses_existing_configured_init_boundary() {
     );
     assert!(boundary.calls.is_empty());
 
-    let report =
+    let outcome =
         approve_slack_project_setup(&index, &proposal, &proposal.revision, "U1", &mut boundary)
             .unwrap();
-    assert_eq!(report.summary, "initialized");
+    assert_eq!(
+        outcome,
+        SlackSetupOutcome::Initialized(ConfiguredInitReport {
+            already_initialized: false,
+            summary: "initialized".into(),
+        })
+    );
     assert_eq!(boundary.calls.len(), 1);
     assert_eq!(boundary.calls[0].0, checkout.path().canonicalize().unwrap());
     assert_eq!(boundary.calls[0].1, proposal.choices);
+}
+
+#[test]
+fn already_initialized_checkout_is_reused_without_reinitialization() {
+    struct RejectBoundary;
+    impl ConfiguredInitBoundary for RejectBoundary {
+        fn initialize(
+            &mut self,
+            _: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            panic!("already initialized checkouts must not rerun initialization")
+        }
+    }
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    fs::create_dir(checkout.path().join(".fluent")).unwrap();
+    fs::write(
+        checkout.path().join(".fluent/config.yaml"),
+        "follow-up: execute\n",
+    )
+    .unwrap();
+    let index = discovery_for_checkout(checkout.path(), &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &index,
+        &index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "execute"),
+    )
+    .unwrap();
+
+    let outcome = approve_slack_project_setup(
+        &index,
+        &proposal,
+        &proposal.revision,
+        "U1",
+        &mut RejectBoundary,
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        SlackSetupOutcome::AlreadyInitialized {
+            configuration: "follow-up: execute\n".into()
+        }
+    );
+}
+
+#[test]
+fn slack_init_preflight_failure_preserves_uninitialized_checkout() {
+    struct FailingBoundary(&'static str);
+    impl ConfiguredInitBoundary for FailingBoundary {
+        fn initialize(
+            &mut self,
+            _: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            anyhow::bail!(self.0)
+        }
+    }
+    for (diagnostic, expected_boundary) in [
+        (
+            "repository root preflight failed; use an existing Git root",
+            "repository",
+        ),
+        (
+            "FLUENT_INIT_DURABLE_PATH_IGNORED: narrow the ignore rule",
+            "durable-path",
+        ),
+        (
+            "host sandbox preflight failed; run outside the sandbox",
+            "host",
+        ),
+        (
+            "provider preflight failed; choose a different profile",
+            "provider",
+        ),
+        (
+            "project config preflight failed; repair config.yaml",
+            "configuration",
+        ),
+    ] {
+        let checkout = TempDir::new().unwrap();
+        initialize_checkout(checkout.path());
+        let before = directory_snapshot(checkout.path());
+        let index = discovery_for_checkout(checkout.path(), &["U1"]);
+        let proposal = prepare_slack_project_setup(
+            &index,
+            &index.offers()[0].selection_id,
+            setup_choices("codex-balanced", "propose"),
+        )
+        .unwrap();
+
+        let outcome = approve_slack_project_setup(
+            &index,
+            &proposal,
+            &proposal.revision,
+            "U1",
+            &mut FailingBoundary(diagnostic),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            SlackSetupOutcome::PreflightFailed {
+                boundary: expected_boundary.into(),
+                recovery: diagnostic.into()
+            }
+        );
+        assert_eq!(directory_snapshot(checkout.path()), before);
+        assert!(!checkout.path().join(".fluent").exists());
+    }
 }
 
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
