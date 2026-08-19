@@ -734,6 +734,14 @@ fn socket_mode_block_action_carries_revision_bound_approval() {
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let action = pending_action(PendingActionKind::Planning);
     runner.request_approval("1.0", action.clone()).unwrap();
+    let control = runner
+        .slack()
+        .deliveries
+        .iter()
+        .find_map(|delivery| delivery.approval_control.as_ref())
+        .expect("revision-bound approval control");
+    assert_eq!(control.action_id, action.id);
+    assert_eq!(control.artifact_revision, action.artifact_revision);
     let matching = decode_socket_mode_envelope(&format!(
         r#"{{"envelope_id":"A1","payload":{{"type":"block_actions","user":{{"id":"U1"}},"channel":{{"id":"C1"}},"message":{{"ts":"2.0","thread_ts":"1.0"}},"actions":[{{"action_id":"fluent_approval","value":"{}","block_id":"{}"}}]}}}}"#,
         action.id, action.artifact_revision
