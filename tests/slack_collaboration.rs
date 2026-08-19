@@ -2511,7 +2511,7 @@ fn claude_structured_session_starts_and_resumes() {
     let executable = fixture.path().join("claude");
     fs::write(
         &executable,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"$0.log\"\nprintf '%s\\n' '{\"session_id\":\"claude-session\",\"result\":\"provider reply\"}'\n",
+        "#!/bin/sh\nset -eu\nprintf '%s|%s|%s\\n' \"$HOME\" \"$CLAUDE_CONFIG_DIR\" \"$*\" >> \"$0.log\"\nprintf '%s\\n' '{\"session_id\":\"claude-session\",\"result\":\"provider reply\"}'\n",
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
@@ -2520,7 +2520,10 @@ fn claude_structured_session_starts_and_resumes() {
         checkout: checkout.path().into(),
         slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
     };
-    let mut provider = ClaudeStructuredSessionProvider::new(executable.clone());
+    let mut provider = ClaudeStructuredSessionProvider::new_scoped_with_test_launcher(
+        executable.clone(),
+        transparent_sandbox_launcher(&fixture),
+    );
 
     let (session, reply) = provider
         .start("action-1", &scope, "inspect this", "U1")
@@ -2535,6 +2538,16 @@ fn claude_structured_session_starts_and_resumes() {
     );
 
     let invocations = fs::read_to_string(executable.with_extension("log")).unwrap();
+    assert!(
+        invocations.contains(
+            &scope
+                .slice_draft
+                .join(".provider-home")
+                .display()
+                .to_string()
+        )
+    );
+    assert!(invocations.contains(&scope.slice_draft.join(".claude-home").display().to_string()));
     assert!(invocations.contains("--print --output-format json --permission-mode plan"));
     assert!(invocations.contains("Slack user U1: inspect this"));
     assert!(invocations.contains("--resume claude-session Slack user U2: continue"));

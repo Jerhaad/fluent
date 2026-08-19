@@ -756,10 +756,55 @@ pub struct ProviderRegistry {
 
 pub struct ClaudeStructuredSessionProvider {
     executable: PathBuf,
+    scoped: bool,
+    test_sandbox_launcher: Option<PathBuf>,
 }
 impl ClaudeStructuredSessionProvider {
     pub fn new(executable: PathBuf) -> Self {
-        Self { executable }
+        Self {
+            executable,
+            scoped: false,
+            test_sandbox_launcher: None,
+        }
+    }
+
+    pub fn new_scoped(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            scoped: true,
+            test_sandbox_launcher: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_scoped_with_test_launcher(executable: PathBuf, launcher: PathBuf) -> Self {
+        Self {
+            executable,
+            scoped: true,
+            test_sandbox_launcher: Some(launcher),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn render_scope_profile(
+        &self,
+        scope: &ProviderScope,
+    ) -> Result<Option<crate::os::SandboxProfile>> {
+        if !self.scoped {
+            return Ok(None);
+        }
+        let private_home = scope.slice_draft.join(".provider-home");
+        let claude_home = scope.slice_draft.join(".claude-home");
+        fs::create_dir_all(&private_home)?;
+        fs::create_dir_all(&claude_home)?;
+        crate::os::render_profile_for_scoped_codex_provider(
+            &ContentResolver::new(None),
+            &private_home,
+            std::slice::from_ref(&scope.slice_draft),
+            std::slice::from_ref(&scope.checkout),
+            &claude_home,
+        )
+        .map(Some)
     }
 }
 impl ClaudeStructuredSessionProvider {
@@ -770,7 +815,29 @@ impl ClaudeStructuredSessionProvider {
         contribution: &str,
         actor: &str,
     ) -> Result<(String, String)> {
-        let mut command = Command::new(&self.executable);
+        fs::create_dir_all(&scope.slice_draft)?;
+        let profile = self.render_scope_profile(scope)?;
+        if let Some(profile) = &profile
+            && self.test_sandbox_launcher.is_none()
+        {
+            crate::os::preflight_profile(profile)?;
+        }
+        let mut command = if let Some(profile) = &profile {
+            if let Some(launcher) = &self.test_sandbox_launcher {
+                let mut command = Command::new(launcher);
+                command.arg("-f").arg(&profile.path).arg(&self.executable);
+                command
+            } else {
+                crate::os::command_under_profile(profile, &self.executable)
+            }
+        } else {
+            Command::new(&self.executable)
+        };
+        if self.scoped {
+            command
+                .env("HOME", scope.slice_draft.join(".provider-home"))
+                .env("CLAUDE_CONFIG_DIR", scope.slice_draft.join(".claude-home"));
+        }
         command.current_dir(&scope.checkout).args([
             "--print",
             "--output-format",

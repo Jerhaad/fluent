@@ -754,7 +754,8 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("claude"));
     let provider = ProviderRegistry::new([
         Box::new(CodexAppServerProvider::new_scoped(codex)) as Box<dyn ConversationProvider>,
-        Box::new(ClaudeStructuredSessionProvider::new(claude)) as Box<dyn ConversationProvider>,
+        Box::new(ClaudeStructuredSessionProvider::new_scoped(claude))
+            as Box<dyn ConversationProvider>,
     ])?;
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
     let scheduler = LocalSchedulerClient::new(
