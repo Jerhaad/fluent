@@ -194,10 +194,11 @@ The Codex command runs `codex login` in the thread's private `CODEX_HOME`. The
 Claude command opens the interactive Claude client with the thread's private
 `CLAUDE_CONFIG_DIR`; enter `/login` there and finish its prompts. Fluent honors
 `FLUENT_CODEX_APP_SERVER` and `FLUENT_CLAUDE`, so this command authenticates
-the exact configured executable. After login completes, invoke the runner's
-explicit provider-login recovery action to recheck those scoped credentials
-and resume the preserved turn. Restarting or reconnecting Slack alone leaves
-the turn paused.
+the exact configured executable. Successful authentication queues the
+provider-login recovery action for the running owner process. That process
+rechecks the selected provider and exact thread scope, then resumes the
+preserved turn. Run this command as the same local account that owns the
+runner. Restarting or reconnecting Slack alone leaves the turn paused.
 
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:
@@ -229,6 +230,14 @@ order, and sent together as the next attributed turn. If the exact bound
 checkout disappears or its identity changes, Fluent stops provider access,
 reports the unavailable binding, and never substitutes another checkout
 automatically. After restoring the exact checkout, invoke the runner's
-explicit checkout-reconfirmation action before Fluent re-admits the preserved
-turn. Restarting or reconnecting Slack alone leaves the turn paused. Fluent
-retains the original project binding throughout recovery.
+checkout-reconfirmation route as the runner owner:
+
+```sh
+fluent slack reconfirm-checkout --project app --thread 1712345678.123456
+```
+
+The command verifies that the configured identity, branch, and commit match
+the restored checkout before it queues the action. The running owner process
+validates the thread's original project binding again before it re-admits the
+preserved turn. Restarting or reconnecting Slack alone leaves the turn paused.
+Fluent retains the original project binding throughout recovery.

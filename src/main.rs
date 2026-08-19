@@ -273,6 +273,15 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
                 &thread,
                 &provider,
             )?;
+            println!("queued provider-login recovery for Slack thread {thread}");
+        }
+        SlackCommands::ReconfirmCheckout { project, thread } => {
+            slack_collaboration::request_checkout_reconfirmation(
+                &slack_home()?,
+                &project,
+                &thread,
+            )?;
+            println!("queued checkout reconfirmation for Slack thread {thread}");
         }
         SlackCommands::Enable => {
             let home = slack_home()?;

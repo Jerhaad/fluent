@@ -245,6 +245,15 @@ pub enum SlackCommands {
         #[arg(long)]
         provider: String,
     },
+    /// Reconfirm a restored checkout and resume its paused Slack thread
+    ReconfirmCheckout {
+        /// Configured project label
+        #[arg(long)]
+        project: String,
+        /// Slack thread timestamp
+        #[arg(long)]
+        thread: String,
+    },
     /// Install and start the local Slack runner at login
     Enable,
     /// Start the configured local Slack runner
@@ -1009,6 +1018,26 @@ pub enum FargateCommands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slack_reconfirm_checkout_route_parses_scoped_identity() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "slack",
+            "reconfirm-checkout",
+            "--project",
+            "app",
+            "--thread",
+            "1712345678.123456",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Slack {
+                command: SlackCommands::ReconfirmCheckout { project, thread }
+            }) if project == "app" && thread == "1712345678.123456"
+        ));
+    }
 
     fn parsed_tester_recovery(args: &[&str]) -> (bool, Vec<String>) {
         let cli = Cli::try_parse_from(args).expect("Tester recovery command should parse");

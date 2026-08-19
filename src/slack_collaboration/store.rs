@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use crate::atomic_write::atomic_write;
 
 use super::{
-    CollaborationStore, FluentThread, InboundEnvelope, InboxState, OutboundDelivery, RunnerConfig,
-    validate_thread_identity,
+    CollaborationStore, FluentThread, InboundEnvelope, InboxState, OperatorRecoveryAction,
+    OutboundDelivery, RunnerConfig, validate_thread_identity,
 };
 
 #[derive(Debug, Clone)]
@@ -77,6 +77,44 @@ fn thread_commit_dir(home: &Path) -> PathBuf {
 
 fn cursor_path(home: &Path) -> PathBuf {
     state_root(home).join("cursors.json")
+}
+
+fn recovery_actions_path(home: &Path) -> PathBuf {
+    state_root(home).join("recovery-actions.json")
+}
+
+pub(super) fn enqueue_recovery_action(home: &Path, action: OperatorRecoveryAction) -> Result<()> {
+    ensure_root(home)?;
+    let _lock = state_lock(home)?;
+    let mut actions: BTreeMap<String, OperatorRecoveryAction> =
+        read_json(recovery_actions_path(home))?;
+    actions.insert(action.id.clone(), action);
+    atomic_write(
+        &recovery_actions_path(home),
+        &serde_json::to_vec_pretty(&actions)?,
+    )?;
+    Ok(())
+}
+
+pub(super) fn load_recovery_actions(home: &Path) -> Result<Vec<OperatorRecoveryAction>> {
+    ensure_root(home)?;
+    let _lock = state_lock(home)?;
+    let actions: BTreeMap<String, OperatorRecoveryAction> = read_json(recovery_actions_path(home))?;
+    Ok(actions.into_values().collect())
+}
+
+pub(super) fn remove_recovery_action(home: &Path, id: &str) -> Result<()> {
+    ensure_root(home)?;
+    let _lock = state_lock(home)?;
+    let mut actions: BTreeMap<String, OperatorRecoveryAction> =
+        read_json(recovery_actions_path(home))?;
+    if actions.remove(id).is_some() {
+        atomic_write(
+            &recovery_actions_path(home),
+            &serde_json::to_vec_pretty(&actions)?,
+        )?;
+    }
+    Ok(())
 }
 
 fn thread_path(project: &Path, id: &str) -> Result<PathBuf> {

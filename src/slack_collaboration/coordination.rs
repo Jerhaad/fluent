@@ -1139,6 +1139,45 @@ where
         self.dispatch_if_ready(thread_id)
     }
 
+    /// Consume owner-authenticated recovery actions from the durable local
+    /// inbox and apply them to this live runner instance.
+    pub fn process_operator_recovery_actions(&mut self) -> Result<()> {
+        for action in load_recovery_actions(self.runner.home)? {
+            validate_thread_identity(&action.thread)?;
+            let thread = self
+                .runner
+                .store
+                .load_thread(&self.runner.config, &action.thread)?
+                .context("Fluent Slack thread is unavailable")?;
+            if thread.project_label.as_deref() != Some(&action.project) {
+                bail!("recovery action does not match the thread project binding");
+            }
+            let still_paused = thread.pending_turn.as_ref().is_some_and(|turn| {
+                turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery
+            });
+            match &action.kind {
+                OperatorRecoveryKind::ProviderLogin { provider } => {
+                    if thread.provider.as_deref() != Some(provider) {
+                        bail!("recovery action does not match the selected provider");
+                    }
+                    if still_paused && thread.provider_failure.is_some() {
+                        self.resume_after_provider_login(&action.thread)?;
+                    }
+                }
+                OperatorRecoveryKind::CheckoutReconfirmation => {
+                    if still_paused {
+                        if thread.provider_failure.is_some() {
+                            bail!("provider recovery must complete before checkout reconfirmation");
+                        }
+                        self.reconfirm_checkout(&action.thread)?;
+                    }
+                }
+            }
+            remove_recovery_action(self.runner.home, &action.id)?;
+        }
+        Ok(())
+    }
+
     pub fn recovery_targets(&self) -> Result<Vec<RecoveryTarget>> {
         self.runner.recovery_targets()
     }
@@ -1323,6 +1362,7 @@ where
     /// Drive completions, Slack ingress, and the earliest durable retry timer.
     pub fn drive_once(&mut self, maximum_wait: std::time::Duration) -> Result<()> {
         self.poll_completions()?;
+        self.process_operator_recovery_actions()?;
         let now = (self.runner.clock)();
         self.wake_due_retries(now)?;
         let retry_wait = self

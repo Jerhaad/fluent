@@ -287,6 +287,20 @@ pub struct PendingTurn {
     pub delivery_attempt: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum OperatorRecoveryKind {
+    ProviderLogin { provider: String },
+    CheckoutReconfirmation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OperatorRecoveryAction {
+    pub id: String,
+    pub project: String,
+    pub thread: String,
+    pub kind: OperatorRecoveryKind,
+}
+
 impl FluentThread {
     pub(super) fn new(event: &InboundEnvelope) -> Self {
         Self {

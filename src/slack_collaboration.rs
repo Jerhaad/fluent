@@ -532,6 +532,12 @@ impl SlackTransport for InMemorySlack {
             .push((channel.into(), user.into(), text.into()));
         Ok(())
     }
+    fn receive_timeout(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<InboundEnvelope>> {
+        Ok(None)
+    }
 }
 
 pub fn safe_identity(project: &ConfiguredProject) -> String {
@@ -819,13 +825,6 @@ pub fn authenticate_provider_for_thread(
     thread: &str,
     provider: &str,
 ) -> Result<()> {
-    let config = read_config(home)?;
-    let bound = FileCollaborationStore::new(home)
-        .load_thread(&config, thread)?
-        .context("Fluent Slack thread is unavailable")?;
-    if bound.project_label.as_deref() != Some(project) {
-        bail!("Fluent Slack thread is not bound to the selected project");
-    }
     let executable = match provider {
         "codex" => std::env::var_os("FLUENT_CODEX_APP_SERVER")
             .map(PathBuf::from)
@@ -835,7 +834,102 @@ pub fn authenticate_provider_for_thread(
             .unwrap_or_else(|| PathBuf::from("claude")),
         _ => bail!("conversation provider must be codex or claude"),
     };
-    authenticate_provider_with_executable(&config, project, thread, provider, &executable)
+    authenticate_provider_for_thread_with_executable(home, project, thread, provider, &executable)
+}
+
+#[doc(hidden)]
+pub fn authenticate_provider_for_thread_with_executable(
+    home: &Path,
+    project: &str,
+    thread: &str,
+    provider: &str,
+    executable: &Path,
+) -> Result<()> {
+    let config = read_config(home)?;
+    validate_provider_login_recovery(home, &config, project, thread, provider)?;
+    authenticate_provider_with_executable(&config, project, thread, provider, executable)?;
+    let current = read_config(home)?;
+    validate_provider_login_recovery(home, &current, project, thread, provider)?;
+    enqueue_recovery_action(
+        home,
+        OperatorRecoveryAction {
+            id: format!("{thread}:provider-login"),
+            project: project.into(),
+            thread: thread.into(),
+            kind: OperatorRecoveryKind::ProviderLogin {
+                provider: provider.into(),
+            },
+        },
+    )
+}
+
+fn validate_provider_login_recovery(
+    home: &Path,
+    config: &RunnerConfig,
+    project: &str,
+    thread: &str,
+    provider: &str,
+) -> Result<()> {
+    let bound = FileCollaborationStore::new(home)
+        .load_thread(config, thread)?
+        .context("Fluent Slack thread is unavailable")?;
+    if bound.project_label.as_deref() != Some(project) {
+        bail!("Fluent Slack thread is not bound to the selected project");
+    }
+    if bound.provider.as_deref() != Some(provider) {
+        bail!("Fluent Slack thread is not using the selected provider");
+    }
+    if !matches!(
+        bound.provider_failure,
+        Some(
+            ProviderFailure::Authentication
+                | ProviderFailure::HostCredentialDenied
+                | ProviderFailure::Unavailable
+        )
+    ) || !bound
+        .pending_turn
+        .as_ref()
+        .is_some_and(|turn| turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery)
+    {
+        bail!("Fluent Slack thread is not paused for provider login recovery");
+    }
+    Ok(())
+}
+
+/// Queue a checkout recovery only after the owner restores the exact binding.
+pub fn request_checkout_reconfirmation(home: &Path, project: &str, thread: &str) -> Result<()> {
+    validate_thread_identity(thread)?;
+    let config = read_config(home)?;
+    let configured = config
+        .projects
+        .get(project)
+        .context("configured Slack project is unavailable")?;
+    if !checkout_is_available(&configured.checkout) {
+        bail!("bound checkout is unavailable");
+    }
+    let bound = FileCollaborationStore::new(home)
+        .load_thread(&config, thread)?
+        .context("Fluent Slack thread is unavailable")?;
+    if bound.project_label.as_deref() != Some(project) {
+        bail!("Fluent Slack thread is not bound to the selected project");
+    }
+    if bound.provider_failure.is_some()
+        || !bound
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery)
+    {
+        bail!("Fluent Slack thread is not paused for checkout recovery");
+    }
+    enqueue_recovery_action(
+        home,
+        OperatorRecoveryAction {
+            id: format!("{thread}:checkout-reconfirmation"),
+            project: project.into(),
+            thread: thread.into(),
+            kind: OperatorRecoveryKind::CheckoutReconfirmation,
+        },
+    )
 }
 
 #[doc(hidden)]

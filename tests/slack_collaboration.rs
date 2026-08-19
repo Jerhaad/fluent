@@ -3115,6 +3115,7 @@ fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let (home, checkout, config) = setup(true);
+    write_config(home.path(), &config).unwrap();
     let mut runner = AsyncCollaborationRunner::new(
         home.path(),
         config.clone(),
@@ -3162,8 +3163,46 @@ fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
         paused.pending_turn.unwrap().dispatch_state,
         PendingTurnDispatchState::PausedForRecovery
     );
-    runner.reconfirm_checkout("1.0").unwrap();
-    runner.wait_for_completion().unwrap();
+    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .env("HOME", home.path())
+        .args([
+            "slack",
+            "reconfirm-checkout",
+            "--project",
+            "other",
+            "--thread",
+            "1.0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let accepted = std::process::Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .env("HOME", home.path())
+        .args([
+            "slack",
+            "reconfirm-checkout",
+            "--project",
+            "app",
+            "--thread",
+            "1.0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    runner
+        .drive_once(std::time::Duration::from_millis(1))
+        .unwrap();
+    for _ in 0..100 {
+        if calls.load(Ordering::SeqCst) == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    runner.poll_completions().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -3211,6 +3250,7 @@ fn async_provider_login_recovery_rechecks_scope_before_resuming() {
     let preparations = Arc::new(AtomicUsize::new(0));
     let turns = Arc::new(AtomicUsize::new(0));
     let (home, _checkout, config) = setup(true);
+    write_config(home.path(), &config).unwrap();
     let mut runner = AsyncCollaborationRunner::new(
         home.path(),
         config.clone(),
@@ -3229,7 +3269,7 @@ fn async_provider_login_recovery_rechecks_scope_before_resuming() {
     drop(runner);
     let mut runner = AsyncCollaborationRunner::new(
         home.path(),
-        config,
+        config.clone(),
         LoginProvider {
             preparations: preparations.clone(),
             turns: turns.clone(),
@@ -3242,8 +3282,39 @@ fn async_provider_login_recovery_rechecks_scope_before_resuming() {
         .unwrap();
     assert_eq!(preparations.load(Ordering::SeqCst), 1);
     assert_eq!(turns.load(Ordering::SeqCst), 0);
-    runner.resume_after_provider_login("1.0").unwrap();
-    runner.wait_for_completion().unwrap();
+    let login = home.path().join("codex-login");
+    fs::write(&login, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&login, fs::Permissions::from_mode(0o755)).unwrap();
+    let authenticated = std::process::Command::new(env!("CARGO_BIN_EXE_fluent"))
+        .env("HOME", home.path())
+        .env("FLUENT_CODEX_APP_SERVER", &login)
+        .args([
+            "slack",
+            "provider-login",
+            "--project",
+            "app",
+            "--thread",
+            "1.0",
+            "--provider",
+            "codex",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        authenticated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authenticated.stderr)
+    );
+    runner
+        .drive_once(std::time::Duration::from_millis(1))
+        .unwrap();
+    for _ in 0..100 {
+        if turns.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    runner.poll_completions().unwrap();
     assert_eq!(preparations.load(Ordering::SeqCst), 2);
     assert_eq!(turns.load(Ordering::SeqCst), 1);
 }
@@ -4159,6 +4230,21 @@ fn local_code_reference_uses_labeled_slack_fallback() {
     .unwrap();
     assert!(reference.contains("local-only reference"));
     assert!(reference.contains("dirty local source"));
+    assert!(!reference.contains(&checkout.path().display().to_string()));
+}
+
+#[test]
+fn clean_code_reference_without_supported_remote_uses_labeled_slack_fallback() {
+    let (_home, checkout, config) = setup(true);
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
+    assert!(reference.contains("local-only reference"));
+    assert!(reference.contains("fixture"));
+    assert!(!reference.contains("github.com"));
     assert!(!reference.contains(&checkout.path().display().to_string()));
 }
 
