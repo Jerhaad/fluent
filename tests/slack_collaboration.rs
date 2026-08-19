@@ -133,6 +133,108 @@ fn unauthorized_project_setup_hides_checkouts_and_preserves_state() {
     assert_eq!(directory_snapshot(allowed.path()), before);
 }
 
+fn setup_choices(profile: &str, mode: &str) -> SlackInitChoices {
+    SlackInitChoices {
+        coder_profile: profile.into(),
+        follow_up_mode: mode.into(),
+        write_coder: None,
+        write_model: None,
+        write_effort: None,
+        review_coder: None,
+        review_model: None,
+        review_effort: None,
+    }
+}
+
+fn discovery_for_checkout(checkout: &std::path::Path, approvers: &[&str]) -> ProjectDiscoveryIndex {
+    discover_project_checkouts(
+        &[ProjectDiscoveryRoot {
+            label: "app".into(),
+            path: checkout.into(),
+            maximum_depth: 0,
+            allowed_participants: BTreeSet::from(["U1".into()]),
+            project_approvers: approvers.iter().map(|value| (*value).into()).collect(),
+        }],
+        "U1",
+    )
+    .unwrap()
+}
+
+#[test]
+fn slack_setup_collects_complete_configured_init_choices_before_mutation() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let before = directory_snapshot(checkout.path());
+    let index = discovery_for_checkout(checkout.path(), &["U1"]);
+    let selection = index.offers()[0].selection_id.clone();
+
+    for profile in [
+        "codex-balanced",
+        "codex-stronger",
+        "claude-balanced",
+        "codex-write-claude-review",
+        "claude-write-codex-review",
+    ] {
+        for mode in ["propose", "execute"] {
+            let proposal =
+                prepare_slack_project_setup(&index, &selection, setup_choices(profile, mode))
+                    .unwrap();
+            assert_eq!(proposal.choices.coder_profile, profile);
+            assert_eq!(proposal.choices.follow_up_mode, mode);
+            assert!(!proposal.revision.is_empty());
+        }
+    }
+    assert!(prepare_slack_project_setup(&index, &selection, setup_choices("", "propose")).is_err());
+    assert_eq!(directory_snapshot(checkout.path()), before);
+}
+
+#[test]
+fn approved_slack_setup_uses_existing_configured_init_boundary() {
+    #[derive(Default)]
+    struct Boundary {
+        calls: Vec<(std::path::PathBuf, SlackInitChoices)>,
+    }
+    impl ConfiguredInitBoundary for Boundary {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            choices: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            self.calls.push((checkout.into(), choices.clone()));
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "initialized".into(),
+            })
+        }
+    }
+
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let index = discovery_for_checkout(checkout.path(), &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &index,
+        &index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+    let mut boundary = Boundary::default();
+
+    assert!(approve_slack_project_setup(&index, &proposal, "stale", "U1", &mut boundary).is_err());
+    assert!(
+        approve_slack_project_setup(&index, &proposal, &proposal.revision, "U2", &mut boundary)
+            .is_err()
+    );
+    assert!(boundary.calls.is_empty());
+
+    let report =
+        approve_slack_project_setup(&index, &proposal, &proposal.revision, "U1", &mut boundary)
+            .unwrap();
+    assert_eq!(report.summary, "initialized");
+    assert_eq!(boundary.calls.len(), 1);
+    assert_eq!(boundary.calls[0].0, checkout.path().canonicalize().unwrap());
+    assert_eq!(boundary.calls[0].1, proposal.choices);
+}
+
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
     fn collect(
         root: &std::path::Path,

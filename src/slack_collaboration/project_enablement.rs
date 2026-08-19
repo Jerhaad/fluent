@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::checkout_identity;
+use crate::setup::{ConfiguredSetup, InitSetupInputs};
 
 /// One runner-owner-approved directory that may contain project checkouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,122 @@ impl ProjectDiscoveryIndex {
     fn entry(&self, selection_id: &str) -> Option<&DiscoveredCheckout> {
         self.entries.get(selection_id)
     }
+}
+
+/// Complete configured-init choices collected before checkout mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackInitChoices {
+    pub coder_profile: String,
+    pub follow_up_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_coder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_coder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_effort: Option<String>,
+}
+
+impl SlackInitChoices {
+    fn configured_setup(&self) -> Result<ConfiguredSetup> {
+        ConfiguredSetup::from_inputs(InitSetupInputs {
+            coder_profile: Some(self.coder_profile.clone()),
+            follow_up_mode: Some(self.follow_up_mode.clone()),
+            write_coder: self.write_coder.clone(),
+            write_model: self.write_model.clone(),
+            write_effort: self.write_effort.clone(),
+            review_coder: self.review_coder.clone(),
+            review_model: self.review_model.clone(),
+            review_effort: self.review_effort.clone(),
+        })?
+        .context("Slack project setup requires configured initialization choices")
+    }
+}
+
+/// Exact path-free setup proposal presented for Slack approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlackSetupProposal {
+    pub selection_id: String,
+    pub project_label: String,
+    pub checkout_label: String,
+    pub choices: SlackInitChoices,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredInitReport {
+    pub already_initialized: bool,
+    pub summary: String,
+}
+
+/// Existing configured-initialization boundary used by Slack setup. Its
+/// implementation owns repository, durable-path, host, and provider preflights.
+pub trait ConfiguredInitBoundary {
+    fn initialize(
+        &mut self,
+        checkout: &Path,
+        choices: &SlackInitChoices,
+    ) -> Result<ConfiguredInitReport>;
+}
+
+pub fn prepare_slack_project_setup(
+    index: &ProjectDiscoveryIndex,
+    selection_id: &str,
+    choices: SlackInitChoices,
+) -> Result<SlackSetupProposal> {
+    choices.configured_setup()?;
+    let entry = index
+        .entry(selection_id)
+        .context("selected checkout is unavailable")?;
+    let mut proposal = SlackSetupProposal {
+        selection_id: selection_id.to_owned(),
+        project_label: entry.offer.project_label.clone(),
+        checkout_label: entry.offer.checkout_label.clone(),
+        choices,
+        revision: String::new(),
+    };
+    proposal.revision = setup_revision(&proposal)?;
+    Ok(proposal)
+}
+
+pub fn approve_slack_project_setup(
+    current_index: &ProjectDiscoveryIndex,
+    proposal: &SlackSetupProposal,
+    reviewed_revision: &str,
+    actor: &str,
+    boundary: &mut dyn ConfiguredInitBoundary,
+) -> Result<ConfiguredInitReport> {
+    if reviewed_revision != proposal.revision || setup_revision(proposal)? != proposal.revision {
+        anyhow::bail!("project setup approval is stale; review the current proposal")
+    }
+    proposal.choices.configured_setup()?;
+    let entry = current_index
+        .entry(&proposal.selection_id)
+        .context("selected checkout is no longer available")?;
+    if entry.offer.project_label != proposal.project_label
+        || entry.offer.checkout_label != proposal.checkout_label
+        || !entry.approvers.contains(actor)
+    {
+        anyhow::bail!("current project authority does not permit setup")
+    }
+    if checkout_identity(&entry.path)? != entry.identity {
+        anyhow::bail!("selected checkout identity changed; select it again")
+    }
+    boundary.initialize(&entry.path, &proposal.choices)
+}
+
+fn setup_revision(proposal: &SlackSetupProposal) -> Result<String> {
+    let mut reviewed = proposal.clone();
+    reviewed.revision.clear();
+    Ok(format!(
+        "setup-v1:{:x}",
+        Sha256::digest(serde_json::to_vec(&reviewed)?)
+    ))
 }
 
 /// Discover canonical Git roots without following authority outside an
