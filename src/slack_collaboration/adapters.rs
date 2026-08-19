@@ -442,7 +442,7 @@ impl CodexConnection {
         if self.stdout.read_line(&mut line)? == 0 {
             bail!("Codex App Server closed its protocol stream")
         }
-        Ok(serde_json::from_str(&line)?)
+        serde_json::from_str(&line).context("incompatible Codex provider protocol")
     }
 
     fn request(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
@@ -463,7 +463,7 @@ impl CodexConnection {
                 return message
                     .get("result")
                     .cloned()
-                    .context("Codex response omitted result");
+                    .context("incompatible Codex provider protocol: response omitted result");
             }
             self.pending.push_back(message);
         }
@@ -883,15 +883,16 @@ impl ClaudeStructuredSessionProvider {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("incompatible Claude provider protocol")?;
         Ok((
             value["session_id"]
                 .as_str()
-                .context("Claude response omitted session_id")?
+                .context("incompatible Claude provider protocol: response omitted session_id")?
                 .into(),
             value["result"]
                 .as_str()
-                .context("Claude response omitted result")?
+                .context("incompatible Claude provider protocol: response omitted result")?
                 .into(),
         ))
     }

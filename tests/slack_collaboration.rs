@@ -2554,6 +2554,41 @@ fn claude_structured_session_starts_and_resumes() {
     assert!(invocations.contains("--resume claude-session Slack user U2: continue"));
 }
 
+#[test]
+fn provider_adapters_translate_incompatible_protocols() {
+    let fixture = TempDir::new().unwrap();
+    let scope = ProviderScope {
+        checkout: fixture.path().into(),
+        slice_draft: fixture.path().join(".fluent/work/slack/drafts/test"),
+    };
+
+    let claude = fixture.path().join("claude-incompatible");
+    fs::write(&claude, "#!/bin/sh\nprintf 'not-json\\n'\n").unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut claude_provider = ClaudeStructuredSessionProvider::new(claude);
+    let claude_error = claude_provider
+        .start("action-1", &scope, "inspect this", "U1")
+        .unwrap_err();
+    assert_eq!(
+        classify_provider_failure(&claude_error.to_string()),
+        ProviderFailure::IncompatibleProtocol
+    );
+
+    let codex = fixture.path().join("codex-incompatible");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nread request\nprintf 'not-json\\n'\nwhile read request; do :; done\n",
+    )
+    .unwrap();
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut codex_provider = CodexAppServerProvider::new(codex);
+    let codex_error = codex_provider.prepare_session(&scope).unwrap_err();
+    assert_eq!(
+        classify_provider_failure(&codex_error.to_string()),
+        ProviderFailure::IncompatibleProtocol
+    );
+}
+
 fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
     #[derive(Clone)]
     struct QueueProvider {
@@ -2858,6 +2893,18 @@ fn provider_failure_classifies_recovery_state() {
             retry_after_seconds: 60
         }
     );
+    assert_eq!(
+        classify_provider_failure("runner host credential access denied"),
+        ProviderFailure::HostCredentialDenied
+    );
+    assert_eq!(
+        classify_provider_failure("Permission denied (os error 13)"),
+        ProviderFailure::HostCredentialDenied
+    );
+    assert_eq!(
+        classify_provider_failure("incompatible provider protocol version"),
+        ProviderFailure::IncompatibleProtocol
+    );
 }
 
 #[test]
@@ -2929,6 +2976,41 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
             .contribution,
         "@Fluent preserve this"
     );
+
+    for (diagnostic, safe_message) in [
+        (
+            "runner host credential access denied",
+            "Provider credentials are unavailable to the runner host",
+        ),
+        (
+            "incompatible provider protocol version",
+            "Provider protocol is incompatible with this Fluent build",
+        ),
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config,
+            FailingProvider(diagnostic),
+            InMemorySlack::default(),
+        );
+        runner
+            .ingest(event("E1", None, "@Fluent preserve typed failure"))
+            .unwrap();
+        let recovery = &runner.slack().deliveries[0].text;
+        assert!(recovery.contains(safe_message));
+        assert!(recovery.contains("project approver may switch providers"));
+        assert_eq!(
+            FileCollaborationStore::new(home.path())
+                .load_thread(&runner.config, "1.0")
+                .unwrap()
+                .unwrap()
+                .pending_turn
+                .unwrap()
+                .contribution,
+            "@Fluent preserve typed failure"
+        );
+    }
 }
 
 #[test]

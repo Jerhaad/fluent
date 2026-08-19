@@ -215,6 +215,8 @@ pub struct CodeReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderFailure {
     Authentication,
+    HostCredentialDenied,
+    IncompatibleProtocol,
     Unavailable,
     RateLimited { retry_after_seconds: u64 },
 }
@@ -225,6 +227,17 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailure {
         ProviderFailure::RateLimited {
             retry_after_seconds: retry_after_seconds(&lowered).unwrap_or(60),
         }
+    } else if lowered.contains("host credential")
+        || lowered.contains("credential access denied")
+        || lowered.contains("credentials access denied")
+        || lowered.contains("permission denied")
+    {
+        ProviderFailure::HostCredentialDenied
+    } else if (lowered.contains("incompatible") && lowered.contains("protocol"))
+        || lowered.contains("protocol version")
+        || lowered.contains("unsupported protocol")
+    {
+        ProviderFailure::IncompatibleProtocol
     } else if lowered.contains("auth")
         || lowered.contains("login")
         || lowered.contains("credential")
@@ -252,6 +265,12 @@ pub fn provider_recovery_message(failure: &ProviderFailure, can_switch: bool) ->
         .unwrap_or("");
     match failure {
         ProviderFailure::Authentication => format!("Provider authentication is required.{action}"),
+        ProviderFailure::HostCredentialDenied => format!(
+            "Provider credentials are unavailable to the runner host; restore host credential access.{action}"
+        ),
+        ProviderFailure::IncompatibleProtocol => format!(
+            "Provider protocol is incompatible with this Fluent build; update the provider or Fluent.{action}"
+        ),
         ProviderFailure::Unavailable => {
             format!("Provider is unavailable; queued replies are preserved.{action}")
         }
