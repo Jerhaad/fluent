@@ -6770,8 +6770,14 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
         .unwrap();
     let store = fluent::work_model::WorkModelStore::new(checkout.path());
     let mut rewritten = store.read_work_item("work-protected").unwrap();
+    let initial_transitions = rewritten.transitions.clone();
     rewritten.transitions.clear();
-    assert!(store.write_work_item(&rewritten).is_err());
+    store.write_work_item(&rewritten).unwrap();
+    assert_eq!(
+        store.read_work_item("work-protected").unwrap().transitions,
+        initial_transitions,
+        "whole-aggregate compatibility writes cannot remove host-owned transitions"
+    );
 
     let metadata = fluent::work_model::DurableTransitionMetadata {
         origin: fluent::work_model::DurableTransitionOrigin::Scheduler,

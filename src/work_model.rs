@@ -7375,7 +7375,9 @@ impl WorkModelStore {
                 source,
             })?;
         reject_transition_history_change(&prior, &work_item, &path)?;
-        append_durable_transitions(Some(&prior), &mut work_item, metadata);
+        if !prior.transitions.is_empty() {
+            append_durable_transitions(Some(&prior), &mut work_item, metadata);
+        }
         work_item
             .validate()
             .map_err(|source| WorkModelStorageError::InvalidModel { path, source })?;
@@ -7419,13 +7421,13 @@ impl WorkModelStore {
         let prior = if create_new {
             None
         } else if path.exists() {
-            Some(WorkItem::from(read_json_file::<WorkItemRecord>(&path)?))
+            Some(self.read_work_item_file_unlocked(&path, false)?)
         } else {
             None
         };
         let mut target = work_item.clone();
         if let Some(prior) = prior.as_ref() {
-            reject_transition_history_change(prior, &target, &path)?;
+            preserve_transition_history(prior, &mut target, &path)?;
         }
         let transition_ledger_active = create_new
             || prior
@@ -8129,6 +8131,18 @@ fn reject_transition_history_change(
         });
     }
     Ok(())
+}
+
+fn preserve_transition_history(
+    prior: &WorkItem,
+    proposed: &mut WorkItem,
+    path: &Path,
+) -> Result<(), WorkModelStorageError> {
+    if prior.transitions.starts_with(&proposed.transitions) {
+        proposed.transitions.clone_from(&prior.transitions);
+        return Ok(());
+    }
+    reject_transition_history_change(prior, proposed, path)
 }
 
 fn append_durable_transitions(
