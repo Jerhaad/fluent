@@ -60,6 +60,17 @@ pub fn detail_values(row: &DashboardRow) -> Vec<String> {
             release.criteria, release.blockers
         ));
     }
+    if let Some(latest) = &row.latest_transition {
+        let transition = &latest.transition;
+        values.push(format!(
+            "Latest transition: {} {} → {} (origin {}, elapsed {}s)",
+            transition.object_kind,
+            transition.object_id,
+            transition.new_state,
+            transition.origin,
+            transition.elapsed_seconds.unwrap_or(0)
+        ));
+    }
     values.push(
         row.next_action
             .clone()

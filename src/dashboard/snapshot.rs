@@ -1,7 +1,9 @@
 use crate::{
+    dashboard::transitions::DashboardTransition,
     guidance,
     work_status::{WorkItemStatus, WorkStatus},
 };
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
@@ -26,6 +28,7 @@ pub struct DashboardRow {
     pub status: WorkItemStatus,
     pub group: Group,
     pub next_action: Option<String>,
+    pub latest_transition: Option<DashboardTransition>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DashboardSnapshot {
@@ -35,6 +38,13 @@ pub struct DashboardSnapshot {
 
 impl DashboardSnapshot {
     pub fn from_status(status: WorkStatus) -> Self {
+        Self::from_status_and_transitions(status, BTreeMap::new())
+    }
+
+    pub fn from_status_and_transitions(
+        status: WorkStatus,
+        transitions: BTreeMap<String, DashboardTransition>,
+    ) -> Self {
         Self {
             rows: status
                 .rows
@@ -43,6 +53,7 @@ impl DashboardSnapshot {
                     let group = group_for(&row.action);
                     let next_action = guidance::next_action_for_status_row(&row);
                     DashboardRow {
+                        latest_transition: transitions.get(&row.id).cloned(),
                         status: row,
                         group,
                         next_action,

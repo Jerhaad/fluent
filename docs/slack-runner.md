@@ -296,9 +296,11 @@ state the permitted recovery action; Slack never mutates GitHub state.
 
 Status comes from persisted Work rather than chat text. The thread projection
 shows the project and checkout, Slice stage, provider state, each Work state,
-and the next action. After a runner restart, Fluent replays only transitions
-whose stable delivery identities have not already been scheduled. A Slice
-becomes complete only when every Work Item's latest required Attempt is
-`complete`, every candidate has landed successfully, and all required
-post-land processing has passed. A failed or `needs-user` latest Attempt, an
-unlanded candidate, or a post-land failure keeps the Slice active.
+and the next action. An allowed participant requests that projection by
+replying `status` or `work status` in the Fluent thread. After a runner restart,
+Fluent replays only transitions whose stable delivery identities have not
+already been scheduled. A Slice becomes complete only when every Work Item's
+latest required Attempt is `complete`, every candidate has landed successfully,
+and all required post-land processing has passed. A failed or `needs-user`
+latest Attempt, an unlanded candidate, or a post-land failure keeps the Slice
+active.

@@ -2,6 +2,7 @@ mod app;
 mod layout;
 mod render;
 mod snapshot;
+mod transitions;
 
 use anyhow::Result;
 use app::{App, Effect};
@@ -103,9 +104,9 @@ impl Drop for TerminalSession {
 
 /// Launch the read-only Work operator console.
 pub fn run_dashboard(search_root: &Path) -> Result<()> {
-    let status = work_status::load_work_status(search_root)?;
+    let snapshot = load_snapshot(search_root)?;
     let mut session = TerminalSession::open()?;
-    let mut app = App::new(snapshot::DashboardSnapshot::from_status(status));
+    let mut app = App::new(snapshot);
     let size = session.terminal.size()?;
     app.resize(size.width, size.height);
     let mut next_poll = Instant::now() + DATA_POLL_INTERVAL;
@@ -147,10 +148,21 @@ fn poll_due(now: Instant, deadline: Instant) -> bool {
 }
 
 fn refresh(root: &Path, app: &mut App) {
-    match work_status::load_work_status(root) {
-        Ok(status) => app.refresh(snapshot::DashboardSnapshot::from_status(status)),
+    match load_snapshot(root) {
+        Ok(snapshot) => app.refresh(snapshot),
         Err(error) => app.refresh_failed(error.to_string()),
     }
+}
+
+fn load_snapshot(root: &Path) -> Result<snapshot::DashboardSnapshot> {
+    let status = work_status::load_work_status(root)?;
+    let transitions = transitions::DashboardTransitionProjection::new(root.to_path_buf())
+        .refresh()?
+        .latest;
+    Ok(snapshot::DashboardSnapshot::from_status_and_transitions(
+        status,
+        transitions,
+    ))
 }
 
 #[cfg(test)]
@@ -211,6 +223,72 @@ mod tests {
         let app = app(vec![row("ready", "task-ready"), row("done", "complete")]);
         assert!(text(&app, 100, 24).contains("Ready (1)"));
         assert!(!text(&app, 100, 24).contains("done title"));
+    }
+
+    #[test]
+    fn dashboard_replays_work_transitions_with_its_own_durable_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::work_model::WorkModelStore::new(root.path());
+        let metadata = crate::work_model::DurableTransitionMetadata {
+            origin: crate::work_model::DurableTransitionOrigin::SlackThread,
+            reason: Some("plan approved".into()),
+            evidence_ref: Some("slack-slice:dashboard".into()),
+        };
+        store
+            .create_work_item_with_transition(
+                &crate::work_model::WorkItem {
+                    id: "work-dashboard".into(),
+                    title: "Dashboard transitions".into(),
+                    authorization: crate::work_model::ExecutionAuthorization::Proposed,
+                    ..Default::default()
+                },
+                &metadata,
+            )
+            .unwrap();
+
+        let projection = transitions::DashboardTransitionProjection::new(root.path().to_path_buf());
+        let first = projection.refresh().unwrap();
+        assert_eq!(first.applied.len(), 1);
+        assert_eq!(first.applied[0].work_item_id, "work-dashboard");
+        assert_eq!(first.applied[0].transition.new_state, "planned");
+        assert_eq!(first.latest["work-dashboard"].transition.sequence, 1);
+
+        let restarted = transitions::DashboardTransitionProjection::new(root.path().to_path_buf());
+        let replay = restarted.refresh().unwrap();
+        assert!(replay.applied.is_empty());
+        assert_eq!(replay.latest["work-dashboard"].transition.sequence, 1);
+        assert!(
+            root.path()
+                .join(".fluent/work/dashboard/transition-projection.json")
+                .is_file()
+        );
+        assert!(!root.path().join(".fluent/slack").exists());
+
+        store
+            .mutate_work_item_with_transition("work-dashboard", &metadata, |item| {
+                item.authorization = crate::work_model::ExecutionAuthorization::execution_ready(
+                    crate::work_model::ExecutionAuthority::Human,
+                );
+                Ok(())
+            })
+            .unwrap();
+        let advanced = restarted.refresh().unwrap();
+        assert_eq!(advanced.applied.len(), 1);
+        assert_eq!(advanced.applied[0].transition.sequence, 2);
+        assert_eq!(advanced.applied[0].transition.new_state, "authorized");
+        assert!(restarted.refresh().unwrap().applied.is_empty());
+
+        let snapshot = load_snapshot(root.path()).unwrap();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.status.id == "work-dashboard")
+            .unwrap();
+        assert!(
+            layout::detail_values(row)
+                .iter()
+                .any(|line| line.contains("Latest transition: work-item work-dashboard"))
+        );
     }
     #[test]
     fn current_work_is_grouped_with_counts() {

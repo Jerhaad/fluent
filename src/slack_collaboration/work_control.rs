@@ -163,9 +163,10 @@ pub fn render_transition_reply(transition: &WorkTransition, evidence: &[String])
     if let Some(reason) = &transition.reason {
         reply.push_str(&format!(" Next action: {reason}."));
     }
-    if let Some(elapsed) = transition.elapsed_seconds {
-        reply.push_str(&format!(" Elapsed: {elapsed}s."));
-    }
+    reply.push_str(&format!(
+        " Elapsed: {}s.",
+        transition.elapsed_seconds.unwrap_or(0)
+    ));
     if !evidence.is_empty() {
         reply.push_str(&format!(" Evidence: {}.", evidence.join(", ")));
     }

@@ -6809,6 +6809,7 @@ fn durable_work_transition_posts_detailed_thread_reply() {
             && delivery.text.contains("is now planned")
             && delivery.text.contains("Origin: slack-thread")
             && delivery.text.contains("Next action: Plan approved by U1")
+            && delivery.text.contains("Elapsed: 0s")
             && delivery.text.contains("Evidence: slack-slice:slice-runner")
     }));
     assert!(runner.report_thread_work("1.0").unwrap().is_empty());
@@ -6972,6 +6973,7 @@ fn durable_work_transition_posts_detailed_thread_reply() {
                 && delivery
                     .text
                     .contains("Next action: candidate passed required gates")
+                && delivery.text.contains("Elapsed: 0s")
                 && delivery.text.contains("Evidence: candidate/evidence.json")
         }));
     }
