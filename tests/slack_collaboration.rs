@@ -2572,6 +2572,55 @@ fn code_question_uses_bound_checkout_and_relative_references() {
 }
 
 #[test]
+fn code_question_posts_provider_reference_in_slack_thread() {
+    struct ReferencingProvider;
+    impl ConversationProvider for ReferencingProvider {
+        fn start(
+            &mut self,
+            _action_id: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<(String, String)> {
+            Ok(("session".into(), "The implementation is here.".into()))
+        }
+        fn resume(
+            &mut self,
+            _action_id: &str,
+            _session: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn code_references(
+            &mut self,
+            _scope: &ProviderScope,
+            _contribution: &str,
+        ) -> anyhow::Result<Vec<CodeReference>> {
+            Ok(vec![CodeReference {
+                path: "README".into(),
+                line: 1,
+            }])
+        }
+    }
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        ReferencingProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent where is this code?"))
+        .unwrap();
+    let reply = &runner.slack().deliveries[0].text;
+    assert!(reply.contains("README:1"));
+    assert!(!reply.contains(&checkout.path().display().to_string()));
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(

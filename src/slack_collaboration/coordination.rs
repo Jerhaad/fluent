@@ -817,6 +817,18 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("provider turn completed without a reply")?;
         let raw_reply = redact_secrets(&raw_reply);
+        let references = self
+            .provider
+            .code_references(&scope, &turn.contribution)?
+            .into_iter()
+            .map(|reference| {
+                crate::slack_collaboration::format_code_reference(
+                    &self.bound_project(thread)?.checkout,
+                    &scope.checkout.join(reference.path),
+                    reference.line,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
         let output = serde_json::from_str::<ProviderOutput>(&raw_reply).unwrap_or_else(|_| {
             ProviderOutput::Message {
                 text: raw_reply.clone(),
@@ -850,6 +862,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     )
                 } else {
                     text
+                };
+                let reply = if references.is_empty() {
+                    reply
+                } else {
+                    format!("{reply}\n\n{}", references.join("\n"))
                 };
                 turn.completed_reply = Some(reply.clone());
                 thread.pending_turn = Some(turn);

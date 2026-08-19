@@ -204,6 +204,14 @@ pub enum ProviderTurnRecovery {
     Completed { turn_id: String, reply: String },
 }
 
+/// A provider-reported source location. The coordinator validates and renders
+/// it at the Slack boundary so providers never expose host checkout paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeReference {
+    pub path: PathBuf,
+    pub line: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderFailure {
     Authentication,
@@ -322,6 +330,14 @@ pub trait ConversationProvider {
     }
 
     fn structured_events(&mut self, _session: &str) -> Result<Vec<ProviderEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn code_references(
+        &mut self,
+        _scope: &ProviderScope,
+        _contribution: &str,
+    ) -> Result<Vec<CodeReference>> {
         Ok(Vec::new())
     }
 

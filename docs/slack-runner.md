@@ -168,9 +168,16 @@ the participants who may switch a recovered thread. The currently supported
 runner adapter is `codex`; do not list `claude` until a Claude adapter is
 installed for this runner.
 
-The runner validates a requested provider against this policy before binding a
-thread. Provider switching requires an interrupted thread and an approver;
-future adapters will expose that action in the Slack workflow. If the exact
-bound checkout disappears or its identity changes, Fluent stops provider access,
-reports the unavailable binding, and never substitutes another checkout
-automatically.
+To select a provider explicitly, include its allowed name in the opening
+mention. For example:
+
+```text
+@Fluent [provider=codex] plan the next release
+```
+
+The requested name must appear in the project's `enabled_providers` list. The
+runner validates it before binding a thread. Provider switching requires an
+interrupted thread and an approver; future adapters will expose that action in
+the Slack workflow. If the exact bound checkout disappears or its identity
+changes, Fluent stops provider access, reports the unavailable binding, and
+never substitutes another checkout automatically.
