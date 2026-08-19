@@ -823,90 +823,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     }
 }
 
-struct SharedProvider<P>(Arc<std::sync::Mutex<P>>);
-
-impl<P> Clone for SharedProvider<P> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<P: ConversationProvider> ConversationProvider for SharedProvider<P> {
-    fn name(&self) -> &str {
-        "shared"
-    }
-
-    fn select(&mut self, provider: &str) -> Result<()> {
-        self.0.lock().unwrap().select(provider)
-    }
-
-    fn start(
-        &mut self,
-        action_id: &str,
-        scope: &ProviderScope,
-        contribution: &str,
-        actor: &str,
-    ) -> Result<(String, String)> {
-        self.0
-            .lock()
-            .unwrap()
-            .start(action_id, scope, contribution, actor)
-    }
-
-    fn resume(
-        &mut self,
-        action_id: &str,
-        session: &str,
-        scope: &ProviderScope,
-        contribution: &str,
-        actor: &str,
-    ) -> Result<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .resume(action_id, session, scope, contribution, actor)
-    }
-
-    fn prepare_session(&mut self, scope: &ProviderScope) -> Result<Option<String>> {
-        self.0.lock().unwrap().prepare_session(scope)
-    }
-
-    fn recover_turn(
-        &mut self,
-        action_id: &str,
-        session: &str,
-        scope: &ProviderScope,
-    ) -> Result<ProviderTurnRecovery> {
-        self.0
-            .lock()
-            .unwrap()
-            .recover_turn(action_id, session, scope)
-    }
-
-    fn run_turn(
-        &mut self,
-        action_id: &str,
-        session: Option<&str>,
-        scope: &ProviderScope,
-        contribution: &str,
-        actor: &str,
-        accepted: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<(Option<String>, String)> {
-        self.0
-            .lock()
-            .unwrap()
-            .run_turn(action_id, session, scope, contribution, actor, accepted)
-    }
-
-    fn code_references(
-        &mut self,
-        scope: &ProviderScope,
-        contribution: &str,
-    ) -> Result<Vec<CodeReference>> {
-        self.0.lock().unwrap().code_references(scope, contribution)
-    }
-}
-
 struct ProviderCompletion {
     thread_id: String,
     result: Result<()>,
@@ -914,8 +830,8 @@ struct ProviderCompletion {
 
 /// Keeps Slack ingress responsive while provider turns run on bounded workers.
 pub struct AsyncCollaborationRunner<'a, P, S> {
-    runner: CollaborationRunner<'a, SharedProvider<P>, S>,
-    provider: SharedProvider<P>,
+    runner: CollaborationRunner<'a, P, S>,
+    provider_factory: Arc<dyn Fn() -> P + Send + Sync>,
     completions_tx: std::sync::mpsc::Sender<ProviderCompletion>,
     completions_rx: std::sync::mpsc::Receiver<ProviderCompletion>,
     pool: FairTurnPool,
@@ -924,7 +840,7 @@ pub struct AsyncCollaborationRunner<'a, P, S> {
 
 impl<'a, P, S> AsyncCollaborationRunner<'a, P, S>
 where
-    P: ConversationProvider + Send + 'static,
+    P: ConversationProvider + Clone + Send + Sync + 'static,
     S: SlackTransport,
 {
     pub fn new(
@@ -934,11 +850,30 @@ where
         slack: S,
         capacity: usize,
     ) -> Self {
-        let provider = SharedProvider(Arc::new(std::sync::Mutex::new(provider)));
+        let template = provider.clone();
+        Self::new_with_provider_factory(home, config, provider, slack, capacity, move || {
+            template.clone()
+        })
+    }
+}
+
+impl<'a, P, S> AsyncCollaborationRunner<'a, P, S>
+where
+    P: ConversationProvider + Send + 'static,
+    S: SlackTransport,
+{
+    pub fn new_with_provider_factory(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        capacity: usize,
+        provider_factory: impl Fn() -> P + Send + Sync + 'static,
+    ) -> Self {
         let (completions_tx, completions_rx) = std::sync::mpsc::channel();
         Self {
-            runner: CollaborationRunner::new(home, config, provider.clone(), slack),
-            provider,
+            runner: CollaborationRunner::new(home, config, provider, slack),
+            provider_factory: Arc::new(provider_factory),
             completions_tx,
             completions_rx,
             pool: FairTurnPool::new(capacity),
@@ -1013,7 +948,7 @@ where
 
     fn spawn_admitted(&mut self, thread_id: String) {
         self.active.insert(thread_id.clone());
-        let provider = self.provider.clone();
+        let provider = (self.provider_factory)();
         let config = self.runner.config.clone();
         let home = self.runner.home.to_owned();
         let clock = self.runner.clock.clone();
@@ -1034,14 +969,13 @@ where
     fn handle_completion(&mut self, completion: ProviderCompletion) -> Result<()> {
         self.active.remove(&completion.thread_id);
         let next = self.pool.finish(&completion.thread_id);
-        completion.result?;
         self.runner.deliver_pending()?;
         if let Some(next) = next {
             self.spawn_admitted(next);
-        } else {
+        } else if completion.result.is_ok() {
             self.dispatch_if_ready(&completion.thread_id)?;
         }
-        Ok(())
+        completion.result
     }
 
     pub fn wait_for_completion(&mut self) -> Result<()> {

@@ -2555,6 +2555,7 @@ fn claude_structured_session_starts_and_resumes() {
 }
 
 fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
+    #[derive(Clone)]
     struct QueueProvider {
         calls: Arc<Mutex<Vec<String>>>,
         gate: Arc<(Mutex<(usize, bool)>, Condvar)>,
@@ -2644,6 +2645,7 @@ fn queued_replies_form_one_ordered_attributed_turn() {
 
 #[test]
 fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
+    #[derive(Clone)]
     struct FairProvider {
         calls: Arc<Mutex<Vec<String>>>,
         gate: Arc<(Mutex<bool>, Condvar)>,
@@ -2718,6 +2720,133 @@ fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
 }
 
 #[test]
+fn async_runner_admits_parallel_threads_at_configured_capacity() {
+    #[derive(Clone)]
+    struct ParallelProvider {
+        gate: Arc<(Mutex<(usize, bool)>, Condvar)>,
+    }
+    impl ConversationProvider for ParallelProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            let (lock, changed) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
+            }
+            Ok((format!("session-{}", state.0), "reply".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let gate = Arc::new((Mutex::new((0, false)), Condvar::new()));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config,
+        ParallelProvider { gate: gate.clone() },
+        InMemorySlack::default(),
+        2,
+    );
+    runner.ingest(event("E1", None, "@Fluent first")).unwrap();
+    let mut second = event("E2", None, "@Fluent second");
+    second.timestamp = "2.0".into();
+    runner.ingest(second).unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while state.0 < 2 {
+            state = changed.wait(state).unwrap();
+        }
+        state.1 = true;
+        changed.notify_all();
+    }
+    runner.wait_for_completion().unwrap();
+    runner.wait_for_completion().unwrap();
+}
+
+#[test]
+fn fatal_worker_still_launches_the_next_fair_admission() {
+    #[derive(Clone)]
+    struct FatalFirstProvider {
+        calls: Arc<AtomicUsize>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl ConversationProvider for FatalFirstProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let (lock, changed) = &*self.gate;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+                anyhow::bail!("simulated fatal worker")
+            }
+            Ok(("session".into(), "recovered waiter".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config,
+        FatalFirstProvider {
+            calls: calls.clone(),
+            gate: gate.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent first")).unwrap();
+    while calls.load(Ordering::SeqCst) == 0 {
+        std::thread::yield_now();
+    }
+    let mut second = event("E2", None, "@Fluent second");
+    second.timestamp = "2.0".into();
+    runner.ingest(second).unwrap();
+    {
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+    }
+    assert!(runner.wait_for_completion().is_err());
+    runner.wait_for_completion().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn provider_failure_classifies_recovery_state() {
     assert_eq!(
         classify_provider_failure("authentication required"),
@@ -2733,7 +2862,7 @@ fn provider_failure_classifies_recovery_state() {
 
 #[test]
 fn provider_failure_preserves_replies_and_reports_recovery() {
-    struct FailingProvider;
+    struct FailingProvider(&'static str);
     impl ConversationProvider for FailingProvider {
         fn start(
             &mut self,
@@ -2742,7 +2871,7 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
             _: &str,
             _: &str,
         ) -> anyhow::Result<(String, String)> {
-            anyhow::bail!("authentication required")
+            anyhow::bail!(self.0)
         }
         fn resume(
             &mut self,
@@ -2759,7 +2888,7 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
-        FailingProvider,
+        FailingProvider("authentication required"),
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
@@ -2775,6 +2904,30 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
     assert_eq!(
         thread.pending_turn.as_ref().unwrap().contribution,
         "@Fluent hello"
+    );
+
+    let (home, _checkout, config) = setup(true);
+    let mut unavailable = CollaborationRunner::new(
+        home.path(),
+        config,
+        FailingProvider("provider runtime unavailable"),
+        InMemorySlack::default(),
+    );
+    unavailable
+        .ingest(event("E1", None, "@Fluent preserve this"))
+        .unwrap();
+    let recovery = &unavailable.slack().deliveries[0].text;
+    assert!(recovery.contains("queued replies are preserved"));
+    assert!(recovery.contains("project approver may switch providers"));
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&unavailable.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .pending_turn
+            .unwrap()
+            .contribution,
+        "@Fluent preserve this"
     );
 }
 
@@ -2960,6 +3113,14 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
             .text
             .contains("project approver may switch providers")
     }));
+    assert!(
+        runner
+            .slack()
+            .inner
+            .deliveries
+            .iter()
+            .any(|delivery| { delivery.text.contains("retrying in 17 seconds") })
+    );
 
     drop(runner);
     let mut runner = AsyncCollaborationRunner::new(

@@ -746,6 +746,8 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     let claude = std::env::var_os("FLUENT_CLAUDE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("claude"));
+    let worker_codex = codex.clone();
+    let worker_claude = claude.clone();
     let provider = ProviderRegistry::new([
         Box::new(CodexAppServerProvider::new_scoped(codex)) as Box<dyn ConversationProvider>,
         Box::new(ClaudeStructuredSessionProvider::new_scoped(claude))
@@ -763,7 +765,23 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
-    let mut runner = AsyncCollaborationRunner::new(home, config, provider, slack, turn_capacity);
+    let mut runner = AsyncCollaborationRunner::new_with_provider_factory(
+        home,
+        config,
+        provider,
+        slack,
+        turn_capacity,
+        move || {
+            ProviderRegistry::new([
+                Box::new(CodexAppServerProvider::new_scoped(worker_codex.clone()))
+                    as Box<dyn ConversationProvider>,
+                Box::new(ClaudeStructuredSessionProvider::new_scoped(
+                    worker_claude.clone(),
+                )) as Box<dyn ConversationProvider>,
+            ])
+            .expect("static provider registry is valid")
+        },
+    );
     let targets = runner.recovery_targets()?;
     let history = runner.slack_mut().bounded_history(&targets)?;
     let connected_at = connection_time();
