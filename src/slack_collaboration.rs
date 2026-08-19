@@ -766,6 +766,7 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     ])?;
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
     let scheduler = LocalSchedulerClient::new(
+        home,
         config
             .projects
             .values()

@@ -59,12 +59,14 @@ fn validate_structured_provider_output(raw: &str, scope: &ProviderScope) -> Resu
 }
 
 pub struct LocalSchedulerClient {
+    socket_path: PathBuf,
     project_roots: Vec<PathBuf>,
 }
 
 impl LocalSchedulerClient {
-    pub fn new(project_roots: impl IntoIterator<Item = PathBuf>) -> Self {
+    pub fn new(home: &std::path::Path, project_roots: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
+            socket_path: crate::scheduler_service::socket_path(home),
             project_roots: project_roots.into_iter().collect(),
         }
     }
@@ -102,8 +104,11 @@ impl WorkScheduler for LocalSchedulerClient {
             attempt_id: format!("slack-{}", request.id),
             created_at: request.created_at.clone(),
         };
-        crate::scheduler_service::persist_request(project_root, &scheduler_request)?;
-        let token = crate::scheduler_service::submit_dispatch(project_root, &scheduler_request)?;
+        let token = crate::scheduler_service::send_execution_request(
+            &self.socket_path,
+            project_root,
+            &scheduler_request,
+        )?;
         Ok(WorkQueueOutcome::Queued {
             request_id: token.request_id,
         })

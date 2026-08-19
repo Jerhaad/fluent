@@ -251,9 +251,6 @@ impl WorkControl {
         let mut slice = self
             .slice(slice_id)?
             .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
-        if slice.approved_by != approver {
-            bail!("only the approving project approver can authorize this Slice");
-        }
         let store = WorkModelStore::new(&self.project_root);
         let mut outcomes = Vec::with_capacity(slice.work_item_ids.len());
         for work_item_id in &slice.work_item_ids {

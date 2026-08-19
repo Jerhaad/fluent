@@ -508,7 +508,19 @@ impl Drop for FakeSocketListener {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SocketRequest {
-    Health { generation: u32 },
+    Health {
+        generation: u32,
+    },
+    SubmitExecution {
+        generation: u32,
+        project_root: PathBuf,
+        request: AttemptExecutionRequest,
+    },
+    ExecutionStatus {
+        generation: u32,
+        project_root: PathBuf,
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -517,6 +529,19 @@ enum SocketResponse {
     HealthOk {
         generation: u32,
         build: BuildIdentity,
+    },
+    ExecutionSubmitted {
+        generation: u32,
+        token: DispatchToken,
+    },
+    ExecutionStatus {
+        generation: u32,
+        request: AttemptExecutionRequest,
+        dispatched: bool,
+    },
+    Error {
+        generation: u32,
+        message: String,
     },
 }
 
@@ -538,7 +563,71 @@ pub fn send_health_request(sock_path: &Path) -> Result<HealthResponse> {
     let resp_bytes = frame_read(&mut stream)?;
     match serde_json::from_slice::<SocketResponse>(&resp_bytes).context("parse health response")? {
         SocketResponse::HealthOk { generation, build } => Ok(HealthResponse { generation, build }),
+        SocketResponse::Error { message, .. } => bail!("scheduler service: {message}"),
+        _ => bail!("scheduler service returned an unexpected health response"),
     }
+}
+
+/// Submit one immutable execution request through the versioned scheduler
+/// service boundary. Only the service writes request and dispatch storage.
+pub fn send_execution_request(
+    sock_path: &Path,
+    project_root: &Path,
+    request: &AttemptExecutionRequest,
+) -> Result<DispatchToken> {
+    let response = exchange(
+        sock_path,
+        &SocketRequest::SubmitExecution {
+            generation: PROTOCOL_GENERATION,
+            project_root: project_root.to_path_buf(),
+            request: request.clone(),
+        },
+    )?;
+    match response {
+        SocketResponse::ExecutionSubmitted { generation, token }
+            if generation == PROTOCOL_GENERATION =>
+        {
+            Ok(token)
+        }
+        SocketResponse::Error { message, .. } => bail!("scheduler service: {message}"),
+        _ => bail!("scheduler service returned an unexpected execution response"),
+    }
+}
+
+/// Read scheduler-owned execution status through the versioned service API.
+pub fn send_execution_status(
+    sock_path: &Path,
+    project_root: &Path,
+    request_id: &str,
+) -> Result<(AttemptExecutionRequest, bool)> {
+    let response = exchange(
+        sock_path,
+        &SocketRequest::ExecutionStatus {
+            generation: PROTOCOL_GENERATION,
+            project_root: project_root.to_path_buf(),
+            request_id: request_id.to_owned(),
+        },
+    )?;
+    match response {
+        SocketResponse::ExecutionStatus {
+            generation,
+            request,
+            dispatched,
+        } if generation == PROTOCOL_GENERATION => Ok((request, dispatched)),
+        SocketResponse::Error { message, .. } => bail!("scheduler service: {message}"),
+        _ => bail!("scheduler service returned an unexpected status response"),
+    }
+}
+
+fn exchange(sock_path: &Path, request: &SocketRequest) -> Result<SocketResponse> {
+    let mut stream = UnixStream::connect(sock_path)
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+    exchange_stream(&mut stream, request)
+}
+
+fn exchange_stream(stream: &mut UnixStream, request: &SocketRequest) -> Result<SocketResponse> {
+    frame_write(stream, &serde_json::to_vec(request)?)?;
+    serde_json::from_slice(&frame_read(stream)?).context("parse scheduler response")
 }
 
 fn frame_write(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
@@ -605,20 +694,63 @@ fn run_fake_listener(listener: UnixListener, build: BuildIdentity, stop_flag: Ar
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
-        let Ok(payload) = frame_read(&mut stream) else {
-            continue;
-        };
-        let resp = match serde_json::from_slice::<SocketRequest>(&payload) {
-            Ok(SocketRequest::Health { .. }) => SocketResponse::HealthOk {
+        let _ = serve_connection(&mut stream, &build);
+    }
+}
+
+fn serve_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()> {
+    let payload = frame_read(stream)?;
+    let resp = match serde_json::from_slice::<SocketRequest>(&payload) {
+        Ok(SocketRequest::Health { generation }) if generation == PROTOCOL_GENERATION => {
+            SocketResponse::HealthOk {
                 generation: PROTOCOL_GENERATION,
                 build: build.clone(),
-            },
-            Err(_) => continue,
-        };
-        if let Ok(bytes) = serde_json::to_vec(&resp) {
-            let _ = frame_write(&mut stream, &bytes);
+            }
         }
-    }
+        Ok(SocketRequest::SubmitExecution {
+            generation,
+            project_root,
+            request,
+        }) if generation == PROTOCOL_GENERATION => {
+            match persist_request(&project_root, &request)
+                .and_then(|()| submit_dispatch(&project_root, &request))
+            {
+                Ok(token) => SocketResponse::ExecutionSubmitted {
+                    generation: PROTOCOL_GENERATION,
+                    token,
+                },
+                Err(error) => SocketResponse::Error {
+                    generation: PROTOCOL_GENERATION,
+                    message: error.to_string(),
+                },
+            }
+        }
+        Ok(SocketRequest::ExecutionStatus {
+            generation,
+            project_root,
+            request_id,
+        }) if generation == PROTOCOL_GENERATION => match load_request(&project_root, &request_id) {
+            Ok(request) => SocketResponse::ExecutionStatus {
+                generation: PROTOCOL_GENERATION,
+                dispatched: dispatch_token_path(&project_root, &request_id).exists(),
+                request,
+            },
+            Err(error) => SocketResponse::Error {
+                generation: PROTOCOL_GENERATION,
+                message: error.to_string(),
+            },
+        },
+        Ok(_) => SocketResponse::Error {
+            generation: PROTOCOL_GENERATION,
+            message: "unsupported scheduler protocol generation".into(),
+        },
+        Err(error) => SocketResponse::Error {
+            generation: PROTOCOL_GENERATION,
+            message: format!("invalid scheduler request: {error}"),
+        },
+    };
+    frame_write(stream, &serde_json::to_vec(&resp)?)?;
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────
@@ -939,4 +1071,66 @@ pub(crate) fn generate_random_hex(n_bytes: usize) -> Result<String> {
     let mut f = fs::File::open("/dev/urandom").context("open /dev/urandom")?;
     f.read_exact(&mut buf).context("read random bytes")?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+#[cfg(test)]
+mod socket_execution_tests {
+    use super::*;
+
+    #[test]
+    fn execution_protocol_owns_persistence_and_status() {
+        let project = tempfile::TempDir::new().unwrap();
+        let request = AttemptExecutionRequest {
+            id: "request-1".into(),
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+            created_at: "2026-08-18T00:00:00Z".into(),
+        };
+        let build = BuildIdentity {
+            version: "test".into(),
+            hash: "build".into(),
+        };
+        let (mut client, mut service) = UnixStream::pair().unwrap();
+        let service_build = build.clone();
+        let handle = std::thread::spawn(move || {
+            serve_connection(&mut service, &service_build).unwrap();
+        });
+        let response = exchange_stream(
+            &mut client,
+            &SocketRequest::SubmitExecution {
+                generation: PROTOCOL_GENERATION,
+                project_root: project.path().to_path_buf(),
+                request: request.clone(),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert!(matches!(
+            response,
+            SocketResponse::ExecutionSubmitted { token, .. } if token.request_id == "request-1"
+        ));
+        assert_eq!(load_request(project.path(), "request-1").unwrap(), request);
+
+        let (mut client, mut service) = UnixStream::pair().unwrap();
+        let handle = std::thread::spawn(move || {
+            serve_connection(&mut service, &build).unwrap();
+        });
+        let response = exchange_stream(
+            &mut client,
+            &SocketRequest::ExecutionStatus {
+                generation: PROTOCOL_GENERATION,
+                project_root: project.path().to_path_buf(),
+                request_id: "request-1".into(),
+            },
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert!(matches!(
+            response,
+            SocketResponse::ExecutionStatus {
+                dispatched: true,
+                ..
+            }
+        ));
+    }
 }

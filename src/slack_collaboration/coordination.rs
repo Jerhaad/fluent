@@ -1523,7 +1523,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
         let project_root = self.bound_project(&thread)?.checkout.path.clone();
-        let scheduler = LocalSchedulerClient::new([project_root]);
+        let scheduler = LocalSchedulerClient::new(self.home, [project_root]);
         self.authorize_thread_execution(thread_id, actor, &scheduler)
     }
 

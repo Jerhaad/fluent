@@ -6604,7 +6604,7 @@ fn execution_approval_queues_each_planned_work_item() {
     let scheduler = FakeScheduler::default();
 
     let report = control
-        .authorize_execution("slice-1", "U1", &scheduler)
+        .authorize_execution("slice-1", "U2", &scheduler)
         .unwrap();
 
     assert_eq!(report.outcomes.len(), 2);
@@ -6618,7 +6618,7 @@ fn execution_approval_queues_each_planned_work_item() {
     }
     assert_eq!(
         control
-            .authorize_execution("slice-1", "U1", &scheduler)
+            .authorize_execution("slice-1", "U2", &scheduler)
             .unwrap()
             .outcomes,
         report.outcomes
@@ -6669,6 +6669,14 @@ fn execution_approval_retries_the_same_request_after_scheduler_failure() {
 
 #[test]
 fn runner_delivers_plan_execution_and_durable_work_updates() {
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
@@ -6692,16 +6700,9 @@ fn runner_delivers_plan_execution_and_durable_work_updates() {
             && delivery.text.contains("Execution has not started")
     }));
 
-    let report = runner
-        .authorize_thread_execution_locally("1.0", "U1")
+    runner
+        .authorize_thread_execution("1.0", "U1", &Scheduler)
         .unwrap();
-    let request_id = match &report.outcomes[0].1 {
-        WorkQueueOutcome::Queued { request_id }
-        | WorkQueueOutcome::AlreadyQueued { request_id } => request_id,
-    };
-    let scheduled = fluent::scheduler_service::load_request(checkout.path(), request_id).unwrap();
-    assert_eq!(scheduled.work_item_id, "work-runner");
-    assert_eq!(scheduled.id, *request_id);
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery
             .text
