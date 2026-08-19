@@ -2277,6 +2277,42 @@ fn scoped_codex_provider_accesses_checkout_below_runner_home() {
 }
 
 #[test]
+fn provider_login_uses_runner_scoped_homes() {
+    let fixture = TempDir::new().unwrap();
+    let executable = fixture.path().join("provider-login");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s|%s|%s|%s\\n' \"$HOME\" \"${CODEX_HOME-}\" \"${CLAUDE_CONFIG_DIR-}\" \"$*\" > \"$0.log\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let (_home, checkout, config) = setup(true);
+    let draft = checkout.path().join(".fluent/work/slack/drafts/1.0");
+
+    authenticate_provider_with_executable(&config, "app", "1.0", "codex", &executable).unwrap();
+    let codex = fs::read_to_string(executable.with_extension("log")).unwrap();
+    assert_eq!(
+        codex.trim(),
+        format!(
+            "{}|{}||login",
+            draft.join(".provider-home").display(),
+            draft.join(".codex-home").display()
+        )
+    );
+
+    authenticate_provider_with_executable(&config, "app", "1.0", "claude", &executable).unwrap();
+    let claude = fs::read_to_string(executable.with_extension("log")).unwrap();
+    assert_eq!(
+        claude.trim(),
+        format!(
+            "{}||{}|",
+            draft.join(".provider-home").display(),
+            draft.join(".claude-home").display()
+        )
+    );
+}
+
+#[test]
 fn pure_collaboration_domain_has_no_filesystem_authority() {
     let domain = fs::read_to_string("src/slack_collaboration/domain.rs").unwrap();
 
@@ -3233,6 +3269,211 @@ fn provider_recovery_failure_preserves_typed_state_and_pending_turn() {
         !recovered.slack().deliveries[0]
             .text
             .contains("secret recovery protocol diagnostic")
+    );
+}
+
+#[test]
+fn provider_selection_failure_preserves_typed_state_and_pending_turn() {
+    struct SelectionFailureProvider;
+    impl ConversationProvider for SelectionFailureProvider {
+        fn select(&mut self, _: &str) -> ProviderResult<()> {
+            Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                "selected adapter disappeared",
+            ))
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            unreachable!()
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        SelectionFailureProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent keep selection turn"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.provider_failure, Some(ProviderFailure::Unavailable));
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "@Fluent keep selection turn"
+    );
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("queued replies are preserved")
+    );
+}
+
+#[test]
+fn missing_accepted_provider_turn_preserves_incompatible_protocol_state() {
+    struct MissingAcceptedTurnProvider;
+    impl ConversationProvider for MissingAcceptedTurnProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            unreachable!()
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+        fn recover_turn(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+        ) -> ProviderResult<ProviderTurnRecovery> {
+            Ok(ProviderTurnRecovery::Missing)
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut first = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    first
+        .ingest(event("E1", None, "@Fluent establish session"))
+        .unwrap();
+    let store = FileCollaborationStore::new(home.path());
+    let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
+    thread.pending_turn = Some(PendingTurn {
+        action_id: "E2".into(),
+        contribution: "keep accepted turn".into(),
+        actor: "U1".into(),
+        starts_session: false,
+        provider_turn_id: Some("accepted-turn".into()),
+        completed_reply: None,
+        retry_at_unix_seconds: None,
+        delivery_attempt: 0,
+    });
+    store.save_thread(&config, &thread).unwrap();
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        MissingAcceptedTurnProvider,
+        InMemorySlack::default(),
+    );
+    recovered
+        .ingest(event("E2", Some("1.0"), "keep accepted turn"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&recovered.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::IncompatibleProtocol)
+    );
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "keep accepted turn"
+    );
+    assert!(
+        recovered.slack().deliveries[0]
+            .text
+            .contains("protocol is incompatible")
+    );
+}
+
+#[test]
+fn provider_reference_failure_preserves_typed_state_and_pending_turn() {
+    struct ReferenceFailureProvider;
+    impl ConversationProvider for ReferenceFailureProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            Ok(("session".into(), "reply".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            Ok("reply".into())
+        }
+        fn code_references(
+            &mut self,
+            _: &ProviderScope,
+            _: &str,
+        ) -> ProviderResult<Vec<CodeReference>> {
+            Err(ProviderError::new(
+                ProviderFailure::IncompatibleProtocol,
+                "reference response schema changed",
+            ))
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        ReferenceFailureProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent inspect code"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::IncompatibleProtocol)
+    );
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "@Fluent inspect code"
+    );
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("protocol is incompatible")
     );
 }
 

@@ -233,6 +233,18 @@ pub enum SlackCommands {
         /// Checkout to identify
         path: PathBuf,
     },
+    /// Authenticate a provider in the private state used by one Slack thread
+    ProviderLogin {
+        /// Configured project label
+        #[arg(long)]
+        project: String,
+        /// Slack thread timestamp
+        #[arg(long)]
+        thread: String,
+        /// Enabled provider name (`codex` or `claude`)
+        #[arg(long)]
+        provider: String,
+    },
     /// Install and start the local Slack runner at login
     Enable,
     /// Start the configured local Slack runner

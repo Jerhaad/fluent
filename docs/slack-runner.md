@@ -181,11 +181,21 @@ bound checkout and private provider state beneath the Slice draft. Set the
 fair cross-thread provider capacity with `FLUENT_SLACK_TURN_CAPACITY` (default
 four).
 
-Authenticate the selected executable as the same operating-system account
-that runs Fluent. Run `codex login` for Codex or `claude /login` for Claude,
-then restart the Slack runner so the adapter rechecks that account's private
-provider state. If an executable path override is configured, invoke that
-exact executable for the login rather than another installation on `PATH`.
+Authenticate each thread's selected executable through Fluent so the login
+uses the same private homes as provider turns. Take the thread timestamp from
+the Slack thread URL, then run:
+
+```sh
+fluent slack provider-login --project app --thread 1712345678.123456 --provider codex
+fluent slack provider-login --project app --thread 1712345678.123456 --provider claude
+```
+
+The Codex command runs `codex login` in the thread's private `CODEX_HOME`. The
+Claude command opens the interactive Claude client with the thread's private
+`CLAUDE_CONFIG_DIR`; enter `/login` there and finish its prompts. Fluent honors
+`FLUENT_CODEX_APP_SERVER` and `FLUENT_CLAUDE`, so this command authenticates
+the exact configured executable. After login completes, run `fluent slack
+restart` to resume the preserved turn with those scoped credentials.
 
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:

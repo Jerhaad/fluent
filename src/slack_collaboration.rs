@@ -811,6 +811,89 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     }
 }
 
+/// Launch an interactive provider login with the same private state paths
+/// used by the selected Slack thread.
+pub fn authenticate_provider_for_thread(
+    home: &Path,
+    project: &str,
+    thread: &str,
+    provider: &str,
+) -> Result<()> {
+    let config = read_config(home)?;
+    let bound = FileCollaborationStore::new(home)
+        .load_thread(&config, thread)?
+        .context("Fluent Slack thread is unavailable")?;
+    if bound.project_label.as_deref() != Some(project) {
+        bail!("Fluent Slack thread is not bound to the selected project");
+    }
+    let executable = match provider {
+        "codex" => std::env::var_os("FLUENT_CODEX_APP_SERVER")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("codex")),
+        "claude" => std::env::var_os("FLUENT_CLAUDE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("claude")),
+        _ => bail!("conversation provider must be codex or claude"),
+    };
+    authenticate_provider_with_executable(&config, project, thread, provider, &executable)
+}
+
+#[doc(hidden)]
+pub fn authenticate_provider_with_executable(
+    config: &RunnerConfig,
+    project: &str,
+    thread: &str,
+    provider: &str,
+    executable: &Path,
+) -> Result<()> {
+    validate_thread_identity(thread)?;
+    let project = config
+        .projects
+        .get(project)
+        .context("configured Slack project is unavailable")?;
+    if !project.enabled_providers.contains(provider) {
+        bail!("conversation provider is not enabled for this project");
+    }
+    if !checkout_is_available(&project.checkout) {
+        bail!("bound checkout is unavailable");
+    }
+    let draft = project
+        .checkout
+        .path
+        .join(".fluent/work/slack/drafts")
+        .join(thread);
+    let private_home = draft.join(".provider-home");
+    fs::create_dir_all(&private_home)?;
+    let mut command = Command::new(executable);
+    command
+        .current_dir(&project.checkout.path)
+        .env("HOME", private_home);
+    match provider {
+        "codex" => {
+            let provider_home = draft.join(".codex-home");
+            fs::create_dir_all(&provider_home)?;
+            command
+                .env("CODEX_HOME", provider_home)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .arg("login");
+        }
+        "claude" => {
+            let provider_home = draft.join(".claude-home");
+            fs::create_dir_all(&provider_home)?;
+            command
+                .env("CLAUDE_CONFIG_DIR", provider_home)
+                .env_remove("CODEX_HOME");
+        }
+        _ => bail!("conversation provider must be codex or claude"),
+    }
+    command
+        .status()
+        .with_context(|| format!("launch {provider} authentication"))?
+        .success()
+        .then_some(())
+        .with_context(|| format!("{provider} authentication did not complete"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

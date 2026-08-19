@@ -262,6 +262,18 @@ fn cmd_slack(command: SlackCommands) -> Result<()> {
         SlackCommands::CheckoutIdentity { path } => {
             println!("{}", slack_collaboration::checkout_identity(&path)?);
         }
+        SlackCommands::ProviderLogin {
+            project,
+            thread,
+            provider,
+        } => {
+            slack_collaboration::authenticate_provider_for_thread(
+                &slack_home()?,
+                &project,
+                &thread,
+                &provider,
+            )?;
+        }
         SlackCommands::Enable => {
             let home = slack_home()?;
             let executable = std::env::current_exe()?;

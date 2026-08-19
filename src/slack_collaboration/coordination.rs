@@ -548,12 +548,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("thread has no pending provider turn")?;
         let original_turn = turn.clone();
-        self.provider.select(
-            thread
-                .provider
-                .as_deref()
-                .context("thread has no selected provider")?,
-        )?;
+        let selected_provider = thread
+            .provider
+            .as_deref()
+            .context("thread has no selected provider")?;
+        if let Err(error) = self.provider.select(selected_provider) {
+            return self.preserve_provider_failure(event, thread, error);
+        }
         let previously_completed = turn.completed_reply.is_some();
         let checkout = match self.bound_project(thread) {
             Ok(project) => project.checkout.path.clone(),
@@ -601,7 +602,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 };
                 match recovery {
                     ProviderTurnRecovery::Missing if turn.provider_turn_id.is_some() => {
-                        bail!("accepted provider turn is missing from provider history");
+                        return self.preserve_provider_failure(
+                            event,
+                            thread,
+                            ProviderError::new(
+                                ProviderFailure::IncompatibleProtocol,
+                                "accepted provider turn is missing from provider history",
+                            ),
+                        );
                     }
                     ProviderTurnRecovery::Missing => {}
                     ProviderTurnRecovery::Accepted { turn_id } => {
@@ -666,7 +674,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .context("provider turn completed without a reply")?;
         let raw_reply = redact_secrets(&raw_reply);
         let provider_reply = raw_reply.clone();
-        let mut provider_references = self.provider.code_references(&scope, &turn.contribution)?;
+        let mut provider_references =
+            match self.provider.code_references(&scope, &turn.contribution) {
+                Ok(references) => references,
+                Err(error) => return self.preserve_provider_failure(event, thread, error),
+            };
         for reference in code_references_in_reply(&raw_reply, &scope.checkout) {
             if !provider_references.contains(&reference) {
                 provider_references.push(reference);
