@@ -100,35 +100,82 @@ fn pending_action(kind: PendingActionKind) -> PendingAction {
 #[test]
 fn unauthorized_mention_receives_private_refusal() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     let mut request = event("E1", None, "@Fluent hello");
     request.user = "U9".into();
     runner.ingest(request).unwrap();
     assert_eq!(runner.slack().private_responses.len(), 1);
-    assert!(runner.slack().private_responses[0].2.contains("not allowed"));
+    assert!(
+        runner.slack().private_responses[0]
+            .2
+            .contains("not allowed")
+    );
 }
 
 #[test]
 fn unauthorized_mention_preserves_state_and_hides_projects() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     let mut request = event("E1", None, "@Fluent hello");
     request.user = "U9".into();
     runner.ingest(request).unwrap();
-    assert!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().is_none());
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .is_none()
+    );
     assert!(!runner.slack().private_responses[0].2.contains("app"));
 }
 
 #[test]
 fn project_approver_advances_exact_requested_action_once() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
-    let first = runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "approval-event", "then").unwrap();
-    let duplicate = runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "approval-event", "later").unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    let first = runner
+        .approve_pending_action(
+            "1.0",
+            "U1",
+            "approve-plan",
+            "revision-1",
+            "approval-event",
+            "then",
+        )
+        .unwrap();
+    let duplicate = runner
+        .approve_pending_action(
+            "1.0",
+            "U1",
+            "approve-plan",
+            "revision-1",
+            "approval-event",
+            "later",
+        )
+        .unwrap();
     assert_eq!(first, duplicate);
-    let thread = FileCollaborationStore::new(home.path()).load_thread(&runner.config, "1.0").unwrap().unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
     assert_eq!(thread.approvals.len(), 1);
     assert!(thread.pending_action.is_none());
 }
@@ -136,103 +183,264 @@ fn project_approver_advances_exact_requested_action_once() {
 #[test]
 fn participant_cannot_advance_approval_controlled_action() {
     let (home, _checkout, mut config) = setup(true);
-    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
-    assert_eq!(runner.approve_pending_action("1.0", "U2", "approve-plan", "revision-1", "E2", "now").unwrap(), ApprovalOutcome::WaitingForApprover);
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    assert_eq!(
+        runner
+            .approve_pending_action("1.0", "U2", "approve-plan", "revision-1", "E2", "now")
+            .unwrap(),
+        ApprovalOutcome::WaitingForApprover
+    );
 }
 
 #[test]
 fn stale_approval_cannot_advance_revised_action() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
-    assert_eq!(runner.approve_pending_action("1.0", "U1", "approve-plan", "old", "E2", "now").unwrap(), ApprovalOutcome::Stale { current_action_id: "approve-plan".into() });
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    assert_eq!(
+        runner
+            .approve_pending_action("1.0", "U1", "approve-plan", "old", "E2", "now")
+            .unwrap(),
+        ApprovalOutcome::Stale {
+            current_action_id: "approve-plan".into()
+        }
+    );
 }
 
 #[test]
 fn approval_uses_current_project_authority() {
     let (home, _checkout, mut config) = setup(true);
     write_config(home.path(), &config).unwrap();
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
     config.projects.get_mut("app").unwrap().project_approvers = BTreeSet::from(["U2".into()]);
-    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
     write_config(home.path(), &config).unwrap();
-    assert_eq!(runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "E2", "now").unwrap(), ApprovalOutcome::WaitingForApprover);
+    assert_eq!(
+        runner
+            .approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "E2", "now")
+            .unwrap(),
+        ApprovalOutcome::WaitingForApprover
+    );
 }
 
 #[test]
 fn conversational_approval_targets_single_current_question() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
     runner.ingest(event("E2", Some("1.0"), "y")).unwrap();
-    let thread = FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
     assert_eq!(thread.approvals.len(), 1);
 }
 
 #[test]
 fn non_approver_gets_private_explanation_while_thread_waits() {
     let (home, _checkout, mut config) = setup(true);
-    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
-    let mut reply = event("E2", Some("1.0"), "y"); reply.user = "U2".into();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    let mut reply = event("E2", Some("1.0"), "y");
+    reply.user = "U2".into();
     runner.ingest(reply).unwrap();
     assert_eq!(runner.slack().private_responses.len(), 1);
-    assert!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap().pending_action.is_some());
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .pending_action
+            .is_some()
+    );
 }
 
 #[test]
 fn reconnect_applies_still_current_planning_approval() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
-    runner.reconnect([event("E2", Some("1.0"), "y")], "reconnected".into()).unwrap();
-    assert_eq!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap().approvals.len(), 1);
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    runner
+        .reconnect([event("E2", Some("1.0"), "y")], "reconnected".into())
+        .unwrap();
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn reconnect_reconfirms_delayed_consequential_action() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Landing)).unwrap();
-    runner.reconnect([event("E2", Some("1.0"), "y")], "reconnected".into()).unwrap();
-    let thread = FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Landing))
+        .unwrap();
+    runner
+        .reconnect([event("E2", Some("1.0"), "y")], "reconnected".into())
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
     assert!(thread.approvals.is_empty());
-    assert!(thread.pending_question.as_deref().unwrap().contains("fresh confirmation"));
-    assert!(runner.slack().deliveries.iter().any(|delivery| delivery.text.contains("Fresh confirmation")));
+    assert!(
+        thread
+            .pending_question
+            .as_deref()
+            .unwrap()
+            .contains("fresh confirmation")
+    );
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("Fresh confirmation"))
+    );
 }
 
 #[test]
 fn setup_validates_complete_collaboration_authority() {
     let (_home, _checkout, mut config) = setup(true);
     config.enabled_providers.clear();
-    assert!(config.validate().unwrap_err().to_string().contains("conversation provider"));
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("conversation provider")
+    );
     config.enabled_providers.insert("codex".into());
-    config.projects.get_mut("app").unwrap().project_approvers.insert("U9".into());
-    assert!(config.validate().unwrap_err().to_string().contains("participant or approver"));
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .project_approvers
+        .insert("U9".into());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("participant or approver")
+    );
 }
 
 #[test]
 fn participant_revocation_applies_to_active_and_future_threads() {
     let (home, _checkout, mut config) = setup(true);
     write_config(home.path(), &config).unwrap();
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    config.projects.get_mut("app").unwrap().allowed_participants.clear();
-    config.projects.get_mut("app").unwrap().project_approvers.clear();
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .clear();
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .project_approvers
+        .clear();
     // A disabled project policy is invalid, so replace it with another allowed actor.
-    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
-    config.projects.get_mut("app").unwrap().project_approvers.insert("U2".into());
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .project_approvers
+        .insert("U2".into());
     write_config(home.path(), &config).unwrap();
     runner.ingest(event("E2", Some("1.0"), "continue")).unwrap();
     assert_eq!(runner.provider().calls.len(), 1);
@@ -244,43 +452,106 @@ fn default_project_change_does_not_rebind_existing_threads() {
     let other_checkout = TempDir::new().unwrap();
     let (identity, commit) = initialize_checkout(other_checkout.path());
     write_config(home.path(), &config).unwrap();
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent first")).unwrap();
-    config.projects.insert("other".into(), ConfiguredProject {
-        label: "other".into(),
-        checkout: Checkout { label: "other".into(), path: other_checkout.path().into(), identity, branch: "main".into(), commit },
-        allowed_participants: BTreeSet::from(["U1".into()]),
-        project_approvers: BTreeSet::from(["U1".into()]),
-    });
+    config.projects.insert(
+        "other".into(),
+        ConfiguredProject {
+            label: "other".into(),
+            checkout: Checkout {
+                label: "other".into(),
+                path: other_checkout.path().into(),
+                identity,
+                branch: "main".into(),
+                commit,
+            },
+            allowed_participants: BTreeSet::from(["U1".into()]),
+            project_approvers: BTreeSet::from(["U1".into()]),
+        },
+    );
     config.channel_defaults.insert("C1".into(), "other".into());
     write_config(home.path(), &config).unwrap();
-    let mut second = event("E2", None, "@Fluent second"); second.timestamp = "2.0".into();
+    let mut second = event("E2", None, "@Fluent second");
+    second.timestamp = "2.0".into();
     runner.ingest(second).unwrap();
     let store = FileCollaborationStore::new(home.path());
-    assert_eq!(store.load_thread(&runner.config, "1.0").unwrap().unwrap().project_label.as_deref(), Some("app"));
-    assert_eq!(store.load_thread(&runner.config, "2.0").unwrap().unwrap().project_label.as_deref(), Some("other"));
+    assert_eq!(
+        store
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .project_label
+            .as_deref(),
+        Some("app")
+    );
+    assert_eq!(
+        store
+            .load_thread(&runner.config, "2.0")
+            .unwrap()
+            .unwrap()
+            .project_label
+            .as_deref(),
+        Some("other")
+    );
 }
 
 #[test]
 fn explicit_approver_request_authorizes_eligible_action() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Execution)).unwrap();
-    runner.ingest(event("E2", Some("1.0"), "execute this work")).unwrap();
-    assert_eq!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap().approvals.len(), 1);
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Execution))
+        .unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "execute this work"))
+        .unwrap();
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn duplicate_approval_event_is_idempotent() {
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
     let event = event("E2", Some("1.0"), "y");
     runner.ingest(event.clone()).unwrap();
     runner.ingest(event).unwrap();
-    assert_eq!(FileCollaborationStore::new(home.path()).load_thread(&runner.config, "1.0").unwrap().unwrap().approvals.len(), 1);
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
 }
 
 #[test]
