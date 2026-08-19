@@ -22,6 +22,7 @@ mod domain;
 mod interfaces;
 mod policy;
 mod store;
+mod work_control;
 
 pub use adapters::*;
 pub use coordination::*;
@@ -29,6 +30,7 @@ pub use domain::*;
 pub use interfaces::*;
 use store::*;
 pub use store::{FileCollaborationStore, ThreadCommitCrashPoint, config_path, state_root};
+pub use work_control::*;
 
 /// Slack app manifest for a local Socket Mode installation. It intentionally
 /// has no request URL because the runner never accepts public HTTP ingress.

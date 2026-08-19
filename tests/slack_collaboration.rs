@@ -6452,6 +6452,83 @@ fn coordinator_uses_pinned_store_and_scheduler_boundaries() {
     };
     assert_eq!(action.idempotency_identity, "restart:build-1");
 }
+
+#[test]
+fn approved_plan_creates_reported_work_without_execution() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+
+    let report = control
+        .approve_plan(
+            "slice-1",
+            "U1",
+            &[PlannedWork::new("work-1", "Implement control")],
+        )
+        .unwrap();
+
+    assert_eq!(report.work_item_ids, vec!["work-1"]);
+    let work = fluent::work_model::WorkModelStore::new(checkout.path())
+        .read_work_item("work-1")
+        .unwrap();
+    assert!(work.authorization.is_proposed());
+    assert!(work.attempts.is_empty());
+    assert_eq!(
+        control.slice("slice-1").unwrap().unwrap().work_item_ids,
+        report.work_item_ids
+    );
+}
+
+#[test]
+fn execution_approval_queues_each_planned_work_item() {
+    #[derive(Default)]
+    struct FakeScheduler {
+        requests: std::cell::RefCell<Vec<WorkExecutionRequest>>,
+    }
+    impl WorkScheduler for FakeScheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            self.requests.borrow_mut().push(request.clone());
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-1",
+            "U1",
+            &[
+                PlannedWork::new("work-1", "First"),
+                PlannedWork::new("work-2", "Second"),
+            ],
+        )
+        .unwrap();
+    let scheduler = FakeScheduler::default();
+
+    let report = control
+        .authorize_execution("slice-1", "U1", &scheduler)
+        .unwrap();
+
+    assert_eq!(report.outcomes.len(), 2);
+    assert_eq!(scheduler.requests.borrow().len(), 2);
+    for work_id in ["work-1", "work-2"] {
+        let work = fluent::work_model::WorkModelStore::new(checkout.path())
+            .read_work_item(work_id)
+            .unwrap();
+        assert!(work.authorization.is_execution_ready());
+        assert!(work.attempts.is_empty());
+    }
+    assert_eq!(
+        control
+            .authorize_execution("slice-1", "U1", &scheduler)
+            .unwrap()
+            .outcomes,
+        report.outcomes
+    );
+    assert_eq!(scheduler.requests.borrow().len(), 2);
+}
 #[test]
 fn invalid_runtime_configuration_fails_closed() {
     let (home, _checkout, mut config) = setup(true);
