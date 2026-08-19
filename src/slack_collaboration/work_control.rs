@@ -614,6 +614,39 @@ impl WorkControl {
         Ok(())
     }
 
+    /// Reconcile host-validated post-land Work even after an earlier correction
+    /// has already reactivated the Slice.
+    pub(crate) fn link_post_land_corrective_work_items(
+        &self,
+        slice_id: &str,
+        work_item_ids: &[String],
+    ) -> Result<()> {
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let store = WorkModelStore::new(&self.project_root);
+        let mut unlinked = Vec::new();
+        for work_item_id in work_item_ids {
+            if slice.work_item_ids.contains(work_item_id) {
+                continue;
+            }
+            let item = store.read_work_item(work_item_id)?;
+            let origin = item
+                .origin
+                .provenance()
+                .and_then(|provenance| provenance.work_item_id.as_deref());
+            if !origin.is_some_and(|origin| slice.work_item_ids.iter().any(|id| id == origin)) {
+                bail!("post-land corrective Work is unrelated to Slice {slice_id}");
+            }
+            unlinked.push(work_item_id.clone());
+        }
+        if !unlinked.is_empty() {
+            slice.work_item_ids.extend(unlinked);
+            self.save_slice(&slice)?;
+        }
+        Ok(())
+    }
+
     /// Render the pinned thread status from durable model state. The caller
     /// supplies provider state because it is runner-local rather than Work
     /// model authority.

@@ -653,6 +653,21 @@ pub struct ReplayOutcome {
     pub work_items_queued: usize,
 }
 
+/// One completed post-land effect that a conversation projection can report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostLandProjectionEffect {
+    /// Stable operation-and-follow-up identity for idempotent delivery.
+    pub identity: String,
+    pub kind: PostLandProjectionKind,
+}
+
+/// The durable effect produced by one completed post-land follow-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostLandProjectionKind {
+    Observation { observation_id: String },
+    CorrectiveWork { work_item_id: String },
+}
+
 /// The canonical byte encoding of a serializable value: sorted-key JSON, so an
 /// identical value always yields identical bytes and thus an identical digest.
 pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -1334,6 +1349,64 @@ pub fn post_land_operation_complete(
         }
     }
     Ok(true)
+}
+
+/// Project completed post-land effects whose origin belongs to any supplied
+/// Work Item. Keep journal interpretation here so conversation consumers do
+/// not become additional owners of the durable follow-up schema.
+pub fn completed_projection_effects(
+    project_root: &Path,
+    origin_work_item_ids: &[String],
+) -> Result<Vec<PostLandProjectionEffect>> {
+    let root = follow_ups_root(project_root);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", root.display())),
+    };
+    let origins = origin_work_item_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut effects = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name() == ".locks" {
+            continue;
+        }
+        let operation_path = entry.path().join("operation.json");
+        if !operation_path.is_file() {
+            continue;
+        }
+        let operation: PendingPostLandOperationV1 =
+            serde_json::from_slice(&fs::read(&operation_path)?).with_context(|| {
+                format!("parse post-land operation {}", operation_path.display())
+            })?;
+        if !origins.contains(&operation.origin.work_item_id) {
+            continue;
+        }
+        if !post_land_operation_complete(project_root, &operation.origin)? {
+            continue;
+        }
+        let journal_path = entry.path().join("journal.json");
+        let journal = read_journal(&journal_path, &operation.operation_id)?;
+        for receipt in journal.follow_ups {
+            let identity = format!("{}:{}", operation.operation_id, receipt.follow_up_id);
+            let kind = if receipt.corrective == Some(true) {
+                PostLandProjectionKind::CorrectiveWork {
+                    work_item_id: receipt
+                        .derived_work_item_id
+                        .context("completed corrective follow-up has no Work Item")?,
+                }
+            } else {
+                PostLandProjectionKind::Observation {
+                    observation_id: receipt.observation_id,
+                }
+            };
+            effects.push(PostLandProjectionEffect { identity, kind });
+        }
+    }
+    effects.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(effects)
 }
 
 /// Record and immediately replay a landed follow-up batch. This is the single

@@ -6402,6 +6402,7 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("Every project approver")
             && guide.contains("/invite @Fluent")
             && guide.contains("@Fluent plan the next release")
+            && guide.contains("new work <description>")
             && guide.contains("keeps the thread unbound")
             && guide.contains("fluent slack checkout-identity")
             && guide.contains("security add-generic-password -U -a app-token")
@@ -8436,16 +8437,76 @@ fn new_work_after_completion_offers_linked_slice_thread() {
     );
     runner.report_thread_work("1.0").unwrap();
     let before = runner.slack().deliveries.len();
-    let offer = runner
-        .offer_linked_slice_for_new_work("1.0", "U1", "new product work")
+    let provider_calls = runner.provider().calls.len();
+    runner
+        .ingest(event("E2", Some("1.0"), "new work add product analytics"))
         .unwrap();
-    assert!(offer.contains("Slice slice-linked remains complete"));
-    assert!(offer.contains("Start linked Slice"));
-    assert!(
-        runner.slack().deliveries[before..]
-            .iter()
-            .any(|delivery| { delivery.thread_timestamp == "1.0" && delivery.text == offer })
+    assert_eq!(runner.provider().calls.len(), provider_calls);
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery
+                .text
+                .contains("Slice slice-linked remains complete")
+            && delivery.text.contains("Start linked Slice")
+    }));
+    assert_eq!(
+        WorkControl::new(checkout.path())
+            .slice_stage("slice-linked")
+            .unwrap(),
+        SliceStage::Complete
     );
+}
+
+fn commit_follow_up_authority(checkout: &TempDir) -> (String, fluent::follow_up::AuthorityLocator) {
+    let anchor = "Correct post-land regressions through focused Work.";
+    fs::write(checkout.path().join("AGENTS.md"), format!("{anchor}\n")).unwrap();
+    for args in [
+        vec!["add", "AGENTS.md"],
+        vec!["commit", "-m", "Add follow-up authority"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let commit = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let authority = fluent::follow_up::AuthorityLocator {
+        kind: fluent::follow_up::AuthorityKind::AgentsInstruction,
+        path: "AGENTS.md".into(),
+        anchor: anchor.into(),
+        digest: fluent::follow_up::content_digest(anchor.as_bytes()),
+    };
+    (commit, authority)
+}
+
+fn post_land_batch(
+    work_item_id: &str,
+    merged_commit: &str,
+    follow_up: fluent::follow_up::FollowUpDraftV1,
+) -> fluent::follow_up::NormalizedFollowUpBatchV1 {
+    fluent::follow_up::NormalizedFollowUpBatchV1 {
+        schema_version: fluent::follow_up::NormalizedFollowUpBatchV1::SCHEMA_VERSION,
+        source: fluent::follow_up::FollowUpSource::Learner,
+        origin: fluent::follow_up::PostLandOrigin {
+            work_item_id: work_item_id.into(),
+            attempt_id: format!("attempt-{work_item_id}"),
+            merge_candidate_id: format!("candidate-{work_item_id}"),
+            merged_commit: merged_commit.into(),
+        },
+        learning_summary: "post-land policy result".into(),
+        follow_ups: vec![follow_up],
+    }
 }
 
 #[test]
@@ -8479,18 +8540,32 @@ fn corrective_follow_up_reactivates_original_slice() {
         control.slice_stage("slice-corrective-runner").unwrap(),
         SliceStage::Complete
     );
-    fluent::work_model::WorkModelStore::new(checkout.path())
-        .create_work_item(&fluent::work_model::WorkItem {
-            id: "work-correction".into(),
-            title: "Corrective Work".into(),
-            authorization: fluent::work_model::ExecutionAuthorization::Proposed,
+    let (merged_commit, authority) = commit_follow_up_authority(&checkout);
+    let batch = post_land_batch(
+        "work-original",
+        &merged_commit,
+        fluent::follow_up::FollowUpDraftV1 {
+            id: "correct-regression".into(),
+            summary: "Correct the post-land regression".into(),
+            corrective: true,
+            corrective_context: Some(fluent::work_model::CorrectiveContext {
+                objective: "Correct the post-land regression".into(),
+                requirement: authority.anchor.clone(),
+                evidence: "The landed behavior regressed".into(),
+                included_scope: "README".into(),
+                excluded_scope: "Unrelated behavior".into(),
+                verification: "cargo test focused_post_land".into(),
+            }),
+            target_paths: vec!["README".into()],
+            expected_result: "The regression is corrected".into(),
+            authority: Some(authority),
             ..Default::default()
-        })
-        .unwrap();
+        },
+    );
+    let outcome = fluent::follow_up::process_landed_batch(checkout.path(), &batch, None).unwrap();
+    assert_eq!(outcome.work_items_created, 1);
 
-    runner
-        .link_thread_corrective_work("1.0", "work-correction")
-        .unwrap();
+    runner.poll_linked_work().unwrap();
 
     assert_eq!(
         control.slice_stage("slice-corrective-runner").unwrap(),
@@ -8499,17 +8574,20 @@ fn corrective_follow_up_reactivates_original_slice() {
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery
             .text
-            .contains("Linked corrective Work Item work-correction")
+            .contains("Linked corrective Work Item derived-")
     }));
     assert!(runner.slack().deliveries.iter().any(|delivery| {
-        delivery.text.contains("Work Item work-correction")
-            && delivery.text.contains("is now planned")
+        delivery.text.contains("Work Item derived-") && delivery.text.contains("is now planned")
     }));
+    let delivered = runner.slack().deliveries.len();
+    runner.poll_linked_work().unwrap();
+    assert_eq!(runner.slack().deliveries.len(), delivered);
 }
 
 #[test]
 fn optional_observation_does_not_reopen_completed_slice() {
     let (home, checkout, config) = setup(true);
+    let merged_commit = config.projects["app"].checkout.commit.clone();
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -8535,20 +8613,32 @@ fn optional_observation_does_not_reopen_completed_slice() {
     );
     runner.report_thread_work("1.0").unwrap();
     let before = runner.slack().deliveries.len();
-    let reply = runner
-        .report_thread_observation("1.0", "observation-42")
-        .unwrap();
-    assert!(reply.contains("remains complete"));
-    assert!(
-        runner.slack().deliveries[before..]
-            .iter()
-            .any(|delivery| { delivery.thread_timestamp == "1.0" && delivery.text == reply })
+    let batch = post_land_batch(
+        "work-observation",
+        &merged_commit,
+        fluent::follow_up::FollowUpDraftV1 {
+            id: "optional-note".into(),
+            summary: "Remember an optional improvement".into(),
+            ..Default::default()
+        },
     );
+    let outcome = fluent::follow_up::process_landed_batch(checkout.path(), &batch, None).unwrap();
+    assert_eq!(outcome.observations_created, 1);
+
+    runner.poll_linked_work().unwrap();
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("remains complete")
+            && delivery.text.contains("Observation: followup-")
+    }));
     let control = WorkControl::new(checkout.path());
     assert_eq!(
         control.slice_stage("slice-observation").unwrap(),
         SliceStage::Complete
     );
+    let delivered = runner.slack().deliveries.len();
+    runner.poll_linked_work().unwrap();
+    assert_eq!(runner.slack().deliveries.len(), delivered);
 }
 #[test]
 fn invalid_runtime_configuration_fails_closed() {

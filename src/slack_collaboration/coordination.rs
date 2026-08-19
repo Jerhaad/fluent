@@ -907,6 +907,25 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 let status = self.render_thread_status(&thread, None)?;
                 return self.queue_reply(&event, &status);
             }
+            if let Some(requested_work) = new_product_work_request(command) {
+                let completed = if let Some(slice_id) = thread.slice.as_deref() {
+                    let project = self.bound_project(&thread)?;
+                    WorkControl::new(&project.checkout.path).slice_stage(slice_id)?
+                        == SliceStage::Complete
+                } else {
+                    false
+                };
+                if completed {
+                    self.store.save_thread(&self.config, &thread)?;
+                    self.offer_linked_slice_for_new_work(&thread.id, &event.user, requested_work)?;
+                    let mut refreshed = self
+                        .store
+                        .load_thread(&self.config, &thread.id)?
+                        .context("Fluent thread disappeared after linked Slice offer")?;
+                    refreshed.processed_events.insert(event.id);
+                    return self.store.save_thread(&self.config, &refreshed);
+                }
+            }
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
                 source_timestamp: event.timestamp.clone(),
@@ -1653,6 +1672,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
         let project = self.bound_project(&thread)?;
+        self.reconcile_thread_post_land_effects(&thread, project)?;
         let slice_id = thread
             .slice
             .as_deref()
@@ -1684,6 +1704,80 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         self.queue_thread_status(&refreshed, None)?;
         self.deliver_pending()?;
         Ok(transitions)
+    }
+
+    fn reconcile_thread_post_land_effects(
+        &self,
+        thread: &FluentThread,
+        project: &ConfiguredProject,
+    ) -> Result<()> {
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let control = WorkControl::new(&project.checkout.path);
+        let slice = control
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let effects = crate::follow_up::completed_projection_effects(
+            &project.checkout.path,
+            &slice.work_item_ids,
+        )?;
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let existing = self
+            .store
+            .load_outbox()?
+            .into_iter()
+            .map(|delivery| delivery.id)
+            .collect::<std::collections::HashSet<_>>();
+        let delivery_id = |identity: &str| {
+            let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+            format!("{}:post-land:{}", thread.id, &digest[..16])
+        };
+        let stage = control.slice_stage(slice_id)?;
+        let mut corrective_work = Vec::new();
+        let mut deliveries = Vec::new();
+        for effect in effects {
+            let id = delivery_id(&effect.identity);
+            match effect.kind {
+                crate::follow_up::PostLandProjectionKind::CorrectiveWork { work_item_id } => {
+                    corrective_work.push(work_item_id.clone());
+                    if !existing.contains(&id) {
+                        deliveries.push((
+                            id,
+                            format!(
+                                "Linked corrective Work Item {work_item_id} to Slice {slice_id}; the Slice is active until the correction reaches its terminal outcome."
+                            ),
+                        ));
+                    }
+                }
+                crate::follow_up::PostLandProjectionKind::Observation { observation_id }
+                    if !existing.contains(&id) =>
+                {
+                    let text = if stage == SliceStage::Complete {
+                        control.render_optional_observation(slice_id, &observation_id)?
+                    } else {
+                        format!("Slice {slice_id} is active. Observation: {observation_id}.")
+                    };
+                    deliveries.push((id, redact_secrets(&text)));
+                }
+                crate::follow_up::PostLandProjectionKind::Observation { .. } => {}
+            }
+        }
+        control.link_post_land_corrective_work_items(slice_id, &corrective_work)?;
+        for (id, text) in deliveries {
+            self.store.persist_outbox(OutboundDelivery {
+                id,
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text,
+                delivered: false,
+                update_timestamp: None,
+            })?;
+        }
+        Ok(())
     }
 
     /// Offer a linked Slice for new product Work without reopening a completed
@@ -2316,4 +2410,16 @@ fn work_item_id_from_request(text: &str) -> Option<&str> {
     text.split_once("work-item:")
         .and_then(|(_, suffix)| suffix.split_whitespace().next())
         .filter(|id| !id.is_empty())
+}
+
+fn new_product_work_request(command: &str) -> Option<&str> {
+    ["new work ", "new product work "]
+        .into_iter()
+        .find_map(|prefix| {
+            let candidate = command.get(..prefix.len())?;
+            candidate
+                .eq_ignore_ascii_case(prefix)
+                .then(|| command[prefix.len()..].trim())
+        })
+        .filter(|request| !request.is_empty())
 }
