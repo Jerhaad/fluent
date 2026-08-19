@@ -2483,6 +2483,53 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
 }
 
 #[test]
+fn provider_failure_preserves_reply_and_reports_recovery() {
+    struct FailingProvider;
+    impl ConversationProvider for FailingProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            anyhow::bail!("authentication required")
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        FailingProvider,
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("authentication is required")
+    );
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.pending_turn.as_ref().unwrap().contribution,
+        "@Fluent hello"
+    );
+}
+
+#[test]
 fn rate_limit_waits_recovers_and_offers_provider_switch() {
     let failure = classify_provider_failure("provider rate limit; retry-after=17");
     assert_eq!(

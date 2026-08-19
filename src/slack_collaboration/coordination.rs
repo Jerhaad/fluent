@@ -797,14 +797,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 current.provider_turn_id = Some(turn_id.to_owned());
                 store.save_thread(config, &checkpoint)
             };
-            let (session, reply) = self.provider.run_turn(
+            let run = self.provider.run_turn(
                 &turn.action_id,
                 thread.provider_session.as_deref(),
                 &scope,
                 &turn.contribution,
                 &turn.actor,
                 &mut accepted,
-            )?;
+            );
+            let (session, reply) = match run {
+                Ok(result) => result,
+                Err(error) => {
+                    let failure = classify_provider_failure(&error.to_string());
+                    let can_switch = self
+                        .bound_project(thread)
+                        .is_ok_and(|project| !project.project_approvers.is_empty());
+                    self.queue_reply(event, &provider_recovery_message(&failure, can_switch))?;
+                    self.store
+                        .save_thread(&self.config, &checkpoint.into_inner())?;
+                    return Ok(());
+                }
+            };
             *thread = checkpoint.into_inner();
             if let Some(session) = session {
                 thread.provider_session = Some(session);
