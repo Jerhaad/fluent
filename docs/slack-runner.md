@@ -8,6 +8,10 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```sh
    fluent slack manifest
    ```
+   If Fluent is already installed in the Slack workspace, update that app with
+   this manifest and reinstall it. Alternatively, enable **Interactivity &
+   Shortcuts** in the app settings before reinstalling. This enables the
+   revision-bound approval controls used by project approvers.
 2. Install the app into the intended workspace. In **Socket Mode**, create an
    app-level token with the `connections:write` scope. Copy its `xapp-` token.
 3. In **OAuth & Permissions**, copy the bot `xoxb-` token after installation.

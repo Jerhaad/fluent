@@ -180,6 +180,18 @@ fn project_approver_advances_exact_requested_action_once() {
             "later",
         )
         .unwrap();
+    let ApprovalOutcome::Accepted(record) = &first else {
+        panic!("project approver should authorize the pending action");
+    };
+    assert_eq!(record.project_label, "app");
+    assert_eq!(record.thread_id, "1.0");
+    assert_eq!(record.pending_action_id, "approve-plan");
+    assert_eq!(record.action_kind, PendingActionKind::Planning);
+    assert_eq!(record.artifact_revision, "revision-1");
+    assert_eq!(record.presented_at, "now");
+    assert_eq!(record.actor, "U1");
+    assert_eq!(record.accepted_at, "then");
+    assert_eq!(record.event_id, "approval-event");
     assert_eq!(first, duplicate);
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
@@ -266,6 +278,35 @@ fn approval_uses_current_project_authority() {
             .approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "E2", "now")
             .unwrap(),
         ApprovalOutcome::WaitingForApprover
+    );
+}
+
+#[test]
+fn invalid_reloaded_authority_fails_closed() {
+    let (home, _checkout, mut config) = setup(true);
+    write_config(home.path(), &config).unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    config.projects.get_mut("app").unwrap().project_approvers = BTreeSet::from(["U2".into()]);
+    fs::write(
+        config_path(home.path()),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        runner
+            .approve_pending_action("1.0", "U2", "approve-plan", "revision-1", "E2", "now")
+            .unwrap_err()
+            .to_string()
+            .contains("participant or approver authority")
     );
 }
 
