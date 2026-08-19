@@ -7359,6 +7359,40 @@ fn runner_posts_durable_ready_candidate_evidence_and_links() {
     );
     assert!(reply.text.contains("/compare/main...abc123"));
     assert!(reply.text.contains("Optionally create a pull request"));
+
+    let control = WorkControl::new(checkout.path());
+    assert_eq!(
+        control.slice_stage("slice-ready-runner").unwrap(),
+        SliceStage::Active,
+        "an unlanded candidate keeps the Slice active"
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-ready-runner", |item| {
+            item.merge_candidates[0].merge_state.status = MergeCandidateMergeStatus::Merged;
+            item.merge_candidates[0].merge_state.follow_up_failure =
+                Some(fluent::work_model::FollowUpProcessingFailure {
+                    stage: "observation".into(),
+                    message: "post-land processing failed".into(),
+                    next_action: "retry post-land processing".into(),
+                });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-ready-runner").unwrap(),
+        SliceStage::Active,
+        "a post-land failure keeps the Slice active"
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-ready-runner", |item| {
+            item.merge_candidates[0].merge_state.follow_up_failure = None;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-ready-runner").unwrap(),
+        SliceStage::Complete
+    );
 }
 
 #[test]
@@ -7511,10 +7545,30 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
 #[test]
 fn finished_planned_work_marks_slice_complete() {
     let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-finished", "work-finished");
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-finished",
+            "U1",
+            &[
+                PlannedWork::new("work-finished", "First"),
+                PlannedWork::new("work-sibling", "Sibling"),
+            ],
+        )
+        .unwrap();
     append_attempt_state(
         &checkout,
         "work-finished",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    assert_eq!(
+        control.slice_stage("slice-finished").unwrap(),
+        SliceStage::Active
+    );
+    append_attempt_state(
+        &checkout,
+        "work-sibling",
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
