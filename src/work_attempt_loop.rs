@@ -10304,6 +10304,12 @@ mod tests {
                 command: "xcodegen generate".to_string(),
                 result: crate::work_model::WriterVerificationResult::Pass,
             }];
+            if row.kind == crate::work_model::WriterCompletionRequirementKind::Finding {
+                row.applicable_constraints = vec![
+                    "none: fixture command failure is independent of the behavior contract"
+                        .to_string(),
+                ];
+            }
         }
         fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
         store
