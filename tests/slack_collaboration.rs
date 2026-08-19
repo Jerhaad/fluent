@@ -4182,8 +4182,10 @@ fn unavailable_provider_preserves_reply_and_offers_switch() {
 }
 
 #[test]
-fn rate_limited_provider_preserves_reply_and_reports_retry() {
-    struct RateLimitedProvider;
+fn synchronous_rate_limit_rechecks_provider_policy_before_retry() {
+    struct RateLimitedProvider {
+        attempts: Arc<AtomicUsize>,
+    }
     impl ConversationProvider for RateLimitedProvider {
         fn start(
             &mut self,
@@ -4192,6 +4194,7 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             _: &str,
             _: &str,
         ) -> ProviderResult<(String, String)> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
             Err(ProviderError::new(
                 ProviderFailure::RateLimited {
                     retry_after_seconds: 17,
@@ -4210,13 +4213,19 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             unreachable!()
         }
     }
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let now = Arc::new(AtomicU64::new(1_000));
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
-        config,
-        RateLimitedProvider,
+        config.clone(),
+        RateLimitedProvider {
+            attempts: attempts.clone(),
+        },
         InMemorySlack::default(),
     );
+    let clock = now.clone();
+    runner.set_clock_for_test(move || clock.load(Ordering::SeqCst));
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     assert!(
         runner.slack().deliveries[0]
@@ -4251,6 +4260,32 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             .dispatch_state,
         PendingTurnDispatchState::RateLimitedUntilDeadline
     );
+
+    let mut revoked = config.clone();
+    let project = revoked.projects.get_mut("app").unwrap();
+    project.default_provider = "claude".into();
+    project.enabled_providers = BTreeSet::from(["claude".into()]);
+    write_config(home.path(), &revoked).unwrap();
+    now.store(1_017, Ordering::SeqCst);
+    assert!(
+        runner
+            .retry_due_turns()
+            .unwrap_err()
+            .to_string()
+            .contains("no longer enabled")
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let paused = FileCollaborationStore::new(home.path())
+        .load_thread(&revoked, "1.0")
+        .unwrap()
+        .unwrap()
+        .pending_turn
+        .unwrap();
+    assert_eq!(
+        paused.dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    assert_eq!(paused.retry_at_unix_seconds, None);
 }
 
 #[test]

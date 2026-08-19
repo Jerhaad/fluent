@@ -330,6 +330,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
 
     /// Re-admit every durable provider turn whose retry deadline has passed.
     pub fn retry_due_turns(&mut self) -> Result<()> {
+        self.config = self.current_authority_config()?;
         let now = (self.clock)();
         let thread_ids: Vec<_> = self.store.load_threads(&self.config)?.into_keys().collect();
         for thread_id in thread_ids {
