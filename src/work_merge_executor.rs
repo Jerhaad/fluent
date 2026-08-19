@@ -1512,6 +1512,7 @@ fn execute_merge_with_coder(
                 config.work_item_id,
                 &candidate.id,
                 &candidate.attempt_id,
+                source_workspace,
                 &target_head_before,
                 &new_tip,
             )?;
@@ -1650,6 +1651,7 @@ fn finalize_merge(
         config.work_item_id,
         &candidate.id,
         &candidate.attempt_id,
+        source_workspace,
         target_head_before,
         &merged_commit,
     )?;
@@ -2745,6 +2747,7 @@ fn regenerate_provenance(
     work_item_id: &str,
     candidate_id: &str,
     attempt_id: &str,
+    source_workspace: &Path,
     accepted_base: &str,
     new_tip: &str,
 ) -> Result<()> {
@@ -2765,6 +2768,75 @@ fn regenerate_provenance(
              Candidate {candidate_id:?}"
         )));
     }
+
+    enum NoChangeAdvance {
+        None,
+        Unchanged,
+        Rebased { from_commit: String },
+        Appended,
+    }
+
+    let latest_output = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .and_then(|attempt| {
+            attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        })
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} has no completed Writer output"))?;
+    let no_change_advance = if latest_output.no_change.is_none() {
+        NoChangeAdvance::None
+    } else if latest_output.commit == new_tip {
+        NoChangeAdvance::Unchanged
+    } else {
+        let ancestor = git::run_raw(
+            source_workspace,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &latest_output.commit,
+                new_tip,
+            ],
+        )?;
+        match ancestor.status.code() {
+            Some(0) => NoChangeAdvance::Appended,
+            Some(1) => {
+                let from_commit = if let Some(transition) =
+                    latest_output.learner_canonicalization.as_ref()
+                {
+                    let prior_parent = git::run_stdout(
+                        source_workspace,
+                        &["rev-parse", &format!("{}^", transition.to_commit)],
+                        "resolve pre-rebase Learner parent",
+                    )?;
+                    if prior_parent != transition.from_commit {
+                        bail!(
+                            "cannot regenerate no-change Learner provenance: {:?} is not the parent of {:?}",
+                            transition.from_commit,
+                            transition.to_commit
+                        );
+                    }
+                    git::run_stdout(
+                        source_workspace,
+                        &["rev-parse", &format!("{new_tip}^")],
+                        "resolve rebased Learner parent",
+                    )?
+                } else {
+                    new_tip.to_string()
+                };
+                NoChangeAdvance::Rebased { from_commit }
+            }
+            _ => bail!(
+                "git merge-base --is-ancestor failed while regenerating no-change provenance: {}",
+                String::from_utf8_lossy(&ancestor.stderr).trim()
+            ),
+        }
+    };
 
     store.mutate_work_item(work_item_id, |item| {
         let canonical_writer_id = {
@@ -2790,8 +2862,27 @@ fn regenerate_provenance(
                     task_id: canonical_writer.id.clone(),
                 }
             })?;
-            output.base_commit = Some(accepted_base.to_string());
-            output.commit = new_tip.to_string();
+            match &no_change_advance {
+                NoChangeAdvance::None => {
+                    output.base_commit = Some(accepted_base.to_string());
+                    output.commit = new_tip.to_string();
+                }
+                NoChangeAdvance::Unchanged => {}
+                NoChangeAdvance::Rebased { from_commit } => {
+                    output.base_commit = Some(from_commit.clone());
+                    output.commit = new_tip.to_string();
+                    if let Some(transition) = output.learner_canonicalization.as_mut() {
+                        transition.from_commit = from_commit.clone();
+                        transition.to_commit = new_tip.to_string();
+                    }
+                }
+                NoChangeAdvance::Appended => {
+                    output.base_commit = Some(accepted_base.to_string());
+                    output.commit = new_tip.to_string();
+                    output.no_change = None;
+                    output.learner_canonicalization = None;
+                }
+            }
             canonical_writer.id.clone()
         };
 
@@ -2984,8 +3075,9 @@ mod tests {
     use crate::content::ContentResolver;
     use crate::work_model::WorkItemAbandonment;
     use crate::work_model::{
-        AttemptReviewState, AttemptStatus, NoChangeOutput, NoChangeVerification,
-        NoChangeVerificationResult, TaskArtifactArea, TaskOutput, TaskStatus, WorkItem,
+        AttemptReviewState, AttemptStatus, LearnerCommitCanonicalization, NoChangeOutput,
+        NoChangeVerification, NoChangeVerificationResult, TaskArtifactArea, TaskOutput, TaskStatus,
+        WorkItem,
     };
 
     #[test]
@@ -4313,7 +4405,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_preserves_historical_no_change_writer() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         let mut item = store.read_work_item("work-1").unwrap();
         let historical_writer = &mut item.attempts[0].tasks[0];
@@ -4340,6 +4432,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4372,7 +4465,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_rejects_invalid_candidate_atomically() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         let mut item = store.read_work_item("work-1").unwrap();
         let canonical_writer = &mut item.attempts[0].tasks[1];
@@ -4401,6 +4494,7 @@ mod tests {
                 "work-1",
                 &candidate_id,
                 "attempt-1",
+                tmp.path(),
                 "new-base-sha",
                 "new-tip-sha",
             )
@@ -4411,8 +4505,143 @@ mod tests {
     }
 
     #[test]
+    fn regenerate_provenance_maps_no_change_learner_across_rebase() {
+        let (tmp, store, _item, candidate_id) = completed_write_item();
+        git::run(
+            tmp.path(),
+            &["init", "-b", "main"],
+            "initialize test repository",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "user.name", "Test"],
+            "configure test author",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure test email",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["config", "commit.gpgsign", "false"],
+            "disable test signing",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "base\n").unwrap();
+        git::run(tmp.path(), &["add", "candidate.txt"], "stage base").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Base"], "commit base").unwrap();
+        let base = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "writer\n").unwrap();
+        git::run(tmp.path(), &["add", "candidate.txt"], "stage writer").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Writer"], "commit writer").unwrap();
+        let old_from = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("expertise.txt"), "learned\n").unwrap();
+        git::run(tmp.path(), &["add", "expertise.txt"], "stage learner").unwrap();
+        git::run(tmp.path(), &["commit", "-m", "Learner"], "commit learner").unwrap();
+        let old_tip = head_commit(tmp.path()).unwrap();
+        git::run(
+            tmp.path(),
+            &["checkout", "-b", "rebased", &base],
+            "create rebased branch",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("candidate.txt"), "writer\n").unwrap();
+        git::run(
+            tmp.path(),
+            &["add", "candidate.txt"],
+            "stage rebased writer",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["commit", "-m", "Writer rebased"],
+            "commit rebased writer",
+        )
+        .unwrap();
+        let new_from = head_commit(tmp.path()).unwrap();
+        fs::write(tmp.path().join("expertise.txt"), "learned\n").unwrap();
+        git::run(
+            tmp.path(),
+            &["add", "expertise.txt"],
+            "stage rebased learner",
+        )
+        .unwrap();
+        git::run(
+            tmp.path(),
+            &["commit", "-m", "Learner rebased"],
+            "commit rebased learner",
+        )
+        .unwrap();
+        let new_tip = head_commit(tmp.path()).unwrap();
+
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+                digest: "sha256:abc".to_string(),
+            },
+        ));
+        let writer = &mut item.attempts[0].tasks[1];
+        writer.artifact_area = Some(TaskArtifactArea {
+            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2".to_string(),
+        });
+        let output = writer.output.as_mut().unwrap();
+        output.base_commit = Some(old_from.clone());
+        output.commit = old_tip.clone();
+        output.no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path:
+                ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2/no-change.json"
+                    .to_string(),
+            reason: "The candidate already contains the correction".to_string(),
+            verification: vec![NoChangeVerification {
+                command: "cargo test focused".to_string(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
+        output.learner_canonicalization = Some(LearnerCommitCanonicalization {
+            from_commit: old_from,
+            to_commit: old_tip.clone(),
+        });
+        item.attempts[0].artifacts[1].path = old_tip.clone();
+        item.merge_candidates[0].candidate_commit = old_tip;
+        store.write_work_item(&item).unwrap();
+
+        regenerate_provenance(
+            &store,
+            "work-1",
+            &candidate_id,
+            "attempt-1",
+            tmp.path(),
+            &base,
+            &new_tip,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let output = stored.attempts[0].tasks[1].output.as_ref().unwrap();
+        assert_eq!(output.base_commit.as_deref(), Some(new_from.as_str()));
+        assert_eq!(output.commit, new_tip);
+        assert_eq!(
+            output.learner_canonicalization.as_ref(),
+            Some(&LearnerCommitCanonicalization {
+                from_commit: new_from,
+                to_commit: new_tip.clone(),
+            })
+        );
+        assert!(output.no_change.is_some());
+        assert_eq!(stored.attempts[0].artifacts[1].path, new_tip);
+        assert_eq!(stored.merge_candidates[0].candidate_commit, new_tip);
+    }
+
+    #[test]
     fn regenerate_provenance_leaves_non_write_tasks_unchanged() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         // Add a rebase task with its own commit to verify it is not modified
         let mut item = store.read_work_item("work-1").unwrap();
@@ -4448,6 +4677,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4486,7 +4716,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_updates_write_commit_artifacts_only() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         // A non-Write artifact reference — e.g. a Tester result — is not a commit.
         let mut item = store.read_work_item("work-1").unwrap();
@@ -4502,6 +4732,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -4540,7 +4771,7 @@ mod tests {
 
     #[test]
     fn regenerate_provenance_preserves_learner_handoff_reference() {
-        let (_tmp, store, _item, candidate_id) = completed_write_item();
+        let (tmp, store, _item, candidate_id) = completed_write_item();
 
         let handoff = crate::follow_up::ArtifactRef {
             path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
@@ -4558,6 +4789,7 @@ mod tests {
             "work-1",
             &candidate_id,
             "attempt-1",
+            tmp.path(),
             "new-base-sha",
             "new-tip-sha",
         )
@@ -5429,6 +5661,7 @@ mod tests {
             "work-1",
             "attempt-1-merge-candidate",
             "attempt-1",
+            &fx.source_workspace,
             "new-base",
             "new-tip",
         )
