@@ -245,6 +245,7 @@ mod tests {
             approvals: Vec::new(),
             processed_events: BTreeSet::new(),
             last_connection: None,
+            first_reply_timestamp: None,
             pending_turn: None,
             queued_contributions: Vec::new(),
             conversation: Vec::new(),
