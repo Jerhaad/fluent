@@ -414,6 +414,16 @@ impl WorkControl {
             remote: remote.to_owned(),
             head_branch: format!("fluent/{slice_id}"),
             candidate,
+            candidate_history: existing
+                .as_ref()
+                .map(|record| {
+                    let mut history = record.candidate_history.clone();
+                    if !history.contains(&record.candidate) {
+                        history.push(record.candidate.clone());
+                    }
+                    history
+                })
+                .unwrap_or_default(),
             pull_request_url: existing
                 .as_ref()
                 .and_then(|record| record.pull_request_url.clone()),
@@ -426,6 +436,14 @@ impl WorkControl {
                 .map(|record| record.routed_feedback_ids.clone())
                 .unwrap_or_default(),
         };
+        if !publication
+            .candidate_history
+            .contains(&publication.candidate)
+        {
+            publication
+                .candidate_history
+                .push(publication.candidate.clone());
+        }
         slice.github_publication = Some(publication.clone());
         self.save_slice(&slice)?;
         let url = github.publish(
@@ -481,7 +499,7 @@ impl WorkControl {
             .github_publication
             .as_mut()
             .context("Slice has no Fluent-created pull request")?;
-        let received = github.review_feedback(publication)?;
+        let received = github.review_feedback(&self.project_root, publication)?;
         let mut unseen = Vec::new();
         for feedback in received {
             if publication
@@ -506,6 +524,7 @@ impl WorkControl {
     pub fn authorize_feedback_rework(
         &self,
         slice_id: &str,
+        project_label: &str,
         actor: &str,
         feedback_ids: &[String],
         boundary: &dyn CandidateReworkBoundary,
@@ -533,6 +552,25 @@ impl WorkControl {
                     .with_context(|| format!("GitHub feedback {id} is unavailable or resolved"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let candidate_commit = selected
+            .first()
+            .map(|feedback| feedback.candidate_commit.as_str())
+            .context("candidate rework requires selected GitHub feedback")?;
+        if selected
+            .iter()
+            .any(|feedback| feedback.candidate_commit != candidate_commit)
+        {
+            bail!("selected GitHub feedback spans multiple candidate commits");
+        }
+        let candidate = publication
+            .candidate_history
+            .iter()
+            .chain(std::iter::once(&publication.candidate))
+            .find(|candidate| candidate.commit == candidate_commit)
+            .cloned()
+            .with_context(|| {
+                format!("GitHub feedback targets unknown candidate commit {candidate_commit}")
+            })?;
         let mut hasher = Sha256::new();
         hasher.update(b"fluent-github-rework-v1\0");
         hasher.update(slice_id.as_bytes());
@@ -544,9 +582,10 @@ impl WorkControl {
         let request = CandidateReworkRequest {
             id: format!("github-rework-{:x}", hasher.finalize()),
             slice_id: slice_id.to_owned(),
-            work_item_id: publication.candidate.work_item_id.clone(),
-            candidate_id: publication.candidate.candidate_id.clone(),
-            candidate_commit: publication.candidate.commit.clone(),
+            project_label: project_label.to_owned(),
+            work_item_id: candidate.work_item_id,
+            candidate_id: candidate.candidate_id,
+            candidate_commit: candidate.commit,
             authorized_by: actor.to_owned(),
             feedback: selected,
         };

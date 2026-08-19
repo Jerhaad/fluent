@@ -7740,6 +7740,12 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("register every configured checkout")
             && guide.contains("/absolute/app-checkout")
             && guide.contains("/absolute/api-checkout")
+            && guide.contains("github_remote")
+            && guide.contains("git -C /absolute/checkout remote get-url origin")
+            && guide.contains("gh auth login --hostname github.com --git-protocol https")
+            && guide.contains("gh auth status --hostname github.com")
+            && guide.contains("create pull request <candidate-id>")
+            && guide.contains("address github feedback <feedback-id>")
             && guide.contains("reusing live coordinator running")
             && guide.contains("Scheduler: running")
             && guide.contains("preflight checks the scheduler request boundary")
@@ -9471,6 +9477,7 @@ struct FakeGitHub {
     publishes: Vec<GitHubPublishRequest>,
     fail_publish: bool,
     feedback: Vec<GitHubReviewFeedback>,
+    feedback_calls: usize,
 }
 
 impl GitHubReviewClient for FakeGitHub {
@@ -9488,10 +9495,271 @@ impl GitHubReviewClient for FakeGitHub {
 
     fn review_feedback(
         &mut self,
+        _checkout: &std::path::Path,
         _publication: &GitHubPublication,
     ) -> anyhow::Result<Vec<GitHubReviewFeedback>> {
+        self.feedback_calls += 1;
         Ok(self.feedback.clone())
     }
+}
+
+fn write_fake_gh(
+    directory: &TempDir,
+    name: &str,
+    body: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let executable = directory.path().join(name);
+    let log = directory.path().join(format!("{name}.log"));
+    let script = format!(
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{}'\n{}\n",
+        log.display(),
+        body
+    );
+    fs::write(&executable, script).unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions).unwrap();
+    (executable, log)
+}
+
+fn github_adapter_request(checkout: &TempDir, remote: &TempDir) -> GitHubPublishRequest {
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    for args in [
+        vec!["remote", "add", "origin", "https://github.com/acme/app.git"],
+        vec![
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let candidate = GitHubCandidate {
+        work_item_id: "work-github".into(),
+        candidate_id: "candidate-github".into(),
+        commit: String::from_utf8(commit.stdout).unwrap().trim().into(),
+        target_branch: "main".into(),
+    };
+    GitHubPublishRequest {
+        checkout: checkout.path().into(),
+        publication: GitHubPublication {
+            slice_id: "slice-github".into(),
+            remote: "https://github.com/acme/app".into(),
+            head_branch: "fluent/slice-github".into(),
+            candidate: candidate.clone(),
+            candidate_history: vec![candidate],
+            pull_request_url: None,
+            feedback: Vec::new(),
+            routed_feedback_ids: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn gh_adapter_records_exact_publish_and_reconciles_partial_success() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(remote.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let request = github_adapter_request(&checkout, &remote);
+    let fixture = TempDir::new().unwrap();
+    let (gh, log) = write_fake_gh(
+        &fixture,
+        "gh-existing",
+        "case \"$1 $2\" in\n  'auth status') exit 0 ;;\n  'pr list') printf '%s\\n' '[{\"url\":\"https://github.com/acme/app/pull/7\"}]'; exit 0 ;;\n  *) exit 91 ;;\nesac",
+    );
+    let mut client = GhGitHubClient::new(gh);
+    let url = client.publish(&request, None).unwrap();
+    assert_eq!(url, "https://github.com/acme/app/pull/7");
+    let invocations = fs::read_to_string(log).unwrap();
+    assert!(invocations.contains(&format!(
+        "{}|auth status --hostname github.com",
+        checkout.path().display()
+    )));
+    assert!(
+        invocations
+            .contains("pr list --repo acme/app --head fluent/slice-github --state open --json url")
+    );
+    assert!(!invocations.contains("pr create"));
+    let remote_head = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(remote.path())
+        .args(["rev-parse", "refs/heads/fluent/slice-github"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(remote_head.stdout).unwrap().trim(),
+        request.publication.candidate.commit
+    );
+}
+
+#[test]
+fn gh_adapter_reports_auth_host_push_and_api_failures() {
+    let auth_checkout = TempDir::new().unwrap();
+    initialize_checkout(auth_checkout.path());
+    let auth_remote = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(auth_remote.path())
+        .status()
+        .unwrap();
+    let auth_request = github_adapter_request(&auth_checkout, &auth_remote);
+    let fixture = TempDir::new().unwrap();
+    let (auth_gh, auth_log) = write_fake_gh(&fixture, "gh-auth", "exit 42");
+    let auth_error = GhGitHubClient::new(auth_gh)
+        .publish(&auth_request, None)
+        .unwrap_err();
+    assert!(auth_error.to_string().contains("GitHub CLI failed"));
+    assert!(
+        fs::read_to_string(auth_log)
+            .unwrap()
+            .contains("auth status")
+    );
+
+    let wrong_checkout = TempDir::new().unwrap();
+    initialize_checkout(wrong_checkout.path());
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(wrong_checkout.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/acme/app.git",
+        ])
+        .status()
+        .unwrap();
+    let mut wrong_request = auth_request.clone();
+    wrong_request.checkout = wrong_checkout.path().into();
+    let wrong_error = GhGitHubClient::new("/usr/bin/false")
+        .publish(&wrong_request, None)
+        .unwrap_err();
+    assert!(wrong_error.to_string().contains("does not match"));
+
+    let push_checkout = TempDir::new().unwrap();
+    initialize_checkout(push_checkout.path());
+    let push_remote = TempDir::new().unwrap();
+    let push_request = github_adapter_request(&push_checkout, &push_remote);
+    let (push_gh, _) = write_fake_gh(
+        &fixture,
+        "gh-push",
+        "[ \"$1 $2\" = 'auth status' ] && exit 0\nexit 90",
+    );
+    let push_error = GhGitHubClient::new(push_gh)
+        .publish(&push_request, None)
+        .unwrap_err();
+    assert!(push_error.to_string().contains("git push"));
+
+    let api_checkout = TempDir::new().unwrap();
+    initialize_checkout(api_checkout.path());
+    let api_remote = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(api_remote.path())
+        .status()
+        .unwrap();
+    let api_request = github_adapter_request(&api_checkout, &api_remote);
+    let (api_gh, _) = write_fake_gh(
+        &fixture,
+        "gh-api",
+        "[ \"$1 $2\" = 'auth status' ] && exit 0\n[ \"$1 $2\" = 'pr list' ] && { printf '%s\\n' 'not-json'; exit 0; }\nexit 89",
+    );
+    let api_error = GhGitHubClient::new(api_gh)
+        .publish(&api_request, None)
+        .unwrap_err();
+    assert!(api_error.to_string().contains("parse GitHub"));
+}
+
+#[test]
+fn gh_adapter_reads_feedback_from_candidate_checkout() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    let mut publication = github_adapter_request(&checkout, &remote).publication;
+    publication.pull_request_url = Some("https://github.com/acme/app/pull/7".into());
+    let fixture = TempDir::new().unwrap();
+    let (gh, log) = write_fake_gh(
+        &fixture,
+        "gh-feedback",
+        "printf '%s\\n' '{\"comments\":[{\"id\":\"C1\",\"body\":\"note\",\"url\":\"https://github.test/C1\"}],\"reviews\":[]}'",
+    );
+    let feedback = GhGitHubClient::new(gh)
+        .review_feedback(checkout.path(), &publication)
+        .unwrap();
+    assert_eq!(feedback[0].id, "C1");
+    let invocation = fs::read_to_string(log).unwrap();
+    let cwd = invocation
+        .lines()
+        .next()
+        .unwrap()
+        .split('|')
+        .next()
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(cwd).canonicalize().unwrap(),
+        checkout.path().canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn local_candidate_rework_boundary_persists_idempotently() {
+    let project = TempDir::new().unwrap();
+    let boundary = LocalCandidateReworkBoundary::new([("app".into(), project.path().into())]);
+    let request = CandidateReworkRequest {
+        id: "github-rework-stable".into(),
+        slice_id: "slice-github".into(),
+        project_label: "app".into(),
+        work_item_id: "work-github".into(),
+        candidate_id: "candidate-github-1".into(),
+        candidate_commit: "commit-one".into(),
+        authorized_by: "U1".into(),
+        feedback: vec![GitHubReviewFeedback {
+            id: "C1".into(),
+            kind: "comment".into(),
+            body: "Please adjust this".into(),
+            url: "https://github.test/C1".into(),
+            candidate_commit: "commit-one".into(),
+            resolved: false,
+        }],
+    };
+
+    boundary.submit_candidate_rework(&request).unwrap();
+    boundary.submit_candidate_rework(&request).unwrap();
+
+    let persisted = project
+        .path()
+        .join(".fluent/work/slack/candidate-rework/github-rework-stable.json");
+    assert_eq!(
+        serde_json::from_slice::<CandidateReworkRequest>(&fs::read(persisted).unwrap()).unwrap(),
+        request
+    );
 }
 
 fn make_ready_candidate(
@@ -9653,10 +9921,28 @@ fn approver_creates_one_pr_for_exact_ready_candidate() {
     let (home, checkout, config) = setup(true);
     let mut runner = github_ready_runner(&home, &checkout, config);
     let mut github = FakeGitHub::default();
-    let outcome = runner
-        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+    let rework = RecordingReworkBoundary::default();
+    runner
+        .ingest_with_github(
+            event(
+                "E-stale",
+                Some("1.0"),
+                "create pull request stale-candidate",
+            ),
+            None,
+            &mut github,
+            &rework,
+        )
         .unwrap();
-    assert!(matches!(outcome, GitHubReviewRequestOutcome::Published(_)));
+    assert!(github.publishes.is_empty());
+    runner
+        .ingest_with_github(
+            event("E2", Some("1.0"), "create pull request candidate-github-1"),
+            None,
+            &mut github,
+            &rework,
+        )
+        .unwrap();
     assert_eq!(github.publishes.len(), 1);
     assert_eq!(
         github.publishes[0].publication.candidate.commit,
@@ -9671,13 +9957,31 @@ fn approver_creates_one_pr_for_exact_ready_candidate() {
 #[test]
 fn duplicate_pr_request_returns_existing_pr() {
     let (home, checkout, config) = setup(true);
-    let mut runner = github_ready_runner(&home, &checkout, config);
+    let mut runner = github_ready_runner(&home, &checkout, config.clone());
     let mut github = FakeGitHub::default();
+    let rework = RecordingReworkBoundary::default();
     runner
-        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .ingest_with_github(
+            event("E2", Some("1.0"), "create pull request candidate-github-1"),
+            None,
+            &mut github,
+            &rework,
+        )
         .unwrap();
-    runner
-        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+    drop(runner);
+    let mut restarted = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    restarted
+        .ingest_with_github(
+            event("E3", Some("1.0"), "create pull request candidate-github-1"),
+            None,
+            &mut github,
+            &rework,
+        )
         .unwrap();
     assert_eq!(github.publishes.len(), 1);
     let publication = WorkControl::new(checkout.path())
@@ -9702,10 +10006,15 @@ fn github_pr_failure_preserves_ready_candidate() {
         fail_publish: true,
         ..Default::default()
     };
-    let outcome = runner
-        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+    let rework = RecordingReworkBoundary::default();
+    runner
+        .ingest_with_github(
+            event("E2", Some("1.0"), "create pull request candidate-github-1"),
+            None,
+            &mut github,
+            &rework,
+        )
         .unwrap();
-    assert!(matches!(outcome, GitHubReviewRequestOutcome::Failed { .. }));
     assert_eq!(store.read_work_item("work-github").unwrap(), before);
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery.text.contains("GitHub review publication failed")
@@ -9714,10 +10023,11 @@ fn github_pr_failure_preserves_ready_candidate() {
     }));
 
     github.fail_publish = false;
-    let retried = runner
-        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+    let mut retry = event("E3", Some("1.0"), "create pull request candidate-github-1");
+    retry.timestamp = "2.0".into();
+    runner
+        .ingest_with_github(retry, None, &mut github, &rework)
         .unwrap();
-    assert!(matches!(retried, GitHubReviewRequestOutcome::Published(_)));
     assert_eq!(
         github.publishes.len(),
         2,
@@ -9735,12 +10045,7 @@ fn existing_pr_advances_only_to_new_ready_candidate() {
         .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
         .unwrap();
 
-    assert!(
-        runner
-            .advance_github_review("1.0", &mut github)
-            .unwrap()
-            .is_none()
-    );
+    runner.poll_linked_work_with_github(&mut github).unwrap();
     assert_eq!(github.publishes.len(), 1);
 
     make_ready_candidate(
@@ -9750,12 +10055,14 @@ fn existing_pr_advances_only_to_new_ready_candidate() {
         "commit-two",
         "2026-08-19T02:00:00Z",
     );
-    let advanced = runner
-        .advance_github_review("1.0", &mut github)
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+    let advanced = WorkControl::new(checkout.path())
+        .slice("slice-github")
         .unwrap()
+        .unwrap()
+        .github_publication
         .unwrap();
     assert_eq!(advanced.candidate.commit, "commit-two");
-    assert_eq!(advanced.head_branch, "fluent/slice-github");
     assert_eq!(
         advanced.pull_request_url.as_deref(),
         Some("https://github.com/acme/app/pull/7")
@@ -9828,7 +10135,18 @@ fn github_review_feedback_reports_without_starting_work() {
             resolved: true,
         },
     ];
-    let reported = runner.report_github_feedback("1.0", &mut github).unwrap();
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+    assert!(
+        github.feedback_calls > 0,
+        "the lifecycle poll must query GitHub"
+    );
+    let reported = WorkControl::new(checkout.path())
+        .slice("slice-github")
+        .unwrap()
+        .unwrap()
+        .github_publication
+        .unwrap()
+        .feedback;
     assert_eq!(reported, github.feedback);
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery.text.contains("changes_requested")
@@ -9843,12 +10161,10 @@ fn github_review_feedback_reports_without_starting_work() {
         before_work
     );
     let delivery_count = runner.slack().deliveries.len();
-    assert!(
-        runner
-            .report_github_feedback("1.0", &mut github)
-            .unwrap()
-            .is_empty()
-    );
+    assert!({
+        runner.poll_linked_work_with_github(&mut github).unwrap();
+        runner.slack().deliveries.len() == delivery_count
+    });
     assert_eq!(runner.slack().deliveries.len(), delivery_count);
 }
 
@@ -9881,12 +10197,22 @@ fn approver_routes_selected_github_feedback_to_candidate_rework() {
             resolved: true,
         },
     ];
-    runner.report_github_feedback("1.0", &mut github).unwrap();
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+    make_ready_candidate(
+        &checkout,
+        "work-github",
+        "candidate-github-2",
+        "commit-two",
+        "2026-08-19T02:00:00Z",
+    );
+    runner.poll_linked_work_with_github(&mut github).unwrap();
     let boundary = RecordingReworkBoundary::default();
 
+    let mut nonapprover = event("E2", Some("1.0"), "address github feedback selected-1");
+    nonapprover.user = "U2".into();
     assert!(
         runner
-            .authorize_github_feedback_rework("1.0", "U2", &["selected-1".into()], &boundary,)
+            .ingest_with_github(nonapprover, None, &mut github, &boundary)
             .is_err()
     );
     assert!(boundary.requests.lock().unwrap().is_empty());
@@ -9895,9 +10221,15 @@ fn approver_routes_selected_github_feedback_to_candidate_rework() {
             .authorize_github_feedback_rework("1.0", "U1", &["resolved-2".into()], &boundary,)
             .is_err()
     );
-    let request = runner
-        .authorize_github_feedback_rework("1.0", "U1", &["selected-1".into()], &boundary)
+    runner
+        .ingest_with_github(
+            event("E3", Some("1.0"), "address github feedback selected-1"),
+            None,
+            &mut github,
+            &boundary,
+        )
         .unwrap();
+    let request = boundary.requests.lock().unwrap()[0].clone();
     assert_eq!(request.candidate_id, "candidate-github-1");
     assert_eq!(request.candidate_commit, "commit-one");
     assert_eq!(request.feedback, vec![github.feedback[0].clone()]);
@@ -9907,7 +10239,12 @@ fn approver_routes_selected_github_feedback_to_candidate_rework() {
     );
 
     runner
-        .authorize_github_feedback_rework("1.0", "U1", &["selected-1".into()], &boundary)
+        .ingest_with_github(
+            event("E4", Some("1.0"), "address github feedback selected-1"),
+            None,
+            &mut github,
+            &boundary,
+        )
         .unwrap();
     assert_eq!(boundary.requests.lock().unwrap().len(), 1);
 }

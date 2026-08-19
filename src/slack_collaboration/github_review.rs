@@ -1,5 +1,7 @@
 //! Host-owned GitHub pull-request and review boundary.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,6 +24,8 @@ pub struct GitHubPublication {
     pub remote: String,
     pub head_branch: String,
     pub candidate: GitHubCandidate,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_history: Vec<GitHubCandidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request_url: Option<String>,
     #[serde(default)]
@@ -59,6 +63,7 @@ pub trait GitHubReviewClient {
 
     fn review_feedback(
         &mut self,
+        checkout: &Path,
         publication: &GitHubPublication,
     ) -> Result<Vec<GitHubReviewFeedback>>;
 }
@@ -68,6 +73,7 @@ pub trait GitHubReviewClient {
 pub struct CandidateReworkRequest {
     pub id: String,
     pub slice_id: String,
+    pub project_label: String,
     pub work_item_id: String,
     pub candidate_id: String,
     pub candidate_commit: String,
@@ -77,6 +83,44 @@ pub struct CandidateReworkRequest {
 
 pub trait CandidateReworkBoundary {
     fn submit_candidate_rework(&self, request: &CandidateReworkRequest) -> Result<()>;
+}
+
+/// Durable production inbox consumed by the host-owned candidate-rework
+/// coordinator. Stable request identities make Slack redelivery idempotent.
+#[derive(Debug, Clone)]
+pub struct LocalCandidateReworkBoundary {
+    projects: BTreeMap<String, PathBuf>,
+}
+
+impl LocalCandidateReworkBoundary {
+    pub fn new(projects: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+        Self {
+            projects: projects.into_iter().collect(),
+        }
+    }
+}
+
+impl CandidateReworkBoundary for LocalCandidateReworkBoundary {
+    fn submit_candidate_rework(&self, request: &CandidateReworkRequest) -> Result<()> {
+        let project_root = self.projects.get(&request.project_label).with_context(|| {
+            format!(
+                "candidate rework project {} is not configured",
+                request.project_label
+            )
+        })?;
+        let directory = project_root.join(".fluent/work/slack/candidate-rework");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.json", request.id));
+        let bytes = serde_json::to_vec_pretty(request)?;
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => bail!("candidate rework identity already has different content"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+        }
+        crate::atomic_write::atomic_write(&path, &bytes)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,16 +251,14 @@ impl GitHubReviewClient for GhGitHubClient {
 
     fn review_feedback(
         &mut self,
+        checkout: &Path,
         publication: &GitHubPublication,
     ) -> Result<Vec<GitHubReviewFeedback>> {
         let url = publication
             .pull_request_url
             .as_deref()
             .context("GitHub publication has no pull-request URL")?;
-        let output = self.gh(
-            Path::new("."),
-            &["pr", "view", url, "--json", "comments,reviews"],
-        )?;
+        let output = self.gh(checkout, &["pr", "view", url, "--json", "comments,reviews"])?;
         parse_feedback(&output, &publication.candidate.commit)
     }
 }

@@ -236,6 +236,30 @@ the thread under the same checkout, allowed-participant, and project-approver
 policy as a channel. Reinstall the app after updating its manifest so Slack can
 deliver `message.im` events and grant the `im:history` scope.
 
+## Configure optional GitHub review
+
+Set `github_remote` only for repositories hosted on `github.com`, using
+`https://github.com/<owner>/<repository>`. The checkout's `origin` must resolve
+to that same owner and repository; Fluent rejects a different host or repository
+before it publishes anything. Confirm both values from the runner account:
+
+```sh
+git -C /absolute/checkout remote get-url origin
+gh auth login --hostname github.com --git-protocol https
+gh auth status --hostname github.com
+```
+
+Keep GitHub credentials in the runner owner's `gh` credential store. Do not add
+tokens to Fluent configuration, Slack messages, or provider environments. The
+runner invokes the host-owned `gh` login and pushes the exact reviewed commit to
+the Slice's managed review branch.
+
+After Fluent reports a ready candidate, a project approver requests publication
+in the same thread with `create pull request <candidate-id>`. Fluent polls an
+open Fluent-created pull request for feedback. To authorize corrective work for
+specific unresolved items, reply `address github feedback <feedback-id>`; list
+multiple identifiers with commas.
+
 ## Ask about code
 
 Participants can ask code questions in a bound Fluent thread. Fluent keeps

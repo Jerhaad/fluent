@@ -243,6 +243,11 @@ struct PlanApprovalCommand {
     planned_work: Vec<PlannedWork>,
 }
 
+struct GitHubIntegrations<'a> {
+    github: &'a mut dyn GitHubReviewClient,
+    rework: &'a dyn CandidateReworkBoundary,
+}
+
 /// Coordinates one local runner. File state is written before external effects.
 pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     pub(super) home: &'a Path,
@@ -648,11 +653,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
 
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
-        self.ingest_at_scheduler_boundary(event, true, None)
-    }
-
-    fn ingest_deferred(&mut self, event: InboundEnvelope) -> Result<()> {
-        self.ingest_at_scheduler_boundary(event, false, None)
+        self.ingest_at_scheduler_boundary(event, true, None, None)
     }
 
     /// Process Slack ingress through an explicitly supplied scheduler boundary.
@@ -663,7 +664,22 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: InboundEnvelope,
         scheduler: &dyn WorkScheduler,
     ) -> Result<()> {
-        self.ingest_at_scheduler_boundary(event, true, Some(scheduler))
+        self.ingest_at_scheduler_boundary(event, true, Some(scheduler), None)
+    }
+
+    pub fn ingest_with_github(
+        &mut self,
+        event: InboundEnvelope,
+        scheduler: Option<&dyn WorkScheduler>,
+        github: &mut dyn GitHubReviewClient,
+        rework: &dyn CandidateReworkBoundary,
+    ) -> Result<()> {
+        self.ingest_at_scheduler_boundary(
+            event,
+            true,
+            scheduler,
+            Some(GitHubIntegrations { github, rework }),
+        )
     }
 
     fn ingest_at_scheduler_boundary(
@@ -671,6 +687,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: InboundEnvelope,
         run_now: bool,
         scheduler: Option<&dyn WorkScheduler>,
+        mut integrations: Option<GitHubIntegrations<'_>>,
     ) -> Result<()> {
         event.validate_thread_identity()?;
         self.config = self.current_authority_config()?;
@@ -695,7 +712,15 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             InboxState::Pending => {}
         }
-        self.process(event.clone(), run_now, scheduler)?;
+        self.process(
+            event.clone(),
+            run_now,
+            scheduler,
+            integrations.as_mut().map(|value| GitHubIntegrations {
+                github: &mut *value.github,
+                rework: value.rework,
+            }),
+        )?;
         self.store.mark_inbox_processed(&event.id)?;
         if self
             .store
@@ -703,6 +728,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .is_some_and(|thread| thread.slice.is_some())
         {
             self.report_thread_work(&event.thread_id())?;
+            if let Some(integrations) = integrations.as_mut() {
+                self.reconcile_thread_github(&event.thread_id(), &mut *integrations.github)?;
+            }
         }
         self.deliver_pending()
     }
@@ -762,7 +790,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         });
         for (recovered, event) in events {
             self.recovering_event = recovered;
-            self.ingest_at_scheduler_boundary(event.clone(), run_now, None)?;
+            self.ingest_at_scheduler_boundary(event.clone(), run_now, None, None)?;
             self.recovering_event = false;
             if recovered {
                 self.store.save_recovery_cursor(
@@ -833,6 +861,57 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         Ok(())
     }
+
+    pub fn poll_linked_work_with_github(
+        &mut self,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<()> {
+        let thread_ids = self
+            .store
+            .load_threads(&self.config)?
+            .into_values()
+            .filter(|thread| thread.state == ThreadState::Active)
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            if self
+                .store
+                .load_thread(&self.config, &thread_id)?
+                .is_none_or(|thread| thread.slice.is_none())
+            {
+                continue;
+            }
+            self.report_thread_work(&thread_id)?;
+            self.reconcile_thread_github(&thread_id, github)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_thread_github(
+        &mut self,
+        thread_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<()> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        if WorkControl::new(&project.checkout.path)
+            .slice(slice_id)?
+            .and_then(|slice| slice.github_publication)
+            .is_none_or(|publication| publication.pull_request_url.is_none())
+        {
+            return Ok(());
+        }
+        self.advance_github_review(thread_id, github)?;
+        self.report_github_feedback(thread_id, github)?;
+        Ok(())
+    }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = self.store.load_outbox()?;
         for index in 0..deliveries.len() {
@@ -892,6 +971,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: InboundEnvelope,
         run_now: bool,
         scheduler: Option<&dyn WorkScheduler>,
+        mut integrations: Option<GitHubIntegrations<'_>>,
     ) -> Result<()> {
         let existing = self.store.load_thread(&self.config, &event.thread_id())?;
         if existing.is_none()
@@ -1058,6 +1138,40 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .store
                     .load_thread(&self.config, &thread.id)?
                     .context("Fluent thread disappeared after execution approval")?;
+                refreshed.processed_events.insert(event.id);
+                return self.store.save_thread(&self.config, &refreshed);
+            }
+            if let Some(candidate_id) = github_pull_request_candidate(command) {
+                let github = integrations
+                    .as_mut()
+                    .context("GitHub integration is unavailable")?;
+                self.request_github_review(
+                    &thread.id,
+                    &event.user,
+                    candidate_id,
+                    &mut *github.github,
+                )?;
+                let mut refreshed = self
+                    .store
+                    .load_thread(&self.config, &thread.id)?
+                    .context("Fluent thread disappeared after GitHub publication")?;
+                refreshed.processed_events.insert(event.id);
+                return self.store.save_thread(&self.config, &refreshed);
+            }
+            if let Some(feedback_ids) = selected_github_feedback(command) {
+                let integrations = integrations
+                    .as_mut()
+                    .context("GitHub integration is unavailable")?;
+                self.authorize_github_feedback_rework(
+                    &thread.id,
+                    &event.user,
+                    &feedback_ids,
+                    integrations.rework,
+                )?;
+                let mut refreshed = self
+                    .store
+                    .load_thread(&self.config, &thread.id)?
+                    .context("Fluent thread disappeared after GitHub rework request")?;
                 refreshed.processed_events.insert(event.id);
                 return self.store.save_thread(&self.config, &refreshed);
             }
@@ -2268,6 +2382,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .context("thread has no approved Slice")?;
         let request = WorkControl::new(&project.checkout.path).authorize_feedback_rework(
             slice_id,
+            &project.label,
             actor,
             feedback_ids,
             boundary,
@@ -2616,6 +2731,8 @@ pub struct AsyncCollaborationRunner<'a, P, S> {
     completions_rx: std::sync::mpsc::Receiver<ProviderCompletion>,
     pool: FairTurnPool,
     active: BTreeSet<String>,
+    github: Box<dyn GitHubReviewClient + Send>,
+    rework: Box<dyn CandidateReworkBoundary + Send + Sync>,
 }
 
 impl<'a, P, S> AsyncCollaborationRunner<'a, P, S>
@@ -2650,6 +2767,35 @@ where
         capacity: usize,
         provider_factory: impl Fn() -> P + Send + Sync + 'static,
     ) -> Self {
+        let rework = LocalCandidateReworkBoundary::new(
+            config
+                .projects
+                .iter()
+                .map(|(label, project)| (label.clone(), project.checkout.path.clone())),
+        );
+        Self::new_with_provider_factory_and_integrations(
+            home,
+            config,
+            provider,
+            slack,
+            capacity,
+            provider_factory,
+            Box::new(GhGitHubClient::default()),
+            Box::new(rework),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_provider_factory_and_integrations(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        capacity: usize,
+        provider_factory: impl Fn() -> P + Send + Sync + 'static,
+        github: Box<dyn GitHubReviewClient + Send>,
+        rework: Box<dyn CandidateReworkBoundary + Send + Sync>,
+    ) -> Self {
         let (completions_tx, completions_rx) = std::sync::mpsc::channel();
         Self {
             runner: CollaborationRunner::new(home, config, provider, slack),
@@ -2658,6 +2804,8 @@ where
             completions_rx,
             pool: FairTurnPool::new(capacity),
             active: BTreeSet::new(),
+            github,
+            rework,
         }
     }
 
@@ -2684,7 +2832,15 @@ where
 
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         let thread_id = event.thread_id();
-        self.runner.ingest_deferred(event)?;
+        self.runner.ingest_at_scheduler_boundary(
+            event,
+            false,
+            None,
+            Some(GitHubIntegrations {
+                github: &mut *self.github,
+                rework: &*self.rework,
+            }),
+        )?;
         self.dispatch_if_ready(&thread_id)
     }
 
@@ -2782,6 +2938,8 @@ where
             report_interruption,
             false,
         )?;
+        self.runner
+            .poll_linked_work_with_github(&mut *self.github)?;
         let thread_ids: Vec<_> = self
             .runner
             .store
@@ -2967,7 +3125,8 @@ where
         if let Some(event) = self.runner.slack_mut().receive_timeout(wait)? {
             self.ingest(event)?;
         } else {
-            self.runner.poll_linked_work()?;
+            self.runner
+                .poll_linked_work_with_github(&mut *self.github)?;
         }
         self.wake_due_retries((self.runner.clock)())?;
         self.poll_completions()
@@ -3016,4 +3175,32 @@ fn new_product_work_request(command: &str) -> Option<&str> {
                 .then(|| command[prefix.len()..].trim())
         })
         .filter(|request| !request.is_empty())
+}
+
+fn github_pull_request_candidate(command: &str) -> Option<&str> {
+    ["create pull request ", "create github pull request "]
+        .into_iter()
+        .find_map(|prefix| {
+            command
+                .to_ascii_lowercase()
+                .strip_prefix(prefix)
+                .map(|_| prefix)
+        })
+        .and_then(|prefix| command.get(prefix.len()..))
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty() && !candidate.contains(char::is_whitespace))
+}
+
+fn selected_github_feedback(command: &str) -> Option<Vec<String>> {
+    let prefix = "address github feedback ";
+    if !command.to_ascii_lowercase().starts_with(prefix) {
+        return None;
+    }
+    let ids = command[prefix.len()..]
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    (!ids.is_empty()).then_some(ids)
 }
