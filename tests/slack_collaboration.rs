@@ -6781,11 +6781,12 @@ fn conflicting_plan_approvals_share_one_slice_transaction() {
         }
         drop(sender);
         barrier.wait();
+        let approvals_blocked = receiver.recv_timeout(Duration::from_millis(100)).is_err();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         assert!(
-            receiver.recv_timeout(Duration::from_millis(100)).is_err(),
+            approvals_blocked,
             "both approvals must wait for the shared Slice transaction lock"
         );
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     });
 
     let outcomes = receiver.into_iter().collect::<Vec<_>>();
