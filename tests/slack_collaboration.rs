@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
-use fluent::work_model::{PlanningContext, WorkItem, WorkModelStore};
+use fluent::work_model::{WorkItem, WorkModelStore};
 use tempfile::TempDir;
 
 fn initialize_checkout(path: &std::path::Path) -> (String, String) {
@@ -151,11 +151,7 @@ fn planning_artifact_waits_for_existing_approval_gate() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    let mut work_item = WorkItem::planned("work-1", "Approve planning");
-    work_item.planning_context = Some(PlanningContext {
-        plan: Some("# Plan\n".into()),
-        ..Default::default()
-    });
+    let work_item = WorkItem::planned("work-1", "Approve planning");
     WorkModelStore::new(checkout.path())
         .create_work_item(&work_item)
         .unwrap();
@@ -182,6 +178,16 @@ fn planning_artifact_waits_for_existing_approval_gate() {
     let thread = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
     assert_eq!(thread.planning_stage.as_deref(), Some("plan"));
     assert!(thread.pending_question.is_none());
+    assert_eq!(
+        WorkModelStore::new(checkout.path())
+            .read_work_item("work-1")
+            .unwrap()
+            .planning_context
+            .unwrap()
+            .plan
+            .as_deref(),
+        Some("# Plan\n")
+    );
 }
 
 #[test]
@@ -193,14 +199,7 @@ fn planning_artifact_reloads_exact_revisions_for_all_stages() {
         ("approach", "# Approach\n"),
         ("plan", "# Plan\n"),
     ];
-    let mut work_item = WorkItem::planned("work-1", "Approve planning");
-    work_item.planning_context = Some(PlanningContext {
-        brief: Some(stages[0].1.into()),
-        behaviors: Some(stages[1].1.into()),
-        approach: Some(stages[2].1.into()),
-        plan: Some(stages[3].1.into()),
-        ..Default::default()
-    });
+    let work_item = WorkItem::planned("work-1", "Approve planning");
     WorkModelStore::new(checkout.path())
         .create_work_item(&work_item)
         .unwrap();
@@ -226,6 +225,19 @@ fn planning_artifact_reloads_exact_revisions_for_all_stages() {
         runner
             .approve_planning_revision("1.0", &revision.id, "U1")
             .unwrap();
+        let approved = WorkModelStore::new(checkout.path())
+            .read_work_item("work-1")
+            .unwrap()
+            .planning_context
+            .unwrap();
+        let approved_stage = match stage {
+            "brief" => approved.brief,
+            "behaviors" => approved.behaviors,
+            "approach" => approved.approach,
+            "plan" => approved.plan,
+            _ => unreachable!(),
+        };
+        assert_eq!(approved_stage.as_deref(), Some(markdown));
     }
 }
 
@@ -3256,6 +3268,8 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("channel ID (`C...`)")
             && guide.contains("direct_message_defaults")
             && guide.contains("DM conversation ID (`D...`)")
+            && guide.contains("project_approvers")
+            && guide.contains("Every project approver")
             && guide.contains("/invite @Fluent")
             && guide.contains("@Fluent plan the next release")
             && guide.contains("keeps the thread unbound")

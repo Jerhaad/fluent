@@ -51,10 +51,15 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Pin every checkout label, identity, branch, commit, and allowed participant.
-   Set `enabled_providers` to the locally enabled conversation providers. Set
+    Set `enabled_providers` to the locally enabled conversation providers. Set
    `project_approvers` to the allowed participants who may authorize planning,
-   execution, resume, and landing actions; it must be a subset of
-   `allowed_participants`.
+    execution, resume, and landing actions; it must be a subset of
+    `allowed_participants`.
+    Set `project_approvers` to the allowed participants who may approve Brief,
+   Behaviors, Approach, and Plan revisions. Every project approver must also
+   appear in `allowed_participants`; add a person's `U...` member ID to both
+    lists when they may contribute and advance planning. A valid policy may omit
+    project approvers, but then no one can advance a planning revision.
    The identity binds the canonical checkout and Git administrative directory
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
