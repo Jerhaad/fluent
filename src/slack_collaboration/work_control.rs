@@ -124,6 +124,14 @@ pub struct WorkTransition {
     pub occurred_at: Option<String>,
     #[serde(default)]
     pub elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_tests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_reviews: Vec<String>,
 }
 
 fn default_work_item_kind() -> String {
@@ -379,6 +387,10 @@ impl WorkControl {
                 object_kind: "work-item".into(),
                 occurred_at: None,
                 elapsed_seconds: None,
+                candidate_commit: None,
+                comparison_base: None,
+                completed_tests: Vec::new(),
+                completed_reviews: Vec::new(),
             };
             slice
                 .observed_states
@@ -424,6 +436,10 @@ impl WorkControl {
                     object_kind: entry.object_kind.clone(),
                     occurred_at: Some(entry.occurred_at.clone()),
                     elapsed_seconds: entry.elapsed_seconds,
+                    candidate_commit: None,
+                    comparison_base: None,
+                    completed_tests: Vec::new(),
+                    completed_reviews: Vec::new(),
                 });
                 slice
                     .transition_cursors
@@ -508,8 +524,28 @@ impl WorkControl {
             }
             "ready" => {
                 reply.push_str(" Candidate is ready for review.");
-                if let Some(remote) = github_remote {
-                    reply.push_str(&format!(" Review {remote}/commit/{} or compare it before optionally creating a pull request.", transition.work_item_id));
+                if let Some(commit) = &transition.candidate_commit {
+                    reply.push_str(&format!(" Commit: {commit}."));
+                    if !transition.completed_tests.is_empty() {
+                        reply.push_str(&format!(
+                            " Tests: {}.",
+                            transition.completed_tests.join(", ")
+                        ));
+                    }
+                    if !transition.completed_reviews.is_empty() {
+                        reply.push_str(&format!(
+                            " Reviews: {}.",
+                            transition.completed_reviews.join(", ")
+                        ));
+                    }
+                    if let Some(remote) = github_remote {
+                        reply.push_str(&format!(" Review {remote}/commit/{commit}."));
+                        if let Some(base) = &transition.comparison_base {
+                            reply
+                                .push_str(&format!(" Compare {remote}/compare/{base}...{commit}."));
+                        }
+                        reply.push_str(" Optionally create a pull request after review.");
+                    }
                 }
             }
             _ => {}

@@ -6720,6 +6720,10 @@ fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
         object_kind: "merge-candidate".into(),
         occurred_at: Some("2026-08-18T00:00:00Z".into()),
         elapsed_seconds: Some(12),
+        candidate_commit: Some("abc123".into()),
+        comparison_base: Some("main-base".into()),
+        completed_tests: vec!["tester passed".into()],
+        completed_reviews: vec!["architecture passed".into()],
     };
     let reply = control.render_actionable_transition(
         &transition,
@@ -6727,8 +6731,12 @@ fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
         Some("https://github.com/acme/app"),
     );
     assert!(reply.contains("Candidate is ready for review"));
-    assert!(reply.contains("https://github.com/acme/app/commit/work-7"));
-    assert!(reply.contains("optionally creating a pull request"));
+    assert!(reply.contains("Commit: abc123"));
+    assert!(reply.contains("Tests: tester passed"));
+    assert!(reply.contains("Reviews: architecture passed"));
+    assert!(reply.contains("https://github.com/acme/app/commit/abc123"));
+    assert!(reply.contains("https://github.com/acme/app/compare/main-base...abc123"));
+    assert!(reply.contains("Optionally create a pull request"));
     assert!(reply.contains("Elapsed: 12s"));
 
     let needs_user = WorkTransition {
