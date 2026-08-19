@@ -9693,6 +9693,83 @@ fn duplicate_pr_request_returns_existing_pr() {
 }
 
 #[test]
+fn github_pr_failure_preserves_ready_candidate() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = github_ready_runner(&home, &checkout, config);
+    let store = WorkModelStore::new(checkout.path());
+    let before = store.read_work_item("work-github").unwrap();
+    let mut github = FakeGitHub {
+        fail_publish: true,
+        ..Default::default()
+    };
+    let outcome = runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+    assert!(matches!(outcome, GitHubReviewRequestOutcome::Failed { .. }));
+    assert_eq!(store.read_work_item("work-github").unwrap(), before);
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("GitHub review publication failed")
+            && delivery.text.contains("ready candidate is unchanged")
+            && delivery.text.contains("retry this pull-request request")
+    }));
+
+    github.fail_publish = false;
+    let retried = runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+    assert!(matches!(retried, GitHubReviewRequestOutcome::Published(_)));
+    assert_eq!(
+        github.publishes.len(),
+        2,
+        "retry reconciles the same intent"
+    );
+    assert_eq!(github.publishes[0], github.publishes[1]);
+}
+
+#[test]
+fn existing_pr_advances_only_to_new_ready_candidate() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = github_ready_runner(&home, &checkout, config);
+    let mut github = FakeGitHub::default();
+    runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+
+    assert!(
+        runner
+            .advance_github_review("1.0", &mut github)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(github.publishes.len(), 1);
+
+    make_ready_candidate(
+        &checkout,
+        "work-github",
+        "candidate-github-2",
+        "commit-two",
+        "2026-08-19T02:00:00Z",
+    );
+    let advanced = runner
+        .advance_github_review("1.0", &mut github)
+        .unwrap()
+        .unwrap();
+    assert_eq!(advanced.candidate.commit, "commit-two");
+    assert_eq!(advanced.head_branch, "fluent/slice-github");
+    assert_eq!(
+        advanced.pull_request_url.as_deref(),
+        Some("https://github.com/acme/app/pull/7")
+    );
+    assert_eq!(github.publishes.len(), 2);
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("newly ready Merge Candidate candidate-github-2")
+            && delivery.text.contains("commit-two")
+    }));
+}
+
+#[test]
 fn ready_candidate_renderer_includes_reviewable_evidence_summary() {
     let (_home, checkout, _config) = setup(true);
     let reply = WorkControl::new(checkout.path()).render_actionable_transition(
