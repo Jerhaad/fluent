@@ -239,6 +239,29 @@ fn participant_revocation_applies_to_active_and_future_threads() {
 }
 
 #[test]
+fn default_project_change_does_not_rebind_existing_threads() {
+    let (home, _checkout, mut config) = setup(true);
+    let other_checkout = TempDir::new().unwrap();
+    let (identity, commit) = initialize_checkout(other_checkout.path());
+    write_config(home.path(), &config).unwrap();
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent first")).unwrap();
+    config.projects.insert("other".into(), ConfiguredProject {
+        label: "other".into(),
+        checkout: Checkout { label: "other".into(), path: other_checkout.path().into(), identity, branch: "main".into(), commit },
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+    });
+    config.channel_defaults.insert("C1".into(), "other".into());
+    write_config(home.path(), &config).unwrap();
+    let mut second = event("E2", None, "@Fluent second"); second.timestamp = "2.0".into();
+    runner.ingest(second).unwrap();
+    let store = FileCollaborationStore::new(home.path());
+    assert_eq!(store.load_thread(&runner.config, "1.0").unwrap().unwrap().project_label.as_deref(), Some("app"));
+    assert_eq!(store.load_thread(&runner.config, "2.0").unwrap().unwrap().project_label.as_deref(), Some("other"));
+}
+
+#[test]
 fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
     let envelope = decode_socket_mode_envelope(
         r#"{"envelope_id":"ENV1","payload":{"event_id":"EV1","event":{"channel":"C1","ts":"1.0","thread_ts":"0.9","user":"U1","text":"continue"}}}"#,
