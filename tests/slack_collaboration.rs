@@ -4570,12 +4570,31 @@ fn approver_switches_provider_without_changing_work() {
     ])
     .unwrap();
     let (home, _checkout, config) = setup(true);
-    let mut runner =
-        CollaborationRunner::new(home.path(), config, registry, InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        registry,
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     runner
         .ingest(event("E2", Some("1.0"), "continue the plan"))
         .unwrap();
+
+    let mut revoked = config.clone();
+    let project = revoked.projects.get_mut("app").unwrap();
+    project.enabled_providers = BTreeSet::from(["codex".into()]);
+    write_config(home.path(), &revoked).unwrap();
+    assert!(
+        runner
+            .switch_provider("1.0", "U1", "claude")
+            .unwrap_err()
+            .to_string()
+            .contains("not enabled")
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2);
+
+    write_config(home.path(), &config).unwrap();
     runner
         .ingest(event("E3", Some("1.0"), "@Fluent [provider=claude]"))
         .unwrap();

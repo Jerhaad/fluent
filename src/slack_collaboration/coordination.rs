@@ -375,6 +375,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     /// the selected provider. Scheduler Work is not represented or mutated at
     /// this boundary.
     pub fn switch_provider(&mut self, thread_id: &str, actor: &str, provider: &str) -> Result<()> {
+        self.config = self.current_authority_config()?;
         let mut thread = self
             .store
             .load_thread(&self.config, thread_id)?
