@@ -103,11 +103,22 @@ pub fn decode_socket_mode_envelope(text: &str) -> Result<InboundEnvelope> {
                 .context("Slack interaction user")?
                 .into(),
             text: action["action_id"].as_str().unwrap_or_default().into(),
+            change: InboundChange::Message,
             approval_action_id: action["value"].as_str().map(str::to_owned),
             approval_artifact_revision: action["block_id"].as_str().map(str::to_owned),
         });
     }
     let event = &payload["event"];
+    let change = match event["subtype"].as_str() {
+        Some("message_changed") => InboundChange::Edit,
+        Some("message_deleted") => InboundChange::Delete,
+        _ => InboundChange::Message,
+    };
+    let message = match change {
+        InboundChange::Edit => &event["message"],
+        InboundChange::Delete => &event["previous_message"],
+        InboundChange::Message => event,
+    };
     Ok(InboundEnvelope {
         id: value["payload"]["event_id"]
             .as_str()
@@ -118,15 +129,19 @@ pub fn decode_socket_mode_envelope(text: &str) -> Result<InboundEnvelope> {
             .context("Slack envelope id")?
             .into(),
         channel: event["channel"].as_str().context("Slack channel")?.into(),
-        timestamp: event["ts"].as_str().context("Slack timestamp")?.into(),
-        thread_timestamp: event["thread_ts"].as_str().map(str::to_owned),
-        user: event["user"].as_str().context("Slack user")?.into(),
-        text: event["text"].as_str().unwrap_or_default().into(),
-        change: match event["subtype"].as_str() {
-            Some("message_changed") => InboundChange::Edit,
-            Some("message_deleted") => InboundChange::Delete,
-            _ => InboundChange::Message,
-        },
+        timestamp: message["ts"]
+            .as_str()
+            .or_else(|| event["deleted_ts"].as_str())
+            .context("Slack timestamp")?
+            .into(),
+        thread_timestamp: message["thread_ts"].as_str().map(str::to_owned),
+        user: message["user"]
+            .as_str()
+            .or_else(|| event["previous_message"]["user"].as_str())
+            .context("Slack user")?
+            .into(),
+        text: message["text"].as_str().unwrap_or_default().into(),
+        change,
         approval_action_id: event["actions"][0]["value"].as_str().map(str::to_owned),
         approval_artifact_revision: event["actions"][0]["block_id"].as_str().map(str::to_owned),
     })

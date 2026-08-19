@@ -1385,6 +1385,24 @@ fn socket_mode_block_action_carries_revision_bound_approval() {
 }
 
 #[test]
+fn socket_mode_envelope_normalizes_message_changes() {
+    let edit = decode_socket_mode_envelope(
+        r#"{"envelope_id":"ENV2","payload":{"event_id":"EV2","event":{"channel":"C1","subtype":"message_changed","message":{"ts":"2.0","thread_ts":"1.0","user":"U1","text":"revised"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(edit.change, InboundChange::Edit);
+    assert_eq!(edit.timestamp, "2.0");
+    assert_eq!(edit.text, "revised");
+
+    let deletion = decode_socket_mode_envelope(
+        r#"{"envelope_id":"ENV3","payload":{"event_id":"EV3","event":{"channel":"C1","subtype":"message_deleted","deleted_ts":"2.0","previous_message":{"ts":"2.0","thread_ts":"1.0","user":"U1"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(deletion.change, InboundChange::Delete);
+    assert_eq!(deletion.timestamp, "2.0");
+}
+
+#[test]
 fn socket_mode_transport_connects_receives_and_acknowledges() {
     let websocket_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let websocket_address = websocket_listener.local_addr().unwrap();
