@@ -89,7 +89,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.store.persist_outbox(OutboundDelivery {
                 id: format!(
                     "{}:artifact:{}:{:0part_width$}",
-                    thread.id, revision.sha256, index
+                    thread.id, revision.id, index
                 ),
                 channel: thread.channel.clone(),
                 thread_timestamp: thread.id.clone(),

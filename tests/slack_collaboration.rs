@@ -103,6 +103,36 @@ fn planning_artifact_renders_exact_revision_in_thread() {
 }
 
 #[test]
+fn same_markdown_planning_stages_use_distinct_delivery_ids() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let markdown = "# Shared planning text\n";
+
+    let brief = runner
+        .present_planning_artifact("1.0", "brief", markdown)
+        .unwrap();
+    let behaviors = runner
+        .present_planning_artifact("1.0", "behaviors", markdown)
+        .unwrap();
+
+    assert_ne!(brief.id, behaviors.id);
+    let delivery_ids: BTreeSet<_> = runner
+        .slack()
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.id.starts_with("1.0:artifact:"))
+        .map(|delivery| delivery.id.as_str())
+        .collect();
+    assert_eq!(delivery_ids.len(), 2);
+}
+
+#[test]
 fn large_planning_artifact_preserves_exact_content_across_messages() {
     let source = format!(
         "{}🙂{}",
