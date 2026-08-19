@@ -53,6 +53,9 @@ impl RunnerConfig {
         if self.workspace.trim().is_empty() {
             bail!("Slack workspace is required");
         }
+        if self.enabled_providers.is_empty() {
+            bail!("at least one conversation provider is required");
+        }
         for (key, project) in &self.projects {
             if key != &project.label || key.trim().is_empty() {
                 bail!("configured project labels must be non-empty map keys");
@@ -74,6 +77,9 @@ impl RunnerConfig {
             {
                 bail!("project {key} has an invalid conversation provider policy");
             }
+            if !project.enabled_providers.is_subset(&self.enabled_providers) {
+                bail!("project {key} enables a conversation provider that is not locally enabled");
+            }
             if project.allowed_participants.is_empty()
                 || !project
                     .project_approvers
@@ -92,9 +98,6 @@ impl RunnerConfig {
             {
                 bail!("project {key} has an invalid Slack identity");
             }
-        }
-        if self.enabled_providers.is_empty() {
-            bail!("at least one conversation provider is required");
         }
         for (channel, project) in &self.channel_defaults {
             if channel.trim().is_empty() || !self.projects.contains_key(project) {

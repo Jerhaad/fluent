@@ -41,7 +41,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    For example, write this policy to `config.json`:
 
    ```json
-   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex","claude"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
+   {"workspace":"example","enabled_providers":["codex","claude"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex","claude"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
    ```
 
    Print the machine-local opaque `identity` with:
@@ -51,7 +51,9 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Pin every checkout label, identity, branch, commit, and allowed participant.
-   Set `enabled_providers` to the locally enabled conversation providers. Set
+   Set the top-level `enabled_providers` to every conversation provider
+   installed and authenticated for this runner. Each project's
+   `enabled_providers` may narrow that local allowlist but cannot add to it. Set
    `project_approvers` to the allowed participants who may approve Brief,
    Behaviors, Approach, and Plan revisions or authorize execution, resume, and
    landing actions. Every project approver must also appear in
@@ -173,9 +175,10 @@ never expose the runner's absolute checkout path.
 ## Provider policy and recovery
 
 `default_provider` selects the provider for a new thread; omit a selection to
-use it. `enabled_providers` is an allowlist. The runner supports `codex` and
-`claude`; enable only adapters whose local executable is installed and
-authenticated for the runner owner. Override their executable paths with
+use it. The top-level `enabled_providers` is the runner's authoritative local
+allowlist, and each project's allowlist must be its subset. The runner supports
+`codex` and `claude`; enable only adapters whose local executable is installed
+and authenticated for the runner owner. Override their executable paths with
 `FLUENT_CODEX_APP_SERVER` and `FLUENT_CLAUDE`. Both adapters run with the exact
 bound checkout and private provider state beneath the Slice draft. Set the
 fair cross-thread provider capacity with `FLUENT_SLACK_TURN_CAPACITY` (default

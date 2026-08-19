@@ -73,7 +73,7 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
         projects: BTreeMap::from([("app".into(), project)]),
         channel_defaults: BTreeMap::new(),
         direct_message_defaults: BTreeMap::new(),
-        enabled_providers: BTreeSet::from(["codex".into()]),
+        enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
     };
     if default {
         config.channel_defaults.insert("C1".into(), "app".into());
@@ -1464,7 +1464,9 @@ fn setup_validates_complete_collaboration_authority() {
             .to_string()
             .contains("conversation provider")
     );
-    config.enabled_providers.insert("codex".into());
+    config
+        .enabled_providers
+        .extend(["codex".into(), "claude".into()]);
     config
         .projects
         .get_mut("app")
@@ -1534,6 +1536,20 @@ fn setup_validates_complete_collaboration_authority() {
             .unwrap_err()
             .to_string()
             .contains("checkout identity")
+    );
+}
+
+#[test]
+fn project_provider_policy_must_be_within_runner_allowlist() {
+    let (_home, _checkout, mut config) = setup(true);
+    config.enabled_providers.remove("claude");
+
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not locally enabled")
     );
 }
 
