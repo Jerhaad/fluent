@@ -7332,7 +7332,11 @@ impl WorkModelStore {
         };
         let mut target = work_item.clone();
         append_durable_transitions(prior.as_ref(), &mut target);
-        self.write_work_item_file_unchecked(&target, create_new)
+        self.write_work_item_file_unchecked(&target, create_new)?;
+        work_item
+            .storage_revision
+            .set(target.storage_revision.get().unwrap_or(0));
+        Ok(())
     }
 
     /// Lock one Work Item's aggregate model before coordinating a mutation in
