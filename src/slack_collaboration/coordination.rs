@@ -1179,23 +1179,6 @@ where
                 self.runner
                     .store
                     .save_thread(&self.runner.config, &thread)?;
-            } else if matches!(
-                thread.provider_failure,
-                Some(
-                    ProviderFailure::Authentication
-                        | ProviderFailure::HostCredentialDenied
-                        | ProviderFailure::Unavailable
-                )
-            ) {
-                let _ = self
-                    .runner
-                    .resume_after_provider_login_metadata(&mut thread);
-            } else if thread.provider_failure.is_none()
-                && thread.pending_turn.as_ref().is_some_and(|turn| {
-                    turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery
-                })
-            {
-                let _ = self.runner.reconfirm_checkout_metadata(&mut thread);
             }
             self.dispatch_if_ready(&thread_id)?;
         }

@@ -3153,6 +3153,16 @@ fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
     runner
         .restore_connection(Vec::new(), "checkout-reconfirmed".into(), false)
         .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let paused = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        paused.pending_turn.unwrap().dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    runner.reconfirm_checkout("1.0").unwrap();
     runner.wait_for_completion().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
@@ -3230,6 +3240,9 @@ fn async_provider_login_recovery_rechecks_scope_before_resuming() {
     runner
         .restore_connection(Vec::new(), "login-recovered".into(), false)
         .unwrap();
+    assert_eq!(preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(turns.load(Ordering::SeqCst), 0);
+    runner.resume_after_provider_login("1.0").unwrap();
     runner.wait_for_completion().unwrap();
     assert_eq!(preparations.load(Ordering::SeqCst), 2);
     assert_eq!(turns.load(Ordering::SeqCst), 1);
@@ -4179,15 +4192,18 @@ fn local_code_reference_truncates_at_utf8_boundary() {
 
 #[test]
 fn code_question_uses_bound_checkout_and_relative_references() {
-    struct AdapterOutputProvider;
+    struct AdapterOutputProvider {
+        scopes: Arc<Mutex<Vec<std::path::PathBuf>>>,
+    }
     impl ConversationProvider for AdapterOutputProvider {
         fn start(
             &mut self,
             _: &str,
-            _: &ProviderScope,
+            scope: &ProviderScope,
             _: &str,
             _: &str,
         ) -> ProviderResult<(String, String)> {
+            self.scopes.lock().unwrap().push(scope.checkout.clone());
             Ok((
                 "session".into(),
                 "Inspect `README:1` for the binding.".into(),
@@ -4205,15 +4221,19 @@ fn code_question_uses_bound_checkout_and_relative_references() {
         }
     }
     let (home, checkout, config) = setup(true);
+    let scopes = Arc::new(Mutex::new(Vec::new()));
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
-        AdapterOutputProvider,
+        AdapterOutputProvider {
+            scopes: scopes.clone(),
+        },
         InMemorySlack::default(),
     );
     runner
         .ingest(event("E1", None, "@Fluent where is the binding?"))
         .unwrap();
+    assert_eq!(&*scopes.lock().unwrap(), &[checkout.path().to_owned()]);
     let reply = &runner.slack().deliveries[0].text;
     assert!(reply.contains("README:1"));
     assert!(reply.contains("local-only reference"));

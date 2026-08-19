@@ -194,8 +194,10 @@ The Codex command runs `codex login` in the thread's private `CODEX_HOME`. The
 Claude command opens the interactive Claude client with the thread's private
 `CLAUDE_CONFIG_DIR`; enter `/login` there and finish its prompts. Fluent honors
 `FLUENT_CODEX_APP_SERVER` and `FLUENT_CLAUDE`, so this command authenticates
-the exact configured executable. After login completes, run `fluent slack
-restart` to resume the preserved turn with those scoped credentials.
+the exact configured executable. After login completes, invoke the runner's
+explicit provider-login recovery action to recheck those scoped credentials
+and resume the preserved turn. Restarting or reconnecting Slack alone leaves
+the turn paused.
 
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:
@@ -226,6 +228,7 @@ automatically; replies received meanwhile are acknowledged, retained in Slack
 order, and sent together as the next attributed turn. If the exact bound
 checkout disappears or its identity changes, Fluent stops provider access,
 reports the unavailable binding, and never substitutes another checkout
-automatically. After restoring the exact checkout, explicitly reconfirm it
-by running `fluent slack restart` before Fluent re-admits the preserved turn.
-Fluent retains the original project binding throughout recovery.
+automatically. After restoring the exact checkout, invoke the runner's
+explicit checkout-reconfirmation action before Fluent re-admits the preserved
+turn. Restarting or reconnecting Slack alone leaves the turn paused. Fluent
+retains the original project binding throughout recovery.
