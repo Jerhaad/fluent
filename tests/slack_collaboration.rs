@@ -6479,6 +6479,50 @@ fn approved_plan_creates_reported_work_without_execution() {
 }
 
 #[test]
+fn slice_identifiers_stay_inside_the_slice_store() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    let error = control
+        .approve_plan("../escape", "U1", &[PlannedWork::new("work-safe", "Work")])
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be used as a file name"));
+    assert!(
+        !checkout
+            .path()
+            .join(".fluent/work/slack/escape.json")
+            .exists()
+    );
+}
+
+#[test]
+fn direct_work_item_writes_append_lifecycle_transitions() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-write",
+            "U1",
+            &[PlannedWork::new("work-write", "Work")],
+        )
+        .unwrap();
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let mut item = store.read_work_item("work-write").unwrap();
+    item.attempts.push(fluent::work_model::Attempt {
+        id: "attempt-write".into(),
+        work_item_id: item.id.clone(),
+        status: fluent::work_model::AttemptStatus::Executing,
+        ..Default::default()
+    });
+    store.write_work_item(&item).unwrap();
+    let saved = store.read_work_item("work-write").unwrap();
+    let transition = saved.transitions.last().unwrap();
+    assert_eq!(transition.object_kind, "attempt");
+    assert_eq!(transition.object_id, "attempt-write");
+    assert_eq!(transition.old_state, None);
+    assert_eq!(transition.new_state, "executing");
+}
+
+#[test]
 fn execution_approval_queues_each_planned_work_item() {
     #[derive(Default)]
     struct FakeScheduler {
@@ -6627,6 +6671,7 @@ fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
     let transition = WorkTransition {
         sequence: 7,
         work_item_id: "work-7".into(),
+        object_id: "candidate-7".into(),
         old_state: Some("reviewing".into()),
         new_state: "ready".into(),
         origin: Some("scheduler".into()),
@@ -6739,7 +6784,10 @@ macro_rules! persisted_slice_status_selector {
             assert_eq!(transitions[0].new_state, "planned");
             assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
             let reply = render_transition_reply(&transitions[0], &["work evidence".into()]);
-            assert!(reply.contains("Work Item work-selector is now planned"));
+            assert!(
+                reply
+                    .contains("work-item work-selector for Work Item work-selector is now planned")
+            );
             assert!(reply.contains("Origin: slack-thread"));
             assert!(reply.contains("Evidence: work evidence"));
             assert!(

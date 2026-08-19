@@ -7289,12 +7289,13 @@ impl WorkModelStore {
                 source,
             }
         })?;
+        let prior = work_item.clone();
         let output =
             reducer(&mut work_item).map_err(|source| WorkModelStorageError::InvalidModel {
                 path: path.clone(),
                 source,
             })?;
-        append_durable_transitions(&mut work_item);
+        append_durable_transitions(Some(&prior), &mut work_item);
         work_item
             .validate()
             .map_err(|source| WorkModelStorageError::InvalidModel { path, source })?;
@@ -7324,7 +7325,14 @@ impl WorkModelStore {
             })?;
 
         let _lock = self.lock_work_item_model(&work_item.id)?;
-        self.write_work_item_file_unchecked(work_item, create_new)
+        let prior = if create_new {
+            None
+        } else {
+            Some(self.read_work_item_under_model_lock(&work_item.id)?)
+        };
+        let mut target = work_item.clone();
+        append_durable_transitions(prior.as_ref(), &mut target);
+        self.write_work_item_file_unchecked(&target, create_new)
     }
 
     /// Lock one Work Item's aggregate model before coordinating a mutation in
@@ -8003,21 +8011,22 @@ impl WorkModelStore {
     }
 }
 
-fn append_durable_transitions(work_item: &mut WorkItem) {
-    let previous = work_item
-        .transitions
-        .last()
-        .map(|entry| entry.sequence)
+fn append_durable_transitions(prior: Option<&WorkItem>, work_item: &mut WorkItem) {
+    let previous = prior
+        .map(|item| {
+            item.transitions
+                .last()
+                .map(|entry| entry.sequence)
+                .unwrap_or(0)
+        })
         .unwrap_or(0);
     let current = durable_object_states(work_item);
-    let prior: HashMap<_, _> = work_item
-        .transitions
+    let prior_states: HashMap<_, _> = prior
+        .map(durable_object_states)
+        .unwrap_or_default()
         .iter()
-        .map(|entry| {
-            (
-                format!("{}:{}", entry.object_kind, entry.object_id),
-                entry.new_state.clone(),
-            )
+        .map(|(object_kind, object_id, state, _)| {
+            (format!("{object_kind}:{object_id}"), state.clone())
         })
         .collect();
     // The aggregate already stores only emitted states. Record a fresh entry for
@@ -8025,7 +8034,7 @@ fn append_durable_transitions(work_item: &mut WorkItem) {
     let now = now_iso8601();
     for (object_kind, object_id, state, reason) in current {
         let key = format!("{object_kind}:{object_id}");
-        let old_state = prior.get(&key).cloned();
+        let old_state = prior_states.get(&key).cloned();
         if old_state.as_deref() == Some(state.as_str()) {
             continue;
         }

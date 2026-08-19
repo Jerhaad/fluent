@@ -8,8 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 use crate::work_model::{
-    DurableWorkTransition, ExecutionAuthority, ExecutionAuthorization, WorkItem, WorkModelStore,
-    now_iso8601,
+    ExecutionAuthority, ExecutionAuthorization, WorkItem, WorkModelStore, validate_work_item_id,
 };
 
 /// A Work Item approved as part of one Slack Slice plan.
@@ -103,6 +102,8 @@ pub struct SliceWork {
 pub struct WorkTransition {
     pub sequence: u64,
     pub work_item_id: String,
+    #[serde(default)]
+    pub object_id: String,
     pub old_state: Option<String>,
     pub new_state: String,
     pub origin: Option<String>,
@@ -123,9 +124,14 @@ fn default_work_item_kind() -> String {
 /// caller supplies links only after it has verified that they are safe public
 /// evidence references.
 pub fn render_transition_reply(transition: &WorkTransition, evidence: &[String]) -> String {
+    let object_id = if transition.object_id.is_empty() {
+        &transition.work_item_id
+    } else {
+        &transition.object_id
+    };
     let mut reply = format!(
-        "Work Item {} is now {}.",
-        transition.work_item_id, transition.new_state
+        "{} {} for Work Item {} is now {}.",
+        transition.object_kind, object_id, transition.work_item_id, transition.new_state
     );
     if let Some(origin) = &transition.origin {
         reply.push_str(&format!(" Origin: {origin}."));
@@ -166,6 +172,7 @@ impl WorkControl {
         if slice_id.trim().is_empty() || approver.trim().is_empty() || planned_work.is_empty() {
             bail!("an approved plan requires a Slice, approver, and Work Items");
         }
+        validate_slice_id(slice_id)?;
         let ids: Vec<_> = planned_work.iter().map(|work| work.id.clone()).collect();
         if ids.iter().any(|id| id.trim().is_empty())
             || planned_work.iter().any(|work| work.title.trim().is_empty())
@@ -185,24 +192,12 @@ impl WorkControl {
 
         let store = WorkModelStore::new(&self.project_root);
         for work in planned_work {
-            let mut item = WorkItem {
+            let item = WorkItem {
                 id: work.id.clone(),
                 title: work.title.clone(),
                 authorization: ExecutionAuthorization::Proposed,
                 ..WorkItem::default()
             };
-            item.transitions.push(DurableWorkTransition {
-                sequence: 1,
-                object_kind: "work-item".into(),
-                object_id: work.id.clone(),
-                old_state: None,
-                new_state: "planned".into(),
-                occurred_at: now_iso8601(),
-                elapsed_seconds: None,
-                origin: Some("slack-thread".into()),
-                reason: Some("Await execution approval".into()),
-                evidence_ref: None,
-            });
             store.create_work_item(&item).with_context(|| {
                 format!("create planned Work Item {} for Slice {slice_id}", work.id)
             })?;
@@ -277,7 +272,7 @@ impl WorkControl {
     }
 
     pub fn slice(&self, slice_id: &str) -> Result<Option<SliceWork>> {
-        let path = self.slice_path(slice_id);
+        let path = self.slice_path(slice_id)?;
         match fs::read(&path) {
             Ok(bytes) => {
                 Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
@@ -356,6 +351,7 @@ impl WorkControl {
             let transition = WorkTransition {
                 sequence: slice.transitions.len() as u64 + 1,
                 work_item_id: status.work_item_id.clone(),
+                object_id: status.work_item_id.clone(),
                 old_state,
                 new_state: status.state.clone(),
                 origin: origin.map(str::to_owned),
@@ -400,6 +396,7 @@ impl WorkControl {
                 reported.push(WorkTransition {
                     sequence: entry.sequence,
                     work_item_id: work_item_id.clone(),
+                    object_id: entry.object_id.clone(),
                     old_state: entry.old_state.clone(),
                     new_state: entry.new_state.clone(),
                     origin: entry.origin.clone(),
@@ -530,7 +527,7 @@ impl WorkControl {
     }
 
     fn save_slice(&self, slice: &SliceWork) -> Result<()> {
-        let path = self.slice_path(&slice.id);
+        let path = self.slice_path(&slice.id)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -538,11 +535,17 @@ impl WorkControl {
         Ok(())
     }
 
-    fn slice_path(&self, slice_id: &str) -> PathBuf {
-        self.project_root
+    fn slice_path(&self, slice_id: &str) -> Result<PathBuf> {
+        validate_slice_id(slice_id)?;
+        Ok(self
+            .project_root
             .join(".fluent/work/slack/slices")
-            .join(format!("{slice_id}.json"))
+            .join(format!("{slice_id}.json")))
     }
+}
+
+fn validate_slice_id(slice_id: &str) -> Result<()> {
+    validate_work_item_id(slice_id).map_err(Into::into)
 }
 
 fn request_id(slice_id: &str, work_item_id: &str) -> String {
