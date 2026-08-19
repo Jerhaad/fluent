@@ -244,6 +244,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if !project.project_approvers.contains(actor) {
             bail!("only a project approver may switch providers");
         }
+        if thread.pending_turn.is_none() {
+            bail!("only an interrupted Fluent thread may switch providers");
+        }
         if !project.enabled_providers.contains(provider) {
             bail!("conversation provider is not enabled");
         }

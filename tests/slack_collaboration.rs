@@ -2645,6 +2645,17 @@ fn approver_switches_provider_without_changing_work() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let store = FileCollaborationStore::new(home.path());
+    let mut interrupted = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
+    interrupted.pending_turn = Some(PendingTurn {
+        action_id: "E2".into(),
+        contribution: "resume this conversation".into(),
+        actor: "U1".into(),
+        starts_session: false,
+        provider_turn_id: None,
+        completed_reply: None,
+    });
+    store.save_thread(&runner.config, &interrupted).unwrap();
     runner.switch_provider("1.0", "U1", "claude").unwrap();
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
