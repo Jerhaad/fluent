@@ -6529,6 +6529,24 @@ fn execution_approval_queues_each_planned_work_item() {
     );
     assert_eq!(scheduler.requests.borrow().len(), 2);
 }
+
+#[test]
+fn status_request_reports_authoritative_work_state_and_actions() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan("slice-1", "U1", &[PlannedWork::new("work-1", "First")])
+        .unwrap();
+
+    assert_eq!(
+        control.status("slice-1").unwrap(),
+        vec![SliceWorkStatus {
+            work_item_id: "work-1".into(),
+            state: "planned".into(),
+            next_action: "Await execution approval".into(),
+        }]
+    );
+}
 #[test]
 fn invalid_runtime_configuration_fails_closed() {
     let (home, _checkout, mut config) = setup(true);

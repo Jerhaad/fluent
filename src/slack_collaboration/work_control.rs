@@ -59,6 +59,14 @@ pub struct ExecutionApprovalReport {
     pub outcomes: Vec<(String, WorkQueueOutcome)>,
 }
 
+/// Public, durable Work status rendered for a Slack thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceWorkStatus {
+    pub work_item_id: String,
+    pub state: String,
+    pub next_action: String,
+}
+
 /// Durable Slice-to-Work binding, stored beside the bound project's Work model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SliceWork {
@@ -199,6 +207,53 @@ impl WorkControl {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).with_context(|| format!("read Slice Work {}", path.display())),
         }
+    }
+
+    /// Read the authoritative persisted aggregate instead of inferring status
+    /// from scheduler queues or prior Slack replies.
+    pub fn status(&self, slice_id: &str) -> Result<Vec<SliceWorkStatus>> {
+        let slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let store = WorkModelStore::new(&self.project_root);
+        slice
+            .work_item_ids
+            .iter()
+            .map(|work_item_id| {
+                let item = store.read_work_item(work_item_id)?;
+                let (state, next_action) = if item.authorization.is_proposed() {
+                    ("planned", "Await execution approval")
+                } else if let Some(attempt) = item.attempts.last() {
+                    match attempt.status {
+                        crate::work_model::AttemptStatus::NeedsUser => {
+                            ("needs-user", "Respond to the current recovery request")
+                        }
+                        crate::work_model::AttemptStatus::Failed => {
+                            ("failed", "Inspect durable evidence and permitted recovery")
+                        }
+                        crate::work_model::AttemptStatus::Complete => {
+                            ("complete", "Await candidate or landing outcome")
+                        }
+                        crate::work_model::AttemptStatus::Planned => {
+                            ("queued", "Await scheduler capacity")
+                        }
+                        crate::work_model::AttemptStatus::Executing => {
+                            ("executing", "Await Attempt progress")
+                        }
+                        crate::work_model::AttemptStatus::Reviewing => {
+                            ("reviewing", "Await review and Tester results")
+                        }
+                    }
+                } else {
+                    ("authorized", "Await scheduler dispatch")
+                };
+                Ok(SliceWorkStatus {
+                    work_item_id: work_item_id.clone(),
+                    state: state.into(),
+                    next_action: next_action.into(),
+                })
+            })
+            .collect()
     }
 
     fn save_slice(&self, slice: &SliceWork) -> Result<()> {
