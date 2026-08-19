@@ -40,6 +40,8 @@ features:
     always_online: false
 settings:
   socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
   token_rotation_enabled: false
   event_subscriptions:
     bot_events:

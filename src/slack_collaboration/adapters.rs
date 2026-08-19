@@ -76,7 +76,37 @@ impl SocketModeTransport {
 
 pub fn decode_socket_mode_envelope(text: &str) -> Result<InboundEnvelope> {
     let value: serde_json::Value = serde_json::from_str(text)?;
-    let event = &value["payload"]["event"];
+    let payload = &value["payload"];
+    if payload["type"].as_str() == Some("block_actions") {
+        let action = &payload["actions"][0];
+        return Ok(InboundEnvelope {
+            id: value["envelope_id"]
+                .as_str()
+                .context("Slack envelope id")?
+                .into(),
+            acknowledgement_id: value["envelope_id"]
+                .as_str()
+                .context("Slack envelope id")?
+                .into(),
+            channel: payload["channel"]["id"]
+                .as_str()
+                .context("Slack interaction channel")?
+                .into(),
+            timestamp: payload["message"]["ts"]
+                .as_str()
+                .context("Slack interaction timestamp")?
+                .into(),
+            thread_timestamp: payload["message"]["thread_ts"].as_str().map(str::to_owned),
+            user: payload["user"]["id"]
+                .as_str()
+                .context("Slack interaction user")?
+                .into(),
+            text: action["action_id"].as_str().unwrap_or_default().into(),
+            approval_action_id: action["value"].as_str().map(str::to_owned),
+            approval_artifact_revision: action["block_id"].as_str().map(str::to_owned),
+        });
+    }
+    let event = &payload["event"];
     Ok(InboundEnvelope {
         id: value["payload"]["event_id"]
             .as_str()
@@ -106,6 +136,10 @@ impl SlackTransport for SocketModeTransport {
 
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
         self.web.post(delivery)
+    }
+
+    fn respond_private(&mut self, channel: &str, user: &str, text: &str) -> Result<()> {
+        self.web.respond_private(channel, user, text)
     }
 
     fn check(&self) -> Result<()> {
@@ -263,6 +297,18 @@ impl SlackTransport for SlackWebApiTransport {
     }
 
     fn post(&mut self, delivery: &OutboundDelivery) -> Result<()> {
+        let blocks = delivery.approval_control.as_ref().map(|control| {
+            serde_json::json!([{
+                "type": "actions",
+                "block_id": control.artifact_revision,
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": control.label},
+                    "action_id": "fluent_approval",
+                    "value": control.action_id
+                }]
+            }])
+        });
         self.call(
             "chat.postMessage",
             &self.bot_token,
@@ -270,8 +316,17 @@ impl SlackTransport for SlackWebApiTransport {
                 "channel": delivery.channel,
                 "thread_ts": delivery.thread_timestamp,
                 "text": delivery.text,
-            "client_msg_id": slack_client_message_id(delivery)
+                "blocks": blocks,
+                "client_msg_id": slack_client_message_id(delivery)
             }),
+        )
+    }
+
+    fn respond_private(&mut self, channel: &str, user: &str, text: &str) -> Result<()> {
+        self.call(
+            "chat.postEphemeral",
+            &self.bot_token,
+            serde_json::json!({"channel": channel, "user": user, "text": text}),
         )
     }
 

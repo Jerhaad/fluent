@@ -572,6 +572,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             thread_timestamp: event.thread_id(),
             text: redact_secrets(text),
             delivered: false,
+            approval_control: None,
         };
         self.store.persist_outbox(delivery)
     }
@@ -590,6 +591,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             thread_timestamp: thread.id.clone(),
             text: text.into(),
             delivered: false,
+            approval_control: Some(ApprovalControl {
+                action_id: action.id.clone(),
+                artifact_revision: action.artifact_revision.clone(),
+                label: "Approve".into(),
+            }),
         })
     }
 
@@ -609,6 +615,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 "Fluent thread status:{interruption} runner last connected at {connected_at}."
             ),
             delivered: false,
+            approval_control: None,
         })
     }
 }

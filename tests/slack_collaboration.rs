@@ -503,6 +503,44 @@ fn setup_validates_complete_collaboration_authority() {
             .to_string()
             .contains("Slack identity")
     );
+
+    let (_home, _checkout, mut config) = setup(true);
+    config.workspace.clear();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("workspace")
+    );
+
+    let (_home, _checkout, mut config) = setup(true);
+    config
+        .channel_defaults
+        .insert("C2".into(), "missing".into());
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("channel default")
+    );
+
+    let (_home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .checkout
+        .label
+        .clear();
+    assert!(
+        config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("checkout identity")
+    );
 }
 
 #[test]
@@ -685,6 +723,54 @@ fn socket_mode_envelope_rejects_missing_durable_identity() {
 }
 
 #[test]
+fn socket_mode_block_action_carries_revision_bound_approval() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let action = pending_action(PendingActionKind::Planning);
+    runner.request_approval("1.0", action.clone()).unwrap();
+    let matching = decode_socket_mode_envelope(&format!(
+        r#"{{"envelope_id":"A1","payload":{{"type":"block_actions","user":{{"id":"U1"}},"channel":{{"id":"C1"}},"message":{{"ts":"2.0","thread_ts":"1.0"}},"actions":[{{"action_id":"fluent_approval","value":"{}","block_id":"{}"}}]}}}}"#,
+        action.id, action.artifact_revision
+    ))
+    .unwrap();
+    assert_eq!(matching.approval_action_id.as_deref(), Some("approve-plan"));
+    runner.ingest(matching).unwrap();
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+
+    let mut replacement = pending_action(PendingActionKind::Planning);
+    replacement.artifact_revision = "revision-2".into();
+    runner.request_approval("1.0", replacement).unwrap();
+    let stale = decode_socket_mode_envelope(
+        r#"{"envelope_id":"A2","payload":{"type":"block_actions","user":{"id":"U1"},"channel":{"id":"C1"},"message":{"ts":"3.0","thread_ts":"1.0"},"actions":[{"action_id":"fluent_approval","value":"approve-plan","block_id":"revision-1"}]}}"#,
+    )
+    .unwrap();
+    runner.ingest(stale).unwrap();
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn socket_mode_transport_connects_receives_and_acknowledges() {
     let websocket_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let websocket_address = websocket_listener.local_addr().unwrap();
@@ -823,6 +909,7 @@ fn slack_web_api_uses_bot_token_and_same_thread_destination() {
         thread_timestamp: "1.0".into(),
         text: "connected at first".into(),
         delivered: false,
+        approval_control: None,
     };
     slack.post(&delivery).unwrap();
     slack.post(&delivery).unwrap();
@@ -1804,6 +1891,7 @@ fn outbound_progress_is_persisted_after_each_accepted_delivery() {
                 thread_timestamp: "1.0".into(),
                 text: id.into(),
                 delivered: false,
+                approval_control: None,
             })
             .unwrap();
     }
@@ -1832,6 +1920,7 @@ fn durable_outbox_identity_cannot_be_rewritten() {
         thread_timestamp: "1.0".into(),
         text: "connected at first".into(),
         delivered: false,
+        approval_control: None,
     };
     store.persist_outbox(original.clone()).unwrap();
     let error = store

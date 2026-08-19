@@ -58,6 +58,16 @@ pub struct OutboundDelivery {
     pub thread_timestamp: String,
     pub text: String,
     pub delivered: bool,
+    #[serde(default)]
+    pub approval_control: Option<ApprovalControl>,
+}
+
+/// A revision-bound Slack button that authorizes one pending action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalControl {
+    pub action_id: String,
+    pub artifact_revision: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -37,7 +37,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    For example, write this policy to `config.json`:
 
    ```json
-   {"workspace":"example","projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"]}},"channel_defaults":{"C123":"app"}}
+   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"}}
    ```
 
    Print the machine-local opaque `identity` with:
@@ -47,6 +47,10 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Pin every checkout label, identity, branch, commit, and allowed participant.
+   Set `enabled_providers` to the locally enabled conversation providers. Set
+   `project_approvers` to the allowed participants who may authorize planning,
+   execution, resume, and landing actions; it must be a subset of
+   `allowed_participants`.
    The identity binds the canonical checkout and Git administrative directory
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
@@ -87,3 +91,8 @@ Continue collaborating with ordinary replies in the resulting thread. When a
 channel has no available default project, Fluent keeps the thread unbound and
 offers the configured projects; it does not grant provider checkout access
 until an allowed participant selects an available project.
+
+Fluent presents approvers with a revision-bound **Approve** control for each
+planning, execution, resume, or landing request. The control authorizes only
+the displayed action and revision. A participant may contribute context, but
+only a configured project approver may use that control or confirm the action.
