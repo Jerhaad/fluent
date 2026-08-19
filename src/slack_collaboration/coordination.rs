@@ -56,6 +56,65 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         &mut self.slack
     }
 
+    /// Store and present an immutable planning revision before it can advance.
+    pub fn present_planning_artifact(
+        &mut self,
+        thread_id: &str,
+        kind: &str,
+        markdown: &str,
+    ) -> Result<ArtifactRevision> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let revision = ArtifactRevision::new(kind, markdown);
+        thread.artifact_revisions.push(revision.clone());
+        thread.pending_artifact_revision = Some(revision.id.clone());
+        self.store.save_thread(&self.config, &thread)?;
+        let parts = split_artifact_markdown(&revision.markdown, SLACK_MESSAGE_CONTENT_LIMIT);
+        let part_count = parts.len();
+        for (index, part) in parts.into_iter().enumerate() {
+            self.store.persist_outbox(OutboundDelivery {
+                id: format!("{}:artifact:{}:{index:04}", thread.id, revision.sha256),
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text: format!(
+                    "Planning revision {} ({}/{part_count})\n\n{part}",
+                    revision.id,
+                    index + 1
+                ),
+                delivered: false,
+            })?;
+        }
+        self.deliver_pending()?;
+        Ok(revision)
+    }
+
+    /// Advance only the exact revision currently waiting for approval.
+    pub fn approve_planning_revision(
+        &mut self,
+        thread_id: &str,
+        revision_id: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        if !self
+            .bound_project(&thread)?
+            .allowed_participants
+            .contains(actor)
+        {
+            bail!("participant cannot approve this Fluent thread");
+        }
+        if thread.pending_artifact_revision.as_deref() != Some(revision_id) {
+            bail!("approval must identify the revision waiting at the planning gate");
+        }
+        thread.pending_artifact_revision = None;
+        self.store.save_thread(&self.config, &thread)
+    }
+
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;

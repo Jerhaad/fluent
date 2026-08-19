@@ -75,6 +75,50 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
     }
     (home, checkout, config)
 }
+
+#[test]
+fn planning_artifact_renders_exact_revision_in_thread() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let source = "# Brief\n\nUse `exact` Markdown.\n";
+    let revision = runner
+        .present_planning_artifact("1.0", "brief", source)
+        .unwrap();
+    let deliveries: Vec<_> = runner
+        .slack()
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.id.starts_with("1.0:artifact:"))
+        .collect();
+    assert_eq!(reassemble_artifact_parts(&deliveries).unwrap(), source);
+    assert!(deliveries[0].text.contains(&revision.id));
+}
+
+#[test]
+fn large_planning_artifact_preserves_exact_content_across_messages() {
+    let source = format!("{}🙂{}", "a".repeat(SLACK_MESSAGE_CONTENT_LIMIT - 2), "b".repeat(8));
+    let parts = split_artifact_markdown(&source, SLACK_MESSAGE_CONTENT_LIMIT);
+    assert!(parts.len() > 1);
+    assert!(parts.iter().all(|part| part.len() <= SLACK_MESSAGE_CONTENT_LIMIT));
+    assert_eq!(parts.concat(), source);
+}
+
+#[test]
+fn planning_artifact_waits_for_existing_approval_gate() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let revision = runner
+        .present_planning_artifact("1.0", "plan", "# Plan\n")
+        .unwrap();
+    assert!(runner.approve_planning_revision("1.0", "different", "U1").is_err());
+    runner.approve_planning_revision("1.0", &revision.id, "U1").unwrap();
+}
 fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
     InboundEnvelope {
         id: id.into(),
@@ -2388,6 +2432,8 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         planning_stage: None,
         linked_work: None,
         pending_question: None,
+        artifact_revisions: Vec::new(),
+        pending_artifact_revision: None,
         pending_action: None,
         approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),
