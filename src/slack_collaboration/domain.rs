@@ -242,6 +242,8 @@ pub struct FluentThread {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTurn {
     pub action_id: String,
+    #[serde(default)]
+    pub source_timestamp: String,
     pub contribution: String,
     pub actor: String,
     pub starts_session: bool,

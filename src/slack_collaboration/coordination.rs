@@ -385,6 +385,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         {
         } else if thread.state == ThreadState::Active
             && event.thread_timestamp.is_some()
+            && thread.pending_artifact_revision.is_some()
+        {
+            self.queue_reply(
+                &event,
+                "Planning is waiting for approval of the presented revision.",
+            )?;
+        } else if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
             && self.offer_linked_thread_if_requested(&event, &mut thread)?
         {
         } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
@@ -392,6 +400,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
+                source_timestamp: event.timestamp.clone(),
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: false,
@@ -492,7 +501,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if let Some(turn) = thread
             .pending_turn
             .as_mut()
-            .filter(|turn| turn.action_id == event.timestamp)
+            .filter(|turn| turn.source_timestamp == event.timestamp)
         {
             turn.contribution = event.text;
             return self.store.save_thread(&self.config, &thread);
@@ -551,6 +560,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
+                source_timestamp: event.timestamp.clone(),
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: true,

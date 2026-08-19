@@ -162,6 +162,20 @@ fn planning_artifact_waits_for_existing_approval_gate() {
     let revision = runner
         .present_planning_artifact("1.0", "plan", "# Plan\n")
         .unwrap();
+    let provider_calls_before_reply = runner.provider().calls.len();
+    runner
+        .ingest(event("E2", Some("1.0"), "continue planning"))
+        .unwrap();
+    assert_eq!(runner.provider().calls.len(), provider_calls_before_reply);
+    assert_eq!(
+        store
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .pending_artifact_revision
+            .as_deref(),
+        Some(revision.id.as_str())
+    );
     assert!(
         runner
             .approve_planning_revision("1.0", "different", "U1")
@@ -296,7 +310,8 @@ fn queued_message_edit_replaces_unprocessed_content() {
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
     thread.pending_turn = Some(PendingTurn {
-        action_id: "2.0".into(),
+        action_id: "E-original".into(),
+        source_timestamp: "2.0".into(),
         contribution: "before".into(),
         actor: "U1".into(),
         starts_session: false,
@@ -2879,6 +2894,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         last_connection: None,
         pending_turn: Some(PendingTurn {
             action_id: "E1".into(),
+            source_timestamp: "1.0".into(),
             contribution: "private contribution".into(),
             actor: "U1".into(),
             starts_session: true,

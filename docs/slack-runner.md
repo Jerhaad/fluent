@@ -106,6 +106,29 @@ planning, execution, resume, or landing request. The control authorizes only
 the displayed action and revision. A participant may contribute context, but
 only a configured project approver may use that control or confirm the action.
 
+## Review planning artifacts
+
+To bind a planning review to an existing Fluent Work Item, include its ID in
+the opening request:
+
+```text
+@Fluent plan the next release work-item: 20260817-next-release
+```
+
+Fluent posts each completed or revised Brief, Behaviors, Approach, or Plan as
+a named planning revision in that thread. Review the exact Markdown in the
+post, then reply in the same thread with its revision ID:
+
+```text
+approve <revision-id>
+```
+
+When an artifact spans several Slack posts, their ordered parts are one exact
+revision; approve the revision ID shown on those posts only after reviewing all
+parts. Fluent holds planning at that revision until an approver replies. Only
+a configured `project_approvers` member may approve it, and approval advances
+the bound Work Item's corresponding planning stage.
+
 ## Configure direct messages
 
 To use a direct message, open its details in Slack and copy the DM conversation
