@@ -32,7 +32,7 @@ const DEFAULT_MAX_NO_PROGRESS_ROUNDS: usize = 2;
 fn attempt_executor_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::AttemptExecutor,
-        reason: Some("advance Attempt execution".to_string()),
+        reason: None,
         evidence_ref: None,
     }
 }
@@ -7968,7 +7968,8 @@ mod tests {
         store.create_work_item(&item).unwrap();
 
         mutate_attempt_work_item(&store, "work-origin", |item| {
-            item.attempts[0].status = AttemptStatus::Executing;
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(PauseKind::ProviderUnavailable);
             Ok(())
         })
         .unwrap();
@@ -7982,10 +7983,7 @@ mod tests {
             .unwrap();
         assert_eq!(transition.object_kind, "attempt");
         assert_eq!(transition.origin, DurableTransitionOrigin::AttemptExecutor);
-        assert_eq!(
-            transition.reason.as_deref(),
-            Some("advance Attempt execution")
-        );
+        assert_eq!(transition.reason.as_deref(), Some("provider-unavailable"));
     }
 
     #[test]

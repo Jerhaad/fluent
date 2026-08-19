@@ -24,7 +24,7 @@ use crate::work_model::{
 fn post_land_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::PostLand,
-        reason: Some("apply post-land follow-up".to_string()),
+        reason: None,
         evidence_ref: None,
     }
 }
@@ -3763,8 +3763,7 @@ mod tests {
             .read_work_item(DERIVED_ID)
             .unwrap();
         assert!(derived.transitions.iter().all(|transition| {
-            transition.origin == DurableTransitionOrigin::PostLand
-                && transition.reason.as_deref() == Some("apply post-land follow-up")
+            transition.origin == DurableTransitionOrigin::PostLand && transition.reason.is_none()
         }));
     }
 

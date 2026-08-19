@@ -7801,6 +7801,55 @@ fn typed_lifecycle_origins_replay_to_the_linked_slack_thread() {
 }
 
 #[test]
+fn executor_origin_replays_the_object_specific_pause_reason() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-pause-origin",
+            &[PlannedWork::new("work-pause-origin", "Paused Work")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: fluent::work_model::DurableTransitionOrigin::AttemptExecutor,
+        reason: None,
+        evidence_ref: Some("attempt:evidence".into()),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition("work-pause-origin", &metadata, |item| {
+            item.attempts.push(fluent::work_model::Attempt {
+                id: "attempt-pause-origin".into(),
+                work_item_id: item.id.clone(),
+                status: fluent::work_model::AttemptStatus::NeedsUser,
+                pause_kind: Some(fluent::work_model::PauseKind::ProviderUnavailable),
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+
+    runner.poll_linked_work().unwrap();
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("attempt attempt-pause-origin")
+            && delivery.text.contains("Origin: attempt-executor")
+            && delivery.text.contains("Next action: provider-unavailable")
+            && delivery.text.contains("Evidence: attempt:evidence")
+    }));
+}
+
+#[test]
 fn status_renderer_tracks_current_slice_state() {
     let (_home, checkout, _config) = setup(true);
     let control = planned_control(&checkout, "slice-status-direct", "work-status-direct");

@@ -8355,7 +8355,7 @@ fn durable_object_states(work_item: &WorkItem) -> Vec<(String, String, String, O
             attempt
                 .pause_kind
                 .as_ref()
-                .map(|pause| format!("{pause:?}").to_lowercase()),
+                .map(|pause| pause.as_str().to_string()),
         )
     }));
     states.extend(work_item.attempts.iter().flat_map(|attempt| {

@@ -53,7 +53,7 @@ const TESTER_CANDIDATE_MUTATION_SCHEMA_VERSION: u32 = 1;
 fn task_executor_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::TaskExecutor,
-        reason: Some("advance Task execution".to_string()),
+        reason: None,
         evidence_ref: None,
     }
 }
@@ -14433,7 +14433,7 @@ mod tests {
         assert_eq!(transition.object_kind, "task");
         assert_eq!(transition.object_id, task_id);
         assert_eq!(transition.origin, DurableTransitionOrigin::TaskExecutor);
-        assert_eq!(transition.reason.as_deref(), Some("advance Task execution"));
+        assert_eq!(transition.reason, None);
     }
 
     fn corrective_review_item(role: &str) -> WorkItem {

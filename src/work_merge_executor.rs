@@ -19,7 +19,7 @@ use crate::{credential, os};
 fn landing_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::Landing,
-        reason: Some("advance merge landing".to_string()),
+        reason: None,
         evidence_ref: None,
     }
 }
@@ -27,7 +27,7 @@ fn landing_transition() -> DurableTransitionMetadata {
 fn post_land_transition() -> DurableTransitionMetadata {
     DurableTransitionMetadata {
         origin: DurableTransitionOrigin::PostLand,
-        reason: Some("record post-land processing".to_string()),
+        reason: None,
         evidence_ref: None,
     }
 }
@@ -4458,6 +4458,35 @@ mod tests {
         let candidate_id = item.create_or_get_merge_candidate("attempt-1").unwrap();
         store.create_work_item(&item).unwrap();
         (tmp, store, item, candidate_id)
+    }
+
+    #[test]
+    fn landing_origin_preserves_the_candidate_failure_reason() {
+        let (_tmp, store, _item, candidate_id) = completed_write_item();
+
+        record_candidate_failure(
+            &store,
+            "work-1",
+            &candidate_id,
+            "required review rejected the candidate".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let transition = store
+            .read_work_item("work-1")
+            .unwrap()
+            .transitions
+            .last()
+            .cloned()
+            .unwrap();
+        assert_eq!(transition.object_kind, "merge-candidate");
+        assert_eq!(transition.origin, DurableTransitionOrigin::Landing);
+        assert_eq!(
+            transition.reason.as_deref(),
+            Some("required review rejected the candidate")
+        );
     }
 
     #[test]
