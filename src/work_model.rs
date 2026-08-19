@@ -2904,6 +2904,7 @@ pub struct WriterCompletionRepair {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WriterCompletionRepairKind {
+    RestoredHostOwnedFields,
     ClearedNonFindingConstraints,
     ClearedPendingClaims,
     RemovedUnknownFindingConstraints,
@@ -2979,11 +2980,62 @@ impl WriterCompletionMatrix {
         task_id: &str,
         findings: &[WriterCompletionFinding],
     ) -> Result<Vec<WriterCompletionRepair>, String> {
-        self.expected_against(contract, task_id, findings)?;
+        let actual_bytes = serde_json::to_vec_pretty(self)
+            .map_err(|error| format!("serialize Writer completion matrix: {error}"))?;
+        if actual_bytes.len() > WRITER_COMPLETION_MATRIX_MAX_BYTES {
+            return Err(format!(
+                "Writer completion matrix is {} bytes; maximum is {} bytes",
+                actual_bytes.len(),
+                WRITER_COMPLETION_MATRIX_MAX_BYTES
+            ));
+        }
+        if self.schema_version != WRITER_COMPLETION_CONTRACT_VERSION {
+            return Err(format!(
+                "Writer completion matrix schema version {} does not match {}",
+                self.schema_version, WRITER_COMPLETION_CONTRACT_VERSION
+            ));
+        }
+        if self.task_id != task_id {
+            return Err(format!(
+                "Writer completion matrix belongs to Task {:?}, expected {:?}",
+                self.task_id, task_id
+            ));
+        }
+        let expected = Self::skeleton(contract, task_id, findings, None)?;
+        if self.rows.len() != expected.rows.len() {
+            return Err(format!(
+                "Writer completion matrix has {} rows; expected {} rows",
+                self.rows.len(),
+                expected.rows.len()
+            ));
+        }
+        let mut repairs = Vec::new();
+        for (row, expected_row) in self.rows.iter_mut().zip(&expected.rows) {
+            if row.id != expected_row.id || row.kind != expected_row.kind {
+                return Err(format!(
+                    "Writer completion matrix immutable row {:?} was omitted, reordered, or rewritten",
+                    expected_row.id
+                ));
+            }
+            if row.source != expected_row.source
+                || row.requirement != expected_row.requirement
+                || row.verification_refs != expected_row.verification_refs
+            {
+                row.source = expected_row.source.clone();
+                row.requirement = expected_row.requirement.clone();
+                row.verification_refs = expected_row.verification_refs.clone();
+                repairs.push(WriterCompletionRepair {
+                    row_id: row.id.clone(),
+                    kind: WriterCompletionRepairKind::RestoredHostOwnedFields,
+                    removed_constraints: Vec::new(),
+                    cleared_implementation_evidence: 0,
+                    cleared_verification_claims: 0,
+                });
+            }
+        }
         let allowed_constraints = contract
             .applicable_constraint_ids()
             .collect::<std::collections::HashSet<_>>();
-        let mut repairs = Vec::new();
         for row in &mut self.rows {
             if row.state == WriterCompletionState::Pending
                 && (!row.implementation_evidence.is_empty()
@@ -8830,11 +8882,25 @@ mod tests {
 
         let mut rewritten = matrix;
         rewritten.rows[0].requirement = "A rewritten requirement".to_string();
+        let repairs = rewritten
+            .repair_writer_claims_against(&contract, "attempt-1-write-2", &findings)
+            .unwrap();
+        assert_eq!(
+            repairs[0].kind,
+            WriterCompletionRepairKind::RestoredHostOwnedFields
+        );
+        assert_eq!(
+            rewritten.rows[0].requirement,
+            "WHEN refreshed, THE SYSTEM SHALL preserve selection."
+        );
+
+        let mut wrong_identity = rewritten;
+        wrong_identity.rows[0].id = "behavior:other:b1".to_string();
         assert!(
-            rewritten
+            wrong_identity
                 .repair_writer_claims_against(&contract, "attempt-1-write-2", &findings)
                 .unwrap_err()
-                .contains("rewritten")
+                .contains("omitted, reordered, or rewritten")
         );
     }
 

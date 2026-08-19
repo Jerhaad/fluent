@@ -15327,7 +15327,7 @@ mod tests {
     }
 
     #[test]
-    fn rewritten_writer_completion_matrix_pauses_before_review() {
+    fn rewritten_writer_completion_fields_are_restored_before_review() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = make_completed_writer_matrix_fixture(tmp.path(), true);
         let path = tmp.path().join(
@@ -15346,14 +15346,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
         let stored = store.read_work_item("matrix-work").unwrap();
-        assert!(
-            stored.attempts[0]
-                .tasks
-                .iter()
-                .all(|task| !is_review_phase_task(task))
-        );
+        let repair_evidence = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/repair.json"))
+            .expect("host-owned field repair is recorded");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repair_evidence.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["repairs"][0]["kind"], "restored-host-owned-fields");
+        let repaired: crate::work_model::WriterCompletionMatrix = serde_json::from_slice(
+            &fs::read(
+                tmp.path()
+                    .join(evidence["repaired-artifact"].as_str().unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(repaired.rows[0].requirement, "A rewritten requirement");
     }
 
     #[test]

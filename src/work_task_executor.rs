@@ -6078,6 +6078,54 @@ pub(crate) fn writer_completion_findings(
                 });
         }
     }
+    for artifact in &task.input_artifacts {
+        let relative = Path::new(&artifact.path);
+        let is_tester_results = relative.file_name().is_some_and(|name| {
+            name == "tester-results.json"
+                && relative
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|parent| parent.to_string_lossy().contains("-tester"))
+        });
+        if !is_tester_results {
+            continue;
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let source = fs::read(&path).with_context(|| {
+            format!(
+                "read Tester findings for Writer completion matrix: {}",
+                path.display()
+            )
+        })?;
+        let results = serde_json::from_slice::<crate::tester::TesterResults>(&source)
+            .with_context(|| {
+                format!(
+                    "parse Tester findings for Writer completion matrix: {}",
+                    path.display()
+                )
+            })?;
+        for (index, command) in results
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.exit_code != 0)
+        {
+            let role = "tester";
+            let stable_title = format!("configured command {index}: {}", command.command);
+            let identity = crate::review::finding_identity(role, &stable_title);
+            findings
+                .entry((role.to_string(), identity.clone()))
+                .or_insert(crate::work_model::WriterCompletionFinding {
+                    id: format!("finding:{role}:{identity}"),
+                    role: role.to_string(),
+                    source: artifact.path.clone(),
+                    requirement: format!(
+                        "Configured Tester command {index} failed with exit code {}",
+                        command.exit_code
+                    ),
+                });
+        }
+    }
     Ok(findings.into_values().collect())
 }
 
@@ -17046,6 +17094,73 @@ mod tests {
             fs::read(path).unwrap(),
             before,
             "retry must not overwrite claims"
+        );
+    }
+
+    #[test]
+    fn corrective_writer_matrix_adds_failed_tester_commands() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Tester correction");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Tester\n\n### B1\n\nWHEN verification fails, THE SYSTEM SHALL correct it.\nTest: tests/binary.rs (corrects_failure)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let tester_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json";
+        let tester_path = project.path().join(tester_rel);
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [
+                    {"command": "cargo test", "test_harness": "cargo", "exit_code": 101, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "cargo fmt --check", "test_harness": "cargo", "exit_code": 0, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-tester-2".to_string(),
+            path: tester_rel.to_string(),
+        }];
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(
+            matrix.rows[1].kind,
+            crate::work_model::WriterCompletionRequirementKind::Finding
+        );
+        assert!(matrix.rows[1].id.starts_with("finding:tester:sha256:"));
+        assert!(
+            matrix.rows[1]
+                .requirement
+                .contains("Configured Tester command 0 failed with exit code 101")
+        );
+        assert!(
+            !matrix
+                .rows
+                .iter()
+                .any(|row| row.requirement.contains("fmt"))
         );
     }
 
