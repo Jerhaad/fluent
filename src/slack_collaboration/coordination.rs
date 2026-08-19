@@ -240,7 +240,23 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         {
             return self.complete_pending_turn(&event, &mut thread);
         }
+        if !policy::participant_can_contribute(&self.config, &thread, &event) {
+            self.slack.respond_private(
+                &event.channel,
+                &event.user,
+                "You cannot participate in this Fluent thread.",
+            )?;
+            return Ok(());
+        }
         if !thread.processed_events.insert(event.id.clone()) {
+            return Ok(());
+        }
+        if !policy::participant_can_contribute(&self.config, &thread, &event) {
+            self.slack.respond_private(
+                &event.channel,
+                &event.user,
+                "You cannot participate in this Fluent thread.",
+            )?;
             return Ok(());
         }
         if !policy::participant_can_contribute(&self.current_authority_config()?, &thread, &event) {

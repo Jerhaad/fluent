@@ -222,6 +222,16 @@ impl SlackWebApiTransport {
     }
 }
 
+impl SlackWebApiTransport {
+    fn respond_private(&self, channel: &str, user: &str, text: &str) -> Result<()> {
+        self.call(
+            "chat.postEphemeral",
+            &self.bot_token,
+            serde_json::json!({"channel": channel, "user": user, "text": text}),
+        )
+    }
+}
+
 pub struct SlackWebApiTransport {
     api_base: String,
     bot_token: String,

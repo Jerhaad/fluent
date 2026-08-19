@@ -173,6 +173,37 @@ fn processed_message_deletion_preserves_audited_context() {
     assert_eq!(reloaded.conversation_inputs[0].content, "@Fluent hello");
     assert!(reloaded.conversation_inputs[0].source_deleted);
 }
+
+#[test]
+fn unauthorized_thread_reply_receives_private_refusal() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(), config, InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut reply = event("E2", Some("1.0"), "private thought");
+    reply.user = "U2".into();
+    runner.ingest(reply).unwrap();
+    assert_eq!(runner.slack().private_responses.len(), 1);
+    assert_eq!(runner.slack().private_responses[0].1, "U2");
+}
+
+#[test]
+fn unauthorized_thread_reply_does_not_reach_agent() {
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let before = store.load_thread(&config, "1.0").unwrap().unwrap();
+    let calls = runner.provider().calls.len();
+    let mut reply = event("E2", Some("1.0"), "private thought");
+    reply.user = "U2".into();
+    runner.ingest(reply).unwrap();
+    assert_eq!(runner.provider().calls.len(), calls);
+    assert_eq!(store.load_thread(&config, "1.0").unwrap().unwrap(), before);
+}
 fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
     InboundEnvelope {
         id: id.into(),
