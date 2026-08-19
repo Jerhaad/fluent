@@ -1,6 +1,6 @@
 use fluent::work_model::{
-    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, LearnerMode,
-    MergeCandidate, MergeCandidateMergeState, MergeReviewState, ReviewContext, Task,
+    Attempt, AttemptKind, AttemptReviewState, AttemptStatus, CoderMapping, DurableTransitionOrigin,
+    LearnerMode, MergeCandidate, MergeCandidateMergeState, MergeReviewState, ReviewContext, Task,
     TaskArtifactArea, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelError,
     WorkModelStorageError, WorkModelStore, WorkspaceAccess, WorkspaceRef, from_json,
 };
@@ -750,7 +750,60 @@ fn work_model_store_prunes_stale_split_records() {
     assert!(!task_path.exists());
     assert!(!candidate_path.exists());
     assert!(attempt_path.exists());
-    assert_eq!(store.read_work_item("work-1").unwrap(), without_task);
+    let after_prune = store.read_work_item("work-1").unwrap();
+    assert_eq!(
+        after_prune
+            .transitions
+            .iter()
+            .map(|transition| (
+                transition.object_kind.as_str(),
+                transition.object_id.as_str(),
+                transition.old_state.as_deref(),
+                transition.new_state.as_str(),
+                transition.origin,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "work-item",
+                "work-1",
+                None,
+                "authorized",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "attempt",
+                "attempt-1",
+                None,
+                "complete",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "task",
+                "write-code",
+                None,
+                "complete",
+                DurableTransitionOrigin::Unknown
+            ),
+            (
+                "merge-candidate",
+                "attempt-1-merge-candidate",
+                None,
+                "pending",
+                DurableTransitionOrigin::Unknown,
+            ),
+            (
+                "attempt",
+                "attempt-1",
+                Some("complete"),
+                "planned",
+                DurableTransitionOrigin::Fluent,
+            ),
+        ]
+    );
+    let mut business_state = after_prune.clone();
+    business_state.transitions.clear();
+    assert_eq!(business_state, without_task);
 
     let mut without_attempt = without_task.clone();
     without_attempt.attempts.clear();
@@ -758,7 +811,11 @@ fn work_model_store_prunes_stale_split_records() {
 
     assert!(!attempt_path.exists());
     assert!(!task_attempt_dir.exists());
-    assert_eq!(store.read_work_item("work-1").unwrap(), without_attempt);
+    let after_attempt_prune = store.read_work_item("work-1").unwrap();
+    assert_eq!(after_attempt_prune.transitions, after_prune.transitions);
+    let mut business_state = after_attempt_prune;
+    business_state.transitions.clear();
+    assert_eq!(business_state, without_attempt);
 }
 
 #[test]

@@ -6697,9 +6697,9 @@ impl Error for WorkModelStorageError {
 ///
 /// Production carries no injectable path: the non-test build authors and applies
 /// transactions directly. Test builds can fault one keyed Work Item write before
-/// transaction publication or after the item record publishes but before journal
-/// cleanup. Each fault is thread-local, RAII-restored, and consumed once, so
-/// concurrent tests and unrelated writes remain unaffected.
+/// transaction publication, while applying split records, or after the item record
+/// publishes but before journal cleanup. Each fault is thread-local, RAII-restored,
+/// and consumed once, so concurrent tests and unrelated writes remain unaffected.
 #[cfg(test)]
 pub(crate) mod persist_fault {
     use std::cell::RefCell;
@@ -6707,6 +6707,7 @@ pub(crate) mod persist_fault {
     thread_local! {
         static FOLLOW_UP_WRITE_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
         static CREATION_AFTER_PUBLISH_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
+        static SPLIT_WRITE_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     /// RAII guard: arm the persistence leaf to fail the next write that persists a
@@ -6714,6 +6715,8 @@ pub(crate) mod persist_fault {
     pub(crate) struct FollowUpWriteFaultGuard;
 
     pub(crate) struct CreationAfterPublishFaultGuard;
+
+    pub(crate) struct SplitWriteFaultGuard;
 
     /// Arm the fault for exactly one follow-up-result write of `work_item_id`.
     pub(crate) fn arm_follow_up_write(work_item_id: &str) -> FollowUpWriteFaultGuard {
@@ -6727,6 +6730,11 @@ pub(crate) mod persist_fault {
         CreationAfterPublishFaultGuard
     }
 
+    pub(crate) fn arm_split_write(work_item_id: &str) -> SplitWriteFaultGuard {
+        SPLIT_WRITE_FAULT.with(|fault| *fault.borrow_mut() = Some(work_item_id.to_string()));
+        SplitWriteFaultGuard
+    }
+
     impl Drop for FollowUpWriteFaultGuard {
         fn drop(&mut self) {
             FOLLOW_UP_WRITE_FAULT.with(|fault| *fault.borrow_mut() = None);
@@ -6736,6 +6744,12 @@ pub(crate) mod persist_fault {
     impl Drop for CreationAfterPublishFaultGuard {
         fn drop(&mut self) {
             CREATION_AFTER_PUBLISH_FAULT.with(|fault| *fault.borrow_mut() = None);
+        }
+    }
+
+    impl Drop for SplitWriteFaultGuard {
+        fn drop(&mut self) {
+            SPLIT_WRITE_FAULT.with(|fault| *fault.borrow_mut() = None);
         }
     }
 
@@ -6759,6 +6773,16 @@ pub(crate) mod persist_fault {
 
     pub(crate) fn should_fault_creation_after_publish(work_item: &super::WorkItem) -> bool {
         CREATION_AFTER_PUBLISH_FAULT.with(|fault| {
+            let matches = fault.borrow().as_deref() == Some(work_item.id.as_str());
+            if matches {
+                *fault.borrow_mut() = None;
+            }
+            matches
+        })
+    }
+
+    pub(crate) fn should_fault_split_write(work_item: &super::WorkItem) -> bool {
+        SPLIT_WRITE_FAULT.with(|fault| {
             let matches = fault.borrow().as_deref() == Some(work_item.id.as_str());
             if matches {
                 *fault.borrow_mut() = None;
@@ -7415,8 +7439,12 @@ impl WorkModelStore {
             });
         }
         let transaction_path = self.work_transaction_path(&work_item.id)?;
-        if !create_new && transaction_path.exists() {
-            return self.write_work_item_file_unchecked(work_item, false);
+        let recovered_transaction = !create_new && transaction_path.exists();
+        if recovered_transaction {
+            // Finish the host-authored snapshot before comparing a caller retry.
+            // This restores one coherent aggregate even when the interrupted write
+            // activated a legacy transition ledger that the caller never supplied.
+            self.recover_work_item_transaction(&work_item.id)?;
         }
         let prior = if create_new {
             None
@@ -7428,6 +7456,12 @@ impl WorkModelStore {
         let mut target = work_item.clone();
         if let Some(prior) = prior.as_ref() {
             preserve_transition_history(prior, &mut target, &path)?;
+            if recovered_transaction
+                && target == *prior
+                && let Some(revision) = prior.storage_revision.get()
+            {
+                target.storage_revision.set(revision);
+            }
         }
         if let Some(metadata) = metadata {
             match prior.as_ref() {
@@ -7809,6 +7843,13 @@ impl WorkModelStore {
                 source,
             }
         })?;
+        #[cfg(test)]
+        if persist_fault::should_fault_split_write(work_item) {
+            return Err(WorkModelStorageError::WriteFile {
+                path: candidates_dir,
+                source: io::Error::other("injected split-record storage fault"),
+            });
+        }
         let mut candidate_files = HashSet::new();
         for candidate in &work_item.merge_candidates {
             let candidate_path = self.work_merge_candidate_path(&work_item.id, &candidate.id)?;
@@ -12933,10 +12974,7 @@ random banner prose that must be ignored
         updated
             .merge_candidates
             .push(candidate_for_completed_write());
-        let candidate_path = store
-            .work_merge_candidate_path("work-1", "attempt-1-merge-candidate")
-            .unwrap();
-        fs::create_dir_all(&candidate_path).unwrap();
+        let _fault = persist_fault::arm_split_write("work-1");
 
         assert!(store.write_work_item(&updated).is_err());
         let transaction_path = tmp.path().join(".fluent/work/transactions/work-1.json");
@@ -12948,7 +12986,6 @@ random banner prose that must be ignored
             read_json_file(&store.work_item_path("work-1").unwrap()).unwrap();
         assert_eq!(top_level.storage_revision, 0, "publish the revision last");
 
-        fs::remove_dir(&candidate_path).unwrap();
         store.write_work_item(&updated).unwrap();
 
         let recovered = WorkModelStore::new(tmp.path())
@@ -16177,11 +16214,19 @@ random banner prose that must be ignored
                 Some(learning.clone()),
                 "[mutate_work_item] the repair preserves the unexposed Learning record"
             );
+            let transitions = after.transitions.clone();
+            let mut business_state = after;
+            business_state.transitions.clear();
             assert_eq!(
-                after, expected,
+                business_state, expected,
                 "[mutate_work_item] a valid identity repair persists with only the identity \
                  fields changed and every unrelated field preserved"
             );
+            assert_eq!(transitions.len(), durable_object_states(&expected).len());
+            assert!(transitions.iter().all(|transition| {
+                transition.old_state.is_none()
+                    && transition.origin == DurableTransitionOrigin::Unknown
+            }));
 
             // Cell 2: public whole-aggregate write_work_item on an INDEPENDENT fresh
             // store — never the reducer-mutated store above.
@@ -16199,11 +16244,19 @@ random banner prose that must be ignored
                 Some(learning.clone()),
                 "[write_work_item] the repair preserves the unexposed Learning record"
             );
+            let transitions = after.transitions.clone();
+            let mut business_state = after;
+            business_state.transitions.clear();
             assert_eq!(
-                after, expected,
+                business_state, expected,
                 "[write_work_item] a valid identity repair persists with only the identity \
                  fields changed and every unrelated field preserved"
             );
+            assert_eq!(transitions.len(), durable_object_states(&expected).len());
+            assert!(transitions.iter().all(|transition| {
+                transition.old_state.is_none()
+                    && transition.origin == DurableTransitionOrigin::Unknown
+            }));
         }
     }
 
