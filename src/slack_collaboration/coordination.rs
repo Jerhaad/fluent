@@ -65,18 +65,30 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     recovering_event: bool,
     configuration_error: Option<String>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    turn_pool: FairTurnPool,
 }
 
 impl<'a, P: ConversationProvider, S: SlackTransport>
     CollaborationRunner<'a, P, S, FileCollaborationStore>
 {
     pub fn new(home: &'a Path, config: RunnerConfig, provider: P, slack: S) -> Self {
-        Self::with_store(
+        Self::new_with_turn_capacity(home, config, provider, slack, 4)
+    }
+
+    pub fn new_with_turn_capacity(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        capacity: usize,
+    ) -> Self {
+        Self::with_store_and_turn_capacity(
             home,
             config,
             provider,
             slack,
             FileCollaborationStore::new(home),
+            capacity,
         )
     }
 }
@@ -90,6 +102,17 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         provider: P,
         slack: S,
         store: C,
+    ) -> Self {
+        Self::with_store_and_turn_capacity(home, config, provider, slack, store, 4)
+    }
+
+    pub fn with_store_and_turn_capacity(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        store: C,
+        capacity: usize,
     ) -> Self {
         let configuration_error = config.validate().err().map(|error| error.to_string());
         Self {
@@ -106,6 +129,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .unwrap_or_default()
                     .as_secs()
             }),
+            turn_pool: FairTurnPool::new(capacity),
         }
     }
     pub fn provider(&self) -> &P {
@@ -829,6 +853,39 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: &InboundEnvelope,
         thread: &mut FluentThread,
     ) -> Result<()> {
+        if !self.turn_pool.request(&thread.id) {
+            self.queue_reply(event, "Turn queued for fair provider admission.")?;
+            return Ok(());
+        }
+        let mut current_event = event.clone();
+        loop {
+            let action_id = thread
+                .pending_turn
+                .as_ref()
+                .map(|turn| turn.action_id.clone());
+            let result = self.execute_pending_turn(&current_event, thread);
+            self.turn_pool.finish(&thread.id);
+            result?;
+            let ready = thread.pending_turn.as_ref().is_some_and(|turn| {
+                turn.retry_at_unix_seconds.is_none() && Some(&turn.action_id) != action_id.as_ref()
+            });
+            if !ready || !self.turn_pool.request(&thread.id) {
+                return Ok(());
+            }
+            if let Some(turn) = &thread.pending_turn {
+                current_event.id = turn.action_id.clone();
+                current_event.acknowledgement_id.clear();
+                current_event.user = turn.actor.clone();
+                current_event.text.clear();
+            }
+        }
+    }
+
+    fn execute_pending_turn(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+    ) -> Result<()> {
         let mut turn = thread
             .pending_turn
             .clone()
@@ -1045,19 +1102,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 retry_at_unix_seconds: None,
             });
             self.store.save_thread(&self.config, thread)?;
-            let queued_event = InboundEnvelope {
-                id: action_id,
-                acknowledgement_id: String::new(),
-                channel: thread.channel.clone(),
-                timestamp: event.timestamp.clone(),
-                thread_timestamp: Some(thread.id.clone()),
-                user: "participants".into(),
-                text: String::new(),
-                change: InboundChange::Message,
-                approval_action_id: None,
-                approval_artifact_revision: None,
-            };
-            self.complete_pending_turn(&queued_event, thread)?;
         }
         Ok(())
     }

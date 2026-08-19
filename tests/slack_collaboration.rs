@@ -2554,22 +2554,93 @@ fn claude_structured_session_starts_and_resumes() {
     assert!(invocations.contains("--resume claude-session Slack user U2: continue"));
 }
 
+fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
+    struct QueueProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+        unavailable: bool,
+    }
+    impl ConversationProvider for QueueProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.lock().unwrap().push(contribution.into());
+            if self.unavailable {
+                anyhow::bail!("provider unavailable")
+            }
+            Ok(("session".into(), "continued".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            self.calls.lock().unwrap().push(contribution.into());
+            Ok("follow-up".into())
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = ProviderRegistry::new([
+        Box::new(QueueProvider {
+            name: "codex",
+            calls: calls.clone(),
+            unavailable: true,
+        }) as Box<dyn ConversationProvider>,
+        Box::new(QueueProvider {
+            name: "claude",
+            calls: calls.clone(),
+            unavailable: false,
+        }) as Box<dyn ConversationProvider>,
+    ])
+    .unwrap();
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new_with_turn_capacity(
+        home.path(),
+        config,
+        provider,
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "first queued"))
+        .unwrap();
+    runner
+        .ingest(event("E3", Some("1.0"), "second queued"))
+        .unwrap();
+    runner
+        .ingest(event("E4", Some("1.0"), "@Fluent [provider=claude]"))
+        .unwrap();
+    let calls = calls.lock().unwrap().clone();
+    (calls, runner.slack().deliveries.clone())
+}
+
 #[test]
 fn reply_during_active_turn_shows_queued_state() {
-    let mut pool = FairTurnPool::new(1);
-    assert!(pool.request("1.0"));
-    assert!(!pool.request("2.0"));
-    assert_eq!(pool.finish("1.0").as_deref(), Some("2.0"));
+    let (_, deliveries) = queued_runner_scenario();
+    assert!(deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("queued for the next conversation turn")
+    }));
 }
 
 #[test]
 fn queued_replies_form_one_ordered_attributed_turn() {
+    let (calls, _) = queued_runner_scenario();
     assert_eq!(
-        coalesce_contributions([
-            (String::from("U1"), String::from("first")),
-            (String::from("U2"), String::from("second"))
-        ]),
-        "Slack user U1: first\nSlack user U2: second"
+        calls.last().unwrap(),
+        "Slack user U1: first queued\nSlack user U1: second queued"
     );
 }
 

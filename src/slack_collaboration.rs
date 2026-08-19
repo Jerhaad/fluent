@@ -765,7 +765,12 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
             .map(|project| project.checkout.path.clone()),
     );
     preflight_with_scheduler(&config, &provider, &slack, &scheduler)?;
-    let mut runner = CollaborationRunner::new(home, config, provider, slack);
+    let turn_capacity = std::env::var("FLUENT_SLACK_TURN_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4);
+    let mut runner =
+        CollaborationRunner::new_with_turn_capacity(home, config, provider, slack, turn_capacity);
     reconcile_connected_runner(&mut runner)?;
     loop {
         runner.retry_due_turns()?;
