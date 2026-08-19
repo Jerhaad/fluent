@@ -6768,7 +6768,7 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].work_item_id, "work-ledger");
     assert_eq!(transitions[0].new_state, "authorized");
-    assert_eq!(transitions[0].origin.as_deref(), Some("fluent"));
+    assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
     assert!(
         control
             .reconcile_durable_transitions("slice-ledger")
