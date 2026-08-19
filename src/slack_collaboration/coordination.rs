@@ -1,6 +1,7 @@
 use super::*;
 use crate::work_model::WorkModelStore;
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// Fair, bounded admission for provider turns. A thread may hold at most one
 /// slot, and waiting threads are admitted in first-ready order.
@@ -62,6 +63,8 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     slack: S,
     store: C,
     recovering_event: bool,
+    configuration_error: Option<String>,
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl<'a, P: ConversationProvider, S: SlackTransport>
@@ -88,6 +91,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         slack: S,
         store: C,
     ) -> Self {
+        let configuration_error = config.validate().err().map(|error| error.to_string());
         Self {
             home,
             config,
@@ -95,6 +99,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             slack,
             store,
             recovering_event: false,
+            configuration_error,
+            clock: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
         }
     }
     pub fn provider(&self) -> &P {
@@ -231,6 +242,52 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 )
             })
             .with_context(|| format!("approve planning Work Item {work_item_id}"))
+    }
+
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) {
+        self.clock = Arc::new(clock);
+    }
+
+    /// Re-admit every durable provider turn whose retry deadline has passed.
+    pub fn retry_due_turns(&mut self) -> Result<()> {
+        let now = (self.clock)();
+        let thread_ids: Vec<_> = self.store.load_threads(&self.config)?.into_keys().collect();
+        for thread_id in thread_ids {
+            let Some(mut thread) = self.store.load_thread(&self.config, &thread_id)? else {
+                continue;
+            };
+            let due = thread
+                .pending_turn
+                .as_ref()
+                .and_then(|turn| turn.retry_at_unix_seconds)
+                .is_some_and(|deadline| deadline <= now);
+            if !due {
+                continue;
+            }
+            if let Some(turn) = thread.pending_turn.as_mut() {
+                turn.retry_at_unix_seconds = None;
+            }
+            self.store.save_thread(&self.config, &thread)?;
+            let event = InboundEnvelope {
+                id: format!("{}:provider-retry:{now}", thread.id),
+                acknowledgement_id: String::new(),
+                channel: thread.channel.clone(),
+                timestamp: thread.id.clone(),
+                thread_timestamp: Some(thread.id.clone()),
+                user: thread
+                    .pending_turn
+                    .as_ref()
+                    .map(|turn| turn.actor.clone())
+                    .unwrap_or_default(),
+                text: String::new(),
+                change: InboundChange::Message,
+                approval_action_id: None,
+                approval_artifact_revision: None,
+            };
+            self.complete_pending_turn(&event, &mut thread)?;
+        }
+        self.deliver_pending()
     }
 
     /// Switch an interrupted conversation and run its preserved turn through
@@ -507,6 +564,17 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             )?;
         } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
+        } else if thread.state == ThreadState::Active
+            && event.thread_timestamp.is_some()
+            && thread.pending_turn.is_some()
+        {
+            thread.queued_contributions.push(QueuedContribution {
+                action_id: event.id.clone(),
+                contribution: event.text.clone(),
+                actor: event.user.clone(),
+            });
+            self.store.save_thread(&self.config, &thread)?;
+            self.queue_reply(&event, "Reply queued for the next conversation turn.")?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
@@ -516,6 +584,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 starts_session: false,
                 provider_turn_id: None,
                 completed_reply: None,
+                retry_at_unix_seconds: None,
             });
             self.store.save_thread(&self.config, &thread)?;
             self.complete_pending_turn(&event, &mut thread)?;
@@ -685,6 +754,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 starts_session: true,
                 provider_turn_id: None,
                 completed_reply: None,
+                retry_at_unix_seconds: None,
             });
             self.store.save_thread(&self.config, thread)?;
             if let Some(connected_at) =
@@ -838,13 +908,26 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             let (session, reply) = match run {
                 Ok(result) => result,
                 Err(error) => {
-                    let failure = classify_provider_failure(&error.to_string());
+                    let diagnostic = error.to_string();
+                    if !is_recoverable_provider_failure(&diagnostic) {
+                        return Err(error);
+                    }
+                    let failure = classify_provider_failure(&diagnostic);
                     let can_switch = self
                         .bound_project(thread)
                         .is_ok_and(|project| !project.project_approvers.is_empty());
                     self.queue_reply(event, &provider_recovery_message(&failure, can_switch))?;
-                    self.store
-                        .save_thread(&self.config, &checkpoint.into_inner())?;
+                    let mut checkpoint = checkpoint.into_inner();
+                    if let ProviderFailure::RateLimited {
+                        retry_after_seconds,
+                    } = failure
+                        && let Some(turn) = checkpoint.pending_turn.as_mut()
+                    {
+                        turn.retry_at_unix_seconds =
+                            Some((self.clock)().saturating_add(retry_after_seconds));
+                    }
+                    *thread = checkpoint;
+                    self.store.save_thread(&self.config, thread)?;
                     return Ok(());
                 }
             };
@@ -860,9 +943,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("provider turn completed without a reply")?;
         let raw_reply = redact_secrets(&raw_reply);
-        let references = self
-            .provider
-            .code_references(&scope, &turn.contribution)?
+        let mut provider_references = self.provider.code_references(&scope, &turn.contribution)?;
+        for reference in code_references_in_reply(&raw_reply, &scope.checkout) {
+            if !provider_references.contains(&reference) {
+                provider_references.push(reference);
+            }
+        }
+        let references = provider_references
             .into_iter()
             .map(|reference| {
                 if reference.path.is_absolute()
@@ -934,7 +1021,45 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread.pending_turn = None;
                 self.store.save_thread(&self.config, thread)
             }
+        }?;
+        if !thread.queued_contributions.is_empty() {
+            let queued = std::mem::take(&mut thread.queued_contributions);
+            let action_id = queued
+                .iter()
+                .map(|item| item.action_id.as_str())
+                .collect::<Vec<_>>()
+                .join("+");
+            let contribution = coalesce_contributions(
+                queued
+                    .iter()
+                    .map(|item| (item.actor.clone(), item.contribution.clone())),
+            );
+            thread.pending_turn = Some(PendingTurn {
+                action_id: action_id.clone(),
+                source_timestamp: event.timestamp.clone(),
+                contribution,
+                actor: "participants".into(),
+                starts_session: false,
+                provider_turn_id: None,
+                completed_reply: None,
+                retry_at_unix_seconds: None,
+            });
+            self.store.save_thread(&self.config, thread)?;
+            let queued_event = InboundEnvelope {
+                id: action_id,
+                acknowledgement_id: String::new(),
+                channel: thread.channel.clone(),
+                timestamp: event.timestamp.clone(),
+                thread_timestamp: Some(thread.id.clone()),
+                user: "participants".into(),
+                text: String::new(),
+                change: InboundChange::Message,
+                approval_action_id: None,
+                approval_artifact_revision: None,
+            };
+            self.complete_pending_turn(&queued_event, thread)?;
         }
+        Ok(())
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let label = thread
@@ -1017,4 +1142,44 @@ fn selected_provider(text: &str) -> Option<&str> {
     let (_, suffix) = text.split_once(marker)?;
     let suffix = suffix.split_once(']')?.0;
     (!suffix.is_empty()).then_some(suffix)
+}
+
+fn is_recoverable_provider_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "auth",
+        "login",
+        "credential",
+        "unavailable",
+        "rate limit",
+        "429",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn code_references_in_reply(reply: &str, checkout: &Path) -> Vec<CodeReference> {
+    reply
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | '.' | ';'
+                )
+            });
+            let (path, line) = token.rsplit_once(':')?;
+            let line = line.parse().ok()?;
+            let path = PathBuf::from(path);
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+                || !checkout.join(&path).is_file()
+            {
+                return None;
+            }
+            Some(CodeReference { path, line })
+        })
+        .collect()
 }

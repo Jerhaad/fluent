@@ -768,6 +768,7 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     let mut runner = CollaborationRunner::new(home, config, provider, slack);
     reconcile_connected_runner(&mut runner)?;
     loop {
+        runner.retry_due_turns()?;
         match runner.slack_mut().receive() {
             Ok(event) => runner.ingest(event)?,
             Err(error) => {

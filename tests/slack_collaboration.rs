@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
@@ -2726,16 +2727,84 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
 
 #[test]
 fn rate_limit_waits_recovers_and_offers_provider_switch() {
-    let failure = classify_provider_failure("provider rate limit; retry-after=17");
-    assert_eq!(
-        failure,
-        ProviderFailure::RateLimited {
-            retry_after_seconds: 17
+    struct RecoveringProvider {
+        calls: Arc<Mutex<Vec<String>>>,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl ConversationProvider for RecoveringProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.lock().unwrap().push(contribution.into());
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("provider rate limit; retry-after=17")
+            }
+            Ok(("session".into(), "recovered".into()))
         }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            self.calls.lock().unwrap().push(contribution.into());
+            Ok("follow-up".into())
+        }
+    }
+    let now = Arc::new(AtomicU64::new(1_000));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        RecoveringProvider {
+            calls: calls.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+        },
+        InMemorySlack::default(),
     );
+    let clock = now.clone();
+    runner.set_clock_for_test(move || clock.load(Ordering::SeqCst));
+
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner
+        .ingest(event("E2", Some("1.0"), "first queued"))
+        .unwrap();
+    runner
+        .ingest(event("E3", Some("1.0"), "second queued"))
+        .unwrap();
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("queued for the next conversation turn")
+    }));
+
+    now.store(1_016, Ordering::SeqCst);
+    runner.retry_due_turns().unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    now.store(1_017, Ordering::SeqCst);
+    runner.retry_due_turns().unwrap();
     assert_eq!(
-        provider_recovery_message(&failure, true),
-        "Provider is rate-limited; retrying in 17 seconds. A project approver may switch providers."
+        &*calls.lock().unwrap(),
+        &[
+            "@Fluent initial".to_string(),
+            "@Fluent initial".to_string(),
+            "Slack user U1: first queued\nSlack user U1: second queued".to_string()
+        ]
+    );
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .pending_turn
+            .is_none()
     );
 }
 
@@ -2907,15 +2976,45 @@ fn local_code_reference_truncates_at_utf8_boundary() {
 
 #[test]
 fn code_question_uses_bound_checkout_and_relative_references() {
-    let (_home, checkout, config) = setup(true);
-    let reference = format_code_reference(
-        &config.projects["app"].checkout,
-        &checkout.path().join("README"),
-        1,
-    )
-    .unwrap();
-    assert!(reference.starts_with("README:1"));
-    assert!(!reference.contains(&checkout.path().display().to_string()));
+    struct AdapterOutputProvider;
+    impl ConversationProvider for AdapterOutputProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            Ok((
+                "session".into(),
+                "Inspect `README:1` for the binding.".into(),
+            ))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        AdapterOutputProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent where is the binding?"))
+        .unwrap();
+    let reply = &runner.slack().deliveries[0].text;
+    assert!(reply.contains("README:1"));
+    assert!(reply.contains("local-only reference"));
+    assert!(!reply.contains(&checkout.path().display().to_string()));
 }
 
 #[test]
@@ -3845,6 +3944,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),
         last_connection: None,
+        queued_contributions: Vec::new(),
         pending_turn: Some(PendingTurn {
             action_id: "E1".into(),
             source_timestamp: "1.0".into(),
@@ -3853,6 +3953,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
             starts_session: true,
             provider_turn_id: None,
             completed_reply: None,
+            retry_at_unix_seconds: None,
         }),
     };
     let store = FileCollaborationStore::new(home.path());

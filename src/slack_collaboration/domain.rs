@@ -238,6 +238,15 @@ pub struct FluentThread {
     pub last_connection: Option<String>,
     #[serde(default)]
     pub pending_turn: Option<PendingTurn>,
+    #[serde(default)]
+    pub queued_contributions: Vec<QueuedContribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedContribution {
+    pub action_id: String,
+    pub contribution: String,
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +261,8 @@ pub struct PendingTurn {
     pub provider_turn_id: Option<String>,
     #[serde(default)]
     pub completed_reply: Option<String>,
+    #[serde(default)]
+    pub retry_at_unix_seconds: Option<u64>,
 }
 
 impl FluentThread {
@@ -276,6 +287,7 @@ impl FluentThread {
             processed_events: BTreeSet::new(),
             last_connection: None,
             pending_turn: None,
+            queued_contributions: Vec::new(),
         }
     }
 }
