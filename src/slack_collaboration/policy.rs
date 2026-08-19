@@ -230,6 +230,8 @@ mod tests {
             channel: "C1".into(),
             state: ThreadState::Active,
             project_label: Some("app".into()),
+            provider: Some("codex".into()),
+            provider_failure: None,
             provider_session: None,
             slice: None,
             planning_stage: None,
@@ -244,6 +246,8 @@ mod tests {
             processed_events: BTreeSet::new(),
             last_connection: None,
             pending_turn: None,
+            queued_contributions: Vec::new(),
+            conversation: Vec::new(),
         };
         let event = InboundEnvelope {
             id: "E2".into(),
