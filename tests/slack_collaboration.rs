@@ -2582,11 +2582,17 @@ fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     fs::remove_dir_all(checkout.path().join(".git")).unwrap();
-    let error = runner
+    runner
         .ingest(event("E2", Some("1.0"), "inspect code"))
-        .unwrap_err();
-    assert!(error.to_string().contains("bound checkout is unavailable"));
+        .unwrap();
     assert_eq!(runner.provider().calls.len(), 1);
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("bound checkout is unavailable"))
+    );
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
         .unwrap()

@@ -740,7 +740,17 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("thread has no pending provider turn")?;
         let previously_completed = turn.completed_reply.is_some();
-        let checkout = self.bound_project(thread)?.checkout.path.clone();
+        let checkout = match self.bound_project(thread) {
+            Ok(project) => project.checkout.path.clone(),
+            Err(error) if error.to_string().contains("bound checkout is unavailable") => {
+                self.queue_reply(
+                    event,
+                    "The bound checkout is unavailable. Fluent stopped provider access and will not rebind this thread automatically.",
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let scope = ProviderScope {
             slice_draft: checkout.join(".fluent/work/slack/drafts").join(&thread.id),
             checkout,

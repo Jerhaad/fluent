@@ -41,7 +41,7 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    For example, write this policy to `config.json`:
 
    ```json
-   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
+   {"workspace":"example","enabled_providers":["codex"],"projects":{"app":{"label":"app","checkout":{"label":"main","path":"/absolute/checkout","identity":"checkout-v1:<digest>","branch":"main","commit":"<commit>"},"allowed_participants":["U123"],"default_provider":"codex","enabled_providers":["codex"],"project_approvers":["U123"]}},"channel_defaults":{"C123":"app"},"direct_message_defaults":{"D123":"app"}}
    ```
 
    Print the machine-local opaque `identity` with:
@@ -73,8 +73,9 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    Inspect its safe status with `fluent slack status`, restart it with
    `fluent slack restart`, and stop it with `fluent slack stop`.
 
-   `fluent slack run` preflights the local Slack, checkout, and Codex
-   boundaries, opens Socket Mode, and keeps receiving events until stopped.
+   `fluent slack run` preflights the local Slack, checkout, and enabled
+   conversation-provider boundaries, opens Socket Mode, and keeps receiving
+   events until stopped.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,
@@ -159,3 +160,20 @@ configuration above. A top-level `@Fluent` request in that DM binds and routes
 the thread under the same checkout, allowed-participant, and project-approver
 policy as a channel. Reinstall the app after updating its manifest so Slack can
 deliver `message.im` events and grant the `im:history` scope.
+
+## Provider policy and recovery
+
+`default_provider` selects the provider for a new thread; omit a selection to
+use it. `enabled_providers` is an allowlist and `project_approvers` identifies
+the participants who may switch a recovered thread. The currently supported
+runner adapter is `codex`; do not list `claude` until a Claude adapter is
+installed for this runner.
+
+When another enabled adapter is available, a participant can request it in the
+opening mention, for example `@Fluent [provider=codex] plan the release`. An
+approver can switch an interrupted thread through the runner's provider-switch
+action. Authentication and provider outages preserve the durable turn and show
+recovery guidance. A rate-limited provider reports its retry delay and offers
+the same approver switch option. If the exact bound checkout disappears or its
+identity changes, Fluent stops provider access, reports the unavailable binding,
+and never substitutes another checkout automatically.
