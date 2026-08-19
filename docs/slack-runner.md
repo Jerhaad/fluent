@@ -244,3 +244,25 @@ the restored checkout before it queues the action. The running owner process
 validates the thread's original project binding again before it re-admits the
 preserved turn. Restarting or reconnecting Slack alone leaves the turn paused.
 Fluent retains the original project binding throughout recovery.
+
+## Control and report Work from the thread
+
+Fluent keeps planning and execution as separate approvals. A configured
+`project_approvers` member can approve a plan to materialize its proposed Work
+Items without starting them. A later execution approval submits the same
+versioned request identity for each Work Item to the local scheduler, so a
+retry cannot create another execution request.
+
+The runner posts scheduler outcomes and authoritative Work lifecycle changes
+back to the originating thread. Transition replies identify the Work object,
+origin, reason, elapsed time, and bounded evidence reference. Ready-candidate
+replies include the verified commit, completed tests and reviews, and review
+links when the configured remote permits them. Failed or `needs-user` replies
+state the permitted recovery action; Slack never mutates GitHub state.
+
+Status comes from persisted Work rather than chat text. The thread projection
+shows the project and checkout, Slice stage, provider state, each Work state,
+and the next action. After a runner restart, Fluent replays only transitions
+whose stable delivery identities have not already been scheduled. A Slice
+becomes complete only after its authoritative attempts are terminal and every
+candidate has landed successfully; a post-land failure makes it active again.

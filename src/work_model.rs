@@ -455,6 +455,10 @@ pub struct DurableTransitionMetadata {
     pub evidence_ref: Option<String>,
 }
 
+pub const MAX_TRANSITION_ORIGIN_BYTES: usize = 64;
+pub const MAX_TRANSITION_REASON_BYTES: usize = 1_024;
+pub const MAX_TRANSITION_EVIDENCE_BYTES: usize = 512;
+
 impl WorkItem {
     pub fn compatibility_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -8066,6 +8070,20 @@ fn append_durable_transitions(
     work_item: &mut WorkItem,
     metadata: Option<&DurableTransitionMetadata>,
 ) {
+    let metadata = metadata.map(|value| DurableTransitionMetadata {
+        origin: value
+            .origin
+            .as_deref()
+            .map(|text| bounded_transition_text(text, MAX_TRANSITION_ORIGIN_BYTES)),
+        reason: value
+            .reason
+            .as_deref()
+            .map(|text| bounded_transition_text(text, MAX_TRANSITION_REASON_BYTES)),
+        evidence_ref: value
+            .evidence_ref
+            .as_deref()
+            .map(|text| bounded_transition_text(text, MAX_TRANSITION_EVIDENCE_BYTES)),
+    });
     let previous = prior
         .map(|item| {
             item.transitions
@@ -8116,11 +8134,27 @@ fn append_durable_transitions(
             new_state: state,
             occurred_at: now.clone(),
             elapsed_seconds,
-            origin: metadata.and_then(|value| value.origin.clone()),
-            reason: metadata.and_then(|value| value.reason.clone()).or(reason),
-            evidence_ref: metadata.and_then(|value| value.evidence_ref.clone()),
+            origin: metadata.as_ref().and_then(|value| value.origin.clone()),
+            reason: metadata
+                .as_ref()
+                .and_then(|value| value.reason.clone())
+                .or(reason),
+            evidence_ref: metadata
+                .as_ref()
+                .and_then(|value| value.evidence_ref.clone()),
         });
     }
+}
+
+fn bounded_transition_text(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn durable_object_states(work_item: &WorkItem) -> Vec<(String, String, String, Option<String>)> {

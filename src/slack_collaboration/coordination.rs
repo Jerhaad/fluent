@@ -1454,7 +1454,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
         let project = self.bound_project(&thread)?;
-        if !project.allowed_participants.contains(actor) {
+        if !project.project_approvers.contains(actor) {
             bail!("participant cannot approve Work for this project");
         }
         let control = WorkControl::new(&project.checkout.path);
@@ -1489,7 +1489,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
         let project = self.bound_project(&thread)?;
-        if !project.allowed_participants.contains(actor) {
+        if !project.project_approvers.contains(actor) {
             bail!("participant cannot authorize Work for this project");
         }
         let slice_id = thread
@@ -1526,6 +1526,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         let control = WorkControl::new(&project.checkout.path);
         let store = &self.store;
         let transitions = control.schedule_durable_transitions(slice_id, |transition| {
+            let evidence = transition.evidence_ref.iter().cloned().collect::<Vec<_>>();
             store.persist_outbox(OutboundDelivery {
                 id: format!(
                     "{thread_id}:work-transition:{}:{}",
@@ -1533,7 +1534,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 ),
                 channel: thread.channel.clone(),
                 thread_timestamp: thread.id.clone(),
-                text: render_transition_reply(transition, &[]),
+                text: control.render_actionable_transition(transition, &evidence, None),
                 delivered: false,
             })
         })?;

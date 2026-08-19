@@ -119,6 +119,8 @@ pub struct WorkTransition {
     pub new_state: String,
     pub origin: Option<String>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
     #[serde(default = "default_work_item_kind")]
     pub object_kind: String,
     #[serde(default)]
@@ -390,6 +392,7 @@ impl WorkControl {
                 new_state: status.state.clone(),
                 origin: origin.map(str::to_owned),
                 reason: Some(status.next_action),
+                evidence_ref: None,
                 object_kind: "work-item".into(),
                 occurred_at: None,
                 elapsed_seconds: None,
@@ -439,6 +442,7 @@ impl WorkControl {
                     new_state: entry.new_state.clone(),
                     origin: entry.origin.clone(),
                     reason: entry.reason.clone(),
+                    evidence_ref: entry.evidence_ref.clone(),
                     object_kind: entry.object_kind.clone(),
                     occurred_at: Some(entry.occurred_at.clone()),
                     elapsed_seconds: entry.elapsed_seconds,
@@ -495,6 +499,7 @@ impl WorkControl {
                         new_state: entry.new_state.clone(),
                         origin: entry.origin.clone(),
                         reason: entry.reason.clone(),
+                        evidence_ref: entry.evidence_ref.clone(),
                         object_kind: entry.object_kind.clone(),
                         occurred_at: Some(entry.occurred_at.clone()),
                         elapsed_seconds: entry.elapsed_seconds,

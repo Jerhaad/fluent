@@ -6539,9 +6539,9 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
     assert!(store.write_work_item(&rewritten).is_err());
 
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
-        reason: Some("capacity became available".into()),
-        evidence_ref: Some("scheduler-event:42".into()),
+        origin: Some(format!("scheduler-é{}", "x".repeat(100))),
+        reason: Some(format!("capacity became available {}", "r".repeat(1_100))),
+        evidence_ref: Some(format!("scheduler-event:42-{}", "e".repeat(600))),
     };
     store
         .mutate_work_item_with_transition("work-protected", Some(&metadata), |item| {
@@ -6553,14 +6553,24 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
         .unwrap();
     let saved = store.read_work_item("work-protected").unwrap();
     let transition = saved.transitions.last().unwrap();
-    assert_eq!(transition.origin.as_deref(), Some("scheduler"));
-    assert_eq!(
-        transition.reason.as_deref(),
-        Some("capacity became available")
+    assert!(
+        transition.origin.as_ref().unwrap().len()
+            <= fluent::work_model::MAX_TRANSITION_ORIGIN_BYTES
     );
-    assert_eq!(
-        transition.evidence_ref.as_deref(),
-        Some("scheduler-event:42")
+    assert!(
+        transition.reason.as_ref().unwrap().len()
+            <= fluent::work_model::MAX_TRANSITION_REASON_BYTES
+    );
+    assert!(
+        transition.evidence_ref.as_ref().unwrap().len()
+            <= fluent::work_model::MAX_TRANSITION_EVIDENCE_BYTES
+    );
+    assert!(
+        transition
+            .origin
+            .as_ref()
+            .unwrap()
+            .starts_with("scheduler-é")
     );
 }
 
@@ -6705,7 +6715,66 @@ fn runner_delivers_plan_execution_and_durable_work_updates() {
         transition.work_item_id == "work-runner"
             && transition.origin.as_deref() == Some("slack-thread")
     }));
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("Work Item work-runner")
+            && delivery.text.contains("Origin: slack-thread")
+            && delivery
+                .text
+                .contains("Next action: Execution approved by U1")
+            && delivery.text.contains("Evidence: slack-slice:slice-runner")
+    }));
     assert!(runner.report_thread_work("1.0").unwrap().is_empty());
+}
+
+#[test]
+fn allowed_participant_cannot_approve_without_project_authority() {
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, _request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            panic!("unauthorized execution must not reach the scheduler")
+        }
+    }
+
+    let (home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+
+    let error = runner
+        .approve_thread_plan(
+            "1.0",
+            "U2",
+            "slice-denied",
+            &[PlannedWork::new("work-denied", "Denied")],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("cannot approve Work"));
+
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-approved",
+            &[PlannedWork::new("work-approved", "Approved")],
+        )
+        .unwrap();
+    let error = runner
+        .authorize_thread_execution("1.0", "U2", &Scheduler)
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot authorize Work"));
 }
 
 #[test]
@@ -6810,6 +6879,7 @@ fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
         new_state: "ready".into(),
         origin: Some("scheduler".into()),
         reason: Some("Review candidate".into()),
+        evidence_ref: Some("tests/output/candidate.log".into()),
         object_kind: "merge-candidate".into(),
         occurred_at: Some("2026-08-18T00:00:00Z".into()),
         elapsed_seconds: Some(12),
