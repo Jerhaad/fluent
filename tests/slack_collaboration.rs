@@ -2722,6 +2722,20 @@ fn local_code_reference_uses_labeled_slack_fallback() {
 }
 
 #[test]
+fn local_code_reference_bounds_long_slack_excerpt() {
+    let (_home, checkout, config) = setup(true);
+    fs::write(checkout.path().join("README"), "x".repeat(500)).unwrap();
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
+    assert!(reference.contains("[truncated]"));
+    assert!(reference.len() < 400);
+}
+
+#[test]
 fn code_question_uses_bound_checkout_and_relative_references() {
     let (_home, checkout, config) = setup(true);
     let reference = format_code_reference(

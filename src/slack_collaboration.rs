@@ -620,6 +620,14 @@ pub fn format_code_reference(checkout: &Checkout, path: &Path, line: usize) -> R
     }
     let source = fs::read_to_string(path).context("read referenced source")?;
     let excerpt = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
+    let excerpt = if excerpt.chars().count() > 240 {
+        format!(
+            "{}… [truncated]",
+            excerpt.chars().take(240).collect::<String>()
+        )
+    } else {
+        excerpt.to_owned()
+    };
     Ok(format!(
         "{relative}:{line} — local-only reference (no durable GitHub link): {excerpt}"
     ))
