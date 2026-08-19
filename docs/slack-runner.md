@@ -87,10 +87,11 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    ```
 
    Because the first terminal already owns the service, each additional
-   registration exits after reporting `scheduler service is already running`.
-   That message is expected: registration completes before the singleton
-   service check. Repeat the command from every remaining checkout; do not run
-   the registration commands concurrently.
+   registration exits after reporting
+   `[scheduler] reusing live coordinator running <version> (<hash>)`. That
+   message is expected: registration completes before the singleton service
+   check. Repeat the command from every remaining checkout; do not run the
+   registration commands concurrently.
 
    Finally, check each registered project and wait until it reports
    `Scheduler: running` with the expected build:

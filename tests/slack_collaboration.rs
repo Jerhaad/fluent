@@ -6435,7 +6435,7 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("register every configured checkout")
             && guide.contains("/absolute/app-checkout")
             && guide.contains("/absolute/api-checkout")
-            && guide.contains("scheduler service is already running")
+            && guide.contains("reusing live coordinator running")
             && guide.contains("Scheduler: running")
             && guide.contains("preflight checks the scheduler request boundary")
             && scheduler_run < scheduler_status
