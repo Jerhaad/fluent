@@ -8,6 +8,7 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     slack: S,
     store: C,
     configuration_error: Option<String>,
+    recovering_event: bool,
 }
 
 impl<'a, P: ConversationProvider, S: SlackTransport>
@@ -42,6 +43,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             slack,
             store,
             configuration_error,
+            recovering_event: false,
         }
     }
     pub fn provider(&self) -> &P {
@@ -101,7 +103,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 .then(left_history.cmp(right_history).then(left.id.cmp(&right.id)))
         });
         for (recovered, event) in events {
+            self.recovering_event = recovered;
             self.ingest(event.clone())?;
+            self.recovering_event = false;
             if recovered {
                 self.store.save_recovery_cursor(
                     &event.channel,
@@ -155,10 +159,18 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(())
     }
     fn process(&mut self, event: InboundEnvelope) -> Result<()> {
-        let mut thread = self
-            .store
-            .load_thread(&self.config, &event.thread_id())?
-            .unwrap_or_else(|| FluentThread::new(&event));
+        let existing = self.store.load_thread(&self.config, &event.thread_id())?;
+        if existing.is_none()
+            && event.is_top_level_mention()
+            && !policy::participant_can_contribute(&self.current_authority_config()?, &FluentThread::new(&event), &event)
+        {
+            return self.slack.respond_private(
+                &event.channel,
+                &event.user,
+                "You are not allowed to start Fluent work.",
+            );
+        }
+        let mut thread = existing.unwrap_or_else(|| FluentThread::new(&event));
         if let Some(project_label) = &thread.project_label {
             self.store
                 .bind_inbox_event(&self.config, &event.id, project_label)?;
@@ -173,7 +185,29 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         if !thread.processed_events.insert(event.id.clone()) {
             return Ok(());
         }
-        if !policy::participant_can_contribute(&self.config, &thread, &event) {
+        if !policy::participant_can_contribute(&self.current_authority_config()?, &thread, &event) {
+            return self.store.save_thread(&self.config, &thread);
+        }
+        if thread.state == ThreadState::Active
+            && thread.pending_action.is_some()
+            && self.is_approval_response(&thread, &event)
+        {
+            match self.approve_thread_action(&mut thread, &event)? {
+                ApprovalOutcome::WaitingForApprover if self.recovering_event => self.queue_reply(
+                    &event,
+                    "Fresh confirmation is required before Fluent can perform this action.",
+                )?,
+                ApprovalOutcome::WaitingForApprover => self.slack.respond_private(
+                    &event.channel,
+                    &event.user,
+                    "Only a project approver may authorize this action.",
+                )?,
+                ApprovalOutcome::Stale { current_action_id } => self.queue_reply(
+                    &event,
+                    &format!("That approval is stale. Current approval request: {current_action_id}."),
+                )?,
+                _ => {}
+            }
             return self.store.save_thread(&self.config, &thread);
         }
         if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
@@ -191,6 +225,106 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.complete_pending_turn(&event, &mut thread)?;
         }
         self.store.save_thread(&self.config, &thread)
+    }
+
+    /// Present exactly one revision-bound lifecycle action for approval.
+    pub fn request_approval(&mut self, thread_id: &str, action: PendingAction) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        if thread.state != ThreadState::Active || action.id.is_empty() || action.artifact_revision.is_empty() {
+            bail!("pending action identity is incomplete");
+        }
+        thread.pending_question = Some(action.id.clone());
+        thread.pending_action = Some(action);
+        self.store.save_thread(&self.config, &thread)
+    }
+
+    /// Evaluate a direct approval attempt against current durable authority.
+    pub fn approve_pending_action(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        action_id: &str,
+        artifact_revision: &str,
+        event_id: &str,
+        accepted_at: &str,
+    ) -> Result<ApprovalOutcome> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        if let Some(record) = thread.approvals.iter().find(|record| record.event_id == event_id) {
+            return Ok(ApprovalOutcome::Accepted(record.clone()));
+        }
+        let Some(action) = thread.pending_action.as_ref() else {
+            return Ok(ApprovalOutcome::NoPendingAction);
+        };
+        if action.id != action_id || action.artifact_revision != artifact_revision {
+            return Ok(ApprovalOutcome::Stale { current_action_id: action.id.clone() });
+        }
+        let outcome = self.approve_thread_action_with(
+            &mut thread, actor, event_id, accepted_at, false,
+        )?;
+        self.store.save_thread(&self.config, &thread)?;
+        Ok(outcome)
+    }
+
+    fn is_approval_response(&self, thread: &FluentThread, event: &InboundEnvelope) -> bool {
+        let Some(action) = &thread.pending_action else { return false };
+        let answer = event.text.trim().to_ascii_lowercase();
+        answer == "y" || answer == "yes" || answer == action.id.to_ascii_lowercase()
+            || action.labels.iter().any(|label| label.eq_ignore_ascii_case(&answer))
+            || match action.kind {
+                PendingActionKind::Planning => answer.contains("plan"),
+                PendingActionKind::Execution => answer.contains("execut"),
+                PendingActionKind::Resume => answer.contains("resume"),
+                PendingActionKind::Landing => answer.contains("land"),
+            }
+    }
+
+    fn approve_thread_action(&mut self, thread: &mut FluentThread, event: &InboundEnvelope) -> Result<ApprovalOutcome> {
+        let accepted_at = chrono::Utc::now().to_rfc3339();
+        self.approve_thread_action_with(thread, &event.user, &event.id, &accepted_at, self.recovering_event)
+    }
+
+    fn approve_thread_action_with(
+        &self,
+        thread: &mut FluentThread,
+        actor: &str,
+        event_id: &str,
+        accepted_at: &str,
+        recovered: bool,
+    ) -> Result<ApprovalOutcome> {
+        let Some(action) = thread.pending_action.clone() else { return Ok(ApprovalOutcome::NoPendingAction) };
+        if thread.approvals.iter().any(|record| record.event_id == event_id) {
+            return Ok(ApprovalOutcome::Accepted(thread.approvals.iter().find(|record| record.event_id == event_id).cloned().unwrap()));
+        }
+        let authority = self.current_authority_config()?;
+        if !policy::actor_is_project_approver(&authority, thread, actor) {
+            return Ok(ApprovalOutcome::WaitingForApprover);
+        }
+        if recovered && !action.kind.is_delayed_safe() {
+            thread.pending_question = Some(format!("fresh confirmation required: {}", action.id));
+            return Ok(ApprovalOutcome::WaitingForApprover);
+        }
+        let record = ApprovalRecord {
+            pending_action_id: action.id,
+            artifact_revision: action.artifact_revision,
+            actor: actor.into(),
+            accepted_at: accepted_at.into(),
+            event_id: event_id.into(),
+        };
+        thread.approvals.push(record.clone());
+        thread.pending_action = None;
+        thread.pending_question = None;
+        Ok(ApprovalOutcome::Accepted(record))
+    }
+
+    fn current_authority_config(&self) -> Result<RunnerConfig> {
+        let path = config_path(self.home);
+        if path.exists() { read_config(self.home) } else { Ok(self.config.clone()) }
     }
     fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
         let default = self

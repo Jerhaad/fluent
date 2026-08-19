@@ -62,11 +62,13 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
             commit,
         },
         allowed_participants: BTreeSet::from(["U1".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
     };
     let mut config = RunnerConfig {
         workspace: "workspace".into(),
         projects: BTreeMap::from([("app".into(), project)]),
         channel_defaults: BTreeMap::new(),
+        enabled_providers: BTreeSet::from(["codex".into()]),
     };
     if default {
         config.channel_defaults.insert("C1".into(), "app".into());
@@ -83,6 +85,108 @@ fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
         user: "U1".into(),
         text: text.into(),
     }
+}
+
+fn pending_action(kind: PendingActionKind) -> PendingAction {
+    PendingAction {
+        id: "approve-plan".into(),
+        kind,
+        artifact_revision: "revision-1".into(),
+        presented_at: "now".into(),
+        labels: BTreeSet::from(["approve".into()]),
+    }
+}
+
+#[test]
+fn unauthorized_mention_receives_private_refusal() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut request = event("E1", None, "@Fluent hello");
+    request.user = "U9".into();
+    runner.ingest(request).unwrap();
+    assert_eq!(runner.slack().private_responses.len(), 1);
+    assert!(runner.slack().private_responses[0].2.contains("not allowed"));
+}
+
+#[test]
+fn unauthorized_mention_preserves_state_and_hides_projects() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    let mut request = event("E1", None, "@Fluent hello");
+    request.user = "U9".into();
+    runner.ingest(request).unwrap();
+    assert!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().is_none());
+    assert!(!runner.slack().private_responses[0].2.contains("app"));
+}
+
+#[test]
+fn project_approver_advances_exact_requested_action_once() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    let first = runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "approval-event", "then").unwrap();
+    let duplicate = runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "approval-event", "later").unwrap();
+    assert_eq!(first, duplicate);
+    let thread = FileCollaborationStore::new(home.path()).load_thread(&runner.config, "1.0").unwrap().unwrap();
+    assert_eq!(thread.approvals.len(), 1);
+    assert!(thread.pending_action.is_none());
+}
+
+#[test]
+fn participant_cannot_advance_approval_controlled_action() {
+    let (home, _checkout, mut config) = setup(true);
+    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
+    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    assert_eq!(runner.approve_pending_action("1.0", "U2", "approve-plan", "revision-1", "E2", "now").unwrap(), ApprovalOutcome::WaitingForApprover);
+}
+
+#[test]
+fn stale_approval_cannot_advance_revised_action() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    assert_eq!(runner.approve_pending_action("1.0", "U1", "approve-plan", "old", "E2", "now").unwrap(), ApprovalOutcome::Stale { current_action_id: "approve-plan".into() });
+}
+
+#[test]
+fn approval_uses_current_project_authority() {
+    let (home, _checkout, mut config) = setup(true);
+    write_config(home.path(), &config).unwrap();
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    config.projects.get_mut("app").unwrap().project_approvers = BTreeSet::from(["U2".into()]);
+    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
+    write_config(home.path(), &config).unwrap();
+    assert_eq!(runner.approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "E2", "now").unwrap(), ApprovalOutcome::WaitingForApprover);
+}
+
+#[test]
+fn conversational_approval_targets_single_current_question() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    runner.ingest(event("E2", Some("1.0"), "y")).unwrap();
+    let thread = FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(thread.approvals.len(), 1);
+}
+
+#[test]
+fn non_approver_gets_private_explanation_while_thread_waits() {
+    let (home, _checkout, mut config) = setup(true);
+    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.request_approval("1.0", pending_action(PendingActionKind::Planning)).unwrap();
+    let mut reply = event("E2", Some("1.0"), "y"); reply.user = "U2".into();
+    runner.ingest(reply).unwrap();
+    assert_eq!(runner.slack().private_responses.len(), 1);
+    assert!(FileCollaborationStore::new(home.path()).load_thread(&config, "1.0").unwrap().unwrap().pending_action.is_some());
 }
 
 #[test]
@@ -1372,6 +1476,8 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         planning_stage: None,
         linked_work: None,
         pending_question: None,
+        pending_action: None,
+        approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),
         last_connection: None,
         pending_turn: Some(PendingTurn {
@@ -1571,6 +1677,7 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U2".into()]),
+            project_approvers: BTreeSet::from(["U2".into()]),
         },
     );
     let mut runner = CollaborationRunner::new(

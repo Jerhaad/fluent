@@ -21,6 +21,8 @@ pub struct ConfiguredProject {
     pub label: String,
     pub checkout: Checkout,
     pub allowed_participants: BTreeSet<String>,
+    #[serde(default)]
+    pub project_approvers: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -28,6 +30,8 @@ pub struct RunnerConfig {
     pub workspace: String,
     pub projects: BTreeMap<String, ConfiguredProject>,
     pub channel_defaults: BTreeMap<String, String>,
+    #[serde(default)]
+    pub enabled_providers: BTreeSet<String>,
 }
 
 impl RunnerConfig {
@@ -47,6 +51,14 @@ impl RunnerConfig {
             {
                 bail!("project {key} has an incomplete checkout identity");
             }
+            if project.allowed_participants.is_empty()
+                || !project.project_approvers.is_subset(&project.allowed_participants)
+            {
+                bail!("project {key} has incomplete participant or approver authority");
+            }
+        }
+        if self.enabled_providers.is_empty() {
+            bail!("at least one conversation provider is required");
         }
         for (channel, project) in &self.channel_defaults {
             if channel.trim().is_empty() || !self.projects.contains_key(project) {

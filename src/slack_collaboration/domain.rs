@@ -61,6 +61,52 @@ pub enum ThreadState {
     Active,
 }
 
+/// A lifecycle action that needs a project approver's current authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingActionKind {
+    Planning,
+    Execution,
+    Resume,
+    Landing,
+}
+
+impl PendingActionKind {
+    pub fn is_delayed_safe(&self) -> bool {
+        matches!(self, Self::Planning)
+    }
+}
+
+/// The one approval question currently presented in a Fluent thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAction {
+    pub id: String,
+    pub kind: PendingActionKind,
+    pub artifact_revision: String,
+    pub presented_at: String,
+    #[serde(default)]
+    pub labels: BTreeSet<String>,
+}
+
+/// A durable authorization record. Consumers, rather than this domain, perform
+/// any filesystem, Work, publication, initialization, or landing effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub pending_action_id: String,
+    pub artifact_revision: String,
+    pub actor: String,
+    pub accepted_at: String,
+    pub event_id: String,
+}
+
+/// Result of evaluating an approval without performing its host-side effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Accepted(ApprovalRecord),
+    WaitingForApprover,
+    Stale { current_action_id: String },
+    NoPendingAction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluentThread {
     pub id: String,
@@ -72,6 +118,10 @@ pub struct FluentThread {
     pub planning_stage: Option<String>,
     pub linked_work: Option<String>,
     pub pending_question: Option<String>,
+    #[serde(default)]
+    pub pending_action: Option<PendingAction>,
+    #[serde(default)]
+    pub approvals: Vec<ApprovalRecord>,
     pub processed_events: BTreeSet<String>,
     pub last_connection: Option<String>,
     #[serde(default)]
@@ -102,6 +152,8 @@ impl FluentThread {
             planning_stage: None,
             linked_work: None,
             pending_question: None,
+            pending_action: None,
+            approvals: Vec::new(),
             processed_events: BTreeSet::new(),
             last_connection: None,
             pending_turn: None,

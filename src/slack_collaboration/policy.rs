@@ -38,3 +38,15 @@ pub(super) fn available_projects(
         .map(|project| project.label.clone())
         .collect()
 }
+
+pub(super) fn actor_is_project_approver(
+    config: &RunnerConfig,
+    thread: &FluentThread,
+    actor: &str,
+) -> bool {
+    thread
+        .project_label
+        .as_deref()
+        .and_then(|label| config.projects.get(label))
+        .is_some_and(|project| project.project_approvers.contains(actor))
+}
