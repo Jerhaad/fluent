@@ -3193,6 +3193,42 @@ fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
         "{}",
         String::from_utf8_lossy(&accepted.stderr)
     );
+    let actions_path = state_root(home.path()).join("recovery-actions.json");
+    let unavailable_again = checkout.path().join(".git-unavailable-again");
+    fs::rename(checkout.path().join(".git"), &unavailable_again).unwrap();
+    assert!(
+        runner
+            .drive_once(std::time::Duration::from_millis(1))
+            .is_err()
+    );
+    let retained: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+    assert!(retained.contains_key("1.0:checkout-reconfirmation"));
+    fs::rename(unavailable_again, checkout.path().join(".git")).unwrap();
+    let mut actions: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&fs::read(&actions_path).unwrap()).unwrap();
+    let mut valid = actions.remove("1.0:checkout-reconfirmation").unwrap();
+    valid["id"] = serde_json::json!("z-valid");
+    actions.insert("z-valid".into(), valid);
+    actions.insert(
+        "0-stale-project".into(),
+        serde_json::json!({
+            "id": "0-stale-project",
+            "project": "retired-project",
+            "thread": "1.0",
+            "kind": "CheckoutReconfirmation"
+        }),
+    );
+    actions.insert(
+        "1-stale-provider".into(),
+        serde_json::json!({
+            "id": "1-stale-provider",
+            "project": "app",
+            "thread": "1.0",
+            "kind": {"ProviderLogin": {"provider": "claude"}}
+        }),
+    );
+    fs::write(&actions_path, serde_json::to_vec_pretty(&actions).unwrap()).unwrap();
     runner
         .drive_once(std::time::Duration::from_millis(1))
         .unwrap();
@@ -3204,6 +3240,9 @@ fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
     }
     runner.poll_completions().unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let remaining: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&fs::read(actions_path).unwrap()).unwrap();
+    assert!(remaining.is_empty());
 }
 
 #[test]

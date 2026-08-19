@@ -1144,33 +1144,50 @@ where
     pub fn process_operator_recovery_actions(&mut self) -> Result<()> {
         for action in load_recovery_actions(self.runner.home)? {
             validate_thread_identity(&action.thread)?;
-            let thread = self
+            let Some(thread) = self
                 .runner
                 .store
                 .load_thread(&self.runner.config, &action.thread)?
-                .context("Fluent Slack thread is unavailable")?;
+            else {
+                remove_recovery_action(self.runner.home, &action.id)?;
+                continue;
+            };
             if thread.project_label.as_deref() != Some(&action.project) {
-                bail!("recovery action does not match the thread project binding");
+                remove_recovery_action(self.runner.home, &action.id)?;
+                continue;
             }
             let still_paused = thread.pending_turn.as_ref().is_some_and(|turn| {
                 turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery
             });
+            if !still_paused {
+                remove_recovery_action(self.runner.home, &action.id)?;
+                continue;
+            }
             match &action.kind {
                 OperatorRecoveryKind::ProviderLogin { provider } => {
                     if thread.provider.as_deref() != Some(provider) {
-                        bail!("recovery action does not match the selected provider");
+                        remove_recovery_action(self.runner.home, &action.id)?;
+                        continue;
                     }
-                    if still_paused && thread.provider_failure.is_some() {
-                        self.resume_after_provider_login(&action.thread)?;
+                    if !matches!(
+                        thread.provider_failure,
+                        Some(
+                            ProviderFailure::Authentication
+                                | ProviderFailure::HostCredentialDenied
+                                | ProviderFailure::Unavailable
+                        )
+                    ) {
+                        remove_recovery_action(self.runner.home, &action.id)?;
+                        continue;
                     }
+                    self.resume_after_provider_login(&action.thread)?;
                 }
                 OperatorRecoveryKind::CheckoutReconfirmation => {
-                    if still_paused {
-                        if thread.provider_failure.is_some() {
-                            bail!("provider recovery must complete before checkout reconfirmation");
-                        }
-                        self.reconfirm_checkout(&action.thread)?;
+                    if thread.provider_failure.is_some() {
+                        remove_recovery_action(self.runner.home, &action.id)?;
+                        continue;
                     }
+                    self.reconfirm_checkout(&action.thread)?;
                 }
             }
             remove_recovery_action(self.runner.home, &action.id)?;
