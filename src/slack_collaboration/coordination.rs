@@ -62,6 +62,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;
+        if config_path(self.home).exists() {
+            self.config = read_config(self.home)?;
+        }
         if let Some(error) = &self.configuration_error {
             bail!("runner configuration is invalid; refusing Slack ingress: {error}");
         }

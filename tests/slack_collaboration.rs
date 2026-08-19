@@ -213,6 +213,32 @@ fn reconnect_reconfirms_delayed_consequential_action() {
 }
 
 #[test]
+fn setup_validates_complete_collaboration_authority() {
+    let (_home, _checkout, mut config) = setup(true);
+    config.enabled_providers.clear();
+    assert!(config.validate().unwrap_err().to_string().contains("conversation provider"));
+    config.enabled_providers.insert("codex".into());
+    config.projects.get_mut("app").unwrap().project_approvers.insert("U9".into());
+    assert!(config.validate().unwrap_err().to_string().contains("participant or approver"));
+}
+
+#[test]
+fn participant_revocation_applies_to_active_and_future_threads() {
+    let (home, _checkout, mut config) = setup(true);
+    write_config(home.path(), &config).unwrap();
+    let mut runner = CollaborationRunner::new(home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    config.projects.get_mut("app").unwrap().allowed_participants.clear();
+    config.projects.get_mut("app").unwrap().project_approvers.clear();
+    // A disabled project policy is invalid, so replace it with another allowed actor.
+    config.projects.get_mut("app").unwrap().allowed_participants.insert("U2".into());
+    config.projects.get_mut("app").unwrap().project_approvers.insert("U2".into());
+    write_config(home.path(), &config).unwrap();
+    runner.ingest(event("E2", Some("1.0"), "continue")).unwrap();
+    assert_eq!(runner.provider().calls.len(), 1);
+}
+
+#[test]
 fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
     let envelope = decode_socket_mode_envelope(
         r#"{"envelope_id":"ENV1","payload":{"event_id":"EV1","event":{"channel":"C1","ts":"1.0","thread_ts":"0.9","user":"U1","text":"continue"}}}"#,
