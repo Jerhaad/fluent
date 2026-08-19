@@ -1559,15 +1559,49 @@ fn reopen_baseline_covered_round_cap_attempt(
         let Some(baseline_path) = baseline_tester_results_path(project_root, attempt) else {
             return Ok(false);
         };
-        let Some(final_tester_path) = latest_tester_results_path(project_root, attempt) else {
-            return Ok(false);
-        };
-        let evidence_is_covered = [&recheck_path, &final_tester_path].iter().all(|path| {
-            path.is_file()
-                && !tester_errored(path)
-                && introduced_tester_failures(path, Some(&baseline_path)) == 0
-                && unexplained_failed_tester_commands(path, Some(&baseline_path)) == 0
-        });
+        failed_command_recheck_correction_artifacts(project_root, recheck).map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered recheck lineage cannot be validated: {error:#}"
+            ))
+        })?;
+        let source_results = recheck.input_artifacts.first().ok_or_else(|| {
+            round_cap_ineligible("baseline-covered recheck has no source Tester result")
+        })?;
+        let final_tester_path = work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &source_results.path,
+        )
+        .map_err(|error| {
+            round_cap_ineligible(format!(
+                "baseline-covered source Tester evidence cannot be resolved: {error:#}"
+            ))
+        })?;
+        let final_results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(&final_tester_path).map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered source Tester evidence cannot be read: {error:#}"
+                ))
+            })?)
+            .map_err(|error| {
+                round_cap_ineligible(format!(
+                    "baseline-covered source Tester evidence is invalid: {error:#}"
+                ))
+            })?;
+        let expected_commit = recheck
+            .review_context
+            .as_ref()
+            .map(|context| context.candidate_commit.as_str());
+        // The source Tester is why the recheck exists: it may contain a new,
+        // transient failure. Require valid candidate-bound source evidence,
+        // then let the linked recheck supersede that failed command when its
+        // current structured failures are wholly covered by the baseline.
+        let evidence_is_covered = expected_commit.is_some()
+            && final_results.candidate_commit.as_deref() == expected_commit
+            && !tester_errored(&final_tester_path)
+            && recheck_path.is_file()
+            && !tester_errored(&recheck_path)
+            && introduced_tester_failures(&recheck_path, Some(&baseline_path)) == 0
+            && unexplained_failed_tester_commands(&recheck_path, Some(&baseline_path)) == 0;
         let failed_frontier =
             round_cap_failure_frontier(project_root, attempt).map_err(|error| {
                 round_cap_ineligible(format!(
@@ -5888,6 +5922,22 @@ fn advance_failed_command_recheck(
     }
 
     let correction = failed_command_recheck_correction_artifacts(project_root, &recheck)?;
+    let recheck_results_path = recheck
+        .artifact_area
+        .as_ref()
+        .and_then(|area| {
+            work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path).ok()
+        })
+        .map(|area| area.join("tester-results.json"));
+    let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
+    if recheck_results_path.as_ref().is_some_and(|path| {
+        path.is_file()
+            && !tester_errored(path)
+            && introduced_tester_failures(path, baseline_path.as_deref()) == 0
+            && unexplained_failed_tester_commands(path, baseline_path.as_deref()) == 0
+    }) {
+        return Ok(None);
+    }
     if correction.is_empty() {
         return Ok(None);
     }
@@ -10679,15 +10729,24 @@ mod tests {
             .join("tester-results.json");
         let mut source_results: serde_json::Value =
             serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
-        source_results["tests"] = serde_json::json!([{
-            "id": "baseline_test",
-            "test_harness": "xcodebuild",
-            "status": "fail",
-            "duration_ms": 1,
-            "failure_excerpt": "known baseline failure"
-        }]);
+        source_results["tests"] = serde_json::json!([
+            {
+                "id": "baseline_test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 1,
+                "failure_excerpt": "known baseline failure"
+            },
+            {
+                "id": "transient_test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 1,
+                "failure_excerpt": "transient failure"
+            }
+        ]);
         source_results["summary"] =
-            serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
+            serde_json::json!({"total": 2, "pass": 0, "fail": 2, "skipped": 0});
         fs::write(&source, serde_json::to_vec_pretty(&source_results).unwrap()).unwrap();
         complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
 
@@ -10716,8 +10775,15 @@ mod tests {
             .join("tester-results.json");
         let mut recheck_results: serde_json::Value =
             serde_json::from_slice(&fs::read(&recheck_path).unwrap()).unwrap();
-        recheck_results["tests"] = source_results["tests"].clone();
-        recheck_results["summary"] = source_results["summary"].clone();
+        recheck_results["tests"] = serde_json::json!([{
+            "id": "baseline_test",
+            "test_harness": "xcodebuild",
+            "status": "fail",
+            "duration_ms": 1,
+            "failure_excerpt": "known baseline failure"
+        }]);
+        recheck_results["summary"] =
+            serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
         fs::write(
             &recheck_path,
             serde_json::to_vec_pretty(&recheck_results).unwrap(),
@@ -10733,7 +10799,7 @@ mod tests {
             "attempt-1-baseline-tester",
         ));
         fs::create_dir_all(&baseline).unwrap();
-        fs::copy(&source, baseline.join("tester-results.json")).unwrap();
+        fs::copy(&recheck_path, baseline.join("tester-results.json")).unwrap();
 
         assert!(
             reopen_baseline_covered_round_cap_attempt(
