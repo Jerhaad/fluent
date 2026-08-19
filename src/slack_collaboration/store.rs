@@ -134,6 +134,8 @@ fn routing_envelope(event: &InboundEnvelope) -> InboundEnvelope {
         thread_timestamp: event.thread_timestamp.clone(),
         user: String::new(),
         text: String::new(),
+        approval_action_id: event.approval_action_id.clone(),
+        approval_artifact_revision: event.approval_artifact_revision.clone(),
     }
 }
 

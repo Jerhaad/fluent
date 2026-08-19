@@ -200,14 +200,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             && self.is_approval_response(&thread, &event)
         {
             match self.approve_thread_action(&mut thread, &event)? {
-                ApprovalOutcome::WaitingForApprover if self.recovering_event => self.queue_reply(
-                    &event,
-                    "Fresh confirmation is required before Fluent can perform this action.",
-                )?,
                 ApprovalOutcome::WaitingForApprover => self.slack.respond_private(
                     &event.channel,
                     &event.user,
                     "Only a project approver may authorize this action.",
+                )?,
+                ApprovalOutcome::FreshConfirmationRequired => self.queue_reply(
+                    &event,
+                    "Fresh confirmation is required before Fluent can perform this action.",
                 )?,
                 ApprovalOutcome::Stale { current_action_id } => self.queue_reply(
                     &event,
@@ -249,8 +249,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             bail!("pending action identity is incomplete");
         }
         thread.pending_question = Some(action.id.clone());
+        let question = format!(
+            "Waiting for a project approver to authorize {} at revision {}.",
+            action.id, action.artifact_revision
+        );
         thread.pending_action = Some(action);
-        self.store.save_thread(&self.config, &thread)
+        self.store.save_thread(&self.config, &thread)?;
+        self.queue_thread_waiting(&thread, &question)?;
+        self.deliver_pending()
     }
 
     /// Evaluate a direct approval attempt against current durable authority.
@@ -293,7 +299,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             return false;
         };
         let answer = event.text.trim().to_ascii_lowercase();
-        answer == "y"
+        event.approval_action_id.is_some()
+            || event.approval_artifact_revision.is_some()
+            || answer == "y"
             || answer == "yes"
             || answer == action.id.to_ascii_lowercase()
             || action
@@ -313,6 +321,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         thread: &mut FluentThread,
         event: &InboundEnvelope,
     ) -> Result<ApprovalOutcome> {
+        let Some(action) = thread.pending_action.as_ref() else {
+            return Ok(ApprovalOutcome::NoPendingAction);
+        };
+        if !self.approval_matches_presented_action(action, event) {
+            return Ok(ApprovalOutcome::Stale {
+                current_action_id: action.id.clone(),
+            });
+        }
         let accepted_at = chrono::Utc::now().to_rfc3339();
         self.approve_thread_action_with(
             thread,
@@ -354,11 +370,19 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         if recovered && !action.kind.is_delayed_safe() {
             thread.pending_question = Some(format!("fresh confirmation required: {}", action.id));
-            return Ok(ApprovalOutcome::WaitingForApprover);
+            return Ok(ApprovalOutcome::FreshConfirmationRequired);
         }
+        let project_label = thread
+            .project_label
+            .clone()
+            .context("approval thread is unbound")?;
         let record = ApprovalRecord {
+            project_label,
+            thread_id: thread.id.clone(),
             pending_action_id: action.id,
+            action_kind: action.kind,
             artifact_revision: action.artifact_revision,
+            presented_at: action.presented_at,
             actor: actor.into(),
             accepted_at: accepted_at.into(),
             event_id: event_id.into(),
@@ -367,6 +391,18 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         thread.pending_action = None;
         thread.pending_question = None;
         Ok(ApprovalOutcome::Accepted(record))
+    }
+
+    fn approval_matches_presented_action(
+        &self,
+        action: &PendingAction,
+        event: &InboundEnvelope,
+    ) -> bool {
+        match (&event.approval_action_id, &event.approval_artifact_revision) {
+            (Some(id), Some(revision)) => id == &action.id && revision == &action.artifact_revision,
+            (None, None) => !self.recovering_event,
+            _ => false,
+        }
     }
 
     fn current_authority_config(&self) -> Result<RunnerConfig> {
@@ -538,6 +574,23 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             delivered: false,
         };
         self.store.persist_outbox(delivery)
+    }
+
+    fn queue_thread_waiting(&self, thread: &FluentThread, text: &str) -> Result<()> {
+        let action = thread
+            .pending_action
+            .as_ref()
+            .context("waiting thread lacks a pending action")?;
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!(
+                "{}:approval-waiting:{}:{}",
+                thread.id, action.id, action.artifact_revision
+            ),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: text.into(),
+            delivered: false,
+        })
     }
 
     fn queue_thread_status(&self, thread: &FluentThread, interruption: Option<&str>) -> Result<()> {

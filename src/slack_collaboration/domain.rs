@@ -15,6 +15,11 @@ pub struct InboundEnvelope {
     pub thread_timestamp: Option<String>,
     pub user: String,
     pub text: String,
+    /// Immutable identity supplied by an approval interaction control.
+    #[serde(default)]
+    pub approval_action_id: Option<String>,
+    #[serde(default)]
+    pub approval_artifact_revision: Option<String>,
 }
 
 impl InboundEnvelope {
@@ -91,8 +96,12 @@ pub struct PendingAction {
 /// any filesystem, Work, publication, initialization, or landing effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRecord {
+    pub project_label: String,
+    pub thread_id: String,
     pub pending_action_id: String,
+    pub action_kind: PendingActionKind,
     pub artifact_revision: String,
+    pub presented_at: String,
     pub actor: String,
     pub accepted_at: String,
     pub event_id: String,
@@ -103,6 +112,7 @@ pub struct ApprovalRecord {
 pub enum ApprovalOutcome {
     Accepted(ApprovalRecord),
     WaitingForApprover,
+    FreshConfirmationRequired,
     Stale { current_action_id: String },
     NoPendingAction,
 }

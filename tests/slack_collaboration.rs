@@ -84,6 +84,8 @@ fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
         thread_timestamp: thread.map(str::to_owned),
         user: "U1".into(),
         text: text.into(),
+        approval_action_id: None,
+        approval_artifact_revision: None,
     }
 }
 
@@ -95,6 +97,13 @@ fn pending_action(kind: PendingActionKind) -> PendingAction {
         presented_at: "now".into(),
         labels: BTreeSet::from(["approve".into()]),
     }
+}
+
+fn approval_event(id: &str, text: &str, action: &PendingAction) -> InboundEnvelope {
+    let mut event = event(id, Some("1.0"), text);
+    event.approval_action_id = Some(action.id.clone());
+    event.approval_artifact_revision = Some(action.artifact_revision.clone());
+    event
 }
 
 #[test]
@@ -270,15 +279,22 @@ fn conversational_approval_targets_single_current_question() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    runner
-        .request_approval("1.0", pending_action(PendingActionKind::Planning))
-        .unwrap();
-    runner.ingest(event("E2", Some("1.0"), "y")).unwrap();
-    let thread = FileCollaborationStore::new(home.path())
-        .load_thread(&config, "1.0")
-        .unwrap()
-        .unwrap();
-    assert_eq!(thread.approvals.len(), 1);
+    for (index, answer) in ["y", "approve", ""].into_iter().enumerate() {
+        let action = pending_action(PendingActionKind::Planning);
+        runner.request_approval("1.0", action.clone()).unwrap();
+        let event_id = format!("approval-{index}");
+        let event = if answer.is_empty() {
+            approval_event(&event_id, answer, &action)
+        } else {
+            event(&event_id, Some("1.0"), answer)
+        };
+        runner.ingest(event).unwrap();
+        let thread = FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(thread.approvals.len(), index + 1);
+    }
 }
 
 #[test]
@@ -305,6 +321,13 @@ fn non_approver_gets_private_explanation_while_thread_waits() {
     runner.ingest(reply).unwrap();
     assert_eq!(runner.slack().private_responses.len(), 1);
     assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("Waiting for a project approver"))
+    );
+    assert!(
         FileCollaborationStore::new(home.path())
             .load_thread(&config, "1.0")
             .unwrap()
@@ -324,11 +347,10 @@ fn reconnect_applies_still_current_planning_approval() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let action = pending_action(PendingActionKind::Planning);
+    runner.request_approval("1.0", action.clone()).unwrap();
     runner
-        .request_approval("1.0", pending_action(PendingActionKind::Planning))
-        .unwrap();
-    runner
-        .reconnect([event("E2", Some("1.0"), "y")], "reconnected".into())
+        .reconnect([approval_event("E2", "y", &action)], "reconnected".into())
         .unwrap();
     assert_eq!(
         FileCollaborationStore::new(home.path())
@@ -342,8 +364,9 @@ fn reconnect_applies_still_current_planning_approval() {
 }
 
 #[test]
-fn reconnect_reconfirms_delayed_consequential_action() {
-    let (home, _checkout, config) = setup(true);
+fn reconnect_rejects_stale_or_revoked_planning_approval() {
+    let (home, _checkout, mut config) = setup(true);
+    write_config(home.path(), &config).unwrap();
     let mut runner = CollaborationRunner::new(
         home.path(),
         config.clone(),
@@ -351,31 +374,89 @@ fn reconnect_reconfirms_delayed_consequential_action() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let stale = pending_action(PendingActionKind::Planning);
+    let mut replacement = stale.clone();
+    replacement.artifact_revision = "revision-2".into();
+    runner.request_approval("1.0", replacement).unwrap();
     runner
-        .request_approval("1.0", pending_action(PendingActionKind::Landing))
+        .reconnect([approval_event("E2", "y", &stale)], "reconnected".into())
         .unwrap();
-    runner
-        .reconnect([event("E2", Some("1.0"), "y")], "reconnected".into())
-        .unwrap();
-    let thread = FileCollaborationStore::new(home.path())
-        .load_thread(&config, "1.0")
-        .unwrap()
-        .unwrap();
-    assert!(thread.approvals.is_empty());
     assert!(
-        thread
-            .pending_question
-            .as_deref()
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
             .unwrap()
-            .contains("fresh confirmation")
+            .unwrap()
+            .approvals
+            .is_empty()
     );
+
+    let current = pending_action(PendingActionKind::Planning);
+    runner.request_approval("1.0", current.clone()).unwrap();
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .project_approvers
+        .clear();
+    config.projects.get_mut("app").unwrap().allowed_participants = BTreeSet::from(["U2".into()]);
+    config.projects.get_mut("app").unwrap().project_approvers = BTreeSet::from(["U2".into()]);
+    write_config(home.path(), &config).unwrap();
+    runner
+        .reconnect(
+            [approval_event("E3", "y", &current)],
+            "reconnected-again".into(),
+        )
+        .unwrap();
     assert!(
-        runner
-            .slack()
-            .deliveries
-            .iter()
-            .any(|delivery| delivery.text.contains("Fresh confirmation"))
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .is_empty()
     );
+}
+
+#[test]
+fn reconnect_reconfirms_delayed_consequential_action() {
+    for kind in [
+        PendingActionKind::Execution,
+        PendingActionKind::Resume,
+        PendingActionKind::Landing,
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+        let action = pending_action(kind);
+        runner.request_approval("1.0", action.clone()).unwrap();
+        runner
+            .reconnect([approval_event("E2", "y", &action)], "reconnected".into())
+            .unwrap();
+        let thread = FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap();
+        assert!(thread.approvals.is_empty());
+        assert!(
+            thread
+                .pending_question
+                .as_deref()
+                .unwrap()
+                .contains("fresh confirmation")
+        );
+        assert!(
+            runner
+                .slack()
+                .deliveries
+                .iter()
+                .any(|delivery| delivery.text.contains("Fresh confirmation"))
+        );
+    }
 }
 
 #[test]
@@ -443,7 +524,17 @@ fn participant_revocation_applies_to_active_and_future_threads() {
         .insert("U2".into());
     write_config(home.path(), &config).unwrap();
     runner.ingest(event("E2", Some("1.0"), "continue")).unwrap();
+    let mut future = event("E3", None, "@Fluent new work");
+    future.timestamp = "2.0".into();
+    runner.ingest(future).unwrap();
     assert_eq!(runner.provider().calls.len(), 1);
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "2.0")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(runner.slack().private_responses.len(), 1);
 }
 
 #[test]
@@ -1523,6 +1614,8 @@ fn recovered_reply(id: &str, timestamp: &str, text: &str) -> InboundEnvelope {
         thread_timestamp: Some("1.0".into()),
         user: "U1".into(),
         text: text.into(),
+        approval_action_id: None,
+        approval_artifact_revision: None,
     }
 }
 
