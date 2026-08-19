@@ -6575,6 +6575,47 @@ fn execution_approval_queues_each_planned_work_item() {
 }
 
 #[test]
+fn execution_approval_retries_the_same_request_after_scheduler_failure() {
+    struct FlakyScheduler(std::cell::Cell<u8>, std::cell::RefCell<Vec<String>>);
+    impl WorkScheduler for FlakyScheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            self.1.borrow_mut().push(request.id.clone());
+            let calls = self.0.get();
+            self.0.set(calls + 1);
+            if calls == 0 {
+                anyhow::bail!("scheduler temporarily unavailable");
+            }
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-retry",
+            "U1",
+            &[PlannedWork::new("work-retry", "Work")],
+        )
+        .unwrap();
+    let scheduler = FlakyScheduler(std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+    assert!(
+        control
+            .authorize_execution("slice-retry", "U1", &scheduler)
+            .is_err()
+    );
+    let report = control
+        .authorize_execution("slice-retry", "U1", &scheduler)
+        .unwrap();
+    assert_eq!(report.outcomes.len(), 1);
+    let requests = scheduler.1.borrow();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
 fn status_request_reports_authoritative_work_state_and_actions() {
     let (_home, checkout, _config) = setup(true);
     let control = WorkControl::new(checkout.path());

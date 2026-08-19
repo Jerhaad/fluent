@@ -1,3 +1,11 @@
+//! Durable Slack Slice bindings and the narrow scheduler submission boundary.
+//!
+//! Plan approval writes proposed Work and its Slice binding under
+//! `.fluent/work/slack/slices/`; execution approval is a separate action that
+//! submits stable requests to the scheduler. Read methods project persisted
+//! Work state, while approval and reconciliation methods mutate only their
+//! durable bindings or the Work model.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -88,6 +96,8 @@ pub struct SliceWork {
     #[serde(default)]
     pub execution_requests: Vec<WorkExecutionRequest>,
     #[serde(default)]
+    acknowledged_request_ids: Vec<String>,
+    #[serde(default)]
     pub transitions: Vec<WorkTransition>,
     #[serde(default)]
     observed_states: BTreeMap<String, String>,
@@ -163,6 +173,7 @@ impl WorkControl {
         }
     }
 
+    /// Materialize one approved plan as proposed Work without starting it.
     pub fn approve_plan(
         &self,
         slice_id: &str,
@@ -207,6 +218,7 @@ impl WorkControl {
             approved_by: approver.into(),
             work_item_ids: ids.clone(),
             execution_requests: Vec::new(),
+            acknowledged_request_ids: Vec::new(),
             transitions: Vec::new(),
             observed_states: BTreeMap::new(),
             transition_cursors: BTreeMap::new(),
@@ -256,11 +268,18 @@ impl WorkControl {
                     ExecutionAuthorization::execution_ready(ExecutionAuthority::Human);
                 Ok(())
             })?;
-            let outcome = match existing_request {
-                Some(_) => WorkQueueOutcome::Queued {
+            let outcome = if slice.acknowledged_request_ids.contains(&request.id) {
+                WorkQueueOutcome::Queued {
                     request_id: request.id.clone(),
-                },
-                None => scheduler.submit(&request)?,
+                }
+            } else {
+                // The scheduler owns idempotency. A persisted request is intent,
+                // not proof of delivery: retry the same identity after a lost or
+                // failed acknowledgement instead of reporting a synthetic queue.
+                let outcome = scheduler.submit(&request)?;
+                slice.acknowledged_request_ids.push(request.id.clone());
+                self.save_slice(&slice)?;
+                outcome
             };
             outcomes.push((work_item_id.clone(), outcome));
         }
@@ -271,6 +290,7 @@ impl WorkControl {
         })
     }
 
+    /// Read the persisted Slice binding without changing it.
     pub fn slice(&self, slice_id: &str) -> Result<Option<SliceWork>> {
         let path = self.slice_path(slice_id)?;
         match fs::read(&path) {
@@ -421,6 +441,7 @@ impl WorkControl {
         Ok(reported)
     }
 
+    /// Derive the current Slice stage from persisted Work and landing state.
     pub fn slice_stage(&self, slice_id: &str) -> Result<SliceStage> {
         let slice = self
             .slice(slice_id)?
