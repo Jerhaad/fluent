@@ -21,8 +21,20 @@ pub struct ConfiguredProject {
     pub label: String,
     pub checkout: Checkout,
     pub allowed_participants: BTreeSet<String>,
+    #[serde(default = "default_conversation_provider")]
+    pub default_provider: String,
+    #[serde(default = "default_enabled_conversation_providers")]
+    pub enabled_providers: BTreeSet<String>,
     #[serde(default)]
     pub project_approvers: BTreeSet<String>,
+}
+
+fn default_conversation_provider() -> String {
+    "codex".into()
+}
+
+fn default_enabled_conversation_providers() -> BTreeSet<String> {
+    BTreeSet::from([default_conversation_provider()])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -51,6 +63,16 @@ impl RunnerConfig {
                 || project.checkout.commit.trim().is_empty()
             {
                 bail!("project {key} has an incomplete checkout identity");
+            }
+            if project.default_provider.trim().is_empty()
+                || !project
+                    .enabled_providers
+                    .contains(&project.default_provider)
+                || project.enabled_providers.iter().any(|provider| {
+                    provider.trim().is_empty() || !matches!(provider.as_str(), "codex" | "claude")
+                })
+            {
+                bail!("project {key} has an invalid conversation provider policy");
             }
             if project.allowed_participants.is_empty()
                 || !project
@@ -184,6 +206,10 @@ pub enum ProviderTurnRecovery {
 
 /// Provider-neutral turn boundary with an explicit filesystem authority scope.
 pub trait ConversationProvider {
+    /// Reports the provider implementation that owns persisted session ids.
+    fn name(&self) -> &str {
+        "codex"
+    }
     fn start(
         &mut self,
         action_id: &str,

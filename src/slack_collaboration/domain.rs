@@ -216,6 +216,8 @@ pub struct FluentThread {
     pub channel: String,
     pub state: ThreadState,
     pub project_label: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub provider_session: Option<String>,
     pub slice: Option<String>,
     pub planning_stage: Option<String>,
@@ -259,6 +261,7 @@ impl FluentThread {
             channel: event.channel.clone(),
             state: ThreadState::WaitingForProject,
             project_label: None,
+            provider: None,
             provider_session: None,
             slice: None,
             planning_stage: None,

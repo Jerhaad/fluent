@@ -557,6 +557,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
         });
         if let Some(project) = available {
+            let provider = selected_provider(&event.text).unwrap_or(&project.default_provider);
+            if !project.enabled_providers.contains(provider) {
+                self.queue_reply(
+                    event,
+                    "The selected conversation provider is not enabled for this project.",
+                )?;
+                return Ok(());
+            }
             self.store
                 .bind_inbox_event(&self.config, &event.id, &project.label)?;
             thread.state = ThreadState::Active;
@@ -567,6 +575,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .with_context(|| format!("read linked Work Item {work_item_id}"))?;
                 thread.linked_work = Some(work_item_id.to_owned());
             }
+            thread.provider = Some(provider.to_owned());
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
                 source_timestamp: event.timestamp.clone(),
@@ -747,8 +756,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     text
                 } else if turn.starts_session {
                     format!(
-                        "Bound to {}.\n{}",
+                        "Bound to {}; provider: {}.\n{}",
                         safe_identity(self.bound_project(thread)?),
+                        thread.provider.as_deref().unwrap_or("unknown"),
                         text
                     )
                 } else {
@@ -840,4 +850,11 @@ fn work_item_id_from_request(text: &str) -> Option<&str> {
     text.split_once("work-item:")
         .and_then(|(_, suffix)| suffix.split_whitespace().next())
         .filter(|id| !id.is_empty())
+}
+
+fn selected_provider(text: &str) -> Option<&str> {
+    let marker = "[provider=";
+    let (_, suffix) = text.split_once(marker)?;
+    let suffix = suffix.split_once(']')?.0;
+    (!suffix.is_empty()).then_some(suffix)
 }

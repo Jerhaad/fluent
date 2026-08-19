@@ -451,6 +451,9 @@ pub struct InMemoryProvider {
     completed_actions: BTreeMap<String, (String, String)>,
 }
 impl ConversationProvider for InMemoryProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
     fn start(
         &mut self,
         action_id: &str,
@@ -758,6 +761,8 @@ mod tests {
                 commit,
             },
             allowed_participants: ["U1".into()].into_iter().collect(),
+            default_provider: "codex".into(),
+            enabled_providers: ["codex".into()].into_iter().collect(),
             project_approvers: ["U1".into()].into_iter().collect(),
         };
         let mut config = RunnerConfig {
@@ -855,6 +860,8 @@ mod tests {
                     commit,
                 },
                 allowed_participants: ["U1".into()].into_iter().collect(),
+                default_provider: "codex".into(),
+                enabled_providers: ["codex".into()].into_iter().collect(),
                 project_approvers: ["U1".into()].into_iter().collect(),
             },
         );

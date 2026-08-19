@@ -63,6 +63,8 @@ fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
             commit,
         },
         allowed_participants: BTreeSet::from(["U1".into()]),
+        default_provider: "codex".into(),
+        enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
         project_approvers: BTreeSet::from(["U1".into()]),
     };
     let mut config = RunnerConfig {
@@ -2399,6 +2401,53 @@ fn top_level_mention_uses_available_channel_default() {
     assert_eq!(runner.provider().calls.len(), 1);
     assert_eq!(runner.provider().calls[0].1, checkout.path());
 }
+
+#[test]
+fn thread_uses_and_displays_project_default_provider() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.provider.as_deref(), Some("codex"));
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("provider: codex")
+    );
+}
+
+#[test]
+fn thread_can_select_enabled_nondefault_provider() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent [provider=claude] hello"))
+        .unwrap();
+    assert_eq!(runner.config.projects["app"].default_provider, "codex");
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.provider.as_deref(), Some("claude"));
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("provider: claude")
+    );
+}
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);
@@ -3151,6 +3200,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         channel: "C1".into(),
         state: ThreadState::Active,
         project_label: Some("app".into()),
+        provider: Some("codex".into()),
         provider_session: None,
         slice: None,
         planning_stage: None,
@@ -3362,6 +3412,8 @@ fn participant_cannot_start_or_continue_another_projects_thread() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U2".into()]),
+            default_provider: "codex".into(),
+            enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U2".into()]),
         },
     );

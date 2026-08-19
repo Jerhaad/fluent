@@ -610,6 +610,9 @@ impl CodexAppServerProvider {
 }
 
 impl ConversationProvider for CodexAppServerProvider {
+    fn name(&self) -> &str {
+        "codex"
+    }
     fn start(
         &mut self,
         action_id: &str,
