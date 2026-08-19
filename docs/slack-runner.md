@@ -65,7 +65,23 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
    closed until the runner owner records a new identity.
-6. Print this guide at any time with `fluent slack setup`. Enable the exact
+6. Before enabling Slack, start the scheduler service from the configured
+   checkout and keep that process running:
+
+   ```sh
+   cd /absolute/checkout
+   fluent scheduler run
+   ```
+
+   In another terminal, confirm that the scheduler reports the configured
+   project and is ready to accept execution requests:
+
+   ```sh
+   cd /absolute/checkout
+   fluent scheduler status
+   ```
+
+7. Print this guide at any time with `fluent slack setup`. Enable the exact
    Fluent executable as an owner-scoped LaunchAgent with:
 
    ```sh

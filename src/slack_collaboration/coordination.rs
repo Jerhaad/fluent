@@ -1630,6 +1630,74 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(transitions)
     }
 
+    /// Offer a linked Slice for new product Work without reopening a completed
+    /// Slice or authorizing the proposed Work.
+    pub fn offer_linked_slice_for_new_work(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        requested_work: &str,
+    ) -> Result<String> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.allowed_participants.contains(actor) {
+            bail!("participant is not allowed to contribute to this project");
+        }
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let reply = WorkControl::new(&project.checkout.path)
+            .linked_slice_offer(slice_id, requested_work)?;
+        let digest = format!("{:x}", Sha256::digest(requested_work.as_bytes()));
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{thread_id}:linked-slice-offer:{}", &digest[..16]),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: reply.clone(),
+            delivered: false,
+            update_timestamp: None,
+        })?;
+        self.deliver_pending()?;
+        Ok(reply)
+    }
+
+    /// Report an optional post-land Observation in the originating thread
+    /// without changing the completed Slice.
+    pub fn report_thread_observation(
+        &mut self,
+        thread_id: &str,
+        observation_ref: &str,
+    ) -> Result<String> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let reply = redact_secrets(
+            &WorkControl::new(&project.checkout.path)
+                .render_optional_observation(slice_id, observation_ref)?,
+        );
+        let digest = format!("{:x}", Sha256::digest(observation_ref.as_bytes()));
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{thread_id}:observation:{}", &digest[..16]),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: reply.clone(),
+            delivered: false,
+            update_timestamp: None,
+        })?;
+        self.deliver_pending()?;
+        Ok(reply)
+    }
+
     /// Link policy-created corrective Work to the originating Slice and report
     /// its durable initial state through the original thread.
     pub fn link_thread_corrective_work(

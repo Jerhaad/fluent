@@ -6363,6 +6363,9 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let scheduler_run = guide.find("fluent scheduler run").unwrap();
+    let scheduler_status = guide.find("fluent scheduler status").unwrap();
+    let slack_enable = guide.find("fluent slack enable").unwrap();
     assert!(
         guide.contains("Socket Mode")
             && guide.contains("Keychain")
@@ -6380,6 +6383,9 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("fluent slack checkout-identity")
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")
+            && guide.contains("keep that process running")
+            && scheduler_run < scheduler_status
+            && scheduler_status < slack_enable
     );
 }
 #[test]
@@ -7520,54 +7526,57 @@ fn failed_work_posts_evidence_and_permitted_recovery() {
 
 #[test]
 fn parallel_work_transitions_remain_attributed() {
-    let (_home, checkout, _config) = setup(true);
-    let control = WorkControl::new(checkout.path());
-    control
-        .approve_plan(
-            "slice-parallel-direct",
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
             "U1",
+            "slice-parallel-runner",
             &[
                 PlannedWork::new("work-left", "Left"),
                 PlannedWork::new("work-right", "Right"),
             ],
         )
         .unwrap();
-    let replies = control
-        .reconcile_durable_transitions("slice-parallel-direct")
-        .unwrap()
-        .into_iter()
-        .map(|transition| render_transition_reply(&transition, &[]))
-        .collect::<Vec<_>>();
-    assert!(
-        replies
-            .iter()
-            .any(|reply| reply.contains("Work Item work-left"))
+    runner.report_thread_work("1.0").unwrap();
+    append_attempt_state(
+        &checkout,
+        "work-left",
+        fluent::work_model::AttemptStatus::Executing,
+        "left started",
     );
-    assert!(
-        replies
-            .iter()
-            .any(|reply| reply.contains("Work Item work-right"))
+    append_attempt_state(
+        &checkout,
+        "work-right",
+        fluent::work_model::AttemptStatus::NeedsUser,
+        "right needs input",
     );
+    let before = runner.slack().deliveries.len();
+    runner.report_thread_work("1.0").unwrap();
+    let replies = &runner.slack().deliveries[before..];
+    assert!(replies.iter().any(|reply| {
+        reply.thread_timestamp == "1.0"
+            && reply.text.contains("Work Item work-left")
+            && reply.text.contains("is now executing")
+    }));
+    assert!(replies.iter().any(|reply| {
+        reply.thread_timestamp == "1.0"
+            && reply.text.contains("Work Item work-right")
+            && reply.text.contains("is now needs-user")
+    }));
 }
 
 #[test]
 fn reconnect_reconciles_work_transitions_exactly_once() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-reconnect-direct", "work-reconnect");
-    let first = control
-        .reconcile_durable_transitions("slice-reconnect-direct")
-        .unwrap();
-    assert!(!first.is_empty());
-    assert!(
-        control
-            .reconcile_durable_transitions("slice-reconnect-direct")
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[test]
-fn runner_reconnect_delivers_missed_work_in_order_once() {
     let (home, checkout, config) = setup(true);
     let mut first = CollaborationRunner::new(
         home.path(),
@@ -7735,12 +7744,21 @@ fn runner_reconnect_delivers_missed_work_in_order_once() {
 
 #[test]
 fn finished_planned_work_marks_slice_complete() {
-    let (_home, checkout, _config) = setup(true);
-    let control = WorkControl::new(checkout.path());
-    control
-        .approve_plan(
-            "slice-finished",
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
             "U1",
+            "slice-finished",
             &[
                 PlannedWork::new("work-finished", "First"),
                 PlannedWork::new("work-sibling", "Sibling"),
@@ -7753,6 +7771,8 @@ fn finished_planned_work_marks_slice_complete() {
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
+    runner.report_thread_work("1.0").unwrap();
+    let control = WorkControl::new(checkout.path());
     assert_eq!(
         control.slice_stage("slice-finished").unwrap(),
         SliceStage::Active
@@ -7763,10 +7783,19 @@ fn finished_planned_work_marks_slice_complete() {
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
+    let before = runner.slack().deliveries.len();
+    runner.report_thread_work("1.0").unwrap();
     assert_eq!(
         control.slice_stage("slice-finished").unwrap(),
         SliceStage::Complete
     );
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.update_timestamp.is_some()
+            && delivery.text.contains("Slice: Complete")
+            && delivery.text.contains("work-finished: complete")
+            && delivery.text.contains("work-sibling: complete")
+    }));
     fluent::work_model::WorkModelStore::new(checkout.path())
         .mutate_work_item("work-finished", |item| {
             item.attempts.push(fluent::work_model::Attempt {
@@ -7778,82 +7807,120 @@ fn finished_planned_work_marks_slice_complete() {
             Ok(())
         })
         .unwrap();
+    let before = runner.slack().deliveries.len();
+    runner.report_thread_work("1.0").unwrap();
     assert_eq!(
         control.slice_stage("slice-finished").unwrap(),
         SliceStage::Active,
         "a failed latest required Attempt keeps the Slice active"
     );
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.update_timestamp.is_some()
+            && delivery.text.contains("Slice: Active")
+            && delivery.text.contains("work-finished: failed")
+    }));
     fluent::work_model::WorkModelStore::new(checkout.path())
         .mutate_work_item("work-finished", |item| {
             item.attempts.last_mut().unwrap().status = fluent::work_model::AttemptStatus::NeedsUser;
             Ok(())
         })
         .unwrap();
+    let before = runner.slack().deliveries.len();
+    runner.report_thread_work("1.0").unwrap();
     assert_eq!(
         control.slice_stage("slice-finished").unwrap(),
         SliceStage::Active,
         "a needs-user latest required Attempt keeps the Slice active"
     );
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.update_timestamp.is_some()
+            && delivery.text.contains("Slice: Active")
+            && delivery.text.contains("work-finished: needs-user")
+    }));
 }
 
 #[test]
 fn completed_thread_still_answers_slice_status_questions() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-answer", "work-answer");
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-answer",
+            &[PlannedWork::new("work-answer", "Answer")],
+        )
+        .unwrap();
     append_attempt_state(
         &checkout,
         "work-answer",
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
-    let status = control
-        .render_status_message("slice-answer", "app", "main", "idle")
+    runner.report_thread_work("1.0").unwrap();
+    let before = runner.slack().deliveries.len();
+    runner
+        .ingest(event("E2", Some("1.0"), "work status"))
         .unwrap();
-    assert!(status.contains("Slice: Complete"));
-    assert!(status.contains("work-answer: complete"));
+    assert!(runner.slack().deliveries[before..].iter().any(|delivery| {
+        delivery.thread_timestamp == "1.0"
+            && delivery.text.contains("Slice: Complete")
+            && delivery.text.contains("work-answer: complete")
+    }));
 }
 
 #[test]
 fn new_work_after_completion_offers_linked_slice_thread() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-linked", "work-linked");
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-linked",
+            &[PlannedWork::new("work-linked", "Linked")],
+        )
+        .unwrap();
     append_attempt_state(
         &checkout,
         "work-linked",
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
-    let offer = control
-        .linked_slice_offer("slice-linked", "new product work")
+    runner.report_thread_work("1.0").unwrap();
+    let before = runner.slack().deliveries.len();
+    let offer = runner
+        .offer_linked_slice_for_new_work("1.0", "U1", "new product work")
         .unwrap();
     assert!(offer.contains("Slice slice-linked remains complete"));
     assert!(offer.contains("Start linked Slice"));
+    assert!(
+        runner.slack().deliveries[before..]
+            .iter()
+            .any(|delivery| { delivery.thread_timestamp == "1.0" && delivery.text == offer })
+    );
 }
 
 #[test]
 fn corrective_follow_up_reactivates_original_slice() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-corrective", "work-corrective");
-    append_attempt_state(
-        &checkout,
-        "work-corrective",
-        fluent::work_model::AttemptStatus::Complete,
-        "completed",
-    );
-    fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item("work-corrective", |item| {
-            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        control.slice_stage("slice-corrective").unwrap(),
-        SliceStage::Active
-    );
-}
-
-#[test]
-fn runner_links_new_corrective_work_to_completed_slice() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
@@ -7913,18 +7980,42 @@ fn runner_links_new_corrective_work_to_completed_slice() {
 
 #[test]
 fn optional_observation_does_not_reopen_completed_slice() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-observation", "work-observation");
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-observation",
+            &[PlannedWork::new("work-observation", "Observation")],
+        )
+        .unwrap();
     append_attempt_state(
         &checkout,
         "work-observation",
         fluent::work_model::AttemptStatus::Complete,
         "completed",
     );
-    let reply = control
-        .render_optional_observation("slice-observation", "observation-42")
+    runner.report_thread_work("1.0").unwrap();
+    let before = runner.slack().deliveries.len();
+    let reply = runner
+        .report_thread_observation("1.0", "observation-42")
         .unwrap();
     assert!(reply.contains("remains complete"));
+    assert!(
+        runner.slack().deliveries[before..]
+            .iter()
+            .any(|delivery| { delivery.thread_timestamp == "1.0" && delivery.text == reply })
+    );
+    let control = WorkControl::new(checkout.path());
     assert_eq!(
         control.slice_stage("slice-observation").unwrap(),
         SliceStage::Complete
