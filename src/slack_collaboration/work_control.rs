@@ -95,6 +95,26 @@ pub struct WorkTransition {
     pub reason: Option<String>,
 }
 
+/// Render one bounded, attributed transition reply for a Slack thread. The
+/// caller supplies links only after it has verified that they are safe public
+/// evidence references.
+pub fn render_transition_reply(transition: &WorkTransition, evidence: &[String]) -> String {
+    let mut reply = format!(
+        "Work Item {} is now {}.",
+        transition.work_item_id, transition.new_state
+    );
+    if let Some(origin) = &transition.origin {
+        reply.push_str(&format!(" Origin: {origin}."));
+    }
+    if let Some(reason) = &transition.reason {
+        reply.push_str(&format!(" Next action: {reason}."));
+    }
+    if !evidence.is_empty() {
+        reply.push_str(&format!(" Evidence: {}.", evidence.join(", ")));
+    }
+    reply
+}
+
 /// Materializes approved plans without starting execution, then independently
 /// authorizes their stable scheduler requests.
 pub struct WorkControl {

@@ -6570,6 +6570,10 @@ macro_rules! persisted_slice_status_selector {
             assert_eq!(transitions[0].work_item_id, "work-selector");
             assert_eq!(transitions[0].new_state, "planned");
             assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
+            let reply = render_transition_reply(&transitions[0], &["work evidence".into()]);
+            assert!(reply.contains("Work Item work-selector is now planned"));
+            assert!(reply.contains("Origin: slack-thread"));
+            assert!(reply.contains("Evidence: work evidence"));
             assert!(
                 control
                     .reconcile_transitions("slice-selector", Some("slack-thread"))
