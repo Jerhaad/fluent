@@ -6721,6 +6721,50 @@ fn runner_delivers_plan_execution_and_durable_work_updates() {
             && delivery.text.contains("Evidence: slack-slice:slice-runner")
     }));
     assert!(runner.report_thread_work("1.0").unwrap().is_empty());
+
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let executing = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some("worker accepted execution".into()),
+        evidence_ref: Some("scheduler-event:accepted".into()),
+    };
+    store
+        .mutate_work_item_with_transition("work-runner", Some(&executing), |item| {
+            item.attempts.push(fluent::work_model::Attempt {
+                id: "attempt-runner".into(),
+                work_item_id: item.id.clone(),
+                status: fluent::work_model::AttemptStatus::Executing,
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    let needs_user = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some("choose a recovery option".into()),
+        evidence_ref: Some("scheduler-event:needs-user".into()),
+    };
+    store
+        .mutate_work_item_with_transition("work-runner", Some(&needs_user), |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+
+    runner.report_thread_work("1.0").unwrap();
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("attempt attempt-runner")
+            && delivery.text.contains("is now needs-user")
+            && delivery.text.contains("Origin: scheduler")
+            && delivery
+                .text
+                .contains("Next action: choose a recovery option")
+            && delivery
+                .text
+                .contains("Evidence: scheduler-event:needs-user")
+            && delivery.text.contains("Elapsed:")
+            && delivery.text.contains("requested recovery decision")
+    }));
 }
 
 #[test]
