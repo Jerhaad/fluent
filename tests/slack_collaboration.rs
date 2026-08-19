@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use fluent::slack_collaboration::*;
 use fluent::work_model::{PlanningContext, WorkItem, WorkModelStore};
@@ -2556,14 +2556,10 @@ fn claude_structured_session_starts_and_resumes() {
 
 fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
     struct QueueProvider {
-        name: &'static str,
         calls: Arc<Mutex<Vec<String>>>,
-        unavailable: bool,
+        gate: Arc<(Mutex<(usize, bool)>, Condvar)>,
     }
     impl ConversationProvider for QueueProvider {
-        fn name(&self) -> &str {
-            self.name
-        }
         fn start(
             &mut self,
             _: &str,
@@ -2572,8 +2568,12 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
             _: &str,
         ) -> anyhow::Result<(String, String)> {
             self.calls.lock().unwrap().push(contribution.into());
-            if self.unavailable {
-                anyhow::bail!("provider unavailable")
+            let (lock, changed) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            changed.notify_all();
+            while !state.1 {
+                state = changed.wait(state).unwrap();
             }
             Ok(("session".into(), "continued".into()))
         }
@@ -2590,37 +2590,35 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
         }
     }
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let provider = ProviderRegistry::new([
-        Box::new(QueueProvider {
-            name: "codex",
-            calls: calls.clone(),
-            unavailable: true,
-        }) as Box<dyn ConversationProvider>,
-        Box::new(QueueProvider {
-            name: "claude",
-            calls: calls.clone(),
-            unavailable: false,
-        }) as Box<dyn ConversationProvider>,
-    ])
-    .unwrap();
+    let gate = Arc::new((Mutex::new((0, false)), Condvar::new()));
+    let provider = QueueProvider {
+        calls: calls.clone(),
+        gate: gate.clone(),
+    };
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new_with_turn_capacity(
-        home.path(),
-        config,
-        provider,
-        InMemorySlack::default(),
-        1,
-    );
+    let mut runner =
+        AsyncCollaborationRunner::new(home.path(), config, provider, InMemorySlack::default(), 1);
     runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while state.0 == 0 {
+            state = changed.wait(state).unwrap();
+        }
+    }
     runner
         .ingest(event("E2", Some("1.0"), "first queued"))
         .unwrap();
     runner
         .ingest(event("E3", Some("1.0"), "second queued"))
         .unwrap();
-    runner
-        .ingest(event("E4", Some("1.0"), "@Fluent [provider=claude]"))
-        .unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        state.1 = true;
+        changed.notify_all();
+    }
+    runner.wait_for_completion().unwrap();
     let calls = calls.lock().unwrap().clone();
     (calls, runner.slack().deliveries.clone())
 }
@@ -2645,7 +2643,82 @@ fn queued_replies_form_one_ordered_attributed_turn() {
 }
 
 #[test]
-fn provider_failure_preserves_replies_and_reports_recovery() {
+fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
+    struct FairProvider {
+        calls: Arc<Mutex<Vec<String>>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl ConversationProvider for FairProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            contribution: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(contribution.into());
+                calls.len() == 1
+            };
+            if first {
+                let (lock, changed) = &*self.gate;
+                let mut released = lock.lock().unwrap();
+                changed.notify_all();
+                while !*released {
+                    released = changed.wait(released).unwrap();
+                }
+            }
+            Ok((format!("session-{contribution}"), "reply".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config,
+        FairProvider {
+            calls: calls.clone(),
+            gate: gate.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent first")).unwrap();
+    while calls.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+    let mut second = event("E2", None, "@Fluent second");
+    second.timestamp = "2.0".into();
+    runner.ingest(second).unwrap();
+    assert_eq!(&*calls.lock().unwrap(), &["@Fluent first"]);
+
+    {
+        let (lock, changed) = &*gate;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+    }
+    runner.wait_for_completion().unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(
+        &*calls.lock().unwrap(),
+        &["@Fluent first", "@Fluent second"]
+    );
+}
+
+#[test]
+fn provider_failure_classifies_recovery_state() {
     assert_eq!(
         classify_provider_failure("authentication required"),
         ProviderFailure::Authentication
@@ -2659,7 +2732,7 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
 }
 
 #[test]
-fn provider_failure_preserves_reply_and_reports_recovery() {
+fn provider_failure_preserves_replies_and_reports_recovery() {
     struct FailingProvider;
     impl ConversationProvider for FailingProvider {
         fn start(
@@ -2798,6 +2871,26 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
 
 #[test]
 fn rate_limit_waits_recovers_and_offers_provider_switch() {
+    struct ClockSlack {
+        inner: InMemorySlack,
+        now: Arc<AtomicU64>,
+    }
+    impl SlackTransport for ClockSlack {
+        fn acknowledge(&mut self, event_id: &str) -> anyhow::Result<()> {
+            self.inner.acknowledge(event_id)
+        }
+        fn post(&mut self, delivery: &OutboundDelivery) -> anyhow::Result<()> {
+            self.inner.post(delivery)
+        }
+        fn receive_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<InboundEnvelope>> {
+            self.now.fetch_add(timeout.as_secs(), Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+    #[derive(Clone)]
     struct RecoveringProvider {
         calls: Arc<Mutex<Vec<String>>>,
         attempts: Arc<AtomicUsize>,
@@ -2830,37 +2923,66 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
     }
     let now = Arc::new(AtomicU64::new(1_000));
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecoveringProvider {
+        calls: calls.clone(),
+        attempts: Arc::new(AtomicUsize::new(0)),
+    };
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(
+    let stored_config = config.clone();
+    let mut runner = AsyncCollaborationRunner::new(
         home.path(),
         config,
-        RecoveringProvider {
-            calls: calls.clone(),
-            attempts: Arc::new(AtomicUsize::new(0)),
+        provider.clone(),
+        ClockSlack {
+            inner: InMemorySlack::default(),
+            now: now.clone(),
         },
-        InMemorySlack::default(),
+        1,
     );
     let clock = now.clone();
     runner.set_clock_for_test(move || clock.load(Ordering::SeqCst));
 
     runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner.wait_for_completion().unwrap();
     runner
         .ingest(event("E2", Some("1.0"), "first queued"))
         .unwrap();
     runner
         .ingest(event("E3", Some("1.0"), "second queued"))
         .unwrap();
-    assert!(runner.slack().deliveries.iter().any(|delivery| {
+    assert!(runner.slack().inner.deliveries.iter().any(|delivery| {
         delivery
             .text
             .contains("queued for the next conversation turn")
     }));
+    assert!(runner.slack().inner.deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("project approver may switch providers")
+    }));
 
-    now.store(1_016, Ordering::SeqCst);
-    runner.retry_due_turns().unwrap();
+    drop(runner);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        stored_config.clone(),
+        provider,
+        ClockSlack {
+            inner: InMemorySlack::default(),
+            now: now.clone(),
+        },
+        1,
+    );
+    let clock = now.clone();
+    runner.set_clock_for_test(move || clock.load(Ordering::SeqCst));
+
+    runner
+        .drive_once(std::time::Duration::from_secs(16))
+        .unwrap();
     assert_eq!(calls.lock().unwrap().len(), 1);
-    now.store(1_017, Ordering::SeqCst);
-    runner.retry_due_turns().unwrap();
+    runner
+        .drive_once(std::time::Duration::from_secs(60))
+        .unwrap();
+    runner.wait_for_completion().unwrap();
     assert_eq!(
         &*calls.lock().unwrap(),
         &[
@@ -2871,7 +2993,7 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
     );
     assert!(
         FileCollaborationStore::new(home.path())
-            .load_thread(&runner.config, "1.0")
+            .load_thread(&stored_config, "1.0")
             .unwrap()
             .unwrap()
             .pending_turn
@@ -2884,7 +3006,7 @@ fn approver_switches_provider_without_changing_work() {
     struct SwitchingProvider {
         name: &'static str,
         calls: Arc<Mutex<Vec<(String, String)>>>,
-        unavailable: bool,
+        fail_resume: bool,
     }
     impl ConversationProvider for SwitchingProvider {
         fn name(&self) -> &str {
@@ -2901,20 +3023,27 @@ fn approver_switches_provider_without_changing_work() {
                 self.name.into(),
                 format!("Slack user {actor}: {contribution}"),
             ));
-            if self.unavailable {
-                anyhow::bail!("provider runtime unavailable")
-            }
-            Ok((format!("{}-session", self.name), "continued reply".into()))
+            Ok((
+                format!("{}-session", self.name),
+                format!("{} prior reply", self.name),
+            ))
         }
         fn resume(
             &mut self,
             _: &str,
             _: &str,
             _: &ProviderScope,
-            _: &str,
-            _: &str,
+            contribution: &str,
+            actor: &str,
         ) -> anyhow::Result<String> {
-            unreachable!()
+            self.calls.lock().unwrap().push((
+                self.name.into(),
+                format!("Slack user {actor}: {contribution}"),
+            ));
+            if self.fail_resume {
+                anyhow::bail!("provider runtime unavailable")
+            }
+            Ok("continued reply".into())
         }
     }
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2922,12 +3051,12 @@ fn approver_switches_provider_without_changing_work() {
         Box::new(SwitchingProvider {
             name: "codex",
             calls: calls.clone(),
-            unavailable: true,
+            fail_resume: true,
         }) as Box<dyn ConversationProvider>,
         Box::new(SwitchingProvider {
             name: "claude",
             calls: calls.clone(),
-            unavailable: false,
+            fail_resume: false,
         }) as Box<dyn ConversationProvider>,
     ])
     .unwrap();
@@ -2936,7 +3065,10 @@ fn approver_switches_provider_without_changing_work() {
         CollaborationRunner::new(home.path(), config, registry, InMemorySlack::default());
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     runner
-        .ingest(event("E2", Some("1.0"), "@Fluent [provider=claude]"))
+        .ingest(event("E2", Some("1.0"), "continue the plan"))
+        .unwrap();
+    runner
+        .ingest(event("E3", Some("1.0"), "@Fluent [provider=claude]"))
         .unwrap();
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
@@ -2945,19 +3077,25 @@ fn approver_switches_provider_without_changing_work() {
     assert_eq!(thread.provider.as_deref(), Some("claude"));
     assert!(thread.linked_work.is_none());
     assert!(thread.pending_turn.is_none());
+    let calls = calls.lock().unwrap();
     assert_eq!(
-        &*calls.lock().unwrap(),
-        &[
-            ("codex".into(), "Slack user U1: @Fluent hello".into()),
-            ("claude".into(), "Slack user U1: @Fluent hello".into())
-        ]
+        calls[0],
+        ("codex".into(), "Slack user U1: @Fluent hello".into())
     );
+    assert_eq!(
+        calls[1],
+        ("codex".into(), "Slack user U1: continue the plan".into())
+    );
+    assert_eq!(calls[2].0, "claude");
+    assert!(calls[2].1.contains("Slack user U1: @Fluent hello"));
+    assert!(calls[2].1.contains("Slack user Fluent: codex prior reply"));
+    assert!(calls[2].1.contains("Slack user U1: continue the plan"));
     assert!(
         runner
             .slack()
             .deliveries
             .iter()
-            .any(|delivery| delivery.text.contains("continued reply"))
+            .any(|delivery| delivery.text.contains("claude prior reply"))
     );
 }
 
@@ -4016,6 +4154,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         processed_events: BTreeSet::from(["E1".into()]),
         last_connection: None,
         queued_contributions: Vec::new(),
+        conversation: Vec::new(),
         pending_turn: Some(PendingTurn {
             action_id: "E1".into(),
             source_timestamp: "1.0".into(),
@@ -4025,6 +4164,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
             provider_turn_id: None,
             completed_reply: None,
             retry_at_unix_seconds: None,
+            delivery_attempt: 0,
         }),
     };
     let store = FileCollaborationStore::new(home.path());

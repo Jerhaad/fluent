@@ -713,12 +713,6 @@ pub fn reconcile_connected_runner<P: ConversationProvider, S: SlackTransport>(
     reconcile_runner_connection(runner, false)
 }
 
-fn reconcile_interrupted_runner<P: ConversationProvider, S: SlackTransport>(
-    runner: &mut CollaborationRunner<'_, P, S>,
-) -> Result<()> {
-    reconcile_runner_connection(runner, true)
-}
-
 fn reconcile_runner_connection<P: ConversationProvider, S: SlackTransport>(
     runner: &mut CollaborationRunner<'_, P, S>,
     report_interruption: bool,
@@ -769,17 +763,28 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
-    let mut runner =
-        CollaborationRunner::new_with_turn_capacity(home, config, provider, slack, turn_capacity);
-    reconcile_connected_runner(&mut runner)?;
+    let mut runner = AsyncCollaborationRunner::new(home, config, provider, slack, turn_capacity);
+    let targets = runner.recovery_targets()?;
+    let history = runner.slack_mut().bounded_history(&targets)?;
+    let connected_at = connection_time();
+    runner.restore_connection(history, connected_at.clone(), false)?;
+    save_runner_operational_state(
+        home,
+        &RunnerOperationalState {
+            connected: true,
+            last_successful_connection: Some(connected_at),
+            failure: None,
+        },
+    )?;
     loop {
-        runner.retry_due_turns()?;
-        match runner.slack_mut().receive() {
-            Ok(event) => runner.ingest(event)?,
+        match runner.drive_once(std::time::Duration::from_secs(1)) {
+            Ok(()) => continue,
             Err(error) => {
                 record_runner_failure(home, &error)?;
                 runner.slack_mut().reconnect()?;
-                reconcile_interrupted_runner(&mut runner)?;
+                let targets = runner.recovery_targets()?;
+                let history = runner.slack_mut().bounded_history(&targets)?;
+                runner.restore_connection(history, connection_time(), true)?;
             }
         }
     }

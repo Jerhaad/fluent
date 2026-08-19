@@ -240,6 +240,8 @@ pub struct FluentThread {
     pub pending_turn: Option<PendingTurn>,
     #[serde(default)]
     pub queued_contributions: Vec<QueuedContribution>,
+    #[serde(default)]
+    pub conversation: Vec<QueuedContribution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +265,8 @@ pub struct PendingTurn {
     pub completed_reply: Option<String>,
     #[serde(default)]
     pub retry_at_unix_seconds: Option<u64>,
+    #[serde(default)]
+    pub delivery_attempt: u64,
 }
 
 impl FluentThread {
@@ -288,6 +292,7 @@ impl FluentThread {
             last_connection: None,
             pending_turn: None,
             queued_contributions: Vec::new(),
+            conversation: Vec::new(),
         }
     }
 }

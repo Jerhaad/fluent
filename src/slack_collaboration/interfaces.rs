@@ -264,7 +264,7 @@ pub fn provider_recovery_message(failure: &ProviderFailure, can_switch: bool) ->
 }
 
 /// Provider-neutral turn boundary with an explicit filesystem authority scope.
-pub trait ConversationProvider {
+pub trait ConversationProvider: Send {
     /// Reports the provider implementation that owns persisted session ids.
     fn name(&self) -> &str {
         "codex"
@@ -371,6 +371,13 @@ pub trait SlackTransport {
 
     fn receive(&mut self) -> Result<InboundEnvelope> {
         bail!("Slack transport does not receive Socket Mode envelopes")
+    }
+
+    fn receive_timeout(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> Result<Option<InboundEnvelope>> {
+        self.receive().map(Some)
     }
 
     fn reconnect(&mut self) -> Result<()> {

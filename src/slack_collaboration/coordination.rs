@@ -1,5 +1,4 @@
 use super::*;
-use crate::work_model::WorkModelStore;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -62,7 +61,6 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     provider: P,
     slack: S,
     store: C,
-    recovering_event: bool,
     configuration_error: Option<String>,
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     turn_pool: FairTurnPool,
@@ -121,7 +119,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             provider,
             slack,
             store,
-            recovering_event: false,
             configuration_error,
             clock: Arc::new(|| {
                 std::time::SystemTime::now()
@@ -143,129 +140,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     }
     pub fn slack_mut(&mut self) -> &mut S {
         &mut self.slack
-    }
-
-    /// Store and present an immutable planning revision before it can advance.
-    pub fn present_planning_artifact(
-        &mut self,
-        thread_id: &str,
-        kind: &str,
-        markdown: &str,
-    ) -> Result<ArtifactRevision> {
-        let mut thread = self
-            .store
-            .load_thread(&self.config, thread_id)?
-            .context("Fluent thread is unavailable")?;
-        self.present_planning_artifact_for_thread(&mut thread, kind, markdown)
-    }
-
-    fn present_planning_artifact_for_thread(
-        &mut self,
-        thread: &mut FluentThread,
-        kind: &str,
-        markdown: &str,
-    ) -> Result<ArtifactRevision> {
-        if let Some(work_item_id) = thread.linked_work.as_deref() {
-            WorkModelStore::new(&self.bound_project(&thread)?.checkout.path)
-                .read_work_item(work_item_id)?
-                .ensure_planning_revision_can_advance(kind)?;
-        }
-        let revision = ArtifactRevision::new(kind, markdown);
-        if !thread
-            .artifact_revisions
-            .iter()
-            .any(|existing| existing.id == revision.id)
-        {
-            thread.artifact_revisions.push(revision.clone());
-        }
-        thread.pending_artifact_revision = Some(revision.id.clone());
-        thread.planning_stage = Some(revision.kind.clone());
-        thread.pending_question = Some(format!(
-            "approve {} revision {}",
-            revision.kind, revision.id
-        ));
-        self.store.save_thread(&self.config, &thread)?;
-        let parts = Self::artifact_delivery_parts(&revision);
-        let part_count = parts.len();
-        let part_width = part_count.to_string().len();
-        for (index, part) in parts.into_iter().enumerate() {
-            self.store.persist_outbox(OutboundDelivery {
-                id: format!(
-                    "{}:artifact:{}:{:0part_width$}",
-                    thread.id, revision.id, index
-                ),
-                channel: thread.channel.clone(),
-                thread_timestamp: thread.id.clone(),
-                text: format!(
-                    "Planning revision {} ({}/{part_count})\n\n{part}",
-                    revision.id,
-                    index + 1
-                ),
-                delivered: false,
-                approval_control: None,
-            })?;
-        }
-        self.deliver_pending()?;
-        Ok(revision)
-    }
-
-    /// Advance only the exact revision currently waiting for approval.
-    pub fn approve_planning_revision(
-        &mut self,
-        thread_id: &str,
-        revision_id: &str,
-        actor: &str,
-    ) -> Result<()> {
-        let mut thread = self
-            .store
-            .load_thread(&self.config, thread_id)?
-            .context("Fluent thread is unavailable")?;
-        if !self
-            .bound_project(&thread)?
-            .project_approvers
-            .contains(actor)
-        {
-            bail!("participant is not a project approver for this Fluent thread");
-        }
-        if thread.pending_artifact_revision.as_deref() != Some(revision_id) {
-            bail!("approval must identify the revision waiting at the planning gate");
-        }
-        let revision = thread
-            .artifact_revisions
-            .iter()
-            .find(|revision| revision.id == revision_id)
-            .context("pending planning revision is unavailable")?;
-        if thread.planning_stage.as_deref() != Some(revision.kind.as_str())
-            || thread.pending_question.as_deref()
-                != Some(&format!("approve {} revision {revision_id}", revision.kind))
-        {
-            bail!("planning lifecycle is not waiting for this artifact revision");
-        }
-        self.approve_work_item_planning_revision(&thread, revision)?;
-        thread.pending_artifact_revision = None;
-        thread.pending_question = None;
-        self.store.save_thread(&self.config, &thread)
-    }
-
-    fn approve_work_item_planning_revision(
-        &self,
-        thread: &FluentThread,
-        revision: &ArtifactRevision,
-    ) -> Result<()> {
-        let work_item_id = thread
-            .linked_work
-            .as_deref()
-            .context("planning artifact is not bound to a Fluent Work Item")?;
-        let checkout = &self.bound_project(thread)?.checkout.path;
-        WorkModelStore::new(checkout)
-            .mutate_work_item(work_item_id, |work_item| {
-                work_item.approve_planning_revision(
-                    &revision.kind,
-                    &revision.id,
-                    revision.markdown.clone(),
-                )
-            })
-            .with_context(|| format!("approve planning Work Item {work_item_id}"))
     }
 
     #[doc(hidden)]
@@ -305,9 +179,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .map(|turn| turn.actor.clone())
                     .unwrap_or_default(),
                 text: String::new(),
-                change: InboundChange::Message,
-                approval_action_id: None,
-                approval_artifact_revision: None,
             };
             self.complete_pending_turn(&event, &mut thread)?;
         }
@@ -322,6 +193,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .store
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
+        self.switch_provider_metadata(&mut thread, actor, provider)?;
+        self.store.save_thread(&self.config, &thread)?;
+        let event = InboundEnvelope {
+            id: format!("{}:provider-switch:{}", thread.id, provider),
+            acknowledgement_id: String::new(),
+            channel: thread.channel.clone(),
+            timestamp: thread.id.clone(),
+            thread_timestamp: Some(thread.id.clone()),
+            user: actor.into(),
+            text: format!("[provider={provider}]"),
+        };
+        self.complete_pending_turn(&event, &mut thread)?;
+        self.store.save_thread(&self.config, &thread)
+    }
+
+    fn switch_provider_metadata(
+        &self,
+        thread: &mut FluentThread,
+        actor: &str,
+        provider: &str,
+    ) -> Result<()> {
         let project = self.bound_project(&thread)?;
         if !project.project_approvers.contains(actor) {
             bail!("only a project approver may switch providers");
@@ -334,45 +226,25 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         thread.provider = Some(provider.into());
         thread.provider_session = None;
-        self.store.save_thread(&self.config, &thread)?;
         self.store.persist_outbox(OutboundDelivery {
             id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false,
-            approval_control: None,
-        })?;
-        let event = InboundEnvelope {
-            id: format!("{}:provider-switch:{}", thread.id, provider),
-            acknowledgement_id: String::new(),
-            channel: thread.channel.clone(),
-            timestamp: thread.id.clone(),
-            thread_timestamp: Some(thread.id.clone()),
-            user: actor.into(),
-            text: format!("[provider={provider}]"),
-            change: InboundChange::Message,
-            approval_action_id: None,
-            approval_artifact_revision: None,
-        };
-        self.complete_pending_turn(&event, &mut thread)?;
-        self.store.save_thread(&self.config, &thread)
+        })
     }
 
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
+        self.ingest_with_completion(event, true)
+    }
+
+    fn ingest_deferred(&mut self, event: InboundEnvelope) -> Result<()> {
+        self.ingest_with_completion(event, false)
+    }
+
+    fn ingest_with_completion(&mut self, event: InboundEnvelope, run_now: bool) -> Result<()> {
         event.validate_thread_identity()?;
-        self.config = self.current_authority_config()?;
-        if let Some(thread) = self.store.load_thread(&self.config, &event.thread_id())?
-            && thread.state == ThreadState::Active
-            && !policy::participant_can_contribute(&self.config, &thread, &event)
-        {
-            if !event.acknowledgement_id.is_empty() {
-                self.slack.acknowledge(&event.acknowledgement_id)?;
-            }
-            self.slack.respond_private(
-                &event.channel,
-                &event.user,
-                "You cannot participate in this Fluent thread.",
-            )?;
-            return Ok(());
+        if let Some(error) = &self.configuration_error {
+            bail!("runner configuration is invalid; refusing Slack ingress: {error}");
         }
         match self.store.persist_inbox(&self.config, &event)? {
             InboxState::Processed => return Ok(()),
@@ -381,27 +253,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             InboxState::Pending => {}
         }
-        self.process(event.clone())?;
+        self.process(event.clone(), run_now)?;
         self.store.mark_inbox_processed(&event.id)?;
         self.deliver_pending()
-    }
-
-    fn artifact_delivery_parts(revision: &ArtifactRevision) -> Vec<String> {
-        let mut part_count = 1;
-        loop {
-            let header = format!(
-                "Planning revision {} ({part_count}/{part_count})\n\n",
-                revision.id
-            );
-            let payload_limit = SLACK_MESSAGE_CONTENT_LIMIT
-                .checked_sub(header.len())
-                .expect("artifact revision header must fit in Slack delivery");
-            let parts = split_artifact_markdown(&revision.markdown, payload_limit);
-            if parts.len() == part_count {
-                return parts;
-            }
-            part_count = parts.len();
-        }
     }
     pub fn reconnect(
         &mut self,
@@ -417,11 +271,21 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         connected_at: String,
         report_interruption: bool,
     ) -> Result<()> {
+        self.restore_connection_with_completion(history, connected_at, report_interruption, true)
+    }
+
+    fn restore_connection_with_completion(
+        &mut self,
+        history: impl IntoIterator<Item = InboundEnvelope>,
+        connected_at: String,
+        report_interruption: bool,
+        run_now: bool,
+    ) -> Result<()> {
         let mut events: Vec<_> = self
             .store
             .load_pending_inbox(&self.config)?
             .into_iter()
-            .map(|event| (true, event))
+            .map(|event| (false, event))
             .collect();
         events.extend(history.into_iter().map(|event| (true, event)));
         events.sort_by(|(left_history, left), (right_history, right)| {
@@ -430,9 +294,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 .then(left_history.cmp(right_history).then(left.id.cmp(&right.id)))
         });
         for (recovered, event) in events {
-            self.recovering_event = recovered;
-            self.ingest(event.clone())?;
-            self.recovering_event = false;
+            self.ingest_with_completion(event.clone(), run_now)?;
             if recovered {
                 self.store.save_recovery_cursor(
                     &event.channel,
@@ -485,23 +347,36 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         Ok(())
     }
-    fn process(&mut self, event: InboundEnvelope) -> Result<()> {
-        let existing = self.store.load_thread(&self.config, &event.thread_id())?;
-        if existing.is_none()
-            && event.is_top_level_mention()
-            && !policy::participant_can_contribute(
-                &self.current_authority_config()?,
-                &FluentThread::new(&event),
-                &event,
-            )
-        {
-            return self.slack.respond_private(
-                &event.channel,
-                &event.user,
-                "You are not allowed to start Fluent work.",
-            );
-        }
-        let mut thread = existing.unwrap_or_else(|| FluentThread::new(&event));
+
+    fn run_pending_thread(&mut self, thread_id: &str) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let turn = thread
+            .pending_turn
+            .as_ref()
+            .context("thread has no pending provider turn")?;
+        let event = InboundEnvelope {
+            id: if turn.delivery_attempt == 0 {
+                turn.action_id.clone()
+            } else {
+                format!("{}:retry:{}", turn.action_id, turn.delivery_attempt)
+            },
+            acknowledgement_id: String::new(),
+            channel: thread.channel.clone(),
+            timestamp: thread.id.clone(),
+            thread_timestamp: Some(thread.id.clone()),
+            user: turn.actor.clone(),
+            text: turn.contribution.clone(),
+        };
+        self.complete_pending_turn(&event, &mut thread)
+    }
+    fn process(&mut self, event: InboundEnvelope, run_now: bool) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, &event.thread_id())?
+            .unwrap_or_else(|| FluentThread::new(&event));
         if let Some(project_label) = &thread.project_label {
             self.store
                 .bind_inbox_event(&self.config, &event.id, project_label)?;
@@ -510,84 +385,31 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             && event.thread_timestamp.is_some()
             && let Some(provider) = selected_provider(&event.text)
         {
-            return self.switch_provider(&thread.id, &event.user, provider);
+            if run_now {
+                return self.switch_provider(&thread.id, &event.user, provider);
+            }
+            self.switch_provider_metadata(&mut thread, &event.user, provider)?;
+            return self.store.save_thread(&self.config, &thread);
         }
         if thread
             .pending_turn
             .as_ref()
             .is_some_and(|turn| turn.action_id == event.id)
         {
-            return self.complete_pending_turn(&event, &mut thread);
-        }
-        if !policy::participant_can_contribute(&self.config, &thread, &event) {
-            self.slack.respond_private(
-                &event.channel,
-                &event.user,
-                "You cannot participate in this Fluent thread.",
-            )?;
-            return Ok(());
+            return if run_now {
+                self.complete_pending_turn(&event, &mut thread)
+            } else {
+                Ok(())
+            };
         }
         if !thread.processed_events.insert(event.id.clone()) {
             return Ok(());
         }
         if !policy::participant_can_contribute(&self.config, &thread, &event) {
-            self.slack.respond_private(
-                &event.channel,
-                &event.user,
-                "You cannot participate in this Fluent thread.",
-            )?;
-            return Ok(());
-        }
-        if !policy::participant_can_contribute(&self.current_authority_config()?, &thread, &event) {
             return self.store.save_thread(&self.config, &thread);
         }
-        if thread.state == ThreadState::Active
-            && thread.pending_action.is_some()
-            && policy::is_approval_response(&thread, &event)
-        {
-            match self.approve_thread_action(&mut thread, &event)? {
-                ApprovalOutcome::WaitingForApprover => self.slack.respond_private(
-                    &event.channel,
-                    &event.user,
-                    "Only a project approver may authorize this action.",
-                )?,
-                ApprovalOutcome::FreshConfirmationRequired => self.queue_reply(
-                    &event,
-                    "Fresh confirmation is required before Fluent can perform this action.",
-                )?,
-                ApprovalOutcome::Stale { current_action_id } => self.queue_reply(
-                    &event,
-                    &format!(
-                        "That approval is stale. Current approval request: {current_action_id}."
-                    ),
-                )?,
-                _ => {}
-            }
-            return self.store.save_thread(&self.config, &thread);
-        }
-        match event.change {
-            InboundChange::Edit => return self.apply_edit(event, thread),
-            InboundChange::Delete => return self.apply_deletion(event, thread),
-            InboundChange::Message => {}
-        }
-        if thread.state == ThreadState::Active
-            && event.thread_timestamp.is_some()
-            && self.approve_revision_if_requested(&event, &mut thread)?
-        {
-        } else if thread.state == ThreadState::Active
-            && event.thread_timestamp.is_some()
-            && self.offer_linked_thread_if_requested(&event, &mut thread)?
-        {
-        } else if thread.state == ThreadState::Active
-            && event.thread_timestamp.is_some()
-            && thread.pending_artifact_revision.is_some()
-        {
-            self.queue_reply(
-                &event,
-                "Planning is waiting for approval of the presented revision.",
-            )?;
-        } else if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
-            self.start_or_offer(&event, &mut thread)?;
+        if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
+            self.start_or_offer(&event, &mut thread, run_now)?;
         } else if thread.state == ThreadState::Active
             && event.thread_timestamp.is_some()
             && thread.pending_turn.is_some()
@@ -602,151 +424,32 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
-                source_timestamp: event.timestamp.clone(),
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: false,
                 provider_turn_id: None,
                 completed_reply: None,
                 retry_at_unix_seconds: None,
+                delivery_attempt: 0,
             });
             self.store.save_thread(&self.config, &thread)?;
-            self.complete_pending_turn(&event, &mut thread)?;
+            if run_now {
+                self.complete_pending_turn(&event, &mut thread)?;
+            }
         }
         self.store.save_thread(&self.config, &thread)
     }
-
-    /// Present exactly one revision-bound lifecycle action for approval.
-    pub fn request_approval(&mut self, thread_id: &str, action: PendingAction) -> Result<()> {
-        let mut thread = self
-            .store
-            .load_thread(&self.config, thread_id)?
-            .context("Fluent thread is unavailable")?;
-        if thread.state != ThreadState::Active
-            || action.id.is_empty()
-            || action.artifact_revision.is_empty()
-        {
-            bail!("pending action identity is incomplete");
-        }
-        thread.pending_question = Some(action.id.clone());
-        let question = format!(
-            "Waiting for a project approver to authorize {} at revision {}.",
-            action.id, action.artifact_revision
-        );
-        thread.pending_action = Some(action);
-        self.store.save_thread(&self.config, &thread)?;
-        self.queue_thread_waiting(&thread, &question)?;
-        self.deliver_pending()
-    }
-
-    /// Evaluate a direct approval attempt against current durable authority.
-    pub fn approve_pending_action(
+    fn start_or_offer(
         &mut self,
-        thread_id: &str,
-        actor: &str,
-        action_id: &str,
-        artifact_revision: &str,
-        event_id: &str,
-        accepted_at: &str,
-    ) -> Result<ApprovalOutcome> {
-        let mut thread = self
-            .store
-            .load_thread(&self.config, thread_id)?
-            .context("Fluent thread is unavailable")?;
-        if let Some(record) = thread
-            .approvals
-            .iter()
-            .find(|record| record.event_id == event_id)
-        {
-            return Ok(ApprovalOutcome::Accepted(record.clone()));
-        }
-        let Some(action) = thread.pending_action.as_ref() else {
-            return Ok(ApprovalOutcome::NoPendingAction);
-        };
-        if action.id != action_id || action.artifact_revision != artifact_revision {
-            return Ok(ApprovalOutcome::Stale {
-                current_action_id: action.id.clone(),
-            });
-        }
-        let authority = policy::project_authority(&self.current_authority_config()?, &thread);
-        let outcome = policy::evaluate_approval(
-            &mut thread,
-            authority.as_ref(),
-            actor,
-            event_id,
-            accepted_at,
-            false,
-            None,
-        );
-        self.store.save_thread(&self.config, &thread)?;
-        Ok(outcome)
-    }
-
-    fn approve_thread_action(
-        &mut self,
-        thread: &mut FluentThread,
         event: &InboundEnvelope,
-    ) -> Result<ApprovalOutcome> {
-        let accepted_at = chrono::Utc::now().to_rfc3339();
-        let authority = policy::project_authority(&self.current_authority_config()?, thread);
-        Ok(policy::evaluate_approval(
-            thread,
-            authority.as_ref(),
-            &event.user,
-            &event.id,
-            &accepted_at,
-            self.recovering_event,
-            Some(event),
-        ))
-    }
-
-    fn apply_edit(&mut self, event: InboundEnvelope, mut thread: FluentThread) -> Result<()> {
-        if let Some(turn) = thread
-            .pending_turn
-            .as_mut()
-            .filter(|turn| turn.source_timestamp == event.timestamp)
-        {
-            turn.contribution = event.text;
-            return self.store.save_thread(&self.config, &thread);
-        }
-        if let Some(input) = thread
-            .conversation_inputs
-            .iter_mut()
-            .find(|input| input.source_timestamp == event.timestamp)
-        {
-            input.corrections.push(AttributedCorrection {
-                event_id: event.id,
-                actor: event.user,
-                content: event.text,
-            });
-        }
-        self.store.save_thread(&self.config, &thread)
-    }
-
-    fn apply_deletion(&mut self, event: InboundEnvelope, mut thread: FluentThread) -> Result<()> {
-        if let Some(input) = thread
-            .conversation_inputs
-            .iter_mut()
-            .find(|input| input.source_timestamp == event.timestamp)
-        {
-            input.source_deleted = true;
-        }
-        self.store.save_thread(&self.config, &thread)
-    }
-
-    fn current_authority_config(&self) -> Result<RunnerConfig> {
-        let path = config_path(self.home);
-        let config = if path.exists() {
-            read_config(self.home)
-        } else {
-            Ok(self.config.clone())
-        }?;
-        config.validate()?;
-        Ok(config)
-    }
-    fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
-        let default = policy::default_project(&self.config, &event.channel)
-            .and_then(|project| self.config.projects.get(project));
+        thread: &mut FluentThread,
+        run_now: bool,
+    ) -> Result<()> {
+        let default = self
+            .config
+            .channel_defaults
+            .get(&event.channel)
+            .and_then(|p| self.config.projects.get(p));
         let available = default.filter(|p| {
             p.allowed_participants.contains(&event.user) && checkout_is_available(&p.checkout)
         });
@@ -763,22 +466,16 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 .bind_inbox_event(&self.config, &event.id, &project.label)?;
             thread.state = ThreadState::Active;
             thread.project_label = Some(project.label.clone());
-            if let Some(work_item_id) = work_item_id_from_request(&event.text) {
-                WorkModelStore::new(&project.checkout.path)
-                    .read_work_item(work_item_id)
-                    .with_context(|| format!("read linked Work Item {work_item_id}"))?;
-                thread.linked_work = Some(work_item_id.to_owned());
-            }
             thread.provider = Some(provider.to_owned());
             thread.pending_turn = Some(PendingTurn {
                 action_id: event.id.clone(),
-                source_timestamp: event.timestamp.clone(),
                 contribution: event.text.clone(),
                 actor: event.user.clone(),
                 starts_session: true,
                 provider_turn_id: None,
                 completed_reply: None,
                 retry_at_unix_seconds: None,
+                delivery_attempt: 0,
             });
             self.store.save_thread(&self.config, thread)?;
             if let Some(connected_at) =
@@ -788,7 +485,9 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 self.store.save_thread(&self.config, thread)?;
                 self.queue_thread_status(thread, None)?;
             }
-            self.complete_pending_turn(event, thread)?;
+            if run_now {
+                self.complete_pending_turn(event, thread)?;
+            }
         } else {
             let projects =
                 policy::available_projects(&self.config, &event.user, checkout_is_available);
@@ -804,49 +503,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             )?;
         }
         Ok(())
-    }
-
-    fn approve_revision_if_requested(
-        &mut self,
-        event: &InboundEnvelope,
-        thread: &mut FluentThread,
-    ) -> Result<bool> {
-        let Some(revision_id) = event.text.trim().strip_prefix("approve ") else {
-            return Ok(false);
-        };
-        if revision_id.trim().is_empty() {
-            return Ok(false);
-        }
-        self.approve_planning_revision(&thread.id, revision_id.trim(), &event.user)?;
-        thread.pending_artifact_revision = None;
-        thread.pending_question = None;
-        self.queue_reply(
-            event,
-            &format!("Approved planning revision {}.", revision_id.trim()),
-        )?;
-        Ok(true)
-    }
-
-    fn offer_linked_thread_if_requested(
-        &mut self,
-        event: &InboundEnvelope,
-        thread: &mut FluentThread,
-    ) -> Result<bool> {
-        let Some(project) = event.text.strip_prefix("project: ").map(str::trim) else {
-            return Ok(false);
-        };
-        if !self.config.projects.contains_key(project)
-            || thread.project_label.as_deref() == Some(project)
-        {
-            return Ok(false);
-        }
-        thread.linked_thread_intent = Some(project.into());
-        self.store.save_thread(&self.config, thread)?;
-        self.queue_reply(
-            event,
-            &format!("This thread remains bound to its original project. Start a linked Fluent thread for project {project}."),
-        )?;
-        Ok(true)
     }
     fn complete_pending_turn(
         &mut self,
@@ -890,6 +546,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .pending_turn
             .clone()
             .context("thread has no pending provider turn")?;
+        let original_turn = turn.clone();
         self.provider.select(
             thread
                 .provider
@@ -917,6 +574,19 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread.provider_session = Some(session);
                 self.store.save_thread(&self.config, thread)?;
             }
+        }
+        if thread.provider_session.is_none() && !thread.conversation.is_empty() {
+            let mut context = thread
+                .conversation
+                .iter()
+                .map(|message| (message.actor.clone(), message.contribution.clone()))
+                .collect::<Vec<_>>();
+            context.push((turn.actor.clone(), turn.contribution.clone()));
+            turn.contribution = format!(
+                "Durable Slice conversation:\n{}",
+                coalesce_contributions(context)
+            );
+            turn.actor = "participants".into();
         }
         if turn.completed_reply.is_none() {
             if let Some(session) = thread.provider_session.as_deref() {
@@ -952,6 +622,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     .as_mut()
                     .context("thread lost its pending provider turn")?;
                 current.provider_turn_id = Some(turn_id.to_owned());
+                if let Some(latest) = store.load_thread(config, &checkpoint.id)? {
+                    if latest.provider != checkpoint.provider {
+                        return Ok(());
+                    }
+                    checkpoint.queued_contributions = latest.queued_contributions;
+                    checkpoint.processed_events = latest.processed_events;
+                    checkpoint.conversation = latest.conversation;
+                }
                 store.save_thread(config, &checkpoint)
             };
             let run = self.provider.run_turn(
@@ -1000,6 +678,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .clone()
             .context("provider turn completed without a reply")?;
         let raw_reply = redact_secrets(&raw_reply);
+        let provider_reply = raw_reply.clone();
         let mut provider_references = self.provider.code_references(&scope, &turn.contribution)?;
         for reference in code_references_in_reply(&raw_reply, &scope.checkout) {
             if !provider_references.contains(&reference) {
@@ -1024,61 +703,54 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let output = serde_json::from_str::<ProviderOutput>(&raw_reply).unwrap_or_else(|_| {
-            ProviderOutput::Message {
-                text: raw_reply.clone(),
+        let reply = if previously_completed {
+            raw_reply
+        } else if turn.starts_session {
+            format!(
+                "Bound to {}; provider: {}.\n{}",
+                safe_identity(self.bound_project(thread)?),
+                thread.provider.as_deref().unwrap_or("unknown"),
+                raw_reply
+            )
+        } else {
+            raw_reply
+        };
+        let reply = if references.is_empty() {
+            reply
+        } else {
+            format!("{reply}\n\n{}", references.join("\n"))
+        };
+        if let Some(latest) = self.store.load_thread(&self.config, &thread.id)? {
+            if latest.provider != thread.provider {
+                *thread = latest;
+                return Ok(());
             }
-        });
-        let accepted_contribution = turn.contribution.clone();
+            thread.queued_contributions = latest.queued_contributions;
+            thread.processed_events = latest.processed_events;
+            thread.conversation = latest.conversation;
+        }
         if !thread
-            .conversation_inputs
+            .conversation
             .iter()
-            .any(|input| input.event_id == event.id)
+            .any(|message| message.action_id == original_turn.action_id)
         {
-            thread.conversation_inputs.push(ConversationInput {
-                event_id: event.id.clone(),
-                source_timestamp: event.timestamp.clone(),
-                actor: event.user.clone(),
-                content: accepted_contribution,
-                corrections: Vec::new(),
-                source_deleted: false,
+            thread.conversation.push(QueuedContribution {
+                action_id: original_turn.action_id.clone(),
+                contribution: original_turn.contribution,
+                actor: original_turn.actor,
+            });
+            thread.conversation.push(QueuedContribution {
+                action_id: format!("{}:reply", original_turn.action_id),
+                contribution: provider_reply,
+                actor: "Fluent".into(),
             });
         }
-        match output {
-            ProviderOutput::Message { text } => {
-                let reply = if previously_completed {
-                    text
-                } else if turn.starts_session {
-                    format!(
-                        "Bound to {}; provider: {}.\n{}",
-                        safe_identity(self.bound_project(thread)?),
-                        thread.provider.as_deref().unwrap_or("unknown"),
-                        text
-                    )
-                } else {
-                    text
-                };
-                let reply = if references.is_empty() {
-                    reply
-                } else {
-                    format!("{reply}\n\n{}", references.join("\n"))
-                };
-                turn.completed_reply = Some(reply.clone());
-                thread.pending_turn = Some(turn);
-                self.store.save_thread(&self.config, thread)?;
-                self.queue_reply(event, &reply)?;
-                thread.pending_turn = None;
-                self.store.save_thread(&self.config, thread)
-            }
-            ProviderOutput::PlanningArtifact { kind, markdown } => {
-                turn.completed_reply = Some(raw_reply);
-                thread.pending_turn = Some(turn);
-                self.store.save_thread(&self.config, thread)?;
-                self.present_planning_artifact_for_thread(thread, &kind, &markdown)?;
-                thread.pending_turn = None;
-                self.store.save_thread(&self.config, thread)
-            }
-        }?;
+        turn.completed_reply = Some(reply.clone());
+        thread.pending_turn = Some(turn);
+        self.store.save_thread(&self.config, thread)?;
+        self.queue_reply(event, &reply)?;
+        thread.pending_turn = None;
+        self.store.save_thread(&self.config, thread)?;
         if !thread.queued_contributions.is_empty() {
             let queued = std::mem::take(&mut thread.queued_contributions);
             let action_id = queued
@@ -1093,13 +765,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             );
             thread.pending_turn = Some(PendingTurn {
                 action_id: action_id.clone(),
-                source_timestamp: event.timestamp.clone(),
                 contribution,
                 actor: "participants".into(),
                 starts_session: false,
                 provider_turn_id: None,
                 completed_reply: None,
                 retry_at_unix_seconds: None,
+                delivery_attempt: 0,
             });
             self.store.save_thread(&self.config, thread)?;
         }
@@ -1127,31 +799,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             thread_timestamp: event.thread_id(),
             text: redact_secrets(text),
             delivered: false,
-            approval_control: None,
         };
         self.store.persist_outbox(delivery)
-    }
-
-    fn queue_thread_waiting(&self, thread: &FluentThread, text: &str) -> Result<()> {
-        let action = thread
-            .pending_action
-            .as_ref()
-            .context("waiting thread lacks a pending action")?;
-        self.store.persist_outbox(OutboundDelivery {
-            id: format!(
-                "{}:approval-waiting:{}:{}",
-                thread.id, action.id, action.artifact_revision
-            ),
-            channel: thread.channel.clone(),
-            thread_timestamp: thread.id.clone(),
-            text: text.into(),
-            delivered: false,
-            approval_control: Some(ApprovalControl {
-                action_id: action.id.clone(),
-                artifact_revision: action.artifact_revision.clone(),
-                label: "Approve".into(),
-            }),
-        })
     }
 
     fn queue_thread_status(&self, thread: &FluentThread, interruption: Option<&str>) -> Result<()> {
@@ -1170,15 +819,308 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 "Fluent thread status:{interruption} runner last connected at {connected_at}."
             ),
             delivered: false,
-            approval_control: None,
         })
     }
 }
 
-fn work_item_id_from_request(text: &str) -> Option<&str> {
-    text.split_once("work-item:")
-        .and_then(|(_, suffix)| suffix.split_whitespace().next())
-        .filter(|id| !id.is_empty())
+struct SharedProvider<P>(Arc<std::sync::Mutex<P>>);
+
+impl<P> Clone for SharedProvider<P> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<P: ConversationProvider> ConversationProvider for SharedProvider<P> {
+    fn name(&self) -> &str {
+        "shared"
+    }
+
+    fn select(&mut self, provider: &str) -> Result<()> {
+        self.0.lock().unwrap().select(provider)
+    }
+
+    fn start(
+        &mut self,
+        action_id: &str,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<(String, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .start(action_id, scope, contribution, actor)
+    }
+
+    fn resume(
+        &mut self,
+        action_id: &str,
+        session: &str,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .resume(action_id, session, scope, contribution, actor)
+    }
+
+    fn prepare_session(&mut self, scope: &ProviderScope) -> Result<Option<String>> {
+        self.0.lock().unwrap().prepare_session(scope)
+    }
+
+    fn recover_turn(
+        &mut self,
+        action_id: &str,
+        session: &str,
+        scope: &ProviderScope,
+    ) -> Result<ProviderTurnRecovery> {
+        self.0
+            .lock()
+            .unwrap()
+            .recover_turn(action_id, session, scope)
+    }
+
+    fn run_turn(
+        &mut self,
+        action_id: &str,
+        session: Option<&str>,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+        accepted: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<(Option<String>, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .run_turn(action_id, session, scope, contribution, actor, accepted)
+    }
+
+    fn code_references(
+        &mut self,
+        scope: &ProviderScope,
+        contribution: &str,
+    ) -> Result<Vec<CodeReference>> {
+        self.0.lock().unwrap().code_references(scope, contribution)
+    }
+}
+
+struct ProviderCompletion {
+    thread_id: String,
+    result: Result<()>,
+}
+
+/// Keeps Slack ingress responsive while provider turns run on bounded workers.
+pub struct AsyncCollaborationRunner<'a, P, S> {
+    runner: CollaborationRunner<'a, SharedProvider<P>, S>,
+    provider: SharedProvider<P>,
+    completions_tx: std::sync::mpsc::Sender<ProviderCompletion>,
+    completions_rx: std::sync::mpsc::Receiver<ProviderCompletion>,
+    pool: FairTurnPool,
+    active: BTreeSet<String>,
+}
+
+impl<'a, P, S> AsyncCollaborationRunner<'a, P, S>
+where
+    P: ConversationProvider + Send + 'static,
+    S: SlackTransport,
+{
+    pub fn new(
+        home: &'a Path,
+        config: RunnerConfig,
+        provider: P,
+        slack: S,
+        capacity: usize,
+    ) -> Self {
+        let provider = SharedProvider(Arc::new(std::sync::Mutex::new(provider)));
+        let (completions_tx, completions_rx) = std::sync::mpsc::channel();
+        Self {
+            runner: CollaborationRunner::new(home, config, provider.clone(), slack),
+            provider,
+            completions_tx,
+            completions_rx,
+            pool: FairTurnPool::new(capacity),
+            active: BTreeSet::new(),
+        }
+    }
+
+    pub fn slack(&self) -> &S {
+        self.runner.slack()
+    }
+
+    pub fn slack_mut(&mut self) -> &mut S {
+        self.runner.slack_mut()
+    }
+
+    #[doc(hidden)]
+    pub fn set_clock_for_test(&mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) {
+        self.runner.set_clock_for_test(clock);
+    }
+
+    pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
+        let thread_id = event.thread_id();
+        self.runner.ingest_deferred(event)?;
+        self.dispatch_if_ready(&thread_id)
+    }
+
+    pub fn recovery_targets(&self) -> Result<Vec<RecoveryTarget>> {
+        self.runner.recovery_targets()
+    }
+
+    pub fn restore_connection(
+        &mut self,
+        history: impl IntoIterator<Item = InboundEnvelope>,
+        connected_at: String,
+        report_interruption: bool,
+    ) -> Result<()> {
+        self.runner.restore_connection_with_completion(
+            history,
+            connected_at,
+            report_interruption,
+            false,
+        )?;
+        let thread_ids: Vec<_> = self
+            .runner
+            .store
+            .load_threads(&self.runner.config)?
+            .into_keys()
+            .collect();
+        for thread_id in thread_ids {
+            self.dispatch_if_ready(&thread_id)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_if_ready(&mut self, thread_id: &str) -> Result<()> {
+        let Some(thread) = self
+            .runner
+            .store
+            .load_thread(&self.runner.config, thread_id)?
+        else {
+            return Ok(());
+        };
+        let ready = thread
+            .pending_turn
+            .as_ref()
+            .is_some_and(|turn| turn.retry_at_unix_seconds.is_none());
+        if ready && self.pool.request(thread_id) {
+            self.spawn_admitted(thread_id.to_owned());
+        }
+        Ok(())
+    }
+
+    fn spawn_admitted(&mut self, thread_id: String) {
+        self.active.insert(thread_id.clone());
+        let provider = self.provider.clone();
+        let config = self.runner.config.clone();
+        let home = self.runner.home.to_owned();
+        let clock = self.runner.clock.clone();
+        let sender = self.completions_tx.clone();
+        std::thread::spawn(move || {
+            let mut worker = CollaborationRunner::new(
+                &home,
+                config,
+                provider,
+                crate::slack_collaboration::InMemorySlack::default(),
+            );
+            worker.clock = clock;
+            let result = worker.run_pending_thread(&thread_id);
+            let _ = sender.send(ProviderCompletion { thread_id, result });
+        });
+    }
+
+    fn handle_completion(&mut self, completion: ProviderCompletion) -> Result<()> {
+        self.active.remove(&completion.thread_id);
+        let next = self.pool.finish(&completion.thread_id);
+        completion.result?;
+        self.runner.deliver_pending()?;
+        if let Some(next) = next {
+            self.spawn_admitted(next);
+        } else {
+            self.dispatch_if_ready(&completion.thread_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_completion(&mut self) -> Result<()> {
+        let completion = self
+            .completions_rx
+            .recv()
+            .context("provider worker stopped")?;
+        self.handle_completion(completion)
+    }
+
+    pub fn poll_completions(&mut self) -> Result<()> {
+        while let Ok(completion) = self.completions_rx.try_recv() {
+            self.handle_completion(completion)?;
+        }
+        Ok(())
+    }
+
+    pub fn next_retry_deadline(&self) -> Result<Option<u64>> {
+        Ok(self
+            .runner
+            .store
+            .load_threads(&self.runner.config)?
+            .into_values()
+            .filter_map(|thread| thread.pending_turn?.retry_at_unix_seconds)
+            .min())
+    }
+
+    pub fn wake_due_retries(&mut self, now: u64) -> Result<()> {
+        let thread_ids: Vec<_> = self
+            .runner
+            .store
+            .load_threads(&self.runner.config)?
+            .into_keys()
+            .collect();
+        for thread_id in thread_ids {
+            let Some(mut thread) = self
+                .runner
+                .store
+                .load_thread(&self.runner.config, &thread_id)?
+            else {
+                continue;
+            };
+            let due = thread
+                .pending_turn
+                .as_ref()
+                .and_then(|turn| turn.retry_at_unix_seconds)
+                .is_some_and(|deadline| deadline <= now);
+            if due {
+                if let Some(turn) = thread.pending_turn.as_mut() {
+                    turn.retry_at_unix_seconds = None;
+                    turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
+                }
+                self.runner
+                    .store
+                    .save_thread(&self.runner.config, &thread)?;
+                self.dispatch_if_ready(&thread_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive completions, Slack ingress, and the earliest durable retry timer.
+    pub fn drive_once(&mut self, maximum_wait: std::time::Duration) -> Result<()> {
+        self.poll_completions()?;
+        let now = (self.runner.clock)();
+        self.wake_due_retries(now)?;
+        let retry_wait = self
+            .next_retry_deadline()?
+            .map(|deadline| std::time::Duration::from_secs(deadline.saturating_sub(now)))
+            .unwrap_or(maximum_wait);
+        let wait = retry_wait
+            .min(maximum_wait)
+            .max(std::time::Duration::from_millis(1));
+        if let Some(event) = self.runner.slack_mut().receive_timeout(wait)? {
+            self.ingest(event)?;
+        }
+        self.wake_due_retries((self.runner.clock)())?;
+        self.poll_completions()
+    }
 }
 
 fn selected_provider(text: &str) -> Option<&str> {

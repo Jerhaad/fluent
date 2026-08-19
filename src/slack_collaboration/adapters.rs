@@ -172,6 +172,31 @@ impl SlackTransport for SocketModeTransport {
         decode_socket_mode_envelope(&message.into_text()?)
     }
 
+    fn receive_timeout(&mut self, timeout: std::time::Duration) -> Result<Option<InboundEnvelope>> {
+        let stream = self.socket.get_mut();
+        match stream {
+            tungstenite::stream::MaybeTlsStream::Plain(stream) => {
+                stream.set_read_timeout(Some(timeout))?
+            }
+            tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
+                stream.sock.set_read_timeout(Some(timeout))?
+            }
+            _ => {}
+        }
+        match self.socket.read() {
+            Ok(message) => decode_socket_mode_envelope(&message.into_text()?).map(Some),
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn reconnect(&mut self) -> Result<()> {
         self.socket = Self::open_socket(&self.web.api_base, &self.web.app_token)?;
         Ok(())
