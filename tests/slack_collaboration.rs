@@ -6638,7 +6638,7 @@ fn plan_approval_resumes_after_partial_materialization() {
         Some("slack-slice:slice-retry-plan")
     );
     let first_report = control
-        .reconcile_durable_transitions("slice-retry-plan")
+        .schedule_durable_transitions("slice-retry-plan", |_| Ok(()))
         .unwrap();
     assert_eq!(first_report.len(), 1);
     assert_eq!(first_report[0].work_item_id, "work-retry-first");
@@ -6684,7 +6684,7 @@ fn plan_approval_resumes_after_partial_materialization() {
     assert_eq!(completed["approval_state"], "complete");
 
     let transitions = control
-        .reconcile_durable_transitions("slice-retry-plan")
+        .schedule_durable_transitions("slice-retry-plan", |_| Ok(()))
         .unwrap();
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].work_item_id, "work-retry-second");
@@ -7451,7 +7451,7 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
         .unwrap();
     assert_eq!(
         control
-            .reconcile_durable_transitions("slice-ledger")
+            .schedule_durable_transitions("slice-ledger", |_| Ok(()))
             .unwrap()[0]
             .new_state,
         "planned"
@@ -7466,7 +7466,7 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
         .authorize_execution("slice-ledger", "U1", &Scheduler)
         .unwrap();
     let transitions = control
-        .reconcile_durable_transitions("slice-ledger")
+        .schedule_durable_transitions("slice-ledger", |_| Ok(()))
         .unwrap();
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].work_item_id, "work-ledger");
@@ -7478,6 +7478,44 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
     assert!(
         control
             .reconcile_durable_transitions("slice-ledger")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn read_only_transition_reconciliation_does_not_acknowledge_delivery() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-read-only", "work-read-only");
+
+    let first = control
+        .reconcile_durable_transitions("slice-read-only")
+        .unwrap();
+    let retry = control
+        .reconcile_durable_transitions("slice-read-only")
+        .unwrap();
+    assert_eq!(retry, first);
+
+    let failure = control
+        .schedule_durable_transitions("slice-read-only", |_| {
+            Err(anyhow::anyhow!("simulated outbox failure"))
+        })
+        .unwrap_err();
+    assert!(failure.to_string().contains("simulated outbox failure"));
+    assert_eq!(
+        control
+            .reconcile_durable_transitions("slice-read-only")
+            .unwrap(),
+        first
+    );
+
+    let scheduled = control
+        .schedule_durable_transitions("slice-read-only", |_| Ok(()))
+        .unwrap();
+    assert_eq!(scheduled, first);
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-read-only")
             .unwrap()
             .is_empty()
     );
@@ -7514,7 +7552,7 @@ fn legacy_empty_ledger_replays_initial_and_current_transition_once() {
         .authorize_execution("slice-legacy-ledger", "U1", &Scheduler)
         .unwrap();
     let transitions = control
-        .reconcile_durable_transitions("slice-legacy-ledger")
+        .schedule_durable_transitions("slice-legacy-ledger", |_| Ok(()))
         .unwrap();
     assert_eq!(
         transitions

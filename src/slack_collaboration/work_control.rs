@@ -478,10 +478,11 @@ impl WorkControl {
     }
 
     /// Read the model-owned ledger after this Slack consumer's independent
-    /// cursor. This reports transitions produced while the runner was away
-    /// without conflating them with transitions another consumer has seen.
+    /// cursor without acknowledging delivery. Callers that perform an external
+    /// effect must use [`Self::schedule_durable_transitions`] so a durable
+    /// outbox entry exists before the cursor advances.
     pub fn reconcile_durable_transitions(&self, slice_id: &str) -> Result<Vec<WorkTransition>> {
-        let mut slice = self
+        let slice = self
             .slice(slice_id)?
             .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
         let store = WorkModelStore::new(&self.project_root);
@@ -503,9 +504,6 @@ impl WorkControl {
                 .filter(|entry| entry.sequence > cursor)
             {
                 reported.push(project_durable_transition(work_item_id, &item, entry));
-                slice
-                    .transition_cursors
-                    .insert(work_item_id.clone(), entry.sequence);
             }
         }
         reported.sort_by(|left, right| {
@@ -513,9 +511,6 @@ impl WorkControl {
                 .cmp(&right.sequence)
                 .then_with(|| left.work_item_id.cmp(&right.work_item_id))
         });
-        if !reported.is_empty() {
-            self.save_slice(&slice)?;
-        }
         Ok(reported)
     }
 
