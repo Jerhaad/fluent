@@ -737,6 +737,7 @@ fn single_workspace_runner_routes_multiple_projects_and_conversations() {
             default_provider: "codex".into(),
             enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
+            github_remote: None,
         },
     );
     config.channel_defaults.insert("C2".into(), "other".into());
@@ -785,6 +786,7 @@ fn project_change_preserves_binding_and_offers_linked_thread() {
             default_provider: "codex".into(),
             enabled_providers: BTreeSet::from(["codex".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
+            github_remote: None,
         },
     );
     let store = FileCollaborationStore::new(home.path());
@@ -1633,6 +1635,7 @@ fn default_project_change_does_not_rebind_existing_threads() {
             default_provider: "codex".into(),
             enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
             project_approvers: BTreeSet::from(["U1".into()]),
+            github_remote: None,
         },
     );
     config.channel_defaults.insert("C1".into(), "other".into());
@@ -8643,7 +8646,10 @@ fn post_land_batch(
 
 #[test]
 fn corrective_follow_up_reactivates_original_slice() {
-    let (home, checkout, config) = setup(true);
+    let (home, checkout, mut config) = setup(true);
+    let (merged_commit, authority) = commit_follow_up_authority(&checkout);
+    config.projects.get_mut("app").unwrap().checkout.commit = merged_commit.clone();
+    write_config(home.path(), &config).unwrap();
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -8672,7 +8678,6 @@ fn corrective_follow_up_reactivates_original_slice() {
         control.slice_stage("slice-corrective-runner").unwrap(),
         SliceStage::Complete
     );
-    let (merged_commit, authority) = commit_follow_up_authority(&checkout);
     let batch = post_land_batch(
         "work-original",
         &merged_commit,

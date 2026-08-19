@@ -269,6 +269,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 ),
                 delivered: false,
                 approval_control: None,
+                update_timestamp: None,
             })?;
         }
         self.deliver_pending()?;
@@ -444,8 +445,15 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
         }
         self.store.persist_outbox(OutboundDelivery {
-            id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
-            thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false, approval_control: None,
+            id: format!("{}:provider-switch:{}", thread.id, provider),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: format!(
+                "Provider switched to {provider}; Fluent will resume from the durable Slice conversation."
+            ),
+            delivered: false,
+            approval_control: None,
+            update_timestamp: None,
         })
     }
 
@@ -1157,7 +1165,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: &InboundEnvelope,
         thread: &mut FluentThread,
     ) -> Result<bool> {
-        let Some(revision_id) = event.text.trim().strip_prefix("approve ") else {
+        let command = event.text.trim();
+        if command.starts_with("approve plan ") {
+            return Ok(false);
+        }
+        let Some(revision_id) = command.strip_prefix("approve ") else {
             return Ok(false);
         };
         if revision_id.trim().is_empty() {
@@ -1605,6 +1617,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 report.work_item_ids.join(", ")
             ),
             delivered: false,
+            approval_control: None,
             update_timestamp: None,
         })?;
         self.queue_thread_status(&thread, None)?;
@@ -1641,6 +1654,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread_timestamp: thread.id.clone(),
                 text: format!("Work Item {work_item_id} queue outcome: {outcome:?}."),
                 delivered: false,
+                approval_control: None,
                 update_timestamp: None,
             })?;
         }
@@ -1694,6 +1708,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     project.github_remote.as_deref(),
                 ),
                 delivered: false,
+                approval_control: None,
                 update_timestamp: None,
             })
         })?;
@@ -1774,6 +1789,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 thread_timestamp: thread.id.clone(),
                 text,
                 delivered: false,
+                approval_control: None,
                 update_timestamp: None,
             })?;
         }
@@ -1809,6 +1825,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             thread_timestamp: thread.id.clone(),
             text: reply.clone(),
             delivered: false,
+            approval_control: None,
             update_timestamp: None,
         })?;
         self.deliver_pending()?;
@@ -1842,6 +1859,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             thread_timestamp: thread.id.clone(),
             text: reply.clone(),
             delivered: false,
+            approval_control: None,
             update_timestamp: None,
         })?;
         self.deliver_pending()?;
@@ -1873,6 +1891,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 "Linked corrective Work Item {work_item_id} to Slice {slice_id}; the Slice is active until the correction reaches its terminal outcome."
             ),
             delivered: false,
+            approval_control: None,
             update_timestamp: None,
         })?;
         self.report_thread_work(thread_id)?;
