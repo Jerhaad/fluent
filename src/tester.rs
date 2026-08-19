@@ -633,8 +633,12 @@ fn run_with_prepared_sandbox_profile_and_collector(
         );
     }
 
-    let (tests, summary) = match extract_and_normalize(&extractor_path, artifact_dir, sandbox_path)
-    {
+    let (tests, summary) = match extract_and_normalize(
+        candidate_workspace,
+        &extractor_path,
+        artifact_dir,
+        sandbox_path,
+    ) {
         Ok(normalized) => normalized,
         Err(error) => {
             let (kind, message) =
@@ -769,9 +773,12 @@ fn structural_problems(
     } else {
         if let Err(error) = fs::write(artifact_dir.join("commands.json"), "[]") {
             problems.push(format!("readiness artifact: {error}"));
-        } else if let Err(error) =
-            extract_and_normalize(&extractor, artifact_dir, profile.map(|p| &p.path))
-        {
+        } else if let Err(error) = extract_and_normalize(
+            candidate_workspace,
+            &extractor,
+            artifact_dir,
+            profile.map(|p| &p.path),
+        ) {
             problems.push(format!(
                 "{EXTRACTOR_PATH}: invalid empty artifact: {error:#}"
             ));
@@ -781,11 +788,17 @@ fn structural_problems(
 }
 
 fn extract_and_normalize(
+    candidate_workspace: &Path,
     extractor_path: &Path,
     artifact_dir: &Path,
     sandbox_path: Option<&PathBuf>,
 ) -> Result<(Vec<TestResult>, Summary)> {
-    let tests = run_extractor(extractor_path, artifact_dir, sandbox_path)?;
+    let tests = run_extractor(
+        candidate_workspace,
+        extractor_path,
+        artifact_dir,
+        sandbox_path,
+    )?;
     let duplicate_ids = find_duplicate_ids(&tests);
     if !duplicate_ids.is_empty() {
         return Err(NormalizationError {
@@ -842,14 +855,13 @@ fn run_command(
         process.arg("-c").arg(command);
         process
     };
-    isolate_tester_child_environment(&mut process);
+    bind_tester_child_to_workspace(&mut process, working_dir);
     if let Some(directory) = settlement_directory {
         process
             .env("TMPDIR", directory)
             .env("FLUENT_RELEASE_TEST_ROOTS", directory);
     }
     let output = process
-        .current_dir(working_dir)
         .output()
         .with_context(|| format!("spawning Tester command: {command}"))?;
     let duration = start.elapsed();
@@ -880,7 +892,21 @@ fn isolate_tester_child_environment(command: &mut Command) {
     command.env_remove(crate::baseline_cache::BASELINE_SESSION_ENV);
 }
 
+/// Bind the child process's filesystem and shell view to the checkout under
+/// test. `Command::current_dir` does not rewrite inherited `PWD`, and Cargo
+/// trusts that variable when locating a workspace. A detached landed-baseline
+/// checkout must therefore replace both views atomically.
+fn bind_tester_child_to_workspace(command: &mut Command, working_dir: &Path) {
+    let working_dir = fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+    isolate_tester_child_environment(command);
+    command
+        .current_dir(&working_dir)
+        .env("PWD", &working_dir)
+        .env_remove("OLDPWD");
+}
+
 fn run_extractor(
+    candidate_workspace: &Path,
     extractor_path: &Path,
     artifact_dir: &Path,
     sandbox_path: Option<&PathBuf>,
@@ -898,7 +924,7 @@ fn run_extractor(
         command.arg(artifact_dir);
         command
     };
-    isolate_tester_child_environment(&mut command);
+    bind_tester_child_to_workspace(&mut command, candidate_workspace);
     let output = command
         .output()
         .with_context(|| format!("running {}", extractor_path.display()))?;
@@ -1164,6 +1190,28 @@ mod tests {
             .find(|(name, _)| *name == crate::baseline_cache::BASELINE_SESSION_ENV)
             .map(|(_, value)| value);
         assert_eq!(inherited, Some(None));
+    }
+
+    #[test]
+    fn tester_commands_and_extractor_bind_pwd_to_tested_checkout() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: 'test \"$PWD\" = \"$(pwd -P)\" && ! env | grep -q \"^OLDPWD=\"'\n    test_harness: shell-harness\n",
+        );
+        write_extractor(
+            workspace.path(),
+            "#!/bin/sh\ntest \"$PWD\" = \"$(pwd -P)\"\n! env | grep -q '^OLDPWD='\necho '[]'\n",
+        );
+
+        let outcome = run(workspace.path(), artifact_dir.path(), true, &resolver()).unwrap();
+
+        assert_eq!(outcome, TesterOutcome::Passed);
+        let results = read_results(artifact_dir.path());
+        assert_eq!(results.commands[0].exit_code, 0);
+        assert!(results.error.is_none());
     }
 
     enum ScriptedInventory {
