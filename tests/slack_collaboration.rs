@@ -6407,6 +6407,10 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")
             && guide.contains("keep that process running")
+            && guide.contains("register every configured checkout")
+            && guide.contains("/absolute/app-checkout")
+            && guide.contains("/absolute/api-checkout")
+            && guide.contains("scheduler service is already running")
             && guide.contains("Scheduler: running")
             && guide.contains("preflight checks the scheduler request boundary")
             && scheduler_run < scheduler_status

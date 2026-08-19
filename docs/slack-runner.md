@@ -65,22 +65,46 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
    closed until the runner owner records a new identity.
-6. Before enabling Slack, start the scheduler service from the configured
-   checkout and keep that process running:
+6. Before enabling Slack, register every configured checkout with the
+   scheduler. `fluent scheduler run` registers its current checkout before it
+   starts or checks the owner-wide scheduler service. Run these commands
+   sequentially with the same Fluent executable.
+
+   In one terminal, start the service from the first checkout and keep that
+   process running:
 
    ```sh
-   cd /absolute/checkout
+   cd /absolute/app-checkout
    fluent scheduler run
    ```
 
-   In another terminal, confirm that it prints `Scheduler: running` and reports
-   the expected build. The Slack runner preflight checks the scheduler request
-   boundary before it begins accepting Slack events:
+   After `fluent scheduler status` reports that service as running, use another
+   terminal to register each additional configured checkout. For example:
 
    ```sh
-   cd /absolute/checkout
+   cd /absolute/api-checkout
+   fluent scheduler run
+   ```
+
+   Because the first terminal already owns the service, each additional
+   registration exits after reporting `scheduler service is already running`.
+   That message is expected: registration completes before the singleton
+   service check. Repeat the command from every remaining checkout; do not run
+   the registration commands concurrently.
+
+   Finally, check each registered project and wait until it reports
+   `Scheduler: running` with the expected build:
+
+   ```sh
+   cd /absolute/app-checkout
+   fluent scheduler status
+
+   cd /absolute/api-checkout
    fluent scheduler status
    ```
+
+   Only then enable the multi-project Slack runner. Its preflight checks the
+   scheduler request boundary before it begins accepting Slack events.
 
 7. Print this guide at any time with `fluent slack setup`. Enable the exact
    Fluent executable as an owner-scoped LaunchAgent with:
