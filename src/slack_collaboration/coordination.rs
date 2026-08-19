@@ -2083,6 +2083,204 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(transitions)
     }
 
+    /// Publish one explicitly requested exact ready candidate. GitHub failures
+    /// become recoverable Slack reports and never modify Work-model readiness.
+    pub fn request_github_review(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        candidate_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<GitHubReviewRequestOutcome> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.project_approvers.contains(actor) {
+            bail!("participant cannot publish GitHub review for this project");
+        }
+        let remote = project
+            .github_remote
+            .as_deref()
+            .context("GitHub pull-request integration is not configured")?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let control = WorkControl::new(&project.checkout.path);
+        match control.publish_ready_candidate(slice_id, candidate_id, remote, github) {
+            Ok(publication) => {
+                let url = publication
+                    .pull_request_url
+                    .as_deref()
+                    .expect("successful publication has a URL");
+                self.store.persist_outbox(OutboundDelivery {
+                    id: format!(
+                        "{thread_id}:github-pr:{}",
+                        publication.candidate.candidate_id
+                    ),
+                    channel: thread.channel.clone(),
+                    thread_timestamp: thread.id.clone(),
+                    text: format!(
+                        "Published exact ready Merge Candidate {} ({}) for GitHub review: {url}",
+                        publication.candidate.candidate_id, publication.candidate.commit
+                    ),
+                    delivered: false,
+                    approval_control: None,
+                    update_timestamp: None,
+                })?;
+                self.deliver_pending()?;
+                Ok(GitHubReviewRequestOutcome::Published(publication))
+            }
+            Err(error) => {
+                let message = redact_secrets(&format!("{error:#}"));
+                self.store.persist_outbox(OutboundDelivery {
+                    id: format!("{thread_id}:github-pr-failure:{candidate_id}"),
+                    channel: thread.channel.clone(),
+                    thread_timestamp: thread.id.clone(),
+                    text: format!(
+                        "GitHub review publication failed for Merge Candidate {candidate_id}: {message}. The ready candidate is unchanged; retry this pull-request request after correcting GitHub authentication, host, or remote access."
+                    ),
+                    delivered: false,
+                    approval_control: None,
+                    update_timestamp: None,
+                })?;
+                self.deliver_pending()?;
+                Ok(GitHubReviewRequestOutcome::Failed {
+                    candidate_id: candidate_id.to_owned(),
+                    message,
+                })
+            }
+        }
+    }
+
+    /// Advance the one open pull request to a newly ready candidate. Callers
+    /// invoke this after Work reconciliation; unready commits remain invisible.
+    pub fn advance_github_review(
+        &mut self,
+        thread_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<Option<GitHubPublication>> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let publication = WorkControl::new(&project.checkout.path)
+            .advance_published_candidate(slice_id, github)?;
+        if let Some(publication) = publication.as_ref() {
+            let url = publication
+                .pull_request_url
+                .as_deref()
+                .context("advanced GitHub publication lacks a URL")?;
+            self.store.persist_outbox(OutboundDelivery {
+                id: format!(
+                    "{thread_id}:github-pr-advance:{}",
+                    publication.candidate.candidate_id
+                ),
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text: format!(
+                    "Updated GitHub pull request {url} to newly ready Merge Candidate {} ({}).",
+                    publication.candidate.candidate_id, publication.candidate.commit
+                ),
+                delivered: false,
+                approval_control: None,
+                update_timestamp: None,
+            })?;
+            self.deliver_pending()?;
+        }
+        Ok(publication)
+    }
+
+    /// Report unseen GitHub feedback with stable links. This path never calls
+    /// the candidate-rework boundary.
+    pub fn report_github_feedback(
+        &mut self,
+        thread_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<Vec<GitHubReviewFeedback>> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let feedback =
+            WorkControl::new(&project.checkout.path).ingest_github_feedback(slice_id, github)?;
+        for item in &feedback {
+            let summary = item.body.split_whitespace().collect::<Vec<_>>().join(" ");
+            let summary = if summary.len() > 240 {
+                format!("{}…", &summary[..summary.floor_char_boundary(240)])
+            } else {
+                summary
+            };
+            self.store.persist_outbox(OutboundDelivery {
+                id: format!("{thread_id}:github-feedback:{}", item.id),
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text: format!(
+                    "GitHub {} on candidate {}: {} {}. No corrective Work started.",
+                    item.kind, item.candidate_commit, summary, item.url
+                ),
+                delivered: false,
+                approval_control: None,
+                update_timestamp: None,
+            })?;
+        }
+        self.deliver_pending()?;
+        Ok(feedback)
+    }
+
+    pub fn authorize_github_feedback_rework(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        feedback_ids: &[String],
+        boundary: &dyn CandidateReworkBoundary,
+    ) -> Result<CandidateReworkRequest> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.project_approvers.contains(actor) {
+            bail!("participant cannot authorize candidate rework for this project");
+        }
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let request = WorkControl::new(&project.checkout.path).authorize_feedback_rework(
+            slice_id,
+            actor,
+            feedback_ids,
+            boundary,
+        )?;
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{thread_id}:{}", request.id),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: format!(
+                "Submitted selected GitHub feedback through Merge Candidate rework request {} for candidate {}.",
+                request.id, request.candidate_id
+            ),
+            delivered: false,
+            approval_control: None,
+            update_timestamp: None,
+        })?;
+        self.deliver_pending()?;
+        Ok(request)
+    }
+
     fn reconcile_thread_post_land_effects(
         &self,
         thread: &FluentThread,

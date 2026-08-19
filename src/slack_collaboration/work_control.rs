@@ -14,6 +14,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::{
+    CandidateReworkBoundary, CandidateReworkRequest, GitHubCandidate, GitHubPublication,
+    GitHubPublishRequest, GitHubReviewClient, GitHubReviewFeedback,
+};
 use crate::atomic_write::atomic_write;
 use crate::work_model::{
     DurableTransitionMetadata, DurableTransitionOrigin, DurableWorkTransition, ExecutionAuthority,
@@ -123,6 +127,8 @@ pub struct SliceWork {
     observed_states: BTreeMap<String, String>,
     #[serde(default)]
     transition_cursors: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_publication: Option<GitHubPublication>,
 }
 
 /// A bounded, ordered status change observed from the authoritative Work
@@ -255,6 +261,7 @@ impl WorkControl {
                 transitions: Vec::new(),
                 observed_states: BTreeMap::new(),
                 transition_cursors: BTreeMap::new(),
+                github_publication: None,
             };
             self.save_slice(&staged)?;
             staged
@@ -372,6 +379,222 @@ impl WorkControl {
             slice_id: slice.id,
             outcomes,
         })
+    }
+
+    /// Publish only the named current ready candidate. The Slice record stores
+    /// intent before the external call so a retry can reconcile partial success.
+    pub fn publish_ready_candidate(
+        &self,
+        slice_id: &str,
+        candidate_id: &str,
+        remote: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<GitHubPublication> {
+        let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
+            .with_context(|| format!("lock GitHub publication for Slice {slice_id}"))?;
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let candidate = self.current_ready_candidate(&slice)?;
+        if candidate.candidate_id != candidate_id {
+            bail!(
+                "Merge Candidate {candidate_id} is stale; current ready candidate is {}",
+                candidate.candidate_id
+            );
+        }
+        if let Some(existing) = slice.github_publication.as_ref()
+            && existing.candidate == candidate
+            && existing.pull_request_url.is_some()
+        {
+            return Ok(existing.clone());
+        }
+        let existing = slice.github_publication.clone();
+        let mut publication = GitHubPublication {
+            slice_id: slice_id.to_owned(),
+            remote: remote.to_owned(),
+            head_branch: format!("fluent/{slice_id}"),
+            candidate,
+            pull_request_url: existing
+                .as_ref()
+                .and_then(|record| record.pull_request_url.clone()),
+            feedback: existing
+                .as_ref()
+                .map(|record| record.feedback.clone())
+                .unwrap_or_default(),
+            routed_feedback_ids: existing
+                .as_ref()
+                .map(|record| record.routed_feedback_ids.clone())
+                .unwrap_or_default(),
+        };
+        slice.github_publication = Some(publication.clone());
+        self.save_slice(&slice)?;
+        let url = github.publish(
+            &GitHubPublishRequest {
+                checkout: self.project_root.clone(),
+                publication: publication.clone(),
+            },
+            existing.as_ref(),
+        )?;
+        if url.trim().is_empty() {
+            bail!("GitHub returned an empty pull-request URL");
+        }
+        publication.pull_request_url = Some(url);
+        slice.github_publication = Some(publication.clone());
+        self.save_slice(&slice)?;
+        Ok(publication)
+    }
+
+    /// Advance an existing Fluent-created pull request only after a different
+    /// candidate independently reaches the authoritative ready state.
+    pub fn advance_published_candidate(
+        &self,
+        slice_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<Option<GitHubPublication>> {
+        let slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let Some(existing) = slice.github_publication.as_ref() else {
+            return Ok(None);
+        };
+        let current = self.current_ready_candidate(&slice)?;
+        if current == existing.candidate {
+            return Ok(None);
+        }
+        self.publish_ready_candidate(slice_id, &current.candidate_id, &existing.remote, github)
+            .map(Some)
+    }
+
+    /// Persist unseen feedback before callers post their Slack updates.
+    pub fn ingest_github_feedback(
+        &self,
+        slice_id: &str,
+        github: &mut dyn GitHubReviewClient,
+    ) -> Result<Vec<GitHubReviewFeedback>> {
+        let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
+            .with_context(|| format!("lock GitHub feedback for Slice {slice_id}"))?;
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let publication = slice
+            .github_publication
+            .as_mut()
+            .context("Slice has no Fluent-created pull request")?;
+        let received = github.review_feedback(publication)?;
+        let mut unseen = Vec::new();
+        for feedback in received {
+            if publication
+                .feedback
+                .iter()
+                .any(|seen| seen.id == feedback.id)
+            {
+                continue;
+            }
+            publication.feedback.push(feedback.clone());
+            unseen.push(feedback);
+        }
+        if !unseen.is_empty() {
+            self.save_slice(&slice)?;
+        }
+        Ok(unseen)
+    }
+
+    /// Route an approver-selected subset through the candidate-rework owner.
+    /// Merely ingesting feedback never calls this boundary.
+    pub fn authorize_feedback_rework(
+        &self,
+        slice_id: &str,
+        actor: &str,
+        feedback_ids: &[String],
+        boundary: &dyn CandidateReworkBoundary,
+    ) -> Result<CandidateReworkRequest> {
+        if feedback_ids.is_empty() {
+            bail!("candidate rework requires selected GitHub feedback");
+        }
+        let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
+            .with_context(|| format!("lock GitHub rework for Slice {slice_id}"))?;
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let publication = slice
+            .github_publication
+            .as_mut()
+            .context("Slice has no Fluent-created pull request")?;
+        let selected = feedback_ids
+            .iter()
+            .map(|id| {
+                publication
+                    .feedback
+                    .iter()
+                    .find(|feedback| feedback.id == *id && !feedback.resolved)
+                    .cloned()
+                    .with_context(|| format!("GitHub feedback {id} is unavailable or resolved"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"fluent-github-rework-v1\0");
+        hasher.update(slice_id.as_bytes());
+        hasher.update([0]);
+        for id in feedback_ids {
+            hasher.update(id.as_bytes());
+            hasher.update([0]);
+        }
+        let request = CandidateReworkRequest {
+            id: format!("github-rework-{:x}", hasher.finalize()),
+            slice_id: slice_id.to_owned(),
+            work_item_id: publication.candidate.work_item_id.clone(),
+            candidate_id: publication.candidate.candidate_id.clone(),
+            candidate_commit: publication.candidate.commit.clone(),
+            authorized_by: actor.to_owned(),
+            feedback: selected,
+        };
+        let already_routed = feedback_ids
+            .iter()
+            .all(|id| publication.routed_feedback_ids.contains(id));
+        if !already_routed {
+            boundary.submit_candidate_rework(&request)?;
+            for id in feedback_ids {
+                if !publication.routed_feedback_ids.contains(id) {
+                    publication.routed_feedback_ids.push(id.clone());
+                }
+            }
+            self.save_slice(&slice)?;
+        }
+        Ok(request)
+    }
+
+    fn current_ready_candidate(&self, slice: &SliceWork) -> Result<GitHubCandidate> {
+        let store = WorkModelStore::new(&self.project_root);
+        let mut ready = Vec::new();
+        for work_item_id in &slice.work_item_ids {
+            let item = store.read_work_item(work_item_id)?;
+            for candidate in &item.merge_candidates {
+                if candidate.ready_at.is_some()
+                    && candidate.merge_state.status
+                        == crate::work_model::MergeCandidateMergeStatus::Pending
+                    && candidate.validate_advancement(&item).is_ok()
+                {
+                    ready.push((
+                        candidate.ready_at.clone().unwrap_or_default(),
+                        GitHubCandidate {
+                            work_item_id: work_item_id.clone(),
+                            candidate_id: candidate.id.clone(),
+                            commit: candidate.candidate_commit.clone(),
+                            target_branch: candidate.target_branch.clone(),
+                        },
+                    ));
+                }
+            }
+        }
+        ready.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then(left.1.candidate_id.cmp(&right.1.candidate_id))
+        });
+        ready
+            .pop()
+            .map(|(_, candidate)| candidate)
+            .context("Slice has no ready Merge Candidate")
     }
 
     /// Read the persisted Slice binding without changing it.

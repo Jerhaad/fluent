@@ -9466,6 +9466,232 @@ fn ready_transition() -> WorkTransition {
     }
 }
 
+#[derive(Default)]
+struct FakeGitHub {
+    publishes: Vec<GitHubPublishRequest>,
+    fail_publish: bool,
+    feedback: Vec<GitHubReviewFeedback>,
+}
+
+impl GitHubReviewClient for FakeGitHub {
+    fn publish(
+        &mut self,
+        request: &GitHubPublishRequest,
+        _existing: Option<&GitHubPublication>,
+    ) -> anyhow::Result<String> {
+        self.publishes.push(request.clone());
+        if self.fail_publish {
+            anyhow::bail!("fake GitHub push failed")
+        }
+        Ok("https://github.com/acme/app/pull/7".into())
+    }
+
+    fn review_feedback(
+        &mut self,
+        _publication: &GitHubPublication,
+    ) -> anyhow::Result<Vec<GitHubReviewFeedback>> {
+        Ok(self.feedback.clone())
+    }
+}
+
+fn make_ready_candidate(
+    checkout: &TempDir,
+    work_item_id: &str,
+    candidate_id: &str,
+    commit: &str,
+    ready_at: &str,
+) {
+    use fluent::work_model::{
+        Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, MergeCandidate,
+        MergeCandidateMergeState, MergeReviewState, Task, TaskKind, TaskOutput, TaskStatus,
+        WorkspaceAccess, WorkspaceRef,
+    };
+    let attempt_id = format!("attempt-{candidate_id}");
+    let source = WorkspaceRef {
+        id: format!("workspace-{candidate_id}"),
+        path: checkout.path().join(candidate_id).display().to_string(),
+    };
+    let target = WorkspaceRef {
+        id: "target-main".into(),
+        path: checkout.path().display().to_string(),
+    };
+    WorkModelStore::new(checkout.path())
+        .mutate_work_item(work_item_id, |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            item.attempts.push(Attempt {
+                id: attempt_id.clone(),
+                work_item_id: work_item_id.into(),
+                status: AttemptStatus::Complete,
+                review_state: Some(AttemptReviewState::Passed),
+                completed_at: Some(ready_at.into()),
+                learning: Some(AttemptLearning::succeeded(
+                    1,
+                    fluent::follow_up::ArtifactRef {
+                        path: "handoff.json".into(),
+                        digest: "sha256:test".into(),
+                    },
+                )),
+                tasks: vec![Task {
+                    id: format!("write-{candidate_id}"),
+                    kind: TaskKind::Write,
+                    status: TaskStatus::Complete,
+                    role: "writer".into(),
+                    instructions: None,
+                    work_item_id: work_item_id.into(),
+                    attempt_id: Some(attempt_id.clone()),
+                    workspace_access: WorkspaceAccess {
+                        reads: vec![target.clone()],
+                        writes: vec![source.clone()],
+                    },
+                    artifact_area: None,
+                    review_context: None,
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: Some(TaskOutput {
+                        workspace_id: source.id.clone(),
+                        workspace_path: source.path.clone(),
+                        source_branch: "main".into(),
+                        base_commit: Some("base".into()),
+                        commit: commit.into(),
+                        no_change: None,
+                        learner_canonicalization: None,
+                    }),
+                    created_at: None,
+                    started_at: None,
+                    completed_at: None,
+                }],
+                ..Default::default()
+            });
+            item.merge_candidates.push(MergeCandidate {
+                id: candidate_id.into(),
+                attempt_id,
+                source_workspace: source,
+                target_workspace: target,
+                source_branch: "main".into(),
+                target_branch: "main".into(),
+                candidate_commit: commit.into(),
+                merge_review_state: MergeReviewState::Passed,
+                merge_state: MergeCandidateMergeState::default(),
+                created_at: Some(ready_at.into()),
+                ready_at: Some(ready_at.into()),
+                started_at: None,
+                completed_at: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn github_ready_runner<'a>(
+    home: &'a TempDir,
+    checkout: &TempDir,
+    config: RunnerConfig,
+) -> CollaborationRunner<'a, InMemoryProvider, InMemorySlack> {
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-github",
+            &[PlannedWork::new("work-github", "GitHub review")],
+        )
+        .unwrap();
+    make_ready_candidate(
+        checkout,
+        "work-github",
+        "candidate-github-1",
+        "commit-one",
+        "2026-08-19T01:00:00Z",
+    );
+    runner
+}
+
+#[test]
+fn planning_and_in_progress_work_create_no_github_artifact() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-github",
+            &[PlannedWork::new("work-github", "GitHub review")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+    assert!(
+        WorkControl::new(checkout.path())
+            .slice("slice-github")
+            .unwrap()
+            .unwrap()
+            .github_publication
+            .is_none()
+    );
+}
+
+#[test]
+fn approver_creates_one_pr_for_exact_ready_candidate() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = github_ready_runner(&home, &checkout, config);
+    let mut github = FakeGitHub::default();
+    let outcome = runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+    assert!(matches!(outcome, GitHubReviewRequestOutcome::Published(_)));
+    assert_eq!(github.publishes.len(), 1);
+    assert_eq!(
+        github.publishes[0].publication.candidate.commit,
+        "commit-one"
+    );
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("candidate-github-1")
+            && delivery.text.contains("https://github.com/acme/app/pull/7")
+    }));
+}
+
+#[test]
+fn duplicate_pr_request_returns_existing_pr() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = github_ready_runner(&home, &checkout, config);
+    let mut github = FakeGitHub::default();
+    runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+    runner
+        .request_github_review("1.0", "U1", "candidate-github-1", &mut github)
+        .unwrap();
+    assert_eq!(github.publishes.len(), 1);
+    let publication = WorkControl::new(checkout.path())
+        .slice("slice-github")
+        .unwrap()
+        .unwrap()
+        .github_publication
+        .unwrap();
+    assert_eq!(
+        publication.pull_request_url.as_deref(),
+        Some("https://github.com/acme/app/pull/7")
+    );
+}
+
 #[test]
 fn ready_candidate_renderer_includes_reviewable_evidence_summary() {
     let (_home, checkout, _config) = setup(true);
