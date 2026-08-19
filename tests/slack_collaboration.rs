@@ -2669,6 +2669,25 @@ fn code_question_rejects_provider_reference_outside_bound_checkout() {
 }
 
 #[test]
+fn code_reference_rejects_checkout_symlink_escape() {
+    let (_home, checkout, config) = setup(true);
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("secret"), "private").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret"),
+        checkout.path().join("linked"),
+    )
+    .unwrap();
+    let error = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("linked"),
+        1,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("outside the bound checkout"));
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(

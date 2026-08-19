@@ -593,8 +593,18 @@ pub fn checkout_is_available(checkout: &Checkout) -> bool {
 /// committed GitHub checkout gets an immutable permalink; local state receives
 /// a clearly labelled, bounded excerpt instead.
 pub fn format_code_reference(checkout: &Checkout, path: &Path, line: usize) -> Result<String> {
+    let checkout_root = checkout
+        .path
+        .canonicalize()
+        .context("canonicalize bound checkout")?;
+    let path = path
+        .canonicalize()
+        .context("canonicalize referenced code")?;
+    if !path.is_file() {
+        bail!("referenced code is not a regular file");
+    }
     let relative = path
-        .strip_prefix(&checkout.path)
+        .strip_prefix(&checkout_root)
         .context("code reference is outside the bound checkout")?;
     let relative = relative.to_string_lossy().replace('\\', "/");
     let committed = git_output(&checkout.path, &["status", "--porcelain", "--", &relative])
