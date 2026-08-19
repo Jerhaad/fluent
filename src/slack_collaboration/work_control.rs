@@ -521,6 +521,24 @@ impl WorkControl {
         })
     }
 
+    /// Link separately created corrective Work to its completed originating
+    /// Slice. The new non-terminal Work immediately reactivates the Slice.
+    pub fn link_corrective_work(&self, slice_id: &str, work_item_id: &str) -> Result<()> {
+        if self.slice_stage(slice_id)? != SliceStage::Complete {
+            bail!("corrective Work can only extend a completed Slice");
+        }
+        let store = WorkModelStore::new(&self.project_root);
+        store.read_work_item(work_item_id)?;
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        if !slice.work_item_ids.iter().any(|id| id == work_item_id) {
+            slice.work_item_ids.push(work_item_id.to_owned());
+            self.save_slice(&slice)?;
+        }
+        Ok(())
+    }
+
     /// Render the pinned thread status from durable model state. The caller
     /// supplies provider state because it is runner-local rather than Work
     /// model authority.

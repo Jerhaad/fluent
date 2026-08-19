@@ -1608,6 +1608,37 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(transitions)
     }
 
+    /// Link policy-created corrective Work to the originating Slice and report
+    /// its durable initial state through the original thread.
+    pub fn link_thread_corrective_work(
+        &mut self,
+        thread_id: &str,
+        work_item_id: &str,
+    ) -> Result<()> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        WorkControl::new(&project.checkout.path).link_corrective_work(slice_id, work_item_id)?;
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{thread_id}:corrective-work:{work_item_id}"),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: format!(
+                "Linked corrective Work Item {work_item_id} to Slice {slice_id}; the Slice is active until the correction reaches its terminal outcome."
+            ),
+            delivered: false,
+            update_timestamp: None,
+        })?;
+        self.report_thread_work(thread_id)?;
+        Ok(())
+    }
+
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let project = self.configured_bound_project(thread)?;
         if !checkout_is_available(&project.checkout) {

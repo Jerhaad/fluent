@@ -7581,6 +7581,65 @@ fn corrective_follow_up_reactivates_original_slice() {
 }
 
 #[test]
+fn runner_links_new_corrective_work_to_completed_slice() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-corrective-runner",
+            &[PlannedWork::new("work-original", "Original")],
+        )
+        .unwrap();
+    append_attempt_state(
+        &checkout,
+        "work-original",
+        fluent::work_model::AttemptStatus::Complete,
+        "landed",
+    );
+    let control = WorkControl::new(checkout.path());
+    assert_eq!(
+        control.slice_stage("slice-corrective-runner").unwrap(),
+        SliceStage::Complete
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .create_work_item(&fluent::work_model::WorkItem {
+            id: "work-correction".into(),
+            title: "Corrective Work".into(),
+            authorization: fluent::work_model::ExecutionAuthorization::Proposed,
+            ..Default::default()
+        })
+        .unwrap();
+
+    runner
+        .link_thread_corrective_work("1.0", "work-correction")
+        .unwrap();
+
+    assert_eq!(
+        control.slice_stage("slice-corrective-runner").unwrap(),
+        SliceStage::Active
+    );
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("Linked corrective Work Item work-correction")
+    }));
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("Work Item work-correction")
+            && delivery.text.contains("is now planned")
+    }));
+}
+
+#[test]
 fn optional_observation_does_not_reopen_completed_slice() {
     let (_home, checkout, _config) = setup(true);
     let control = planned_control(&checkout, "slice-observation", "work-observation");
