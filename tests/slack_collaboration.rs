@@ -2726,6 +2726,51 @@ fn production_adapters_reject_unsafe_structured_references() {
 }
 
 #[test]
+fn production_adapters_require_complete_structured_references() {
+    let fixture = TempDir::new().unwrap();
+    let checkout = TempDir::new().unwrap();
+    fs::write(checkout.path().join("README"), "fixture\n").unwrap();
+    let scope = ProviderScope {
+        checkout: checkout.path().into(),
+        slice_draft: checkout.path().join(".fluent/work/slack/drafts/test"),
+    };
+
+    let codex = codex_fixture(&fixture);
+    fs::write(
+        format!("{}.reply", codex.display()),
+        serde_json::json!({"type": "message", "text": "missing references"}).to_string(),
+    )
+    .unwrap();
+    let mut codex_provider = CodexAppServerProvider::new(codex);
+    let codex_error = codex_provider
+        .start("action-1", &scope, "inspect", "U1")
+        .unwrap_err();
+    assert_eq!(codex_error.failure, ProviderFailure::IncompatibleProtocol);
+
+    let claude = fixture.path().join("claude-invalid-line");
+    let invalid_line = serde_json::json!({
+        "type": "message",
+        "text": "invalid line",
+        "references": [{"path": "README", "line": 2}]
+    })
+    .to_string();
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            serde_json::json!({"session_id": "claude-session", "result": invalid_line})
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut claude_provider = ClaudeStructuredSessionProvider::new(claude);
+    let claude_error = claude_provider
+        .start("action-2", &scope, "inspect", "U1")
+        .unwrap_err();
+    assert_eq!(claude_error.failure, ProviderFailure::IncompatibleProtocol);
+}
+
+#[test]
 fn provider_adapters_return_typed_setup_and_recovery_failures() {
     let fixture = TempDir::new().unwrap();
     let scope = ProviderScope {
