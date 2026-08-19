@@ -1062,6 +1062,9 @@ impl Drop for SchedulerService {
 /// Serve the production scheduler socket until the owning process exits.
 /// The scheduler command runs this listener alongside its queue coordinator.
 pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> Result<()> {
+    if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
+        return Ok(());
+    }
     #[cfg(feature = "test-support")]
     if std::env::var_os("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT").is_some() {
         return run_transportless_service(home_dir, build, poll_seconds);
@@ -1093,6 +1096,9 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
     let poll_interval = Duration::from_secs(poll_seconds.max(1));
     let mut next_poll = Instant::now();
     loop {
+        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let _ = service.serve_connection(&mut stream);
@@ -1104,9 +1110,6 @@ pub fn run_service(home_dir: &Path, build: BuildIdentity, poll_seconds: u64) -> 
         if Instant::now() >= next_poll {
             service.poll_once()?;
             next_poll = Instant::now() + poll_interval;
-        }
-        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
-            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1132,6 +1135,9 @@ fn run_transportless_service(
     let mut next_poll = Instant::now();
     let mut owned_coordinator = false;
     loop {
+        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
+            return Ok(());
+        }
         service.reconcile_stops()?;
         if owned_coordinator && !service.owns_coordinator() {
             return Ok(());
@@ -1147,9 +1153,6 @@ fn run_transportless_service(
             }
             owned_coordinator |= service.owns_coordinator();
             next_poll = Instant::now() + poll_interval;
-        }
-        if SERVICE_SHUTDOWN.load(Ordering::Acquire) {
-            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
