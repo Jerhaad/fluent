@@ -1,4 +1,5 @@
 use super::*;
+use crate::work_model::WorkModelStore;
 
 /// Coordinates one local runner. File state is written before external effects.
 pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
@@ -131,9 +132,40 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         {
             bail!("planning lifecycle is not waiting for this artifact revision");
         }
+        self.approve_work_item_planning_revision(&thread, revision)?;
         thread.pending_artifact_revision = None;
         thread.pending_question = None;
         self.store.save_thread(&self.config, &thread)
+    }
+
+    fn approve_work_item_planning_revision(
+        &self,
+        thread: &FluentThread,
+        revision: &ArtifactRevision,
+    ) -> Result<()> {
+        let work_item_id = thread
+            .linked_work
+            .as_deref()
+            .context("planning artifact is not bound to a Fluent Work Item")?;
+        let checkout = &self.bound_project(thread)?.checkout.path;
+        let work_item = WorkModelStore::new(checkout)
+            .read_work_item(work_item_id)
+            .with_context(|| format!("read planning Work Item {work_item_id}"))?;
+        let context = work_item
+            .planning_context
+            .context("Work Item has no approved planning context")?;
+        let approved = match revision.kind.as_str() {
+            "brief" => context.brief,
+            "behaviors" => context.behaviors,
+            "approach" => context.approach,
+            "plan" => context.plan,
+            _ => bail!("unknown planning artifact stage {}", revision.kind),
+        }
+        .context("Work Item has no approved revision for this planning stage")?;
+        if approved != revision.markdown {
+            bail!("planning revision does not match the Work Item's approved artifact");
+        }
+        Ok(())
     }
 
     /// Persist first, then acknowledge exactly once, then process and send.

@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 
 use fluent::slack_collaboration::*;
+use fluent::work_model::{PlanningContext, WorkItem, WorkModelStore};
 use tempfile::TempDir;
 
 fn initialize_checkout(path: &std::path::Path) -> (String, String) {
@@ -136,7 +137,7 @@ fn large_planning_artifact_preserves_exact_content_across_messages() {
 
 #[test]
 fn planning_artifact_waits_for_existing_approval_gate() {
-    let (home, _checkout, mut config) = setup(true);
+    let (home, checkout, mut config) = setup(true);
     config
         .projects
         .get_mut("app")
@@ -150,6 +151,18 @@ fn planning_artifact_waits_for_existing_approval_gate() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut work_item = WorkItem::planned("work-1", "Approve planning");
+    work_item.planning_context = Some(PlanningContext {
+        plan: Some("# Plan\n".into()),
+        ..Default::default()
+    });
+    WorkModelStore::new(checkout.path())
+        .create_work_item(&work_item)
+        .unwrap();
+    let store = FileCollaborationStore::new(home.path());
+    let mut thread = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
+    thread.linked_work = Some("work-1".into());
+    store.save_thread(&runner.config, &thread).unwrap();
     let revision = runner
         .present_planning_artifact("1.0", "plan", "# Plan\n")
         .unwrap();
@@ -166,12 +179,54 @@ fn planning_artifact_waits_for_existing_approval_gate() {
     runner
         .approve_planning_revision("1.0", &revision.id, "U1")
         .unwrap();
-    let thread = FileCollaborationStore::new(home.path())
-        .load_thread(&runner.config, "1.0")
-        .unwrap()
-        .unwrap();
+    let thread = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
     assert_eq!(thread.planning_stage.as_deref(), Some("plan"));
     assert!(thread.pending_question.is_none());
+}
+
+#[test]
+fn planning_artifact_reloads_exact_revisions_for_all_stages() {
+    let (home, checkout, config) = setup(true);
+    let stages = [
+        ("brief", "# Brief\n"),
+        ("behaviors", "# Behaviors\n"),
+        ("approach", "# Approach\n"),
+        ("plan", "# Plan\n"),
+    ];
+    let mut work_item = WorkItem::planned("work-1", "Approve planning");
+    work_item.planning_context = Some(PlanningContext {
+        brief: Some(stages[0].1.into()),
+        behaviors: Some(stages[1].1.into()),
+        approach: Some(stages[2].1.into()),
+        plan: Some(stages[3].1.into()),
+        ..Default::default()
+    });
+    WorkModelStore::new(checkout.path())
+        .create_work_item(&work_item)
+        .unwrap();
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut thread = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
+    thread.linked_work = Some("work-1".into());
+    store.save_thread(&runner.config, &thread).unwrap();
+    for (stage, markdown) in stages {
+        let revision = runner
+            .present_planning_artifact("1.0", stage, markdown)
+            .unwrap();
+        let reloaded = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
+        let stored = reloaded.artifact_revisions.last().unwrap();
+        assert_eq!(stored.markdown, markdown);
+        assert_eq!(stored.sha256, ArtifactRevision::new(stage, markdown).sha256);
+        runner
+            .approve_planning_revision("1.0", &revision.id, "U1")
+            .unwrap();
+    }
 }
 
 #[test]
