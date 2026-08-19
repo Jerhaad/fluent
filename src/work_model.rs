@@ -447,6 +447,14 @@ pub struct DurableWorkTransition {
     pub evidence_ref: Option<String>,
 }
 
+/// Bounded attribution supplied by the trusted caller that owns a mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableTransitionMetadata {
+    pub origin: Option<String>,
+    pub reason: Option<String>,
+    pub evidence_ref: Option<String>,
+}
+
 impl WorkItem {
     pub fn compatibility_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -6025,6 +6033,7 @@ pub fn set_merge_candidate_terminal(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkModelError {
+    TransitionLedgerModified,
     AttemptResumeIneligible {
         attempt_id: String,
         reason: String,
@@ -6211,6 +6220,9 @@ pub enum WorkModelError {
 impl fmt::Display for WorkModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::TransitionLedgerModified => {
+                f.write_str("durable transition history is append-only and host-owned")
+            }
             Self::AttemptResumeIneligible { reason, .. } => f.write_str(reason),
             Self::RoundCapExtensionIncrementOutOfRange { requested } => write!(
                 f,
@@ -7280,6 +7292,16 @@ impl WorkModelStore {
         id: &str,
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
+        self.mutate_work_item_with_transition(id, None, reducer)
+    }
+
+    /// Mutate an aggregate and atomically attribute any derived transitions.
+    pub fn mutate_work_item_with_transition<T>(
+        &self,
+        id: &str,
+        metadata: Option<&DurableTransitionMetadata>,
+        reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+    ) -> Result<T, WorkModelStorageError> {
         let path = self.work_item_path(id)?;
         let _lock = self.lock_work_item_model(id)?;
         let mut work_item = self.read_work_item_under_model_lock(id)?;
@@ -7295,7 +7317,8 @@ impl WorkModelStore {
                 path: path.clone(),
                 source,
             })?;
-        append_durable_transitions(Some(&prior), &mut work_item);
+        reject_transition_history_change(&prior, &work_item, &path)?;
+        append_durable_transitions(Some(&prior), &mut work_item, metadata);
         work_item
             .validate()
             .map_err(|source| WorkModelStorageError::InvalidModel { path, source })?;
@@ -7325,13 +7348,22 @@ impl WorkModelStore {
             })?;
 
         let _lock = self.lock_work_item_model(&work_item.id)?;
+        if create_new && !work_item.transitions.is_empty() {
+            return Err(WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source: WorkModelError::TransitionLedgerModified,
+            });
+        }
         let prior = if create_new {
             None
         } else {
             Some(self.read_work_item_under_model_lock(&work_item.id)?)
         };
         let mut target = work_item.clone();
-        append_durable_transitions(prior.as_ref(), &mut target);
+        if let Some(prior) = prior.as_ref() {
+            reject_transition_history_change(prior, &target, &path)?;
+        }
+        append_durable_transitions(prior.as_ref(), &mut target, None);
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
             .storage_revision
@@ -8015,7 +8047,25 @@ impl WorkModelStore {
     }
 }
 
-fn append_durable_transitions(prior: Option<&WorkItem>, work_item: &mut WorkItem) {
+fn reject_transition_history_change(
+    prior: &WorkItem,
+    proposed: &WorkItem,
+    path: &Path,
+) -> Result<(), WorkModelStorageError> {
+    if proposed.transitions != prior.transitions {
+        return Err(WorkModelStorageError::InvalidModel {
+            path: path.to_path_buf(),
+            source: WorkModelError::TransitionLedgerModified,
+        });
+    }
+    Ok(())
+}
+
+fn append_durable_transitions(
+    prior: Option<&WorkItem>,
+    work_item: &mut WorkItem,
+    metadata: Option<&DurableTransitionMetadata>,
+) {
     let previous = prior
         .map(|item| {
             item.transitions
@@ -8036,6 +8086,7 @@ fn append_durable_transitions(prior: Option<&WorkItem>, work_item: &mut WorkItem
     // The aggregate already stores only emitted states. Record a fresh entry for
     // an object when its current state differs from its last durable state.
     let now = now_iso8601();
+    let now_timestamp = chrono::DateTime::parse_from_rfc3339(&now).ok();
     for (object_kind, object_id, state, reason) in current {
         let key = format!("{object_kind}:{object_id}");
         let old_state = prior_states.get(&key).cloned();
@@ -8047,6 +8098,16 @@ fn append_durable_transitions(prior: Option<&WorkItem>, work_item: &mut WorkItem
             .last()
             .map(|entry| entry.sequence + 1)
             .unwrap_or(previous + 1);
+        let elapsed_seconds = prior
+            .and_then(|item| {
+                item.transitions
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.object_kind == object_kind && entry.object_id == object_id)
+            })
+            .and_then(|entry| chrono::DateTime::parse_from_rfc3339(&entry.occurred_at).ok())
+            .zip(now_timestamp)
+            .map(|(started, ended)| (ended - started).num_seconds().max(0) as u64);
         work_item.transitions.push(DurableWorkTransition {
             sequence,
             object_kind,
@@ -8054,10 +8115,10 @@ fn append_durable_transitions(prior: Option<&WorkItem>, work_item: &mut WorkItem
             old_state,
             new_state: state,
             occurred_at: now.clone(),
-            elapsed_seconds: None,
-            origin: Some("fluent".into()),
-            reason,
-            evidence_ref: None,
+            elapsed_seconds,
+            origin: metadata.and_then(|value| value.origin.clone()),
+            reason: metadata.and_then(|value| value.reason.clone()).or(reason),
+            evidence_ref: metadata.and_then(|value| value.evidence_ref.clone()),
         });
     }
 }

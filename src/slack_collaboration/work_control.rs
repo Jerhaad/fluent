@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 use crate::work_model::{
-    ExecutionAuthority, ExecutionAuthorization, WorkItem, WorkModelStore, validate_work_item_id,
+    DurableTransitionMetadata, ExecutionAuthority, ExecutionAuthorization, WorkItem,
+    WorkModelStore, validate_work_item_id,
 };
 
 /// A Work Item approved as part of one Slack Slice plan.
@@ -271,7 +272,12 @@ impl WorkControl {
                 slice.execution_requests.push(request.clone());
                 self.save_slice(&slice)?;
             }
-            store.mutate_work_item(work_item_id, |item| {
+            let metadata = DurableTransitionMetadata {
+                origin: Some("slack-thread".into()),
+                reason: Some(format!("Execution approved by {approver}")),
+                evidence_ref: Some(format!("slack-slice:{slice_id}")),
+            };
+            store.mutate_work_item_with_transition(work_item_id, Some(&metadata), |item| {
                 item.authorization =
                     ExecutionAuthorization::execution_ready(ExecutionAuthority::Human);
                 Ok(())
@@ -455,6 +461,66 @@ impl WorkControl {
             self.save_slice(&slice)?;
         }
         Ok(reported)
+    }
+
+    /// Schedule each unseen transition before advancing its durable cursor.
+    /// Repeating after a crash is safe when `schedule` uses the transition's
+    /// stable identity at an idempotent outbox boundary.
+    pub fn schedule_durable_transitions(
+        &self,
+        slice_id: &str,
+        mut schedule: impl FnMut(&WorkTransition) -> Result<()>,
+    ) -> Result<Vec<WorkTransition>> {
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let store = WorkModelStore::new(&self.project_root);
+        let mut pending = Vec::new();
+        for work_item_id in &slice.work_item_ids {
+            let item = store.read_work_item(work_item_id)?;
+            let cursor = slice
+                .transition_cursors
+                .get(work_item_id)
+                .copied()
+                .unwrap_or(0);
+            pending.extend(
+                item.transitions
+                    .iter()
+                    .filter(|entry| entry.sequence > cursor)
+                    .map(|entry| WorkTransition {
+                        sequence: entry.sequence,
+                        work_item_id: work_item_id.clone(),
+                        object_id: entry.object_id.clone(),
+                        old_state: entry.old_state.clone(),
+                        new_state: entry.new_state.clone(),
+                        origin: entry.origin.clone(),
+                        reason: entry.reason.clone(),
+                        object_kind: entry.object_kind.clone(),
+                        occurred_at: Some(entry.occurred_at.clone()),
+                        elapsed_seconds: entry.elapsed_seconds,
+                        candidate_commit: None,
+                        comparison_base: None,
+                        completed_tests: Vec::new(),
+                        completed_reviews: Vec::new(),
+                    }),
+            );
+        }
+        pending.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+        for transition in &pending {
+            schedule(transition)?;
+            slice
+                .transition_cursors
+                .insert(transition.work_item_id.clone(), transition.sequence);
+        }
+        if !pending.is_empty() {
+            self.save_slice(&slice)?;
+        }
+        Ok(pending)
     }
 
     /// Derive the current Slice stage from persisted Work and landing state.

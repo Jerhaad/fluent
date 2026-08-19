@@ -6523,6 +6523,48 @@ fn direct_work_item_writes_append_lifecycle_transitions() {
 }
 
 #[test]
+fn transition_history_is_immutable_and_metadata_is_atomic() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-ledger-protected",
+            "U1",
+            &[PlannedWork::new("work-protected", "Work")],
+        )
+        .unwrap();
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let mut rewritten = store.read_work_item("work-protected").unwrap();
+    rewritten.transitions.clear();
+    assert!(store.write_work_item(&rewritten).is_err());
+
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some("capacity became available".into()),
+        evidence_ref: Some("scheduler-event:42".into()),
+    };
+    store
+        .mutate_work_item_with_transition("work-protected", Some(&metadata), |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            Ok(())
+        })
+        .unwrap();
+    let saved = store.read_work_item("work-protected").unwrap();
+    let transition = saved.transitions.last().unwrap();
+    assert_eq!(transition.origin.as_deref(), Some("scheduler"));
+    assert_eq!(
+        transition.reason.as_deref(),
+        Some("capacity became available")
+    );
+    assert_eq!(
+        transition.evidence_ref.as_deref(),
+        Some("scheduler-event:42")
+    );
+}
+
+#[test]
 fn execution_approval_queues_each_planned_work_item() {
     #[derive(Default)]
     struct FakeScheduler {
@@ -6613,6 +6655,57 @@ fn execution_approval_retries_the_same_request_after_scheduler_failure() {
     let requests = scheduler.1.borrow();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn runner_delivers_plan_execution_and_durable_work_updates() {
+    #[derive(Default)]
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
+        .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-runner",
+            &[PlannedWork::new("work-runner", "Runner integration")],
+        )
+        .unwrap();
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("Planned Work Items: work-runner")
+            && delivery.text.contains("Execution has not started")
+    }));
+
+    runner
+        .authorize_thread_execution("1.0", "U1", &Scheduler)
+        .unwrap();
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("Work Item work-runner queue outcome")
+    }));
+    let transitions = runner.report_thread_work("1.0").unwrap();
+    assert!(transitions.iter().any(|transition| {
+        transition.work_item_id == "work-runner"
+            && transition.origin.as_deref() == Some("slack-thread")
+    }));
+    assert!(runner.report_thread_work("1.0").unwrap().is_empty());
 }
 
 #[test]

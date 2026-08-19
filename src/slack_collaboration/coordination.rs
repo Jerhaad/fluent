@@ -1439,6 +1439,108 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         thread.provider_failure = Some(failure);
         self.store.save_thread(&self.config, thread)
     }
+
+    /// Materialize an authorized thread plan and durably queue its identifiers
+    /// for Slack delivery without starting execution.
+    pub fn approve_thread_plan(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        slice_id: &str,
+        planned_work: &[PlannedWork],
+    ) -> Result<ApprovedPlanReport> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.allowed_participants.contains(actor) {
+            bail!("participant cannot approve Work for this project");
+        }
+        let control = WorkControl::new(&project.checkout.path);
+        let report = control.approve_plan(slice_id, actor, planned_work)?;
+        thread.slice = Some(slice_id.to_owned());
+        thread.linked_work = report.work_item_ids.first().cloned();
+        self.store.save_thread(&self.config, &thread)?;
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{thread_id}:work-plan:{slice_id}"),
+            channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(),
+            text: format!(
+                "Approved Slice {slice_id}. Planned Work Items: {}. Execution has not started.",
+                report.work_item_ids.join(", ")
+            ),
+            delivered: false,
+        })?;
+        self.deliver_pending()?;
+        Ok(report)
+    }
+
+    /// Submit separately approved Work through the scheduler boundary and
+    /// durably report each real acknowledgement in the bound thread.
+    pub fn authorize_thread_execution(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+        scheduler: &dyn WorkScheduler,
+    ) -> Result<ExecutionApprovalReport> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.allowed_participants.contains(actor) {
+            bail!("participant cannot authorize Work for this project");
+        }
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let report = WorkControl::new(&project.checkout.path)
+            .authorize_execution(slice_id, actor, scheduler)?;
+        for (work_item_id, outcome) in &report.outcomes {
+            self.store.persist_outbox(OutboundDelivery {
+                id: format!("{thread_id}:work-queue:{work_item_id}"),
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text: format!("Work Item {work_item_id} queue outcome: {outcome:?}."),
+                delivered: false,
+            })?;
+        }
+        self.deliver_pending()?;
+        Ok(report)
+    }
+
+    /// Project authoritative Work state and schedule unseen lifecycle replies
+    /// through the collaboration outbox before advancing Slack cursors.
+    pub fn report_thread_work(&mut self, thread_id: &str) -> Result<Vec<WorkTransition>> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        let slice_id = thread
+            .slice
+            .as_deref()
+            .context("thread has no approved Slice")?;
+        let control = WorkControl::new(&project.checkout.path);
+        let store = &self.store;
+        let transitions = control.schedule_durable_transitions(slice_id, |transition| {
+            store.persist_outbox(OutboundDelivery {
+                id: format!(
+                    "{thread_id}:work-transition:{}:{}",
+                    transition.work_item_id, transition.sequence
+                ),
+                channel: thread.channel.clone(),
+                thread_timestamp: thread.id.clone(),
+                text: render_transition_reply(transition, &[]),
+                delivered: false,
+            })
+        })?;
+        self.deliver_pending()?;
+        Ok(transitions)
+    }
+
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let project = self.configured_bound_project(thread)?;
         if !checkout_is_available(&project.checkout) {
