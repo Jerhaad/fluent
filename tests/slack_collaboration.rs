@@ -6669,17 +6669,7 @@ fn execution_approval_retries_the_same_request_after_scheduler_failure() {
 
 #[test]
 fn runner_delivers_plan_execution_and_durable_work_updates() {
-    #[derive(Default)]
-    struct Scheduler;
-    impl WorkScheduler for Scheduler {
-        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
-            Ok(WorkQueueOutcome::Queued {
-                request_id: request.id.clone(),
-            })
-        }
-    }
-
-    let (home, _checkout, config) = setup(true);
+    let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -6702,9 +6692,16 @@ fn runner_delivers_plan_execution_and_durable_work_updates() {
             && delivery.text.contains("Execution has not started")
     }));
 
-    runner
-        .authorize_thread_execution("1.0", "U1", &Scheduler)
+    let report = runner
+        .authorize_thread_execution_locally("1.0", "U1")
         .unwrap();
+    let request_id = match &report.outcomes[0].1 {
+        WorkQueueOutcome::Queued { request_id }
+        | WorkQueueOutcome::AlreadyQueued { request_id } => request_id,
+    };
+    let scheduled = fluent::scheduler_service::load_request(checkout.path(), request_id).unwrap();
+    assert_eq!(scheduled.work_item_id, "work-runner");
+    assert_eq!(scheduled.id, *request_id);
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery
             .text

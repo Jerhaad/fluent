@@ -44,6 +44,7 @@ pub struct WorkExecutionRequest {
     pub slice_id: String,
     pub work_item_id: String,
     pub authorized_by: String,
+    pub created_at: String,
 }
 
 /// Scheduler acknowledgement that is safe to report in a Slack thread.
@@ -269,6 +270,7 @@ impl WorkControl {
                     slice_id: slice_id.into(),
                     work_item_id: work_item_id.clone(),
                     authorized_by: approver.into(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
                 });
             if existing_request.is_none() {
                 slice.execution_requests.push(request.clone());

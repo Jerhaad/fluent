@@ -1511,6 +1511,22 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         Ok(report)
     }
 
+    /// Authorize Work through the configured checkout's production scheduler
+    /// submission boundary.
+    pub fn authorize_thread_execution_locally(
+        &mut self,
+        thread_id: &str,
+        actor: &str,
+    ) -> Result<ExecutionApprovalReport> {
+        let thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project_root = self.bound_project(&thread)?.checkout.path.clone();
+        let scheduler = LocalSchedulerClient::new([project_root]);
+        self.authorize_thread_execution(thread_id, actor, &scheduler)
+    }
+
     /// Project authoritative Work state and schedule unseen lifecycle replies
     /// through the collaboration outbox before advancing Slack cursors.
     pub fn report_thread_work(&mut self, thread_id: &str) -> Result<Vec<WorkTransition>> {

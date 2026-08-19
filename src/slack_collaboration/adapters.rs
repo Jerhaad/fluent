@@ -13,6 +13,7 @@ use super::{
     ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderError,
     ProviderFailure, ProviderOutput, ProviderResult, ProviderScope, ProviderTurnRecovery,
     RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
+    WorkExecutionRequest, WorkQueueOutcome, WorkScheduler,
 };
 
 const STRUCTURED_REPLY_INSTRUCTION: &str = "Return exactly one JSON object. Use {\"type\":\"message\",\"text\":\"...\",\"references\":[{\"path\":\"src/lib.rs\",\"line\":1}]} for a conversational reply. Every reference must name an existing repository-relative file and a one-based line; use an empty references array when no source location supports the reply. When you complete or revise a planning artifact, use {\"type\":\"planning_artifact\",\"kind\":\"brief|behaviors|approach|plan\",\"markdown\":\"...\"} with the complete Markdown.";
@@ -78,6 +79,34 @@ impl SchedulerClient for LocalSchedulerClient {
             crate::scheduler::status(project_root)?;
         }
         Ok(SchedulerStatus { reachable: true })
+    }
+}
+
+impl WorkScheduler for LocalSchedulerClient {
+    fn submit(&self, request: &WorkExecutionRequest) -> Result<WorkQueueOutcome> {
+        if request.version != crate::slack_collaboration::WorkControl::REQUEST_VERSION {
+            bail!("unsupported Work execution request version");
+        }
+        let project_root = self
+            .project_roots
+            .iter()
+            .find(|root| {
+                crate::work_model::WorkModelStore::new(root)
+                    .read_work_item(&request.work_item_id)
+                    .is_ok()
+            })
+            .context("Work execution request does not belong to a configured checkout")?;
+        let scheduler_request = crate::scheduler_service::AttemptExecutionRequest {
+            id: request.id.clone(),
+            work_item_id: request.work_item_id.clone(),
+            attempt_id: format!("slack-{}", request.id),
+            created_at: request.created_at.clone(),
+        };
+        crate::scheduler_service::persist_request(project_root, &scheduler_request)?;
+        let token = crate::scheduler_service::submit_dispatch(project_root, &scheduler_request)?;
+        Ok(WorkQueueOutcome::Queued {
+            request_id: token.request_id,
+        })
     }
 }
 
