@@ -207,18 +207,25 @@ mention. For example:
 The requested name must appear in the project's `enabled_providers` list. The
 runner validates it before binding a thread. When a turn is interrupted, a
 configured project approver can post `@Fluent [provider=claude]` (or `codex`)
-in that thread. Fluent switches adapters, queues the preserved turn, and
-resumes it when fair provider capacity is available without changing
-scheduler-owned Work.
+in that thread. Each `project_approvers` entry is a Slack member ID authorized
+to perform that switch; an empty set removes the provider-switch recovery
+action. Fluent switches adapters, queues the preserved turn, and resumes it
+when fair provider capacity is available without changing scheduler-owned
+Work.
 Fluent reports authentication requirements, denied runner-host credential
 access, unavailable runtimes, incompatible provider protocols, and rate
-limits as distinct recovery states. Failed turns stay durable, and the status
-offers provider switching when the project has a configured approver. Restore
-host credentials for access denials; update Fluent or the provider executable
-when their structured-session protocols are incompatible.
+limits as distinct recovery states. Failed turns stay durable and paused, and
+the runner does not repeatedly invoke the provider or post recovery messages.
+After a scoped provider login succeeds, the runner rechecks the selected
+provider in the bound checkout before it re-admits the preserved turn. The
+status offers provider switching when the project has a configured approver.
+Restore host credentials for access denials; update Fluent or the provider
+executable when their structured-session protocols are incompatible.
 Rate-limited turns retain the provider's retry deadline and resume
 automatically; replies received meanwhile are acknowledged, retained in Slack
 order, and sent together as the next attributed turn. If the exact bound
 checkout disappears or its identity changes, Fluent stops provider access,
 reports the unavailable binding, and never substitutes another checkout
-automatically.
+automatically. After restoring the exact checkout, explicitly reconfirm it
+by running `fluent slack restart` before Fluent re-admits the preserved turn.
+Fluent retains the original project binding throughout recovery.

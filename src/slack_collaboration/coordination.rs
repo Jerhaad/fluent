@@ -223,6 +223,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             if let Some(turn) = thread.pending_turn.as_mut() {
                 turn.retry_at_unix_seconds = None;
+                turn.dispatch_state = PendingTurnDispatchState::Runnable;
             }
             self.store.save_thread(&self.config, &thread)?;
             let event = InboundEnvelope {
@@ -266,6 +267,20 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         self.store.save_thread(&self.config, &thread)
     }
 
+    /// Recheck the selected provider after the runner owner completes its
+    /// scoped login flow, then resume the preserved turn.
+    pub fn resume_after_provider_login(&mut self, thread_id: &str) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        self.resume_after_provider_login_metadata(&mut thread)?;
+        let event = recovery_event(&thread, "provider-login");
+        self.complete_pending_turn(&event, &mut thread)?;
+        self.store.save_thread(&self.config, &thread)?;
+        self.deliver_pending()
+    }
+
     fn switch_provider_metadata(
         &self,
         thread: &mut FluentThread,
@@ -285,10 +300,70 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         thread.provider = Some(provider.into());
         thread.provider_session = None;
         thread.provider_failure = None;
+        if let Some(turn) = thread.pending_turn.as_mut() {
+            turn.dispatch_state = PendingTurnDispatchState::Runnable;
+            turn.retry_at_unix_seconds = None;
+            turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
+        }
         self.store.persist_outbox(OutboundDelivery {
             id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false,
         })
+    }
+
+    fn resume_after_provider_login_metadata(&mut self, thread: &mut FluentThread) -> Result<()> {
+        let failure = thread
+            .provider_failure
+            .as_ref()
+            .context("thread is not paused for provider recovery")?;
+        if !matches!(
+            failure,
+            ProviderFailure::Authentication
+                | ProviderFailure::HostCredentialDenied
+                | ProviderFailure::Unavailable
+        ) {
+            bail!("provider failure requires a different recovery action");
+        }
+        let selected = thread
+            .provider
+            .as_deref()
+            .context("thread has no selected provider")?;
+        self.provider.select(selected)?;
+        let checkout = self.bound_project(thread)?.checkout.path.clone();
+        let scope = ProviderScope {
+            slice_draft: checkout.join(".fluent/work/slack/drafts").join(&thread.id),
+            checkout,
+        };
+        if let Some(session) = self.provider.prepare_session(&scope)? {
+            thread.provider_session = Some(session);
+        }
+        thread.provider_failure = None;
+        let turn = thread
+            .pending_turn
+            .as_mut()
+            .context("thread has no preserved provider turn")?;
+        turn.dispatch_state = PendingTurnDispatchState::Runnable;
+        turn.retry_at_unix_seconds = None;
+        turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
+        self.store.save_thread(&self.config, thread)
+    }
+
+    fn reconfirm_checkout_metadata(&self, thread: &mut FluentThread) -> Result<()> {
+        if thread.provider_failure.is_some() {
+            bail!("provider recovery must complete before checkout reconfirmation");
+        }
+        self.bound_project(thread)?;
+        let turn = thread
+            .pending_turn
+            .as_mut()
+            .context("thread has no preserved provider turn")?;
+        if turn.dispatch_state != PendingTurnDispatchState::PausedForRecovery {
+            bail!("thread is not paused for checkout recovery");
+        }
+        turn.dispatch_state = PendingTurnDispatchState::Runnable;
+        turn.retry_at_unix_seconds = None;
+        turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
+        self.store.save_thread(&self.config, thread)
     }
 
     /// Persist first, then acknowledge exactly once, then process and send.
@@ -488,6 +563,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 starts_session: false,
                 provider_turn_id: None,
                 completed_reply: None,
+                dispatch_state: PendingTurnDispatchState::Runnable,
                 retry_at_unix_seconds: None,
                 delivery_attempt: 0,
             });
@@ -533,6 +609,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 starts_session: true,
                 provider_turn_id: None,
                 completed_reply: None,
+                dispatch_state: PendingTurnDispatchState::Runnable,
                 retry_at_unix_seconds: None,
                 delivery_attempt: 0,
             });
@@ -568,10 +645,33 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         event: &InboundEnvelope,
         thread: &mut FluentThread,
     ) -> Result<()> {
+        let paused = thread.pending_turn.as_ref().is_some_and(|turn| {
+            matches!(
+                turn.dispatch_state,
+                PendingTurnDispatchState::PausedForRecovery
+                    | PendingTurnDispatchState::RateLimitedUntilDeadline
+            ) || turn.retry_at_unix_seconds.is_some()
+        });
+        if paused {
+            return Ok(());
+        }
+        if thread
+            .provider_failure
+            .as_ref()
+            .is_some_and(|failure| !matches!(failure, ProviderFailure::RateLimited { .. }))
+            && let Some(turn) = thread.pending_turn.as_mut()
+        {
+            turn.dispatch_state = PendingTurnDispatchState::PausedForRecovery;
+            return self.store.save_thread(&self.config, thread);
+        }
         if !self.turn_pool.request(&thread.id) {
             self.queue_reply(event, "Turn queued for fair provider admission.")?;
             return Ok(());
         }
+        if let Some(turn) = thread.pending_turn.as_mut() {
+            turn.dispatch_state = PendingTurnDispatchState::InFlight;
+        }
+        self.store.save_thread(&self.config, thread)?;
         let mut current_event = event.clone();
         loop {
             let action_id = thread
@@ -582,17 +682,21 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.turn_pool.finish(&thread.id);
             result?;
             let ready = thread.pending_turn.as_ref().is_some_and(|turn| {
-                turn.retry_at_unix_seconds.is_none() && Some(&turn.action_id) != action_id.as_ref()
+                turn.dispatch_state == PendingTurnDispatchState::Runnable
+                    && turn.retry_at_unix_seconds.is_none()
+                    && Some(&turn.action_id) != action_id.as_ref()
             });
             if !ready || !self.turn_pool.request(&thread.id) {
                 return Ok(());
             }
-            if let Some(turn) = &thread.pending_turn {
+            if let Some(turn) = thread.pending_turn.as_mut() {
+                turn.dispatch_state = PendingTurnDispatchState::InFlight;
                 current_event.id = turn.action_id.clone();
                 current_event.acknowledgement_id.clear();
                 current_event.user = turn.actor.clone();
                 current_event.text.clear();
             }
+            self.store.save_thread(&self.config, thread)?;
         }
     }
 
@@ -617,11 +721,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         let checkout = match self.bound_project(thread) {
             Ok(project) => project.checkout.path.clone(),
             Err(error) if error.to_string().contains("bound checkout is unavailable") => {
+                if let Some(pending) = thread.pending_turn.as_mut() {
+                    pending.dispatch_state = PendingTurnDispatchState::PausedForRecovery;
+                }
                 self.queue_reply(
                     event,
                     "The bound checkout is unavailable. Fluent stopped provider access and will not rebind this thread automatically.",
                 )?;
-                return Ok(());
+                return self.store.save_thread(&self.config, thread);
             }
             Err(error) => return Err(error),
         };
@@ -847,6 +954,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 starts_session: false,
                 provider_turn_id: None,
                 completed_reply: None,
+                dispatch_state: PendingTurnDispatchState::Runnable,
                 retry_at_unix_seconds: None,
                 delivery_attempt: 0,
             });
@@ -869,12 +977,20 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .bound_project(thread)
             .is_ok_and(|project| !project.project_approvers.is_empty());
         self.queue_reply(event, &provider_recovery_message(&failure, can_switch))?;
-        if let ProviderFailure::RateLimited {
-            retry_after_seconds,
-        } = &failure
-            && let Some(turn) = thread.pending_turn.as_mut()
-        {
-            turn.retry_at_unix_seconds = Some((self.clock)().saturating_add(*retry_after_seconds));
+        if let Some(turn) = thread.pending_turn.as_mut() {
+            match &failure {
+                ProviderFailure::RateLimited {
+                    retry_after_seconds,
+                } => {
+                    turn.retry_at_unix_seconds =
+                        Some((self.clock)().saturating_add(*retry_after_seconds));
+                    turn.dispatch_state = PendingTurnDispatchState::RateLimitedUntilDeadline;
+                }
+                _ => {
+                    turn.retry_at_unix_seconds = None;
+                    turn.dispatch_state = PendingTurnDispatchState::PausedForRecovery;
+                }
+            }
         }
         thread.provider_failure = Some(failure);
         self.store.save_thread(&self.config, thread)
@@ -1002,6 +1118,27 @@ where
         self.dispatch_if_ready(&thread_id)
     }
 
+    pub fn resume_after_provider_login(&mut self, thread_id: &str) -> Result<()> {
+        let mut thread = self
+            .runner
+            .store
+            .load_thread(&self.runner.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        self.runner
+            .resume_after_provider_login_metadata(&mut thread)?;
+        self.dispatch_if_ready(thread_id)
+    }
+
+    pub fn reconfirm_checkout(&mut self, thread_id: &str) -> Result<()> {
+        let mut thread = self
+            .runner
+            .store
+            .load_thread(&self.runner.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        self.runner.reconfirm_checkout_metadata(&mut thread)?;
+        self.dispatch_if_ready(thread_id)
+    }
+
     pub fn recovery_targets(&self) -> Result<Vec<RecoveryTarget>> {
         self.runner.recovery_targets()
     }
@@ -1025,6 +1162,41 @@ where
             .into_keys()
             .collect();
         for thread_id in thread_ids {
+            let Some(mut thread) = self
+                .runner
+                .store
+                .load_thread(&self.runner.config, &thread_id)?
+            else {
+                continue;
+            };
+            if thread
+                .pending_turn
+                .as_ref()
+                .is_some_and(|turn| turn.dispatch_state == PendingTurnDispatchState::InFlight)
+            {
+                thread.pending_turn.as_mut().unwrap().dispatch_state =
+                    PendingTurnDispatchState::Runnable;
+                self.runner
+                    .store
+                    .save_thread(&self.runner.config, &thread)?;
+            } else if matches!(
+                thread.provider_failure,
+                Some(
+                    ProviderFailure::Authentication
+                        | ProviderFailure::HostCredentialDenied
+                        | ProviderFailure::Unavailable
+                )
+            ) {
+                let _ = self
+                    .runner
+                    .resume_after_provider_login_metadata(&mut thread);
+            } else if thread.provider_failure.is_none()
+                && thread.pending_turn.as_ref().is_some_and(|turn| {
+                    turn.dispatch_state == PendingTurnDispatchState::PausedForRecovery
+                })
+            {
+                let _ = self.runner.reconfirm_checkout_metadata(&mut thread);
+            }
             self.dispatch_if_ready(&thread_id)?;
         }
         Ok(())
@@ -1038,14 +1210,30 @@ where
         else {
             return Ok(());
         };
-        let ready = thread
-            .pending_turn
+        let ready = thread.pending_turn.as_ref().is_some_and(|turn| {
+            turn.dispatch_state == PendingTurnDispatchState::Runnable
+                && turn.retry_at_unix_seconds.is_none()
+        }) && !thread
+            .provider_failure
             .as_ref()
-            .is_some_and(|turn| turn.retry_at_unix_seconds.is_none());
+            .is_some_and(|failure| !matches!(failure, ProviderFailure::RateLimited { .. }));
         if ready && self.pool.request(thread_id) {
+            if let Err(error) = self.mark_in_flight(thread) {
+                self.pool.finish(thread_id);
+                return Err(error);
+            }
             self.spawn_admitted(thread_id.to_owned());
         }
         Ok(())
+    }
+
+    fn mark_in_flight(&self, mut thread: FluentThread) -> Result<()> {
+        thread
+            .pending_turn
+            .as_mut()
+            .context("thread has no pending provider turn")?
+            .dispatch_state = PendingTurnDispatchState::InFlight;
+        self.runner.store.save_thread(&self.runner.config, &thread)
     }
 
     fn spawn_admitted(&mut self, thread_id: String) {
@@ -1073,7 +1261,16 @@ where
         let next = self.pool.finish(&completion.thread_id);
         self.runner.deliver_pending()?;
         if let Some(next) = next {
+            let thread = self
+                .runner
+                .store
+                .load_thread(&self.runner.config, &next)?
+                .context("fairly admitted thread is unavailable")?;
+            self.mark_in_flight(thread)?;
             self.spawn_admitted(next);
+            if completion.result.is_ok() {
+                self.dispatch_if_ready(&completion.thread_id)?;
+            }
         } else if completion.result.is_ok() {
             self.dispatch_if_ready(&completion.thread_id)?;
         }
@@ -1128,6 +1325,7 @@ where
             if due {
                 if let Some(turn) = thread.pending_turn.as_mut() {
                     turn.retry_at_unix_seconds = None;
+                    turn.dispatch_state = PendingTurnDispatchState::Runnable;
                     turn.delivery_attempt = turn.delivery_attempt.saturating_add(1);
                 }
                 self.runner
@@ -1164,6 +1362,22 @@ fn selected_provider(text: &str) -> Option<&str> {
     let (_, suffix) = text.split_once(marker)?;
     let suffix = suffix.split_once(']')?.0;
     (!suffix.is_empty()).then_some(suffix)
+}
+
+fn recovery_event(thread: &FluentThread, suffix: &str) -> InboundEnvelope {
+    InboundEnvelope {
+        id: format!("{}:{suffix}", thread.id),
+        acknowledgement_id: String::new(),
+        channel: thread.channel.clone(),
+        timestamp: thread.id.clone(),
+        thread_timestamp: Some(thread.id.clone()),
+        user: thread
+            .pending_turn
+            .as_ref()
+            .map(|turn| turn.actor.clone())
+            .unwrap_or_default(),
+        text: String::new(),
+    }
 }
 
 fn code_references_in_reply(reply: &str, checkout: &Path) -> Vec<CodeReference> {

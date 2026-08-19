@@ -2991,6 +2991,251 @@ fn fatal_worker_still_launches_the_next_fair_admission() {
 }
 
 #[test]
+fn async_provider_failure_pauses_until_approved_switch() {
+    #[derive(Clone)]
+    struct PausingProvider {
+        selected: String,
+        calls: Arc<(Mutex<Vec<String>>, Condvar)>,
+    }
+    impl ConversationProvider for PausingProvider {
+        fn name(&self) -> &str {
+            &self.selected
+        }
+        fn select(&mut self, provider: &str) -> ProviderResult<()> {
+            self.selected = provider.into();
+            Ok(())
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            let (lock, changed) = &*self.calls;
+            lock.lock().unwrap().push(self.selected.clone());
+            changed.notify_all();
+            if self.selected == "codex" {
+                return Err(ProviderError::new(
+                    ProviderFailure::Authentication,
+                    "provider login required",
+                ));
+            }
+            Ok(("claude-session".into(), "recovered".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+    }
+
+    let calls = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        PausingProvider {
+            selected: "codex".into(),
+            calls: calls.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner.wait_for_completion().unwrap();
+
+    let (lock, changed) = &*calls;
+    let (observed, _) = changed
+        .wait_timeout_while(
+            lock.lock().unwrap(),
+            std::time::Duration::from_millis(100),
+            |calls| calls.len() < 2,
+        )
+        .unwrap();
+    assert_eq!(&*observed, &["codex"]);
+    drop(observed);
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.pending_turn.unwrap().dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    assert_eq!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.text.contains("authentication"))
+            .count(),
+        1
+    );
+
+    runner
+        .ingest(event("E2", Some("1.0"), "[provider=claude]"))
+        .unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(&*lock.lock().unwrap(), &["codex", "claude"]);
+}
+
+#[test]
+fn async_checkout_loss_pauses_until_explicit_reconfirmation() {
+    #[derive(Clone)]
+    struct CountingProvider(Arc<AtomicUsize>);
+    impl ConversationProvider for CountingProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(("session".into(), "initial".into()))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("continued".into())
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (home, checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        CountingProvider(calls.clone()),
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner.wait_for_completion().unwrap();
+    let revoked = checkout.path().join(".git-revoked");
+    fs::rename(checkout.path().join(".git"), &revoked).unwrap();
+
+    runner.ingest(event("E2", Some("1.0"), "continue")).unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.project_label.as_deref(), Some("app"));
+    assert_eq!(
+        thread.pending_turn.unwrap().dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    assert_eq!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .filter(|delivery| delivery.text.contains("bound checkout is unavailable"))
+            .count(),
+        1
+    );
+
+    fs::rename(revoked, checkout.path().join(".git")).unwrap();
+    runner
+        .restore_connection(Vec::new(), "checkout-reconfirmed".into(), false)
+        .unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn async_provider_login_recovery_rechecks_scope_before_resuming() {
+    #[derive(Clone)]
+    struct LoginProvider {
+        preparations: Arc<AtomicUsize>,
+        turns: Arc<AtomicUsize>,
+    }
+    impl ConversationProvider for LoginProvider {
+        fn prepare_session(&mut self, scope: &ProviderScope) -> ProviderResult<Option<String>> {
+            assert!(scope.checkout.join(".git").is_dir());
+            if self.preparations.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ProviderError::new(
+                    ProviderFailure::Authentication,
+                    "provider login required",
+                ));
+            }
+            Ok(Some("authenticated-session".into()))
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            unreachable!()
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            session: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            assert_eq!(session, "authenticated-session");
+            self.turns.fetch_add(1, Ordering::SeqCst);
+            Ok("resumed after login".into())
+        }
+    }
+
+    let preparations = Arc::new(AtomicUsize::new(0));
+    let turns = Arc::new(AtomicUsize::new(0));
+    let (home, _checkout, config) = setup(true);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        LoginProvider {
+            preparations: preparations.clone(),
+            turns: turns.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(preparations.load(Ordering::SeqCst), 1);
+    assert_eq!(turns.load(Ordering::SeqCst), 0);
+
+    drop(runner);
+    let mut runner = AsyncCollaborationRunner::new(
+        home.path(),
+        config,
+        LoginProvider {
+            preparations: preparations.clone(),
+            turns: turns.clone(),
+        },
+        InMemorySlack::default(),
+        1,
+    );
+    runner
+        .restore_connection(Vec::new(), "login-recovered".into(), false)
+        .unwrap();
+    runner.wait_for_completion().unwrap();
+    assert_eq!(preparations.load(Ordering::SeqCst), 2);
+    assert_eq!(turns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn provider_failure_classifies_recovery_state() {
     assert_eq!(
         classify_provider_failure("authentication required"),
@@ -3387,6 +3632,7 @@ fn missing_accepted_provider_turn_preserves_incompatible_protocol_state() {
         starts_session: false,
         provider_turn_id: Some("accepted-turn".into()),
         completed_reply: None,
+        dispatch_state: PendingTurnDispatchState::Runnable,
         retry_at_unix_seconds: None,
         delivery_attempt: 0,
     });
@@ -3588,6 +3834,16 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
         Some(ProviderFailure::RateLimited {
             retry_after_seconds: 17
         })
+    );
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .pending_turn
+            .unwrap()
+            .dispatch_state,
+        PendingTurnDispatchState::RateLimitedUntilDeadline
     );
 }
 
@@ -5020,6 +5276,46 @@ fn git_inspection_errors_make_checkout_unavailable() {
 }
 
 #[test]
+fn revoked_git_permissions_preserve_binding_without_provider_access() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent initial")).unwrap();
+    assert_eq!(runner.provider().calls.len(), 1);
+
+    let git = checkout.path().join(".git");
+    let original_permissions = fs::metadata(&git).unwrap().permissions();
+    let mut revoked_permissions = original_permissions.clone();
+    revoked_permissions.set_mode(0o000);
+    fs::set_permissions(&git, revoked_permissions).unwrap();
+    let result = runner.ingest(event("E2", Some("1.0"), "continue"));
+    fs::set_permissions(&git, original_permissions).unwrap();
+    result.unwrap();
+
+    assert_eq!(runner.provider().calls.len(), 1);
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.project_label.as_deref(), Some("app"));
+    assert_eq!(
+        thread.pending_turn.unwrap().dispatch_state,
+        PendingTurnDispatchState::PausedForRecovery
+    );
+    assert!(
+        runner
+            .slack()
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.text.contains("bound checkout is unavailable"))
+    );
+}
+
+#[test]
 fn bound_thread_home_index_excludes_active_snapshot_state() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
@@ -5072,6 +5368,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
             starts_session: true,
             provider_turn_id: None,
             completed_reply: None,
+            dispatch_state: PendingTurnDispatchState::Runnable,
             retry_at_unix_seconds: None,
             delivery_attempt: 0,
         }),

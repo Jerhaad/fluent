@@ -254,6 +254,20 @@ pub struct QueuedContribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingTurnDispatchState {
+    Runnable,
+    InFlight,
+    RateLimitedUntilDeadline,
+    PausedForRecovery,
+}
+
+impl Default for PendingTurnDispatchState {
+    fn default() -> Self {
+        Self::Runnable
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTurn {
     pub action_id: String,
     #[serde(default)]
@@ -265,6 +279,8 @@ pub struct PendingTurn {
     pub provider_turn_id: Option<String>,
     #[serde(default)]
     pub completed_reply: Option<String>,
+    #[serde(default)]
+    pub dispatch_state: PendingTurnDispatchState,
     #[serde(default)]
     pub retry_at_unix_seconds: Option<u64>,
     #[serde(default)]
