@@ -113,6 +113,12 @@ pub fn coalesce_contributions(replies: impl IntoIterator<Item = (String, String)
         .join("\n")
 }
 
+#[derive(Deserialize)]
+struct PlanApprovalCommand {
+    slice_id: String,
+    planned_work: Vec<PlannedWork>,
+}
+
 /// Coordinates one local runner. File state is written before external effects.
 pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     pub(super) home: &'a Path,
@@ -497,14 +503,30 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
 
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
-        self.ingest_with_completion(event, true)
+        self.ingest_at_scheduler_boundary(event, true, None)
     }
 
     fn ingest_deferred(&mut self, event: InboundEnvelope) -> Result<()> {
-        self.ingest_with_completion(event, false)
+        self.ingest_at_scheduler_boundary(event, false, None)
     }
 
-    fn ingest_with_completion(&mut self, event: InboundEnvelope, run_now: bool) -> Result<()> {
+    /// Process Slack ingress through an explicitly supplied scheduler boundary.
+    /// Production uses the local scheduler; embedders and tests can supply the
+    /// same typed boundary directly.
+    pub fn ingest_with_scheduler(
+        &mut self,
+        event: InboundEnvelope,
+        scheduler: &dyn WorkScheduler,
+    ) -> Result<()> {
+        self.ingest_at_scheduler_boundary(event, true, Some(scheduler))
+    }
+
+    fn ingest_at_scheduler_boundary(
+        &mut self,
+        event: InboundEnvelope,
+        run_now: bool,
+        scheduler: Option<&dyn WorkScheduler>,
+    ) -> Result<()> {
         event.validate_thread_identity()?;
         self.config = self.current_authority_config()?;
         if let Some(thread) = self.store.load_thread(&self.config, &event.thread_id())?
@@ -528,7 +550,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             InboxState::Pending => {}
         }
-        self.process(event.clone(), run_now)?;
+        self.process(event.clone(), run_now, scheduler)?;
         self.store.mark_inbox_processed(&event.id)?;
         if self
             .store
@@ -595,7 +617,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         });
         for (recovered, event) in events {
             self.recovering_event = recovered;
-            self.ingest_with_completion(event.clone(), run_now)?;
+            self.ingest_at_scheduler_boundary(event.clone(), run_now, None)?;
             self.recovering_event = false;
             if recovered {
                 self.store.save_recovery_cursor(
@@ -693,7 +715,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         Ok(())
     }
-
     fn run_pending_thread(&mut self, thread_id: &str) -> Result<()> {
         let mut thread = self
             .store
@@ -721,7 +742,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         };
         self.complete_pending_turn(&event, &mut thread)
     }
-    fn process(&mut self, event: InboundEnvelope, run_now: bool) -> Result<()> {
+    fn process(
+        &mut self,
+        event: InboundEnvelope,
+        run_now: bool,
+        scheduler: Option<&dyn WorkScheduler>,
+    ) -> Result<()> {
         let existing = self.store.load_thread(&self.config, &event.thread_id())?;
         if existing.is_none()
             && event.is_top_level_mention()
@@ -843,8 +869,38 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.store.save_thread(&self.config, &thread)?;
             self.queue_queued_acknowledgement(&event)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
+            let command = event.text.trim();
+            if let Some(payload) = command.strip_prefix("approve plan ") {
+                let approval: PlanApprovalCommand = serde_json::from_str(payload)
+                    .context("approve plan requires a valid JSON plan payload")?;
+                self.approve_thread_plan(
+                    &thread.id,
+                    &event.user,
+                    &approval.slice_id,
+                    &approval.planned_work,
+                )?;
+                let mut refreshed = self
+                    .store
+                    .load_thread(&self.config, &thread.id)?
+                    .context("Fluent thread disappeared after plan approval")?;
+                refreshed.processed_events.insert(event.id);
+                return self.store.save_thread(&self.config, &refreshed);
+            }
+            if command.eq_ignore_ascii_case("authorize execution") {
+                if let Some(scheduler) = scheduler {
+                    self.authorize_thread_execution(&thread.id, &event.user, scheduler)?;
+                } else {
+                    self.authorize_thread_execution_locally(&thread.id, &event.user)?;
+                }
+                let mut refreshed = self
+                    .store
+                    .load_thread(&self.config, &thread.id)?
+                    .context("Fluent thread disappeared after execution approval")?;
+                refreshed.processed_events.insert(event.id);
+                return self.store.save_thread(&self.config, &refreshed);
+            }
             if matches!(
-                event.text.trim().to_ascii_lowercase().as_str(),
+                command.to_ascii_lowercase().as_str(),
                 "status" | "work status"
             ) {
                 self.store.save_thread(&self.config, &thread)?;

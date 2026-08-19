@@ -73,8 +73,9 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    fluent scheduler run
    ```
 
-   In another terminal, confirm that the scheduler reports the configured
-   project and is ready to accept execution requests:
+   In another terminal, confirm that it prints `Scheduler: running` and reports
+   the expected build. The Slack runner preflight checks the scheduler request
+   boundary before it begins accepting Slack events:
 
    ```sh
    cd /absolute/checkout
@@ -268,6 +269,17 @@ Fluent keeps planning and execution as separate approvals. A configured
 Items without starting them. A later execution approval submits the same
 versioned request identity for each Work Item to the local scheduler, so a
 retry cannot create another execution request.
+
+The conversation provider presents the exact plan-approval action in the
+thread. Its durable command has this shape:
+
+```text
+approve plan {"slice_id":"slice-release","planned_work":[{"id":"release-ui","title":"Implement the release UI"}]}
+```
+
+An approver submits `authorize execution` in the same thread only after the
+plan action succeeds. The runner validates the Slack actor against the bound
+project for both actions; other conversation text continues to the provider.
 
 The versioned scheduler service validates the registered checkout and running
 build before it admits that request to Fluent's real durable queue. It owns

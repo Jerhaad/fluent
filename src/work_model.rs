@@ -439,23 +439,55 @@ pub struct DurableWorkTransition {
     pub occurred_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
+    #[serde(default)]
+    pub origin: DurableTransitionOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
+}
+
+/// Closed attribution for a lifecycle mutation recorded in the Work ledger.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DurableTransitionOrigin {
+    Fluent,
+    SlackThread,
+    Scheduler,
+    AttemptExecutor,
+    TaskExecutor,
+    Landing,
+    PostLand,
+    External,
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for DurableTransitionOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Fluent => "fluent",
+            Self::SlackThread => "slack-thread",
+            Self::Scheduler => "scheduler",
+            Self::AttemptExecutor => "attempt-executor",
+            Self::TaskExecutor => "task-executor",
+            Self::Landing => "landing",
+            Self::PostLand => "post-land",
+            Self::External => "external",
+            Self::Unknown => "unknown",
+        };
+        formatter.write_str(value)
+    }
 }
 
 /// Bounded attribution supplied by the trusted caller that owns a mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableTransitionMetadata {
-    pub origin: Option<String>,
+    pub origin: DurableTransitionOrigin,
     pub reason: Option<String>,
     pub evidence_ref: Option<String>,
 }
 
-pub const MAX_TRANSITION_ORIGIN_BYTES: usize = 64;
 pub const MAX_TRANSITION_REASON_BYTES: usize = 1_024;
 pub const MAX_TRANSITION_EVIDENCE_BYTES: usize = 512;
 
@@ -7296,14 +7328,22 @@ impl WorkModelStore {
         id: &str,
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
-        self.mutate_work_item_with_transition(id, None, reducer)
+        self.mutate_work_item_with_transition(
+            id,
+            &DurableTransitionMetadata {
+                origin: DurableTransitionOrigin::Fluent,
+                reason: None,
+                evidence_ref: None,
+            },
+            reducer,
+        )
     }
 
     /// Mutate an aggregate and atomically attribute any derived transitions.
     pub fn mutate_work_item_with_transition<T>(
         &self,
         id: &str,
-        metadata: Option<&DurableTransitionMetadata>,
+        metadata: &DurableTransitionMetadata,
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
         let path = self.work_item_path(id)?;
@@ -7367,7 +7407,15 @@ impl WorkModelStore {
         if let Some(prior) = prior.as_ref() {
             reject_transition_history_change(prior, &target, &path)?;
         }
-        append_durable_transitions(prior.as_ref(), &mut target, None);
+        append_durable_transitions(
+            prior.as_ref(),
+            &mut target,
+            &DurableTransitionMetadata {
+                origin: DurableTransitionOrigin::Fluent,
+                reason: None,
+                evidence_ref: None,
+            },
+        );
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
             .storage_revision
@@ -8068,22 +8116,19 @@ fn reject_transition_history_change(
 fn append_durable_transitions(
     prior: Option<&WorkItem>,
     work_item: &mut WorkItem,
-    metadata: Option<&DurableTransitionMetadata>,
+    metadata: &DurableTransitionMetadata,
 ) {
-    let metadata = metadata.map(|value| DurableTransitionMetadata {
-        origin: value
-            .origin
-            .as_deref()
-            .map(|text| bounded_transition_text(text, MAX_TRANSITION_ORIGIN_BYTES)),
-        reason: value
+    let metadata = DurableTransitionMetadata {
+        origin: metadata.origin,
+        reason: metadata
             .reason
             .as_deref()
             .map(|text| bounded_transition_text(text, MAX_TRANSITION_REASON_BYTES)),
-        evidence_ref: value
+        evidence_ref: metadata
             .evidence_ref
             .as_deref()
             .map(|text| bounded_transition_text(text, MAX_TRANSITION_EVIDENCE_BYTES)),
-    });
+    };
     let previous = prior
         .map(|item| {
             item.transitions
@@ -8134,14 +8179,9 @@ fn append_durable_transitions(
             new_state: state,
             occurred_at: now.clone(),
             elapsed_seconds,
-            origin: metadata.as_ref().and_then(|value| value.origin.clone()),
-            reason: metadata
-                .as_ref()
-                .and_then(|value| value.reason.clone())
-                .or(reason),
-            evidence_ref: metadata
-                .as_ref()
-                .and_then(|value| value.evidence_ref.clone()),
+            origin: metadata.origin,
+            reason: metadata.reason.clone().or(reason),
+            evidence_ref: metadata.evidence_ref.clone(),
         });
     }
 }

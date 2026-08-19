@@ -1789,6 +1789,29 @@ fn duplicate_approval_event_is_idempotent() {
     );
 }
 
+fn read_http_request(stream: &mut impl Read) {
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0; 1024];
+        let count = stream.read(&mut buffer).unwrap();
+        request.extend_from_slice(&buffer[..count]);
+        let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.parse::<usize>().ok())
+            })
+            .unwrap_or_default();
+        if request.len() >= header_end + 4 + content_length {
+            return;
+        }
+    }
+}
 #[test]
 fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
     let envelope = decode_socket_mode_envelope(
@@ -6384,6 +6407,8 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("security add-generic-password -U -a app-token")
             && guide.contains("security add-generic-password -U -a bot-token")
             && guide.contains("keep that process running")
+            && guide.contains("Scheduler: running")
+            && guide.contains("preflight checks the scheduler request boundary")
             && scheduler_run < scheduler_status
             && scheduler_status < slack_enable
     );
@@ -6404,8 +6429,7 @@ fn runner_start_preflights_external_and_local_boundaries() {
         let scopes = scopes.to_owned();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0; 4096];
-            stream.read(&mut buffer).unwrap();
+            read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-OAuth-Scopes: {scopes}\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{{\"ok\":true}}"
             );
@@ -6485,16 +6509,14 @@ fn approved_plan_creates_reported_work_without_execution() {
     runner
         .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
-    let report = runner
-        .approve_thread_plan(
-            "1.0",
-            "U1",
-            "slice-1",
-            &[PlannedWork::new("work-1", "Implement control")],
-        )
+    runner
+        .ingest(event(
+            "E2",
+            Some("1.0"),
+            r#"approve plan {"slice_id":"slice-1","planned_work":[{"id":"work-1","title":"Implement control"}]}"#,
+        ))
         .unwrap();
 
-    assert_eq!(report.work_item_ids, vec!["work-1"]);
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery.thread_timestamp == "1.0"
             && delivery.text.contains("Planned Work Items: work-1")
@@ -6549,6 +6571,10 @@ fn direct_work_item_writes_append_lifecycle_transitions() {
     assert_eq!(transition.object_id, "attempt-write");
     assert_eq!(transition.old_state, None);
     assert_eq!(transition.new_state, "executing");
+    assert_eq!(
+        transition.origin,
+        fluent::work_model::DurableTransitionOrigin::Fluent
+    );
 }
 
 #[test]
@@ -6568,12 +6594,12 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
     assert!(store.write_work_item(&rewritten).is_err());
 
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some(format!("scheduler-é{}", "x".repeat(100))),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some(format!("capacity became available {}", "r".repeat(1_100))),
         evidence_ref: Some(format!("scheduler-event:42-{}", "e".repeat(600))),
     };
     store
-        .mutate_work_item_with_transition("work-protected", Some(&metadata), |item| {
+        .mutate_work_item_with_transition("work-protected", &metadata, |item| {
             item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
                 fluent::work_model::ExecutionAuthority::Human,
             );
@@ -6582,9 +6608,9 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
         .unwrap();
     let saved = store.read_work_item("work-protected").unwrap();
     let transition = saved.transitions.last().unwrap();
-    assert!(
-        transition.origin.as_ref().unwrap().len()
-            <= fluent::work_model::MAX_TRANSITION_ORIGIN_BYTES
+    assert_eq!(
+        transition.origin,
+        fluent::work_model::DurableTransitionOrigin::Scheduler
     );
     assert!(
         transition.reason.as_ref().unwrap().len()
@@ -6594,12 +6620,23 @@ fn transition_history_is_immutable_and_metadata_is_atomic() {
         transition.evidence_ref.as_ref().unwrap().len()
             <= fluent::work_model::MAX_TRANSITION_EVIDENCE_BYTES
     );
-    assert!(
-        transition
-            .origin
-            .as_ref()
-            .unwrap()
-            .starts_with("scheduler-é")
+}
+
+#[test]
+fn legacy_transition_without_origin_is_explicitly_unknown() {
+    let transition: fluent::work_model::DurableWorkTransition =
+        serde_json::from_value(serde_json::json!({
+            "sequence": 1,
+            "object_kind": "work-item",
+            "object_id": "legacy-work",
+            "old_state": null,
+            "new_state": "planned",
+            "occurred_at": "2026-08-18T00:00:00Z"
+        }))
+        .unwrap();
+    assert_eq!(
+        transition.origin,
+        fluent::work_model::DurableTransitionOrigin::Unknown
     );
 }
 
@@ -6629,23 +6666,18 @@ fn execution_approval_queues_each_planned_work_item() {
         .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
     runner
-        .approve_thread_plan(
-            "1.0",
-            "U1",
-            "slice-1",
-            &[
-                PlannedWork::new("work-1", "First"),
-                PlannedWork::new("work-2", "Second"),
-            ],
-        )
+        .ingest(event(
+            "E2",
+            Some("1.0"),
+            r#"approve plan {"slice_id":"slice-1","planned_work":[{"id":"work-1","title":"First"},{"id":"work-2","title":"Second"}]}"#,
+        ))
         .unwrap();
     let scheduler = FakeScheduler::default();
 
-    let report = runner
-        .authorize_thread_execution("1.0", "U1", &scheduler)
+    runner
+        .ingest_with_scheduler(event("E3", Some("1.0"), "authorize execution"), &scheduler)
         .unwrap();
 
-    assert_eq!(report.outcomes.len(), 2);
     assert_eq!(scheduler.requests.borrow().len(), 2);
     for work_id in ["work-1", "work-2"] {
         let work = fluent::work_model::WorkModelStore::new(checkout.path())
@@ -6660,13 +6692,9 @@ fn execution_approval_queues_each_planned_work_item() {
                     .contains(&format!("Work Item {work_id} queue outcome: Queued"))
         }));
     }
-    assert_eq!(
-        runner
-            .authorize_thread_execution("1.0", "U1", &scheduler)
-            .unwrap()
-            .outcomes,
-        report.outcomes
-    );
+    runner
+        .ingest_with_scheduler(event("E4", Some("1.0"), "authorize execution"), &scheduler)
+        .unwrap();
     assert_eq!(scheduler.requests.borrow().len(), 2);
 }
 
@@ -6755,7 +6783,7 @@ fn durable_work_transition_posts_detailed_thread_reply() {
     let transitions = runner.report_thread_work("1.0").unwrap();
     assert!(transitions.iter().any(|transition| {
         transition.work_item_id == "work-runner"
-            && transition.origin.as_deref() == Some("slack-thread")
+            && transition.origin == fluent::work_model::DurableTransitionOrigin::SlackThread
     }));
     assert!(runner.slack().deliveries.iter().any(|delivery| {
         delivery.text.contains("Work Item work-runner")
@@ -6769,12 +6797,12 @@ fn durable_work_transition_posts_detailed_thread_reply() {
 
     let store = fluent::work_model::WorkModelStore::new(checkout.path());
     let executing = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some("worker accepted execution".into()),
         evidence_ref: Some("scheduler-event:accepted".into()),
     };
     store
-        .mutate_work_item_with_transition("work-runner", Some(&executing), |item| {
+        .mutate_work_item_with_transition("work-runner", &executing, |item| {
             item.attempts.push(fluent::work_model::Attempt {
                 id: "attempt-runner".into(),
                 work_item_id: item.id.clone(),
@@ -6785,12 +6813,12 @@ fn durable_work_transition_posts_detailed_thread_reply() {
         })
         .unwrap();
     let needs_user = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some("choose a recovery option".into()),
         evidence_ref: Some("scheduler-event:needs-user".into()),
     };
     store
-        .mutate_work_item_with_transition("work-runner", Some(&needs_user), |item| {
+        .mutate_work_item_with_transition("work-runner", &needs_user, |item| {
             item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
             Ok(())
         })
@@ -6838,27 +6866,27 @@ fn allowed_participant_cannot_approve_without_project_authority() {
         .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
 
-    let error = runner
-        .approve_thread_plan(
-            "1.0",
-            "U2",
-            "slice-denied",
-            &[PlannedWork::new("work-denied", "Denied")],
-        )
-        .unwrap_err();
+    let mut denied_plan = event(
+        "E2",
+        Some("1.0"),
+        r#"approve plan {"slice_id":"slice-denied","planned_work":[{"id":"work-denied","title":"Denied"}]}"#,
+    );
+    denied_plan.user = "U2".into();
+    let error = runner.ingest(denied_plan).unwrap_err();
 
     assert!(error.to_string().contains("cannot approve Work"));
 
     runner
-        .approve_thread_plan(
-            "1.0",
-            "U1",
-            "slice-approved",
-            &[PlannedWork::new("work-approved", "Approved")],
-        )
+        .ingest(event(
+            "E3",
+            Some("1.0"),
+            r#"approve plan {"slice_id":"slice-approved","planned_work":[{"id":"work-approved","title":"Approved"}]}"#,
+        ))
         .unwrap();
+    let mut denied_execution = event("E4", Some("1.0"), "authorize execution");
+    denied_execution.user = "U2".into();
     let error = runner
-        .authorize_thread_execution("1.0", "U2", &Scheduler)
+        .ingest_with_scheduler(denied_execution, &Scheduler)
         .unwrap_err();
     assert!(error.to_string().contains("cannot authorize Work"));
 }
@@ -6932,6 +6960,7 @@ fn status_message_tracks_current_slice_state() {
     assert!(update.text.contains("Project: app"));
     assert!(update.text.contains("checkout: main"));
     assert!(update.text.contains("Slice: Active"));
+    assert!(update.text.contains("provider: connected"));
     assert!(update.text.contains("work-pinned: planned"));
     assert!(update.text.contains("Await execution approval"));
 }
@@ -6978,7 +7007,10 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
     assert_eq!(transitions.len(), 1);
     assert_eq!(transitions[0].work_item_id, "work-ledger");
     assert_eq!(transitions[0].new_state, "authorized");
-    assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
+    assert_eq!(
+        transitions[0].origin,
+        fluent::work_model::DurableTransitionOrigin::SlackThread
+    );
     assert!(
         control
             .reconcile_durable_transitions("slice-ledger")
@@ -7018,7 +7050,7 @@ fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
         object_id: "candidate-7".into(),
         old_state: Some("reviewing".into()),
         new_state: "ready".into(),
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some("Review candidate".into()),
         evidence_ref: Some("tests/output/candidate.log".into()),
         object_kind: "merge-candidate".into(),
@@ -7160,12 +7192,12 @@ fn external_work_transition_updates_linked_thread() {
     runner.report_thread_work("1.0").unwrap();
     let delivered_before_idle_tick = runner.slack().deliveries.len();
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some("capacity available".into()),
         evidence_ref: Some("scheduler:42".into()),
     };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition("work-external", Some(&metadata), |item| {
+        .mutate_work_item_with_transition("work-external", &metadata, |item| {
             item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
                 fluent::work_model::ExecutionAuthority::Human,
             );
@@ -7206,12 +7238,12 @@ fn append_attempt_state(
     reason: &str,
 ) {
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some(reason.into()),
         evidence_ref: Some(format!("evidence:{work}")),
     };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition(work, Some(&metadata), |item| {
+        .mutate_work_item_with_transition(work, &metadata, |item| {
             item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
                 fluent::work_model::ExecutionAuthority::Human,
             );
@@ -7270,7 +7302,7 @@ fn ready_transition() -> WorkTransition {
         object_id: "candidate-ready".into(),
         old_state: Some("reviewing".into()),
         new_state: "ready".into(),
-        origin: Some("fluent".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Fluent,
         reason: Some("review candidate".into()),
         evidence_ref: Some("candidate.json".into()),
         object_kind: "merge-candidate".into(),
@@ -7345,12 +7377,12 @@ fn assert_runner_posts_durable_ready_candidate_evidence_and_links() {
         path: checkout.path().display().to_string(),
     };
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("fluent".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Fluent,
         reason: Some("candidate passed required gates".into()),
         evidence_ref: Some("candidate/evidence.json".into()),
     };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition("work-ready-runner", Some(&metadata), |item| {
+        .mutate_work_item_with_transition("work-ready-runner", &metadata, |item| {
             item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
                 fluent::work_model::ExecutionAuthority::Human,
             );
@@ -7608,12 +7640,12 @@ fn reconnect_reconciles_work_transitions_exactly_once() {
         "worker started",
     );
     let metadata = fluent::work_model::DurableTransitionMetadata {
-        origin: Some("scheduler".into()),
+        origin: fluent::work_model::DurableTransitionOrigin::Scheduler,
         reason: Some("operator decision required".into()),
         evidence_ref: Some("recovery.json".into()),
     };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition("work-reconnect-runner", Some(&metadata), |item| {
+        .mutate_work_item_with_transition("work-reconnect-runner", &metadata, |item| {
             item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
             Ok(())
         })
@@ -7628,7 +7660,7 @@ fn reconnect_reconciles_work_transitions_exactly_once() {
         path: checkout.path().display().to_string(),
     };
     fluent::work_model::WorkModelStore::new(checkout.path())
-        .mutate_work_item_with_transition("work-reconnect-candidate", Some(&metadata), |item| {
+        .mutate_work_item_with_transition("work-reconnect-candidate", &metadata, |item| {
             item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
                 fluent::work_model::ExecutionAuthority::Human,
             );

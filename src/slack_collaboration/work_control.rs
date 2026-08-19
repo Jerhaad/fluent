@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
 use crate::work_model::{
-    DurableTransitionMetadata, DurableWorkTransition, ExecutionAuthority, ExecutionAuthorization,
-    WorkItem, WorkModelStore, validate_work_item_id,
+    DurableTransitionMetadata, DurableTransitionOrigin, DurableWorkTransition, ExecutionAuthority,
+    ExecutionAuthorization, WorkItem, WorkModelStore, validate_work_item_id,
 };
 
 /// A Work Item approved as part of one Slack Slice plan.
@@ -118,7 +118,8 @@ pub struct WorkTransition {
     pub object_id: String,
     pub old_state: Option<String>,
     pub new_state: String,
-    pub origin: Option<String>,
+    #[serde(default)]
+    pub origin: DurableTransitionOrigin,
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
@@ -155,7 +156,8 @@ pub fn render_transition_reply(transition: &WorkTransition, evidence: &[String])
         "{} {} for Work Item {} is now {}.",
         transition.object_kind, object_id, transition.work_item_id, transition.new_state
     );
-    if let Some(origin) = &transition.origin {
+    if transition.origin != DurableTransitionOrigin::Unknown {
+        let origin = transition.origin;
         reply.push_str(&format!(" Origin: {origin}."));
     }
     if let Some(reason) = &transition.reason {
@@ -274,11 +276,11 @@ impl WorkControl {
                 self.save_slice(&slice)?;
             }
             let metadata = DurableTransitionMetadata {
-                origin: Some("slack-thread".into()),
+                origin: DurableTransitionOrigin::SlackThread,
                 reason: Some(format!("Execution approved by {approver}")),
                 evidence_ref: Some(format!("slack-slice:{slice_id}")),
             };
-            store.mutate_work_item_with_transition(work_item_id, Some(&metadata), |item| {
+            store.mutate_work_item_with_transition(work_item_id, &metadata, |item| {
                 item.authorization =
                     ExecutionAuthorization::execution_ready(ExecutionAuthority::Human);
                 Ok(())
@@ -371,7 +373,7 @@ impl WorkControl {
     pub fn reconcile_transitions(
         &self,
         slice_id: &str,
-        origin: Option<&str>,
+        origin: DurableTransitionOrigin,
     ) -> Result<Vec<WorkTransition>> {
         let mut slice = self
             .slice(slice_id)?
@@ -389,7 +391,7 @@ impl WorkControl {
                 object_id: status.work_item_id.clone(),
                 old_state,
                 new_state: status.state.clone(),
-                origin: origin.map(str::to_owned),
+                origin,
                 reason: Some(status.next_action),
                 evidence_ref: None,
                 object_kind: "work-item".into(),
