@@ -72,20 +72,89 @@ fn enablement_goal(text: &str) -> Option<String> {
         .filter(|goal| !goal.is_empty())
 }
 
-fn parse_checkout_selection(text: &str) -> Option<(&str, &str, &str)> {
+fn parse_checkout_selection(text: &str) -> Option<(&str, SlackInitChoices)> {
     let fields = text.split_whitespace().collect::<Vec<_>>();
-    match fields.as_slice() {
-        [
-            "select",
-            "checkout",
-            selection,
-            "profile",
-            profile,
-            "mode",
-            mode,
-        ] => Some((selection, profile, mode)),
-        _ => None,
+    let [
+        "select",
+        "checkout",
+        selection,
+        "profile",
+        profile,
+        "mode",
+        mode,
+        role_fields @ ..,
+    ] = fields.as_slice()
+    else {
+        return None;
+    };
+    if role_fields.len() % 2 != 0 {
+        return None;
     }
+    let mut choices = SlackInitChoices {
+        coder_profile: (*profile).into(),
+        follow_up_mode: (*mode).into(),
+        write_coder: None,
+        write_model: None,
+        write_effort: None,
+        review_coder: None,
+        review_model: None,
+        review_effort: None,
+    };
+    for pair in role_fields.chunks_exact(2) {
+        let field = match pair[0] {
+            "write-coder" => &mut choices.write_coder,
+            "write-model" => &mut choices.write_model,
+            "write-effort" => &mut choices.write_effort,
+            "review-coder" => &mut choices.review_coder,
+            "review-model" => &mut choices.review_model,
+            "review-effort" => &mut choices.review_effort,
+            _ => return None,
+        };
+        if field.replace(pair[1].into()).is_some() {
+            return None;
+        }
+    }
+    if choices.coder_profile == "custom"
+        && [
+            &choices.write_coder,
+            &choices.write_model,
+            &choices.write_effort,
+            &choices.review_coder,
+            &choices.review_model,
+            &choices.review_effort,
+        ]
+        .iter()
+        .any(|field| field.is_none())
+    {
+        return None;
+    }
+    Some((selection, choices))
+}
+
+fn render_setup_choices(choices: &SlackInitChoices) -> String {
+    let mut rendered = format!(
+        "profile {}; follow-up mode {}",
+        choices.coder_profile, choices.follow_up_mode
+    );
+    if let (Some(coder), Some(model), Some(effort)) = (
+        &choices.write_coder,
+        &choices.write_model,
+        &choices.write_effort,
+    ) {
+        rendered.push_str(&format!(
+            "; Writer: coder {coder}, model {model}, effort {effort}"
+        ));
+    }
+    if let (Some(coder), Some(model), Some(effort)) = (
+        &choices.review_coder,
+        &choices.review_model,
+        &choices.review_effort,
+    ) {
+        rendered.push_str(&format!(
+            "; Reviewer: coder {coder}, model {model}, effort {effort}"
+        ));
+    }
+    rendered
 }
 
 fn render_initialization_review(review: &InitializationReview) -> String {
@@ -1286,7 +1355,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.queue_reply(
                 event,
                 &format!(
-                    "Available project checkouts:\n{labels}\nReply `select checkout <id> profile <profile> mode <propose|execute>`."
+                    "Available project checkouts:\n{labels}\nReply `select checkout <id> profile <profile> mode <propose|execute>`. For profile `custom`, append `write-coder <coder> write-model <model> write-effort <effort> review-coder <coder> review-model <model> review-effort <effort>`."
                 ),
             )?;
             return Ok(true);
@@ -1296,28 +1365,15 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         };
         match state {
             SlackProjectSetupState::Selecting { goal } => {
-                let Some((selection, profile, mode)) = parse_checkout_selection(&event.text) else {
+                let Some((selection, choices)) = parse_checkout_selection(&event.text) else {
                     self.queue_reply(
                         event,
-                        "Choose a checkout with `select checkout <id> profile <profile> mode <propose|execute>`.",
+                        "Choose a checkout with `select checkout <id> profile <profile> mode <propose|execute>`. A `custom` profile also requires all Writer and reviewer coder, model, and effort fields.",
                     )?;
                     return Ok(true);
                 };
                 let index = discover_project_checkouts(&self.project_discovery_roots, &event.user)?;
-                let proposal = prepare_slack_project_setup(
-                    &index,
-                    selection,
-                    SlackInitChoices {
-                        coder_profile: profile.into(),
-                        follow_up_mode: mode.into(),
-                        write_coder: None,
-                        write_model: None,
-                        write_effort: None,
-                        review_coder: None,
-                        review_model: None,
-                        review_effort: None,
-                    },
-                )?;
+                let proposal = prepare_slack_project_setup(&index, selection, choices)?;
                 thread.pending_question = Some(encode_project_setup_state(
                     &SlackProjectSetupState::AwaitingSetupApproval {
                         proposal: proposal.clone(),
@@ -1328,11 +1384,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 self.queue_reply(
                     event,
                     &format!(
-                        "Proposed setup: project {}; checkout {}; profile {}; follow-up mode {}. No checkout changes have been made. A project approver may reply `approve setup {}`.",
+                        "Proposed setup: project {}; checkout {}; {}. No checkout changes have been made. A project approver may reply `approve setup {}`.",
                         proposal.project_label,
                         proposal.checkout_label,
-                        proposal.choices.coder_profile,
-                        proposal.choices.follow_up_mode,
+                        render_setup_choices(&proposal.choices),
                         proposal.revision
                     ),
                 )?;

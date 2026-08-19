@@ -175,10 +175,12 @@ An allowed participant starts project setup with:
 Add `goal: <product goal>` to promote the same thread into the first planning
 conversation after setup. Fluent replies with safe checkout choices and the
 exact `select checkout` command. It then collects the configured coder profile
-and follow-up mode, presents the exact proposal, and waits for the displayed
-`approve setup` revision. Successful initialization produces a separate review
-of generated changes. A project approver must use the displayed `commit
-initialization` revision before Fluent creates the initialization-only commit.
+and follow-up mode. For the `custom` profile, append all Writer and reviewer
+`coder`, `model`, and `effort` fields as instructed in Slack. Fluent presents
+those exact choices and waits for the displayed `approve setup` revision.
+Successful initialization produces a separate review of generated changes. A
+project approver must use the displayed `commit initialization` revision before
+Fluent creates the initialization-only commit.
 Existing Fluent checkouts skip initialization and report their configuration.
 
 ## Review planning artifacts

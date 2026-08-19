@@ -798,8 +798,16 @@ fn slack_enablement_request_drives_init_review_commit_and_binding() {
         fn initialize(
             &mut self,
             checkout: &std::path::Path,
-            _: &SlackInitChoices,
+            choices: &SlackInitChoices,
         ) -> anyhow::Result<ConfiguredInitReport> {
+            assert_eq!(choices.coder_profile, "custom");
+            assert_eq!(choices.follow_up_mode, "propose");
+            assert_eq!(choices.write_coder.as_deref(), Some("claude"));
+            assert_eq!(choices.write_model.as_deref(), Some("write-model"));
+            assert_eq!(choices.write_effort.as_deref(), Some("high"));
+            assert_eq!(choices.review_coder.as_deref(), Some("codex"));
+            assert_eq!(choices.review_model.as_deref(), Some("review-model"));
+            assert_eq!(choices.review_effort.as_deref(), Some("medium"));
             fs::create_dir(checkout.join(".fluent"))?;
             fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
             Ok(ConfiguredInitReport {
@@ -864,11 +872,31 @@ fn slack_enablement_request_drives_init_review_commit_and_binding() {
             .contains(&checkout.path().display().to_string())
     );
 
+    let before_incomplete_selection = directory_snapshot(checkout.path());
+    runner
+        .ingest(event(
+            "ENABLE_INCOMPLETE",
+            Some("1.0"),
+            &format!("select checkout {offer} profile custom mode propose"),
+        ))
+        .unwrap();
+    let incomplete_reply = &runner.slack().deliveries.last().unwrap().text;
+    assert!(incomplete_reply.contains("requires all Writer and reviewer"));
+    assert!(!incomplete_reply.contains("approve setup"));
+    assert_eq!(
+        directory_snapshot(checkout.path()),
+        before_incomplete_selection
+    );
+
     runner
         .ingest(event(
             "ENABLE2",
             Some("1.0"),
-            &format!("select checkout {offer} profile codex-balanced mode propose"),
+            &format!(
+                "select checkout {offer} profile custom mode propose \
+                 write-coder claude write-model write-model write-effort high \
+                 review-coder codex review-model review-model review-effort medium"
+            ),
         ))
         .unwrap();
     let setup_reply = &runner.slack().deliveries.last().unwrap().text;
@@ -879,6 +907,8 @@ fn slack_enablement_request_drives_init_review_commit_and_binding() {
         .trim_end_matches(['`', '.'])
         .to_owned();
     assert!(setup_reply.contains("No checkout changes have been made"));
+    assert!(setup_reply.contains("Writer: coder claude, model write-model, effort high"));
+    assert!(setup_reply.contains("Reviewer: coder codex, model review-model, effort medium"));
 
     runner
         .ingest(event(
