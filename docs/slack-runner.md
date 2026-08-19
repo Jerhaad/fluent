@@ -73,9 +73,8 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    Inspect its safe status with `fluent slack status`, restart it with
    `fluent slack restart`, and stop it with `fluent slack stop`.
 
-   `fluent slack run` preflights the local Slack, checkout, and enabled
-   conversation-provider boundaries, opens Socket Mode, and keeps receiving
-   events until stopped.
+   `fluent slack run` preflights the local Slack, checkout, and Codex provider
+   boundaries, opens Socket Mode, and keeps receiving events until stopped.
 
 If an agent sandbox blocks Keychain or LaunchAgent access, run the reported
 host handoff command outside that sandbox. This is a host permission issue,
@@ -169,11 +168,9 @@ the participants who may switch a recovered thread. The currently supported
 runner adapter is `codex`; do not list `claude` until a Claude adapter is
 installed for this runner.
 
-When another enabled adapter is available, a participant can request it in the
-opening mention, for example `@Fluent [provider=codex] plan the release`. An
-approver can switch an interrupted thread through the runner's provider-switch
-action. Authentication and provider outages preserve the durable turn and show
-recovery guidance. A rate-limited provider reports its retry delay and offers
-the same approver switch option. If the exact bound checkout disappears or its
-identity changes, Fluent stops provider access, reports the unavailable binding,
-and never substitutes another checkout automatically.
+The runner validates a requested provider against this policy before binding a
+thread. Provider switching requires an interrupted thread and an approver;
+future adapters will expose that action in the Slack workflow. If the exact
+bound checkout disappears or its identity changes, Fluent stops provider access,
+reports the unavailable binding, and never substitutes another checkout
+automatically.
