@@ -429,10 +429,15 @@ impl WorkControl {
         let mut completed = !slice.work_item_ids.is_empty();
         for work_item_id in &slice.work_item_ids {
             let item = store.read_work_item(work_item_id)?;
-            completed &= matches!(
+            let attempt_complete = matches!(
                 item.attempts.last().map(|attempt| &attempt.status),
                 Some(crate::work_model::AttemptStatus::Complete)
             );
+            let candidates_landed = item.merge_candidates.iter().all(|candidate| {
+                candidate.merge_state.status == crate::work_model::MergeCandidateMergeStatus::Merged
+                    && candidate.merge_state.follow_up_failure.is_none()
+            });
+            completed &= attempt_complete && candidates_landed;
         }
         Ok(if completed {
             SliceStage::Complete
