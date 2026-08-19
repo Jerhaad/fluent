@@ -2736,6 +2736,20 @@ fn local_code_reference_bounds_long_slack_excerpt() {
 }
 
 #[test]
+fn local_code_reference_truncates_at_utf8_boundary() {
+    let (_home, checkout, config) = setup(true);
+    fs::write(checkout.path().join("README"), "🦀".repeat(300)).unwrap();
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
+    assert!(reference.contains("… [truncated]"));
+    assert!(reference.is_char_boundary(reference.len()));
+}
+
+#[test]
 fn code_question_uses_bound_checkout_and_relative_references() {
     let (_home, checkout, config) = setup(true);
     let reference = format_code_reference(
