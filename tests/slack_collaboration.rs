@@ -2450,6 +2450,62 @@ fn thread_can_select_enabled_nondefault_provider() {
 }
 
 #[test]
+fn selected_provider_dispatches_to_matching_adapter() {
+    struct NamedProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ConversationProvider for NamedProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.lock().unwrap().push(self.name.into());
+            Ok((
+                format!("{}-session", self.name),
+                format!("{} reply", self.name),
+            ))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry = ProviderRegistry::new([
+        Box::new(NamedProvider {
+            name: "codex",
+            calls: calls.clone(),
+        }) as Box<dyn ConversationProvider>,
+        Box::new(NamedProvider {
+            name: "claude",
+            calls: calls.clone(),
+        }) as Box<dyn ConversationProvider>,
+    ])
+    .unwrap();
+    let (home, _checkout, config) = setup(true);
+    let mut runner =
+        CollaborationRunner::new(home.path(), config, registry, InMemorySlack::default());
+    runner
+        .ingest(event("E1", None, "@Fluent [provider=claude] hello"))
+        .unwrap();
+    assert_eq!(&*calls.lock().unwrap(), &["claude"]);
+    assert!(runner.slack().deliveries[0].text.contains("claude reply"));
+}
+
+#[test]
 fn reply_during_active_turn_shows_queued_state() {
     let mut pool = FairTurnPool::new(1);
     assert!(pool.request("1.0"));

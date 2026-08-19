@@ -269,6 +269,12 @@ pub trait ConversationProvider {
     fn name(&self) -> &str {
         "codex"
     }
+    fn select(&mut self, provider: &str) -> Result<()> {
+        if self.name() != provider {
+            bail!("conversation provider {provider} is not available")
+        }
+        Ok(())
+    }
     fn start(
         &mut self,
         action_id: &str,

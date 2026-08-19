@@ -747,3 +747,173 @@ impl ConversationProvider for CodexAppServerProvider {
             .context("Codex App Server is unavailable")
     }
 }
+
+/// Dispatches persisted provider identities to their owning adapters.
+pub struct ProviderRegistry {
+    providers: std::collections::BTreeMap<String, Box<dyn ConversationProvider>>,
+    selected: String,
+}
+
+pub struct ClaudeStructuredSessionProvider {
+    executable: PathBuf,
+}
+impl ClaudeStructuredSessionProvider {
+    pub fn new(executable: PathBuf) -> Self {
+        Self { executable }
+    }
+}
+impl ClaudeStructuredSessionProvider {
+    fn invoke(
+        &self,
+        scope: &ProviderScope,
+        session: Option<&str>,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<(String, String)> {
+        let mut command = Command::new(&self.executable);
+        command.current_dir(&scope.checkout).args([
+            "--print",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "plan",
+        ]);
+        if let Some(session) = session {
+            command.args(["--resume", session]);
+        }
+        command.arg(format!("Slack user {actor}: {contribution}"));
+        let output = command
+            .output()
+            .context("invoke Claude structured session")?;
+        if !output.status.success() {
+            bail!(
+                "Claude unavailable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        Ok((
+            value["session_id"]
+                .as_str()
+                .context("Claude response omitted session_id")?
+                .into(),
+            value["result"]
+                .as_str()
+                .context("Claude response omitted result")?
+                .into(),
+        ))
+    }
+}
+impl ConversationProvider for ClaudeStructuredSessionProvider {
+    fn name(&self) -> &str {
+        "claude"
+    }
+    fn start(
+        &mut self,
+        _: &str,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<(String, String)> {
+        self.invoke(scope, None, contribution, actor)
+    }
+    fn resume(
+        &mut self,
+        _: &str,
+        session: &str,
+        scope: &ProviderScope,
+        contribution: &str,
+        actor: &str,
+    ) -> Result<String> {
+        Ok(self.invoke(scope, Some(session), contribution, actor)?.1)
+    }
+    fn ready(&self) -> Result<()> {
+        Command::new(&self.executable)
+            .arg("--version")
+            .status()?
+            .success()
+            .then_some(())
+            .context("Claude is unavailable")
+    }
+}
+
+impl ProviderRegistry {
+    pub fn new(providers: impl IntoIterator<Item = Box<dyn ConversationProvider>>) -> Result<Self> {
+        let mut registry = std::collections::BTreeMap::new();
+        for provider in providers {
+            let name = provider.name().to_owned();
+            if registry.insert(name.clone(), provider).is_some() {
+                bail!("duplicate provider {name}");
+            }
+        }
+        let selected = if registry.contains_key("codex") {
+            "codex".into()
+        } else {
+            registry
+                .keys()
+                .next()
+                .context("provider registry is empty")?
+                .clone()
+        };
+        Ok(Self {
+            providers: registry,
+            selected,
+        })
+    }
+    fn current(&mut self) -> Result<&mut (dyn ConversationProvider + '_)> {
+        match self.providers.get_mut(&self.selected) {
+            Some(provider) => Ok(provider.as_mut()),
+            None => bail!("selected provider is unavailable"),
+        }
+    }
+}
+
+impl ConversationProvider for ProviderRegistry {
+    fn name(&self) -> &str {
+        &self.selected
+    }
+    fn select(&mut self, provider: &str) -> Result<()> {
+        if !self.providers.contains_key(provider) {
+            bail!("conversation provider {provider} is not available");
+        }
+        self.selected = provider.into();
+        Ok(())
+    }
+    fn start(&mut self, a: &str, s: &ProviderScope, c: &str, u: &str) -> Result<(String, String)> {
+        self.current()?.start(a, s, c, u)
+    }
+    fn resume(&mut self, a: &str, id: &str, s: &ProviderScope, c: &str, u: &str) -> Result<String> {
+        self.current()?.resume(a, id, s, c, u)
+    }
+    fn prepare_session(&mut self, s: &ProviderScope) -> Result<Option<String>> {
+        self.current()?.prepare_session(s)
+    }
+    fn recover_turn(
+        &mut self,
+        a: &str,
+        id: &str,
+        s: &ProviderScope,
+    ) -> Result<ProviderTurnRecovery> {
+        self.current()?.recover_turn(a, id, s)
+    }
+    fn run_turn(
+        &mut self,
+        a: &str,
+        id: Option<&str>,
+        s: &ProviderScope,
+        c: &str,
+        u: &str,
+        accepted: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<(Option<String>, String)> {
+        self.current()?.run_turn(a, id, s, c, u, accepted)
+    }
+    fn code_references(&mut self, s: &ProviderScope, c: &str) -> Result<Vec<super::CodeReference>> {
+        self.current()?.code_references(s, c)
+    }
+    fn ready(&self) -> Result<()> {
+        self.providers
+            .get(&self.selected)
+            .context("selected provider is unavailable")?
+            .ready()
+    }
+}

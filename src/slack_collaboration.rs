@@ -454,6 +454,13 @@ impl ConversationProvider for InMemoryProvider {
     fn name(&self) -> &str {
         "codex"
     }
+    fn select(&mut self, provider: &str) -> Result<()> {
+        if matches!(provider, "codex" | "claude") {
+            Ok(())
+        } else {
+            bail!("provider unavailable")
+        }
+    }
     fn start(
         &mut self,
         action_id: &str,
@@ -742,7 +749,13 @@ pub fn run_configured_runner(home: &Path) -> Result<()> {
     let codex = std::env::var_os("FLUENT_CODEX_APP_SERVER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("codex"));
-    let provider = CodexAppServerProvider::new_scoped(codex);
+    let claude = std::env::var_os("FLUENT_CLAUDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("claude"));
+    let provider = ProviderRegistry::new([
+        Box::new(CodexAppServerProvider::new_scoped(codex)) as Box<dyn ConversationProvider>,
+        Box::new(ClaudeStructuredSessionProvider::new(claude)) as Box<dyn ConversationProvider>,
+    ])?;
     let slack = SocketModeTransport::connect(api_base, app_token, bot_token)?;
     let scheduler = LocalSchedulerClient::new(
         config

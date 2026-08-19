@@ -742,6 +742,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .pending_turn
             .clone()
             .context("thread has no pending provider turn")?;
+        self.provider.select(
+            thread
+                .provider
+                .as_deref()
+                .context("thread has no selected provider")?,
+        )?;
         let previously_completed = turn.completed_reply.is_some();
         let checkout = match self.bound_project(thread) {
             Ok(project) => project.checkout.path.clone(),
