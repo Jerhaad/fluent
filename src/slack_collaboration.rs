@@ -589,6 +589,30 @@ pub fn checkout_is_available(checkout: &Checkout) -> bool {
     branch == checkout.branch && commit == checkout.commit
 }
 
+/// Format a code reference without disclosing the runner's host path. A
+/// committed GitHub checkout gets an immutable permalink; local state receives
+/// a clearly labelled, bounded excerpt instead.
+pub fn format_code_reference(checkout: &Checkout, path: &Path, line: usize) -> Result<String> {
+    let relative = path.strip_prefix(&checkout.path).context("code reference is outside the bound checkout")?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let committed = git_output(&checkout.path, &["status", "--porcelain", "--", &relative]).map_or(false, |value| value.is_empty());
+    let remote = git_output(&checkout.path, &["remote", "get-url", "origin"]).ok();
+    if committed {
+        if let Some(remote) = remote.and_then(|remote| github_https_remote(&remote)) {
+            return Ok(format!("{relative}:{line} — {remote}/blob/{}/{}#L{line}", checkout.commit, relative));
+        }
+    }
+    let source = fs::read_to_string(path).context("read referenced source")?;
+    let excerpt = source.lines().nth(line.saturating_sub(1)).unwrap_or("");
+    Ok(format!("{relative}:{line} — local-only reference (no durable GitHub link): {excerpt}"))
+}
+
+fn github_https_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim_end_matches('/').trim_end_matches(".git");
+    if let Some(path) = remote.strip_prefix("git@github.com:") { return Some(format!("https://github.com/{path}")); }
+    remote.starts_with("https://github.com/").then_some(remote.to_owned())
+}
+
 pub fn write_config(home: &Path, config: &RunnerConfig) -> Result<()> {
     config.validate()?;
     ensure_root(home)?;

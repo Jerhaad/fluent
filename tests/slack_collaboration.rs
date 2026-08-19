@@ -2500,6 +2500,25 @@ fn approver_switches_provider_without_changing_work() {
     assert_eq!(thread.provider.as_deref(), Some("claude"));
     assert!(thread.linked_work.is_none());
 }
+
+#[test]
+fn committed_code_reference_uses_commit_pinned_github_link() {
+    let (_home, checkout, config) = setup(true);
+    std::process::Command::new("git").arg("-C").arg(checkout.path()).args(["remote", "add", "origin", "git@github.com:fluent/example.git"]).status().unwrap();
+    let reference = format_code_reference(&config.projects["app"].checkout, &checkout.path().join("README"), 1).unwrap();
+    assert!(reference.contains(&format!("/blob/{}/README#L1", config.projects["app"].checkout.commit)));
+    assert!(!reference.contains(&checkout.path().display().to_string()));
+}
+
+#[test]
+fn local_code_reference_uses_labeled_slack_fallback() {
+    let (_home, checkout, config) = setup(true);
+    fs::write(checkout.path().join("README"), "dirty local source").unwrap();
+    let reference = format_code_reference(&config.projects["app"].checkout, &checkout.path().join("README"), 1).unwrap();
+    assert!(reference.contains("local-only reference"));
+    assert!(reference.contains("dirty local source"));
+    assert!(!reference.contains(&checkout.path().display().to_string()));
+}
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);
