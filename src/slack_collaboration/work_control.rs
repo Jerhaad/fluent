@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::atomic_write::atomic_write;
-use crate::work_model::{ExecutionAuthority, ExecutionAuthorization, WorkItem, WorkModelStore};
+use crate::work_model::{
+    DurableWorkTransition, ExecutionAuthority, ExecutionAuthorization, WorkItem, WorkModelStore,
+    now_iso8601,
+};
 
 /// A Work Item approved as part of one Slack Slice plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +71,15 @@ pub struct SliceWorkStatus {
     pub next_action: String,
 }
 
+/// Projected Slice state. A completed Slice remains readable and can be linked
+/// to future corrective Work without losing its original record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SliceStage {
+    Active,
+    Complete,
+}
+
 /// Durable Slice-to-Work binding, stored beside the bound project's Work model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SliceWork {
@@ -80,6 +92,8 @@ pub struct SliceWork {
     pub transitions: Vec<WorkTransition>,
     #[serde(default)]
     observed_states: BTreeMap<String, String>,
+    #[serde(default)]
+    transition_cursors: BTreeMap<String, u64>,
 }
 
 /// A bounded, ordered status change observed from the authoritative Work
@@ -93,6 +107,16 @@ pub struct WorkTransition {
     pub new_state: String,
     pub origin: Option<String>,
     pub reason: Option<String>,
+    #[serde(default = "default_work_item_kind")]
+    pub object_kind: String,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<u64>,
+}
+
+fn default_work_item_kind() -> String {
+    "work-item".into()
 }
 
 /// Render one bounded, attributed transition reply for a Slack thread. The
@@ -108,6 +132,9 @@ pub fn render_transition_reply(transition: &WorkTransition, evidence: &[String])
     }
     if let Some(reason) = &transition.reason {
         reply.push_str(&format!(" Next action: {reason}."));
+    }
+    if let Some(elapsed) = transition.elapsed_seconds {
+        reply.push_str(&format!(" Elapsed: {elapsed}s."));
     }
     if !evidence.is_empty() {
         reply.push_str(&format!(" Evidence: {}.", evidence.join(", ")));
@@ -158,12 +185,24 @@ impl WorkControl {
 
         let store = WorkModelStore::new(&self.project_root);
         for work in planned_work {
-            let item = WorkItem {
+            let mut item = WorkItem {
                 id: work.id.clone(),
                 title: work.title.clone(),
                 authorization: ExecutionAuthorization::Proposed,
                 ..WorkItem::default()
             };
+            item.transitions.push(DurableWorkTransition {
+                sequence: 1,
+                object_kind: "work-item".into(),
+                object_id: work.id.clone(),
+                old_state: None,
+                new_state: "planned".into(),
+                occurred_at: now_iso8601(),
+                elapsed_seconds: None,
+                origin: Some("slack-thread".into()),
+                reason: Some("Await execution approval".into()),
+                evidence_ref: None,
+            });
             store.create_work_item(&item).with_context(|| {
                 format!("create planned Work Item {} for Slice {slice_id}", work.id)
             })?;
@@ -175,6 +214,7 @@ impl WorkControl {
             execution_requests: Vec::new(),
             transitions: Vec::new(),
             observed_states: BTreeMap::new(),
+            transition_cursors: BTreeMap::new(),
         };
         self.save_slice(&slice)?;
         Ok(ApprovedPlanReport {
@@ -320,6 +360,9 @@ impl WorkControl {
                 new_state: status.state.clone(),
                 origin: origin.map(str::to_owned),
                 reason: Some(status.next_action),
+                object_kind: "work-item".into(),
+                occurred_at: None,
+                elapsed_seconds: None,
             };
             slice
                 .observed_states
@@ -331,6 +374,115 @@ impl WorkControl {
             self.save_slice(&slice)?;
         }
         Ok(appended)
+    }
+
+    /// Read the model-owned ledger after this Slack consumer's independent
+    /// cursor. This reports transitions produced while the runner was away
+    /// without conflating them with transitions another consumer has seen.
+    pub fn reconcile_durable_transitions(&self, slice_id: &str) -> Result<Vec<WorkTransition>> {
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let store = WorkModelStore::new(&self.project_root);
+        let mut reported = Vec::new();
+        for work_item_id in &slice.work_item_ids {
+            let item = store.read_work_item(work_item_id)?;
+            let cursor = slice
+                .transition_cursors
+                .get(work_item_id)
+                .copied()
+                .unwrap_or(0);
+            for entry in item
+                .transitions
+                .iter()
+                .filter(|entry| entry.sequence > cursor)
+            {
+                reported.push(WorkTransition {
+                    sequence: entry.sequence,
+                    work_item_id: work_item_id.clone(),
+                    old_state: entry.old_state.clone(),
+                    new_state: entry.new_state.clone(),
+                    origin: entry.origin.clone(),
+                    reason: entry.reason.clone(),
+                    object_kind: entry.object_kind.clone(),
+                    occurred_at: Some(entry.occurred_at.clone()),
+                    elapsed_seconds: entry.elapsed_seconds,
+                });
+                slice
+                    .transition_cursors
+                    .insert(work_item_id.clone(), entry.sequence);
+            }
+        }
+        reported.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.work_item_id.cmp(&right.work_item_id))
+        });
+        if !reported.is_empty() {
+            self.save_slice(&slice)?;
+        }
+        Ok(reported)
+    }
+
+    pub fn slice_stage(&self, slice_id: &str) -> Result<SliceStage> {
+        let statuses = self.status(slice_id)?;
+        Ok(
+            if !statuses.is_empty() && statuses.iter().all(|status| status.state == "complete") {
+                SliceStage::Complete
+            } else {
+                SliceStage::Active
+            },
+        )
+    }
+
+    /// Render the pinned thread status from durable model state. The caller
+    /// supplies provider state because it is runner-local rather than Work
+    /// model authority.
+    pub fn render_status_message(
+        &self,
+        slice_id: &str,
+        project_label: &str,
+        checkout_label: &str,
+        provider_state: &str,
+    ) -> Result<String> {
+        let statuses = self.status(slice_id)?;
+        let stage = self.slice_stage(slice_id)?;
+        let work = statuses
+            .iter()
+            .map(|status| format!("{}: {}", status.work_item_id, status.state))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let next = statuses
+            .first()
+            .map(|status| status.next_action.as_str())
+            .unwrap_or("No Work is planned");
+        Ok(format!(
+            "Project: {project_label}; checkout: {checkout_label}; Slice: {stage:?}; provider: {provider_state}; Work: {work}. Next action: {next}."
+        ))
+    }
+
+    /// Explain a durable exceptional transition without publishing externally.
+    pub fn render_actionable_transition(
+        &self,
+        transition: &WorkTransition,
+        evidence: &[String],
+        github_remote: Option<&str>,
+    ) -> String {
+        let mut reply = render_transition_reply(transition, evidence);
+        match transition.new_state.as_str() {
+            "needs-user" => reply.push_str(" Reply with the requested recovery decision."),
+            "failed" => {
+                reply.push_str(" Inspect the evidence and use only the permitted recovery action.")
+            }
+            "ready" => {
+                reply.push_str(" Candidate is ready for review.");
+                if let Some(remote) = github_remote {
+                    reply.push_str(&format!(" Review {remote}/commit/{} or compare it before optionally creating a pull request.", transition.work_item_id));
+                }
+            }
+            _ => {}
+        }
+        reply
     }
 
     fn save_slice(&self, slice: &SliceWork) -> Result<()> {

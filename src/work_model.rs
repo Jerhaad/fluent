@@ -367,6 +367,11 @@ pub struct WorkItem {
     pub attempts: Vec<Attempt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_candidates: Vec<MergeCandidate>,
+    /// Immutable lifecycle entries derived while the aggregate is held under
+    /// its model lock. Consumers keep their own cursors; they never infer a
+    /// durable change by comparing a previous Slack reply with current state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<DurableWorkTransition>,
 }
 
 impl PartialEq for WorkItem {
@@ -389,6 +394,7 @@ impl PartialEq for WorkItem {
             && self.input_artifacts == other.input_artifacts
             && self.attempts == other.attempts
             && self.merge_candidates == other.merge_candidates
+            && self.transitions == other.transitions
     }
 }
 
@@ -417,8 +423,28 @@ impl Default for WorkItem {
             storage_revision: StorageRevision::default(),
             attempts: Vec::new(),
             merge_candidates: Vec::new(),
+            transitions: Vec::new(),
         }
     }
+}
+
+/// One bounded lifecycle change recorded with the aggregate that caused it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableWorkTransition {
+    pub sequence: u64,
+    pub object_kind: String,
+    pub object_id: String,
+    pub old_state: Option<String>,
+    pub new_state: String,
+    pub occurred_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
 }
 
 impl WorkItem {
@@ -6730,6 +6756,8 @@ struct WorkItemRecord {
     pending_enqueue: Option<EnqueueIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     input_artifacts: Vec<WorkItemInputArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transitions: Vec<DurableWorkTransition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6823,6 +6851,7 @@ impl From<&WorkItem> for WorkItemRecord {
             corrective_audit: work_item.corrective_audit.clone(),
             pending_enqueue: work_item.pending_enqueue.clone(),
             input_artifacts: work_item.input_artifacts.clone(),
+            transitions: work_item.transitions.clone(),
         }
     }
 }
@@ -6850,6 +6879,7 @@ impl From<WorkItemRecord> for WorkItem {
             input_artifacts: record.input_artifacts,
             attempts: Vec::new(),
             merge_candidates: Vec::new(),
+            transitions: record.transitions,
         }
     }
 }
@@ -7264,6 +7294,7 @@ impl WorkModelStore {
                 path: path.clone(),
                 source,
             })?;
+        append_durable_transitions(&mut work_item);
         work_item
             .validate()
             .map_err(|source| WorkModelStorageError::InvalidModel { path, source })?;
@@ -7970,6 +8001,96 @@ impl WorkModelStore {
             source,
         })
     }
+}
+
+fn append_durable_transitions(work_item: &mut WorkItem) {
+    let previous = work_item
+        .transitions
+        .last()
+        .map(|entry| entry.sequence)
+        .unwrap_or(0);
+    let current = durable_object_states(work_item);
+    let prior: HashMap<_, _> = work_item
+        .transitions
+        .iter()
+        .map(|entry| {
+            (
+                format!("{}:{}", entry.object_kind, entry.object_id),
+                entry.new_state.clone(),
+            )
+        })
+        .collect();
+    // The aggregate already stores only emitted states. Record a fresh entry for
+    // an object when its current state differs from its last durable state.
+    let now = now_iso8601();
+    for (object_kind, object_id, state, reason) in current {
+        let key = format!("{object_kind}:{object_id}");
+        let old_state = prior.get(&key).cloned();
+        if old_state.as_deref() == Some(state.as_str()) {
+            continue;
+        }
+        let sequence = work_item
+            .transitions
+            .last()
+            .map(|entry| entry.sequence + 1)
+            .unwrap_or(previous + 1);
+        work_item.transitions.push(DurableWorkTransition {
+            sequence,
+            object_kind,
+            object_id,
+            old_state,
+            new_state: state,
+            occurred_at: now.clone(),
+            elapsed_seconds: None,
+            origin: Some("fluent".into()),
+            reason,
+            evidence_ref: None,
+        });
+    }
+}
+
+fn durable_object_states(work_item: &WorkItem) -> Vec<(String, String, String, Option<String>)> {
+    let mut states = vec![(
+        "work-item".into(),
+        work_item.id.clone(),
+        if work_item.authorization.is_proposed() {
+            "planned"
+        } else {
+            "authorized"
+        }
+        .into(),
+        None,
+    )];
+    states.extend(work_item.attempts.iter().map(|attempt| {
+        (
+            "attempt".into(),
+            attempt.id.clone(),
+            attempt.status.as_str().into(),
+            attempt
+                .pause_kind
+                .as_ref()
+                .map(|pause| format!("{pause:?}").to_lowercase()),
+        )
+    }));
+    states.extend(work_item.attempts.iter().flat_map(|attempt| {
+        attempt.tasks.iter().map(|task| {
+            (
+                "task".into(),
+                task.id.clone(),
+                format!("{:?}", task.status).to_lowercase(),
+                None,
+            )
+        })
+    }));
+    states.extend(work_item.merge_candidates.iter().map(|candidate| {
+        (
+            "merge-candidate".into(),
+            candidate.id.clone(),
+            format!("{:?}", candidate.merge_state.status).to_lowercase(),
+            candidate.merge_state.failure_reason.clone(),
+        )
+    }));
+    states
 }
 
 fn reject_intake_contract_change(

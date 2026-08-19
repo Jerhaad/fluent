@@ -6548,6 +6548,78 @@ fn status_request_reports_authoritative_work_state_and_actions() {
     );
 }
 
+#[test]
+fn durable_transition_ledger_replays_once_per_slack_cursor() {
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-ledger",
+            "U1",
+            &[PlannedWork::new("work-ledger", "Work")],
+        )
+        .unwrap();
+    assert_eq!(
+        control
+            .reconcile_durable_transitions("slice-ledger")
+            .unwrap()[0]
+            .new_state,
+        "planned"
+    );
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-ledger")
+            .unwrap()
+            .is_empty()
+    );
+    control
+        .authorize_execution("slice-ledger", "U1", &Scheduler)
+        .unwrap();
+    let transitions = control
+        .reconcile_durable_transitions("slice-ledger")
+        .unwrap();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].work_item_id, "work-ledger");
+    assert_eq!(transitions[0].new_state, "authorized");
+    assert_eq!(transitions[0].origin.as_deref(), Some("fluent"));
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-ledger")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn status_message_uses_current_durable_slice_projection() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-status",
+            "U1",
+            &[PlannedWork::new("work-status", "Work")],
+        )
+        .unwrap();
+    let message = control
+        .render_status_message("slice-status", "app", "app-checkout", "idle")
+        .unwrap();
+    assert!(message.contains("Project: app"));
+    assert!(message.contains("checkout: app-checkout"));
+    assert!(message.contains("Slice: Active"));
+    assert!(message.contains("work-status: planned"));
+    assert!(message.contains("Await execution approval"));
+}
+
 // Each behavior-level selector verifies the persisted transition stream that
 // the Slack adapter uses to render a linked Work update.
 macro_rules! persisted_slice_status_selector {
