@@ -97,7 +97,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .store
             .load_pending_inbox(&self.config)?
             .into_iter()
-            .map(|event| (false, event))
+            .map(|event| (true, event))
             .collect();
         events.extend(history.into_iter().map(|event| (true, event)));
         events.sort_by(|(left_history, left), (right_history, right)| {
@@ -197,7 +197,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         if thread.state == ThreadState::Active
             && thread.pending_action.is_some()
-            && self.is_approval_response(&thread, &event)
+            && policy::is_approval_response(&thread, &event)
         {
             match self.approve_thread_action(&mut thread, &event)? {
                 ApprovalOutcome::WaitingForApprover => self.slack.respond_private(
@@ -288,32 +288,18 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 current_action_id: action.id.clone(),
             });
         }
-        let outcome =
-            self.approve_thread_action_with(&mut thread, actor, event_id, accepted_at, false)?;
+        let authority = policy::project_authority(&self.current_authority_config()?, &thread);
+        let outcome = policy::evaluate_approval(
+            &mut thread,
+            authority.as_ref(),
+            actor,
+            event_id,
+            accepted_at,
+            false,
+            None,
+        );
         self.store.save_thread(&self.config, &thread)?;
         Ok(outcome)
-    }
-
-    fn is_approval_response(&self, thread: &FluentThread, event: &InboundEnvelope) -> bool {
-        let Some(action) = &thread.pending_action else {
-            return false;
-        };
-        let answer = event.text.trim().to_ascii_lowercase();
-        (event.approval_action_id.is_some() || event.approval_artifact_revision.is_some())
-            && event.text == "fluent_approval"
-            || answer == "y"
-            || answer == "yes"
-            || answer == action.id.to_ascii_lowercase()
-            || action
-                .labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case(&answer))
-            || match action.kind {
-                PendingActionKind::Planning => answer.contains("plan"),
-                PendingActionKind::Execution => answer.contains("execut"),
-                PendingActionKind::Resume => answer.contains("resume"),
-                PendingActionKind::Landing => answer.contains("land"),
-            }
     }
 
     fn approve_thread_action(
@@ -321,91 +307,17 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         thread: &mut FluentThread,
         event: &InboundEnvelope,
     ) -> Result<ApprovalOutcome> {
-        let Some(action) = thread.pending_action.as_ref() else {
-            return Ok(ApprovalOutcome::NoPendingAction);
-        };
-        if !self.approval_matches_presented_action(action, event) {
-            return Ok(ApprovalOutcome::Stale {
-                current_action_id: action.id.clone(),
-            });
-        }
         let accepted_at = chrono::Utc::now().to_rfc3339();
-        self.approve_thread_action_with(
+        let authority = policy::project_authority(&self.current_authority_config()?, thread);
+        Ok(policy::evaluate_approval(
             thread,
+            authority.as_ref(),
             &event.user,
             &event.id,
             &accepted_at,
             self.recovering_event,
-        )
-    }
-
-    fn approve_thread_action_with(
-        &self,
-        thread: &mut FluentThread,
-        actor: &str,
-        event_id: &str,
-        accepted_at: &str,
-        recovered: bool,
-    ) -> Result<ApprovalOutcome> {
-        let Some(action) = thread.pending_action.clone() else {
-            return Ok(ApprovalOutcome::NoPendingAction);
-        };
-        if thread
-            .approvals
-            .iter()
-            .any(|record| record.event_id == event_id)
-        {
-            return Ok(ApprovalOutcome::Accepted(
-                thread
-                    .approvals
-                    .iter()
-                    .find(|record| record.event_id == event_id)
-                    .cloned()
-                    .unwrap(),
-            ));
-        }
-        let authority = self.current_authority_config()?;
-        if !policy::actor_is_project_approver(&authority, thread, actor) {
-            return Ok(ApprovalOutcome::WaitingForApprover);
-        }
-        if recovered && !action.kind.is_delayed_safe() {
-            thread.pending_question = Some(format!("fresh confirmation required: {}", action.id));
-            return Ok(ApprovalOutcome::FreshConfirmationRequired);
-        }
-        let project_label = thread
-            .project_label
-            .clone()
-            .context("approval thread is unbound")?;
-        let record = ApprovalRecord {
-            project_label,
-            thread_id: thread.id.clone(),
-            pending_action_id: action.id,
-            action_kind: action.kind,
-            artifact_revision: action.artifact_revision,
-            presented_at: action.presented_at,
-            actor: actor.into(),
-            accepted_at: accepted_at.into(),
-            event_id: event_id.into(),
-        };
-        thread.approvals.push(record.clone());
-        thread.pending_action = None;
-        thread.pending_question = None;
-        Ok(ApprovalOutcome::Accepted(record))
-    }
-
-    fn approval_matches_presented_action(
-        &self,
-        action: &PendingAction,
-        event: &InboundEnvelope,
-    ) -> bool {
-        match (&event.approval_action_id, &event.approval_artifact_revision) {
-            (Some(id), Some(revision)) => id == &action.id && revision == &action.artifact_revision,
-            (None, None) if self.recovering_event => {
-                slack_timestamp_is_at_or_after(&event.timestamp, &action.presented_at)
-            }
-            (None, None) => true,
-            _ => false,
-        }
+            Some(event),
+        ))
     }
 
     fn current_authority_config(&self) -> Result<RunnerConfig> {
@@ -621,35 +533,4 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             approval_control: None,
         })
     }
-}
-
-fn slack_timestamp_is_at_or_after(value: &str, threshold: &str) -> bool {
-    fn parts(value: &str) -> Option<(&str, &str)> {
-        let (seconds, fraction) = value.split_once('.')?;
-        if seconds.is_empty()
-            || fraction.is_empty()
-            || !seconds.bytes().all(|byte| byte.is_ascii_digit())
-            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return None;
-        }
-        Some((seconds, fraction))
-    }
-    let Some((value_seconds, value_fraction)) = parts(value) else {
-        return false;
-    };
-    let Some((threshold_seconds, threshold_fraction)) = parts(threshold) else {
-        return false;
-    };
-    let Ok(value_seconds) = value_seconds.parse::<u64>() else {
-        return false;
-    };
-    let Ok(threshold_seconds) = threshold_seconds.parse::<u64>() else {
-        return false;
-    };
-    if value_seconds != threshold_seconds {
-        return value_seconds > threshold_seconds;
-    }
-    let width = value_fraction.len().max(threshold_fraction.len());
-    format!("{value_fraction:0<width$}") >= format!("{threshold_fraction:0<width$}")
 }

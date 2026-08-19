@@ -578,6 +578,60 @@ fn reconnect_reconfirms_delayed_consequential_action() {
 }
 
 #[test]
+fn pending_inbox_reconnect_reconfirms_consequential_action() {
+    for kind in [
+        PendingActionKind::Execution,
+        PendingActionKind::Resume,
+        PendingActionKind::Landing,
+    ] {
+        let (home, _checkout, config) = setup(true);
+        let mut initial = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        initial.ingest(event("E1", None, "@Fluent hello")).unwrap();
+        let action = pending_action(kind);
+        initial.request_approval("1.0", action.clone()).unwrap();
+        let approval = approval_event("E2", "y", &action);
+        assert_eq!(
+            FileCollaborationStore::new(home.path())
+                .persist_inbox(&config, &approval)
+                .unwrap(),
+            InboxState::Pending
+        );
+
+        let mut recovered = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
+        recovered.reconnect([], "reconnected".into()).unwrap();
+        let thread = FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap();
+        assert!(thread.approvals.is_empty());
+        assert!(
+            thread
+                .pending_question
+                .as_deref()
+                .unwrap()
+                .contains("fresh confirmation")
+        );
+        assert!(
+            recovered
+                .slack()
+                .deliveries
+                .iter()
+                .any(|delivery| delivery.text.contains("Fresh confirmation"))
+        );
+    }
+}
+
+#[test]
 fn setup_validates_complete_collaboration_authority() {
     let (_home, _checkout, mut config) = setup(true);
     config.enabled_providers.clear();

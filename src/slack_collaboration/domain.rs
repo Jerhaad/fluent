@@ -102,6 +102,13 @@ pub struct PendingAction {
     pub labels: BTreeSet<String>,
 }
 
+/// A point-in-time project authority snapshot used to evaluate an approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantAuthority {
+    pub project_label: String,
+    pub approvers: BTreeSet<String>,
+}
+
 /// A durable authorization record. Consumers, rather than this domain, perform
 /// any filesystem, Work, publication, initialization, or landing effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
