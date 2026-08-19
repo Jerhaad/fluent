@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::work_model::{WriterCompletionContract, WriterCompletionRequirementKind};
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 3;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 
@@ -65,11 +65,22 @@ pub struct CandidateGateEvidence {
 /// metadata while preserving the rejected candidate's exact tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CandidateMetadataRewriteEvidence {
-    pub prior_gate_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_gate_path: Option<String>,
+    #[serde(default)]
+    pub authorization: CandidateMetadataRewriteAuthorization,
     pub original_base_commit: String,
     pub rejected_candidate_commit: String,
     pub replacement_candidate_commit: String,
     pub candidate_tree: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CandidateMetadataRewriteAuthorization {
+    #[default]
+    RejectedMetadataGate,
+    WriterCompletionRepair,
 }
 
 pub struct CandidateGateRequest<'a> {
@@ -82,6 +93,7 @@ pub struct CandidateGateRequest<'a> {
     pub base_commit: &'a str,
     pub candidate_commit: &'a str,
     pub completion_contract: Option<&'a WriterCompletionContract>,
+    pub allow_tree_identical_metadata_rewrite: bool,
     pub tester_results_path: Option<&'a Path>,
     pub artifact_path: &'a Path,
 }
@@ -222,11 +234,21 @@ fn check_candidate_identity(
                 Err(reason) => diagnostics.push(reason),
             },
             None => {
-                if !is_ancestor(
+                if is_ancestor(
                     request.workspace,
                     request.base_commit,
                     request.candidate_commit,
                 )? {
+                    // The normal append-only Writer path needs no recovery.
+                } else if request.allow_tree_identical_metadata_rewrite {
+                    match validate_completion_repair_metadata_rewrite(request)? {
+                        Ok((base, evidence)) => {
+                            effective_base_commit = base;
+                            metadata_rewrite = Some(evidence);
+                        }
+                        Err(reason) => diagnostics.push(reason),
+                    }
+                } else {
                     diagnostics.push(format!(
                         "base commit {} is not an ancestor of candidate {}",
                         request.base_commit, request.candidate_commit
@@ -259,6 +281,63 @@ fn check_candidate_identity(
         effective_base_commit,
         metadata_rewrite,
     })
+}
+
+fn validate_completion_repair_metadata_rewrite(
+    request: &CandidateGateRequest<'_>,
+) -> Result<std::result::Result<(String, CandidateMetadataRewriteEvidence), String>> {
+    let base_tree = crate::git::run_stdout(
+        request.workspace,
+        &["rev-parse", &format!("{}^{{tree}}", request.base_commit)],
+        "resolve completion-repair base tree",
+    );
+    let candidate_tree = crate::git::run_stdout(
+        request.workspace,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", request.candidate_commit),
+        ],
+        "resolve completion-repair candidate tree",
+    );
+    let (base_tree, candidate_tree) = match (base_tree, candidate_tree) {
+        (Ok(base), Ok(candidate)) => (base, candidate),
+        (Err(error), _) => {
+            return Ok(Err(format!(
+                "completion-repair base tree cannot be resolved: {error:#}"
+            )));
+        }
+        (_, Err(error)) => {
+            return Ok(Err(format!(
+                "completion-repair candidate tree cannot be resolved: {error:#}"
+            )));
+        }
+    };
+    if base_tree != candidate_tree {
+        return Ok(Err(format!(
+            "completion-repair candidate tree {candidate_tree} does not match base tree {base_tree}"
+        )));
+    }
+    let original_base = crate::git::run_stdout(
+        request.workspace,
+        &["merge-base", request.base_commit, request.candidate_commit],
+        "resolve completion-repair original base",
+    )?;
+    if original_base.is_empty() {
+        return Ok(Err(
+            "completion-repair metadata rewrite has no common base".to_string()
+        ));
+    }
+    Ok(Ok((
+        original_base.clone(),
+        CandidateMetadataRewriteEvidence {
+            prior_gate_path: None,
+            authorization: CandidateMetadataRewriteAuthorization::WriterCompletionRepair,
+            original_base_commit: original_base,
+            rejected_candidate_commit: request.base_commit.to_string(),
+            replacement_candidate_commit: request.candidate_commit.to_string(),
+            candidate_tree,
+        },
+    )))
 }
 
 fn is_ancestor(workspace: &Path, base: &str, candidate: &str) -> Result<bool> {
@@ -428,7 +507,8 @@ fn validate_metadata_only_rewrite(
         )));
     }
     Ok(Ok(CandidateMetadataRewriteEvidence {
-        prior_gate_path: evidence_path(request.project_root, prior_gate_path),
+        prior_gate_path: Some(evidence_path(request.project_root, prior_gate_path)),
+        authorization: CandidateMetadataRewriteAuthorization::RejectedMetadataGate,
         original_base_commit: prior.base_commit.clone(),
         rejected_candidate_commit: prior.candidate_commit.clone(),
         replacement_candidate_commit: request.candidate_commit.to_string(),
@@ -518,6 +598,14 @@ fn check_commit_metadata(
             diagnostics.push(format!(
                 "commit {commit} contains literal \\n text instead of line breaks"
             ));
+        }
+        for (index, line) in message.lines().enumerate().skip(1) {
+            if line.chars().count() > 72 {
+                diagnostics.push(format!(
+                    "commit {commit} body line {} exceeds 72 characters",
+                    index + 1
+                ));
+            }
         }
         if message.lines().any(|line| {
             line.trim_start()
@@ -998,6 +1086,7 @@ mod tests {
                 base_commit: &self.base,
                 candidate_commit: candidate,
                 completion_contract: contract,
+                allow_tree_identical_metadata_rewrite: false,
                 tester_results_path,
                 artifact_path,
             }
@@ -1133,7 +1222,14 @@ mod tests {
         assert_eq!(rewrite.original_base_commit, fixture.base);
         assert_eq!(rewrite.rejected_candidate_commit, rejected);
         assert_eq!(rewrite.replacement_candidate_commit, replacement);
-        assert_eq!(rewrite.prior_gate_path, prior_artifact.to_string_lossy());
+        assert_eq!(
+            rewrite.prior_gate_path.as_deref(),
+            Some(prior_artifact.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            rewrite.authorization,
+            CandidateMetadataRewriteAuthorization::RejectedMetadataGate
+        );
     }
 
     #[test]
@@ -1240,6 +1336,105 @@ mod tests {
         let evidence = run_candidate_gate(request).unwrap();
 
         assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+    }
+
+    #[test]
+    fn accepts_tree_identical_rewrite_for_completion_repair() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\n\n- Keep the candidate tree unchanged",
+        );
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate metadata",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+        request.allow_tree_identical_metadata_rewrite = true;
+
+        let evidence = run_candidate_gate(request).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(evidence.base_commit, fixture.base);
+        let rewrite = evidence.metadata_rewrite.unwrap();
+        assert_eq!(rewrite.prior_gate_path, None);
+        assert_eq!(
+            rewrite.authorization,
+            CandidateMetadataRewriteAuthorization::WriterCompletionRepair
+        );
+        assert_eq!(rewrite.rejected_candidate_commit, rejected);
+        assert_eq!(rewrite.replacement_candidate_commit, replacement);
+    }
+
+    #[test]
+    fn completion_repair_rewrite_still_rejects_tree_changes() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add value");
+        fs::write(
+            fixture.root.path().join("src/lib.rs"),
+            "pub fn value() { 1 }\n",
+        )
+        .unwrap();
+        crate::git::run(fixture.root.path(), &["add", "src/lib.rs"], "stage rewrite").unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "--amend", "-q", "-m", "Add value"],
+            "rewrite candidate tree",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+        request.allow_tree_identical_metadata_rewrite = true;
+
+        let evidence = run_candidate_gate(request).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert!(
+            check(&evidence, "candidate-identity")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("does not match base tree"))
+        );
+    }
+
+    #[test]
+    fn rejects_overlong_commit_body_lines() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            &format!("Add value\n\n- {}", "x".repeat(73)),
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        assert!(
+            check(&evidence, "commit-metadata")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("exceeds 72 characters"))
+        );
     }
 
     #[test]

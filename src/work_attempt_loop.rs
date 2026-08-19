@@ -3767,6 +3767,7 @@ fn run_learner_candidate_gate(
             base_commit,
             candidate_commit,
             completion_contract: attempt.writer_completion_contract.as_ref(),
+            allow_tree_identical_metadata_rewrite: false,
             tester_results_path: tester_results.as_deref(),
             artifact_path: &artifact_path,
         })?;
@@ -6051,6 +6052,10 @@ fn gate_candidate_after_writer(
             completion_contract: item.attempts[attempt_index]
                 .writer_completion_contract
                 .as_ref(),
+            allow_tree_identical_metadata_rewrite: task.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == "writer-completion-repair"
+                    && artifact.path.ends_with("writer-completion.json")
+            }),
             tester_results_path: None,
             artifact_path: &project_root.join(&artifact.path),
         },
@@ -6182,6 +6187,7 @@ fn gate_candidate_after_final_tester(
             base_commit: &output.commit,
             candidate_commit: &output.commit,
             completion_contract: attempt.writer_completion_contract.as_ref(),
+            allow_tree_identical_metadata_rewrite: false,
             tester_results_path: Some(tester_results_path),
             artifact_path: &project_root.join(&artifact.path),
         })?;
@@ -11403,6 +11409,7 @@ mod tests {
                 base_commit: &candidate,
                 candidate_commit: &candidate,
                 completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                allow_tree_identical_metadata_rewrite: false,
                 tester_results_path: Some(&tester_results),
                 artifact_path: &learner_gate,
             },
