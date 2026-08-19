@@ -863,7 +863,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .project_label
             .as_deref()
             .context("thread is unbound")?;
-        let project = self.config
+        let project = self
+            .config
             .projects
             .get(label)
             .context("thread project no longer configured")?;

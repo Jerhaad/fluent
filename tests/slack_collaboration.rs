@@ -2483,6 +2483,21 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
 }
 
 #[test]
+fn rate_limit_waits_recovers_and_offers_provider_switch() {
+    let failure = classify_provider_failure("provider rate limit; retry-after=17");
+    assert_eq!(
+        failure,
+        ProviderFailure::RateLimited {
+            retry_after_seconds: 17
+        }
+    );
+    assert_eq!(
+        provider_recovery_message(&failure, true),
+        "Provider is rate-limited; retrying in 17 seconds. A project approver may switch providers."
+    );
+}
+
+#[test]
 fn approver_switches_provider_without_changing_work() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
@@ -2504,9 +2519,27 @@ fn approver_switches_provider_without_changing_work() {
 #[test]
 fn committed_code_reference_uses_commit_pinned_github_link() {
     let (_home, checkout, config) = setup(true);
-    std::process::Command::new("git").arg("-C").arg(checkout.path()).args(["remote", "add", "origin", "git@github.com:fluent/example.git"]).status().unwrap();
-    let reference = format_code_reference(&config.projects["app"].checkout, &checkout.path().join("README"), 1).unwrap();
-    assert!(reference.contains(&format!("/blob/{}/README#L1", config.projects["app"].checkout.commit)));
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:fluent/example.git",
+        ])
+        .status()
+        .unwrap();
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
+    assert!(reference.contains(&format!(
+        "/blob/{}/README#L1",
+        config.projects["app"].checkout.commit
+    )));
     assert!(!reference.contains(&checkout.path().display().to_string()));
 }
 
@@ -2514,22 +2547,50 @@ fn committed_code_reference_uses_commit_pinned_github_link() {
 fn local_code_reference_uses_labeled_slack_fallback() {
     let (_home, checkout, config) = setup(true);
     fs::write(checkout.path().join("README"), "dirty local source").unwrap();
-    let reference = format_code_reference(&config.projects["app"].checkout, &checkout.path().join("README"), 1).unwrap();
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
     assert!(reference.contains("local-only reference"));
     assert!(reference.contains("dirty local source"));
     assert!(!reference.contains(&checkout.path().display().to_string()));
 }
 
 #[test]
+fn code_question_uses_bound_checkout_and_relative_references() {
+    let (_home, checkout, config) = setup(true);
+    let reference = format_code_reference(
+        &config.projects["app"].checkout,
+        &checkout.path().join("README"),
+        1,
+    )
+    .unwrap();
+    assert!(reference.starts_with("README:1"));
+    assert!(!reference.contains(&checkout.path().display().to_string()));
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     fs::remove_dir_all(checkout.path().join(".git")).unwrap();
-    let error = runner.ingest(event("E2", Some("1.0"), "inspect code")).unwrap_err();
+    let error = runner
+        .ingest(event("E2", Some("1.0"), "inspect code"))
+        .unwrap_err();
     assert!(error.to_string().contains("bound checkout is unavailable"));
     assert_eq!(runner.provider().calls.len(), 1);
-    let thread = FileCollaborationStore::new(home.path()).load_thread(&runner.config, "1.0").unwrap().unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
     assert_eq!(thread.project_label.as_deref(), Some("app"));
 }
 #[test]

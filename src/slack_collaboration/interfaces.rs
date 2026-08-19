@@ -215,7 +215,7 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailure {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("rate limit") || lowered.contains("429") {
         ProviderFailure::RateLimited {
-            retry_after_seconds: 60,
+            retry_after_seconds: retry_after_seconds(&lowered).unwrap_or(60),
         }
     } else if lowered.contains("auth")
         || lowered.contains("login")
@@ -224,6 +224,34 @@ pub fn classify_provider_failure(message: &str) -> ProviderFailure {
         ProviderFailure::Authentication
     } else {
         ProviderFailure::Unavailable
+    }
+}
+
+fn retry_after_seconds(message: &str) -> Option<u64> {
+    let (_, suffix) = message.split_once("retry-after=")?;
+    suffix
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Produce a Slack-safe recovery status without exposing provider diagnostics.
+pub fn provider_recovery_message(failure: &ProviderFailure, can_switch: bool) -> String {
+    let action = can_switch
+        .then_some(" A project approver may switch providers.")
+        .unwrap_or("");
+    match failure {
+        ProviderFailure::Authentication => format!("Provider authentication is required.{action}"),
+        ProviderFailure::Unavailable => {
+            format!("Provider is unavailable; queued replies are preserved.{action}")
+        }
+        ProviderFailure::RateLimited {
+            retry_after_seconds,
+        } => {
+            format!("Provider is rate-limited; retrying in {retry_after_seconds} seconds.{action}")
+        }
     }
 }
 
