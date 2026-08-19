@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::content::ContentResolver;
 
 use super::{
-    ConversationProvider, InboundEnvelope, OutboundDelivery, ProviderScope, ProviderTurnRecovery,
+    ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderScope, ProviderTurnRecovery,
     RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
 };
 
@@ -121,6 +121,11 @@ pub fn decode_socket_mode_envelope(text: &str) -> Result<InboundEnvelope> {
         thread_timestamp: event["thread_ts"].as_str().map(str::to_owned),
         user: event["user"].as_str().context("Slack user")?.into(),
         text: event["text"].as_str().unwrap_or_default().into(),
+        change: match event["subtype"].as_str() {
+            Some("message_changed") => InboundChange::Edit,
+            Some("message_deleted") => InboundChange::Delete,
+            _ => InboundChange::Message,
+        },
         approval_action_id: event["actions"][0]["value"].as_str().map(str::to_owned),
         approval_artifact_revision: event["actions"][0]["block_id"].as_str().map(str::to_owned),
     })
@@ -194,6 +199,7 @@ impl SlackWebApiTransport {
                         thread_timestamp: Some(target.thread_timestamp.clone()),
                         user: message["user"].as_str().unwrap_or_default().into(),
                         text: message["text"].as_str().unwrap_or_default().into(),
+                        change: InboundChange::Message,
                         approval_action_id: None,
                         approval_artifact_revision: None,
                     });

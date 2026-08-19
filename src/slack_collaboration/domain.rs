@@ -81,11 +81,22 @@ pub struct InboundEnvelope {
     pub thread_timestamp: Option<String>,
     pub user: String,
     pub text: String,
+    #[serde(default)]
+    pub change: InboundChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum InboundChange {
+    #[default]
+    Message,
+    Edit,
+    Delete,
     /// Immutable identity supplied by an approval interaction control.
     #[serde(default)]
     pub approval_action_id: Option<String>,
     #[serde(default)]
     pub approval_artifact_revision: Option<String>,
+}
 }
 
 impl InboundEnvelope {
@@ -215,6 +226,8 @@ pub struct FluentThread {
     pub artifact_revisions: Vec<ArtifactRevision>,
     #[serde(default)]
     pub pending_artifact_revision: Option<String>,
+    #[serde(default)]
+    pub conversation_inputs: Vec<ConversationInput>,
     pub pending_action: Option<PendingAction>,
     #[serde(default)]
     pub approvals: Vec<ApprovalRecord>,
@@ -250,6 +263,7 @@ impl FluentThread {
             pending_question: None,
             artifact_revisions: Vec::new(),
             pending_artifact_revision: None,
+            conversation_inputs: Vec::new(),
             pending_action: None,
             approvals: Vec::new(),
             processed_events: BTreeSet::new(),
@@ -257,4 +271,24 @@ impl FluentThread {
             pending_turn: None,
         }
     }
+}
+
+/// Accepted provider context remains immutable even when Slack changes later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationInput {
+    pub event_id: String,
+    pub source_timestamp: String,
+    pub actor: String,
+    pub content: String,
+    #[serde(default)]
+    pub corrections: Vec<AttributedCorrection>,
+    #[serde(default)]
+    pub source_deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributedCorrection {
+    pub event_id: String,
+    pub actor: String,
+    pub content: String,
 }

@@ -119,6 +119,60 @@ fn planning_artifact_waits_for_existing_approval_gate() {
     assert!(runner.approve_planning_revision("1.0", "different", "U1").is_err());
     runner.approve_planning_revision("1.0", &revision.id, "U1").unwrap();
 }
+
+#[test]
+fn queued_message_edit_replaces_unprocessed_content() {
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
+    thread.pending_turn = Some(PendingTurn {
+        action_id: "2.0".into(), contribution: "before".into(), actor: "U1".into(),
+        starts_session: false, provider_turn_id: None, completed_reply: None,
+    });
+    store.save_thread(&config, &thread).unwrap();
+    let mut edit = event("E2", Some("1.0"), "after");
+    edit.timestamp = "2.0".into();
+    edit.change = InboundChange::Edit;
+    runner.ingest(edit).unwrap();
+    let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(reloaded.pending_turn.unwrap().contribution, "after");
+}
+
+#[test]
+fn processed_message_edit_becomes_attributed_correction() {
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut edit = event("E2", Some("1.0"), "correction");
+    edit.change = InboundChange::Edit;
+    runner.ingest(edit).unwrap();
+    let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(reloaded.conversation_inputs[0].content, "@Fluent hello");
+    assert_eq!(reloaded.conversation_inputs[0].corrections[0].content, "correction");
+}
+
+#[test]
+fn processed_message_deletion_preserves_audited_context() {
+    let (home, _checkout, config) = setup(true);
+    let store = FileCollaborationStore::new(home.path());
+    let mut runner = CollaborationRunner::new(
+        home.path(), config.clone(), InMemoryProvider::default(), InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut deletion = event("E2", Some("1.0"), "");
+    deletion.change = InboundChange::Delete;
+    runner.ingest(deletion).unwrap();
+    let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(reloaded.conversation_inputs[0].content, "@Fluent hello");
+    assert!(reloaded.conversation_inputs[0].source_deleted);
+}
 fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
     InboundEnvelope {
         id: id.into(),
@@ -128,6 +182,7 @@ fn event(id: &str, thread: Option<&str>, text: &str) -> InboundEnvelope {
         thread_timestamp: thread.map(str::to_owned),
         user: "U1".into(),
         text: text.into(),
+        change: InboundChange::Message,
         approval_action_id: None,
         approval_artifact_revision: None,
     }
@@ -2110,6 +2165,7 @@ fn recovered_reply(id: &str, timestamp: &str, text: &str) -> InboundEnvelope {
         thread_timestamp: Some("1.0".into()),
         user: "U1".into(),
         text: text.into(),
+        change: InboundChange::Message,
         approval_action_id: None,
         approval_artifact_revision: None,
     }
@@ -2434,6 +2490,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         pending_question: None,
         artifact_revisions: Vec::new(),
         pending_artifact_revision: None,
+        conversation_inputs: Vec::new(),
         pending_action: None,
         approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),

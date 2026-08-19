@@ -270,6 +270,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             return self.store.save_thread(&self.config, &thread);
         }
+        match event.change {
+            InboundChange::Edit => return self.apply_edit(event, thread),
+            InboundChange::Delete => return self.apply_deletion(event, thread),
+            InboundChange::Message => {}
+        }
         if thread.state == ThreadState::WaitingForProject && event.is_top_level_mention() {
             self.start_or_offer(&event, &mut thread)?;
         } else if thread.state == ThreadState::Active && event.thread_timestamp.is_some() {
@@ -369,6 +374,36 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.recovering_event,
             Some(event),
         ))
+    }
+
+    fn apply_edit(&mut self, event: InboundEnvelope, mut thread: FluentThread) -> Result<()> {
+        if let Some(turn) = thread.pending_turn.as_mut().filter(|turn| turn.action_id == event.timestamp) {
+            turn.contribution = event.text;
+            return self.store.save_thread(&self.config, &thread);
+        }
+        if let Some(input) = thread
+            .conversation_inputs
+            .iter_mut()
+            .find(|input| input.source_timestamp == event.timestamp)
+        {
+            input.corrections.push(AttributedCorrection {
+                event_id: event.id,
+                actor: event.user,
+                content: event.text,
+            });
+        }
+        self.store.save_thread(&self.config, &thread)
+    }
+
+    fn apply_deletion(&mut self, event: InboundEnvelope, mut thread: FluentThread) -> Result<()> {
+        if let Some(input) = thread
+            .conversation_inputs
+            .iter_mut()
+            .find(|input| input.source_timestamp == event.timestamp)
+        {
+            input.source_deleted = true;
+        }
+        self.store.save_thread(&self.config, &thread)
     }
 
     fn current_authority_config(&self) -> Result<RunnerConfig> {
@@ -518,6 +553,20 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         };
         turn.completed_reply = Some(reply.clone());
         thread.pending_turn = Some(turn);
+        if !thread
+            .conversation_inputs
+            .iter()
+            .any(|input| input.event_id == event.id)
+        {
+            thread.conversation_inputs.push(ConversationInput {
+                event_id: event.id.clone(),
+                source_timestamp: event.timestamp.clone(),
+                actor: event.user.clone(),
+                content: event.text.clone(),
+                corrections: Vec::new(),
+                source_deleted: false,
+            });
+        }
         self.store.save_thread(&self.config, thread)?;
         self.queue_reply(event, &reply)?;
         thread.pending_turn = None;

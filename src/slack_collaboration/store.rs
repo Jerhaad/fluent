@@ -134,6 +134,7 @@ fn routing_envelope(event: &InboundEnvelope) -> InboundEnvelope {
         thread_timestamp: event.thread_timestamp.clone(),
         user: String::new(),
         text: String::new(),
+        change: event.change.clone(),
         approval_action_id: event.approval_action_id.clone(),
         approval_artifact_revision: event.approval_artifact_revision.clone(),
     }
@@ -463,6 +464,7 @@ fn save_thread_with_crash(
         private_mapping.pending_question = None;
         private_mapping.artifact_revisions.clear();
         private_mapping.pending_artifact_revision = None;
+        private_mapping.conversation_inputs.clear();
         private_mapping.processed_events.clear();
         private_mapping.last_connection = None;
         private_mapping.pending_turn = None;
