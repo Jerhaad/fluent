@@ -237,12 +237,53 @@ fn validate_focused_command(command: &str) -> Result<()> {
         !command.contains(['\n', '\r', '\0']),
         "focused evidence command must occupy one line"
     );
-    for token in [";", "&", "|", "`", "$(", "(", ")", ">", "<"] {
-        anyhow::ensure!(
-            !command.contains(token),
-            "focused evidence command must name one direct harness invocation; shell control token {token:?} is not allowed"
-        );
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
     }
+    let mut quote = Quote::Unquoted;
+    let mut escaped = false;
+    let mut chars = command.char_indices().peekable();
+    while let Some((_, character)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Quote::Single {
+            escaped = true;
+            continue;
+        }
+        match (quote, character) {
+            (Quote::Unquoted, '\'') => quote = Quote::Single,
+            (Quote::Unquoted, '"') => quote = Quote::Double,
+            (Quote::Single, '\'') => quote = Quote::Unquoted,
+            (Quote::Double, '"') => quote = Quote::Unquoted,
+            (Quote::Unquoted, ';' | '&' | '|' | '(' | ')' | '>' | '<') => {
+                bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token {character:?} is not allowed"
+                )
+            }
+            (Quote::Unquoted | Quote::Double, '`') => {
+                bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token \"`\" is not allowed"
+                )
+            }
+            (Quote::Unquoted | Quote::Double, '$')
+                if chars.peek().is_some_and(|(_, next)| *next == '(') =>
+            {
+                bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token \"$(\" is not allowed"
+                )
+            }
+            _ => {}
+        }
+    }
+    anyhow::ensure!(
+        quote == Quote::Unquoted && !escaped,
+        "focused evidence command contains an unterminated quote or escape"
+    );
     Ok(())
 }
 
@@ -930,6 +971,32 @@ mod tests {
             .unwrap(),
             "swift test --filter one"
         );
+    }
+
+    #[test]
+    fn focused_command_allows_quoted_harness_expressions() {
+        validate_focused_command(
+            "cargo nextest run -E 'test(failed_split_write_retries_from_durable_transaction)'",
+        )
+        .unwrap();
+        validate_focused_command("printf '(literal)'").unwrap();
+    }
+
+    #[test]
+    fn focused_command_rejects_active_shell_control() {
+        for command in [
+            "printf one && printf two",
+            "printf $(whoami)",
+            "printf \"$(whoami)\"",
+            "(printf one)",
+            "printf one > output",
+            "printf 'unterminated",
+        ] {
+            assert!(
+                validate_focused_command(command).is_err(),
+                "must reject {command:?}"
+            );
+        }
     }
 
     #[test]
