@@ -7,7 +7,6 @@ pub struct CollaborationRunner<'a, P, S, C = FileCollaborationStore> {
     provider: P,
     slack: S,
     store: C,
-    configuration_error: Option<String>,
     recovering_event: bool,
 }
 
@@ -35,14 +34,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         slack: S,
         store: C,
     ) -> Self {
-        let configuration_error = config.validate().err().map(|error| error.to_string());
         Self {
             home,
             config,
             provider,
             slack,
             store,
-            configuration_error,
             recovering_event: false,
         }
     }
@@ -62,12 +59,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;
-        if config_path(self.home).exists() {
-            self.config = read_config(self.home)?;
-        }
-        if let Some(error) = &self.configuration_error {
-            bail!("runner configuration is invalid; refusing Slack ingress: {error}");
-        }
+        self.config = self.current_authority_config()?;
         match self.store.persist_inbox(&self.config, &event)? {
             InboxState::Processed => return Ok(()),
             InboxState::Pending if !event.acknowledgement_id.is_empty() => {
@@ -322,11 +314,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
 
     fn current_authority_config(&self) -> Result<RunnerConfig> {
         let path = config_path(self.home);
-        if path.exists() {
+        let config = if path.exists() {
             read_config(self.home)
         } else {
             Ok(self.config.clone())
-        }
+        }?;
+        config.validate()?;
+        Ok(config)
     }
     fn start_or_offer(&mut self, event: &InboundEnvelope, thread: &mut FluentThread) -> Result<()> {
         let default = self

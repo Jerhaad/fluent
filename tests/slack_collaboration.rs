@@ -337,6 +337,73 @@ fn invalid_reloaded_authority_fails_closed() {
 }
 
 #[test]
+fn invalid_reloaded_config_fails_before_inbox_persistence() {
+    let (home, _checkout, mut config) = setup(true);
+    write_config(home.path(), &config).unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner
+        .request_approval("1.0", pending_action(PendingActionKind::Planning))
+        .unwrap();
+    config.enabled_providers.clear();
+    fs::write(
+        config_path(home.path()),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let approval = event("E2", Some("1.0"), "y");
+    assert!(
+        runner
+            .ingest(approval)
+            .unwrap_err()
+            .to_string()
+            .contains("conversation provider")
+    );
+    let inbox = fs::read_to_string(state_root(home.path()).join("inbox.json")).unwrap();
+    assert!(!inbox.contains("\"E2\""));
+    assert!(
+        runner
+            .approve_pending_action("1.0", "U1", "approve-plan", "revision-1", "E3", "now")
+            .unwrap_err()
+            .to_string()
+            .contains("conversation provider")
+    );
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .is_empty()
+    );
+}
+
+#[test]
+fn valid_disk_reload_clears_constructor_config_error() {
+    let (home, _checkout, valid_config) = setup(true);
+    let mut invalid_config = valid_config.clone();
+    invalid_config.enabled_providers.clear();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        invalid_config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    write_config(home.path(), &valid_config).unwrap();
+
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+
+    assert_eq!(runner.config, valid_config);
+    assert_eq!(runner.provider().calls.len(), 1);
+}
+
+#[test]
 fn conversational_approval_targets_single_current_question() {
     let (home, _checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
