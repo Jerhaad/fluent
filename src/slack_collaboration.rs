@@ -780,6 +780,7 @@ mod tests {
             thread_timestamp: thread.map(str::to_owned),
             user: "U1".into(),
             text: text.into(),
+            change: InboundChange::Message,
             approval_action_id: None,
             approval_artifact_revision: None,
         }

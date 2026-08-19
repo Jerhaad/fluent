@@ -23806,6 +23806,7 @@ fn setup_candidate_preservation_fixture(
         approach: Some("Approved approach bytes".to_string()),
         plan: Some("Approved plan bytes".to_string()),
         combined: None,
+        approved_revisions: Default::default(),
     });
     item.instructions = Some("Approved execution instructions".to_string());
     item.add_initial_attempt("attempt-1").unwrap();
