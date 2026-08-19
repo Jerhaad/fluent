@@ -1,11 +1,13 @@
 # Learnings Index
 
 - [absolute-paths-in-persisted-manifests](absolute-paths-in-persisted-manifests.md) — Relative paths accepted by one phase must be resolved to absolute before being persisted for later phases
+- [approval-records-bind-current-authority](approval-records-bind-current-authority.md) — Evaluate approvals against freshly loaded project authority and persist a self-contained record of the exact action and revision
 - [assert-persisted-message-equals-source](assert-persisted-message-equals-source.md) — A regression reading a persisted artifact must compare it for exact equality with the production source; a denylist plus positive-substring check passes even when the write path appends unintended fields
 - [atomic-manifest-within-smoke-root](atomic-manifest-within-smoke-root.md) — Shell atomic manifest writes must allocate the temp file beside the target, not in the global /tmp
 - [atomic-task-start-reservation](atomic-task-start-reservation.md) — Task starts run read-only preflight, then a single lock-held reservation that honors the precedence boundary, then CAS rollback — never mark Executing while discarding the transition verdict
 - [atomic-write-replace-through-utility](atomic-write-replace-through-utility.md) — Replace a durable file through crate::atomic_write::atomic_write (unique temp + persist), never a fixed-name temp + rename; distinguish NotFound from other read errors instead of unwrap_or_default
 - [attempt-coder-mapping-is-runtime-authority](attempt-coder-mapping-is-runtime-authority.md) — Resolve coder mappings from config and environment only when creating an Attempt; existing runs use the persisted mapping, with explicit CLI fields applied as a fresh atomic overlay
+- [authorization-language-uses-bounded-affirmatives](authorization-language-uses-bounded-affirmatives.md) — Treat only exact affirmative forms as lifecycle authorization; contextual, uncertain, and negated action mentions remain contributions
 - [autonomous-claude-safe-mode-boundary](autonomous-claude-safe-mode-boundary.md) — Launch autonomous Claude work in safe mode while leaving explicitly interactive sessions customizable
 - [backward-compatible-serde-fields](backward-compatible-serde-fields.md) — Persisted Work model field additions and renames must preserve backward compatibility with existing on-disk JSON
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
@@ -73,11 +75,13 @@
 - [pure-domain-keeps-filesystem-authority-at-edges](pure-domain-keeps-filesystem-authority-at-edges.md) — Keep collaboration domain state path-free and resolve filesystem authority in interfaces and adapters
 - [readiness-gate-at-selection-not-permanent-skip](readiness-gate-at-selection-not-permanent-skip.md) — A shared readiness predicate must gate at every projection including auto-merge selection, and a retryable gate must withhold selection, never select-then-fail-then-mark a permanent skip
 - [record-divergence-in-decisions-md](record-divergence-in-decisions-md.md) — Deliberate divergences from approach.md belong in decisions.md (durable), not just progress.md (round-scoped)
+- [recovered-approvals-preserve-delay-provenance](recovered-approvals-preserve-delay-provenance.md) — Mark every reconnect replay source as recovered so delayed consequential approvals require fresh confirmation
 - [recovery-cursors-advance-after-durable-ingest](recovery-cursors-advance-after-durable-ingest.md) — Recover paginated event history from a durable high-water mark and advance it only after each event is durably processed
 - [registry-read-modify-write-needs-flock](registry-read-modify-write-needs-flock.md) — JSON registry read-modify-write operations need flock around the full read-write pair; atomic_write alone only protects the individual write
 - [rejection-tests-snapshot-owned-trees](rejection-tests-snapshot-owned-trees.md) — A CLI rejection that promises no mutation must snapshot every project and home tree it can manage, byte-for-byte, including pre-existing files and empty directories
 - [release-fixture-process-group-ownership](release-fixture-process-group-ownership.md) — Every long-lived release fixture owns, terminates, and reaps its complete process group on every exit path
 - [release-suite-scoped-process-guard](release-suite-scoped-process-guard.md) — Declared release commands compare root-scoped process inventories before and after each suite to report surviving Fluent or provider processes
+- [reloaded-authority-config-validates-before-ingress](reloaded-authority-config-validates-before-ingress.md) — Validate every live authority configuration reload before persisting ingress or evaluating an approval
 - [required-progress-manifest-excludes-review-follow-ups](required-progress-manifest-excludes-review-follow-ups.md) — Project matrix-backed required progress from host-owned contracts, keep review follow-ups separate, and isolate legacy Writer-owned reconciliation
 - [reserved-phase-terminal-finalizer](reserved-phase-terminal-finalizer.md) — Once a phase reserves durable state, its whole failure path funnels through one finalizer that persists authoritative state before any handoff/artifact — never a raw ? or panic out of the reserved body
 - [route-tests-drive-real-launch-wiring](route-tests-drive-real-launch-wiring.md) — A launch-route regression must drive the real phase or resume path and observe what reaches the coder; helper or persistence-only assertions do not verify execution wiring
