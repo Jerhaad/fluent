@@ -465,11 +465,12 @@ impl WorkControl {
             .map(Some)
     }
 
-    /// Persist unseen feedback before callers post their Slack updates.
-    pub fn ingest_github_feedback(
+    /// Schedule unseen feedback before advancing the durable seen set.
+    pub fn schedule_github_feedback(
         &self,
         slice_id: &str,
         github: &mut dyn GitHubReviewClient,
+        mut schedule: impl FnMut(&GitHubReviewFeedback) -> Result<()>,
     ) -> Result<Vec<GitHubReviewFeedback>> {
         let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
             .with_context(|| format!("lock GitHub feedback for Slice {slice_id}"))?;
@@ -490,6 +491,7 @@ impl WorkControl {
             {
                 continue;
             }
+            schedule(&feedback)?;
             publication.feedback.push(feedback.clone());
             unseen.push(feedback);
         }

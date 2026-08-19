@@ -348,8 +348,20 @@ The runner posts scheduler outcomes and authoritative Work lifecycle changes
 back to the originating thread. Transition replies identify the Work object,
 origin, reason, elapsed time, and bounded evidence reference. Ready-candidate
 replies include the verified commit, completed tests and reviews, and review
-links when the configured remote permits them. Failed or `needs-user` replies
-state the permitted recovery action; Slack never mutates GitHub state.
+links when the configured remote permits them. GitHub publication remains
+optional: only a project approver's explicit request publishes the exact current
+ready candidate. Fluent persists one pull-request identity for the Slice, returns
+that URL on a duplicate request, and advances the same pull request only after a
+newer candidate independently becomes ready. A GitHub failure leaves candidate
+readiness unchanged and reports how to retry after fixing host authentication or
+remote access.
+
+Fluent reports new GitHub comments and review decisions in the originating
+thread with stable links. Feedback alone starts no corrective Work. A project
+approver must select the unresolved feedback to address; Fluent then preserves
+the pull request, candidate, and feedback identities when it submits the request
+through the Merge Candidate rework boundary. Failed or `needs-user` replies
+state the permitted recovery action.
 
 Status comes from persisted Work rather than chat text. The thread projection
 shows the project and checkout, Slice stage, provider state, each Work state,

@@ -2135,8 +2135,12 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             }
             Err(error) => {
                 let message = redact_secrets(&format!("{error:#}"));
+                let digest = format!("{:x}", Sha256::digest(message.as_bytes()));
                 self.store.persist_outbox(OutboundDelivery {
-                    id: format!("{thread_id}:github-pr-failure:{candidate_id}"),
+                    id: format!(
+                        "{thread_id}:github-pr-failure:{candidate_id}:{}",
+                        &digest[..16]
+                    ),
                     channel: thread.channel.clone(),
                     thread_timestamp: thread.id.clone(),
                     text: format!(
@@ -2214,28 +2218,31 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .slice
             .as_deref()
             .context("thread has no approved Slice")?;
-        let feedback =
-            WorkControl::new(&project.checkout.path).ingest_github_feedback(slice_id, github)?;
-        for item in &feedback {
-            let summary = item.body.split_whitespace().collect::<Vec<_>>().join(" ");
-            let summary = if summary.len() > 240 {
-                format!("{}…", &summary[..summary.floor_char_boundary(240)])
-            } else {
-                summary
-            };
-            self.store.persist_outbox(OutboundDelivery {
-                id: format!("{thread_id}:github-feedback:{}", item.id),
-                channel: thread.channel.clone(),
-                thread_timestamp: thread.id.clone(),
-                text: format!(
-                    "GitHub {} on candidate {}: {} {}. No corrective Work started.",
-                    item.kind, item.candidate_commit, summary, item.url
-                ),
-                delivered: false,
-                approval_control: None,
-                update_timestamp: None,
-            })?;
-        }
+        let store = &self.store;
+        let feedback = WorkControl::new(&project.checkout.path).schedule_github_feedback(
+            slice_id,
+            github,
+            |item| {
+                let summary = item.body.split_whitespace().collect::<Vec<_>>().join(" ");
+                let summary = if summary.len() > 240 {
+                    format!("{}…", &summary[..summary.floor_char_boundary(240)])
+                } else {
+                    summary
+                };
+                store.persist_outbox(OutboundDelivery {
+                    id: format!("{thread_id}:github-feedback:{}", item.id),
+                    channel: thread.channel.clone(),
+                    thread_timestamp: thread.id.clone(),
+                    text: format!(
+                        "GitHub {} on candidate {}: {} {}. No corrective Work started.",
+                        item.kind, item.candidate_commit, summary, item.url
+                    ),
+                    delivered: false,
+                    approval_control: None,
+                    update_timestamp: None,
+                })
+            },
+        )?;
         self.deliver_pending()?;
         Ok(feedback)
     }

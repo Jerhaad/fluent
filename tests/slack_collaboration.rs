@@ -9769,6 +9769,149 @@ fn existing_pr_advances_only_to_new_ready_candidate() {
     }));
 }
 
+#[derive(Default)]
+struct RecordingReworkBoundary {
+    requests: Mutex<Vec<CandidateReworkRequest>>,
+}
+
+impl CandidateReworkBoundary for RecordingReworkBoundary {
+    fn submit_candidate_rework(&self, request: &CandidateReworkRequest) -> anyhow::Result<()> {
+        self.requests.lock().unwrap().push(request.clone());
+        Ok(())
+    }
+}
+
+fn published_github_runner<'a>(
+    home: &'a TempDir,
+    checkout: &TempDir,
+    config: RunnerConfig,
+    github: &mut FakeGitHub,
+) -> CollaborationRunner<'a, InMemoryProvider, InMemorySlack> {
+    let mut runner = github_ready_runner(home, checkout, config);
+    runner
+        .request_github_review("1.0", "U1", "candidate-github-1", github)
+        .unwrap();
+    runner
+}
+
+#[test]
+fn github_review_feedback_reports_without_starting_work() {
+    let (home, checkout, config) = setup(true);
+    let mut github = FakeGitHub::default();
+    let mut runner = published_github_runner(&home, &checkout, config, &mut github);
+    let before_work = WorkModelStore::new(checkout.path())
+        .read_work_item("work-github")
+        .unwrap();
+    github.feedback = vec![
+        GitHubReviewFeedback {
+            id: "comment-1".into(),
+            kind: "comment".into(),
+            body: "Please clarify this branch.".into(),
+            url: "https://github.com/acme/app/pull/7#discussion_r1".into(),
+            candidate_commit: "commit-one".into(),
+            resolved: false,
+        },
+        GitHubReviewFeedback {
+            id: "review-1".into(),
+            kind: "changes_requested".into(),
+            body: "This applies to the earlier candidate.".into(),
+            url: "https://github.com/acme/app/pull/7#pullrequestreview-1".into(),
+            candidate_commit: "older-commit".into(),
+            resolved: false,
+        },
+        GitHubReviewFeedback {
+            id: "resolved-1".into(),
+            kind: "comment".into(),
+            body: "Already resolved.".into(),
+            url: "https://github.com/acme/app/pull/7#discussion_r2".into(),
+            candidate_commit: "commit-one".into(),
+            resolved: true,
+        },
+    ];
+    let reported = runner.report_github_feedback("1.0", &mut github).unwrap();
+    assert_eq!(reported, github.feedback);
+    assert!(runner.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("changes_requested")
+            && delivery.text.contains("older-commit")
+            && delivery.text.contains("pullrequestreview-1")
+            && delivery.text.contains("No corrective Work started")
+    }));
+    assert_eq!(
+        WorkModelStore::new(checkout.path())
+            .read_work_item("work-github")
+            .unwrap(),
+        before_work
+    );
+    let delivery_count = runner.slack().deliveries.len();
+    assert!(
+        runner
+            .report_github_feedback("1.0", &mut github)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(runner.slack().deliveries.len(), delivery_count);
+}
+
+#[test]
+fn approver_routes_selected_github_feedback_to_candidate_rework() {
+    let (home, checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
+    let mut github = FakeGitHub::default();
+    let mut runner = published_github_runner(&home, &checkout, config, &mut github);
+    github.feedback = vec![
+        GitHubReviewFeedback {
+            id: "selected-1".into(),
+            kind: "changes_requested".into(),
+            body: "Handle the empty response.".into(),
+            url: "https://github.com/acme/app/pull/7#pullrequestreview-2".into(),
+            candidate_commit: "commit-one".into(),
+            resolved: false,
+        },
+        GitHubReviewFeedback {
+            id: "resolved-2".into(),
+            kind: "comment".into(),
+            body: "No longer applicable.".into(),
+            url: "https://github.com/acme/app/pull/7#discussion_r3".into(),
+            candidate_commit: "commit-one".into(),
+            resolved: true,
+        },
+    ];
+    runner.report_github_feedback("1.0", &mut github).unwrap();
+    let boundary = RecordingReworkBoundary::default();
+
+    assert!(
+        runner
+            .authorize_github_feedback_rework("1.0", "U2", &["selected-1".into()], &boundary,)
+            .is_err()
+    );
+    assert!(boundary.requests.lock().unwrap().is_empty());
+    assert!(
+        runner
+            .authorize_github_feedback_rework("1.0", "U1", &["resolved-2".into()], &boundary,)
+            .is_err()
+    );
+    let request = runner
+        .authorize_github_feedback_rework("1.0", "U1", &["selected-1".into()], &boundary)
+        .unwrap();
+    assert_eq!(request.candidate_id, "candidate-github-1");
+    assert_eq!(request.candidate_commit, "commit-one");
+    assert_eq!(request.feedback, vec![github.feedback[0].clone()]);
+    assert_eq!(
+        boundary.requests.lock().unwrap().as_slice(),
+        &[request.clone()]
+    );
+
+    runner
+        .authorize_github_feedback_rework("1.0", "U1", &["selected-1".into()], &boundary)
+        .unwrap();
+    assert_eq!(boundary.requests.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn ready_candidate_renderer_includes_reviewable_evidence_summary() {
     let (_home, checkout, _config) = setup(true);

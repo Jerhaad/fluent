@@ -112,8 +112,6 @@ impl GhGitHubClient {
     fn gh(&self, checkout: &Path, args: &[&str]) -> Result<String> {
         let output = Command::new(&self.executable)
             .current_dir(checkout)
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
             .args(args)
             .output()
             .with_context(|| format!("invoke host GitHub CLI {}", self.executable.display()))?;
@@ -125,13 +123,15 @@ impl GhGitHubClient {
     }
 
     fn find_pull_request(&self, request: &GitHubPublishRequest) -> Result<Option<String>> {
+        let repository = github_repository(&request.publication.remote)
+            .context("configured GitHub remote is unsupported")?;
         let output = self.gh(
             &request.checkout,
             &[
                 "pr",
                 "list",
                 "--repo",
-                &request.publication.remote,
+                &repository,
                 "--head",
                 &request.publication.head_branch,
                 "--state",
@@ -156,6 +156,16 @@ impl GitHubReviewClient for GhGitHubClient {
         request: &GitHubPublishRequest,
         existing: Option<&GitHubPublication>,
     ) -> Result<String> {
+        let repository = github_repository(&request.publication.remote)
+            .context("configured GitHub remote is unsupported")?;
+        let origin = crate::git::run_stdout(
+            &request.checkout,
+            &["remote", "get-url", "origin"],
+            "inspect GitHub publication remote",
+        )?;
+        if github_repository(&origin).as_deref() != Some(repository.as_str()) {
+            bail!("Git origin does not match the configured github.com repository");
+        }
         self.gh(
             &request.checkout,
             &["auth", "status", "--hostname", "github.com"],
@@ -182,7 +192,7 @@ impl GitHubReviewClient for GhGitHubClient {
                 "pr",
                 "create",
                 "--repo",
-                &request.publication.remote,
+                &repository,
                 "--base",
                 &request.publication.candidate.target_branch,
                 "--head",
@@ -209,6 +219,18 @@ impl GitHubReviewClient for GhGitHubClient {
         )?;
         parse_feedback(&output, &publication.candidate.commit)
     }
+}
+
+fn github_repository(remote: &str) -> Option<String> {
+    let path = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("git@github.com:"))?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    (!owner.is_empty() && !repo.is_empty() && parts.next().is_none())
+        .then(|| format!("{owner}/{repo}"))
 }
 
 fn parse_feedback(output: &str, candidate_commit: &str) -> Result<Vec<GitHubReviewFeedback>> {
