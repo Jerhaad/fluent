@@ -108,19 +108,41 @@ fn large_planning_artifact_preserves_exact_content_across_messages() {
         "a".repeat(SLACK_MESSAGE_CONTENT_LIMIT - 2),
         "b".repeat(8)
     );
-    let parts = split_artifact_markdown(&source, SLACK_MESSAGE_CONTENT_LIMIT);
-    assert!(parts.len() > 1);
-    assert!(
-        parts
-            .iter()
-            .all(|part| part.len() <= SLACK_MESSAGE_CONTENT_LIMIT)
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
     );
-    assert_eq!(parts.concat(), source);
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner
+        .present_planning_artifact("1.0", "brief", &source)
+        .unwrap();
+    let deliveries: Vec<_> = runner
+        .slack()
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.id.starts_with("1.0:artifact:"))
+        .collect();
+    assert!(deliveries.len() > 1);
+    assert!(
+        deliveries
+            .iter()
+            .all(|delivery| delivery.text.len() <= SLACK_MESSAGE_CONTENT_LIMIT)
+    );
+    assert_eq!(reassemble_artifact_parts(&deliveries).unwrap(), source);
 }
 
 #[test]
 fn planning_artifact_waits_for_existing_approval_gate() {
-    let (home, _checkout, config) = setup(true);
+    let (home, _checkout, mut config) = setup(true);
+    config
+        .projects
+        .get_mut("app")
+        .unwrap()
+        .allowed_participants
+        .insert("U2".into());
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -136,9 +158,20 @@ fn planning_artifact_waits_for_existing_approval_gate() {
             .approve_planning_revision("1.0", "different", "U1")
             .is_err()
     );
+    assert!(
+        runner
+            .approve_planning_revision("1.0", &revision.id, "U2")
+            .is_err()
+    );
     runner
         .approve_planning_revision("1.0", &revision.id, "U1")
         .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.planning_stage.as_deref(), Some("plan"));
+    assert!(thread.pending_question.is_none());
 }
 
 #[test]
@@ -249,6 +282,31 @@ fn unauthorized_thread_reply_does_not_reach_agent() {
 }
 
 #[test]
+fn unauthorized_thread_reply_does_not_enter_project_inbox() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let inbox = checkout.path().join(".fluent/work/slack/inbox");
+    let before: Vec<_> = fs::read_dir(&inbox)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let mut reply = event("E2", Some("1.0"), "private thought");
+    reply.user = "U2".into();
+    runner.ingest(reply).unwrap();
+    let after: Vec<_> = fs::read_dir(inbox)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn direct_message_uses_same_fluent_thread_contract() {
     let (home, checkout, mut config) = setup(false);
     config
@@ -284,6 +342,7 @@ fn single_workspace_runner_routes_multiple_projects_and_conversations() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U1".into()]),
+            project_approvers: BTreeSet::from(["U1".into()]),
         },
     );
     config.channel_defaults.insert("C2".into(), "other".into());
@@ -329,6 +388,7 @@ fn project_change_preserves_binding_and_offers_linked_thread() {
                 commit,
             },
             allowed_participants: BTreeSet::from(["U1".into()]),
+            project_approvers: BTreeSet::from(["U1".into()]),
         },
     );
     let store = FileCollaborationStore::new(home.path());
@@ -3123,6 +3183,8 @@ fn thread_status_shows_runner_last_connection() {
 fn setup_provides_socket_mode_manifest_without_public_endpoint() {
     assert!(
         SOCKET_MODE_MANIFEST.contains("socket_mode_enabled: true")
+            && SOCKET_MODE_MANIFEST.contains("message.im")
+            && SOCKET_MODE_MANIFEST.contains("im:history")
             && !SOCKET_MODE_MANIFEST.contains("request_url")
     );
     let guide = fs::read_to_string("docs/slack-runner.md")
@@ -3137,6 +3199,8 @@ fn setup_provides_socket_mode_manifest_without_public_endpoint() {
             && guide.contains("mkdir -p ~/.config/fluent/slack")
             && guide.contains("Copy member ID")
             && guide.contains("channel ID (`C...`)")
+            && guide.contains("direct_message_defaults")
+            && guide.contains("DM conversation ID (`D...`)")
             && guide.contains("/invite @Fluent")
             && guide.contains("@Fluent plan the next release")
             && guide.contains("keeps the thread unbound")
@@ -3178,9 +3242,11 @@ fn runner_start_preflights_external_and_local_boundaries() {
         result
     }
 
-    web_api_check("app_mentions:read,channels:history,chat:write").unwrap();
+    web_api_check("app_mentions:read,channels:history,im:history,chat:write").unwrap();
     let error = web_api_check("app_mentions:read,chat:write").unwrap_err();
     assert!(error.to_string().contains("channels:history"));
+    let error = web_api_check("app_mentions:read,channels:history,chat:write").unwrap_err();
+    assert!(error.to_string().contains("im:history"));
 }
 
 #[test]

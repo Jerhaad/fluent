@@ -70,12 +70,21 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         let revision = ArtifactRevision::new(kind, markdown);
         thread.artifact_revisions.push(revision.clone());
         thread.pending_artifact_revision = Some(revision.id.clone());
+        thread.planning_stage = Some(revision.kind.clone());
+        thread.pending_question = Some(format!(
+            "approve {} revision {}",
+            revision.kind, revision.id
+        ));
         self.store.save_thread(&self.config, &thread)?;
-        let parts = split_artifact_markdown(&revision.markdown, SLACK_MESSAGE_CONTENT_LIMIT);
+        let parts = Self::artifact_delivery_parts(&revision);
         let part_count = parts.len();
+        let part_width = part_count.to_string().len();
         for (index, part) in parts.into_iter().enumerate() {
             self.store.persist_outbox(OutboundDelivery {
-                id: format!("{}:artifact:{}:{index:04}", thread.id, revision.sha256),
+                id: format!(
+                    "{}:artifact:{}:{:0part_width$}",
+                    thread.id, revision.sha256, index
+                ),
                 channel: thread.channel.clone(),
                 thread_timestamp: thread.id.clone(),
                 text: format!(
@@ -103,15 +112,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .context("Fluent thread is unavailable")?;
         if !self
             .bound_project(&thread)?
-            .allowed_participants
+            .project_approvers
             .contains(actor)
         {
-            bail!("participant cannot approve this Fluent thread");
+            bail!("participant is not a project approver for this Fluent thread");
         }
         if thread.pending_artifact_revision.as_deref() != Some(revision_id) {
             bail!("approval must identify the revision waiting at the planning gate");
         }
+        let revision = thread
+            .artifact_revisions
+            .iter()
+            .find(|revision| revision.id == revision_id)
+            .context("pending planning revision is unavailable")?;
+        if thread.planning_stage.as_deref() != Some(revision.kind.as_str())
+            || thread.pending_question.as_deref()
+                != Some(&format!("approve {} revision {revision_id}", revision.kind))
+        {
+            bail!("planning lifecycle is not waiting for this artifact revision");
+        }
         thread.pending_artifact_revision = None;
+        thread.pending_question = None;
         self.store.save_thread(&self.config, &thread)
     }
 
@@ -119,6 +140,23 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;
         self.config = self.current_authority_config()?;
+        if let Some(error) = &self.configuration_error {
+            bail!("runner configuration is invalid; refusing Slack ingress: {error}");
+        }
+        if let Some(thread) = self.store.load_thread(&self.config, &event.thread_id())?
+            && thread.state == ThreadState::Active
+            && !policy::participant_can_contribute(&self.config, &thread, &event)
+        {
+            if !event.acknowledgement_id.is_empty() {
+                self.slack.acknowledge(&event.acknowledgement_id)?;
+            }
+            self.slack.respond_private(
+                &event.channel,
+                &event.user,
+                "You cannot participate in this Fluent thread.",
+            )?;
+            return Ok(());
+        }
         match self.store.persist_inbox(&self.config, &event)? {
             InboxState::Processed => return Ok(()),
             InboxState::Pending if !event.acknowledgement_id.is_empty() => {
@@ -129,6 +167,24 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         self.process(event.clone())?;
         self.store.mark_inbox_processed(&event.id)?;
         self.deliver_pending()
+    }
+
+    fn artifact_delivery_parts(revision: &ArtifactRevision) -> Vec<String> {
+        let mut part_count = 1;
+        loop {
+            let header = format!(
+                "Planning revision {} ({part_count}/{part_count})\n\n",
+                revision.id
+            );
+            let payload_limit = SLACK_MESSAGE_CONTENT_LIMIT
+                .checked_sub(header.len())
+                .expect("artifact revision header must fit in Slack delivery");
+            let parts = split_artifact_markdown(&revision.markdown, payload_limit);
+            if parts.len() == part_count {
+                return parts;
+            }
+            part_count = parts.len();
+        }
     }
     pub fn reconnect(
         &mut self,

@@ -47,11 +47,13 @@ settings:
     bot_events:
       - app_mention
       - message.channels
+      - message.im
 oauth_config:
   scopes:
     bot:
       - app_mentions:read
       - channels:history
+      - im:history
       - chat:write
 "#;
 

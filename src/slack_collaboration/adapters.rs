@@ -372,7 +372,12 @@ impl SlackTransport for SlackWebApiTransport {
             .split(',')
             .map(str::trim)
             .collect();
-        for required in ["app_mentions:read", "channels:history", "chat:write"] {
+        for required in [
+            "app_mentions:read",
+            "channels:history",
+            "im:history",
+            "chat:write",
+        ] {
             if !granted.contains(required) {
                 bail!("Slack bot is missing required scope {required}");
             }
