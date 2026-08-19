@@ -129,6 +129,27 @@ parts. Fluent holds planning at that revision until an approver replies. Only
 a configured `project_approvers` member may approve it, and approval advances
 the bound Work Item's corresponding planning stage.
 
+## Request another project
+
+An active Fluent thread remains bound to the project that started it. To work
+with another configured project, reply in the thread with:
+
+```text
+project: other-project
+```
+
+Fluent keeps the current thread and its history bound to the original project,
+then offers a linked Fluent thread for `other-project`. Use the linked thread
+for the new project's checkout and decisions.
+
+## Preserve Slack reply history
+
+If you edit a reply before Fluent processes it, Fluent uses the latest Slack
+text as that contribution. After Fluent has processed a reply, an edit becomes
+an attributed correction: Fluent retains the contribution it used and records
+the new text alongside it. Deleting a processed Slack reply similarly marks its
+source as deleted without removing the contribution from Fluent's history.
+
 ## Configure direct messages
 
 To use a direct message, open its details in Slack and copy the DM conversation

@@ -68,6 +68,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .store
             .load_thread(&self.config, thread_id)?
             .context("Fluent thread is unavailable")?;
+        if let Some(work_item_id) = thread.linked_work.as_deref() {
+            WorkModelStore::new(&self.bound_project(&thread)?.checkout.path)
+                .read_work_item(work_item_id)?
+                .ensure_planning_revision_can_advance(kind)?;
+        }
         let revision = ArtifactRevision::new(kind, markdown);
         thread.artifact_revisions.push(revision.clone());
         thread.pending_artifact_revision = Some(revision.id.clone());

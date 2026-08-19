@@ -159,6 +159,18 @@ fn planning_artifact_waits_for_existing_approval_gate() {
     let mut thread = store.load_thread(&runner.config, "1.0").unwrap().unwrap();
     thread.linked_work = Some("work-1".into());
     store.save_thread(&runner.config, &thread).unwrap();
+    for (stage, markdown) in [
+        ("brief", "# Brief\n"),
+        ("behaviors", "# Behaviors\n"),
+        ("approach", "# Approach\n"),
+    ] {
+        let revision = runner
+            .present_planning_artifact("1.0", stage, markdown)
+            .unwrap();
+        runner
+            .approve_planning_revision("1.0", &revision.id, "U1")
+            .unwrap();
+    }
     let revision = runner
         .present_planning_artifact("1.0", "plan", "# Plan\n")
         .unwrap();
@@ -299,6 +311,65 @@ fn slack_approval_reply_advances_the_bound_work_item() {
         .unwrap()
         .unwrap();
     assert!(thread.pending_artifact_revision.is_none());
+}
+
+#[test]
+fn planning_approval_requires_order_and_an_unstarted_work_item() {
+    let mut work_item = WorkItem::planned("work-1", "Slack planning");
+    let behaviors = ArtifactRevision::new("behaviors", "# Behaviors\n");
+    assert!(
+        work_item
+            .approve_planning_revision(&behaviors.kind, &behaviors.id, behaviors.markdown.clone())
+            .is_err()
+    );
+
+    let brief = ArtifactRevision::new("brief", "# Brief\n");
+    work_item
+        .approve_planning_revision(&brief.kind, &brief.id, brief.markdown.clone())
+        .unwrap();
+    work_item.add_initial_attempt("attempt-1").unwrap();
+    let revised_brief = ArtifactRevision::new("brief", "# Revised brief\n");
+    assert!(
+        work_item
+            .approve_planning_revision(
+                &revised_brief.kind,
+                &revised_brief.id,
+                revised_brief.markdown.clone(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn slack_planning_presentation_rejects_started_work_item() {
+    let (home, checkout, config) = setup(true);
+    let mut work_item = WorkItem::planned("work-1", "Started planning");
+    work_item.add_initial_attempt("attempt-1").unwrap();
+    WorkModelStore::new(checkout.path())
+        .create_work_item(&work_item)
+        .unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan this work-item: work-1"))
+        .unwrap();
+    assert!(
+        runner
+            .present_planning_artifact("1.0", "brief", "# Revised brief\n")
+            .is_err()
+    );
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .artifact_revisions
+            .is_empty()
+    );
 }
 
 #[test]

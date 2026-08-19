@@ -554,11 +554,44 @@ impl WorkItem {
         revision_id: &str,
         markdown: String,
     ) -> Result<(), WorkModelError> {
-        self.ensure_not_abandoned()?;
+        self.ensure_planning_revision_can_advance(stage)?;
         self.planning_context
             .get_or_insert_default()
             .approve_revision(stage, revision_id, markdown)?;
         self.validate()
+    }
+
+    /// Reject planning revisions that would invalidate an existing execution plan.
+    pub fn ensure_planning_revision_can_advance(&self, stage: &str) -> Result<(), WorkModelError> {
+        self.ensure_not_abandoned()?;
+        if !self.attempts.is_empty() {
+            return Err(WorkModelError::InvalidPlanningRevision {
+                reason: "cannot revise planning after an Attempt exists".to_string(),
+            });
+        }
+        let stages = ["brief", "behaviors", "approach", "plan"];
+        let stage_index = stages
+            .iter()
+            .position(|candidate| *candidate == stage)
+            .ok_or_else(|| WorkModelError::InvalidPlanningRevision {
+                reason: format!("unknown planning stage {stage:?}"),
+            })?;
+        let approved_index = self.planning_context.as_ref().and_then(|context| {
+            context
+                .approved_revisions
+                .keys()
+                .filter_map(|approved| stages.iter().position(|candidate| *candidate == approved))
+                .max()
+        });
+        let can_replace_current = approved_index == Some(stage_index);
+        let is_next_stage =
+            approved_index.map_or(stage_index == 0, |index| stage_index == index + 1);
+        if can_replace_current || is_next_stage {
+            return Ok(());
+        }
+        Err(WorkModelError::InvalidPlanningRevision {
+            reason: format!("cannot approve {stage:?} before the preceding planning stage"),
+        })
     }
 
     /// Authorize proposed Work to execute, charging its lineage exactly once the
