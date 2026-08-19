@@ -2837,6 +2837,26 @@ fn regenerate_provenance(
             ),
         }
     };
+    let artifact_rewrite = match &no_change_advance {
+        NoChangeAdvance::None => Some((latest_output.commit.clone(), new_tip.to_string())),
+        NoChangeAdvance::Unchanged => None,
+        NoChangeAdvance::Rebased { from_commit } => Some((
+            latest_output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| transition.from_commit.clone())
+                .unwrap_or_else(|| latest_output.commit.clone()),
+            from_commit.clone(),
+        )),
+        NoChangeAdvance::Appended => Some((
+            latest_output
+                .learner_canonicalization
+                .as_ref()
+                .map(|transition| transition.from_commit.clone())
+                .unwrap_or_else(|| latest_output.commit.clone()),
+            new_tip.to_string(),
+        )),
+    };
 
     store.mutate_work_item(work_item_id, |item| {
         let canonical_writer_id = {
@@ -2894,9 +2914,11 @@ fn regenerate_provenance(
             .iter_mut()
             .find(|attempt| attempt.id == attempt_id)
             .expect("attempt selected above remains present");
-        for artifact in &mut attempt.artifacts {
-            if artifact.producer_id == canonical_writer_id {
-                artifact.path = new_tip.to_string();
+        if let Some((old_commit, new_commit)) = &artifact_rewrite {
+            for artifact in &mut attempt.artifacts {
+                if artifact.producer_id == canonical_writer_id && artifact.path == *old_commit {
+                    artifact.path = new_commit.clone();
+                }
             }
         }
 
@@ -4605,10 +4627,14 @@ mod tests {
             }],
         });
         output.learner_canonicalization = Some(LearnerCommitCanonicalization {
-            from_commit: old_from,
+            from_commit: old_from.clone(),
             to_commit: old_tip.clone(),
         });
-        item.attempts[0].artifacts[1].path = old_tip.clone();
+        item.attempts[0].artifacts[1].path = old_from;
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: "attempt-1-write-2".to_string(),
+            path: ".fluent/work/artifacts/work-1/attempt-1/candidate-gate.json".to_string(),
+        });
         item.merge_candidates[0].candidate_commit = old_tip;
         store.write_work_item(&item).unwrap();
 
@@ -4630,12 +4656,16 @@ mod tests {
         assert_eq!(
             output.learner_canonicalization.as_ref(),
             Some(&LearnerCommitCanonicalization {
-                from_commit: new_from,
+                from_commit: new_from.clone(),
                 to_commit: new_tip.clone(),
             })
         );
         assert!(output.no_change.is_some());
-        assert_eq!(stored.attempts[0].artifacts[1].path, new_tip);
+        assert_eq!(stored.attempts[0].artifacts[1].path, new_from);
+        assert_eq!(
+            stored.attempts[0].artifacts[2].path,
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gate.json"
+        );
         assert_eq!(stored.merge_candidates[0].candidate_commit, new_tip);
     }
 
