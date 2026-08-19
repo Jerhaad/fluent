@@ -2530,6 +2530,50 @@ fn provider_failure_preserves_reply_and_reports_recovery() {
 }
 
 #[test]
+fn unavailable_provider_preserves_reply_and_offers_switch() {
+    struct UnavailableProvider;
+    impl ConversationProvider for UnavailableProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            anyhow::bail!("provider runtime unavailable")
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        UnavailableProvider,
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent help")).unwrap();
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("queued replies are preserved")
+    );
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("project approver may switch providers")
+    );
+}
+
+#[test]
 fn rate_limited_provider_preserves_reply_and_reports_retry() {
     struct RateLimitedProvider;
     impl ConversationProvider for RateLimitedProvider {
