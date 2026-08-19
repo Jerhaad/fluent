@@ -77,8 +77,9 @@ impl SchedulerClient for LocalSchedulerClient {
         if request.version != 1 || request.operation != "status" {
             bail!("unsupported scheduler request")
         }
-        for project_root in &self.project_roots {
-            crate::scheduler::status(project_root)?;
+        let health = crate::scheduler_service::send_health_request(&self.socket_path)?;
+        if health.generation != crate::scheduler_service::PROTOCOL_GENERATION {
+            bail!("scheduler service protocol generation mismatch");
         }
         Ok(SchedulerStatus { reachable: true })
     }
@@ -249,16 +250,13 @@ impl SlackTransport for SocketModeTransport {
     }
 
     fn receive_timeout(&mut self, timeout: std::time::Duration) -> Result<Option<InboundEnvelope>> {
-        let stream = self.socket.get_mut();
-        match stream {
-            tungstenite::stream::MaybeTlsStream::Plain(stream) => {
-                stream.set_read_timeout(Some(timeout))?
-            }
-            tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
-                stream.sock.set_read_timeout(Some(timeout))?
-            }
-            _ => {}
-        }
+        use tungstenite::stream::MaybeTlsStream;
+        let socket = match self.socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => stream,
+            MaybeTlsStream::Rustls(stream) => &mut stream.sock,
+            _ => bail!("unsupported Socket Mode TLS transport"),
+        };
+        socket.set_read_timeout(Some(timeout))?;
         match self.socket.read() {
             Ok(message) => decode_socket_mode_envelope(&message.into_text()?).map(Some),
             Err(tungstenite::Error::Io(error))

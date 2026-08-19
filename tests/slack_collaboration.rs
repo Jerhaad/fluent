@@ -7088,11 +7088,26 @@ fn durable_work_transition_posts_detailed_thread_reply() {
 
 #[test]
 fn external_work_transition_updates_linked_thread() {
-    let (_home, checkout, _config) = setup(true);
-    let control = planned_control(&checkout, "slice-external", "work-external");
-    control
-        .reconcile_durable_transitions("slice-external")
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent plan work"))
         .unwrap();
+    runner
+        .approve_thread_plan(
+            "1.0",
+            "U1",
+            "slice-external",
+            &[PlannedWork::new("work-external", "External")],
+        )
+        .unwrap();
+    runner.report_thread_work("1.0").unwrap();
+    let delivered_before_idle_tick = runner.slack().deliveries.len();
     let metadata = fluent::work_model::DurableTransitionMetadata {
         origin: Some("scheduler".into()),
         reason: Some("capacity available".into()),
@@ -7106,13 +7121,19 @@ fn external_work_transition_updates_linked_thread() {
             Ok(())
         })
         .unwrap();
-    let transition = control
-        .reconcile_durable_transitions("slice-external")
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(transition.origin.as_deref(), Some("scheduler"));
-    assert_eq!(transition.evidence_ref.as_deref(), Some("scheduler:42"));
+    runner.poll_linked_work().unwrap();
+    let delivery = runner.slack().deliveries[delivered_before_idle_tick..]
+        .iter()
+        .find(|delivery| delivery.id.contains(":work-transition:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "idle deliveries: {:?}",
+                &runner.slack().deliveries[delivered_before_idle_tick..]
+            )
+        });
+    assert!(delivery.text.contains("Work Item work-external"));
+    assert!(delivery.text.contains("Origin: scheduler"));
+    assert!(delivery.text.contains("Evidence: scheduler:42"));
 }
 
 #[test]

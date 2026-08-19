@@ -1518,6 +1518,18 @@ fn cmd_scheduler(project_root: &Path, command: SchedulerCommands) -> Result<()> 
     match command {
         SchedulerCommands::Run { poll_seconds } => {
             let poll = poll_seconds.unwrap_or(30);
+            let home = slack_home().context("resolve home for scheduler service")?;
+            let identity = fluent::scheduler_service::assign_checkout_identity(project_root)?;
+            fluent::scheduler_service::register_checkout(&home, project_root, &identity)?;
+            let build = fluent::scheduler_service::executable_build_identity(
+                &std::env::current_exe().context("resolve scheduler executable")?,
+            )?;
+            let service_home = home.clone();
+            thread::spawn(move || {
+                if let Err(error) = fluent::scheduler_service::run_service(&service_home, build) {
+                    eprintln!("Scheduler service stopped: {error:#}");
+                }
+            });
             let runner = fluent::scheduler::CliAttemptRunner;
             fluent::scheduler::run(project_root, poll, &runner)?;
         }

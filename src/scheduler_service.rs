@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -750,6 +751,34 @@ fn serve_connection(stream: &mut UnixStream, build: &BuildIdentity) -> Result<()
         },
     };
     frame_write(stream, &serde_json::to_vec(&resp)?)?;
+    Ok(())
+}
+
+/// Serve the production scheduler socket until the owning process exits.
+/// The scheduler command runs this listener alongside its queue coordinator.
+pub fn run_service(home_dir: &Path, build: BuildIdentity) -> Result<()> {
+    let path = socket_path(home_dir);
+    if send_health_request(&path).is_ok() {
+        bail!("scheduler service is already running");
+    }
+    let _ = fs::remove_file(&path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind scheduler service {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                let _ = serve_connection(&mut stream, &build);
+            }
+            Err(error) => return Err(error).context("accept scheduler service connection"),
+        }
+    }
     Ok(())
 }
 

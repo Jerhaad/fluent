@@ -645,6 +645,27 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             })
             .collect()
     }
+
+    /// Reconcile every bound Slice during a healthy idle connection tick.
+    pub fn poll_linked_work(&mut self) -> Result<()> {
+        let thread_ids = self
+            .store
+            .load_threads(&self.config)?
+            .into_values()
+            .filter(|thread| thread.state == ThreadState::Active)
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        for thread_id in thread_ids {
+            if self
+                .store
+                .load_thread(&self.config, &thread_id)?
+                .is_some_and(|thread| thread.slice.is_some())
+            {
+                self.report_thread_work(&thread_id)?;
+            }
+        }
+        Ok(())
+    }
     pub fn deliver_pending(&mut self) -> Result<()> {
         let mut deliveries = self.store.load_outbox()?;
         for index in 0..deliveries.len() {
@@ -2122,6 +2143,8 @@ where
             .max(std::time::Duration::from_millis(1));
         if let Some(event) = self.runner.slack_mut().receive_timeout(wait)? {
             self.ingest(event)?;
+        } else {
+            self.runner.poll_linked_work()?;
         }
         self.wake_due_retries((self.runner.clock)())?;
         self.poll_completions()
