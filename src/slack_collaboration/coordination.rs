@@ -233,6 +233,30 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .with_context(|| format!("approve planning Work Item {work_item_id}"))
     }
 
+    /// Switch only an interrupted conversation's provider metadata. Scheduler
+    /// Work is deliberately not represented or mutated at this boundary.
+    pub fn switch_provider(&mut self, thread_id: &str, actor: &str, provider: &str) -> Result<()> {
+        let mut thread = self
+            .store
+            .load_thread(&self.config, thread_id)?
+            .context("Fluent thread is unavailable")?;
+        let project = self.bound_project(&thread)?;
+        if !project.project_approvers.contains(actor) {
+            bail!("only a project approver may switch providers");
+        }
+        if !project.enabled_providers.contains(provider) {
+            bail!("conversation provider is not enabled");
+        }
+        thread.provider = Some(provider.into());
+        thread.provider_session = None;
+        self.store.save_thread(&self.config, &thread)?;
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
+            thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false,
+            approval_control: None,
+        })
+    }
+
     /// Persist first, then acknowledge exactly once, then process and send.
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;

@@ -2467,6 +2467,39 @@ fn queued_replies_form_one_ordered_attributed_turn() {
         "Slack user U1: first\nSlack user U2: second"
     );
 }
+
+#[test]
+fn provider_failure_preserves_replies_and_reports_recovery() {
+    assert_eq!(
+        classify_provider_failure("authentication required"),
+        ProviderFailure::Authentication
+    );
+    assert_eq!(
+        classify_provider_failure("HTTP 429 rate limit"),
+        ProviderFailure::RateLimited {
+            retry_after_seconds: 60
+        }
+    );
+}
+
+#[test]
+fn approver_switches_provider_without_changing_work() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    runner.switch_provider("1.0", "U1", "claude").unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.provider.as_deref(), Some("claude"));
+    assert!(thread.linked_work.is_none());
+}
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);

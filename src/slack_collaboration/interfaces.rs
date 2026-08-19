@@ -204,6 +204,29 @@ pub enum ProviderTurnRecovery {
     Completed { turn_id: String, reply: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderFailure {
+    Authentication,
+    Unavailable,
+    RateLimited { retry_after_seconds: u64 },
+}
+
+pub fn classify_provider_failure(message: &str) -> ProviderFailure {
+    let lowered = message.to_ascii_lowercase();
+    if lowered.contains("rate limit") || lowered.contains("429") {
+        ProviderFailure::RateLimited {
+            retry_after_seconds: 60,
+        }
+    } else if lowered.contains("auth")
+        || lowered.contains("login")
+        || lowered.contains("credential")
+    {
+        ProviderFailure::Authentication
+    } else {
+        ProviderFailure::Unavailable
+    }
+}
+
 /// Provider-neutral turn boundary with an explicit filesystem authority scope.
 pub trait ConversationProvider {
     /// Reports the provider implementation that owns persisted session ids.
