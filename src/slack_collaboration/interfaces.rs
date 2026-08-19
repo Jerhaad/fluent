@@ -212,14 +212,63 @@ pub struct CodeReference {
     pub line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderFailure {
     Authentication,
     HostCredentialDenied,
     IncompatibleProtocol,
     Unavailable,
-    RateLimited { retry_after_seconds: u64 },
+    RateLimited {
+        retry_after_seconds: u64,
+    },
+    /// The adapter could not complete its host-side bookkeeping. This is not
+    /// a provider recovery state and remains an operational runner error.
+    Internal,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderError {
+    pub failure: ProviderFailure,
+    diagnostic: String,
+}
+
+impl ProviderError {
+    pub fn new(failure: ProviderFailure, diagnostic: impl Into<String>) -> Self {
+        Self {
+            failure,
+            diagnostic: diagnostic.into(),
+        }
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+
+    pub fn from_diagnostic(diagnostic: impl Into<String>) -> Self {
+        let diagnostic = diagnostic.into();
+        Self::new(classify_provider_failure(&diagnostic), diagnostic)
+    }
+
+    pub fn internal(diagnostic: impl Into<String>) -> Self {
+        Self::new(ProviderFailure::Internal, diagnostic)
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+impl From<anyhow::Error> for ProviderError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::from_diagnostic(format!("{error:#}"))
+    }
+}
+
+pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
 
 pub fn classify_provider_failure(message: &str) -> ProviderFailure {
     let lowered = message.to_ascii_lowercase();
@@ -279,6 +328,7 @@ pub fn provider_recovery_message(failure: &ProviderFailure, can_switch: bool) ->
         } => {
             format!("Provider is rate-limited; retrying in {retry_after_seconds} seconds.{action}")
         }
+        ProviderFailure::Internal => "The provider runner encountered an internal error.".into(),
     }
 }
 
@@ -288,9 +338,12 @@ pub trait ConversationProvider: Send {
     fn name(&self) -> &str {
         "codex"
     }
-    fn select(&mut self, provider: &str) -> Result<()> {
+    fn select(&mut self, provider: &str) -> ProviderResult<()> {
         if self.name() != provider {
-            bail!("conversation provider {provider} is not available")
+            return Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                format!("conversation provider {provider} is not available"),
+            ));
         }
         Ok(())
     }
@@ -300,7 +353,7 @@ pub trait ConversationProvider: Send {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<(String, String)>;
+    ) -> ProviderResult<(String, String)>;
 
     fn resume(
         &mut self,
@@ -309,9 +362,9 @@ pub trait ConversationProvider: Send {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<String>;
+    ) -> ProviderResult<String>;
 
-    fn prepare_session(&mut self, _scope: &ProviderScope) -> Result<Option<String>> {
+    fn prepare_session(&mut self, _scope: &ProviderScope) -> ProviderResult<Option<String>> {
         Ok(None)
     }
 
@@ -320,7 +373,7 @@ pub trait ConversationProvider: Send {
         _action_id: &str,
         _session: &str,
         _scope: &ProviderScope,
-    ) -> Result<ProviderTurnRecovery> {
+    ) -> ProviderResult<ProviderTurnRecovery> {
         Ok(ProviderTurnRecovery::Missing)
     }
 
@@ -332,7 +385,7 @@ pub trait ConversationProvider: Send {
         contribution: &str,
         actor: &str,
         accepted: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<(Option<String>, String)> {
+    ) -> ProviderResult<(Option<String>, String)> {
         let (new_session, reply) = if let Some(session) = session {
             (
                 None,
@@ -342,19 +395,25 @@ pub trait ConversationProvider: Send {
             let (session, reply) = self.start(action_id, scope, contribution, actor)?;
             (Some(session), reply)
         };
-        accepted(action_id)?;
+        accepted(action_id).map_err(|error| ProviderError::internal(format!("{error:#}")))?;
         Ok((new_session, reply))
     }
 
-    fn send(&mut self, _session: &str, _message: &str) -> Result<()> {
-        bail!("conversation provider does not support direct messages")
+    fn send(&mut self, _session: &str, _message: &str) -> ProviderResult<()> {
+        Err(ProviderError::new(
+            ProviderFailure::Unavailable,
+            "conversation provider does not support direct messages",
+        ))
     }
 
-    fn interrupt(&mut self, _session: &str) -> Result<()> {
-        bail!("conversation provider does not support interruption")
+    fn interrupt(&mut self, _session: &str) -> ProviderResult<()> {
+        Err(ProviderError::new(
+            ProviderFailure::Unavailable,
+            "conversation provider does not support interruption",
+        ))
     }
 
-    fn structured_events(&mut self, _session: &str) -> Result<Vec<ProviderEvent>> {
+    fn structured_events(&mut self, _session: &str) -> ProviderResult<Vec<ProviderEvent>> {
         Ok(Vec::new())
     }
 
@@ -362,11 +421,11 @@ pub trait ConversationProvider: Send {
         &mut self,
         _scope: &ProviderScope,
         _contribution: &str,
-    ) -> Result<Vec<CodeReference>> {
+    ) -> ProviderResult<Vec<CodeReference>> {
         Ok(Vec::new())
     }
 
-    fn ready(&self) -> Result<()> {
+    fn ready(&self) -> ProviderResult<()> {
         Ok(())
     }
 }

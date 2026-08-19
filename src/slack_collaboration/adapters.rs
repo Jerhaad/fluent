@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use crate::content::ContentResolver;
 
 use super::{
-    ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderScope,
-    ProviderTurnRecovery, RecoveryTarget, SchedulerClient, SchedulerRequest, SchedulerStatus,
-    SlackTransport,
+    ConversationProvider, InboundChange, InboundEnvelope, OutboundDelivery, ProviderError,
+    ProviderFailure, ProviderResult, ProviderScope, ProviderTurnRecovery, RecoveryTarget,
+    SchedulerClient, SchedulerRequest, SchedulerStatus, SlackTransport,
 };
 
 pub struct LocalSchedulerClient {
@@ -626,7 +626,7 @@ impl CodexAppServerProvider {
                 .rev()
                 .find(|item| item["type"] == "agentMessage")
                 .and_then(|item| item["text"].as_str())
-                .context("completed Codex turn has no agent reply")?
+                .context("incompatible Codex provider protocol: completed turn omitted reply")?
                 .to_owned();
             return Ok(ProviderTurnRecovery::Completed { turn_id, reply });
         }
@@ -644,7 +644,7 @@ impl ConversationProvider for CodexAppServerProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<(String, String)> {
+    ) -> ProviderResult<(String, String)> {
         let session = self
             .prepare_session(scope)?
             .context("Codex did not create a thread")?;
@@ -666,7 +666,7 @@ impl ConversationProvider for CodexAppServerProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         Ok(self
             .run_turn(
                 action_id,
@@ -679,7 +679,7 @@ impl ConversationProvider for CodexAppServerProvider {
             .1)
     }
 
-    fn prepare_session(&mut self, scope: &ProviderScope) -> Result<Option<String>> {
+    fn prepare_session(&mut self, scope: &ProviderScope) -> ProviderResult<Option<String>> {
         let mut connection = self.connect(scope)?;
         let result = connection.request(
             "thread/start",
@@ -692,7 +692,7 @@ impl ConversationProvider for CodexAppServerProvider {
         Ok(Some(
             result["thread"]["id"]
                 .as_str()
-                .context("Codex thread/start omitted thread id")?
+                .context("incompatible Codex provider protocol: thread/start omitted thread id")?
                 .to_owned(),
         ))
     }
@@ -702,14 +702,14 @@ impl ConversationProvider for CodexAppServerProvider {
         action_id: &str,
         session: &str,
         scope: &ProviderScope,
-    ) -> Result<ProviderTurnRecovery> {
+    ) -> ProviderResult<ProviderTurnRecovery> {
         let mut connection = self.connect(scope)?;
         self.resume_thread(&mut connection, session, scope)?;
         let result = connection.request(
             "thread/read",
             serde_json::json!({"threadId": session, "includeTurns": true}),
         )?;
-        Self::recovered_turn(&result, action_id)
+        Ok(Self::recovered_turn(&result, action_id)?)
     }
 
     fn run_turn(
@@ -720,7 +720,7 @@ impl ConversationProvider for CodexAppServerProvider {
         contribution: &str,
         actor: &str,
         accepted: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<(Option<String>, String)> {
+    ) -> ProviderResult<(Option<String>, String)> {
         let session = session.context("Codex turn requires a persisted thread id")?;
         let mut connection = self.connect(scope)?;
         self.resume_thread(&mut connection, session, scope)?;
@@ -736,9 +736,9 @@ impl ConversationProvider for CodexAppServerProvider {
         )?;
         let turn_id = result["turn"]["id"]
             .as_str()
-            .context("Codex turn/start omitted turn id")?
+            .context("incompatible Codex provider protocol: turn/start omitted turn id")?
             .to_owned();
-        accepted(&turn_id)?;
+        accepted(&turn_id).map_err(|error| ProviderError::internal(format!("{error:#}")))?;
         let mut reply = None;
         loop {
             let message = connection.next_message()?;
@@ -752,24 +752,32 @@ impl ConversationProvider for CodexAppServerProvider {
             }
             if method == "turn/completed" && params["turn"]["id"].as_str() == Some(&turn_id) {
                 if params["turn"]["status"] != "completed" {
-                    bail!("Codex turn {turn_id} did not complete successfully")
+                    return Err(ProviderError::new(
+                        ProviderFailure::Unavailable,
+                        format!("Codex turn {turn_id} did not complete successfully"),
+                    ));
                 }
                 return Ok((
                     None,
-                    reply.context("Codex turn completed without an agent message")?,
+                    reply.context(
+                        "incompatible Codex provider protocol: completed turn omitted agent message",
+                    )?,
                 ));
             }
         }
     }
 
-    fn ready(&self) -> Result<()> {
-        Command::new(&self.executable)
-            .arg("app-server")
-            .arg("--help")
-            .status()?
-            .success()
-            .then_some(())
-            .context("Codex App Server is unavailable")
+    fn ready(&self) -> ProviderResult<()> {
+        (|| -> Result<()> {
+            Command::new(&self.executable)
+                .arg("app-server")
+                .arg("--help")
+                .status()?
+                .success()
+                .then_some(())
+                .context("Codex App Server is unavailable")
+        })()
+        .map_err(ProviderError::from)
     }
 }
 
@@ -907,8 +915,9 @@ impl ConversationProvider for ClaudeStructuredSessionProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<(String, String)> {
+    ) -> ProviderResult<(String, String)> {
         self.invoke(scope, None, contribution, actor)
+            .map_err(ProviderError::from)
     }
     fn resume(
         &mut self,
@@ -917,16 +926,22 @@ impl ConversationProvider for ClaudeStructuredSessionProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<String> {
-        Ok(self.invoke(scope, Some(session), contribution, actor)?.1)
+    ) -> ProviderResult<String> {
+        Ok(self
+            .invoke(scope, Some(session), contribution, actor)
+            .map_err(ProviderError::from)?
+            .1)
     }
-    fn ready(&self) -> Result<()> {
-        Command::new(&self.executable)
-            .arg("--version")
-            .status()?
-            .success()
-            .then_some(())
-            .context("Claude is unavailable")
+    fn ready(&self) -> ProviderResult<()> {
+        (|| -> Result<()> {
+            Command::new(&self.executable)
+                .arg("--version")
+                .status()?
+                .success()
+                .then_some(())
+                .context("Claude is unavailable")
+        })()
+        .map_err(ProviderError::from)
     }
 }
 
@@ -953,10 +968,13 @@ impl ProviderRegistry {
             selected,
         })
     }
-    fn current(&mut self) -> Result<&mut (dyn ConversationProvider + '_)> {
+    fn current(&mut self) -> ProviderResult<&mut (dyn ConversationProvider + '_)> {
         match self.providers.get_mut(&self.selected) {
             Some(provider) => Ok(provider.as_mut()),
-            None => bail!("selected provider is unavailable"),
+            None => Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                "selected provider is unavailable",
+            )),
         }
     }
 }
@@ -965,20 +983,36 @@ impl ConversationProvider for ProviderRegistry {
     fn name(&self) -> &str {
         &self.selected
     }
-    fn select(&mut self, provider: &str) -> Result<()> {
+    fn select(&mut self, provider: &str) -> ProviderResult<()> {
         if !self.providers.contains_key(provider) {
-            bail!("conversation provider {provider} is not available");
+            return Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                format!("conversation provider {provider} is not available"),
+            ));
         }
         self.selected = provider.into();
         Ok(())
     }
-    fn start(&mut self, a: &str, s: &ProviderScope, c: &str, u: &str) -> Result<(String, String)> {
+    fn start(
+        &mut self,
+        a: &str,
+        s: &ProviderScope,
+        c: &str,
+        u: &str,
+    ) -> ProviderResult<(String, String)> {
         self.current()?.start(a, s, c, u)
     }
-    fn resume(&mut self, a: &str, id: &str, s: &ProviderScope, c: &str, u: &str) -> Result<String> {
+    fn resume(
+        &mut self,
+        a: &str,
+        id: &str,
+        s: &ProviderScope,
+        c: &str,
+        u: &str,
+    ) -> ProviderResult<String> {
         self.current()?.resume(a, id, s, c, u)
     }
-    fn prepare_session(&mut self, s: &ProviderScope) -> Result<Option<String>> {
+    fn prepare_session(&mut self, s: &ProviderScope) -> ProviderResult<Option<String>> {
         self.current()?.prepare_session(s)
     }
     fn recover_turn(
@@ -986,7 +1020,7 @@ impl ConversationProvider for ProviderRegistry {
         a: &str,
         id: &str,
         s: &ProviderScope,
-    ) -> Result<ProviderTurnRecovery> {
+    ) -> ProviderResult<ProviderTurnRecovery> {
         self.current()?.recover_turn(a, id, s)
     }
     fn run_turn(
@@ -997,16 +1031,25 @@ impl ConversationProvider for ProviderRegistry {
         c: &str,
         u: &str,
         accepted: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<(Option<String>, String)> {
+    ) -> ProviderResult<(Option<String>, String)> {
         self.current()?.run_turn(a, id, s, c, u, accepted)
     }
-    fn code_references(&mut self, s: &ProviderScope, c: &str) -> Result<Vec<super::CodeReference>> {
+    fn code_references(
+        &mut self,
+        s: &ProviderScope,
+        c: &str,
+    ) -> ProviderResult<Vec<super::CodeReference>> {
         self.current()?.code_references(s, c)
     }
-    fn ready(&self) -> Result<()> {
+    fn ready(&self) -> ProviderResult<()> {
         self.providers
             .get(&self.selected)
-            .context("selected provider is unavailable")?
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderFailure::Unavailable,
+                    "selected provider is unavailable",
+                )
+            })?
             .ready()
     }
 }

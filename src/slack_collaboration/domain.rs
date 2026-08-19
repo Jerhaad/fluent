@@ -218,6 +218,8 @@ pub struct FluentThread {
     pub project_label: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
+    #[serde(default)]
+    pub provider_failure: Option<super::ProviderFailure>,
     pub provider_session: Option<String>,
     pub slice: Option<String>,
     pub planning_stage: Option<String>,
@@ -277,6 +279,7 @@ impl FluentThread {
             state: ThreadState::WaitingForProject,
             project_label: None,
             provider: None,
+            provider_failure: None,
             provider_session: None,
             slice: None,
             planning_stage: None,

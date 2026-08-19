@@ -454,11 +454,14 @@ impl ConversationProvider for InMemoryProvider {
     fn name(&self) -> &str {
         "codex"
     }
-    fn select(&mut self, provider: &str) -> Result<()> {
+    fn select(&mut self, provider: &str) -> ProviderResult<()> {
         if matches!(provider, "codex" | "claude") {
             Ok(())
         } else {
-            bail!("provider unavailable")
+            Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                "provider unavailable",
+            ))
         }
     }
     fn start(
@@ -467,7 +470,7 @@ impl ConversationProvider for InMemoryProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<(String, String)> {
+    ) -> ProviderResult<(String, String)> {
         if let Some((session, reply)) = self.completed_actions.get(action_id) {
             return Ok((session.clone(), reply.clone()));
         }
@@ -492,7 +495,7 @@ impl ConversationProvider for InMemoryProvider {
         scope: &ProviderScope,
         contribution: &str,
         actor: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         if let Some((_, reply)) = self.completed_actions.get(action_id) {
             return Ok(reply.clone());
         }

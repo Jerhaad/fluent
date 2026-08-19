@@ -181,6 +181,12 @@ bound checkout and private provider state beneath the Slice draft. Set the
 fair cross-thread provider capacity with `FLUENT_SLACK_TURN_CAPACITY` (default
 four).
 
+Authenticate the selected executable as the same operating-system account
+that runs Fluent. Run `codex login` for Codex or `claude /login` for Claude,
+then restart the Slack runner so the adapter rechecks that account's private
+provider state. If an executable path override is configured, invoke that
+exact executable for the login rather than another installation on `PATH`.
+
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:
 

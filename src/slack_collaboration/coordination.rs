@@ -226,6 +226,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         thread.provider = Some(provider.into());
         thread.provider_session = None;
+        thread.provider_failure = None;
         self.store.persist_outbox(OutboundDelivery {
             id: format!("{}:provider-switch:{}", thread.id, provider), channel: thread.channel.clone(),
             thread_timestamp: thread.id.clone(), text: format!("Provider switched to {provider}; Fluent will resume from the durable Slice conversation."), delivered: false,
@@ -570,9 +571,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             checkout,
         };
         if turn.starts_session && thread.provider_session.is_none() {
-            if let Some(session) = self.provider.prepare_session(&scope)? {
-                thread.provider_session = Some(session);
-                self.store.save_thread(&self.config, thread)?;
+            match self.provider.prepare_session(&scope) {
+                Ok(Some(session)) => {
+                    thread.provider_session = Some(session);
+                    self.store.save_thread(&self.config, thread)?;
+                }
+                Ok(None) => {}
+                Err(error) => return self.preserve_provider_failure(event, thread, error),
             }
         }
         if thread.provider_session.is_none() && !thread.conversation.is_empty() {
@@ -590,10 +595,11 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         }
         if turn.completed_reply.is_none() {
             if let Some(session) = thread.provider_session.as_deref() {
-                match self
-                    .provider
-                    .recover_turn(&turn.action_id, session, &scope)?
-                {
+                let recovery = match self.provider.recover_turn(&turn.action_id, session, &scope) {
+                    Ok(recovery) => recovery,
+                    Err(error) => return self.preserve_provider_failure(event, thread, error),
+                };
+                match recovery {
                     ProviderTurnRecovery::Missing if turn.provider_turn_id.is_some() => {
                         bail!("accepted provider turn is missing from provider history");
                     }
@@ -643,27 +649,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             let (session, reply) = match run {
                 Ok(result) => result,
                 Err(error) => {
-                    let diagnostic = error.to_string();
-                    if !is_recoverable_provider_failure(&diagnostic) {
-                        return Err(error);
-                    }
-                    let failure = classify_provider_failure(&diagnostic);
-                    let can_switch = self
-                        .bound_project(thread)
-                        .is_ok_and(|project| !project.project_approvers.is_empty());
-                    self.queue_reply(event, &provider_recovery_message(&failure, can_switch))?;
-                    let mut checkpoint = checkpoint.into_inner();
-                    if let ProviderFailure::RateLimited {
-                        retry_after_seconds,
-                    } = failure
-                        && let Some(turn) = checkpoint.pending_turn.as_mut()
-                    {
-                        turn.retry_at_unix_seconds =
-                            Some((self.clock)().saturating_add(retry_after_seconds));
-                    }
-                    *thread = checkpoint;
-                    self.store.save_thread(&self.config, thread)?;
-                    return Ok(());
+                    *thread = checkpoint.into_inner();
+                    return self.preserve_provider_failure(event, thread, error);
                 }
             };
             *thread = checkpoint.into_inner();
@@ -746,6 +733,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             });
         }
         turn.completed_reply = Some(reply.clone());
+        thread.provider_failure = None;
         thread.pending_turn = Some(turn);
         self.store.save_thread(&self.config, thread)?;
         self.queue_reply(event, &reply)?;
@@ -776,6 +764,31 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             self.store.save_thread(&self.config, thread)?;
         }
         Ok(())
+    }
+
+    fn preserve_provider_failure(
+        &mut self,
+        event: &InboundEnvelope,
+        thread: &mut FluentThread,
+        error: ProviderError,
+    ) -> Result<()> {
+        if error.failure == ProviderFailure::Internal {
+            return Err(error.into());
+        }
+        let failure = error.failure;
+        let can_switch = self
+            .bound_project(thread)
+            .is_ok_and(|project| !project.project_approvers.is_empty());
+        self.queue_reply(event, &provider_recovery_message(&failure, can_switch))?;
+        if let ProviderFailure::RateLimited {
+            retry_after_seconds,
+        } = &failure
+            && let Some(turn) = thread.pending_turn.as_mut()
+        {
+            turn.retry_at_unix_seconds = Some((self.clock)().saturating_add(*retry_after_seconds));
+        }
+        thread.provider_failure = Some(failure);
+        self.store.save_thread(&self.config, thread)
     }
     fn bound_project(&self, thread: &FluentThread) -> Result<&ConfiguredProject> {
         let label = thread
@@ -1062,24 +1075,6 @@ fn selected_provider(text: &str) -> Option<&str> {
     let (_, suffix) = text.split_once(marker)?;
     let suffix = suffix.split_once(']')?.0;
     (!suffix.is_empty()).then_some(suffix)
-}
-
-fn is_recoverable_provider_failure(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "auth",
-        "login",
-        "credential",
-        "permission denied",
-        "incompatible",
-        "protocol version",
-        "unsupported protocol",
-        "unavailable",
-        "rate limit",
-        "429",
-    ]
-    .iter()
-    .any(|marker| message.contains(marker))
 }
 
 fn code_references_in_reply(reply: &str, checkout: &Path) -> Vec<CodeReference> {

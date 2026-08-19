@@ -2441,7 +2441,7 @@ fn thread_can_select_enabled_nondefault_provider() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             self.calls.lock().unwrap().push(self.name.into());
             Ok((
                 format!("{}-session", self.name),
@@ -2455,7 +2455,7 @@ fn thread_can_select_enabled_nondefault_provider() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -2508,7 +2508,7 @@ fn selected_provider_dispatches_to_matching_adapter() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             self.calls.lock().unwrap().push(self.name.into());
             Ok((
                 format!("{}-session", self.name),
@@ -2522,7 +2522,7 @@ fn selected_provider_dispatches_to_matching_adapter() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -2597,7 +2597,7 @@ fn claude_structured_session_starts_and_resumes() {
 }
 
 #[test]
-fn provider_adapters_translate_incompatible_protocols() {
+fn provider_adapters_return_typed_setup_and_recovery_failures() {
     let fixture = TempDir::new().unwrap();
     let scope = ProviderScope {
         checkout: fixture.path().into(),
@@ -2611,8 +2611,17 @@ fn provider_adapters_translate_incompatible_protocols() {
     let claude_error = claude_provider
         .start("action-1", &scope, "inspect this", "U1")
         .unwrap_err();
+    assert_eq!(claude_error.failure, ProviderFailure::IncompatibleProtocol);
+    assert!(
+        claude_error
+            .diagnostic()
+            .contains("Claude provider protocol")
+    );
+    let claude_resume_error = claude_provider
+        .resume("action-2", "claude-session", &scope, "continue", "U1")
+        .unwrap_err();
     assert_eq!(
-        classify_provider_failure(&claude_error.to_string()),
+        claude_resume_error.failure,
         ProviderFailure::IncompatibleProtocol
     );
 
@@ -2625,8 +2634,13 @@ fn provider_adapters_translate_incompatible_protocols() {
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
     let mut codex_provider = CodexAppServerProvider::new(codex);
     let codex_error = codex_provider.prepare_session(&scope).unwrap_err();
+    assert_eq!(codex_error.failure, ProviderFailure::IncompatibleProtocol);
+    assert!(codex_error.diagnostic().contains("Codex provider protocol"));
+    let codex_recovery_error = codex_provider
+        .recover_turn("action-1", "codex-session", &scope)
+        .unwrap_err();
     assert_eq!(
-        classify_provider_failure(&codex_error.to_string()),
+        codex_recovery_error.failure,
         ProviderFailure::IncompatibleProtocol
     );
 }
@@ -2644,7 +2658,7 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
             _: &ProviderScope,
             contribution: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             self.calls.lock().unwrap().push(contribution.into());
             let (lock, changed) = &*self.gate;
             let mut state = lock.lock().unwrap();
@@ -2662,7 +2676,7 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
             _: &ProviderScope,
             contribution: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             self.calls.lock().unwrap().push(contribution.into());
             let (lock, changed) = &*self.gate;
             let mut state = lock.lock().unwrap();
@@ -2745,7 +2759,7 @@ fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
             _: &ProviderScope,
             contribution: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             let first = {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push(contribution.into());
@@ -2768,7 +2782,7 @@ fn async_runner_admits_waiting_threads_fairly_at_capacity_one() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -2820,7 +2834,7 @@ fn async_runner_admits_parallel_threads_at_configured_capacity() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             let (lock, changed) = &*self.gate;
             let mut state = lock.lock().unwrap();
             state.0 += 1;
@@ -2837,7 +2851,7 @@ fn async_runner_admits_parallel_threads_at_configured_capacity() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -2881,7 +2895,7 @@ fn fatal_worker_still_launches_the_next_fair_admission() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 let (lock, changed) = &*self.gate;
@@ -2889,7 +2903,7 @@ fn fatal_worker_still_launches_the_next_fair_admission() {
                 while !*released {
                     released = changed.wait(released).unwrap();
                 }
-                anyhow::bail!("simulated fatal worker")
+                return Err(ProviderError::internal("simulated fatal worker"));
             }
             Ok(("session".into(), "recovered waiter".into()))
         }
@@ -2900,7 +2914,7 @@ fn fatal_worker_still_launches_the_next_fair_admission() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -2970,8 +2984,8 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
-            anyhow::bail!(self.0)
+        ) -> ProviderResult<(String, String)> {
+            Err(ProviderError::from_diagnostic(self.0))
         }
         fn resume(
             &mut self,
@@ -2980,7 +2994,7 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -3005,6 +3019,10 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
         thread.pending_turn.as_ref().unwrap().contribution,
         "@Fluent hello"
     );
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::Authentication)
+    );
 
     let (home, _checkout, config) = setup(true);
     let mut unavailable = CollaborationRunner::new(
@@ -3019,6 +3037,14 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
     let recovery = &unavailable.slack().deliveries[0].text;
     assert!(recovery.contains("queued replies are preserved"));
     assert!(recovery.contains("project approver may switch providers"));
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&unavailable.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .provider_failure,
+        Some(ProviderFailure::Unavailable)
+    );
     assert_eq!(
         FileCollaborationStore::new(home.path())
             .load_thread(&unavailable.config, "1.0")
@@ -3067,6 +3093,150 @@ fn provider_failure_preserves_replies_and_reports_recovery() {
 }
 
 #[test]
+fn provider_setup_failure_preserves_typed_state_and_pending_turn() {
+    struct SetupFailureProvider;
+    impl ConversationProvider for SetupFailureProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            unreachable!()
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+        fn prepare_session(&mut self, _: &ProviderScope) -> ProviderResult<Option<String>> {
+            Err(ProviderError::new(
+                ProviderFailure::HostCredentialDenied,
+                "secret credential helper diagnostic",
+            ))
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        SetupFailureProvider,
+        InMemorySlack::default(),
+    );
+    runner
+        .ingest(event("E1", None, "@Fluent keep setup turn"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&runner.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::HostCredentialDenied)
+    );
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "@Fluent keep setup turn"
+    );
+    assert!(
+        runner.slack().deliveries[0]
+            .text
+            .contains("credentials are unavailable to the runner host")
+    );
+    assert!(
+        !runner.slack().deliveries[0]
+            .text
+            .contains("secret credential helper diagnostic")
+    );
+}
+
+#[test]
+fn provider_recovery_failure_preserves_typed_state_and_pending_turn() {
+    struct RecoveryFailureProvider;
+    impl ConversationProvider for RecoveryFailureProvider {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<(String, String)> {
+            unreachable!()
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> ProviderResult<String> {
+            unreachable!()
+        }
+        fn recover_turn(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+        ) -> ProviderResult<ProviderTurnRecovery> {
+            Err(ProviderError::new(
+                ProviderFailure::IncompatibleProtocol,
+                "secret recovery protocol diagnostic",
+            ))
+        }
+    }
+
+    let (home, _checkout, config) = setup(true);
+    let mut first = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    first
+        .ingest(event("E1", None, "@Fluent establish session"))
+        .unwrap();
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config,
+        RecoveryFailureProvider,
+        InMemorySlack::default(),
+    );
+    recovered
+        .ingest(event("E2", Some("1.0"), "keep recovery turn"))
+        .unwrap();
+    let thread = FileCollaborationStore::new(home.path())
+        .load_thread(&recovered.config, "1.0")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        thread.provider_failure,
+        Some(ProviderFailure::IncompatibleProtocol)
+    );
+    assert_eq!(
+        thread.pending_turn.unwrap().contribution,
+        "keep recovery turn"
+    );
+    assert!(
+        recovered.slack().deliveries[0]
+            .text
+            .contains("protocol is incompatible")
+    );
+    assert!(
+        !recovered.slack().deliveries[0]
+            .text
+            .contains("secret recovery protocol diagnostic")
+    );
+}
+
+#[test]
 fn unavailable_provider_preserves_reply_and_offers_switch() {
     struct UnavailableProvider;
     impl ConversationProvider for UnavailableProvider {
@@ -3076,8 +3246,11 @@ fn unavailable_provider_preserves_reply_and_offers_switch() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
-            anyhow::bail!("provider runtime unavailable")
+        ) -> ProviderResult<(String, String)> {
+            Err(ProviderError::new(
+                ProviderFailure::Unavailable,
+                "provider runtime unavailable",
+            ))
         }
         fn resume(
             &mut self,
@@ -3086,7 +3259,7 @@ fn unavailable_provider_preserves_reply_and_offers_switch() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -3120,8 +3293,13 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
-            anyhow::bail!("HTTP 429 rate limit; retry-after=17")
+        ) -> ProviderResult<(String, String)> {
+            Err(ProviderError::new(
+                ProviderFailure::RateLimited {
+                    retry_after_seconds: 17,
+                },
+                "HTTP 429 rate limit; retry-after=17",
+            ))
         }
         fn resume(
             &mut self,
@@ -3130,7 +3308,7 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -3154,6 +3332,16 @@ fn rate_limited_provider_preserves_reply_and_reports_retry() {
             .unwrap()
             .pending_turn
             .is_some()
+    );
+    assert_eq!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&runner.config, "1.0")
+            .unwrap()
+            .unwrap()
+            .provider_failure,
+        Some(ProviderFailure::RateLimited {
+            retry_after_seconds: 17
+        })
     );
 }
 
@@ -3190,10 +3378,15 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
             _: &ProviderScope,
             contribution: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             self.calls.lock().unwrap().push(contribution.into());
             if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("provider rate limit; retry-after=17")
+                return Err(ProviderError::new(
+                    ProviderFailure::RateLimited {
+                        retry_after_seconds: 17,
+                    },
+                    "provider rate limit; retry-after=17",
+                ));
             }
             Ok(("session".into(), "recovered".into()))
         }
@@ -3204,7 +3397,7 @@ fn rate_limit_waits_recovers_and_offers_provider_switch() {
             _: &ProviderScope,
             contribution: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             self.calls.lock().unwrap().push(contribution.into());
             Ok("follow-up".into())
         }
@@ -3314,7 +3507,7 @@ fn approver_switches_provider_without_changing_work() {
             _: &ProviderScope,
             contribution: &str,
             actor: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             self.calls.lock().unwrap().push((
                 self.name.into(),
                 format!("Slack user {actor}: {contribution}"),
@@ -3331,13 +3524,16 @@ fn approver_switches_provider_without_changing_work() {
             _: &ProviderScope,
             contribution: &str,
             actor: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             self.calls.lock().unwrap().push((
                 self.name.into(),
                 format!("Slack user {actor}: {contribution}"),
             ));
             if self.fail_resume {
-                anyhow::bail!("provider runtime unavailable")
+                return Err(ProviderError::new(
+                    ProviderFailure::Unavailable,
+                    "provider runtime unavailable",
+                ));
             }
             Ok("continued reply".into())
         }
@@ -3489,7 +3685,7 @@ fn code_question_uses_bound_checkout_and_relative_references() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             Ok((
                 "session".into(),
                 "Inspect `README:1` for the binding.".into(),
@@ -3502,7 +3698,7 @@ fn code_question_uses_bound_checkout_and_relative_references() {
             _: &ProviderScope,
             _: &str,
             _: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
@@ -3532,7 +3728,7 @@ fn code_question_posts_provider_reference_in_slack_thread() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             Ok(("session".into(), "The implementation is here.".into()))
         }
         fn resume(
@@ -3542,14 +3738,14 @@ fn code_question_posts_provider_reference_in_slack_thread() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
         fn code_references(
             &mut self,
             _scope: &ProviderScope,
             _contribution: &str,
-        ) -> anyhow::Result<Vec<CodeReference>> {
+        ) -> ProviderResult<Vec<CodeReference>> {
             Ok(vec![CodeReference {
                 path: "README".into(),
                 line: 1,
@@ -3581,7 +3777,7 @@ fn code_question_rejects_provider_reference_outside_bound_checkout() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             Ok(("session".into(), "answer".into()))
         }
         fn resume(
@@ -3591,14 +3787,14 @@ fn code_question_rejects_provider_reference_outside_bound_checkout() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
         fn code_references(
             &mut self,
             _scope: &ProviderScope,
             _contribution: &str,
-        ) -> anyhow::Result<Vec<CodeReference>> {
+        ) -> ProviderResult<Vec<CodeReference>> {
             Ok(vec![CodeReference {
                 path: "../secret".into(),
                 line: 1,
@@ -3839,7 +4035,7 @@ impl ConversationProvider for CrashOnceProvider {
         _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
-    ) -> anyhow::Result<(String, String)> {
+    ) -> ProviderResult<(String, String)> {
         let mut actions = self.actions.lock().unwrap();
         let result = actions
             .entry(action_id.into())
@@ -3849,7 +4045,9 @@ impl ConversationProvider for CrashOnceProvider {
         let mut fail = self.fail_after_start.lock().unwrap();
         if *fail {
             *fail = false;
-            anyhow::bail!("simulated crash after provider side effect");
+            return Err(ProviderError::internal(
+                "simulated crash after provider side effect",
+            ));
         }
         Ok(result)
     }
@@ -3861,7 +4059,7 @@ impl ConversationProvider for CrashOnceProvider {
         _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
-    ) -> anyhow::Result<String> {
+    ) -> ProviderResult<String> {
         Ok(self
             .actions
             .lock()
@@ -4110,7 +4308,7 @@ impl ConversationProvider for FailContributionOnceProvider {
         _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
-    ) -> anyhow::Result<(String, String)> {
+    ) -> ProviderResult<(String, String)> {
         Ok(("session-1".into(), format!("reply: {contribution}")))
     }
 
@@ -4121,10 +4319,12 @@ impl ConversationProvider for FailContributionOnceProvider {
         _scope: &ProviderScope,
         contribution: &str,
         _actor: &str,
-    ) -> anyhow::Result<String> {
+    ) -> ProviderResult<String> {
         if contribution == "second" && !*self.failed.lock().unwrap() {
             *self.failed.lock().unwrap() = true;
-            anyhow::bail!("crash midway through Slack recovery");
+            return Err(ProviderError::internal(
+                "crash midway through Slack recovery",
+            ));
         }
         self.completed.lock().unwrap().push(contribution.into());
         Ok(format!("reply: {contribution}"))
@@ -4459,6 +4659,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         state: ThreadState::Active,
         project_label: Some("app".into()),
         provider: Some("codex".into()),
+        provider_failure: None,
         provider_session: None,
         slice: None,
         planning_stage: None,
@@ -5056,7 +5257,7 @@ fn slack_credentials_use_host_store_and_are_redacted() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<(String, String)> {
+        ) -> ProviderResult<(String, String)> {
             Ok((
                 "session-1".into(),
                 format!("provider error: {} {}", self.app_token, self.bot_token),
@@ -5070,7 +5271,7 @@ fn slack_credentials_use_host_store_and_are_redacted() {
             _scope: &ProviderScope,
             _contribution: &str,
             _actor: &str,
-        ) -> anyhow::Result<String> {
+        ) -> ProviderResult<String> {
             unreachable!()
         }
     }
