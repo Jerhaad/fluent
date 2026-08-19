@@ -2589,6 +2589,7 @@ fn read_planning_context(
             (None, None) => None,
             (Some(_), Some(_)) => unreachable!("clap rejects conflicting planning context inputs"),
         },
+        approved_revisions: Default::default(),
     };
 
     Ok((!context.is_empty()).then_some(context))

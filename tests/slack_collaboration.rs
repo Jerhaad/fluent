@@ -280,16 +280,20 @@ fn slack_approval_reply_advances_the_bound_work_item() {
             &format!("approve {}", revision.id),
         ))
         .unwrap();
-    assert_eq!(
-        WorkModelStore::new(checkout.path())
-            .read_work_item("work-1")
-            .unwrap()
-            .planning_context
-            .unwrap()
-            .brief
-            .as_deref(),
-        Some("# Brief\n")
+    let mut approved_work_item = WorkModelStore::new(checkout.path())
+        .read_work_item("work-1")
+        .unwrap();
+    let context = approved_work_item.planning_context.as_ref().unwrap();
+    assert_eq!(context.brief.as_deref(), Some("# Brief\n"));
+    assert_eq!(context.approved_revisions["brief"].revision_id, revision.id);
+    assert!(
+        approved_work_item
+            .clone()
+            .add_initial_attempt("attempt-1")
+            .is_ok()
     );
+    approved_work_item.planning_context.as_mut().unwrap().brief = Some("# Revised\n".into());
+    assert!(approved_work_item.add_initial_attempt("attempt-1").is_err());
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
         .unwrap()

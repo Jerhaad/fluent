@@ -461,6 +461,7 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
             approach: None,
             plan: None,
             combined: None,
+            approved_revisions: Default::default(),
         }),
         instructions: None,
         abandonment: None,
@@ -701,6 +702,7 @@ pub fn create_post_merge_review_fix_work_item(
         approach: None,
         plan: None,
         combined: None,
+        approved_revisions: Default::default(),
     };
     let mut item = WorkItem {
         id: id.clone(),

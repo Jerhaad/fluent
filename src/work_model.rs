@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -541,7 +541,24 @@ impl WorkItem {
                 work_item_id: self.id.clone(),
             });
         }
+        if let Some(context) = &self.planning_context {
+            context.validate_approved_revisions()?;
+        }
         Ok(())
+    }
+
+    /// Approve one exact planning revision through the Work Item lifecycle.
+    pub fn approve_planning_revision(
+        &mut self,
+        stage: &str,
+        revision_id: &str,
+        markdown: String,
+    ) -> Result<(), WorkModelError> {
+        self.ensure_not_abandoned()?;
+        self.planning_context
+            .get_or_insert_default()
+            .approve_revision(stage, revision_id, markdown)?;
+        self.validate()
     }
 
     /// Authorize proposed Work to execute, charging its lineage exactly once the
@@ -1602,6 +1619,9 @@ impl WorkItem {
                 });
             }
         }
+        if let Some(context) = &self.planning_context {
+            context.validate_approved_revisions()?;
+        }
         if let Some(contract) = &self.release_contract {
             contract.validate()?;
         }
@@ -1718,9 +1738,74 @@ pub struct PlanningContext {
     pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub combined: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub approved_revisions: BTreeMap<String, ApprovedPlanningRevision>,
+}
+
+/// Immutable identity for planning bytes approved through the Work Item lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedPlanningRevision {
+    pub revision_id: String,
+    pub sha256: String,
 }
 
 impl PlanningContext {
+    fn approve_revision(
+        &mut self,
+        stage: &str,
+        revision_id: &str,
+        markdown: String,
+    ) -> Result<(), WorkModelError> {
+        if !["brief", "behaviors", "approach", "plan"].contains(&stage) {
+            return Err(WorkModelError::InvalidPlanningRevision {
+                reason: format!("unknown planning stage {stage:?}"),
+            });
+        }
+        let sha256 = planning_revision_digest(&markdown);
+        if revision_id != format!("{stage}:{sha256}") {
+            return Err(WorkModelError::InvalidPlanningRevision {
+                reason: "revision identity does not match approved planning bytes".to_string(),
+            });
+        }
+        match stage {
+            "brief" => self.brief = Some(markdown),
+            "behaviors" => self.behaviors = Some(markdown),
+            "approach" => self.approach = Some(markdown),
+            "plan" => self.plan = Some(markdown),
+            _ => unreachable!("planning stage was validated before assignment"),
+        }
+        self.approved_revisions.insert(
+            stage.to_owned(),
+            ApprovedPlanningRevision {
+                revision_id: revision_id.to_owned(),
+                sha256,
+            },
+        );
+        Ok(())
+    }
+
+    fn validate_approved_revisions(&self) -> Result<(), WorkModelError> {
+        for (stage, approval) in &self.approved_revisions {
+            let markdown = match stage.as_str() {
+                "brief" => self.brief.as_deref(),
+                "behaviors" => self.behaviors.as_deref(),
+                "approach" => self.approach.as_deref(),
+                "plan" => self.plan.as_deref(),
+                _ => None,
+            }
+            .ok_or_else(|| WorkModelError::InvalidPlanningRevision {
+                reason: format!("approved {stage:?} revision has no planning bytes"),
+            })?;
+            let sha256 = planning_revision_digest(markdown);
+            if sha256 != approval.sha256 || approval.revision_id != format!("{stage}:{sha256}") {
+                return Err(WorkModelError::InvalidPlanningRevision {
+                    reason: format!("approved {stage:?} revision does not match planning bytes"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn to_instructions(&self) -> Option<String> {
         if let Some(combined) = non_empty_clone(&self.combined) {
             return Some(combined);
@@ -1802,6 +1887,13 @@ impl PlanningContext {
         )
         .unwrap_or(u32::MAX)
     }
+}
+
+fn planning_revision_digest(markdown: &str) -> String {
+    Sha256::digest(markdown.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Host-derived scope diagnostic recorded at Work creation.
@@ -6023,6 +6115,9 @@ pub enum WorkModelError {
     InvalidPlanningScope {
         reason: String,
     },
+    InvalidPlanningRevision {
+        reason: String,
+    },
     ReleaseContractRequired {
         work_item_id: String,
     },
@@ -6286,6 +6381,9 @@ impl fmt::Display for WorkModelError {
             }
             Self::InvalidPlanningScope { reason } => {
                 write!(f, "invalid planning scope assessment: {reason}")
+            }
+            Self::InvalidPlanningRevision { reason } => {
+                write!(f, "invalid planning revision: {reason}")
             }
             Self::ReleaseContractRequired { work_item_id } => {
                 write!(

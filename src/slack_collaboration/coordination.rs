@@ -148,22 +148,13 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .as_deref()
             .context("planning artifact is not bound to a Fluent Work Item")?;
         let checkout = &self.bound_project(thread)?.checkout.path;
-        let stage = revision.kind.as_str();
-        if !["brief", "behaviors", "approach", "plan"].contains(&stage) {
-            bail!("unknown planning artifact stage {}", revision.kind);
-        }
-        let markdown = revision.markdown.clone();
         WorkModelStore::new(checkout)
-            .mutate_work_item(work_item_id, move |work_item| {
-                let context = work_item.planning_context.get_or_insert_default();
-                match stage {
-                    "brief" => context.brief = Some(markdown),
-                    "behaviors" => context.behaviors = Some(markdown),
-                    "approach" => context.approach = Some(markdown),
-                    "plan" => context.plan = Some(markdown),
-                    _ => unreachable!("planning stage was validated before mutation"),
-                }
-                Ok(())
+            .mutate_work_item(work_item_id, |work_item| {
+                work_item.approve_planning_revision(
+                    &revision.kind,
+                    &revision.id,
+                    revision.markdown.clone(),
+                )
             })
             .with_context(|| format!("approve planning Work Item {work_item_id}"))
     }
