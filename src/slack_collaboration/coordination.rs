@@ -401,7 +401,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
         match (&event.approval_action_id, &event.approval_artifact_revision) {
             (Some(id), Some(revision)) => id == &action.id && revision == &action.artifact_revision,
             (None, None) if self.recovering_event => {
-                event.timestamp.parse::<f64>().ok() >= action.presented_at.parse::<f64>().ok()
+                slack_timestamp_is_at_or_after(&event.timestamp, &action.presented_at)
             }
             (None, None) => true,
             _ => false,
@@ -621,4 +621,35 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             approval_control: None,
         })
     }
+}
+
+fn slack_timestamp_is_at_or_after(value: &str, threshold: &str) -> bool {
+    fn parts(value: &str) -> Option<(&str, &str)> {
+        let (seconds, fraction) = value.split_once('.')?;
+        if seconds.is_empty()
+            || fraction.is_empty()
+            || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        Some((seconds, fraction))
+    }
+    let Some((value_seconds, value_fraction)) = parts(value) else {
+        return false;
+    };
+    let Some((threshold_seconds, threshold_fraction)) = parts(threshold) else {
+        return false;
+    };
+    let Ok(value_seconds) = value_seconds.parse::<u64>() else {
+        return false;
+    };
+    let Ok(threshold_seconds) = threshold_seconds.parse::<u64>() else {
+        return false;
+    };
+    if value_seconds != threshold_seconds {
+        return value_seconds > threshold_seconds;
+    }
+    let width = value_fraction.len().max(threshold_fraction.len());
+    format!("{value_fraction:0<width$}") >= format!("{threshold_fraction:0<width$}")
 }

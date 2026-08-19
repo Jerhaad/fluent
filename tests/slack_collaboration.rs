@@ -438,6 +438,38 @@ fn reconnect_applies_still_current_planning_approval() {
 }
 
 #[test]
+fn reconnect_rejects_reply_before_presented_microsecond() {
+    let (home, _checkout, config) = setup(true);
+    let mut initial = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    initial.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let mut action = pending_action(PendingActionKind::Planning);
+    action.presented_at = "1700000000.000002".into();
+    initial.request_approval("1.0", action).unwrap();
+    let mut reply = event("E2", Some("1.0"), "y");
+    reply.timestamp = "1700000000.000001".into();
+    let mut recovered = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    recovered.reconnect([reply], "reconnected".into()).unwrap();
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .is_empty()
+    );
+}
+
+#[test]
 fn reconnect_rejects_stale_or_revoked_planning_approval() {
     let (home, _checkout, mut config) = setup(true);
     write_config(home.path(), &config).unwrap();
