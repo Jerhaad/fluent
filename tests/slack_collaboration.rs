@@ -4152,7 +4152,7 @@ fn provider_reply_sanitizes_host_paths_before_persistence_and_delivery() {
             Ok((
                 "session".into(),
                 format!(
-                    "Inspect {} and /Users/runner/private/credentials.txt; keep src/module.rs and https://example.test/docs",
+                    "Inspect {} and /Users/runner/private/credentials.txt; also See </Users/runner/angle/private.txt>; keep src/module.rs and https://example.test/docs",
                     scope.checkout.join("README:1").display()
                 ),
             ))
@@ -4182,10 +4182,12 @@ fn provider_reply_sanitizes_host_paths_before_persistence_and_delivery() {
     let delivery = &runner.slack().deliveries[0].text;
     assert!(delivery.contains("README:1"));
     assert!(delivery.contains("[REDACTED_PATH]"));
+    assert!(delivery.contains("See <[REDACTED_PATH]>"));
     assert!(delivery.contains("src/module.rs"));
     assert!(delivery.contains("https://example.test/docs"));
     assert!(!delivery.contains(&checkout.path().display().to_string()));
     assert!(!delivery.contains("/Users/runner/private"));
+    assert!(!delivery.contains("/Users/runner/angle"));
 
     let thread = FileCollaborationStore::new(home.path())
         .load_thread(&runner.config, "1.0")
@@ -4194,10 +4196,12 @@ fn provider_reply_sanitizes_host_paths_before_persistence_and_delivery() {
     let persisted = &thread.conversation.last().unwrap().contribution;
     assert!(persisted.contains("README:1"));
     assert!(persisted.contains("[REDACTED_PATH]"));
+    assert!(persisted.contains("See <[REDACTED_PATH]>"));
     assert!(persisted.contains("src/module.rs"));
     assert!(persisted.contains("https://example.test/docs"));
     assert!(!persisted.contains(&checkout.path().display().to_string()));
     assert!(!persisted.contains("/Users/runner/private"));
+    assert!(!persisted.contains("/Users/runner/angle"));
 }
 
 #[test]

@@ -28,10 +28,9 @@ fn sanitize_provider_reply(reply: &str, checkout: &Path) -> String {
                     return None;
                 }
                 let begins_absolute_path = index == 0
-                    || body[..index]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|character| "=([{:'\"".contains(character));
+                    || body[..index].chars().next_back().is_some_and(|character| {
+                        !character.is_alphanumeric() && !"/\\._-".contains(character)
+                    });
                 begins_absolute_path.then_some(index)
             }) else {
                 return piece.to_owned();
@@ -41,8 +40,8 @@ fn sanitize_provider_reply(reply: &str, checkout: &Path) -> String {
                 return piece.to_owned();
             }
             let candidate_with_punctuation = &body[slash..];
-            let candidate =
-                candidate_with_punctuation.trim_end_matches([')', ']', '}', ',', ';', '\'', '"']);
+            let candidate = candidate_with_punctuation
+                .trim_end_matches([')', ']', '}', '>', ',', ';', '\'', '"', '`']);
             let punctuation = &candidate_with_punctuation[candidate.len()..];
             let replacement = roots
                 .iter()
