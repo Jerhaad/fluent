@@ -7160,7 +7160,11 @@ impl WorkModelStore {
     }
 
     pub fn create_work_item(&self, work_item: &WorkItem) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file(work_item, true, &fluent_transition_metadata())
+        let metadata = work_item
+            .authorization
+            .is_proposed()
+            .then(fluent_transition_metadata);
+        self.write_work_item_file(work_item, true, metadata.as_ref())
     }
 
     /// Create a Work Item and atomically attribute its initial lifecycle state.
@@ -7169,7 +7173,7 @@ impl WorkModelStore {
         work_item: &WorkItem,
         metadata: &DurableTransitionMetadata,
     ) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file(work_item, true, metadata)
+        self.write_work_item_file(work_item, true, Some(metadata))
     }
 
     /// Preserve approved managed input files and publish their Work Item through
@@ -7308,7 +7312,6 @@ impl WorkModelStore {
             }
         }
 
-        append_durable_transitions(None, &mut target, &fluent_transition_metadata());
         if let Err(error) = self.write_work_item_file_unchecked(&target, true) {
             let transaction_path = self.work_transaction_path(&target.id)?;
             if !item_path.exists() && !transaction_path.exists() && artifact_root.exists() {
@@ -7326,7 +7329,7 @@ impl WorkModelStore {
     }
 
     pub fn write_work_item(&self, work_item: &WorkItem) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file(work_item, false, &fluent_transition_metadata())
+        self.write_work_item_file(work_item, false, Some(&fluent_transition_metadata()))
     }
 
     /// Atomically mutate a Work Item under its per-Work-Item model lock.
@@ -7384,7 +7387,7 @@ impl WorkModelStore {
         &self,
         work_item: &WorkItem,
         create_new: bool,
-        metadata: &DurableTransitionMetadata,
+        metadata: Option<&DurableTransitionMetadata>,
     ) -> Result<(), WorkModelStorageError> {
         let path = self.work_item_path(&work_item.id)?;
         if !create_new {
@@ -7409,16 +7412,28 @@ impl WorkModelStore {
                 source: WorkModelError::TransitionLedgerModified,
             });
         }
+        let transaction_path = self.work_transaction_path(&work_item.id)?;
+        if !create_new && transaction_path.exists() {
+            return self.write_work_item_file_unchecked(work_item, false);
+        }
         let prior = if create_new {
             None
+        } else if path.exists() {
+            Some(WorkItem::from(read_json_file::<WorkItemRecord>(&path)?))
         } else {
-            Some(self.read_work_item_under_model_lock(&work_item.id)?)
+            None
         };
         let mut target = work_item.clone();
         if let Some(prior) = prior.as_ref() {
             reject_transition_history_change(prior, &target, &path)?;
         }
-        append_durable_transitions(prior.as_ref(), &mut target, metadata);
+        let transition_ledger_active = create_new
+            || prior
+                .as_ref()
+                .is_some_and(|work_item| !work_item.transitions.is_empty());
+        if let Some(metadata) = metadata.filter(|_| transition_ledger_active) {
+            append_durable_transitions(prior.as_ref(), &mut target, metadata);
+        }
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
             .storage_revision
@@ -8142,11 +8157,13 @@ fn append_durable_transitions(
         .unwrap_or(0);
     let current = durable_object_states(work_item);
     let prior_states: HashMap<_, _> = prior
-        .map(durable_object_states)
-        .unwrap_or_default()
-        .iter()
-        .map(|(object_kind, object_id, state, _)| {
-            (format!("{object_kind}:{object_id}"), state.clone())
+        .into_iter()
+        .flat_map(|item| item.transitions.iter())
+        .map(|transition| {
+            (
+                format!("{}:{}", transition.object_kind, transition.object_id),
+                transition.new_state.clone(),
+            )
         })
         .collect();
     // The aggregate already stores only emitted states. Record a fresh entry for
