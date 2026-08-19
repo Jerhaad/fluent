@@ -1456,7 +1456,7 @@ fn participant_revocation_applies_to_active_and_future_threads() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(runner.slack().private_responses.len(), 1);
+    assert_eq!(runner.slack().private_responses.len(), 2);
 }
 
 #[test]

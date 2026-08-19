@@ -201,6 +201,14 @@ fn slack_timestamp_is_at_or_after(value: &str, threshold: &str) -> bool {
     format!("{value_fraction:0<width$}") >= format!("{threshold_fraction:0<width$}")
 }
 
+pub(super) fn default_project<'a>(config: &'a RunnerConfig, destination: &str) -> Option<&'a str> {
+    config
+        .channel_defaults
+        .get(destination)
+        .or_else(|| config.direct_message_defaults.get(destination))
+        .map(String::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -227,6 +235,10 @@ mod tests {
             planning_stage: None,
             linked_work: None,
             pending_question: Some(action.id.clone()),
+            artifact_revisions: Vec::new(),
+            pending_artifact_revision: None,
+            linked_thread_intent: None,
+            conversation_inputs: Vec::new(),
             pending_action: Some(action.clone()),
             approvals: Vec::new(),
             processed_events: BTreeSet::new(),
@@ -241,6 +253,7 @@ mod tests {
             thread_timestamp: Some("1.0".into()),
             user: "U1".into(),
             text: "fluent_approval".into(),
+            change: Default::default(),
             approval_action_id: Some(action.id.clone()),
             approval_artifact_revision: Some(action.artifact_revision.clone()),
         };
@@ -269,11 +282,4 @@ mod tests {
                 .is_some_and(|question| question.contains("fresh confirmation"))
         );
     }
-
-pub(super) fn default_project<'a>(config: &'a RunnerConfig, destination: &str) -> Option<&'a str> {
-    config
-        .channel_defaults
-        .get(destination)
-        .or_else(|| config.direct_message_defaults.get(destination))
-        .map(String::as_str)
 }

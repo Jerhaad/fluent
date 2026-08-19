@@ -74,7 +74,6 @@ impl RunnerConfig {
         if self.enabled_providers.is_empty() {
             bail!("at least one conversation provider is required");
         }
-        }
         for (channel, project) in &self.channel_defaults {
             if channel.trim().is_empty() || !self.projects.contains_key(project) {
                 bail!("channel default references an unavailable configured project");

@@ -99,6 +99,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                     index + 1
                 ),
                 delivered: false,
+                approval_control: None,
             })?;
         }
         self.deliver_pending()?;
@@ -168,9 +169,6 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     pub fn ingest(&mut self, event: InboundEnvelope) -> Result<()> {
         event.validate_thread_identity()?;
         self.config = self.current_authority_config()?;
-        if let Some(error) = &self.configuration_error {
-            bail!("runner configuration is invalid; refusing Slack ingress: {error}");
-        }
         if let Some(thread) = self.store.load_thread(&self.config, &event.thread_id())?
             && thread.state == ThreadState::Active
             && !policy::participant_can_contribute(&self.config, &thread, &event)

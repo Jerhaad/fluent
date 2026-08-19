@@ -83,6 +83,11 @@ pub struct InboundEnvelope {
     pub text: String,
     #[serde(default)]
     pub change: InboundChange,
+    /// Immutable identity supplied by an approval interaction control.
+    #[serde(default)]
+    pub approval_action_id: Option<String>,
+    #[serde(default)]
+    pub approval_artifact_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -91,12 +96,6 @@ pub enum InboundChange {
     Message,
     Edit,
     Delete,
-    /// Immutable identity supplied by an approval interaction control.
-    #[serde(default)]
-    pub approval_action_id: Option<String>,
-    #[serde(default)]
-    pub approval_artifact_revision: Option<String>,
-}
 }
 
 impl InboundEnvelope {
