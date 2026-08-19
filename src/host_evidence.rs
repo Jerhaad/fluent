@@ -379,6 +379,11 @@ fn execute_focused_command(
     let temporary = scratch.join("tmp");
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&temporary)?;
+    let cargo_home = scratch.join("cargo-home");
+    crate::writer_cache::prepare_private_cargo_dependency_cache(
+        &cargo_home,
+        crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+    )?;
     let source_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .context("focused evidence requires the host HOME path for toolchain confinement")?;
@@ -425,7 +430,7 @@ fn execute_focused_command(
         .env("CFFIXED_USER_HOME", &home)
         .env("TMPDIR", &temporary)
         .env("XDG_CACHE_HOME", scratch.join("xdg-cache"))
-        .env("CARGO_HOME", scratch.join("cargo-home"))
+        .env("CARGO_HOME", &cargo_home)
         .env("CARGO_TARGET_DIR", scratch.join("cargo-target"))
         .env("CLANG_MODULE_CACHE_PATH", scratch.join("clang-modules"))
         .env("SWIFT_MODULE_CACHE_PATH", scratch.join("swift-modules"))

@@ -23527,12 +23527,20 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
     let rustup_home = tmp.path().join("rustup-home");
     fs::create_dir(&rustup_home).unwrap();
     let rustup_home = rustup_home.canonicalize().unwrap();
+    let canonical_cargo_home = tmp.path().join("canonical-cargo-home");
+    fs::create_dir_all(canonical_cargo_home.join("registry/index")).unwrap();
+    fs::write(
+        canonical_cargo_home.join("registry/index/dependency"),
+        "cached",
+    )
+    .unwrap();
+    fs::write(canonical_cargo_home.join("credentials.toml"), "secret").unwrap();
     write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
     write_mock_executable(
         &bin,
         "cargo",
         &format!(
-            "#!/bin/sh\n[ \"$RUSTUP_HOME\" = '{}' ] || exit 31\n[ \"$RUSTUP_TOOLCHAIN\" = 'stable-test-toolchain' ] || exit 32\ncase \"$CARGO_HOME\" in */scratch/cargo-home) ;; *) exit 33 ;; esac\nprintf 'toolchain-preserved\\n'\n",
+            "#!/bin/sh\n[ \"$RUSTUP_HOME\" = '{}' ] || exit 31\n[ \"$RUSTUP_TOOLCHAIN\" = 'stable-test-toolchain' ] || exit 32\ncase \"$CARGO_HOME\" in */scratch/cargo-home) ;; *) exit 33 ;; esac\n[ -f \"$CARGO_HOME/registry/index/dependency\" ] || exit 34\n[ ! -e \"$CARGO_HOME/credentials.toml\" ] || exit 35\nprintf 'toolchain-and-dependencies-preserved\\n'\n",
             rustup_home.display()
         ),
     );
@@ -23549,6 +23557,8 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("RUSTUP_HOME", &rustup_home)
         .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
+        .env("CARGO_HOME", &canonical_cargo_home)
+        .env("FLUENT_TEST_CANONICAL_CARGO_HOME", &canonical_cargo_home)
         .args([
             "attempt",
             "evidence",
@@ -23573,7 +23583,7 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
         evidence["output"]
             .as_str()
             .unwrap()
-            .contains("toolchain-preserved")
+            .contains("toolchain-and-dependencies-preserved")
     );
     assert_eq!(git_head(&project), candidate);
 }

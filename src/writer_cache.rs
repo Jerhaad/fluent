@@ -68,21 +68,25 @@ pub(crate) fn prepare_writer_dependency_cache(
     canonical_cargo_home: Option<&Path>,
 ) -> Result<()> {
     reject_symlinked_existing_components(&cache.project_root, &cache.cargo_home)?;
-    fs::create_dir_all(&cache.cargo_home).with_context(|| {
-        format!(
-            "create private Writer Cargo home {}",
-            cache.cargo_home.display()
-        )
-    })?;
+    prepare_private_cargo_dependency_cache(&cache.cargo_home, canonical_cargo_home)?;
     reject_symlinked_existing_components(&cache.project_root, &cache.cargo_home)?;
+    Ok(())
+}
 
+/// Seed only dependency stores into a private Cargo home. Callers retain an
+/// isolated writable cache without admitting host credentials or config.
+pub(crate) fn prepare_private_cargo_dependency_cache(
+    private_home: &Path,
+    canonical_cargo_home: Option<&Path>,
+) -> Result<()> {
+    fs::create_dir_all(private_home)
+        .with_context(|| format!("create private Cargo home {}", private_home.display()))?;
     if let Some(source_home) = canonical_cargo_home {
         for name in ADMITTED_CARGO_DIRS {
-            seed_dependency_tree(source_home, &cache.cargo_home, name)?;
+            seed_dependency_tree(source_home, private_home, name)?;
         }
     }
-    validate_private_cache_symlinks(&cache.cargo_home, &cache.cargo_home)?;
-    Ok(())
+    validate_private_cache_symlinks(private_home, private_home)
 }
 
 /// Reclaim stale caches and prepare one launch while holding the project cache
