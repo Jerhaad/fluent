@@ -2688,6 +2688,14 @@ fn code_reference_rejects_checkout_symlink_escape() {
 }
 
 #[test]
+fn code_reference_rejects_directory_targets() {
+    let (_home, checkout, config) = setup(true);
+    let error =
+        format_code_reference(&config.projects["app"].checkout, checkout.path(), 1).unwrap_err();
+    assert!(error.to_string().contains("not a regular file"));
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(
