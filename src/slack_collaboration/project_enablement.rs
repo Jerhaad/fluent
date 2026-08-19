@@ -58,7 +58,7 @@ pub fn decode_project_setup_state(value: Option<&str>) -> Result<Option<SlackPro
 }
 
 pub fn project_discovery_roots_path(home: &Path) -> PathBuf {
-    home.join(".config/fluent/slack-project-roots.json")
+    home.join(".config/fluent/slack/project-roots.json")
 }
 
 pub fn read_project_discovery_roots(home: &Path) -> Result<Vec<ProjectDiscoveryRoot>> {

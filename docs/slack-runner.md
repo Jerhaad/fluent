@@ -65,6 +65,19 @@ Fluent's Slack runner uses Socket Mode. It does not need a public request URL.
    to their filesystem identities. A checkout or Git directory that is
    replaced or recreated, or whose branch or commit cannot be inspected, fails
    closed until the runner owner records a new identity.
+
+   To let allowed participants enable existing, unconfigured checkouts from
+   Slack, create `~/.config/fluent/slack/project-roots.json`. Each entry names
+   one owner-approved directory, a bounded discovery depth, and its Slack
+   authority. For example:
+
+   ```json
+   [{"label":"products","path":"/absolute/projects","maximum_depth":2,"allowed_participants":["U123"],"project_approvers":["U123"]}]
+   ```
+
+   Fluent canonicalizes candidates, rejects symlink escapes, and shows only
+   the safe project and checkout labels in Slack. It never posts the configured
+   absolute directory.
 6. Before enabling Slack, register every configured checkout with the
    scheduler. `fluent scheduler run` registers its current checkout before it
    starts or checks the owner-wide scheduler service. Run these commands
@@ -150,6 +163,23 @@ displayed action and revision. Completed or revised planning artifacts follow
 the separate thread reply flow described below. A participant may contribute
 context, but only a configured project approver may use the control or approve
 a planning revision.
+
+## Enable an existing checkout
+
+An allowed participant starts project setup with:
+
+```text
+@Fluent enable project
+```
+
+Add `goal: <product goal>` to promote the same thread into the first planning
+conversation after setup. Fluent replies with safe checkout choices and the
+exact `select checkout` command. It then collects the configured coder profile
+and follow-up mode, presents the exact proposal, and waits for the displayed
+`approve setup` revision. Successful initialization produces a separate review
+of generated changes. A project approver must use the displayed `commit
+initialization` revision before Fluent creates the initialization-only commit.
+Existing Fluent checkouts skip initialization and report their configuration.
 
 ## Review planning artifacts
 
