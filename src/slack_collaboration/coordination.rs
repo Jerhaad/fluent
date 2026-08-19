@@ -715,6 +715,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             raw_reply
         };
         turn.completed_reply = Some(reply.clone());
+        let accepted_contribution = turn.contribution.clone();
         thread.pending_turn = Some(turn);
         if !thread
             .conversation_inputs
@@ -725,7 +726,7 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 event_id: event.id.clone(),
                 source_timestamp: event.timestamp.clone(),
                 actor: event.user.clone(),
-                content: event.text.clone(),
+                content: accepted_contribution,
                 corrections: Vec::new(),
                 source_deleted: false,
             });

@@ -313,6 +313,8 @@ fn queued_message_edit_replaces_unprocessed_content() {
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
     let mut thread = store.load_thread(&config, "1.0").unwrap().unwrap();
+    let mut original = event("E-original", Some("1.0"), "before");
+    original.timestamp = "2.0".into();
     thread.pending_turn = Some(PendingTurn {
         action_id: "E-original".into(),
         source_timestamp: "2.0".into(),
@@ -322,6 +324,7 @@ fn queued_message_edit_replaces_unprocessed_content() {
         provider_turn_id: None,
         completed_reply: None,
     });
+    thread.processed_events.insert(original.id.clone());
     store.save_thread(&config, &thread).unwrap();
     let mut edit = event("E2", Some("1.0"), "after");
     edit.timestamp = "2.0".into();
@@ -329,6 +332,24 @@ fn queued_message_edit_replaces_unprocessed_content() {
     runner.ingest(edit).unwrap();
     let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
     assert_eq!(reloaded.pending_turn.unwrap().contribution, "after");
+
+    let mut restarted = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    restarted.ingest(original).unwrap();
+    assert_eq!(restarted.provider().calls[0].2, "after");
+    let reloaded = store.load_thread(&config, "1.0").unwrap().unwrap();
+    assert_eq!(
+        reloaded.conversation_inputs.last().unwrap().event_id,
+        "E-original"
+    );
+    assert_eq!(
+        reloaded.conversation_inputs.last().unwrap().content,
+        "after"
+    );
 }
 
 #[test]
@@ -382,11 +403,13 @@ fn unauthorized_thread_reply_receives_private_refusal() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let deliveries_before_refusal = runner.slack().deliveries.clone();
     let mut reply = event("E2", Some("1.0"), "private thought");
     reply.user = "U2".into();
     runner.ingest(reply).unwrap();
     assert_eq!(runner.slack().private_responses.len(), 1);
     assert_eq!(runner.slack().private_responses[0].1, "U2");
+    assert_eq!(runner.slack().deliveries, deliveries_before_refusal);
 }
 
 #[test]
