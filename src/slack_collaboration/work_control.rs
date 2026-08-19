@@ -312,6 +312,8 @@ impl WorkControl {
         approver: &str,
         scheduler: &dyn WorkScheduler,
     ) -> Result<ExecutionApprovalReport> {
+        let _slice_lock = crate::lease::acquire_blocking(&self.slice_lock_path(slice_id)?)
+            .with_context(|| format!("lock approved Slice {slice_id}"))?;
         let mut slice = self
             .slice(slice_id)?
             .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;

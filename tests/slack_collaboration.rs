@@ -7172,6 +7172,81 @@ fn execution_approval_retries_the_same_request_after_scheduler_failure() {
 }
 
 #[test]
+fn concurrent_execution_approvals_share_one_frozen_request() {
+    #[derive(Default)]
+    struct RecordingScheduler {
+        requests: Mutex<Vec<WorkExecutionRequest>>,
+    }
+    impl WorkScheduler for RecordingScheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let slice_id = "slice-concurrent-execution";
+    WorkControl::new(checkout.path())
+        .approve_plan(
+            slice_id,
+            "U1",
+            &[PlannedWork::new("work-concurrent-execution", "Work")],
+        )
+        .unwrap();
+
+    let lock_path = checkout
+        .path()
+        .join(".fluent/work/slack/locks")
+        .join(format!("{slice_id}.lock"));
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    let scheduler = Arc::new(RecordingScheduler::default());
+    let barrier = Arc::new(Barrier::new(3));
+    let (sender, receiver) = mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let scheduler = Arc::clone(&scheduler);
+            let sender = sender.clone();
+            let project_root = checkout.path().to_path_buf();
+            scope.spawn(move || {
+                barrier.wait();
+                let result = WorkControl::new(project_root)
+                    .authorize_execution(slice_id, "U1", scheduler.as_ref())
+                    .map_err(|error| error.to_string());
+                sender.send(result).unwrap();
+            });
+        }
+        drop(sender);
+        barrier.wait();
+        let approvals_blocked = receiver.recv_timeout(Duration::from_millis(100)).is_err();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        assert!(
+            approvals_blocked,
+            "execution approvals must wait for the shared Slice transaction lock"
+        );
+    });
+
+    let outcomes = receiver.into_iter().collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(Result::is_ok));
+    let submitted = scheduler.requests.lock().unwrap();
+    assert_eq!(submitted.len(), 1);
+    let slice = WorkControl::new(checkout.path())
+        .slice(slice_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(slice.execution_requests, submitted.as_slice());
+}
+
+#[test]
 fn durable_work_transition_posts_detailed_thread_reply() {
     struct Scheduler;
     impl WorkScheduler for Scheduler {
