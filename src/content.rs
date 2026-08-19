@@ -769,6 +769,24 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn bundled_tests_review_matches_final_tester_order() {
+        let content = bundled_skill_content("review-tests/references/tests.md")
+            .expect("review-tests testing reference should be bundled");
+        assert!(content.contains(
+            "domain review intentionally runs before\n\
+             the canonical final Tester"
+        ));
+        assert!(content.contains(
+            "Do not fail a review solely because the full\n\
+             configured suite has not yet run for that candidate"
+        ));
+        assert!(content.contains(
+            "Baseline-covered failures\n\
+             are not candidate regressions"
+        ));
+    }
+
+    #[test]
     fn bundled_skill_names_lists_all_skills() {
         let names = bundled_skill_names();
         assert!(
