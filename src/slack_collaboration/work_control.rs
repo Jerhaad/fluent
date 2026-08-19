@@ -89,12 +89,30 @@ pub enum SliceStage {
     Complete,
 }
 
+/// Durable progress for one approved plan's Work materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanApprovalState {
+    Materializing,
+    Complete,
+}
+
+impl Default for PlanApprovalState {
+    fn default() -> Self {
+        Self::Complete
+    }
+}
+
 /// Durable Slice-to-Work binding, stored beside the bound project's Work model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SliceWork {
     pub id: String,
     pub approved_by: String,
     pub work_item_ids: Vec<String>,
+    #[serde(default)]
+    pub planned_work: Vec<PlannedWork>,
+    #[serde(default)]
+    pub approval_state: PlanApprovalState,
     #[serde(default)]
     pub execution_requests: Vec<WorkExecutionRequest>,
     #[serde(default)]
@@ -206,15 +224,39 @@ impl WorkControl {
         {
             bail!("approved plan Work Items must have unique non-empty identifiers and titles");
         }
-        if let Some(existing) = self.slice(slice_id)? {
-            if existing.work_item_ids == ids && existing.approved_by == approver {
+        for id in &ids {
+            validate_work_item_id(id)?;
+        }
+        let mut slice = if let Some(existing) = self.slice(slice_id)? {
+            let same_plan = existing.work_item_ids == ids
+                && existing.approved_by == approver
+                && (existing.planned_work.is_empty() || existing.planned_work == planned_work);
+            if !same_plan {
+                bail!("Slice {slice_id:?} already has a different approved plan");
+            }
+            if existing.approval_state == PlanApprovalState::Complete {
                 return Ok(ApprovedPlanReport {
                     slice_id: existing.id,
                     work_item_ids: existing.work_item_ids,
                 });
             }
-            bail!("Slice {slice_id:?} already has a different approved plan");
-        }
+            existing
+        } else {
+            let staged = SliceWork {
+                id: slice_id.into(),
+                approved_by: approver.into(),
+                work_item_ids: ids.clone(),
+                planned_work: planned_work.to_vec(),
+                approval_state: PlanApprovalState::Materializing,
+                execution_requests: Vec::new(),
+                acknowledged_request_ids: Vec::new(),
+                transitions: Vec::new(),
+                observed_states: BTreeMap::new(),
+                transition_cursors: BTreeMap::new(),
+            };
+            self.save_slice(&staged)?;
+            staged
+        };
 
         let store = WorkModelStore::new(&self.project_root);
         let metadata = DurableTransitionMetadata {
@@ -223,28 +265,38 @@ impl WorkControl {
             evidence_ref: Some(format!("slack-slice:{slice_id}")),
         };
         for work in planned_work {
+            let path = store.work_item_path(&work.id)?;
+            if path.exists() {
+                let existing = store.read_work_item(&work.id).with_context(|| {
+                    format!("inspect planned Work Item {} for Slice {slice_id}", work.id)
+                })?;
+                if !approved_work_matches(&existing, work, &metadata) {
+                    bail!(
+                        "planned Work Item {} already exists outside Slice {slice_id}",
+                        work.id
+                    );
+                }
+            }
+        }
+        for work in planned_work {
             let item = WorkItem {
                 id: work.id.clone(),
                 title: work.title.clone(),
                 authorization: ExecutionAuthorization::Proposed,
                 ..WorkItem::default()
             };
-            store
-                .create_work_item_with_transition(&item, &metadata)
-                .with_context(|| {
-                    format!("create planned Work Item {} for Slice {slice_id}", work.id)
-                })?;
+            if let Err(create_error) = store.create_work_item_with_transition(&item, &metadata) {
+                match store.read_work_item(&work.id) {
+                    Ok(existing) if approved_work_matches(&existing, work, &metadata) => {}
+                    _ => {
+                        return Err(create_error).with_context(|| {
+                            format!("create planned Work Item {} for Slice {slice_id}", work.id)
+                        });
+                    }
+                }
+            }
         }
-        let slice = SliceWork {
-            id: slice_id.into(),
-            approved_by: approver.into(),
-            work_item_ids: ids.clone(),
-            execution_requests: Vec::new(),
-            acknowledged_request_ids: Vec::new(),
-            transitions: Vec::new(),
-            observed_states: BTreeMap::new(),
-            transition_cursors: BTreeMap::new(),
-        };
+        slice.approval_state = PlanApprovalState::Complete;
         self.save_slice(&slice)?;
         Ok(ApprovedPlanReport {
             slice_id: slice_id.into(),
@@ -261,6 +313,9 @@ impl WorkControl {
         let mut slice = self
             .slice(slice_id)?
             .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        if slice.approval_state != PlanApprovalState::Complete {
+            bail!("approved Slice {slice_id} is still materializing its planned Work");
+        }
         let store = WorkModelStore::new(&self.project_root);
         let mut outcomes = Vec::with_capacity(slice.work_item_ids.len());
         for work_item_id in &slice.work_item_ids {
@@ -432,7 +487,11 @@ impl WorkControl {
         let store = WorkModelStore::new(&self.project_root);
         let mut reported = Vec::new();
         for work_item_id in &slice.work_item_ids {
-            let item = store.read_work_item(work_item_id)?;
+            let item = match store.read_work_item(work_item_id) {
+                Ok(item) => item,
+                Err(_) if slice.approval_state == PlanApprovalState::Materializing => continue,
+                Err(error) => return Err(error.into()),
+            };
             let cursor = slice
                 .transition_cursors
                 .get(work_item_id)
@@ -474,7 +533,11 @@ impl WorkControl {
         let store = WorkModelStore::new(&self.project_root);
         let mut pending = Vec::new();
         for work_item_id in &slice.work_item_ids {
-            let item = store.read_work_item(work_item_id)?;
+            let item = match store.read_work_item(work_item_id) {
+                Ok(item) => item,
+                Err(_) if slice.approval_state == PlanApprovalState::Materializing => continue,
+                Err(error) => return Err(error.into()),
+            };
             let cursor = slice
                 .transition_cursors
                 .get(work_item_id)
@@ -721,6 +784,25 @@ fn project_durable_transition(
             })
             .unwrap_or_default(),
     }
+}
+
+fn approved_work_matches(
+    item: &WorkItem,
+    planned: &PlannedWork,
+    metadata: &DurableTransitionMetadata,
+) -> bool {
+    item.id == planned.id
+        && item.title == planned.title
+        && item.authorization.is_proposed()
+        && item.transitions.iter().any(|transition| {
+            transition.object_kind == "work-item"
+                && transition.object_id == planned.id
+                && transition.old_state.is_none()
+                && transition.new_state == "planned"
+                && transition.origin == metadata.origin
+                && transition.reason == metadata.reason
+                && transition.evidence_ref == metadata.evidence_ref
+        })
 }
 
 fn validate_slice_id(slice_id: &str) -> Result<()> {

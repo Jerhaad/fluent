@@ -6559,6 +6559,131 @@ fn approved_plan_creates_reported_work_without_execution() {
 }
 
 #[test]
+fn plan_approval_resumes_after_partial_materialization() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let blocked_path = checkout
+        .path()
+        .join(".fluent/work/transactions/work-retry-second.json");
+    fs::create_dir_all(&blocked_path).unwrap();
+    let planned_work = [
+        PlannedWork::new("work-retry-first", "First"),
+        PlannedWork::new("work-retry-second", "Second"),
+    ];
+
+    let error = control
+        .approve_plan("slice-retry-plan", "U1", &planned_work)
+        .unwrap_err();
+    assert!(error.to_string().contains("work-retry-second"));
+
+    let staged_path = checkout
+        .path()
+        .join(".fluent/work/slack/slices/slice-retry-plan.json");
+    let staged: serde_json::Value =
+        serde_json::from_slice(&fs::read(&staged_path).unwrap()).unwrap();
+    assert_eq!(staged["approval_state"], "materializing");
+    assert_eq!(
+        staged["planned_work"],
+        serde_json::to_value(&planned_work).unwrap()
+    );
+    assert_eq!(
+        staged["work_item_ids"],
+        serde_json::json!(["work-retry-first", "work-retry-second"])
+    );
+    let first = store.read_work_item("work-retry-first").unwrap();
+    assert_eq!(first.transitions.len(), 1);
+    assert_eq!(
+        first.transitions[0].evidence_ref.as_deref(),
+        Some("slack-slice:slice-retry-plan")
+    );
+    let first_report = control
+        .reconcile_durable_transitions("slice-retry-plan")
+        .unwrap();
+    assert_eq!(first_report.len(), 1);
+    assert_eq!(first_report[0].work_item_id, "work-retry-first");
+    let changed_retry = control
+        .approve_plan(
+            "slice-retry-plan",
+            "U1",
+            &[
+                PlannedWork::new("work-retry-first", "Changed"),
+                PlannedWork::new("work-retry-second", "Second"),
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        changed_retry
+            .to_string()
+            .contains("already has a different approved plan")
+    );
+
+    fs::remove_dir(&blocked_path).unwrap();
+    let report = control
+        .approve_plan("slice-retry-plan", "U1", &planned_work)
+        .unwrap();
+    assert_eq!(
+        report.work_item_ids,
+        ["work-retry-first", "work-retry-second"]
+    );
+    let completed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&staged_path).unwrap()).unwrap();
+    assert_eq!(completed["approval_state"], "complete");
+
+    let transitions = control
+        .reconcile_durable_transitions("slice-retry-plan")
+        .unwrap();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].work_item_id, "work-retry-second");
+    assert!(transitions.iter().all(|entry| entry.new_state == "planned"));
+    control
+        .approve_plan("slice-retry-plan", "U1", &planned_work)
+        .unwrap();
+    assert_eq!(store.list_work_items().unwrap().len(), 2);
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-retry-plan")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn plan_approval_detects_conflicts_before_publishing_work() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    store
+        .create_work_item(&fluent::work_model::WorkItem {
+            id: "work-existing".into(),
+            title: "Existing".into(),
+            authorization: fluent::work_model::ExecutionAuthorization::Proposed,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let error = control
+        .approve_plan(
+            "slice-conflict",
+            "U1",
+            &[
+                PlannedWork::new("work-new", "New"),
+                PlannedWork::new("work-existing", "Existing"),
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("already exists outside Slice slice-conflict")
+    );
+    assert!(store.read_work_item("work-new").is_err());
+    assert_eq!(store.list_work_items().unwrap().len(), 1);
+    let staged = control.slice("slice-conflict").unwrap().unwrap();
+    assert_eq!(staged.approval_state, PlanApprovalState::Materializing);
+}
+
+#[test]
 fn slice_identifiers_stay_inside_the_slice_store() {
     let (_home, checkout, _config) = setup(true);
     let control = WorkControl::new(checkout.path());
