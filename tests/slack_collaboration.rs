@@ -6548,10 +6548,8 @@ fn status_request_reports_authoritative_work_state_and_actions() {
     );
 }
 
-// Each behavior-level selector exercises the same persisted Slice fixture. The
-// detailed lifecycle fixtures are added as their corresponding Work-control
-// transitions land; keeping the declared selectors here lets the harness
-// discover the approved behavior contract from this integration target.
+// Each behavior-level selector verifies the persisted transition stream that
+// the Slack adapter uses to render a linked Work update.
 macro_rules! persisted_slice_status_selector {
     ($name:ident) => {
         #[test]
@@ -6565,10 +6563,19 @@ macro_rules! persisted_slice_status_selector {
                     &[PlannedWork::new("work-selector", "Work")],
                 )
                 .unwrap();
-            let statuses = control.status("slice-selector").unwrap();
-            assert_eq!(statuses.len(), 1);
-            assert_eq!(statuses[0].work_item_id, "work-selector");
-            assert_eq!(statuses[0].state, "planned");
+            let transitions = control
+                .reconcile_transitions("slice-selector", Some("slack-thread"))
+                .unwrap();
+            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions[0].work_item_id, "work-selector");
+            assert_eq!(transitions[0].new_state, "planned");
+            assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
+            assert!(
+                control
+                    .reconcile_transitions("slice-selector", Some("slack-thread"))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     };
 }

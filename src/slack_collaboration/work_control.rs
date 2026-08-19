@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -75,6 +76,23 @@ pub struct SliceWork {
     pub work_item_ids: Vec<String>,
     #[serde(default)]
     pub execution_requests: Vec<WorkExecutionRequest>,
+    #[serde(default)]
+    pub transitions: Vec<WorkTransition>,
+    #[serde(default)]
+    observed_states: BTreeMap<String, String>,
+}
+
+/// A bounded, ordered status change observed from the authoritative Work
+/// aggregate. The originating actor stays optional because direct Fluent
+/// mutations do not always carry one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkTransition {
+    pub sequence: u64,
+    pub work_item_id: String,
+    pub old_state: Option<String>,
+    pub new_state: String,
+    pub origin: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// Materializes approved plans without starting execution, then independently
@@ -135,6 +153,8 @@ impl WorkControl {
             approved_by: approver.into(),
             work_item_ids: ids.clone(),
             execution_requests: Vec::new(),
+            transitions: Vec::new(),
+            observed_states: BTreeMap::new(),
         };
         self.save_slice(&slice)?;
         Ok(ApprovedPlanReport {
@@ -254,6 +274,43 @@ impl WorkControl {
                 })
             })
             .collect()
+    }
+
+    /// Reconcile the persisted Work aggregate into an append-only Slice
+    /// transition stream. A repeated poll after no Work mutation emits nothing.
+    pub fn reconcile_transitions(
+        &self,
+        slice_id: &str,
+        origin: Option<&str>,
+    ) -> Result<Vec<WorkTransition>> {
+        let mut slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let statuses = self.status(slice_id)?;
+        let mut appended = Vec::new();
+        for status in statuses {
+            let old_state = slice.observed_states.get(&status.work_item_id).cloned();
+            if old_state.as_deref() == Some(&status.state) {
+                continue;
+            }
+            let transition = WorkTransition {
+                sequence: slice.transitions.len() as u64 + 1,
+                work_item_id: status.work_item_id.clone(),
+                old_state,
+                new_state: status.state.clone(),
+                origin: origin.map(str::to_owned),
+                reason: Some(status.next_action),
+            };
+            slice
+                .observed_states
+                .insert(status.work_item_id, status.state);
+            slice.transitions.push(transition.clone());
+            appended.push(transition);
+        }
+        if !appended.is_empty() {
+            self.save_slice(&slice)?;
+        }
+        Ok(appended)
     }
 
     fn save_slice(&self, slice: &SliceWork) -> Result<()> {
