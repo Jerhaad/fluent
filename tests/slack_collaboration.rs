@@ -414,11 +414,18 @@ fn reconnect_applies_still_current_planning_approval() {
         InMemorySlack::default(),
     );
     runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
-    let action = pending_action(PendingActionKind::Planning);
-    runner.request_approval("1.0", action.clone()).unwrap();
-    runner
-        .reconnect([approval_event("E2", "y", &action)], "reconnected".into())
-        .unwrap();
+    let mut action = pending_action(PendingActionKind::Planning);
+    action.presented_at = "1.5".into();
+    runner.request_approval("1.0", action).unwrap();
+    let mut recovered = event("E2", Some("1.0"), "y");
+    recovered.timestamp = "2.0".into();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.reconnect([recovered], "reconnected".into()).unwrap();
     assert_eq!(
         FileCollaborationStore::new(home.path())
             .load_thread(&config, "1.0")
@@ -445,6 +452,12 @@ fn reconnect_rejects_stale_or_revoked_planning_approval() {
     let mut replacement = stale.clone();
     replacement.artifact_revision = "revision-2".into();
     runner.request_approval("1.0", replacement).unwrap();
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
     runner
         .reconnect([approval_event("E2", "y", &stale)], "reconnected".into())
         .unwrap();
@@ -501,6 +514,12 @@ fn reconnect_reconfirms_delayed_consequential_action() {
         runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
         let action = pending_action(kind);
         runner.request_approval("1.0", action.clone()).unwrap();
+        let mut runner = CollaborationRunner::new(
+            home.path(),
+            config.clone(),
+            InMemoryProvider::default(),
+            InMemorySlack::default(),
+        );
         runner
             .reconnect([approval_event("E2", "y", &action)], "reconnected".into())
             .unwrap();

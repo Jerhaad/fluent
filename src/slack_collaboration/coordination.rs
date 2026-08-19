@@ -400,7 +400,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
     ) -> bool {
         match (&event.approval_action_id, &event.approval_artifact_revision) {
             (Some(id), Some(revision)) => id == &action.id && revision == &action.artifact_revision,
-            (None, None) => !self.recovering_event,
+            (None, None) if self.recovering_event => {
+                event.timestamp.parse::<f64>().ok() >= action.presented_at.parse::<f64>().ok()
+            }
+            (None, None) => true,
             _ => false,
         }
     }
