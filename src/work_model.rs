@@ -7375,8 +7375,8 @@ impl WorkModelStore {
                 source,
             })?;
         reject_transition_history_change(&prior, &work_item, &path)?;
-        if !prior.transitions.is_empty() {
-            append_durable_transitions(Some(&prior), &mut work_item, metadata);
+        if work_item != prior {
+            append_transition_ledger(&prior, &mut work_item, metadata);
         }
         work_item
             .validate()
@@ -7429,12 +7429,14 @@ impl WorkModelStore {
         if let Some(prior) = prior.as_ref() {
             preserve_transition_history(prior, &mut target, &path)?;
         }
-        let transition_ledger_active = create_new
-            || prior
-                .as_ref()
-                .is_some_and(|work_item| !work_item.transitions.is_empty());
-        if let Some(metadata) = metadata.filter(|_| transition_ledger_active) {
-            append_durable_transitions(prior.as_ref(), &mut target, metadata);
+        if let Some(metadata) = metadata {
+            match prior.as_ref() {
+                Some(prior) if target != *prior => {
+                    append_transition_ledger(prior, &mut target, metadata);
+                }
+                None if create_new => append_durable_transitions(None, &mut target, metadata),
+                _ => {}
+            }
         }
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
@@ -8143,6 +8145,36 @@ fn preserve_transition_history(
         return Ok(());
     }
     reject_transition_history_change(prior, proposed, path)
+}
+
+/// Append the current mutation, activating a legacy aggregate's ledger first.
+///
+/// An empty persisted ledger predates transition recording, so it cannot prove
+/// that the aggregate has never changed. Snapshot every durable object state
+/// with an unknown historical origin, then derive the caller-attributed change
+/// from that snapshot. Both sets of entries persist in the mutation's single
+/// aggregate transaction.
+fn append_transition_ledger(
+    prior: &WorkItem,
+    work_item: &mut WorkItem,
+    metadata: &DurableTransitionMetadata,
+) {
+    if prior.transitions.is_empty() {
+        let mut baseline = prior.clone();
+        append_durable_transitions(
+            None,
+            &mut baseline,
+            &DurableTransitionMetadata {
+                origin: DurableTransitionOrigin::Unknown,
+                reason: None,
+                evidence_ref: None,
+            },
+        );
+        work_item.transitions.clone_from(&baseline.transitions);
+        append_durable_transitions(Some(&baseline), work_item, metadata);
+    } else {
+        append_durable_transitions(Some(prior), work_item, metadata);
+    }
 }
 
 fn append_durable_transitions(

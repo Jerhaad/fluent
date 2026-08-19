@@ -6758,6 +6758,144 @@ fn direct_work_item_writes_append_lifecycle_transitions() {
 }
 
 #[test]
+fn legacy_empty_ledger_activates_on_first_post_upgrade_mutation() {
+    let (_home, checkout, _config) = setup(true);
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let legacy = fluent::work_model::WorkItem {
+        id: "legacy-work".into(),
+        title: "Legacy work".into(),
+        attempts: vec![fluent::work_model::Attempt {
+            id: "attempt-legacy".into(),
+            work_item_id: "legacy-work".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    store.create_work_item(&legacy).unwrap();
+    assert!(
+        store
+            .read_work_item("legacy-work")
+            .unwrap()
+            .transitions
+            .is_empty(),
+        "the compatibility creation path models a pre-ledger aggregate"
+    );
+
+    store
+        .mutate_work_item("legacy-work", |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+
+    let transitions = store.read_work_item("legacy-work").unwrap().transitions;
+    assert_eq!(transitions.len(), 3);
+    assert_eq!(transitions[0].sequence, 1);
+    assert_eq!(transitions[0].object_kind, "work-item");
+    assert_eq!(transitions[0].new_state, "authorized");
+    assert_eq!(
+        transitions[0].origin,
+        fluent::work_model::DurableTransitionOrigin::Unknown,
+        "the migrated initial state has no attributable historical origin"
+    );
+    assert_eq!(transitions[1].sequence, 2);
+    assert_eq!(transitions[1].object_kind, "attempt");
+    assert_eq!(transitions[1].object_id, "attempt-legacy");
+    assert_eq!(transitions[1].new_state, "planned");
+    assert_eq!(
+        transitions[1].origin,
+        fluent::work_model::DurableTransitionOrigin::Unknown
+    );
+    assert_eq!(transitions[2].sequence, 3);
+    assert_eq!(transitions[2].object_kind, "attempt");
+    assert_eq!(transitions[2].object_id, "attempt-legacy");
+    assert_eq!(transitions[2].old_state.as_deref(), Some("planned"));
+    assert_eq!(transitions[2].new_state, "executing");
+    assert_eq!(
+        transitions[2].origin,
+        fluent::work_model::DurableTransitionOrigin::Fluent
+    );
+}
+
+#[test]
+fn legacy_empty_ledger_activates_on_first_whole_aggregate_write() {
+    let (_home, checkout, _config) = setup(true);
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let legacy = fluent::work_model::WorkItem {
+        id: "legacy-whole-write".into(),
+        title: "Legacy work".into(),
+        ..Default::default()
+    };
+    store.create_work_item(&legacy).unwrap();
+
+    let mut changed = store.read_work_item("legacy-whole-write").unwrap();
+    changed.attempts.push(fluent::work_model::Attempt {
+        id: "attempt-whole-write".into(),
+        work_item_id: changed.id.clone(),
+        status: fluent::work_model::AttemptStatus::Executing,
+        ..Default::default()
+    });
+    store.write_work_item(&changed).unwrap();
+
+    let transitions = store
+        .read_work_item("legacy-whole-write")
+        .unwrap()
+        .transitions;
+    assert_eq!(transitions.len(), 2);
+    assert_eq!(transitions[0].object_kind, "work-item");
+    assert_eq!(
+        transitions[0].origin,
+        fluent::work_model::DurableTransitionOrigin::Unknown
+    );
+    assert_eq!(transitions[1].object_kind, "attempt");
+    assert_eq!(transitions[1].object_id, "attempt-whole-write");
+    assert_eq!(
+        transitions[1].origin,
+        fluent::work_model::DurableTransitionOrigin::Fluent
+    );
+}
+
+#[test]
+fn legacy_empty_ledger_still_rejects_forged_history() {
+    let (_home, checkout, _config) = setup(true);
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let legacy = fluent::work_model::WorkItem {
+        id: "legacy-forged".into(),
+        title: "Legacy work".into(),
+        ..Default::default()
+    };
+    store.create_work_item(&legacy).unwrap();
+
+    let error = store
+        .mutate_work_item("legacy-forged", |item| {
+            item.transitions
+                .push(fluent::work_model::DurableWorkTransition {
+                    sequence: 1,
+                    object_kind: "work-item".into(),
+                    object_id: item.id.clone(),
+                    old_state: None,
+                    new_state: "forged".into(),
+                    occurred_at: "2026-08-18T00:00:00Z".into(),
+                    elapsed_seconds: None,
+                    origin: fluent::work_model::DurableTransitionOrigin::External,
+                    reason: None,
+                    evidence_ref: None,
+                });
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(error.to_string().contains("append-only and host-owned"));
+    assert!(
+        store
+            .read_work_item("legacy-forged")
+            .unwrap()
+            .transitions
+            .is_empty()
+    );
+}
+
+#[test]
 fn transition_history_is_immutable_and_metadata_is_atomic() {
     let (_home, checkout, _config) = setup(true);
     let control = WorkControl::new(checkout.path());
@@ -7313,6 +7451,62 @@ fn durable_transition_ledger_replays_once_per_slack_cursor() {
     assert!(
         control
             .reconcile_durable_transitions("slice-ledger")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn legacy_empty_ledger_replays_initial_and_current_transition_once() {
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-legacy-ledger",
+            "U1",
+            &[PlannedWork::new("work-legacy-ledger", "Legacy Work")],
+        )
+        .unwrap();
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    let item_path = store.work_item_path("work-legacy-ledger").unwrap();
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&item_path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("transitions");
+    fs::write(&item_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    control
+        .authorize_execution("slice-legacy-ledger", "U1", &Scheduler)
+        .unwrap();
+    let transitions = control
+        .reconcile_durable_transitions("slice-legacy-ledger")
+        .unwrap();
+    assert_eq!(
+        transitions
+            .iter()
+            .map(|transition| transition.new_state.as_str())
+            .collect::<Vec<_>>(),
+        vec!["planned", "authorized"]
+    );
+    assert_eq!(
+        transitions[0].origin,
+        fluent::work_model::DurableTransitionOrigin::Unknown
+    );
+    assert_eq!(
+        transitions[1].origin,
+        fluent::work_model::DurableTransitionOrigin::SlackThread
+    );
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-legacy-ledger")
             .unwrap()
             .is_empty()
     );
