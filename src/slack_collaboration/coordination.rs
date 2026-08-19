@@ -863,10 +863,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .project_label
             .as_deref()
             .context("thread is unbound")?;
-        self.config
+        let project = self.config
             .projects
             .get(label)
-            .context("thread project no longer configured")
+            .context("thread project no longer configured")?;
+        if !checkout_is_available(&project.checkout) {
+            bail!("bound checkout is unavailable; provider access stopped without rebinding");
+        }
+        Ok(project)
     }
     fn queue_reply(&self, event: &InboundEnvelope, text: &str) -> Result<()> {
         let delivery = OutboundDelivery {

@@ -2519,6 +2519,19 @@ fn local_code_reference_uses_labeled_slack_fallback() {
     assert!(reference.contains("dirty local source"));
     assert!(!reference.contains(&checkout.path().display().to_string()));
 }
+
+#[test]
+fn unavailable_bound_checkout_fails_closed_without_rebinding() {
+    let (home, checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(home.path(), config, InMemoryProvider::default(), InMemorySlack::default());
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    fs::remove_dir_all(checkout.path().join(".git")).unwrap();
+    let error = runner.ingest(event("E2", Some("1.0"), "inspect code")).unwrap_err();
+    assert!(error.to_string().contains("bound checkout is unavailable"));
+    assert_eq!(runner.provider().calls.len(), 1);
+    let thread = FileCollaborationStore::new(home.path()).load_thread(&runner.config, "1.0").unwrap().unwrap();
+    assert_eq!(thread.project_label.as_deref(), Some("app"));
+}
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
     let (home, checkout, config) = setup(true);
