@@ -52,7 +52,9 @@ impl RunnerConfig {
                 bail!("project {key} has an incomplete checkout identity");
             }
             if project.allowed_participants.is_empty()
-                || !project.project_approvers.is_subset(&project.allowed_participants)
+                || !project
+                    .project_approvers
+                    .is_subset(&project.allowed_participants)
             {
                 bail!("project {key} has incomplete participant or approver authority");
             }

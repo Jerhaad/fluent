@@ -511,7 +511,8 @@ impl SlackTransport for InMemorySlack {
         Ok(())
     }
     fn respond_private(&mut self, channel: &str, user: &str, text: &str) -> Result<()> {
-        self.private_responses.push((channel.into(), user.into(), text.into()));
+        self.private_responses
+            .push((channel.into(), user.into(), text.into()));
         Ok(())
     }
 }
