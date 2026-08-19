@@ -6620,6 +6620,102 @@ fn status_message_uses_current_durable_slice_projection() {
     assert!(message.contains("Await execution approval"));
 }
 
+#[test]
+fn actionable_work_replies_offer_recovery_and_review_without_github_mutation() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    let transition = WorkTransition {
+        sequence: 7,
+        work_item_id: "work-7".into(),
+        old_state: Some("reviewing".into()),
+        new_state: "ready".into(),
+        origin: Some("scheduler".into()),
+        reason: Some("Review candidate".into()),
+        object_kind: "merge-candidate".into(),
+        occurred_at: Some("2026-08-18T00:00:00Z".into()),
+        elapsed_seconds: Some(12),
+    };
+    let reply = control.render_actionable_transition(
+        &transition,
+        &["tests/output/candidate.log".into()],
+        Some("https://github.com/acme/app"),
+    );
+    assert!(reply.contains("Candidate is ready for review"));
+    assert!(reply.contains("https://github.com/acme/app/commit/work-7"));
+    assert!(reply.contains("optionally creating a pull request"));
+    assert!(reply.contains("Elapsed: 12s"));
+
+    let needs_user = WorkTransition {
+        new_state: "needs-user".into(),
+        ..transition.clone()
+    };
+    assert!(
+        control
+            .render_actionable_transition(&needs_user, &[], None)
+            .contains("requested recovery decision")
+    );
+    let failed = WorkTransition {
+        new_state: "failed".into(),
+        ..transition
+    };
+    assert!(
+        control
+            .render_actionable_transition(&failed, &["failure.log".into()], None)
+            .contains("permitted recovery action")
+    );
+}
+
+#[test]
+fn completed_slice_stays_complete_for_observation_and_offers_linked_work() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-complete",
+            "U1",
+            &[PlannedWork::new("work-complete", "Work")],
+        )
+        .unwrap();
+    let store = fluent::work_model::WorkModelStore::new(checkout.path());
+    store
+        .mutate_work_item("work-complete", |item| {
+            item.attempts.push(fluent::work_model::Attempt {
+                id: "attempt-complete".into(),
+                work_item_id: item.id.clone(),
+                status: fluent::work_model::AttemptStatus::Complete,
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-complete").unwrap(),
+        SliceStage::Complete
+    );
+    assert!(
+        control
+            .render_optional_observation("slice-complete", "observation-1")
+            .unwrap()
+            .contains("remains complete")
+    );
+    assert!(
+        control
+            .linked_slice_offer("slice-complete", "Add another feature")
+            .unwrap()
+            .contains("Start linked Slice")
+    );
+    store
+        .mutate_work_item("work-complete", |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-complete").unwrap(),
+        SliceStage::Active
+    );
+}
+
 // Each behavior-level selector verifies the persisted transition stream that
 // the Slack adapter uses to render a linked Work update.
 macro_rules! persisted_slice_status_selector {

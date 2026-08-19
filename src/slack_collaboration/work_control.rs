@@ -425,14 +425,23 @@ impl WorkControl {
     }
 
     pub fn slice_stage(&self, slice_id: &str) -> Result<SliceStage> {
-        let statuses = self.status(slice_id)?;
-        Ok(
-            if !statuses.is_empty() && statuses.iter().all(|status| status.state == "complete") {
-                SliceStage::Complete
-            } else {
-                SliceStage::Active
-            },
-        )
+        let slice = self
+            .slice(slice_id)?
+            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
+        let store = WorkModelStore::new(&self.project_root);
+        let mut completed = !slice.work_item_ids.is_empty();
+        for work_item_id in &slice.work_item_ids {
+            let item = store.read_work_item(work_item_id)?;
+            completed &= matches!(
+                item.attempts.last().map(|attempt| &attempt.status),
+                Some(crate::work_model::AttemptStatus::Complete)
+            );
+        }
+        Ok(if completed {
+            SliceStage::Complete
+        } else {
+            SliceStage::Active
+        })
     }
 
     /// Render the pinned thread status from durable model state. The caller
@@ -483,6 +492,41 @@ impl WorkControl {
             _ => {}
         }
         reply
+    }
+
+    /// Preserve a completed Slice and offer an explicit linked conversation for
+    /// newly requested product work. This does not create or authorize Work.
+    pub fn linked_slice_offer(
+        &self,
+        completed_slice_id: &str,
+        requested_work: &str,
+    ) -> Result<String> {
+        if self.slice_stage(completed_slice_id)? != SliceStage::Complete {
+            bail!("Slice {completed_slice_id:?} is not complete");
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"fluent-slack-linked-slice-v1\0");
+        hasher.update(completed_slice_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(requested_work.as_bytes());
+        Ok(format!(
+            "Slice {completed_slice_id} remains complete. Start linked Slice slice-{:x} for the requested product Work?",
+            hasher.finalize()
+        ))
+    }
+
+    /// Report an optional post-land Observation without changing Slice stage.
+    pub fn render_optional_observation(
+        &self,
+        slice_id: &str,
+        observation_ref: &str,
+    ) -> Result<String> {
+        if self.slice_stage(slice_id)? != SliceStage::Complete {
+            bail!("optional Observations do not close an active Slice");
+        }
+        Ok(format!(
+            "Slice {slice_id} remains complete. Observation: {observation_ref}."
+        ))
     }
 
     fn save_slice(&self, slice: &SliceWork) -> Result<()> {
