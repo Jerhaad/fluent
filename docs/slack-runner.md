@@ -163,10 +163,11 @@ deliver `message.im` events and grant the `im:history` scope.
 ## Provider policy and recovery
 
 `default_provider` selects the provider for a new thread; omit a selection to
-use it. `enabled_providers` is an allowlist and `project_approvers` identifies
-the participants who may switch a recovered thread. The currently supported
-runner adapter is `codex`; do not list `claude` until a Claude adapter is
-installed for this runner.
+use it. `enabled_providers` is an allowlist. The currently supported runner
+adapter is `codex`; do not list `claude` until a Claude adapter is installed
+for this runner. `project_approvers` reserves the approver role for a future
+interrupted-thread provider-switch action; it does not grant a Slack command
+in the current runner.
 
 To select a provider explicitly, include its allowed name in the opening
 mention. For example:
@@ -176,8 +177,9 @@ mention. For example:
 ```
 
 The requested name must appear in the project's `enabled_providers` list. The
-runner validates it before binding a thread. Provider switching requires an
-interrupted thread and an approver; future adapters will expose that action in
-the Slack workflow. If the exact bound checkout disappears or its identity
-changes, Fluent stops provider access, reports the unavailable binding, and
-never substitutes another checkout automatically.
+runner validates it before binding a thread. The current runner does not expose
+a Slack provider-switch action or automatic provider retry. If a provider
+cannot continue, preserve the thread and ask the runner owner to restore the
+provider before continuing. If the exact bound checkout disappears or its
+identity changes, Fluent stops provider access, reports the unavailable binding,
+and never substitutes another checkout automatically.
