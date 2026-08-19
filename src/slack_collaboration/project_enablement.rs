@@ -124,6 +124,20 @@ pub struct InitGeneratedChange {
     pub path: String,
     pub before: Option<Vec<u8>>,
     pub after: Option<Vec<u8>>,
+    pub before_mode: Option<String>,
+    pub after_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEntry {
+    bytes: Vec<u8>,
+    mode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CheckoutSnapshot {
+    entries: BTreeMap<PathBuf, SnapshotEntry>,
+    directories: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +301,7 @@ pub fn approve_slack_project_setup(
         }
         Err(error) => {
             let diagnostic = error.to_string();
+            restore_checkout(&entry.path, &before)?;
             Ok(SlackSetupOutcome::PreflightFailed {
                 boundary: classify_init_boundary(&diagnostic).into(),
                 recovery: diagnostic,
@@ -340,7 +355,11 @@ pub fn commit_reviewed_initialization(
                 change.path
             )
         }
-        if current.get(&path).cloned() != change.after {
+        let reviewed_after = change.after.as_ref().map(|bytes| SnapshotEntry {
+            bytes: bytes.clone(),
+            mode: change.after_mode.clone().unwrap_or_else(|| "100644".into()),
+        });
+        if current.entries.get(&path).cloned() != reviewed_after {
             anyhow::bail!(
                 "reviewed initialization bytes changed at {}; resolve the checkout locally",
                 change.path
@@ -376,7 +395,7 @@ pub fn commit_reviewed_initialization(
                         "update-index",
                         "--add",
                         "--cacheinfo",
-                        "100644",
+                        change.after_mode.as_deref().unwrap_or("100644"),
                         &blob,
                         &change.path,
                     ],
@@ -458,12 +477,10 @@ fn preexisting_paths(checkout: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-fn snapshot_checkout(checkout: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-    fn visit(
-        root: &Path,
-        directory: &Path,
-        snapshot: &mut BTreeMap<PathBuf, Vec<u8>>,
-    ) -> Result<()> {
+fn snapshot_checkout(checkout: &Path) -> Result<CheckoutSnapshot> {
+    fn visit(root: &Path, directory: &Path, snapshot: &mut CheckoutSnapshot) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
         for child in fs::read_dir(directory)? {
             let child = child?;
             if directory == root && child.file_name() == ".git" {
@@ -472,42 +489,112 @@ fn snapshot_checkout(checkout: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
             let path = child.path();
             let kind = child.file_type()?;
             if kind.is_dir() {
+                snapshot
+                    .directories
+                    .insert(path.strip_prefix(root)?.to_owned());
                 visit(root, &path, snapshot)?;
             } else if kind.is_file() {
-                snapshot.insert(path.strip_prefix(root)?.to_owned(), fs::read(path)?);
-            } else if kind.is_symlink() {
-                snapshot.insert(
+                let executable = fs::metadata(&path)?.permissions().mode() & 0o111 != 0;
+                snapshot.entries.insert(
                     path.strip_prefix(root)?.to_owned(),
-                    fs::read_link(path)?.as_os_str().as_encoded_bytes().to_vec(),
+                    SnapshotEntry {
+                        bytes: fs::read(path)?,
+                        mode: if executable { "100755" } else { "100644" }.into(),
+                    },
+                );
+            } else if kind.is_symlink() {
+                snapshot.entries.insert(
+                    path.strip_prefix(root)?.to_owned(),
+                    SnapshotEntry {
+                        bytes: fs::read_link(path)?.as_os_str().as_encoded_bytes().to_vec(),
+                        mode: "120000".into(),
+                    },
                 );
             }
         }
         Ok(())
     }
-    let mut snapshot = BTreeMap::new();
+    let mut snapshot = CheckoutSnapshot::default();
     visit(checkout, checkout, &mut snapshot)?;
     Ok(snapshot)
 }
 
 fn generated_changes(
-    before: &BTreeMap<PathBuf, Vec<u8>>,
-    after: &BTreeMap<PathBuf, Vec<u8>>,
+    before: &CheckoutSnapshot,
+    after: &CheckoutSnapshot,
 ) -> Result<Vec<InitGeneratedChange>> {
-    let paths = before.keys().chain(after.keys()).collect::<BTreeSet<_>>();
+    let paths = before
+        .entries
+        .keys()
+        .chain(after.entries.keys())
+        .collect::<BTreeSet<_>>();
     paths
         .into_iter()
-        .filter(|path| before.get(*path) != after.get(*path))
+        .filter(|path| before.entries.get(*path) != after.entries.get(*path))
         .map(|path| {
             Ok(InitGeneratedChange {
                 path: path
                     .to_str()
                     .context("initialization produced a non-UTF-8 path")?
                     .replace('\\', "/"),
-                before: before.get(path).cloned(),
-                after: after.get(path).cloned(),
+                before: before.entries.get(path).map(|entry| entry.bytes.clone()),
+                after: after.entries.get(path).map(|entry| entry.bytes.clone()),
+                before_mode: before.entries.get(path).map(|entry| entry.mode.clone()),
+                after_mode: after.entries.get(path).map(|entry| entry.mode.clone()),
             })
         })
         .collect()
+}
+
+fn restore_checkout(checkout: &Path, expected: &CheckoutSnapshot) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let current = snapshot_checkout(checkout)?;
+    for relative in current.entries.keys() {
+        if !expected.entries.contains_key(relative) {
+            fs::remove_file(checkout.join(relative))?;
+        }
+    }
+    for (relative, entry) in &expected.entries {
+        let path = checkout.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let current_entry = current.entries.get(relative);
+        if current_entry == Some(entry) {
+            continue;
+        }
+        if path.symlink_metadata().is_ok() {
+            fs::remove_file(&path)?;
+        }
+        if entry.mode == "120000" {
+            symlink(std::ffi::OsStr::from_bytes(&entry.bytes), &path)?;
+        } else {
+            fs::write(&path, &entry.bytes)?;
+            let permissions = if entry.mode == "100755" { 0o755 } else { 0o644 };
+            fs::set_permissions(&path, fs::Permissions::from_mode(permissions))?;
+        }
+    }
+    let mut extra_directories = current
+        .directories
+        .difference(&expected.directories)
+        .cloned()
+        .collect::<Vec<_>>();
+    extra_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for relative in extra_directories {
+        let path = checkout.join(relative);
+        if path
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_none())
+        {
+            fs::remove_dir(path)?;
+        }
+    }
+    if snapshot_checkout(checkout)? != *expected {
+        anyhow::bail!("configured initialization failure could not restore the checkout exactly")
+    }
+    Ok(())
 }
 
 fn index_sha256(checkout: &Path) -> Result<String> {

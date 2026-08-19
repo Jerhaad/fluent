@@ -289,9 +289,12 @@ fn slack_init_preflight_failure_preserves_uninitialized_checkout() {
     impl ConfiguredInitBoundary for FailingBoundary {
         fn initialize(
             &mut self,
-            _: &std::path::Path,
+            checkout: &std::path::Path,
             _: &SlackInitChoices,
         ) -> anyhow::Result<ConfiguredInitReport> {
+            fs::write(checkout.join("README"), "mutated before failure")?;
+            fs::create_dir(checkout.join(".fluent"))?;
+            fs::write(checkout.join(".fluent/partial"), "partial initialization")?;
             anyhow::bail!(self.0)
         }
     }
@@ -398,6 +401,8 @@ fn successful_slack_init_separates_and_offers_generated_changes() {
             path: ".fluent/config.yaml".into(),
             before: None,
             after: Some(b"follow-up: propose\n".to_vec()),
+            before_mode: None,
+            after_mode: Some("100644".into()),
         }]
     );
     assert!(!review.revision.is_empty());
@@ -429,8 +434,16 @@ fn initialized_review(checkout: &std::path::Path) -> (ProjectDiscoveryIndex, Ini
             checkout: &std::path::Path,
             _: &SlackInitChoices,
         ) -> anyhow::Result<ConfiguredInitReport> {
+            use std::os::unix::fs::PermissionsExt;
+
             fs::create_dir(checkout.join(".fluent"))?;
             fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
+            fs::write(checkout.join(".fluent/run"), "#!/bin/sh\nexit 0\n")?;
+            fs::set_permissions(
+                checkout.join(".fluent/run"),
+                fs::Permissions::from_mode(0o755),
+            )?;
+            std::os::unix::fs::symlink("config.yaml", checkout.join(".fluent/config-link"))?;
             Ok(ConfiguredInitReport {
                 already_initialized: false,
                 summary: "initialized".into(),
@@ -503,6 +516,15 @@ fn approved_init_commit_uses_exact_generated_changes_and_git_identity() {
     assert!(tree.contains(".fluent/config.yaml"));
     assert!(tree.contains("README"));
     assert!(!tree.contains("notes.txt"));
+    let modes = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["ls-tree", "-r", "HEAD"])
+        .output()
+        .unwrap();
+    let modes = String::from_utf8(modes.stdout).unwrap();
+    assert!(modes.contains("100755 blob") && modes.contains(".fluent/run"));
+    assert!(modes.contains("120000 blob") && modes.contains(".fluent/config-link"));
     let author = std::process::Command::new("git")
         .arg("-C")
         .arg(checkout.path())
