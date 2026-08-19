@@ -1931,9 +1931,28 @@ fn socket_mode_transport_connects_receives_and_acknowledges() {
     let captured = authorization.clone();
     let api = std::thread::spawn(move || {
         let (mut stream, _) = api_listener.accept().unwrap();
-        let mut buffer = [0; 4096];
-        let count = stream.read(&mut buffer).unwrap();
-        *captured.lock().unwrap() = String::from_utf8_lossy(&buffer[..count]).into_owned();
+        let mut request = Vec::new();
+        loop {
+            let mut buffer = [0; 1024];
+            let count = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        *captured.lock().unwrap() = String::from_utf8(request).unwrap();
         let body = format!(r#"{{"ok":true,"url":"ws://{websocket_address}"}}"#);
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
