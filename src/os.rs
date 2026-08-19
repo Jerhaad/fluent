@@ -971,29 +971,51 @@ mod tests {
         )
         .unwrap();
 
-        let own_session = own_temp.join("session");
-        let own = Command::new("/usr/bin/sandbox-exec")
-            .arg("-f")
-            .arg(&profile.path)
-            .arg("/bin/mkdir")
-            .arg("-p")
-            .arg(&own_session)
-            .status()
-            .unwrap();
-        assert!(own.success(), "the task-owned Claude temp must be writable");
-
-        let sibling = Command::new("/usr/bin/sandbox-exec")
-            .arg("-f")
-            .arg(&profile.path)
-            .arg("/bin/mkdir")
-            .arg("-p")
-            .arg(sibling_temp.join("session"))
-            .status()
-            .unwrap();
-        assert!(
-            !sibling.success(),
-            "a sibling Claude temp namespace must remain denied"
+        let content = std::fs::read_to_string(&profile.path).unwrap();
+        let own_rule = format!("(allow file-write* (subpath {}))", sbpl_string(&own_temp));
+        let sibling_rule = format!(
+            "(allow file-write* (subpath {}))",
+            sbpl_string(&sibling_temp)
         );
+        assert!(
+            content.contains(&own_rule),
+            "the profile must grant the task-owned Claude temp namespace"
+        );
+        assert!(
+            !content.contains(&sibling_rule),
+            "the profile must not grant a sibling Claude temp namespace"
+        );
+
+        let sandbox_usable = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if sandbox_usable {
+            let own_session = own_temp.join("session");
+            let own = Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile.path)
+                .arg("/bin/mkdir")
+                .arg("-p")
+                .arg(&own_session)
+                .status()
+                .unwrap();
+            assert!(own.success(), "the task-owned Claude temp must be writable");
+
+            let sibling = Command::new("/usr/bin/sandbox-exec")
+                .arg("-f")
+                .arg(&profile.path)
+                .arg("/bin/mkdir")
+                .arg("-p")
+                .arg(sibling_temp.join("session"))
+                .status()
+                .unwrap();
+            assert!(
+                !sibling.success(),
+                "a sibling Claude temp namespace must remain denied"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(own_temp);
     }
