@@ -110,8 +110,25 @@ pub struct ConfiguredInitReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlackSetupOutcome {
     AlreadyInitialized { configuration: String },
-    Initialized(ConfiguredInitReport),
+    Initialized(InitializationReview),
     PreflightFailed { boundary: String, recovery: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitGeneratedChange {
+    pub path: String,
+    pub before: Option<Vec<u8>>,
+    pub after: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InitializationReview {
+    pub summary: String,
+    pub expected_head: String,
+    pub expected_index_sha256: String,
+    pub preexisting_status: String,
+    pub generated_changes: Vec<InitGeneratedChange>,
+    pub revision: String,
 }
 
 /// Existing configured-initialization boundary used by Slack setup. Its
@@ -223,8 +240,36 @@ pub fn approve_slack_project_setup(
             .unwrap_or_else(|_| "Fluent is initialized with default project configuration.".into());
         return Ok(SlackSetupOutcome::AlreadyInitialized { configuration });
     }
+    let before = snapshot_checkout(&entry.path)?;
+    let expected_head = crate::git::run_stdout(
+        &entry.path,
+        &["rev-parse", "HEAD"],
+        "record initialization HEAD",
+    )?;
+    let expected_index_sha256 = index_sha256(&entry.path)?;
+    let preexisting_status = crate::git::run_stdout(
+        &entry.path,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        "record pre-existing checkout changes",
+    )?;
     match boundary.initialize(&entry.path, &proposal.choices) {
-        Ok(report) => Ok(SlackSetupOutcome::Initialized(report)),
+        Ok(report) => {
+            let after = snapshot_checkout(&entry.path)?;
+            let generated_changes = generated_changes(&before, &after)?;
+            let mut review = InitializationReview {
+                summary: report.summary,
+                expected_head,
+                expected_index_sha256,
+                preexisting_status,
+                generated_changes,
+                revision: String::new(),
+            };
+            review.revision = format!(
+                "init-review-v1:{:x}",
+                Sha256::digest(serde_json::to_vec(&review)?)
+            );
+            Ok(SlackSetupOutcome::Initialized(review))
+        }
         Err(error) => {
             let diagnostic = error.to_string();
             Ok(SlackSetupOutcome::PreflightFailed {
@@ -233,6 +278,68 @@ pub fn approve_slack_project_setup(
             })
         }
     }
+}
+
+fn snapshot_checkout(checkout: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        snapshot: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<()> {
+        for child in fs::read_dir(directory)? {
+            let child = child?;
+            if directory == root && child.file_name() == ".git" {
+                continue;
+            }
+            let path = child.path();
+            let kind = child.file_type()?;
+            if kind.is_dir() {
+                visit(root, &path, snapshot)?;
+            } else if kind.is_file() {
+                snapshot.insert(path.strip_prefix(root)?.to_owned(), fs::read(path)?);
+            } else if kind.is_symlink() {
+                snapshot.insert(
+                    path.strip_prefix(root)?.to_owned(),
+                    fs::read_link(path)?.as_os_str().as_encoded_bytes().to_vec(),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut snapshot = BTreeMap::new();
+    visit(checkout, checkout, &mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn generated_changes(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    after: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<Vec<InitGeneratedChange>> {
+    let paths = before.keys().chain(after.keys()).collect::<BTreeSet<_>>();
+    paths
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| {
+            Ok(InitGeneratedChange {
+                path: path
+                    .to_str()
+                    .context("initialization produced a non-UTF-8 path")?
+                    .replace('\\', "/"),
+                before: before.get(path).cloned(),
+                after: after.get(path).cloned(),
+            })
+        })
+        .collect()
+}
+
+fn index_sha256(checkout: &Path) -> Result<String> {
+    let git_dir = crate::git::run_stdout(
+        checkout,
+        &["rev-parse", "--absolute-git-dir"],
+        "locate checkout index",
+    )?;
+    let bytes = fs::read(PathBuf::from(git_dir).join("index")).unwrap_or_default();
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn classify_init_boundary(diagnostic: &str) -> &'static str {

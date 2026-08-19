@@ -229,13 +229,10 @@ fn approved_slack_setup_uses_existing_configured_init_boundary() {
     let outcome =
         approve_slack_project_setup(&index, &proposal, &proposal.revision, "U1", &mut boundary)
             .unwrap();
-    assert_eq!(
+    assert!(matches!(
         outcome,
-        SlackSetupOutcome::Initialized(ConfiguredInitReport {
-            already_initialized: false,
-            summary: "initialized".into(),
-        })
-    );
+        SlackSetupOutcome::Initialized(InitializationReview { summary, .. }) if summary == "initialized"
+    ));
     assert_eq!(boundary.calls.len(), 1);
     assert_eq!(boundary.calls[0].0, checkout.path().canonicalize().unwrap());
     assert_eq!(boundary.calls[0].1, proposal.choices);
@@ -350,6 +347,78 @@ fn slack_init_preflight_failure_preserves_uninitialized_checkout() {
         assert_eq!(directory_snapshot(checkout.path()), before);
         assert!(!checkout.path().join(".fluent").exists());
     }
+}
+
+#[test]
+fn successful_slack_init_separates_and_offers_generated_changes() {
+    struct WritingBoundary;
+    impl ConfiguredInitBoundary for WritingBoundary {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            fs::create_dir(checkout.join(".fluent"))?;
+            fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "Review generated setup; commit initialization separately.".into(),
+            })
+        }
+    }
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    fs::write(checkout.path().join("README"), "unstaged user edit").unwrap();
+    fs::write(checkout.path().join("notes.txt"), "untracked user work").unwrap();
+    let index = discovery_for_checkout(checkout.path(), &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &index,
+        &index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+
+    let outcome = approve_slack_project_setup(
+        &index,
+        &proposal,
+        &proposal.revision,
+        "U1",
+        &mut WritingBoundary,
+    )
+    .unwrap();
+    let SlackSetupOutcome::Initialized(review) = outcome else {
+        panic!("expected generated initialization review")
+    };
+
+    assert!(review.preexisting_status.contains("README"));
+    assert!(review.preexisting_status.contains("notes.txt"));
+    assert_eq!(
+        review.generated_changes,
+        vec![InitGeneratedChange {
+            path: ".fluent/config.yaml".into(),
+            before: None,
+            after: Some(b"follow-up: propose\n".to_vec()),
+        }]
+    );
+    assert!(!review.revision.is_empty());
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("README")).unwrap(),
+        "unstaged user edit"
+    );
+    assert_eq!(
+        fs::read_to_string(checkout.path().join("notes.txt")).unwrap(),
+        "untracked user work"
+    );
+    assert_eq!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        format!("{}\n", review.expected_head).as_bytes()
+    );
 }
 
 fn directory_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
