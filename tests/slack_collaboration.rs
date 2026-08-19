@@ -7014,59 +7014,333 @@ fn completed_slice_stays_complete_for_observation_and_offers_linked_work() {
     );
 }
 
-// Each behavior-level selector verifies the persisted transition stream that
-// the Slack adapter uses to render a linked Work update.
-macro_rules! persisted_slice_status_selector {
-    ($name:ident) => {
-        #[test]
-        fn $name() {
-            let (_home, checkout, _config) = setup(true);
-            let control = WorkControl::new(checkout.path());
-            control
-                .approve_plan(
-                    "slice-selector",
-                    "U1",
-                    &[PlannedWork::new("work-selector", "Work")],
-                )
-                .unwrap();
-            let transitions = control
-                .reconcile_transitions("slice-selector", Some("slack-thread"))
-                .unwrap();
-            assert_eq!(transitions.len(), 1);
-            assert_eq!(transitions[0].work_item_id, "work-selector");
-            assert_eq!(transitions[0].new_state, "planned");
-            assert_eq!(transitions[0].origin.as_deref(), Some("slack-thread"));
-            let reply = render_transition_reply(&transitions[0], &["work evidence".into()]);
-            assert!(
-                reply
-                    .contains("work-item work-selector for Work Item work-selector is now planned")
-            );
-            assert!(reply.contains("Origin: slack-thread"));
-            assert!(reply.contains("Evidence: work evidence"));
-            assert!(
-                control
-                    .reconcile_transitions("slice-selector", Some("slack-thread"))
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-    };
+fn planned_control<'a>(checkout: &'a TempDir, slice: &str, work: &str) -> WorkControl {
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(slice, "U1", &[PlannedWork::new(work, "Work")])
+        .unwrap();
+    control
 }
 
-persisted_slice_status_selector!(durable_work_transition_posts_detailed_thread_reply);
-persisted_slice_status_selector!(external_work_transition_updates_linked_thread);
-persisted_slice_status_selector!(status_message_tracks_current_slice_state);
-persisted_slice_status_selector!(needs_user_transition_posts_actionable_request);
-persisted_slice_status_selector!(ready_candidate_posts_reviewable_evidence_summary);
-persisted_slice_status_selector!(ready_candidate_offers_github_review_without_creating_pr);
-persisted_slice_status_selector!(failed_work_posts_evidence_and_permitted_recovery);
-persisted_slice_status_selector!(parallel_work_transitions_remain_attributed);
-persisted_slice_status_selector!(reconnect_reconciles_work_transitions_exactly_once);
-persisted_slice_status_selector!(finished_planned_work_marks_slice_complete);
-persisted_slice_status_selector!(completed_thread_still_answers_slice_status_questions);
-persisted_slice_status_selector!(new_work_after_completion_offers_linked_slice_thread);
-persisted_slice_status_selector!(corrective_follow_up_reactivates_original_slice);
-persisted_slice_status_selector!(optional_observation_does_not_reopen_completed_slice);
+#[test]
+fn durable_work_transition_posts_detailed_thread_reply() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-detail", "work-detail");
+    let transition = control
+        .reconcile_durable_transitions("slice-detail")
+        .unwrap()
+        .pop()
+        .unwrap();
+    let reply = render_transition_reply(&transition, &["work.json".into()]);
+    assert!(reply.contains("Work Item work-detail"));
+    assert!(reply.contains("is now planned"));
+    assert!(reply.contains("Evidence: work.json"));
+}
+
+#[test]
+fn external_work_transition_updates_linked_thread() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-external", "work-external");
+    control
+        .reconcile_durable_transitions("slice-external")
+        .unwrap();
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some("capacity available".into()),
+        evidence_ref: Some("scheduler:42".into()),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition("work-external", Some(&metadata), |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            Ok(())
+        })
+        .unwrap();
+    let transition = control
+        .reconcile_durable_transitions("slice-external")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(transition.origin.as_deref(), Some("scheduler"));
+    assert_eq!(transition.evidence_ref.as_deref(), Some("scheduler:42"));
+}
+
+#[test]
+fn status_message_tracks_current_slice_state() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-status-direct", "work-status-direct");
+    let status = control
+        .render_status_message("slice-status-direct", "app", "main", "connected")
+        .unwrap();
+    assert!(status.contains("Slice: Active"));
+    assert!(status.contains("work-status-direct: planned"));
+    assert!(status.contains("Await execution approval"));
+}
+
+fn append_attempt_state(
+    checkout: &TempDir,
+    work: &str,
+    state: fluent::work_model::AttemptStatus,
+    reason: &str,
+) {
+    let metadata = fluent::work_model::DurableTransitionMetadata {
+        origin: Some("scheduler".into()),
+        reason: Some(reason.into()),
+        evidence_ref: Some(format!("evidence:{work}")),
+    };
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item_with_transition(work, Some(&metadata), |item| {
+            item.authorization = fluent::work_model::ExecutionAuthorization::execution_ready(
+                fluent::work_model::ExecutionAuthority::Human,
+            );
+            item.attempts.push(fluent::work_model::Attempt {
+                id: format!("attempt-{work}"),
+                work_item_id: item.id.clone(),
+                status: state,
+                ..Default::default()
+            });
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn needs_user_transition_posts_actionable_request() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-question", "work-question");
+    control
+        .reconcile_durable_transitions("slice-question")
+        .unwrap();
+    append_attempt_state(
+        &checkout,
+        "work-question",
+        fluent::work_model::AttemptStatus::NeedsUser,
+        "choose retry or stop",
+    );
+    let transition = control
+        .reconcile_durable_transitions("slice-question")
+        .unwrap()
+        .pop()
+        .unwrap();
+    let reply = control.render_actionable_transition(
+        &transition,
+        &[transition.evidence_ref.clone().unwrap()],
+        None,
+    );
+    assert!(reply.contains("choose retry or stop"));
+    assert!(reply.contains("requested recovery decision"));
+}
+
+fn ready_transition() -> WorkTransition {
+    WorkTransition {
+        sequence: 1,
+        work_item_id: "work-ready".into(),
+        object_id: "candidate-ready".into(),
+        old_state: Some("reviewing".into()),
+        new_state: "ready".into(),
+        origin: Some("fluent".into()),
+        reason: Some("review candidate".into()),
+        evidence_ref: Some("candidate.json".into()),
+        object_kind: "merge-candidate".into(),
+        occurred_at: Some("2026-08-18T00:00:00Z".into()),
+        elapsed_seconds: Some(4),
+        candidate_commit: Some("abc123".into()),
+        comparison_base: Some("base123".into()),
+        completed_tests: vec!["tester passed".into()],
+        completed_reviews: vec!["reviews passed".into()],
+    }
+}
+
+#[test]
+fn ready_candidate_posts_reviewable_evidence_summary() {
+    let (_home, checkout, _config) = setup(true);
+    let reply = WorkControl::new(checkout.path()).render_actionable_transition(
+        &ready_transition(),
+        &["candidate.json".into()],
+        None,
+    );
+    assert!(reply.contains("Commit: abc123"));
+    assert!(reply.contains("Tests: tester passed"));
+    assert!(reply.contains("Reviews: reviews passed"));
+}
+
+#[test]
+fn ready_candidate_offers_github_review_without_creating_pr() {
+    let (_home, checkout, _config) = setup(true);
+    let reply = WorkControl::new(checkout.path()).render_actionable_transition(
+        &ready_transition(),
+        &[],
+        Some("https://github.com/acme/app"),
+    );
+    assert!(reply.contains("/commit/abc123"));
+    assert!(reply.contains("/compare/base123...abc123"));
+    assert!(reply.contains("Optionally create a pull request"));
+}
+
+#[test]
+fn failed_work_posts_evidence_and_permitted_recovery() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-failed", "work-failed");
+    control
+        .reconcile_durable_transitions("slice-failed")
+        .unwrap();
+    append_attempt_state(
+        &checkout,
+        "work-failed",
+        fluent::work_model::AttemptStatus::Failed,
+        "retry after fixing credentials",
+    );
+    let transition = control
+        .reconcile_durable_transitions("slice-failed")
+        .unwrap()
+        .pop()
+        .unwrap();
+    let reply = control.render_actionable_transition(&transition, &["failure.log".into()], None);
+    assert!(reply.contains("retry after fixing credentials"));
+    assert!(reply.contains("Evidence: failure.log"));
+    assert!(reply.contains("permitted recovery action"));
+}
+
+#[test]
+fn parallel_work_transitions_remain_attributed() {
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-parallel-direct",
+            "U1",
+            &[
+                PlannedWork::new("work-left", "Left"),
+                PlannedWork::new("work-right", "Right"),
+            ],
+        )
+        .unwrap();
+    let replies = control
+        .reconcile_durable_transitions("slice-parallel-direct")
+        .unwrap()
+        .into_iter()
+        .map(|transition| render_transition_reply(&transition, &[]))
+        .collect::<Vec<_>>();
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply.contains("Work Item work-left"))
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply.contains("Work Item work-right"))
+    );
+}
+
+#[test]
+fn reconnect_reconciles_work_transitions_exactly_once() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-reconnect-direct", "work-reconnect");
+    let first = control
+        .reconcile_durable_transitions("slice-reconnect-direct")
+        .unwrap();
+    assert!(!first.is_empty());
+    assert!(
+        control
+            .reconcile_durable_transitions("slice-reconnect-direct")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn finished_planned_work_marks_slice_complete() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-finished", "work-finished");
+    append_attempt_state(
+        &checkout,
+        "work-finished",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    assert_eq!(
+        control.slice_stage("slice-finished").unwrap(),
+        SliceStage::Complete
+    );
+}
+
+#[test]
+fn completed_thread_still_answers_slice_status_questions() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-answer", "work-answer");
+    append_attempt_state(
+        &checkout,
+        "work-answer",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    let status = control
+        .render_status_message("slice-answer", "app", "main", "idle")
+        .unwrap();
+    assert!(status.contains("Slice: Complete"));
+    assert!(status.contains("work-answer: complete"));
+}
+
+#[test]
+fn new_work_after_completion_offers_linked_slice_thread() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-linked", "work-linked");
+    append_attempt_state(
+        &checkout,
+        "work-linked",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    let offer = control
+        .linked_slice_offer("slice-linked", "new product work")
+        .unwrap();
+    assert!(offer.contains("Slice slice-linked remains complete"));
+    assert!(offer.contains("Start linked Slice"));
+}
+
+#[test]
+fn corrective_follow_up_reactivates_original_slice() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-corrective", "work-corrective");
+    append_attempt_state(
+        &checkout,
+        "work-corrective",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    fluent::work_model::WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-corrective", |item| {
+            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        control.slice_stage("slice-corrective").unwrap(),
+        SliceStage::Active
+    );
+}
+
+#[test]
+fn optional_observation_does_not_reopen_completed_slice() {
+    let (_home, checkout, _config) = setup(true);
+    let control = planned_control(&checkout, "slice-observation", "work-observation");
+    append_attempt_state(
+        &checkout,
+        "work-observation",
+        fluent::work_model::AttemptStatus::Complete,
+        "completed",
+    );
+    let reply = control
+        .render_optional_observation("slice-observation", "observation-42")
+        .unwrap();
+    assert!(reply.contains("remains complete"));
+    assert_eq!(
+        control.slice_stage("slice-observation").unwrap(),
+        SliceStage::Complete
+    );
+}
 #[test]
 fn invalid_runtime_configuration_fails_closed() {
     let (home, _checkout, mut config) = setup(true);
