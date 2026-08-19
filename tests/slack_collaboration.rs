@@ -101,9 +101,35 @@ fn pending_action(kind: PendingActionKind) -> PendingAction {
 
 fn approval_event(id: &str, text: &str, action: &PendingAction) -> InboundEnvelope {
     let mut event = event(id, Some("1.0"), text);
+    event.text = "fluent_approval".into();
     event.approval_action_id = Some(action.id.clone());
     event.approval_artifact_revision = Some(action.artifact_revision.clone());
     event
+}
+
+#[test]
+fn unrelated_interaction_cannot_authorize_an_action() {
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config.clone(),
+        InMemoryProvider::default(),
+        InMemorySlack::default(),
+    );
+    runner.ingest(event("E1", None, "@Fluent hello")).unwrap();
+    let action = pending_action(PendingActionKind::Planning);
+    runner.request_approval("1.0", action.clone()).unwrap();
+    let mut interaction = approval_event("E2", "ignored", &action);
+    interaction.text = "other_control".into();
+    runner.ingest(interaction).unwrap();
+    assert!(
+        FileCollaborationStore::new(home.path())
+            .load_thread(&config, "1.0")
+            .unwrap()
+            .unwrap()
+            .approvals
+            .is_empty()
+    );
 }
 
 #[test]

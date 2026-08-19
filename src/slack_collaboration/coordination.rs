@@ -299,8 +299,8 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             return false;
         };
         let answer = event.text.trim().to_ascii_lowercase();
-        event.approval_action_id.is_some()
-            || event.approval_artifact_revision.is_some()
+        (event.approval_action_id.is_some() || event.approval_artifact_revision.is_some())
+            && event.text == "fluent_approval"
             || answer == "y"
             || answer == "yes"
             || answer == action.id.to_ascii_lowercase()
