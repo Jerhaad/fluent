@@ -2621,6 +2621,54 @@ fn code_question_posts_provider_reference_in_slack_thread() {
 }
 
 #[test]
+fn code_question_rejects_provider_reference_outside_bound_checkout() {
+    struct EscapingProvider;
+    impl ConversationProvider for EscapingProvider {
+        fn start(
+            &mut self,
+            _action_id: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<(String, String)> {
+            Ok(("session".into(), "answer".into()))
+        }
+        fn resume(
+            &mut self,
+            _action_id: &str,
+            _session: &str,
+            _scope: &ProviderScope,
+            _contribution: &str,
+            _actor: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        fn code_references(
+            &mut self,
+            _scope: &ProviderScope,
+            _contribution: &str,
+        ) -> anyhow::Result<Vec<CodeReference>> {
+            Ok(vec![CodeReference {
+                path: "../secret".into(),
+                line: 1,
+            }])
+        }
+    }
+    let (home, _checkout, config) = setup(true);
+    let mut runner = CollaborationRunner::new(
+        home.path(),
+        config,
+        EscapingProvider,
+        InMemorySlack::default(),
+    );
+    let error = runner
+        .ingest(event("E1", None, "@Fluent inspect code"))
+        .unwrap_err();
+    assert!(error.to_string().contains("outside the bound checkout"));
+    assert!(runner.slack().deliveries.is_empty());
+}
+
+#[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     let (home, checkout, config) = setup(true);
     let mut runner = CollaborationRunner::new(

@@ -822,6 +822,14 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             .code_references(&scope, &turn.contribution)?
             .into_iter()
             .map(|reference| {
+                if reference.path.is_absolute()
+                    || reference
+                        .path
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+                {
+                    bail!("provider code reference is outside the bound checkout");
+                }
                 crate::slack_collaboration::format_code_reference(
                     &self.bound_project(thread)?.checkout,
                     &scope.checkout.join(reference.path),
