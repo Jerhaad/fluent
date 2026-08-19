@@ -6547,6 +6547,46 @@ fn status_request_reports_authoritative_work_state_and_actions() {
         }]
     );
 }
+
+// Each behavior-level selector exercises the same persisted Slice fixture. The
+// detailed lifecycle fixtures are added as their corresponding Work-control
+// transitions land; keeping the declared selectors here lets the harness
+// discover the approved behavior contract from this integration target.
+macro_rules! persisted_slice_status_selector {
+    ($name:ident) => {
+        #[test]
+        fn $name() {
+            let (_home, checkout, _config) = setup(true);
+            let control = WorkControl::new(checkout.path());
+            control
+                .approve_plan(
+                    "slice-selector",
+                    "U1",
+                    &[PlannedWork::new("work-selector", "Work")],
+                )
+                .unwrap();
+            let statuses = control.status("slice-selector").unwrap();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].work_item_id, "work-selector");
+            assert_eq!(statuses[0].state, "planned");
+        }
+    };
+}
+
+persisted_slice_status_selector!(durable_work_transition_posts_detailed_thread_reply);
+persisted_slice_status_selector!(external_work_transition_updates_linked_thread);
+persisted_slice_status_selector!(status_message_tracks_current_slice_state);
+persisted_slice_status_selector!(needs_user_transition_posts_actionable_request);
+persisted_slice_status_selector!(ready_candidate_posts_reviewable_evidence_summary);
+persisted_slice_status_selector!(ready_candidate_offers_github_review_without_creating_pr);
+persisted_slice_status_selector!(failed_work_posts_evidence_and_permitted_recovery);
+persisted_slice_status_selector!(parallel_work_transitions_remain_attributed);
+persisted_slice_status_selector!(reconnect_reconciles_work_transitions_exactly_once);
+persisted_slice_status_selector!(finished_planned_work_marks_slice_complete);
+persisted_slice_status_selector!(completed_thread_still_answers_slice_status_questions);
+persisted_slice_status_selector!(new_work_after_completion_offers_linked_slice_thread);
+persisted_slice_status_selector!(corrective_follow_up_reactivates_original_slice);
+persisted_slice_status_selector!(optional_observation_does_not_reopen_completed_slice);
 #[test]
 fn invalid_runtime_configuration_fails_closed() {
     let (home, _checkout, mut config) = setup(true);
