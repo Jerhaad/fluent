@@ -2427,13 +2427,53 @@ fn thread_uses_and_displays_project_default_provider() {
 
 #[test]
 fn thread_can_select_enabled_nondefault_provider() {
+    struct NamedProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    impl ConversationProvider for NamedProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn start(
+            &mut self,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<(String, String)> {
+            self.calls.lock().unwrap().push(self.name.into());
+            Ok((
+                format!("{}-session", self.name),
+                format!("{} reply", self.name),
+            ))
+        }
+        fn resume(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &ProviderScope,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+    }
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let registry = ProviderRegistry::new([
+        Box::new(NamedProvider {
+            name: "codex",
+            calls: calls.clone(),
+        }) as Box<dyn ConversationProvider>,
+        Box::new(NamedProvider {
+            name: "claude",
+            calls: calls.clone(),
+        }) as Box<dyn ConversationProvider>,
+    ])
+    .unwrap();
     let (home, _checkout, config) = setup(true);
-    let mut runner = CollaborationRunner::new(
-        home.path(),
-        config,
-        InMemoryProvider::default(),
-        InMemorySlack::default(),
-    );
+    let mut runner =
+        CollaborationRunner::new(home.path(), config, registry, InMemorySlack::default());
     runner
         .ingest(event("E1", None, "@Fluent [provider=claude] hello"))
         .unwrap();
@@ -2443,11 +2483,13 @@ fn thread_can_select_enabled_nondefault_provider() {
         .unwrap()
         .unwrap();
     assert_eq!(thread.provider.as_deref(), Some("claude"));
+    assert_eq!(&*calls.lock().unwrap(), &["claude"]);
     assert!(
         runner.slack().deliveries[0]
             .text
             .contains("provider: claude")
     );
+    assert!(runner.slack().deliveries[0].text.contains("claude reply"));
 }
 
 #[test]
@@ -2622,6 +2664,10 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
             _: &str,
         ) -> anyhow::Result<String> {
             self.calls.lock().unwrap().push(contribution.into());
+            let (lock, changed) = &*self.gate;
+            let mut state = lock.lock().unwrap();
+            state.0 += 1;
+            changed.notify_all();
             Ok("follow-up".into())
         }
     }
@@ -2655,6 +2701,13 @@ fn queued_runner_scenario() -> (Vec<String>, Vec<OutboundDelivery>) {
         changed.notify_all();
     }
     runner.wait_for_completion().unwrap();
+    {
+        let (lock, changed) = &*gate;
+        let mut state = lock.lock().unwrap();
+        while state.0 < 2 {
+            state = changed.wait(state).unwrap();
+        }
+    }
     let calls = calls.lock().unwrap().clone();
     (calls, runner.slack().deliveries.clone())
 }
@@ -3604,7 +3657,19 @@ fn code_reference_rejects_missing_target_without_host_path() {
 
 #[test]
 fn unavailable_bound_checkout_fails_closed_without_rebinding() {
-    let (home, checkout, config) = setup(true);
+    let (home, checkout, mut config) = setup(true);
+    let alternative_checkout = TempDir::new().unwrap();
+    let (identity, commit) = initialize_checkout(alternative_checkout.path());
+    let mut alternative = config.projects["app"].clone();
+    alternative.label = "alternative".into();
+    alternative.checkout = Checkout {
+        label: "alternative-main".into(),
+        path: alternative_checkout.path().into(),
+        identity,
+        branch: "main".into(),
+        commit,
+    };
+    config.projects.insert("alternative".into(), alternative);
     let mut runner = CollaborationRunner::new(
         home.path(),
         config,
@@ -3619,6 +3684,13 @@ fn unavailable_bound_checkout_fails_closed_without_rebinding() {
     assert_eq!(runner.provider().calls.len(), 1);
     assert!(
         runner
+            .provider()
+            .calls
+            .iter()
+            .all(|(_, checkout, _, _)| checkout != alternative_checkout.path())
+    );
+    assert!(
+        runner
             .slack()
             .deliveries
             .iter()
@@ -3629,6 +3701,10 @@ fn unavailable_bound_checkout_fails_closed_without_rebinding() {
         .unwrap()
         .unwrap();
     assert_eq!(thread.project_label.as_deref(), Some("app"));
+    assert_ne!(
+        runner.config.projects["app"].checkout.identity,
+        runner.config.projects["alternative"].checkout.identity
+    );
 }
 #[test]
 fn bound_thread_shows_safe_checkout_identity() {
