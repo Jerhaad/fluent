@@ -734,7 +734,10 @@ fn committed_setup_fixture() -> (
         .load_thread(&runner.config, "1.0")
         .unwrap()
         .unwrap();
-    let config = runner.config.clone();
+    let mut config = runner.config.clone();
+    config.projects.clear();
+    config.channel_defaults.clear();
+    config.direct_message_defaults.clear();
     let checkout = TempDir::new().unwrap();
     initialize_checkout(checkout.path());
     let (index, review) = initialized_review(checkout.path());
@@ -748,6 +751,30 @@ fn committed_setup_fixture() -> (
     .unwrap();
     drop(runner);
     (home, checkout, config, index, committed, thread)
+}
+
+fn configured_project_for_checkout(path: &std::path::Path) -> ConfiguredProject {
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    ConfiguredProject {
+        label: "app".into(),
+        checkout: Checkout {
+            label: "main".into(),
+            path: path.canonicalize().unwrap(),
+            identity: checkout_identity(path).unwrap(),
+            branch: "main".into(),
+            commit: String::from_utf8(commit.stdout).unwrap().trim().into(),
+        },
+        allowed_participants: BTreeSet::from(["U1".into()]),
+        default_provider: "codex".into(),
+        enabled_providers: BTreeSet::from(["codex".into(), "claude".into()]),
+        project_approvers: BTreeSet::from(["U1".into()]),
+        github_remote: Some("https://github.com/acme/preserved".into()),
+    }
 }
 
 #[test]
@@ -788,6 +815,90 @@ fn committed_initialization_enables_checkout_for_slack_binding() {
             slack_approver: "U1".into(),
         }]
     );
+}
+
+#[test]
+fn project_enablement_rejects_label_collisions_and_reuses_the_same_checkout() {
+    let (home, _checkout, mut config, index, committed, mut thread) = committed_setup_fixture();
+    let conflicting_checkout = TempDir::new().unwrap();
+    initialize_checkout(conflicting_checkout.path());
+    let configured_before = configured_project_for_checkout(conflicting_checkout.path());
+    config
+        .projects
+        .insert("app".into(), configured_before.clone());
+    write_config(home.path(), &config).unwrap();
+
+    let error = complete_project_enablement(
+        home.path(),
+        &mut config,
+        &index,
+        &index.offers()[0].selection_id,
+        &committed,
+        &mut thread,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("already belongs to another checkout")
+    );
+    assert_eq!(config.projects["app"], configured_before);
+    assert_eq!(
+        read_config(home.path()).unwrap().projects["app"],
+        configured_before
+    );
+
+    let (same_home, same_checkout, mut same_config, same_index, same_commit, mut same_thread) =
+        committed_setup_fixture();
+    let mut same_before = configured_project_for_checkout(same_checkout.path());
+    same_before.checkout.commit = same_commit.commit.clone();
+    same_config
+        .projects
+        .insert("app".into(), same_before.clone());
+    write_config(same_home.path(), &same_config).unwrap();
+
+    complete_project_enablement(
+        same_home.path(),
+        &mut same_config,
+        &same_index,
+        &same_index.offers()[0].selection_id,
+        &same_commit,
+        &mut same_thread,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(same_config.projects["app"], same_before);
+    assert_eq!(
+        same_thread.provider.as_deref(),
+        Some(&*same_before.default_provider)
+    );
+}
+
+#[test]
+fn project_discovery_policy_rejects_duplicate_labels() {
+    let home = TempDir::new().unwrap();
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    let roots = [first.path(), second.path()]
+        .into_iter()
+        .map(|path| ProjectDiscoveryRoot {
+            label: "app".into(),
+            path: path.into(),
+            maximum_depth: 0,
+            allowed_participants: BTreeSet::from(["U1".into()]),
+            project_approvers: BTreeSet::from(["U1".into()]),
+        })
+        .collect::<Vec<_>>();
+    let policy_path = project_discovery_roots_path(home.path());
+    fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+    fs::write(&policy_path, serde_json::to_vec(&roots).unwrap()).unwrap();
+
+    let error = read_project_discovery_roots(home.path()).unwrap_err();
+
+    assert!(error.to_string().contains("duplicate project label"));
 }
 
 #[test]

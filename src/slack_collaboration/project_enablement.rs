@@ -68,6 +68,7 @@ pub fn read_project_discovery_roots(home: &Path) -> Result<Vec<ProjectDiscoveryR
     }
     let roots: Vec<ProjectDiscoveryRoot> =
         serde_json::from_slice(&fs::read(path)?).context("read Slack project discovery roots")?;
+    let mut labels = BTreeSet::new();
     for root in &roots {
         if root.label.trim().is_empty()
             || root.maximum_depth > 8
@@ -75,6 +76,12 @@ pub fn read_project_discovery_roots(home: &Path) -> Result<Vec<ProjectDiscoveryR
             || !root.project_approvers.is_subset(&root.allowed_participants)
         {
             anyhow::bail!("Slack project discovery root policy is invalid")
+        }
+        if !labels.insert(root.label.clone()) {
+            anyhow::bail!(
+                "Slack project discovery root policy has duplicate project label {:?}",
+                root.label
+            )
         }
     }
     Ok(roots)
@@ -796,34 +803,47 @@ pub fn complete_project_enablement(
         &["branch", "--show-current"],
         "record enabled checkout branch",
     )?;
-    let default_provider = if config.enabled_providers.contains("codex") {
-        "codex".to_owned()
+    let identity = checkout_identity(&entry.path)?;
+    let existing = config.projects.get(&entry.offer.project_label);
+    if existing.is_some_and(|project| project.checkout.identity != identity) {
+        anyhow::bail!(
+            "project label {:?} already belongs to another checkout",
+            entry.offer.project_label
+        )
+    }
+    let default_provider = if let Some(project) = existing {
+        project.default_provider.clone()
     } else {
-        config
-            .enabled_providers
-            .iter()
-            .next()
-            .context("Slack runner has no enabled conversation provider")?
-            .clone()
-    };
-    config.projects.insert(
-        entry.offer.project_label.clone(),
-        ConfiguredProject {
-            label: entry.offer.project_label.clone(),
-            checkout: Checkout {
-                label: entry.offer.checkout_label.clone(),
-                path: entry.path.clone(),
-                identity: checkout_identity(&entry.path)?,
-                branch,
-                commit: committed.commit.clone(),
+        let default_provider = if config.enabled_providers.contains("codex") {
+            "codex".to_owned()
+        } else {
+            config
+                .enabled_providers
+                .iter()
+                .next()
+                .context("Slack runner has no enabled conversation provider")?
+                .clone()
+        };
+        config.projects.insert(
+            entry.offer.project_label.clone(),
+            ConfiguredProject {
+                label: entry.offer.project_label.clone(),
+                checkout: Checkout {
+                    label: entry.offer.checkout_label.clone(),
+                    path: entry.path.clone(),
+                    identity,
+                    branch,
+                    commit: committed.commit.clone(),
+                },
+                allowed_participants: entry.allowed_participants.clone(),
+                default_provider: default_provider.clone(),
+                enabled_providers: BTreeSet::from([default_provider.clone()]),
+                project_approvers: entry.approvers.clone(),
+                github_remote: None,
             },
-            allowed_participants: entry.allowed_participants.clone(),
-            default_provider: default_provider.clone(),
-            enabled_providers: BTreeSet::from([default_provider.clone()]),
-            project_approvers: entry.approvers.clone(),
-            github_remote: None,
-        },
-    );
+        );
+        default_provider
+    };
     write_config(home, config)?;
 
     thread.state = ThreadState::Active;
