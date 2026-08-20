@@ -10129,6 +10129,24 @@ fn make_ready_candidate(
     commit: &str,
     ready_at: &str,
 ) {
+    make_candidate(
+        checkout,
+        work_item_id,
+        candidate_id,
+        commit,
+        ready_at,
+        Some(ready_at),
+    );
+}
+
+fn make_candidate(
+    checkout: &TempDir,
+    work_item_id: &str,
+    candidate_id: &str,
+    commit: &str,
+    created_at: &str,
+    ready_at: Option<&str>,
+) {
     use fluent::work_model::{
         Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, MergeCandidate,
         MergeCandidateMergeState, MergeReviewState, Task, TaskKind, TaskOutput, TaskStatus,
@@ -10153,7 +10171,7 @@ fn make_ready_candidate(
                 work_item_id: work_item_id.into(),
                 status: AttemptStatus::Complete,
                 review_state: Some(AttemptReviewState::Passed),
-                completed_at: Some(ready_at.into()),
+                completed_at: Some(created_at.into()),
                 learning: Some(AttemptLearning::succeeded(
                     1,
                     fluent::follow_up::ArtifactRef {
@@ -10203,8 +10221,8 @@ fn make_ready_candidate(
                 candidate_commit: commit.into(),
                 merge_review_state: MergeReviewState::Passed,
                 merge_state: MergeCandidateMergeState::default(),
-                created_at: Some(ready_at.into()),
-                ready_at: Some(ready_at.into()),
+                created_at: Some(created_at.into()),
+                ready_at: ready_at.map(ToOwned::to_owned),
                 started_at: None,
                 completed_at: None,
             });
@@ -10413,13 +10431,39 @@ fn existing_pr_advances_only_to_new_ready_candidate() {
     runner.poll_linked_work_with_github(&mut github).unwrap();
     assert_eq!(github.publishes.len(), 1);
 
-    make_ready_candidate(
+    make_candidate(
         &checkout,
         "work-github",
         "candidate-github-2",
         "commit-two",
         "2026-08-19T02:00:00Z",
+        None,
     );
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+    let publication = WorkControl::new(checkout.path())
+        .slice("slice-github")
+        .unwrap()
+        .unwrap()
+        .github_publication
+        .unwrap();
+    assert_eq!(publication.candidate.commit, "commit-one");
+    assert_eq!(github.publishes.len(), 1);
+    assert!(!runner.slack().deliveries.iter().any(|delivery| {
+        delivery
+            .text
+            .contains("newly ready Merge Candidate candidate-github-2")
+    }));
+
+    WorkModelStore::new(checkout.path())
+        .mutate_work_item("work-github", |item| {
+            item.merge_candidates
+                .iter_mut()
+                .find(|candidate| candidate.id == "candidate-github-2")
+                .unwrap()
+                .ready_at = Some("2026-08-19T02:00:00Z".into());
+            Ok(())
+        })
+        .unwrap();
     runner.poll_linked_work_with_github(&mut github).unwrap();
     let advanced = WorkControl::new(checkout.path())
         .slice("slice-github")
