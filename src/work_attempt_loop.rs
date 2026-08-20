@@ -10639,7 +10639,12 @@ mod tests {
         .unwrap();
         crate::git::run(
             workspace.path(),
-            &["commit", "-q", "-m", "Correct candidate"],
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Correct candidate\n\n- Add the corrected value",
+            ],
             "commit correction",
         )
         .unwrap();
