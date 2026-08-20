@@ -736,6 +736,14 @@ fn committed_initialization_enables_checkout_for_slack_binding() {
         .unwrap();
     assert_eq!(rebound.project_label.as_deref(), Some("app"));
     assert_eq!(rebound.state, ThreadState::Active);
+    assert_eq!(
+        rebound.project_initialization_approvals,
+        vec![ProjectInitializationApproval {
+            commit: committed.commit.clone(),
+            reviewed_revision: committed.reviewed_revision.clone(),
+            slack_approver: "U1".into(),
+        }]
+    );
 }
 
 #[test]
@@ -6981,6 +6989,7 @@ fn bound_payloads_are_persisted_only_in_project_runtime() {
         conversation_inputs: Vec::new(),
         pending_action: None,
         approvals: Vec::new(),
+        project_initialization_approvals: Vec::new(),
         processed_events: BTreeSet::from(["E1".into()]),
         last_connection: None,
         first_reply_timestamp: None,

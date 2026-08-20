@@ -212,6 +212,15 @@ pub enum ApprovalOutcome {
     NoPendingAction,
 }
 
+/// Records who approved a reviewed initialization commit independently from
+/// the Git author identity used to create that commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInitializationApproval {
+    pub commit: String,
+    pub reviewed_revision: String,
+    pub slack_approver: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FluentThread {
     pub id: String,
@@ -238,6 +247,8 @@ pub struct FluentThread {
     pub pending_action: Option<PendingAction>,
     #[serde(default)]
     pub approvals: Vec<ApprovalRecord>,
+    #[serde(default)]
+    pub project_initialization_approvals: Vec<ProjectInitializationApproval>,
     pub processed_events: BTreeSet<String>,
     pub last_connection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +338,7 @@ impl FluentThread {
             conversation_inputs: Vec::new(),
             pending_action: None,
             approvals: Vec::new(),
+            project_initialization_approvals: Vec::new(),
             processed_events: BTreeSet::new(),
             last_connection: None,
             first_reply_timestamp: None,

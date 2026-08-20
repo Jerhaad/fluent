@@ -243,6 +243,7 @@ mod tests {
             conversation_inputs: Vec::new(),
             pending_action: Some(action.clone()),
             approvals: Vec::new(),
+            project_initialization_approvals: Vec::new(),
             processed_events: BTreeSet::new(),
             last_connection: None,
             first_reply_timestamp: None,

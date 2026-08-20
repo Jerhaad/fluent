@@ -827,6 +827,13 @@ pub fn complete_project_enablement(
     thread.project_label = Some(entry.offer.project_label.clone());
     thread.provider = Some(default_provider);
     thread.pending_question = None;
+    thread
+        .project_initialization_approvals
+        .push(super::ProjectInitializationApproval {
+            commit: committed.commit.clone(),
+            reviewed_revision: committed.reviewed_revision.clone(),
+            slack_approver: committed.slack_approver.clone(),
+        });
     if let Some(goal) = original_goal.filter(|goal| !goal.trim().is_empty()) {
         thread.slice = None;
         thread.linked_thread_intent = Some(format!("slack-{}", thread.id.replace('.', "-")));
