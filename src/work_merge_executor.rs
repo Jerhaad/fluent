@@ -536,10 +536,17 @@ fn with_detached_landed_checkout<T>(
     commit: &str,
     operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {
-    let temporary_root = project_root.join(".fluent/tmp/landed-baselines");
-    fs::create_dir_all(&temporary_root)?;
+    // Keep the detached checkout beside the project, not beneath it. Cargo
+    // searches parent directories for a workspace manifest; nesting this
+    // checkout under `.fluent/tmp` makes it inspect the target checkout's
+    // Cargo.toml, which the Tester sandbox deliberately cannot read.
+    let canonical_project = fs::canonicalize(project_root)
+        .with_context(|| format!("canonicalize project root {}", project_root.display()))?;
+    let temporary_root = canonical_project
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("project root has no parent directory"))?;
     let holder = tempfile::Builder::new()
-        .prefix("landed-")
+        .prefix(".fluent-landed-baseline-")
         .tempdir_in(&temporary_root)
         .context("create landed baseline checkout holder")?;
     let checkout = holder.path().join("checkout");
@@ -5009,7 +5016,13 @@ mod tests {
         git::run(&repo, &["commit", "-m", "later"], "commit later change").unwrap();
         let current = head_commit(&repo).unwrap();
 
+        let mut checkout_path = None;
         let observed = with_detached_landed_checkout(&repo, &repo, &landed, |checkout| {
+            assert!(
+                !checkout.starts_with(&repo),
+                "the landed checkout must not be nested under the target repository"
+            );
+            checkout_path = Some(checkout.to_path_buf());
             assert_eq!(fs::read_to_string(checkout.join("file.txt"))?, "initial");
             head_commit(checkout)
         })
@@ -5017,8 +5030,7 @@ mod tests {
 
         assert_eq!(observed, landed);
         assert_eq!(head_commit(&repo).unwrap(), current);
-        let temporary_root = repo.join(".fluent/tmp/landed-baselines");
-        assert_eq!(fs::read_dir(temporary_root).unwrap().count(), 0);
+        assert!(!checkout_path.unwrap().exists());
     }
 
     #[test]
