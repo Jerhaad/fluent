@@ -12,6 +12,7 @@
 - [backward-compatible-serde-fields](backward-compatible-serde-fields.md) — Persisted Work model field additions and renames must preserve backward compatibility with existing on-disk JSON
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
 - [bound-conversation-state-follows-project-authority](bound-conversation-state-follows-project-authority.md) — Keep bound conversation payloads and active state in the project runtime; the runner-owner root retains only routing, deduplication, and unbound ingress
+- [candidate-commits-require-separated-body](candidate-commits-require-separated-body.md) — Candidate commits need a non-whitespace body separated from the subject by a blank line before review or testing
 - [canonical-reviewer-cache-cleanup](canonical-reviewer-cache-cleanup.md) — Shared reviewer caches retire only when no nonterminal Work references their candidate commit; legacy artifact-cache cleanup removes only recognized canonical directories
 - [canonicalize-confinement-paths](canonicalize-confinement-paths.md) — Canonicalize existing paths before passing them between the environment and Seatbelt policy, while retaining the lifetime guard that owns temporary-directory cleanup
 - [capture-pump-terminate-descendants-before-eof](capture-pump-terminate-descendants-before-eof.md) — When a thread drains a child's piped stdout to EOF, terminate the whole process group before waiting for EOF; a backgrounded descendant can hold the pipe open forever
