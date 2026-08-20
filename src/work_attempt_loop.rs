@@ -385,6 +385,14 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             && attempt.pause_kind == Some(PauseKind::RoundCap)
             && attempt.round_cap_extensions.is_empty()
         {
+            if reclassify_codex_transport_pause(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+            )? {
+                continue;
+            }
             match reclassify_legacy_provider_pause(
                 config.store,
                 config.project_root,
@@ -1729,6 +1737,61 @@ enum LegacyProviderPauseRecovery {
     Reclassified,
     Ineligible(String),
     NotLegacy,
+}
+
+/// Recover an older generic pause only when one failed Codex Task has an exact
+/// no-progress transport-outage transcript. This migration preserves real hard
+/// failures and retries the same Task without charging another Writer round.
+fn reclassify_codex_transport_pause(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let Some(attempt) = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Ok(false);
+        };
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+        {
+            return Ok(false);
+        }
+
+        let failed = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.status == TaskStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(false);
+        }
+        let (task_index, task) = failed[0];
+        if !matches!(task.kind, TaskKind::Write | TaskKind::Review)
+            || task.output.is_some()
+            || attempt.coder_mapping.for_task_kind(task.kind).coder
+                != crate::coder::CoderKind::Codex
+        {
+            return Ok(false);
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let transcript = project_root.join(&area.path).join("transcript.jsonl");
+        if crate::provider_evidence::classify_codex_transport_unavailable(&transcript).is_none() {
+            return Ok(false);
+        }
+
+        crate::work_model::set_task_terminal(&mut attempt.tasks[task_index], TaskStatus::NeedsUser);
+        attempt.pause_kind = Some(PauseKind::ProviderUnavailable);
+        attempt.pause_recovery = None;
+        Ok(true)
+    })?)
 }
 
 fn reclassify_legacy_provider_pause(
@@ -17666,6 +17729,93 @@ mod tests {
                 .join(".fluent/work/artifacts/work-1/attempt-1/review-provider/transcript.jsonl")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn reclassifies_failed_codex_transport_task_for_same_task_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover Codex transport outage");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        let task = &mut attempt.tasks[0];
+        task.status = TaskStatus::Failed;
+        task.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... stream disconnected before completion: Connection refused (os error 61)\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            reclassify_codex_transport_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap()
+        );
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        assert!(attempt.tasks[0].output.is_none());
+    }
+
+    #[test]
+    fn codex_transport_recovery_rejects_progressed_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Keep progressed failure hard");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.tasks[0].status = TaskStatus::Failed;
+        attempt.tasks[0].artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"status\":\"completed\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: Connection refused (os error 61)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            !reclassify_codex_transport_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap()
+        );
+        let item = store.read_work_item("work-1").unwrap();
+        assert_eq!(item.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+        assert_eq!(item.attempts[0].tasks[0].status, TaskStatus::Failed);
     }
 
     #[test]

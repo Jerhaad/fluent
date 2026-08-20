@@ -52,6 +52,61 @@ pub fn classify_provider_unavailable(
     classify_provider_phase(provider, transcript).then_some(ProviderUnavailable { provider })
 }
 
+/// Recognize a Codex launch that exhausted its own reconnect path before the
+/// model produced any message or tool activity.
+///
+/// This classifier intentionally accepts only Codex's small structured
+/// transport-failure grammar. Any unknown event or usable model progress makes
+/// the evidence inconclusive and leaves the failure hard.
+pub(crate) fn classify_codex_transport_unavailable(
+    transcript: &Path,
+) -> Option<ProviderUnavailable> {
+    let events = read_json_lines(transcript)?;
+    let mut saw_turn = false;
+    let mut saw_transport_failure = false;
+    let mut saw_terminal_failure = false;
+
+    for (index, event) in events.iter().enumerate() {
+        match event["type"].as_str()? {
+            "thread.started" if !saw_turn && !saw_terminal_failure => {}
+            "turn.started" if !saw_turn && !saw_terminal_failure => saw_turn = true,
+            "error" if saw_turn && !saw_terminal_failure => {
+                if !is_codex_transport_failure_message(event["message"].as_str()?) {
+                    return None;
+                }
+                saw_transport_failure = true;
+            }
+            "item.completed" if saw_turn && !saw_terminal_failure => {
+                if event["item"]["type"].as_str() != Some("error")
+                    || !is_codex_transport_failure_message(event["item"]["message"].as_str()?)
+                {
+                    return None;
+                }
+                saw_transport_failure = true;
+            }
+            "turn.failed" if saw_turn && index + 1 == events.len() => {
+                if !is_codex_transport_failure_message(event["error"]["message"].as_str()?) {
+                    return None;
+                }
+                saw_transport_failure = true;
+                saw_terminal_failure = true;
+            }
+            _ => return None,
+        }
+    }
+
+    (saw_turn && saw_transport_failure && saw_terminal_failure).then_some(ProviderUnavailable {
+        provider: CoderKind::Codex,
+    })
+}
+
+fn is_codex_transport_failure_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("stream disconnected before completion")
+        && (message.contains("connection refused")
+            || message.contains("error sending request for url"))
+}
+
 /// Recognize only the preserved single-file Claude scheduler outage grammar.
 ///
 /// This compatibility classifier is intentionally separate from current Task
@@ -402,5 +457,47 @@ mod tests {
         std::fs::write(&path, "{\"type\":\"rate_limit_event\",\"retry_after\":1}\n").unwrap();
 
         assert!(classify_provider_unavailable(CoderKind::Claude, &path).is_none());
+    }
+
+    #[test]
+    fn classifies_codex_transport_outage_before_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... stream disconnected before completion: Connection refused (os error 61)\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"error\",\"message\":\"Falling back. stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            classify_codex_transport_unavailable(&path),
+            Some(ProviderUnavailable {
+                provider: CoderKind::Codex,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_codex_transport_outage_after_model_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"working\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: Connection refused (os error 61)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(classify_codex_transport_unavailable(&path).is_none());
     }
 }

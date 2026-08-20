@@ -2983,7 +2983,13 @@ fn provider_pause_error(
                 return Err(anyhow::Error::new(host).context(error));
             }
             match transcript.as_deref().and_then(|path| {
-                crate::provider_evidence::classify_provider_unavailable(coder, path)
+                crate::provider_evidence::classify_provider_unavailable(coder, path).or_else(|| {
+                    (coder == CoderKind::Codex)
+                        .then(|| {
+                            crate::provider_evidence::classify_codex_transport_unavailable(path)
+                        })
+                        .flatten()
+                })
             }) {
                 Some(evidence) => Err(anyhow::Error::new(
                     crate::provider_evidence::ProviderUnavailableError(evidence),
@@ -9038,6 +9044,34 @@ mod tests {
                 .unwrap_err()
                 .is::<crate::provider_evidence::ProviderUnavailableError>(),
             "model progress prevents the typed provider pause"
+        );
+    }
+
+    #[test]
+    fn codex_transport_failure_before_progress_becomes_provider_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Reconnecting... stream disconnected before completion: Connection refused (os error 61)\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"stream disconnected before completion: error sending request for url (https://example.invalid)\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let result = provider_pause_error(
+            Err(anyhow::anyhow!("Codex exited with code 1")),
+            CoderKind::Codex,
+            Some(transcript),
+        );
+
+        assert!(
+            result
+                .unwrap_err()
+                .is::<crate::provider_evidence::ProviderUnavailableError>()
         );
     }
 
