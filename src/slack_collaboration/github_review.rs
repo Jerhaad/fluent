@@ -48,7 +48,14 @@ pub struct GitHubPublishRequest {
 /// One stable review event returned by GitHub structured output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubReviewFeedback {
+    /// Stable review-comment or review identity selected by approvers.
     pub id: String,
+    /// Stable parent thread for an inline review comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Stable inline comment identity; equal to `id` for thread comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_id: Option<String>,
     pub kind: String,
     pub body: String,
     pub url: String,
@@ -310,16 +317,55 @@ impl GhGitHubClient {
             .map(ToOwned::to_owned))
     }
 
-    fn observed_remote_head(&self, checkout: &Path, branch: &str) -> Result<Option<String>> {
-        let push_url = crate::git::run_stdout(
-            checkout,
-            &["remote", "get-url", "--push", "origin"],
-            "inspect GitHub publication push remote",
-        )?;
+    fn configured_remote_urls(checkout: &Path, key: &str) -> Result<Vec<String>> {
+        let output = crate::git::run_raw(checkout, &["config", "--get-all", key])?;
+        if output.status.code() == Some(1) {
+            return Ok(Vec::new());
+        }
+        if !output.status.success() {
+            bail!(
+                "Git failed while inspecting {key}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    fn validated_push_url(&self, checkout: &Path, repository: &str) -> Result<String> {
+        let origins = Self::configured_remote_urls(checkout, "remote.origin.url")?;
+        let [origin] = origins.as_slice() else {
+            bail!("Git origin must have exactly one fetch URL");
+        };
+        if github_repository(origin).as_deref() != Some(repository) {
+            bail!("Git origin does not match the configured github.com repository");
+        }
+        let configured_push_urls = Self::configured_remote_urls(checkout, "remote.origin.pushurl")?;
+        let push_url = match configured_push_urls.as_slice() {
+            [] => origin,
+            [push_url] => push_url,
+            _ => bail!("Git origin must have exactly one push URL"),
+        };
+        if github_repository(push_url).as_deref() != Some(repository) {
+            bail!("Git origin push URL does not match the configured github.com repository");
+        }
+        Ok(push_url.clone())
+    }
+
+    fn observed_remote_head(
+        &self,
+        checkout: &Path,
+        push_url: &str,
+        branch: &str,
+    ) -> Result<Option<String>> {
         let remote_ref = format!("refs/heads/{branch}");
         let output = crate::git::run_stdout(
             checkout,
-            &["ls-remote", "--heads", "--", &push_url, &remote_ref],
+            &["ls-remote", "--heads", "--", push_url, &remote_ref],
             "inspect the current GitHub review head",
         )?;
         if output.trim().is_empty() {
@@ -354,27 +400,24 @@ impl GitHubReviewClient for GhGitHubClient {
     ) -> Result<String> {
         let repository = github_repository(&request.publication.remote)
             .context("configured GitHub remote is unsupported")?;
-        let origin = crate::git::run_stdout(
-            &request.checkout,
-            &["remote", "get-url", "origin"],
-            "inspect GitHub publication remote",
-        )?;
-        if github_repository(&origin).as_deref() != Some(repository.as_str()) {
-            bail!("Git origin does not match the configured github.com repository");
-        }
+        let push_url = self.validated_push_url(&request.checkout, &repository)?;
         self.gh(
             &request.checkout,
             &["auth", "status", "--hostname", "github.com"],
         )?;
         let remote_ref = format!("refs/heads/{}", request.publication.head_branch);
         let expected = self
-            .observed_remote_head(&request.checkout, &request.publication.head_branch)?
+            .observed_remote_head(
+                &request.checkout,
+                &push_url,
+                &request.publication.head_branch,
+            )?
             .unwrap_or_default();
         let lease = format!("--force-with-lease={remote_ref}:{expected}");
         let refspec = format!("{}:{remote_ref}", request.publication.candidate.commit);
         crate::git::run(
             &request.checkout,
-            &["push", &lease, "origin", &refspec],
+            &["push", &lease, "--", &push_url, &refspec],
             "publish the exact reviewed candidate",
         )?;
         if let Some(url) = existing.and_then(|record| record.pull_request_url.clone()) {
@@ -412,8 +455,13 @@ impl GitHubReviewClient for GhGitHubClient {
             .pull_request_url
             .as_deref()
             .context("GitHub publication has no pull-request URL")?;
-        let output = self.gh(checkout, &["pr", "view", url, "--json", "comments,reviews"])?;
-        parse_feedback(&output, &publication.candidate.commit)
+        let url_field = format!("url={url}");
+        let query_field = format!("query={REVIEW_FEEDBACK_QUERY}");
+        let output = self.gh(
+            checkout,
+            &["api", "graphql", "-f", &url_field, "-f", &query_field],
+        )?;
+        parse_feedback(&output)
     }
 }
 
@@ -429,29 +477,110 @@ fn github_repository(remote: &str) -> Option<String> {
         .then(|| format!("{owner}/{repo}"))
 }
 
-fn parse_feedback(output: &str, candidate_commit: &str) -> Result<Vec<GitHubReviewFeedback>> {
+const REVIEW_FEEDBACK_QUERY: &str = r#"query($url: URI!) {
+  resource(url: $url) {
+    ... on PullRequest {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 100) {
+            nodes { id body url originalCommit { oid } }
+          }
+        }
+      }
+      reviews(first: 100) {
+        nodes { id state body url commit { oid } }
+      }
+    }
+  }
+}"#;
+
+fn parse_feedback(output: &str) -> Result<Vec<GitHubReviewFeedback>> {
     let root: serde_json::Value =
         serde_json::from_str(output).context("parse GitHub review output")?;
+    let pull_request = root
+        .pointer("/data/resource")
+        .context("GitHub review output lacks pull request data")?;
     let mut feedback = Vec::new();
-    for (field, kind) in [("comments", "comment"), ("reviews", "review")] {
-        for row in root[field].as_array().into_iter().flatten() {
-            let id = row["id"].as_str().context("GitHub feedback lacks id")?;
-            let url = row["url"]
+    let threads = pull_request
+        .pointer("/reviewThreads/nodes")
+        .and_then(serde_json::Value::as_array)
+        .context("GitHub review output lacks review threads")?;
+    for thread in threads {
+        let thread_id = thread["id"]
+            .as_str()
+            .context("GitHub review thread lacks id")?;
+        let comments = thread
+            .pointer("/comments/nodes")
+            .and_then(serde_json::Value::as_array)
+            .context("GitHub review thread lacks comments")?;
+        if comments.is_empty() {
+            bail!("GitHub review thread lacks a comment");
+        }
+        for comment in comments {
+            let comment_id = comment["id"]
                 .as_str()
-                .or_else(|| row["htmlUrl"].as_str())
-                .context("GitHub feedback lacks URL")?;
-            feedback.push(GitHubReviewFeedback {
-                id: id.to_owned(),
-                kind: row["state"].as_str().unwrap_or(kind).to_ascii_lowercase(),
-                body: row["body"].as_str().unwrap_or_default().to_owned(),
-                url: url.to_owned(),
-                candidate_commit: row["commit"]["oid"]
-                    .as_str()
-                    .unwrap_or(candidate_commit)
-                    .to_owned(),
-                resolved: row["isResolved"].as_bool().unwrap_or(false),
-            });
+                .context("GitHub review comment lacks id")?;
+            feedback.push(parsed_feedback(
+                comment_id,
+                Some(thread_id),
+                Some(comment_id),
+                "review_thread",
+                comment,
+                "/originalCommit/oid",
+                thread["isResolved"].as_bool().unwrap_or(false),
+            )?);
         }
     }
+    let reviews = pull_request
+        .pointer("/reviews/nodes")
+        .and_then(serde_json::Value::as_array)
+        .context("GitHub review output lacks reviews")?;
+    for review in reviews {
+        let id = review["id"].as_str().context("GitHub review lacks id")?;
+        let kind = review["state"]
+            .as_str()
+            .unwrap_or("review")
+            .to_ascii_lowercase();
+        feedback.push(parsed_feedback(
+            id,
+            None,
+            None,
+            &kind,
+            review,
+            "/commit/oid",
+            false,
+        )?);
+    }
     Ok(feedback)
+}
+
+fn parsed_feedback(
+    id: &str,
+    thread_id: Option<&str>,
+    comment_id: Option<&str>,
+    kind: &str,
+    row: &serde_json::Value,
+    commit_pointer: &str,
+    resolved: bool,
+) -> Result<GitHubReviewFeedback> {
+    let candidate_commit = row
+        .pointer(commit_pointer)
+        .and_then(serde_json::Value::as_str)
+        .filter(|commit| !commit.is_empty())
+        .context("GitHub feedback lacks a candidate commit")?;
+    Ok(GitHubReviewFeedback {
+        id: id.to_owned(),
+        thread_id: thread_id.map(ToOwned::to_owned),
+        comment_id: comment_id.map(ToOwned::to_owned),
+        kind: kind.to_owned(),
+        body: row["body"].as_str().unwrap_or_default().to_owned(),
+        url: row["url"]
+            .as_str()
+            .context("GitHub feedback lacks URL")?
+            .to_owned(),
+        candidate_commit: candidate_commit.to_owned(),
+        resolved,
+    })
 }

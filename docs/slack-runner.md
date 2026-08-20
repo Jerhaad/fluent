@@ -239,20 +239,39 @@ deliver `message.im` events and grant the `im:history` scope.
 ## Configure optional GitHub review
 
 Set `github_remote` only for repositories hosted on `github.com`, using
-`https://github.com/<owner>/<repository>`. The checkout's `origin` must resolve
-to that same owner and repository; Fluent rejects a different host or repository
-before it publishes anything. Confirm both values from the runner account:
+`https://github.com/<owner>/<repository>`. The checkout's `origin` fetch and
+push URLs must name that same owner and repository. Fluent accepts HTTPS and
+`git@github.com:` SSH origins and rejects a different push host or repository
+before it publishes anything. Confirm both URLs from the runner account:
 
 ```sh
 git -C /absolute/checkout remote get-url origin
+git -C /absolute/checkout remote get-url --push origin
 gh auth login --hostname github.com --git-protocol https
 gh auth status --hostname github.com
 ```
 
-Keep GitHub credentials in the runner owner's `gh` credential store. Do not add
-tokens to Fluent configuration, Slack messages, or provider environments. The
-runner uses the host-owned `gh` authentication and pushes the exact reviewed
-commit to the Slice's managed review branch.
+The `gh` login authenticates GitHub API requests but does not by itself grant
+Git write access for every origin protocol. Configure the runner owner's Git
+credentials for the origin before starting Fluent:
+
+- For an HTTPS origin, run `gh auth setup-git` after `gh auth login` so Git uses
+  the runner owner's `gh` credential helper.
+- For an SSH origin, load a GitHub-authorized key into the runner owner's SSH
+  agent and verify it with `ssh -T git@github.com`. GitHub reports successful
+  authentication while declining shell access, so that command can exit with
+  status 1.
+
+Confirm write authentication without changing the remote:
+
+```sh
+git -C /absolute/checkout push --dry-run origin HEAD:refs/heads/fluent-auth-check
+```
+
+Keep GitHub credentials in the runner owner's credential store or SSH agent.
+Do not add tokens or private keys to Fluent configuration, Slack messages, or
+provider environments. The runner uses host-owned API and Git authentication
+to push the exact reviewed commit to the Slice's managed review branch.
 
 After Fluent reports a ready candidate, a project approver requests publication
 in the same thread with `create pull request <candidate-id>`. Fluent polls an

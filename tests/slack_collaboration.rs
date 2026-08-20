@@ -9529,14 +9529,13 @@ fn github_adapter_request(checkout: &TempDir, remote: &TempDir) -> GitHubPublish
         .args(["rev-parse", "HEAD"])
         .output()
         .unwrap();
+    let rewrite_key = format!("url.{}.insteadOf", remote.path().display());
     for args in [
         vec!["remote", "add", "origin", "https://github.com/acme/app.git"],
         vec![
-            "remote",
-            "set-url",
-            "--push",
-            "origin",
-            remote.path().to_str().unwrap(),
+            "config",
+            rewrite_key.as_str(),
+            "https://github.com/acme/app.git",
         ],
     ] {
         assert!(
@@ -9797,6 +9796,88 @@ fn gh_adapter_reports_auth_host_push_and_api_failures() {
 }
 
 #[test]
+fn gh_adapter_rejects_mismatched_push_repository() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(remote.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let request = github_adapter_request(&checkout, &remote);
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args([
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                "https://github.com/acme/elsewhere.git",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let error = GhGitHubClient::new("/usr/bin/false")
+        .publish(&request, None)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("push URL"));
+}
+
+#[test]
+fn gh_adapter_accepts_matching_ssh_push_repository() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(remote.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let request = github_adapter_request(&checkout, &remote);
+    let rewrite_key = format!("url.{}.insteadOf", remote.path().display());
+    for args in [
+        vec!["remote", "set-url", "origin", "git@github.com:acme/app.git"],
+        vec![
+            "config",
+            rewrite_key.as_str(),
+            "git@github.com:acme/app.git",
+        ],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let fixture = TempDir::new().unwrap();
+    let (gh, _) = write_fake_gh(
+        &fixture,
+        "gh-ssh",
+        "case \"$1 $2\" in\n  'auth status') exit 0 ;;\n  'pr list') printf '%s\\n' '[{\"url\":\"https://github.com/acme/app/pull/7\"}]'; exit 0 ;;\n  *) exit 91 ;;\nesac",
+    );
+
+    let url = GhGitHubClient::new(gh).publish(&request, None).unwrap();
+
+    assert_eq!(url, "https://github.com/acme/app/pull/7");
+}
+
+#[test]
 fn gh_adapter_reads_feedback_from_candidate_checkout() {
     let checkout = TempDir::new().unwrap();
     initialize_checkout(checkout.path());
@@ -9809,16 +9890,80 @@ fn gh_adapter_reads_feedback_from_candidate_checkout() {
     let mut publication = github_adapter_request(&checkout, &remote).publication;
     publication.pull_request_url = Some("https://github.com/acme/app/pull/7".into());
     let fixture = TempDir::new().unwrap();
+    let response = serde_json::json!({
+        "data": {
+            "resource": {
+                "reviewThreads": {
+                    "nodes": [
+                        {
+                            "id": "RT1",
+                            "isResolved": false,
+                            "comments": {
+                                "nodes": [
+                                    {
+                                        "id": "RC1",
+                                        "body": "note",
+                                        "url": "https://github.test/RC1",
+                                        "originalCommit": {"oid": publication.candidate.commit},
+                                    },
+                                    {
+                                        "id": "RC1-reply",
+                                        "body": "follow-up",
+                                        "url": "https://github.test/RC1-reply",
+                                        "originalCommit": {"oid": publication.candidate.commit},
+                                    },
+                                ],
+                            },
+                        },
+                        {
+                            "id": "RT2",
+                            "isResolved": true,
+                            "comments": {
+                                "nodes": [{
+                                    "id": "RC2",
+                                    "body": "resolved note",
+                                    "url": "https://github.test/RC2",
+                                    "originalCommit": {"oid": publication.candidate.commit},
+                                }],
+                            },
+                        },
+                    ],
+                },
+                "reviews": {
+                    "nodes": [{
+                        "id": "R1",
+                        "state": "CHANGES_REQUESTED",
+                        "body": "request changes",
+                        "url": "https://github.test/R1",
+                        "commit": {"oid": publication.candidate.commit},
+                    }],
+                },
+            },
+        },
+    });
     let (gh, log) = write_fake_gh(
         &fixture,
         "gh-feedback",
-        "printf '%s\\n' '{\"comments\":[{\"id\":\"C1\",\"body\":\"note\",\"url\":\"https://github.test/C1\"}],\"reviews\":[]}'",
+        &format!("printf '%s\\n' '{}'", response),
     );
     let feedback = GhGitHubClient::new(gh)
         .review_feedback(checkout.path(), &publication)
         .unwrap();
-    assert_eq!(feedback[0].id, "C1");
+    assert_eq!(feedback[0].id, "RC1");
+    assert_eq!(feedback[0].thread_id.as_deref(), Some("RT1"));
+    assert_eq!(feedback[0].comment_id.as_deref(), Some("RC1"));
+    assert_eq!(feedback[0].candidate_commit, publication.candidate.commit);
+    assert!(!feedback[0].resolved);
+    assert_eq!(feedback[1].id, "RC1-reply");
+    assert_eq!(feedback[1].thread_id.as_deref(), Some("RT1"));
+    assert_eq!(feedback[2].id, "RC2");
+    assert_eq!(feedback[2].thread_id.as_deref(), Some("RT2"));
+    assert!(feedback[2].resolved);
+    assert_eq!(feedback[3].id, "R1");
+    assert_eq!(feedback[3].kind, "changes_requested");
+    assert_eq!(feedback[3].comment_id, None);
     let invocation = fs::read_to_string(log).unwrap();
+    assert!(invocation.contains("api graphql"));
     let cwd = invocation
         .lines()
         .next()
@@ -9830,6 +9975,53 @@ fn gh_adapter_reads_feedback_from_candidate_checkout() {
         std::path::Path::new(cwd).canonicalize().unwrap(),
         checkout.path().canonicalize().unwrap()
     );
+}
+
+#[test]
+fn gh_adapter_rejects_feedback_without_candidate_commit() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(remote.path())
+        .status()
+        .unwrap();
+    let mut publication = github_adapter_request(&checkout, &remote).publication;
+    publication.pull_request_url = Some("https://github.com/acme/app/pull/7".into());
+    let fixture = TempDir::new().unwrap();
+    let response = serde_json::json!({
+        "data": {
+            "resource": {
+                "reviewThreads": {
+                    "nodes": [{
+                        "id": "RT-unbound",
+                        "isResolved": false,
+                        "comments": {
+                            "nodes": [{
+                                "id": "RC-unbound",
+                                "body": "unknown candidate",
+                                "url": "https://github.test/RC-unbound",
+                                "originalCommit": null,
+                            }],
+                        },
+                    }],
+                },
+                "reviews": {"nodes": []},
+            },
+        },
+    });
+    let (gh, _) = write_fake_gh(
+        &fixture,
+        "gh-unbound-feedback",
+        &format!("printf '%s\\n' '{}'", response),
+    );
+
+    let error = GhGitHubClient::new(gh)
+        .review_feedback(checkout.path(), &publication)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("candidate commit"));
 }
 
 #[test]
@@ -9874,6 +10066,8 @@ fn local_candidate_rework_boundary_persists_idempotently() {
         authorized_by: "U1".into(),
         feedback: vec![GitHubReviewFeedback {
             id: "C1".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "comment".into(),
             body: "Please adjust this".into(),
             url: "https://github.test/C1".into(),
@@ -10283,6 +10477,8 @@ fn github_review_feedback_reports_without_starting_work() {
     github.feedback = vec![
         GitHubReviewFeedback {
             id: "comment-1".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "comment".into(),
             body: "Please clarify this branch.".into(),
             url: "https://github.com/acme/app/pull/7#discussion_r1".into(),
@@ -10291,6 +10487,8 @@ fn github_review_feedback_reports_without_starting_work() {
         },
         GitHubReviewFeedback {
             id: "review-1".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "changes_requested".into(),
             body: "This applies to the earlier candidate.".into(),
             url: "https://github.com/acme/app/pull/7#pullrequestreview-1".into(),
@@ -10299,6 +10497,8 @@ fn github_review_feedback_reports_without_starting_work() {
         },
         GitHubReviewFeedback {
             id: "resolved-1".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "comment".into(),
             body: "Already resolved.".into(),
             url: "https://github.com/acme/app/pull/7#discussion_r2".into(),
@@ -10340,6 +10540,47 @@ fn github_review_feedback_reports_without_starting_work() {
 }
 
 #[test]
+fn github_review_resolution_updates_persisted_thread() {
+    let (home, checkout, config) = setup(true);
+    let mut github = FakeGitHub::default();
+    let mut runner = published_github_runner(&home, &checkout, config, &mut github);
+    github.feedback = vec![GitHubReviewFeedback {
+        id: "comment-1".into(),
+        thread_id: Some("thread-1".into()),
+        comment_id: Some("comment-1".into()),
+        kind: "review_thread".into(),
+        body: "Please adjust this line.".into(),
+        url: "https://github.com/acme/app/pull/7#discussion_r1".into(),
+        candidate_commit: "commit-one".into(),
+        resolved: false,
+    }];
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+    let delivery_count = runner.slack().deliveries.len();
+
+    github.feedback[0].resolved = true;
+    runner.poll_linked_work_with_github(&mut github).unwrap();
+
+    let publication = WorkControl::new(checkout.path())
+        .slice("slice-github")
+        .unwrap()
+        .unwrap()
+        .github_publication
+        .unwrap();
+    assert!(publication.feedback[0].resolved);
+    assert_eq!(runner.slack().deliveries.len(), delivery_count);
+    assert!(
+        runner
+            .authorize_github_feedback_rework(
+                "1.0",
+                "U1",
+                &["comment-1".into()],
+                &RecordingReworkBoundary::default(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn approver_routes_selected_github_feedback_to_candidate_rework() {
     let (home, checkout, mut config) = setup(true);
     config
@@ -10353,6 +10594,8 @@ fn approver_routes_selected_github_feedback_to_candidate_rework() {
     github.feedback = vec![
         GitHubReviewFeedback {
             id: "selected-1".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "changes_requested".into(),
             body: "Handle the empty response.".into(),
             url: "https://github.com/acme/app/pull/7#pullrequestreview-2".into(),
@@ -10361,6 +10604,8 @@ fn approver_routes_selected_github_feedback_to_candidate_rework() {
         },
         GitHubReviewFeedback {
             id: "resolved-2".into(),
+            thread_id: None,
+            comment_id: None,
             kind: "comment".into(),
             body: "No longer applicable.".into(),
             url: "https://github.com/acme/app/pull/7#discussion_r3".into(),

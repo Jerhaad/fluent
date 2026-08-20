@@ -501,19 +501,37 @@ impl WorkControl {
             .context("Slice has no Fluent-created pull request")?;
         let received = github.review_feedback(&self.project_root, publication)?;
         let mut unseen = Vec::new();
+        let mut publication_changed = false;
         for feedback in received {
-            if publication
+            if let Some(seen) = publication
                 .feedback
-                .iter()
-                .any(|seen| seen.id == feedback.id)
+                .iter_mut()
+                .find(|seen| seen.id == feedback.id)
             {
+                if seen.thread_id != feedback.thread_id
+                    || seen.comment_id != feedback.comment_id
+                    || seen.url != feedback.url
+                    || seen.candidate_commit != feedback.candidate_commit
+                {
+                    bail!("GitHub feedback identity changed for {}", feedback.id);
+                }
+                if seen.kind != feedback.kind
+                    || seen.body != feedback.body
+                    || seen.resolved != feedback.resolved
+                {
+                    seen.kind = feedback.kind;
+                    seen.body = feedback.body;
+                    seen.resolved = feedback.resolved;
+                    publication_changed = true;
+                }
                 continue;
             }
             schedule(&feedback)?;
             publication.feedback.push(feedback.clone());
             unseen.push(feedback);
+            publication_changed = true;
         }
-        if !unseen.is_empty() {
+        if publication_changed {
             self.save_slice(&slice)?;
         }
         Ok(unseen)
