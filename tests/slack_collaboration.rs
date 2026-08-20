@@ -10141,15 +10141,20 @@ fn duplicate_pr_request_returns_existing_pr() {
         InMemoryProvider::default(),
         InMemorySlack::default(),
     );
+    let redelivery = event("E2", Some("1.0"), "create pull request candidate-github-1");
     restarted
-        .ingest_with_github(
-            event("E3", Some("1.0"), "create pull request candidate-github-1"),
-            None,
-            &mut github,
-            &rework,
-        )
+        .ingest_with_github(redelivery.clone(), None, &mut github, &rework)
         .unwrap();
     assert_eq!(github.publishes.len(), 1);
+    assert!(restarted.slack().deliveries.iter().any(|delivery| {
+        delivery.text.contains("candidate-github-1")
+            && delivery.text.contains("https://github.com/acme/app/pull/7")
+    }));
+    let delivery_count = restarted.slack().deliveries.len();
+    restarted
+        .ingest_with_github(redelivery, None, &mut github, &rework)
+        .unwrap();
+    assert_eq!(restarted.slack().deliveries.len(), delivery_count);
     let publication = WorkControl::new(checkout.path())
         .slice("slice-github")
         .unwrap()

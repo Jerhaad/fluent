@@ -706,7 +706,10 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
             return Ok(());
         }
         match self.store.persist_inbox(&self.config, &event)? {
-            InboxState::Processed => return Ok(()),
+            InboxState::Processed => {
+                self.replay_processed_github_request(&event)?;
+                return Ok(());
+            }
             InboxState::Pending if !event.acknowledgement_id.is_empty() => {
                 self.slack.acknowledge(&event.acknowledgement_id)?
             }
@@ -732,6 +735,56 @@ impl<'a, P: ConversationProvider, S: SlackTransport, C: CollaborationStore>
                 self.reconcile_thread_github(&event.thread_id(), &mut *integrations.github)?;
             }
         }
+        self.deliver_pending()
+    }
+
+    fn replay_processed_github_request(&mut self, event: &InboundEnvelope) -> Result<()> {
+        let Some(candidate_id) = github_pull_request_candidate(event.text.trim()) else {
+            return Ok(());
+        };
+        let Some(thread) = self.store.load_thread(&self.config, &event.thread_id())? else {
+            return Ok(());
+        };
+        let Some(slice_id) = thread.slice.as_deref() else {
+            return Ok(());
+        };
+        let checkout = self
+            .configured_bound_project(&thread)?
+            .checkout
+            .path
+            .clone();
+        let Some(publication) = WorkControl::new(checkout)
+            .slice(slice_id)?
+            .and_then(|slice| slice.github_publication)
+        else {
+            return Ok(());
+        };
+        let candidate_was_published = publication.candidate.candidate_id == candidate_id
+            || publication
+                .candidate_history
+                .iter()
+                .any(|candidate| candidate.candidate_id == candidate_id);
+        let Some(url) = publication
+            .pull_request_url
+            .filter(|_| candidate_was_published)
+        else {
+            return Ok(());
+        };
+
+        if !event.acknowledgement_id.is_empty() {
+            self.slack.acknowledge(&event.acknowledgement_id)?;
+        }
+        self.store.persist_outbox(OutboundDelivery {
+            id: format!("{}:github-pr-existing", event.id),
+            channel: thread.channel,
+            thread_timestamp: thread.id,
+            text: format!(
+                "GitHub pull request for Merge Candidate {candidate_id} already exists: {url}"
+            ),
+            delivered: false,
+            approval_control: None,
+            update_timestamp: None,
+        })?;
         self.deliver_pending()
     }
 
