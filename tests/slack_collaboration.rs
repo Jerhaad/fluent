@@ -52,6 +52,21 @@ fn initialize_checkout(path: &std::path::Path) -> (String, String) {
     )
 }
 
+fn replace_git_admin_directory(checkout: &std::path::Path) {
+    let git_dir = checkout.join(".git");
+    let original = checkout.join(".git-original");
+    fs::rename(&git_dir, &original).unwrap();
+    assert!(
+        std::process::Command::new("cp")
+            .args(["-R"])
+            .arg(&original)
+            .arg(&git_dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 fn setup(default: bool) -> (TempDir, TempDir, RunnerConfig) {
     let home = TempDir::new().unwrap();
     let checkout = TempDir::new().unwrap();
@@ -90,6 +105,17 @@ fn project_setup_lists_only_safely_labeled_allowed_checkouts() {
     let nested = allowed.path().join("team/app");
     fs::create_dir_all(&nested).unwrap();
     initialize_checkout(&nested);
+    let linked = allowed.path().join("linked");
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&nested)
+            .args(["worktree", "add", "-b", "linked"])
+            .arg(&linked)
+            .status()
+            .unwrap()
+            .success()
+    );
     let too_deep = allowed.path().join("one/two/hidden");
     fs::create_dir_all(&too_deep).unwrap();
     initialize_checkout(&too_deep);
@@ -106,9 +132,15 @@ fn project_setup_lists_only_safely_labeled_allowed_checkouts() {
 
     let offers = discover_project_checkouts(&roots, "U1").unwrap().offers();
 
-    assert_eq!(offers.len(), 1);
-    assert_eq!(offers[0].project_label, "products");
-    assert_eq!(offers[0].checkout_label, "app");
+    assert_eq!(offers.len(), 2);
+    assert!(offers.iter().all(|offer| offer.project_label == "products"));
+    assert_eq!(
+        offers
+            .iter()
+            .map(|offer| offer.checkout_label.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["app", "linked"])
+    );
     let rendered = serde_json::to_string(&offers).unwrap();
     assert!(!rendered.contains(&allowed.path().display().to_string()));
     assert!(!rendered.contains(&outside.path().display().to_string()));
@@ -236,6 +268,77 @@ fn approved_slack_setup_uses_existing_configured_init_boundary() {
     assert_eq!(boundary.calls.len(), 1);
     assert_eq!(boundary.calls[0].0, checkout.path().canonicalize().unwrap());
     assert_eq!(boundary.calls[0].1, proposal.choices);
+}
+
+#[test]
+fn selected_checkout_identity_is_revalidated_before_setup_and_commit() {
+    struct RejectBoundary;
+    impl ConfiguredInitBoundary for RejectBoundary {
+        fn initialize(
+            &mut self,
+            _: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            panic!("a replaced checkout must not reach configured initialization")
+        }
+    }
+
+    let setup_checkout = TempDir::new().unwrap();
+    initialize_checkout(setup_checkout.path());
+    let setup_index = discovery_for_checkout(setup_checkout.path(), &["U1"]);
+    let proposal = prepare_slack_project_setup(
+        &setup_index,
+        &setup_index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+    replace_git_admin_directory(setup_checkout.path());
+
+    let setup_error = approve_slack_project_setup(
+        &setup_index,
+        &proposal,
+        &proposal.revision,
+        "U1",
+        &mut RejectBoundary,
+    )
+    .unwrap_err();
+
+    assert!(
+        setup_error
+            .to_string()
+            .contains("checkout identity changed")
+    );
+    assert!(!setup_checkout.path().join(".fluent").exists());
+
+    let commit_checkout = TempDir::new().unwrap();
+    initialize_checkout(commit_checkout.path());
+    let (commit_index, review) = initialized_review(commit_checkout.path());
+    replace_git_admin_directory(commit_checkout.path());
+
+    let commit_error = commit_reviewed_initialization(
+        &commit_index,
+        &commit_index.offers()[0].selection_id,
+        &review,
+        &review.revision,
+        "U1",
+    )
+    .unwrap_err();
+
+    assert!(
+        commit_error
+            .to_string()
+            .contains("checkout identity changed")
+    );
+    assert_eq!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(commit_checkout.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        format!("{}\n", review.expected_head).as_bytes()
+    );
 }
 
 #[test]
@@ -875,6 +978,29 @@ fn project_enablement_rejects_label_collisions_and_reuses_the_same_checkout() {
         same_thread.provider.as_deref(),
         Some(&*same_before.default_provider)
     );
+}
+
+#[test]
+fn project_enablement_revalidates_selected_identity_before_binding() {
+    let (home, checkout, mut config, index, committed, mut thread) = committed_setup_fixture();
+    let config_before = config.clone();
+    let thread_before = thread.clone();
+    replace_git_admin_directory(checkout.path());
+
+    let error = complete_project_enablement(
+        home.path(),
+        &mut config,
+        &index,
+        &index.offers()[0].selection_id,
+        &committed,
+        &mut thread,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("checkout identity changed"));
+    assert_eq!(config, config_before);
+    assert_eq!(thread, thread_before);
 }
 
 #[test]

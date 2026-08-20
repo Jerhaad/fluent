@@ -804,6 +804,9 @@ pub fn complete_project_enablement(
         "record enabled checkout branch",
     )?;
     let identity = checkout_identity(&entry.path)?;
+    if identity != entry.identity {
+        anyhow::bail!("selected checkout identity changed; select it again")
+    }
     let existing = config.projects.get(&entry.offer.project_label);
     if existing.is_some_and(|project| project.checkout.identity != identity) {
         anyhow::bail!(
