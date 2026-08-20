@@ -9,6 +9,16 @@ seed_review_skill_stubs() {
     mkdir -p "${workspace}/skills/review-${role}"
     printf 'stub\n' > "${workspace}/skills/review-${role}/SKILL.md"
   done
+  local hook_path
+  hook_path="$(git -C "$workspace" rev-parse --git-path hooks/commit-msg)"
+  mkdir -p "$(dirname "$hook_path")"
+  cat > "$hook_path" <<'HOOK'
+#!/bin/sh
+if ! sed -n '3,$p' "$1" | grep -q '[^[:space:]]'; then
+  printf '\n- Describe the fixture change\n' >> "$1"
+fi
+HOOK
+  chmod +x "$hook_path"
 }
 
 # Seed a minimal tester config so the tester runs clean (no error).

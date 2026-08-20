@@ -18829,6 +18829,19 @@ fn setup_git_project(tmp: &TempDir) -> std::path::PathBuf {
     )
     .unwrap();
     git::run(&main_dir, &["config", "user.name", "test"], "set user.name").unwrap();
+    let commit_msg_hook = main_dir.join(".git/hooks/commit-msg");
+    fs::write(
+        &commit_msg_hook,
+        "#!/bin/sh\nif ! sed -n '3,$p' \"$1\" | grep -q '[^[:space:]]'; then\n  printf '\\n- Describe the fixture change\\n' >> \"$1\"\nfi\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&commit_msg_hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&commit_msg_hook, permissions).unwrap();
+    }
     fs::write(main_dir.join("README.md"), "test").unwrap();
     // Mirror the real project's gitignore so Fluent-managed runtime state
     // under .fluent/work/ doesn't appear as uncommitted changes.
