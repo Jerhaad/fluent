@@ -2806,10 +2806,10 @@ fn duplicate_approval_event_is_idempotent() {
     );
 }
 
-fn read_http_request(stream: &mut impl Read) {
+fn capture_http_request(stream: &mut impl Read) -> String {
     let mut request = Vec::new();
     loop {
-        let mut buffer = [0; 1024];
+        let mut buffer = [0; 16];
         let count = stream.read(&mut buffer).unwrap();
         request.extend_from_slice(&buffer[..count]);
         let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
@@ -2825,9 +2825,13 @@ fn read_http_request(stream: &mut impl Read) {
             })
             .unwrap_or_default();
         if request.len() >= header_end + 4 + content_length {
-            return;
+            return String::from_utf8(request).unwrap();
         }
     }
+}
+
+fn read_http_request(stream: &mut impl Read) {
+    drop(capture_http_request(stream));
 }
 #[test]
 fn socket_mode_envelope_preserves_event_and_acknowledgement_identities() {
@@ -3127,12 +3131,11 @@ fn slack_web_api_sends_private_refusals_ephemerally() {
     let address = listener.local_addr().unwrap();
     let request = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut buffer = [0; 4096];
-        let count = stream.read(&mut buffer).unwrap();
+        let request = capture_http_request(&mut stream);
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
             .unwrap();
-        String::from_utf8(buffer[..count].to_vec()).unwrap()
+        request
     });
     let mut slack = SlackWebApiTransport::new(
         format!("http://{address}"),
