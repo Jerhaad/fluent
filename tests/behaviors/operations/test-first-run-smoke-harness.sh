@@ -70,12 +70,22 @@ QUEUE_STATUS_FILE="$STATE_DIR/queue-status"
 queue_status() {
   [ -f "$QUEUE_STATUS_FILE" ] && cat "$QUEUE_STATUS_FILE" || printf 'none'
 }
-set_queue_status() { printf '%s\n' "$1" > "$QUEUE_STATUS_FILE"; }
+set_queue_status() {
+  local temporary
+  temporary="$(mktemp "${QUEUE_STATUS_FILE}.XXXXXX")"
+  printf '%s\n' "$1" > "$temporary"
+  mv "$temporary" "$QUEUE_STATUS_FILE"
+}
 QUEUE_ATTEMPT_FILE="$STATE_DIR/queue-attempt"
 queue_attempt() {
   [ -f "$QUEUE_ATTEMPT_FILE" ] && cat "$QUEUE_ATTEMPT_FILE" || printf 'none'
 }
-set_queue_attempt() { printf '%s\n' "$1" > "$QUEUE_ATTEMPT_FILE"; }
+set_queue_attempt() {
+  local temporary
+  temporary="$(mktemp "${QUEUE_ATTEMPT_FILE}.XXXXXX")"
+  printf '%s\n' "$1" > "$temporary"
+  mv "$temporary" "$QUEUE_ATTEMPT_FILE"
+}
 
 produce_candidate() {
   if [ "$(stage)" != "ran" ]; then
