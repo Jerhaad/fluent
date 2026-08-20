@@ -318,9 +318,12 @@ pub fn approve_slack_project_setup(
         anyhow::bail!("selected checkout identity changed; select it again")
     }
     let fluent_dir = entry.path.join(".fluent");
-    if fluent_dir.is_dir() {
-        let configuration = fs::read_to_string(fluent_dir.join("config.yaml"))
-            .unwrap_or_else(|_| "Fluent is initialized with default project configuration.".into());
+    let project_config = fluent_dir.join("config.yaml");
+    if project_config.is_file() {
+        crate::config::preflight_project_coder_config(&entry.path)
+            .context("validate existing Fluent project configuration")?;
+        let configuration = fs::read_to_string(project_config)
+            .context("read existing Fluent project configuration")?;
         return Ok(SlackSetupOutcome::AlreadyInitialized { configuration });
     }
     let before = snapshot_checkout(&entry.path)?;

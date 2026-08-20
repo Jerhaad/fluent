@@ -281,6 +281,50 @@ fn already_initialized_checkout_is_reused_without_reinitialization() {
             configuration: "follow-up: execute\n".into()
         }
     );
+
+    struct PartialDirectoryBoundary(bool);
+    impl ConfiguredInitBoundary for PartialDirectoryBoundary {
+        fn initialize(
+            &mut self,
+            checkout: &std::path::Path,
+            _: &SlackInitChoices,
+        ) -> anyhow::Result<ConfiguredInitReport> {
+            self.0 = true;
+            fs::write(checkout.join(".fluent/config.yaml"), "follow-up: propose\n")?;
+            Ok(ConfiguredInitReport {
+                already_initialized: false,
+                summary: "initialized partial directory".into(),
+            })
+        }
+    }
+    let partial = TempDir::new().unwrap();
+    initialize_checkout(partial.path());
+    fs::create_dir(partial.path().join(".fluent")).unwrap();
+    fs::write(partial.path().join(".fluent/notes"), "user-owned directory").unwrap();
+    let partial_index = discovery_for_checkout(partial.path(), &["U1"]);
+    let partial_proposal = prepare_slack_project_setup(
+        &partial_index,
+        &partial_index.offers()[0].selection_id,
+        setup_choices("codex-balanced", "propose"),
+    )
+    .unwrap();
+    let mut boundary = PartialDirectoryBoundary(false);
+
+    let partial_outcome = approve_slack_project_setup(
+        &partial_index,
+        &partial_proposal,
+        &partial_proposal.revision,
+        "U1",
+        &mut boundary,
+    )
+    .unwrap();
+
+    assert!(boundary.0);
+    assert!(matches!(
+        partial_outcome,
+        SlackSetupOutcome::Initialized(InitializationReview { summary, .. })
+            if summary == "initialized partial directory"
+    ));
 }
 
 #[test]
