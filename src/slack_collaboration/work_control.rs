@@ -122,10 +122,6 @@ pub struct SliceWork {
     #[serde(default)]
     acknowledged_request_ids: Vec<String>,
     #[serde(default)]
-    pub transitions: Vec<WorkTransition>,
-    #[serde(default)]
-    observed_states: BTreeMap<String, String>,
-    #[serde(default)]
     transition_cursors: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_publication: Option<GitHubPublication>,
@@ -258,8 +254,6 @@ impl WorkControl {
                 approval_state: PlanApprovalState::Materializing,
                 execution_requests: Vec::new(),
                 acknowledged_request_ids: Vec::new(),
-                transitions: Vec::new(),
-                observed_states: BTreeMap::new(),
                 transition_cursors: BTreeMap::new(),
                 github_publication: None,
             };
@@ -715,52 +709,6 @@ impl WorkControl {
                 })
             })
             .collect()
-    }
-
-    /// Reconcile the persisted Work aggregate into an append-only Slice
-    /// transition stream. A repeated poll after no Work mutation emits nothing.
-    pub fn reconcile_transitions(
-        &self,
-        slice_id: &str,
-        origin: DurableTransitionOrigin,
-    ) -> Result<Vec<WorkTransition>> {
-        let mut slice = self
-            .slice(slice_id)?
-            .with_context(|| format!("approved Slice {slice_id} is unavailable"))?;
-        let statuses = self.status(slice_id)?;
-        let mut appended = Vec::new();
-        for status in statuses {
-            let old_state = slice.observed_states.get(&status.work_item_id).cloned();
-            if old_state.as_deref() == Some(&status.state) {
-                continue;
-            }
-            let transition = WorkTransition {
-                sequence: slice.transitions.len() as u64 + 1,
-                work_item_id: status.work_item_id.clone(),
-                object_id: status.work_item_id.clone(),
-                old_state,
-                new_state: status.state.clone(),
-                origin,
-                reason: Some(status.next_action),
-                evidence_ref: None,
-                object_kind: "work-item".into(),
-                occurred_at: None,
-                elapsed_seconds: None,
-                candidate_commit: None,
-                comparison_base: None,
-                completed_tests: Vec::new(),
-                completed_reviews: Vec::new(),
-            };
-            slice
-                .observed_states
-                .insert(status.work_item_id, status.state);
-            slice.transitions.push(transition.clone());
-            appended.push(transition);
-        }
-        if !appended.is_empty() {
-            self.save_slice(&slice)?;
-        }
-        Ok(appended)
     }
 
     /// Read the model-owned ledger after this Slack consumer's independent

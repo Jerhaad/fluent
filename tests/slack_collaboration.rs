@@ -8989,6 +8989,60 @@ fn read_only_transition_reconciliation_does_not_acknowledge_delivery() {
 }
 
 #[test]
+fn slice_writes_drop_obsolete_transition_ledger_fields() {
+    struct Scheduler;
+    impl WorkScheduler for Scheduler {
+        fn submit(&self, request: &WorkExecutionRequest) -> anyhow::Result<WorkQueueOutcome> {
+            Ok(WorkQueueOutcome::Queued {
+                request_id: request.id.clone(),
+            })
+        }
+    }
+
+    let (_home, checkout, _config) = setup(true);
+    let control = WorkControl::new(checkout.path());
+    control
+        .approve_plan(
+            "slice-legacy-fields",
+            "U1",
+            &[PlannedWork::new("work-legacy-fields", "Work")],
+        )
+        .unwrap();
+    control
+        .schedule_durable_transitions("slice-legacy-fields", |_| Ok(()))
+        .unwrap();
+
+    let slice_path = checkout
+        .path()
+        .join(".fluent/work/slack/slices/slice-legacy-fields.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slice_path).unwrap()).unwrap();
+    let object = record.as_object_mut().unwrap();
+    object.insert("transitions".into(), serde_json::json!([]));
+    object.insert(
+        "observed_states".into(),
+        serde_json::json!({"work-legacy-fields": "planned"}),
+    );
+    fs::write(&slice_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    control
+        .authorize_execution("slice-legacy-fields", "U1", &Scheduler)
+        .unwrap();
+    let transitions = control
+        .schedule_durable_transitions("slice-legacy-fields", |_| Ok(()))
+        .unwrap();
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].new_state, "authorized");
+
+    let rewritten: serde_json::Value =
+        serde_json::from_slice(&fs::read(&slice_path).unwrap()).unwrap();
+    let object = rewritten.as_object().unwrap();
+    assert!(!object.contains_key("transitions"));
+    assert!(!object.contains_key("observed_states"));
+    assert_eq!(object["transition_cursors"]["work-legacy-fields"], 2);
+}
+
+#[test]
 fn legacy_empty_ledger_replays_initial_and_current_transition_once() {
     struct Scheduler;
     impl WorkScheduler for Scheduler {
