@@ -597,6 +597,52 @@ pub fn ensure_dispatch(
     Ok(EnsureDispatchOutcome::Created)
 }
 
+/// Idempotently enqueue an approver-authorized correction after a reviewed
+/// Merge Candidate becomes terminal. Unlike first-time automatic promotion,
+/// this boundary permits earlier terminal dispatch history while rejecting an
+/// unrelated active dispatch.
+pub fn ensure_candidate_rework_dispatch(
+    project_root: &Path,
+    id: &str,
+    origin_operation_id: &str,
+    priority: i64,
+) -> Result<EnsureDispatchOutcome> {
+    if !work_item_exists(project_root, id) {
+        bail!("Work Item {id:?} not found");
+    }
+    let store = WorkModelStore::new(project_root);
+    let _model_lock = store.lock_work_item_model(id)?;
+    let item = store.read_work_item_under_model_lock(id)?;
+    let eligibility = ensure_lifecycle_eligible(&item, id);
+
+    let _lock = lock_queue(project_root)?;
+    let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
+    if ledger
+        .dispatches
+        .iter()
+        .any(|dispatch| dispatch.origin_operation_id.as_deref() == Some(origin_operation_id))
+    {
+        return Ok(EnsureDispatchOutcome::ExistingMatching);
+    }
+    eligibility?;
+    if let Some(active) = ledger.active() {
+        bail!(
+            "Work Item {id:?} already has active dispatch {:?} ({})",
+            active.dispatch_id,
+            active.status
+        );
+    }
+    let sequence = ledger.next_sequence();
+    ledger.dispatches.push(Dispatch::new_queued(
+        id,
+        priority,
+        Some(origin_operation_id.to_string()),
+        sequence,
+    ));
+    write_ledger(project_root, &ledger)?;
+    Ok(EnsureDispatchOutcome::Created)
+}
+
 /// List each Work Item's active dispatch, ordered by priority descending then
 /// queue time ascending. Terminal dispositions stay in their ledger as history
 /// and are not listed. Skips malformed ledger files with a warning and

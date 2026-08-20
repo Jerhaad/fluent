@@ -9616,6 +9616,100 @@ fn gh_adapter_records_exact_publish_and_reconciles_partial_success() {
 }
 
 #[test]
+fn gh_adapter_advances_existing_head_without_remote_tracking_ref() {
+    let checkout = TempDir::new().unwrap();
+    initialize_checkout(checkout.path());
+    let remote = TempDir::new().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(remote.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let first = github_adapter_request(&checkout, &remote);
+    let fixture = TempDir::new().unwrap();
+    let (gh, _) = write_fake_gh(
+        &fixture,
+        "gh-advance",
+        "case \"$1 $2\" in\n  'auth status') exit 0 ;;\n  'pr list') printf '%s\\n' '[{\"url\":\"https://github.com/acme/app/pull/7\"}]'; exit 0 ;;\n  *) exit 91 ;;\nesac",
+    );
+    let mut client = GhGitHubClient::new(gh);
+    let url = client.publish(&first, None).unwrap();
+
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args([
+                "update-ref",
+                "-d",
+                "refs/remotes/origin/fluent/slice-github",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout.path())
+            .args([
+                "show-ref",
+                "--verify",
+                "refs/remotes/origin/fluent/slice-github",
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "the advance must not depend on a generated remote-tracking ref"
+    );
+    fs::write(checkout.path().join("README"), "fixture two").unwrap();
+    for args in [vec!["add", "README"], vec!["commit", "-m", "second"]] {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(checkout.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let second_commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout.path())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let second_commit = String::from_utf8(second_commit.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut existing = first.publication.clone();
+    existing.pull_request_url = Some(url.clone());
+    let mut second = first.clone();
+    second.publication.candidate.commit = second_commit.clone();
+    second.publication.candidate_history = vec![
+        existing.candidate.clone(),
+        second.publication.candidate.clone(),
+    ];
+
+    assert_eq!(client.publish(&second, Some(&existing)).unwrap(), url);
+    let remote_head = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(remote.path())
+        .args(["rev-parse", "refs/heads/fluent/slice-github"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(remote_head.stdout).unwrap().trim(),
+        second_commit
+    );
+}
+
+#[test]
 fn gh_adapter_reports_auth_host_push_and_api_failures() {
     let auth_checkout = TempDir::new().unwrap();
     initialize_checkout(auth_checkout.path());
@@ -9661,6 +9755,16 @@ fn gh_adapter_reports_auth_host_push_and_api_failures() {
     let push_checkout = TempDir::new().unwrap();
     initialize_checkout(push_checkout.path());
     let push_remote = TempDir::new().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(push_remote.path())
+        .status()
+        .unwrap();
+    let reject_push = push_remote.path().join("hooks/pre-receive");
+    fs::write(&reject_push, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut permissions = fs::metadata(&reject_push).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&reject_push, permissions).unwrap();
     let push_request = github_adapter_request(&push_checkout, &push_remote);
     let (push_gh, _) = write_fake_gh(
         &fixture,
@@ -9731,6 +9835,34 @@ fn gh_adapter_reads_feedback_from_candidate_checkout() {
 #[test]
 fn local_candidate_rework_boundary_persists_idempotently() {
     let project = TempDir::new().unwrap();
+    initialize_checkout(project.path());
+    WorkModelStore::new(project.path())
+        .create_work_item(&fluent::work_model::WorkItem::planned(
+            "work-github",
+            "GitHub review",
+        ))
+        .unwrap();
+    fluent::queue::add(project.path(), "work-github", None).unwrap();
+    fluent::queue::reconcile_active(
+        project.path(),
+        "work-github",
+        fluent::queue::DispatchStatus::CandidateReady,
+    )
+    .unwrap();
+    make_ready_candidate(
+        &project,
+        "work-github",
+        "candidate-github-1",
+        "commit-one",
+        "2026-08-19T01:00:00Z",
+    );
+    make_ready_candidate(
+        &project,
+        "work-github",
+        "candidate-github-2",
+        "commit-two",
+        "2026-08-19T02:00:00Z",
+    );
     let boundary = LocalCandidateReworkBoundary::new([("app".into(), project.path().into())]);
     let request = CandidateReworkRequest {
         id: "github-rework-stable".into(),
@@ -9755,10 +9887,44 @@ fn local_candidate_rework_boundary_persists_idempotently() {
 
     let persisted = project
         .path()
-        .join(".fluent/work/slack/candidate-rework/github-rework-stable.json");
+        .join(".fluent/work/artifacts/work-github/github-rework/github-rework-stable.json");
     assert_eq!(
         serde_json::from_slice::<CandidateReworkRequest>(&fs::read(persisted).unwrap()).unwrap(),
         request
+    );
+    let item = WorkModelStore::new(project.path())
+        .read_work_item("work-github")
+        .unwrap();
+    assert_eq!(item.attempts.len(), 3);
+    let rework = item.attempts.last().unwrap();
+    assert_eq!(rework.status, fluent::work_model::AttemptStatus::Planned);
+    assert!(
+        rework.tasks[0]
+            .instructions
+            .as_deref()
+            .unwrap()
+            .contains("Please adjust this")
+    );
+    assert!(
+        rework.tasks[0]
+            .input_artifacts
+            .iter()
+            .any(|artifact| artifact.path.ends_with("github-rework-stable.json"))
+    );
+    assert!(item.merge_candidates.iter().all(|candidate| {
+        candidate.merge_state.status == fluent::work_model::MergeCandidateMergeStatus::Failed
+    }));
+    let ledger = fluent::queue::read_ledger(project.path(), "work-github")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.dispatches.len(), 2);
+    assert_eq!(
+        ledger.dispatches[1].origin_operation_id.as_deref(),
+        Some("github-rework-stable")
+    );
+    assert_eq!(
+        ledger.dispatches[1].status,
+        fluent::queue::DispatchStatus::Queued
     );
 }
 

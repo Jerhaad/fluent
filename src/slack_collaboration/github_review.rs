@@ -8,6 +8,11 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::work_model::{
+    ArtifactRef, DurableTransitionMetadata, DurableTransitionOrigin, MergeCandidateMergeStatus,
+    WorkModelError, WorkModelStore, validate_work_item_id,
+};
+
 /// The exact ready candidate authorized for publication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubCandidate {
@@ -85,8 +90,9 @@ pub trait CandidateReworkBoundary {
     fn submit_candidate_rework(&self, request: &CandidateReworkRequest) -> Result<()>;
 }
 
-/// Durable production inbox consumed by the host-owned candidate-rework
-/// coordinator. Stable request identities make Slack redelivery idempotent.
+/// Production adapter that turns selected feedback into a normal queued Write
+/// Attempt. The persisted request is both immutable Writer input and the stable
+/// idempotency identity for queue submission.
 #[derive(Debug, Clone)]
 pub struct LocalCandidateReworkBoundary {
     projects: BTreeMap<String, PathBuf>,
@@ -102,25 +108,136 @@ impl LocalCandidateReworkBoundary {
 
 impl CandidateReworkBoundary for LocalCandidateReworkBoundary {
     fn submit_candidate_rework(&self, request: &CandidateReworkRequest) -> Result<()> {
+        validate_work_item_id(&request.work_item_id)?;
+        if request.id.is_empty()
+            || !request
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("candidate rework identity is not a safe path component");
+        }
         let project_root = self.projects.get(&request.project_label).with_context(|| {
             format!(
                 "candidate rework project {} is not configured",
                 request.project_label
             )
         })?;
-        let directory = project_root.join(".fluent/work/slack/candidate-rework");
-        fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("{}.json", request.id));
+        let relative_path = format!(
+            ".fluent/work/artifacts/{}/github-rework/{}.json",
+            request.work_item_id, request.id
+        );
+        let path = project_root.join(&relative_path);
+        let directory = path
+            .parent()
+            .expect("candidate rework artifact has a parent");
+        fs::create_dir_all(directory)?;
         let bytes = serde_json::to_vec_pretty(request)?;
         match fs::read(&path) {
-            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(existing) if existing == bytes => {}
             Ok(_) => bail!("candidate rework identity already has different content"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         }
-        crate::atomic_write::atomic_write(&path, &bytes)?;
+        if !path.exists() {
+            crate::atomic_write::atomic_write(&path, &bytes)?;
+        }
+        let artifact = ArtifactRef {
+            producer_id: "github-review".into(),
+            path: relative_path,
+        };
+        let metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::SlackThread,
+            reason: Some(format!(
+                "Project approver {} selected GitHub feedback for candidate {}",
+                request.authorized_by, request.candidate_id
+            )),
+            evidence_ref: Some(format!("github-rework:{}", request.id)),
+        };
+        let instructions = candidate_rework_instructions(request);
+        WorkModelStore::new(project_root).mutate_work_item_with_transition(
+            &request.work_item_id,
+            &metadata,
+            |item| {
+                if item.attempts.iter().any(|attempt| {
+                    attempt
+                        .tasks
+                        .iter()
+                        .any(|task| task.input_artifacts.contains(&artifact))
+                }) {
+                    return Ok(());
+                }
+                let candidate = item
+                    .merge_candidates
+                    .iter()
+                    .find(|candidate| candidate.id == request.candidate_id)
+                    .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                        candidate_id: request.candidate_id.clone(),
+                    })?;
+                if candidate.candidate_commit != request.candidate_commit
+                    || candidate.merge_state.status != MergeCandidateMergeStatus::Pending
+                    || candidate.ready_at.is_none()
+                {
+                    return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                        candidate_id: request.candidate_id.clone(),
+                        reason: "the request does not target the exact ready candidate".to_string(),
+                    });
+                }
+                let completed_at = chrono::Utc::now().to_rfc3339();
+                for pending in item.merge_candidates.iter_mut().filter(|candidate| {
+                    candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+                }) {
+                    pending.merge_state.status = MergeCandidateMergeStatus::Failed;
+                    pending.merge_state.failure_reason = Some(format!(
+                        "Superseded by authorized GitHub review request {} for candidate {}",
+                        request.id, request.candidate_id
+                    ));
+                    pending.completed_at = Some(completed_at.clone());
+                }
+
+                let attempt_id = item.next_attempt_id();
+                item.add_initial_attempt(attempt_id.clone())?;
+                let attempt = item
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .expect("new candidate rework Attempt exists");
+                attempt.artifacts.push(artifact.clone());
+                let write = attempt
+                    .tasks
+                    .first_mut()
+                    .expect("new candidate rework Attempt has a Writer");
+                write.instructions = Some(match write.instructions.take() {
+                    Some(original) => format!("{original}\n\n{instructions}"),
+                    None => instructions.clone(),
+                });
+                write.input_artifacts.push(artifact.clone());
+                item.validate()?;
+                Ok(())
+            },
+        )?;
+        crate::queue::ensure_candidate_rework_dispatch(
+            project_root,
+            &request.work_item_id,
+            &request.id,
+            0,
+        )?;
         Ok(())
     }
+}
+
+fn candidate_rework_instructions(request: &CandidateReworkRequest) -> String {
+    let mut instructions = format!(
+        "Address the project approver's selected GitHub review feedback for Merge Candidate {} at commit {}. Preserve the candidate and feedback identities recorded in the attached request.\n\nSelected feedback:",
+        request.candidate_id, request.candidate_commit
+    );
+    for feedback in &request.feedback {
+        instructions.push_str(&format!(
+            "\n\n- {} ({}): {}\n  {}",
+            feedback.id, feedback.kind, feedback.url, feedback.body
+        ));
+    }
+    instructions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +309,41 @@ impl GhGitHubClient {
             .and_then(|url| url.as_str())
             .map(ToOwned::to_owned))
     }
+
+    fn observed_remote_head(&self, checkout: &Path, branch: &str) -> Result<Option<String>> {
+        let push_url = crate::git::run_stdout(
+            checkout,
+            &["remote", "get-url", "--push", "origin"],
+            "inspect GitHub publication push remote",
+        )?;
+        let remote_ref = format!("refs/heads/{branch}");
+        let output = crate::git::run_stdout(
+            checkout,
+            &["ls-remote", "--heads", "--", &push_url, &remote_ref],
+            "inspect the current GitHub review head",
+        )?;
+        if output.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut rows = output.lines();
+        let row = rows.next().expect("non-empty remote-head output");
+        if rows.next().is_some() {
+            bail!("Git returned multiple heads for the managed review branch");
+        }
+        let mut fields = row.split_whitespace();
+        let commit = fields
+            .next()
+            .context("Git returned a head without a commit")?;
+        let observed_ref = fields.next().context("Git returned a head without a ref")?;
+        if fields.next().is_some()
+            || observed_ref != remote_ref
+            || commit.len() < 40
+            || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("Git returned an invalid managed review head");
+        }
+        Ok(Some(commit.to_owned()))
+    }
 }
 
 impl GitHubReviewClient for GhGitHubClient {
@@ -214,13 +366,15 @@ impl GitHubReviewClient for GhGitHubClient {
             &request.checkout,
             &["auth", "status", "--hostname", "github.com"],
         )?;
-        let refspec = format!(
-            "{}:refs/heads/{}",
-            request.publication.candidate.commit, request.publication.head_branch
-        );
+        let remote_ref = format!("refs/heads/{}", request.publication.head_branch);
+        let expected = self
+            .observed_remote_head(&request.checkout, &request.publication.head_branch)?
+            .unwrap_or_default();
+        let lease = format!("--force-with-lease={remote_ref}:{expected}");
+        let refspec = format!("{}:{remote_ref}", request.publication.candidate.commit);
         crate::git::run(
             &request.checkout,
-            &["push", "--force-with-lease", "origin", &refspec],
+            &["push", &lease, "origin", &refspec],
             "publish the exact reviewed candidate",
         )?;
         if let Some(url) = existing.and_then(|record| record.pull_request_url.clone()) {
