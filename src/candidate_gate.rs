@@ -594,6 +594,17 @@ fn check_commit_metadata(
         {
             diagnostics.push(format!("commit {commit} has an empty subject"));
         }
+        let mut message_lines = message.lines();
+        let _subject = message_lines.next();
+        let has_body = message_lines
+            .next()
+            .is_some_and(|separator| separator.trim().is_empty())
+            && message_lines.any(|line| !line.trim().is_empty());
+        if !has_body {
+            diagnostics.push(format!(
+                "commit {commit} has no body separated from its subject by a blank line"
+            ));
+        }
         if message.contains("\\n") {
             diagnostics.push(format!(
                 "commit {commit} contains literal \\n text instead of line breaks"
@@ -1193,7 +1204,13 @@ mod tests {
 
         crate::git::run(
             fixture.root.path(),
-            &["commit", "--amend", "-q", "-m", "Add value"],
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add value\n\n- Explain value",
+            ],
             "rewrite candidate metadata",
         )
         .unwrap();
@@ -1250,7 +1267,13 @@ mod tests {
         crate::git::run(fixture.root.path(), &["add", "src/lib.rs"], "stage rewrite").unwrap();
         crate::git::run(
             fixture.root.path(),
-            &["commit", "--amend", "-q", "-m", "Add value"],
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add value\n\n- Correct the candidate metadata",
+            ],
             "rewrite candidate and tree",
         )
         .unwrap();
@@ -1288,7 +1311,13 @@ mod tests {
         run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
         crate::git::run(
             fixture.root.path(),
-            &["commit", "--amend", "-q", "-m", "Add value"],
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add value\n\n- Keep the candidate tree unchanged",
+            ],
             "rewrite candidate metadata",
         )
         .unwrap();
@@ -1348,7 +1377,13 @@ mod tests {
         );
         crate::git::run(
             fixture.root.path(),
-            &["commit", "--amend", "-q", "-m", "Add value"],
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add value\n\n- Correct the candidate metadata",
+            ],
             "rewrite candidate metadata",
         )
         .unwrap();
@@ -1438,6 +1473,68 @@ mod tests {
     }
 
     #[test]
+    fn rejects_commit_without_body() {
+        let subject_only_fixture = Fixture::new();
+        let subject_only = subject_only_fixture.commit(
+            "src/subject_only.rs",
+            "pub fn subject_only() {}\n",
+            "Add subject-only candidate",
+        );
+        let whitespace_only_fixture = Fixture::new();
+        let whitespace_only = whitespace_only_fixture.commit(
+            "src/whitespace_only.rs",
+            "pub fn whitespace_only() {}\n",
+            "Add whitespace-only candidate\n\n   ",
+        );
+        let valid_fixture = Fixture::new();
+        let valid = valid_fixture.commit(
+            "src/valid.rs",
+            "pub fn valid() {}\n",
+            "Add valid candidate\n\n- Explain the candidate",
+        );
+
+        let subject_only_artifact = subject_only_fixture
+            .artifacts
+            .path()
+            .join("subject-only.json");
+        let subject_only_evidence = run_candidate_gate(subject_only_fixture.request(
+            &subject_only,
+            None,
+            None,
+            &subject_only_artifact,
+        ))
+        .unwrap();
+        assert_eq!(
+            check(&subject_only_evidence, "commit-metadata").status,
+            CandidateCheckStatus::Failed
+        );
+
+        let whitespace_only_artifact = whitespace_only_fixture
+            .artifacts
+            .path()
+            .join("whitespace-only.json");
+        let whitespace_only_evidence = run_candidate_gate(whitespace_only_fixture.request(
+            &whitespace_only,
+            None,
+            None,
+            &whitespace_only_artifact,
+        ))
+        .unwrap();
+        assert_eq!(
+            check(&whitespace_only_evidence, "commit-metadata").status,
+            CandidateCheckStatus::Failed
+        );
+
+        let valid_artifact = valid_fixture.artifacts.path().join("valid.json");
+        let valid_evidence =
+            run_candidate_gate(valid_fixture.request(&valid, None, None, &valid_artifact)).unwrap();
+        assert_eq!(
+            check(&valid_evidence, "commit-metadata").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
     fn malformed_prior_gate_blocks_history_rewrite() {
         let fixture = Fixture::new();
         let rejected = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add bad value");
@@ -1473,10 +1570,18 @@ mod tests {
     #[test]
     fn continuation_rechecks_the_complete_candidate_range() {
         let fixture = Fixture::new();
-        let rejected = fixture.commit("src/lib.rs", "pub fn value() {    \n}\n", "Add value");
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {    \n}\n",
+            "Add value\n\n- Explain the value",
+        );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
         run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
-        let replacement = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Clean value");
+        let replacement = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Clean value\n\n- Remove the whitespace error",
+        );
         let artifact = fixture.artifacts.path().join("replacement-gate.json");
         let mut request = fixture.request(&replacement, None, None, &artifact);
         request.base_commit = &rejected;
@@ -1562,7 +1667,7 @@ mod tests {
         let candidate = fixture.commit(
             "tests/dashboard.rs",
             "#[test]\nfn another_test() {}\n",
-            "Add dashboard test",
+            "Add dashboard test\n\n- Cover dashboard selection",
         );
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
         let contract = behavior_contract("tests/dashboard.rs (preserves_selection)");
@@ -1586,7 +1691,7 @@ mod tests {
         let candidate = fixture.commit(
             "tests/dashboard.rs",
             "#[test]\nfn preserves_selection() {}\n",
-            "Add dashboard test",
+            "Add dashboard test\n\n- Cover dashboard selection",
         );
         let tester = fixture.artifacts.path().join("tester-results.json");
         fs::write(
@@ -1683,7 +1788,7 @@ mod tests {
         let candidate = fixture.commit(
             "tests/scheduler_service.rs",
             &format!("#[test]\nfn {selector}() {{}}\n"),
-            "Test concurrent registry unregistration",
+            "Test concurrent registry unregistration\n\n- Cover registry updates",
         );
         let tester = fixture.artifacts.path().join("tester-results.json");
         let results = serde_json::json!({
@@ -1729,7 +1834,7 @@ mod tests {
         let candidate = fixture.commit(
             "tests/binary.rs",
             &format!("#[test]\nfn {selector}() {{}}\n"),
-            "Add skills test",
+            "Add skills test\n\n- Cover skill installation",
         );
         let tester = fixture.artifacts.path().join("tester-results.json");
         let results = serde_json::json!({
@@ -1770,7 +1875,7 @@ mod tests {
         let candidate = fixture.commit(
             "tests/behaviors/operations/test-dashboard.sh",
             "#!/bin/sh\n# preserves selection\n",
-            "Add dashboard journey",
+            "Add dashboard journey\n\n- Cover dashboard selection",
         );
         let tester = fixture.artifacts.path().join("tester-results.json");
         fs::write(

@@ -14601,7 +14601,12 @@ mod tests {
         crate::git::run(workspace.path(), &["add", "src/lib.rs"], "stage candidate").unwrap();
         crate::git::run(
             workspace.path(),
-            &["commit", "-q", "-m", "Add candidate"],
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add candidate\n\n- Describe the candidate",
+            ],
             "commit candidate",
         )
         .unwrap();
@@ -14926,6 +14931,67 @@ mod tests {
         assert_eq!(
             evidence.disposition,
             crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn missing_commit_body_returns_to_writer_before_review() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        crate::git::run(
+            workspace.path(),
+            &["commit", "--amend", "-q", "-m", "Add candidate"],
+            "remove candidate body",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read bodyless candidate",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate;
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+        );
+        let gate = &stored.attempts[0].tasks.last().unwrap().input_artifacts[0];
+        let evidence: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(
+            evidence.disposition,
+            crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+        assert_eq!(
+            evidence
+                .checks
+                .iter()
+                .find(|check| check.name == "commit-metadata")
+                .unwrap()
+                .status,
+            crate::candidate_gate::CandidateCheckStatus::Failed
         );
     }
 
@@ -15327,7 +15393,13 @@ mod tests {
 
         crate::git::run(
             workspace.path(),
-            &["commit", "--amend", "-q", "-m", "Add candidate"],
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\n\n- Explain the candidate",
+            ],
             "repair candidate metadata",
         )
         .unwrap();
