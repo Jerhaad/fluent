@@ -44,6 +44,35 @@ pub enum EvidenceResult {
     Fail,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundRecheckArtifact {
+    path: String,
+    digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailedCommandRecheckEvidenceBinding {
+    schema_version: u32,
+    candidate_commit: String,
+    recheck_task_id: String,
+    source_results: BoundRecheckArtifact,
+    recheck_artifacts: Vec<BoundRecheckArtifact>,
+    command_index: usize,
+    command: String,
+    working_directory: String,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedRecheckFrontier {
+    prior_tests_review: Task,
+    binding: FailedCommandRecheckEvidenceBinding,
+    binding_path: String,
+    binding_bytes: Vec<u8>,
+    correction_artifacts: Vec<ArtifactRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedEvidenceRun {
     pub recovery: EvidenceRecovery,
@@ -202,6 +231,7 @@ pub fn run_focused(
         &candidate_commit,
         &document_path,
         &[review_artifact.to_string()],
+        None,
     )?;
     Ok(FocusedEvidenceRun {
         recovery,
@@ -554,7 +584,13 @@ pub fn attach(
     candidate_commit: &str,
     evidence_file: &Path,
     review_artifacts: &[String],
+    recheck_artifact: Option<&str>,
 ) -> Result<EvidenceRecovery> {
+    anyhow::ensure!(
+        (recheck_artifact.is_some() && review_artifacts.is_empty())
+            || (recheck_artifact.is_none() && !review_artifacts.is_empty()),
+        "name either failed review artifacts or one failed-command recheck artifact"
+    );
     if fs::symlink_metadata(evidence_file)
         .with_context(|| format!("inspect evidence file {}", evidence_file.display()))?
         .file_type()
@@ -582,20 +618,54 @@ pub fn attach(
             .ok_or_else(|| WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
-        if let Some(existing) = existing.evidence_recoveries.iter().find(|existing| {
-            existing.candidate_commit == candidate_commit
-                && existing.attachment.digest == digest
-                && existing.attachment.snapshot_path == snapshot_path
+        let recheck_frontier = recheck_artifact
+            .map(|artifact| {
+                validate_recheck_evidence_frontier(
+                    project_root,
+                    item,
+                    attempt_id,
+                    candidate_commit,
+                    artifact,
+                    &document,
+                )
+            })
+            .transpose()?;
+        let prior_reviews = match &recheck_frontier {
+            Some(frontier) => vec![frontier.prior_tests_review.clone()],
+            None => validate_evidence_frontier(
+                project_root,
+                item,
+                attempt_id,
+                candidate_commit,
+                review_artifacts,
+            )?,
+        };
+        let target_artifacts = match &recheck_frontier {
+            Some(frontier) => vec![frontier.binding_path.clone()],
+            None => review_artifacts.to_vec(),
+        };
+        if let Some(prior) = existing.evidence_recoveries.iter().find(|prior| {
+            prior.candidate_commit == candidate_commit
+                && prior.attachment.digest == digest
+                && prior.attachment.snapshot_path == snapshot_path
         }) {
-            return Ok(existing.clone());
+            let same_targets = prior.targets.len() == prior_reviews.len()
+                && prior.targets.iter().all(|target| {
+                    prior_reviews
+                        .iter()
+                        .any(|review| review.role == target.role)
+                        && target_artifacts
+                            .iter()
+                            .any(|path| path == &target.prior_review_artifact)
+                });
+            return if same_targets {
+                Ok(prior.clone())
+            } else {
+                Err(WorkModelError::AttemptEvidenceRecoveryConflict {
+                    attempt_id: attempt_id.to_string(),
+                })
+            };
         }
-        let prior_reviews = validate_evidence_frontier(
-            project_root,
-            item,
-            attempt_id,
-            candidate_commit,
-            review_artifacts,
-        )?;
         // Publish only after the lock-held frontier check. A rejected request
         // therefore cannot leave a host-owned artifact behind.
         publish_snapshot(project_root, &snapshot_path, &bytes).map_err(|_| {
@@ -603,6 +673,16 @@ pub fn attach(
                 id: attempt_id.to_string(),
             }
         })?;
+        if let Some(frontier) = &recheck_frontier {
+            publish_snapshot(
+                project_root,
+                &frontier.binding_path,
+                &frontier.binding_bytes,
+            )
+            .map_err(|_| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        }
         let attempt = item
             .attempts
             .iter_mut()
@@ -623,16 +703,21 @@ pub fn attach(
                 .iter()
                 .map(|role| EvidenceReviewTarget {
                     role: role.clone(),
-                    prior_review_artifact: review_artifacts
-                        .iter()
-                        .find(|path| {
-                            prior_reviews.iter().any(|task| {
-                                task.role == *role
-                                    && review_artifact_path(task).as_deref() == Some(path.as_str())
+                    prior_review_artifact: if recheck_frontier.is_some() {
+                        target_artifacts.first().cloned().unwrap_or_default()
+                    } else {
+                        review_artifacts
+                            .iter()
+                            .find(|path| {
+                                prior_reviews.iter().any(|task| {
+                                    task.role == *role
+                                        && review_artifact_path(task).as_deref()
+                                            == Some(path.as_str())
+                                })
                             })
-                        })
-                        .cloned()
-                        .unwrap_or_default(),
+                            .cloned()
+                            .unwrap_or_default()
+                    },
                     review_task_id: None,
                 })
                 .collect(),
@@ -648,6 +733,13 @@ pub fn attach(
             let task_id = format!("{attempt_id}-evidence-{}-{role}", &digest[7..19]);
             if !attempt.tasks.iter().any(|task| task.id == task_id) {
                 let mut inputs = prior.input_artifacts.clone();
+                if let Some(frontier) = &recheck_frontier {
+                    inputs.push(ArtifactRef {
+                        producer_id: frontier.binding.recheck_task_id.clone(),
+                        path: frontier.binding_path.clone(),
+                    });
+                    inputs.extend(frontier.correction_artifacts.clone());
+                }
                 inputs.push(ArtifactRef {
                     producer_id: "host-evidence".to_string(),
                     path: snapshot_path.clone(),
@@ -656,7 +748,10 @@ pub fn attach(
                     producer_id: prior.id.clone(),
                     path: review_artifact_path(&prior).unwrap(),
                 });
-                let prior_review_artifact = review_artifact_path(&prior).unwrap();
+                let prior_review_artifact = recheck_frontier
+                    .as_ref()
+                    .map(|frontier| frontier.binding_path.clone())
+                    .unwrap_or_else(|| review_artifact_path(&prior).unwrap());
                 attempt.tasks.push(Task {
                     id: task_id.clone(),
                     kind: TaskKind::Review,
@@ -817,6 +912,380 @@ fn validate_evidence_frontier(
     Ok(selected)
 }
 
+fn validate_recheck_evidence_frontier(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+    candidate_commit: &str,
+    recheck_artifact: &str,
+    document: &EvidenceDocument,
+) -> Result<ValidatedRecheckFrontier, WorkModelError> {
+    let rejected = || WorkModelError::AttemptNotFound {
+        id: attempt_id.to_string(),
+    };
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(rejected)?;
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::RoundCap)
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+        || attempt.tasks.iter().any(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Planned | TaskStatus::Executing | TaskStatus::Failed
+            )
+        })
+        || item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id && candidate.candidate_commit == candidate_commit
+        })
+        || document.result != EvidenceResult::Pass
+        || document.working_directory != "."
+    {
+        return Err(rejected());
+    }
+    let (_writer_index, writer_output) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, task)| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|(index, task)| task.output.as_ref().map(|output| (index, output)))
+        .ok_or_else(rejected)?;
+    if writer_output.commit != candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, writer_output, candidate_commit)
+    {
+        return Err(rejected());
+    }
+    let recheck = attempt
+        .tasks
+        .last()
+        .filter(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && task.is_failed_command_recheck()
+        })
+        .ok_or_else(rejected)?;
+    let area = recheck.artifact_area.as_ref().ok_or_else(rejected)?;
+    let expected_manifest = format!("{}/failed-command-recheck.json", area.path);
+    if recheck_artifact != expected_manifest {
+        return Err(rejected());
+    }
+    let correction_artifacts =
+        crate::tester_evidence::failed_command_recheck_correction_artifacts(project_root, recheck)
+            .map_err(|_| rejected())?;
+    let manifest_path = project_root.join(&expected_manifest);
+    let manifest: crate::tester::FailedCommandRecheckManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).map_err(|_| rejected())?)
+            .map_err(|_| rejected())?;
+    let results_artifact = correction_artifacts
+        .iter()
+        .find(|artifact| artifact.path.ends_with("/tester-results.json"))
+        .ok_or_else(rejected)?;
+    let results_path = project_root.join(&results_artifact.path);
+    let results: crate::tester::TesterResults =
+        serde_json::from_slice(&fs::read(&results_path).map_err(|_| rejected())?)
+            .map_err(|_| rejected())?;
+    let [command_index] = manifest.failed_command_indexes.as_slice() else {
+        return Err(rejected());
+    };
+    let [recheck_command] = results.commands.as_slice() else {
+        return Err(rejected());
+    };
+    if results.error.is_some()
+        || results.summary.fail > 0
+        || recheck_command.exit_code == 0
+        || recheck_command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || document.check != recheck_command.command
+    {
+        return Err(rejected());
+    }
+    let source = recheck.input_artifacts.first().ok_or_else(rejected)?;
+    if source.path != manifest.source_results {
+        return Err(rejected());
+    }
+    let source_path = project_root.join(&source.path);
+    let source_bytes = fs::read(&source_path).map_err(|_| rejected())?;
+    let source_results: crate::tester::TesterResults =
+        serde_json::from_slice(&source_bytes).map_err(|_| rejected())?;
+    let source_command = source_results
+        .commands
+        .get(*command_index)
+        .ok_or_else(rejected)?;
+    if source_results.candidate_commit.as_deref() != Some(candidate_commit)
+        || source_results.error.is_some()
+        || source_command.exit_code == 0
+        || source_command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || source_command.command != recheck_command.command
+        || source_command.test_harness != recheck_command.test_harness
+        || crate::tester_evidence::introduced_tester_failures(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 0
+        || crate::tester_evidence::unexplained_failed_tester_commands(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 1
+    {
+        return Err(rejected());
+    }
+    let prior_tests_review = latest_passing_tests_review(project_root, attempt, candidate_commit)
+        .cloned()
+        .ok_or_else(rejected)?;
+    let bound_artifact = |artifact: &ArtifactRef| -> Result<BoundRecheckArtifact, WorkModelError> {
+        let bytes = fs::read(project_root.join(&artifact.path)).map_err(|_| rejected())?;
+        Ok(BoundRecheckArtifact {
+            path: artifact.path.clone(),
+            digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        })
+    };
+    let binding = FailedCommandRecheckEvidenceBinding {
+        schema_version: 1,
+        candidate_commit: candidate_commit.to_string(),
+        recheck_task_id: recheck.id.clone(),
+        source_results: BoundRecheckArtifact {
+            path: source.path.clone(),
+            digest: format!("sha256:{:x}", Sha256::digest(&source_bytes)),
+        },
+        recheck_artifacts: correction_artifacts
+            .iter()
+            .map(bound_artifact)
+            .collect::<Result<Vec<_>, _>>()?,
+        command_index: *command_index,
+        command: recheck_command.command.clone(),
+        working_directory: ".".to_string(),
+    };
+    let binding_bytes = serde_json::to_vec_pretty(&binding).map_err(|_| rejected())?;
+    let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+    let binding_path =
+        snapshot_path(item.id.as_str(), attempt_id, &binding_digest).map_err(|_| rejected())?;
+    Ok(ValidatedRecheckFrontier {
+        prior_tests_review,
+        binding,
+        binding_path,
+        binding_bytes,
+        correction_artifacts,
+    })
+}
+
+pub(crate) fn failed_recheck_evidence_recovery_action(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Option<String> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::RoundCap)
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+    {
+        return None;
+    }
+    pending_failed_recheck_evidence_recovery_action(project_root, attempt)
+}
+
+pub(crate) fn pending_failed_recheck_evidence_recovery_action(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Option<String> {
+    let writer_output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)?
+        .output
+        .as_ref()?;
+    let candidate = writer_output.commit.as_str();
+    if !candidate_workspace_is_clean_at(project_root, writer_output, candidate)
+        || latest_passing_tests_review(project_root, attempt, candidate).is_none()
+    {
+        return None;
+    }
+    let recheck = attempt.tasks.last().filter(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task.is_failed_command_recheck()
+    })?;
+    let area = recheck.artifact_area.as_ref()?;
+    let manifest_path = format!("{}/failed-command-recheck.json", area.path);
+    let manifest: crate::tester::FailedCommandRecheckManifest =
+        serde_json::from_slice(&fs::read(project_root.join(&manifest_path)).ok()?).ok()?;
+    let results: crate::tester::TesterResults = serde_json::from_slice(
+        &fs::read(project_root.join(&area.path).join("tester-results.json")).ok()?,
+    )
+    .ok()?;
+    let [command_index] = manifest.failed_command_indexes.as_slice() else {
+        return None;
+    };
+    let [recheck_command] = results.commands.as_slice() else {
+        return None;
+    };
+    let source = recheck.input_artifacts.first()?;
+    let source_path = project_root.join(&source.path);
+    let source_results: crate::tester::TesterResults =
+        serde_json::from_slice(&fs::read(&source_path).ok()?).ok()?;
+    let source_command = source_results.commands.get(*command_index)?;
+    if manifest.candidate_commit != candidate
+        || manifest.source_results != source.path
+        || results.candidate_commit.as_deref() != Some(candidate)
+        || results.error.is_some()
+        || results.summary.fail > 0
+        || recheck_command.exit_code == 0
+        || recheck_command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || source_results.candidate_commit.as_deref() != Some(candidate)
+        || source_results.error.is_some()
+        || source_command.exit_code == 0
+        || source_command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || source_command.command != recheck_command.command
+        || source_command.test_harness != recheck_command.test_harness
+        || crate::tester_evidence::introduced_tester_failures(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 0
+        || crate::tester_evidence::unexplained_failed_tester_commands(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 1
+        || crate::tester_evidence::failed_command_recheck_correction_artifacts(
+            project_root,
+            recheck,
+        )
+        .is_err()
+    {
+        return None;
+    }
+    Some(format!(
+        "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path> --recheck-artifact {}",
+        attempt.work_item_id, attempt.id, candidate, manifest_path
+    ))
+}
+
+pub(crate) fn completed_recheck_evidence_source(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Option<PathBuf> {
+    let recovery = attempt.evidence_recoveries.iter().rev().find(|recovery| {
+        recovery.state == EvidenceRecoveryState::Complete
+            && recovery.targets.len() == 1
+            && recovery.targets[0].role == "tests"
+    })?;
+    let target = &recovery.targets[0];
+    let binding_bytes = fs::read(project_root.join(&target.prior_review_artifact)).ok()?;
+    let binding: FailedCommandRecheckEvidenceBinding =
+        serde_json::from_slice(&binding_bytes).ok()?;
+    let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+    if binding.schema_version != 1
+        || binding.candidate_commit != recovery.candidate_commit
+        || snapshot_path(
+            attempt.work_item_id.as_str(),
+            attempt.id.as_str(),
+            &binding_digest,
+        )
+        .ok()
+        .as_deref()
+            != Some(target.prior_review_artifact.as_str())
+        || attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .map(|output| output.commit.as_str())
+            != Some(recovery.candidate_commit.as_str())
+    {
+        return None;
+    }
+    let evidence_bytes = fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
+        return None;
+    }
+    let evidence = parse_document(&evidence_bytes).ok()?;
+    if evidence.result != EvidenceResult::Pass
+        || evidence.check != binding.command
+        || evidence.working_directory != binding.working_directory
+    {
+        return None;
+    }
+    let review_task = target.review_task_id.as_ref().and_then(|id| {
+        attempt.tasks.iter().find(|task| {
+            task.id == *id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && task
+                    .evidence_review_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.recovery_id == recovery.id
+                            && context.candidate_commit == recovery.candidate_commit
+                            && context.prior_review_artifact == target.prior_review_artifact
+                    })
+        })
+    })?;
+    if read_verdict(project_root, review_task) != Some(Verdict::Pass) {
+        return None;
+    }
+    let recheck = attempt.tasks.iter().find(|task| {
+        task.id == binding.recheck_task_id
+            && task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task.is_failed_command_recheck()
+    })?;
+    let current_artifacts =
+        crate::tester_evidence::failed_command_recheck_correction_artifacts(project_root, recheck)
+            .ok()?;
+    if current_artifacts.len() != binding.recheck_artifacts.len()
+        || !current_artifacts
+            .iter()
+            .zip(&binding.recheck_artifacts)
+            .all(|(current, bound)| {
+                current.path == bound.path
+                    && fs::read(project_root.join(&current.path)).is_ok_and(|bytes| {
+                        format!("sha256:{:x}", Sha256::digest(&bytes)) == bound.digest
+                    })
+            })
+    {
+        return None;
+    }
+    let source_path = project_root.join(&binding.source_results.path);
+    let source_bytes = fs::read(&source_path).ok()?;
+    if format!("sha256:{:x}", Sha256::digest(&source_bytes)) != binding.source_results.digest {
+        return None;
+    }
+    let source: crate::tester::TesterResults = serde_json::from_slice(&source_bytes).ok()?;
+    let command = source.commands.get(binding.command_index)?;
+    if source.candidate_commit.as_deref() != Some(recovery.candidate_commit.as_str())
+        || source.error.is_some()
+        || command.exit_code == 0
+        || command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || command.command != binding.command
+        || crate::tester_evidence::introduced_tester_failures(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 0
+        || crate::tester_evidence::unexplained_failed_tester_commands(
+            &source_path,
+            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) != 1
+    {
+        return None;
+    }
+    Some(source_path)
+}
+
 fn candidate_workspace_is_clean_at(
     project_root: &Path,
     output: &crate::work_model::TaskOutput,
@@ -876,6 +1345,28 @@ fn read_verdict(project_root: &Path, task: &Task) -> Option<Verdict> {
     fs::read_to_string(project_root.join(review_artifact_path(task)?))
         .ok()
         .map(|text| review::extract_verdict(&text))
+}
+
+fn latest_passing_tests_review<'a>(
+    project_root: &Path,
+    attempt: &'a work_model::Attempt,
+    candidate: &str,
+) -> Option<&'a Task> {
+    attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && task
+                    .review_context
+                    .as_ref()
+                    .map(|context| context.candidate_commit.as_str())
+                    == Some(candidate)
+        })
+        .filter(|task| read_verdict(project_root, task) == Some(Verdict::Pass))
 }
 
 fn publish_snapshot(project_root: &Path, relative: &str, bytes: &[u8]) -> Result<()> {

@@ -210,7 +210,7 @@ IF a failed-command recheck reports another command, structured-test, or process
 settlement failure, THEN THE SYSTEM SHALL return its durable result and relevant
 command logs directly to a corrective Writer or the existing round-cap pause.
 Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
-Test: src/work_attempt_loop.rs (repeated_failed_command_respects_existing_round_cap)
+Test: src/work_attempt_loop.rs (failed_recheck_is_a_round_cap_extension_frontier)
 Test: src/work_attempt_loop.rs (structured_failure_in_recheck_returns_to_writer)
 
 ### B6
@@ -453,6 +453,34 @@ Test: tests/binary.rs (work_show_explains_evidence_only_recovery_history_and_nex
 WHEN an evidence-targeted reviewer fails, THE SYSTEM SHALL accept only the typed
 dispositions `evidence-needed` and `code-change`.
 Test: src/review.rs (evidence_targeted_disposition_is_fail_only_and_typed)
+
+### B18
+
+WHEN one unexplained failed-command recheck reaches the Writer-round cap, THE
+SYSTEM SHALL show a candidate-bound evidence attachment command accepted by
+that Attempt state.
+Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+
+### B19
+
+WHEN a targeted Tests Review accepts passing evidence for the unchanged
+candidate and exact failed command, THE SYSTEM SHALL continue to Learning
+without rerunning that command.
+Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+
+### B20
+
+IF attached evidence names another candidate or recheck, any bound evidence or
+failure bytes change, or the Tester result contains another failure, THEN THE
+SYSTEM SHALL reject command-only recovery without making the candidate ready.
+Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+
+### B21
+
+WHEN a failed-command recheck cannot use command-only evidence recovery, THE
+SYSTEM SHALL retain an extension frontier bound to the unchanged candidate and
+recheck artifacts.
+Test: src/work_attempt_loop.rs (failed_recheck_is_a_round_cap_extension_frontier)
 
 ## Test harnesses
 

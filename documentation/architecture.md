@@ -864,14 +864,24 @@ managed artifacts, binds its digest to the named candidate commit, and plans
 only the named failed reviewer roles. Attachment never changes the candidate or
 approved planning inputs, and it cannot make a candidate landable.
 
-Evidence-targeted reviewers receive the immutable snapshot and their prior
-failed review. A passing result replaces only that role's result for the same
+Evidence-targeted reviewers receive the immutable snapshot and the prior
+decision artifact. This is normally their failed review; after an unexplained
+failed-command recheck at the Writer-round cap, it is a content-addressed
+binding of the source Tester result, recheck manifest, command, logs, and exact
+candidate. A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
 `Disposition: code-change`. The former waits for another attachment without a
 Writer round. The latter closes evidence recovery and follows the normal
 Writer, Tester, and reviewer path. Once every targeted role passes and the
 unchanged candidate's remaining exact-commit evidence passes, the Attempt
 continues to Learning without rerunning the Writer or Tester.
+
+For a failed-command recheck, `fluent attempt evidence attach` accepts
+`--recheck-artifact` instead of `--review-artifact`. Fluent accepts this route
+only for one unexplained failed command, requires passing evidence for that
+exact command from the candidate root, and revalidates every bound byte before
+Learning. When this narrow route is not eligible, the immutable recheck
+artifacts remain a valid frontier for an explicit Writer extension.
 
 `fluent work-item list` and `fluent work-item show <id>` expose the same durable
 Work Item model for inspection. These commands use `.fluent/work/items/`

@@ -14,6 +14,12 @@ use crate::git;
 use crate::review::{self, Verdict};
 use crate::review_diff_command;
 use crate::review_only_worktree;
+use crate::tester_evidence::{
+    baseline_tester_results_path, failed_command_recheck_correction_artifacts,
+    introduced_tester_failures, unexplained_failed_tester_commands,
+};
+#[cfg(test)]
+use crate::tester_evidence::{failing_ids, tester_failures};
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptLearning, AttemptReviewState, AttemptStatus, CoderMappingInputs,
     DurableTransitionMetadata, DurableTransitionOrigin, EvidenceRecoveryState,
@@ -5276,46 +5282,6 @@ fn completed_review_tasks_after_latest_write(tasks: &[Task]) -> impl Iterator<It
         .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
 }
 
-fn tester_failures(tester_results_path: &Path) -> usize {
-    let content = match fs::read_to_string(tester_results_path) {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
-    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
-        Ok(r) => r,
-        Err(_) => return 0,
-    };
-    results.tests.iter().filter(|t| t.status == "fail").count()
-}
-
-fn failing_ids(path: &Path) -> HashSet<String> {
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return HashSet::new(),
-    };
-    let results: crate::tester::TesterResults = match serde_json::from_str(&content) {
-        Ok(r) => r,
-        Err(_) => return HashSet::new(),
-    };
-    results
-        .tests
-        .iter()
-        .filter(|t| t.status == "fail")
-        .map(|t| t.id.clone())
-        .collect()
-}
-
-fn introduced_tester_failures(current_path: &Path, baseline_path: Option<&Path>) -> usize {
-    match baseline_path {
-        Some(bp) => {
-            let current = failing_ids(current_path);
-            let baseline = failing_ids(bp);
-            current.difference(&baseline).count()
-        }
-        None => tester_failures(current_path),
-    }
-}
-
 fn tester_errored(tester_results_path: &Path) -> bool {
     let content = match fs::read_to_string(tester_results_path) {
         Ok(c) => c,
@@ -5328,100 +5294,12 @@ fn tester_errored(tester_results_path: &Path) -> bool {
     results.error.is_some()
 }
 
-fn unexplained_failed_tester_commands(
-    tester_results_path: &Path,
-    baseline_path: Option<&Path>,
-) -> usize {
-    let current: crate::tester::TesterResults = match fs::read(tester_results_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
-    {
-        Some(results) => results,
-        None => return 0,
-    };
-    let failed_count = current
-        .commands
-        .iter()
-        .filter(|command| command.exit_code != 0)
-        .count();
-    if failed_count == 0 {
-        return 0;
-    }
-    let baseline: crate::tester::TesterResults = match baseline_path
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
-    {
-        Some(results) if current.error.is_none() && results.error.is_none() => results,
-        _ => return failed_count,
-    };
-
-    current
-        .commands
-        .iter()
-        .enumerate()
-        .filter(|(index, command)| {
-            if command.exit_code == 0 {
-                return false;
-            }
-            let Some(baseline_command) = baseline.commands.get(*index) else {
-                return true;
-            };
-            let command_identity_matches = command.command == baseline_command.command
-                && command.test_harness == baseline_command.test_harness
-                && command.exit_code == baseline_command.exit_code;
-            let settlements_are_clean = [command, baseline_command].iter().all(|command| {
-                command
-                    .process_settlement
-                    .as_ref()
-                    .is_none_or(|settlement| settlement.leaks.is_empty())
-            });
-            let harness_is_unambiguous = current
-                .commands
-                .iter()
-                .filter(|candidate| {
-                    candidate.exit_code != 0 && candidate.test_harness == command.test_harness
-                })
-                .count()
-                == 1
-                && baseline
-                    .commands
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.exit_code != 0 && candidate.test_harness == command.test_harness
-                    })
-                    .count()
-                    == 1;
-            let current_failures = current
-                .tests
-                .iter()
-                .filter(|test| test.status == "fail" && test.test_harness == command.test_harness)
-                .map(|test| test.id.as_str())
-                .collect::<HashSet<_>>();
-            let baseline_failures = baseline
-                .tests
-                .iter()
-                .filter(|test| test.status == "fail" && test.test_harness == command.test_harness)
-                .map(|test| test.id.as_str())
-                .collect::<HashSet<_>>();
-            !(command_identity_matches
-                && settlements_are_clean
-                && harness_is_unambiguous
-                && !current_failures.is_empty()
-                && current_failures.is_subset(&baseline_failures))
-        })
-        .count()
-}
-
-fn baseline_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    let work_item_id = &attempt.work_item_id;
-    let attempt_id = &attempt.id;
-    let baseline_artifact = format!("{attempt_id}-baseline-tester");
-    let artifact_path = work_artifact_path(work_item_id, attempt_id, &baseline_artifact);
-    let path = project_root.join(artifact_path).join("tester-results.json");
-    path.is_file().then_some(path)
-}
-
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
+    if let Some(source) =
+        crate::host_evidence::completed_recheck_evidence_source(project_root, attempt)
+    {
+        return Some(source);
+    }
     let latest_write_index = attempt
         .tasks
         .iter()
@@ -5564,90 +5442,6 @@ fn failed_command_recheck_source(
         return Ok(None);
     }
     Ok(Some((*source).clone()))
-}
-
-fn failed_command_recheck_correction_artifacts(
-    project_root: &Path,
-    recheck: &Task,
-) -> Result<Vec<ArtifactRef>> {
-    let area = recheck
-        .artifact_area
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no artifact area"))?;
-    let artifact_dir =
-        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
-    let manifest_path = artifact_dir.join("failed-command-recheck.json");
-    let manifest: crate::tester::FailedCommandRecheckManifest =
-        serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    let results_path = artifact_dir.join("tester-results.json");
-    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&results_path)?)?;
-    let expected_commit = recheck
-        .review_context
-        .as_ref()
-        .map(|context| context.candidate_commit.as_str())
-        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no candidate context"))?;
-    if results.candidate_commit.as_deref() != Some(expected_commit) {
-        bail!(
-            "failed-command recheck result is not bound to candidate {}",
-            expected_commit
-        );
-    }
-    let indexes_are_strict = manifest
-        .failed_command_indexes
-        .windows(2)
-        .all(|indexes| indexes[0] < indexes[1]);
-    let expected_source = recheck
-        .input_artifacts
-        .first()
-        .map(|artifact| artifact.path.as_str());
-    if manifest.schema_version != crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION
-        || manifest.candidate_commit != expected_commit
-        || manifest.failed_command_indexes.len() != results.commands.len()
-        || manifest.failed_command_indexes.is_empty()
-        || !indexes_are_strict
-        || expected_source != Some(manifest.source_results.as_str())
-    {
-        bail!("failed-command recheck manifest does not match its candidate and command results");
-    }
-    let structured_failure = results.summary.fail > 0 || results.error.is_some();
-    let failed = results.commands.iter().enumerate().filter(|(_, command)| {
-        structured_failure
-            || command.exit_code != 0
-            || command
-                .process_settlement
-                .as_ref()
-                .is_some_and(|evidence| !evidence.leaks.is_empty())
-    });
-    let mut failed = failed.peekable();
-    if !structured_failure && failed.peek().is_none() {
-        return Ok(Vec::new());
-    }
-
-    let mut artifacts = vec![
-        ArtifactRef {
-            producer_id: recheck.id.clone(),
-            path: format!("{}/failed-command-recheck.json", area.path),
-        },
-        ArtifactRef {
-            producer_id: recheck.id.clone(),
-            path: format!("{}/tester-results.json", area.path),
-        },
-    ];
-    for (index, command) in failed {
-        for (actual, expected) in [
-            (&command.stdout_log, format!("commands/{index}-stdout.log")),
-            (&command.stderr_log, format!("commands/{index}-stderr.log")),
-        ] {
-            if actual != &expected || !artifact_dir.join(&expected).is_file() {
-                bail!("failed-command recheck log path {actual:?} does not match {expected:?}");
-            }
-            artifacts.push(ArtifactRef {
-                producer_id: recheck.id.clone(),
-                path: format!("{}/{}", area.path, expected),
-            });
-        }
-    }
-    Ok(artifacts)
 }
 
 /// Build the bounded correction input set for a rejected final-Tester gate.
@@ -6045,6 +5839,32 @@ fn advance_failed_command_recheck(
         .count();
     let round_cap_reached = write_rounds
         >= item.attempts[attempt_index].effective_write_round_cap(max_total_write_rounds());
+    if round_cap_reached {
+        if let Some(action) = crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            return Ok(Some(settle_review_pause(
+                store,
+                project_root,
+                &work_item_id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                PauseKind::RoundCap,
+                &correction,
+                |root, work_item_id, attempt_id, findings| {
+                    write_failed_recheck_evidence_handoff(
+                        root,
+                        work_item_id,
+                        attempt_id,
+                        findings,
+                        &action,
+                    )
+                },
+                &|_| {},
+            )?));
+        }
+    }
     Ok(Some(settle_review_pause(
         store,
         project_root,
@@ -7405,23 +7225,40 @@ fn interpret_reviews(
     let tester_gate_applicable = failed.is_empty() && uncertain.is_empty();
     let tester_result_path =
         latest_tester_results_path(project_root, &item.attempts[attempt_index]);
+    let tester_recheck_is_recovered = crate::host_evidence::completed_recheck_evidence_source(
+        project_root,
+        &item.attempts[attempt_index],
+    )
+    .is_some();
     let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
     let tester_fail_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
-        .map(|p| introduced_tester_failures(p, baseline_path.as_deref()))
+        .map(|p| {
+            if tester_recheck_is_recovered {
+                0
+            } else {
+                introduced_tester_failures(p, baseline_path.as_deref())
+            }
+        })
         .unwrap_or(0);
     // A planned and completed canonical Tester without a readable result is an
     // infrastructure failure, never permission to advance without evidence.
     let tester_has_error = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
-        .map(|p| !p.is_file() || tester_errored(p))
+        .map(|p| !p.is_file() || (!tester_recheck_is_recovered && tester_errored(p)))
         .unwrap_or(false);
     let tester_failed_command_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
-        .map(|path| unexplained_failed_tester_commands(path, baseline_path.as_deref()))
+        .map(|path| {
+            if tester_recheck_is_recovered {
+                0
+            } else {
+                unexplained_failed_tester_commands(path, baseline_path.as_deref())
+            }
+        })
         .unwrap_or(0);
 
     if tester_gate_applicable && tester_fail_count == 0 && !tester_has_error {
@@ -7638,6 +7475,10 @@ fn round_cap_failure_frontier(
             });
         }
     }
+    failed.extend(failed_command_recheck_round_cap_frontier(
+        project_root,
+        attempt,
+    )?);
     let gated_tester = rejected_final_tester_gate_frontier(project_root, attempt)?;
     if gated_tester.is_empty() {
         failed.extend(failed_final_tester_without_gate_frontier(
@@ -7648,6 +7489,48 @@ fn round_cap_failure_frontier(
         failed.extend(gated_tester);
     }
     Ok(failed)
+}
+
+fn failed_command_recheck_round_cap_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> Result<Vec<RoundCapReviewArtifact>> {
+    let Some(recheck) = attempt.tasks.last().filter(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task.is_failed_command_recheck()
+    }) else {
+        return Ok(Vec::new());
+    };
+    let Some(area) = recheck.artifact_area.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let results_path =
+        work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?
+            .join("tester-results.json");
+    if !results_path.is_file()
+        || tester_errored(&results_path)
+        || (introduced_tester_failures(
+            &results_path,
+            baseline_tester_results_path(project_root, attempt).as_deref(),
+        ) == 0
+            && unexplained_failed_tester_commands(
+                &results_path,
+                baseline_tester_results_path(project_root, attempt).as_deref(),
+            ) == 0)
+    {
+        return Ok(Vec::new());
+    }
+    failed_command_recheck_correction_artifacts(project_root, recheck)?
+        .into_iter()
+        .map(|artifact| {
+            let bytes = fs::read(project_root.join(&artifact.path))?;
+            Ok(RoundCapReviewArtifact {
+                artifact,
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect()
 }
 
 /// Bind an exhausted round-cap approval to the latest failed final Tester when
@@ -7989,6 +7872,33 @@ fn write_budget_exhausted_handoff(
         &path,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop stopped advancing. The candidate commit and review history remain unchanged.\n\n{recovery}\n\nFailed correction artifacts still need attention:\n\n{artifacts}\n"
+        )
+        .as_bytes(),
+    )?;
+    Ok(relative_path)
+}
+
+fn write_failed_recheck_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    failed: &[ArtifactRef],
+    action: &str,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let artifacts = failed
+        .iter()
+        .map(|artifact| format!("- {}", artifact.path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::atomic_write::atomic_write(
+        &path,
+        format!(
+            "# Attempt needs external test evidence\n\nThe unchanged candidate reached the Writer-round cap after one failed-command recheck. Attach passing evidence from a host that can run the exact command:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
         )
         .as_bytes(),
     )?;
@@ -10557,7 +10467,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_failed_command_respects_existing_round_cap() {
+    fn failed_recheck_is_a_round_cap_extension_frontier() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
@@ -10618,6 +10528,24 @@ mod tests {
                 .count(),
             10
         );
+        let frontier = round_cap_failure_frontier(project.path(), &stored.attempts[0])
+            .expect("the failed recheck must remain an extension frontier");
+        assert!(frontier.iter().any(|artifact| {
+            artifact
+                .artifact
+                .path
+                .ends_with("/failed-command-recheck.json")
+        }));
+        assert!(
+            frontier
+                .iter()
+                .any(|artifact| { artifact.artifact.path.ends_with("/tester-results.json") })
+        );
+
+        assert!(frontier.iter().all(|artifact| {
+            artifact.digest.starts_with("sha256:")
+                && project.path().join(&artifact.artifact.path).is_file()
+        }));
     }
 
     #[test]
@@ -10954,6 +10882,342 @@ mod tests {
             outcome,
             WorkAttemptRunOutcome::PlannedReviews { .. }
         ));
+    }
+
+    #[test]
+    fn external_recheck_evidence_advances_round_cap_to_candidate() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.add_review_tasks("attempt-1", &["tests"])?;
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .rev()
+                    .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let tests_review = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap()
+            .clone();
+        let tests_review_dir = project
+            .path()
+            .join(&tests_review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&tests_review_dir).unwrap();
+        fs::write(tests_review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+        let tester = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap()
+            .clone();
+        let tester_results = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tester_results).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&results).unwrap(),
+        )
+        .unwrap();
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .round_cap_extensions
+                    .push(crate::work_model::RoundCapExtension {
+                        id: "fixture-cap-2".to_string(),
+                        old_cap: 1,
+                        new_cap: 2,
+                        additional_write_rounds: 1,
+                        evidence_write_rounds: 0,
+                        candidate_commit: candidate.clone(),
+                        failed_reviews: Vec::new(),
+                        human_resolution: String::new(),
+                        human_resolution_digest: String::new(),
+                        approved_at: "2026-08-21T00:00:00Z".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedFailedCommandRecheck { task_id } = outcome else {
+            panic!("no-change correction must plan the failed-command recheck")
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                let recheck = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let recheck = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap()
+            .clone();
+        write_recheck_result(project.path(), &recheck, &candidate, 65);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("exhausted unexplained recheck must request external evidence")
+        };
+        let handoff = fs::read_to_string(project.path().join(&handoff_path)).unwrap();
+        assert!(handoff.contains("--recheck-artifact"));
+        assert!(!handoff.contains("attempt extend"));
+        let paused = store.read_work_item("work-1").unwrap();
+        let status_action = crate::work_status::attempt_recovery_next_action(
+            Some(&paused.attempts[0]),
+            Some(project.path()),
+        )
+        .unwrap();
+        assert!(status_action.contains("--recheck-artifact"));
+        assert!(handoff.contains(&status_action));
+
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("external-evidence.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "remote Linux host",
+                "check": "xcodebuild test",
+                "working_directory": ".",
+                "result": "pass",
+                "run_at": "2026-08-21T12:00:00Z",
+                "output": "passed on the required host runtime"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source_bytes = fs::read(&tester_results).unwrap();
+        let mut source_with_extra_failure: serde_json::Value =
+            serde_json::from_slice(&source_bytes).unwrap();
+        source_with_extra_failure["tests"][0]["status"] = serde_json::json!("fail");
+        source_with_extra_failure["summary"]["pass"] = serde_json::json!(0);
+        source_with_extra_failure["summary"]["fail"] = serde_json::json!(1);
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&source_with_extra_failure).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+                project.path(),
+                &store.read_work_item("work-1").unwrap().attempts[0],
+            )
+            .is_none(),
+            "a broader Tester failure must not advertise command-only evidence recovery"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "command evidence must not supersede a structured Tester failure"
+        );
+        fs::write(&tester_results, source_bytes).unwrap();
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "candidate-mismatched evidence must be rejected"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(".fluent/work/artifacts/work-1/attempt-1/unrelated.json"),
+            )
+            .is_err(),
+            "an unrelated recheck artifact must be rejected"
+        );
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .unwrap();
+        let review_task_id = store.read_work_item("work-1").unwrap().attempts[0]
+            .evidence_recoveries
+            .iter()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap()
+            .targets[0]
+            .review_task_id
+            .clone()
+            .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == review_task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let review = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == review_task_id)
+            .unwrap()
+            .clone();
+        let review_dir = project
+            .path()
+            .join(&review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&review_dir).unwrap();
+        fs::write(review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+        let mut stored = store.read_work_item("work-1").unwrap();
+        stored.attempts[0]
+            .evidence_recoveries
+            .iter_mut()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap()
+            .state = EvidenceRecoveryState::Complete;
+        let stored_recovery = stored.attempts[0]
+            .evidence_recoveries
+            .iter()
+            .find(|entry| entry.id == recovery.id)
+            .unwrap();
+        let snapshot_path = project
+            .path()
+            .join(&stored_recovery.attachment.snapshot_path);
+        let snapshot_bytes = fs::read(&snapshot_path).unwrap();
+        fs::write(&snapshot_path, b"altered evidence\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered evidence bytes must not supersede the recheck"
+        );
+        fs::write(&snapshot_path, &snapshot_bytes).unwrap();
+        let binding_path = project
+            .path()
+            .join(&stored_recovery.targets[0].prior_review_artifact);
+        let binding_bytes = fs::read(&binding_path).unwrap();
+        fs::write(&binding_path, b"altered binding\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered binding bytes must not supersede the recheck"
+        );
+        fs::write(&binding_path, &binding_bytes).unwrap();
+        let stderr_path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("commands/0-stderr.log");
+        let stderr_bytes = fs::read(&stderr_path).unwrap();
+        fs::write(&stderr_path, b"altered recheck log\n").unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_none(),
+            "altered recheck bytes must not be covered by prior evidence"
+        );
+        fs::write(&stderr_path, &stderr_bytes).unwrap();
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_some(),
+            "restored exact bytes must recover the accepted evidence frontier"
+        );
+        let tester_count = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::MergeCandidateReady { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            tester_count,
+            "accepted external evidence must not rerun the incompatible command"
+        );
     }
 
     #[test]

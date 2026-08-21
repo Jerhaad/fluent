@@ -667,6 +667,7 @@ fn cmd_attempt(
                     candidate,
                     evidence_file,
                     review_artifact,
+                    recheck_artifact,
                 },
         } => {
             let recovery = fluent::host_evidence::attach(
@@ -677,6 +678,7 @@ fn cmd_attempt(
                 &candidate,
                 Path::new(&evidence_file),
                 &review_artifact,
+                recheck_artifact.as_deref(),
             )?;
             println!(
                 "Attached host evidence {} for Attempt {}; targeted reviews: {}",

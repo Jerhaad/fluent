@@ -604,8 +604,11 @@ pub enum AttemptEvidenceCommands {
         #[arg(long, value_name = "PATH")]
         evidence_file: String,
         /// Failed review artifact this evidence addresses
-        #[arg(long, value_name = "PATH", required = true)]
+        #[arg(long, value_name = "PATH")]
         review_artifact: Vec<String>,
+        /// Failed-command recheck manifest this evidence addresses
+        #[arg(long, value_name = "PATH")]
+        recheck_artifact: Option<String>,
     },
 }
 
@@ -1066,5 +1069,36 @@ mod tests {
         ]);
         assert!(approved);
         assert!(extra_args.is_empty());
+    }
+
+    #[test]
+    fn evidence_attach_parses_failed_recheck_frontier() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--evidence-file",
+            "evidence.json",
+            "--recheck-artifact",
+            ".fluent/work/artifacts/work-1/attempt-1/recheck/failed-command-recheck.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Attach {
+                        review_artifact,
+                        recheck_artifact: Some(recheck),
+                        ..
+                    }
+                }
+            }) if review_artifact.is_empty() && recheck.ends_with("failed-command-recheck.json")
+        ));
     }
 }

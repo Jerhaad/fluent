@@ -4714,7 +4714,20 @@ impl Attempt {
             existing.candidate_commit == recovery.candidate_commit
                 && existing.attachment == recovery.attachment
         }) {
-            return Ok(existing.clone());
+            let same_targets = existing.targets.len() == recovery.targets.len()
+                && existing.targets.iter().all(|target| {
+                    recovery.targets.iter().any(|candidate| {
+                        candidate.role == target.role
+                            && candidate.prior_review_artifact == target.prior_review_artifact
+                    })
+                });
+            return if same_targets {
+                Ok(existing.clone())
+            } else {
+                Err(WorkModelError::AttemptEvidenceRecoveryConflict {
+                    attempt_id: self.id.clone(),
+                })
+            };
         }
         if self
             .evidence_recoveries

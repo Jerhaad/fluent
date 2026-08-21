@@ -66,5 +66,6 @@ pub mod slack_collaboration;
 #[cfg(test)]
 pub(crate) mod test_lock_probe;
 pub mod tester;
+pub(crate) mod tester_evidence;
 pub mod update;
 pub mod usage;

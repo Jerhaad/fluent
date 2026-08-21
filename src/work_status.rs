@@ -870,6 +870,11 @@ pub fn attempt_recovery_next_action(
             Some(PauseKind::RoundCap | PauseKind::Uncertain)
         )
     {
+        if let Some(action) = project_root.and_then(|root| {
+            crate::host_evidence::failed_recheck_evidence_recovery_action(root, attempt)
+        }) {
+            return Some(action);
+        }
         let (writer_index, candidate_commit) = attempt
             .tasks
             .iter()
