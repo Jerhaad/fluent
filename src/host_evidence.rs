@@ -994,7 +994,18 @@ fn validate_recheck_evidence_frontier(
         return Err(rejected());
     };
     if results.error.is_some()
-        || results.summary.fail > 0
+        || results.summary.fail
+            != results
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || crate::tester_evidence::introduced_tester_failures_except_command(
+            &results_path,
+            None,
+            0,
+            &recheck_command.command,
+        ) != 0
         || recheck_command.exit_code == 0
         || recheck_command
             .process_settlement
@@ -1025,9 +1036,17 @@ fn validate_recheck_evidence_frontier(
             .is_some_and(|settlement| !settlement.leaks.is_empty())
         || source_command.command != recheck_command.command
         || source_command.test_harness != recheck_command.test_harness
-        || crate::tester_evidence::introduced_tester_failures(
+        || source_results.summary.fail
+            != source_results
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || crate::tester_evidence::introduced_tester_failures_except_command(
             &source_path,
             crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+            *command_index,
+            &source_command.command,
         ) != 0
         || crate::tester_evidence::unexplained_failed_tester_commands(
             &source_path,
@@ -1133,7 +1152,18 @@ pub(crate) fn pending_failed_recheck_evidence_recovery_action(
         || manifest.source_results != source.path
         || results.candidate_commit.as_deref() != Some(candidate)
         || results.error.is_some()
-        || results.summary.fail > 0
+        || results.summary.fail
+            != results
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || crate::tester_evidence::introduced_tester_failures_except_command(
+            &project_root.join(&area.path).join("tester-results.json"),
+            None,
+            0,
+            &recheck_command.command,
+        ) != 0
         || recheck_command.exit_code == 0
         || recheck_command
             .process_settlement
@@ -1148,9 +1178,17 @@ pub(crate) fn pending_failed_recheck_evidence_recovery_action(
             .is_some_and(|settlement| !settlement.leaks.is_empty())
         || source_command.command != recheck_command.command
         || source_command.test_harness != recheck_command.test_harness
-        || crate::tester_evidence::introduced_tester_failures(
+        || source_results.summary.fail
+            != source_results
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || crate::tester_evidence::introduced_tester_failures_except_command(
             &source_path,
             crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+            *command_index,
+            &source_command.command,
         ) != 0
         || crate::tester_evidence::unexplained_failed_tester_commands(
             &source_path,
@@ -1272,9 +1310,17 @@ pub(crate) fn completed_recheck_evidence_source(
             .as_ref()
             .is_some_and(|settlement| !settlement.leaks.is_empty())
         || command.command != binding.command
-        || crate::tester_evidence::introduced_tester_failures(
+        || source.summary.fail
+            != source
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || crate::tester_evidence::introduced_tester_failures_except_command(
             &source_path,
             crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
+            binding.command_index,
+            &command.command,
         ) != 0
         || crate::tester_evidence::unexplained_failed_tester_commands(
             &source_path,

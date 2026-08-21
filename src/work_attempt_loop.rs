@@ -10342,6 +10342,7 @@ mod tests {
         .unwrap();
         fs::write(artifact_dir.join("commands/0-stdout.log"), "stdout\n").unwrap();
         fs::write(artifact_dir.join("commands/0-stderr.log"), "stderr\n").unwrap();
+        let status = if exit_code == 0 { "pass" } else { "fail" };
         let results = serde_json::json!({
             "candidate_commit": candidate,
             "commands": [{
@@ -10352,8 +10353,19 @@ mod tests {
                 "stdout_log": "commands/0-stdout.log",
                 "stderr_log": "commands/0-stderr.log"
             }],
-            "tests": [],
-            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "tests": [{
+                "id": "command-0:xcodebuild test",
+                "test_harness": "xcodebuild",
+                "status": status,
+                "duration_ms": 10,
+                "failure_excerpt": if exit_code == 0 { None } else { Some("command failed") }
+            }],
+            "summary": {
+                "total": 1,
+                "pass": if exit_code == 0 { 1 } else { 0 },
+                "fail": if exit_code == 0 { 0 } else { 1 },
+                "skipped": 0
+            },
             "error": null
         });
         fs::write(
@@ -10932,6 +10944,25 @@ mod tests {
         )
         .unwrap();
         add_failed_final_tester_command(project.path(), &store);
+        let mut source_with_command_record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&tester_results).unwrap()).unwrap();
+        source_with_command_record["tests"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "command-0:xcodebuild test",
+                "test_harness": "xcodebuild",
+                "status": "fail",
+                "duration_ms": 10,
+                "failure_excerpt": "command failed"
+            }));
+        source_with_command_record["summary"] =
+            serde_json::json!({"total": 2, "pass": 1, "fail": 1, "skipped": 0});
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&source_with_command_record).unwrap(),
+        )
+        .unwrap();
         complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
         store
             .mutate_work_item("work-1", |item| {

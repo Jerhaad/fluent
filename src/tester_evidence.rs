@@ -54,6 +54,23 @@ pub(crate) fn introduced_tester_failures(
     }
 }
 
+pub(crate) fn introduced_tester_failures_except_command(
+    current_path: &Path,
+    baseline_path: Option<&Path>,
+    command_index: usize,
+    command: &str,
+) -> usize {
+    let mut current = failing_ids(current_path);
+    current.remove(&format!("command-{command_index}:{command}"));
+    match baseline_path {
+        Some(baseline_path) => {
+            let baseline = failing_ids(baseline_path);
+            current.difference(&baseline).count()
+        }
+        None => current.len(),
+    }
+}
+
 pub(crate) fn unexplained_failed_tester_commands(
     tester_results_path: &Path,
     baseline_path: Option<&Path>,
