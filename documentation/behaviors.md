@@ -5738,7 +5738,7 @@ WHEN the repair Writer completes, THE SYSTEM SHALL accept a commit only when its
 net changes are confined to `.fluent/tester.yaml` and
 `.fluent/extract-tester-results`.
 Test: src/work_task_executor.rs (tester_harness_repair_scope_accepts_only_config_and_extractor)
-Test: src/work_task_executor.rs (tester_harness_repair_writer_commits_through_the_real_executor)
+Test: src/work_task_executor.rs (tester_harness_repair_writer_restores_rejection_and_retries_through_real_executor)
 
 ### B10g
 
@@ -5773,6 +5773,36 @@ WHEN an eligible suspended Attempt has no active dispatch and its latest
 dispatch is canceled, THE SYSTEM SHALL append a fresh resume bound to the exact
 current Attempt without reviving or linking the canceled dispatch.
 Test: src/queue.rs (resume_after_canceled_history_uses_the_current_exact_attempt)
+
+### B10l
+
+WHEN Fluent launches a tracked Tester-harness repair Writer, THE SYSTEM SHALL
+provide the failed Tester artifacts for diagnosis without turning ordinary
+failed Tester commands into completion-matrix obligations for that narrowly
+scoped repair.
+Test: src/work_task_executor.rs (tester_harness_repair_matrix_excludes_and_sanitizes_failed_tester_commands)
+
+### B10m
+
+IF a Tester-harness repair Writer commits changes outside its approved file
+boundary, THEN THE SYSTEM SHALL retain an artifact naming the rejected commit,
+and restore the exact clean approved candidate.
+Test: src/work_task_executor.rs (tester_harness_repair_start_restores_rejected_descendant_for_retry)
+Test: src/work_task_executor.rs (tester_harness_repair_writer_restores_rejection_and_retries_through_real_executor)
+
+### B10n
+
+WHEN an operator resumes a rejected Tester-harness repair, THE SYSTEM SHALL
+retry the same repair Writer from its approved candidate.
+Test: src/queue.rs (resume_preserves_history_binds_exact_attempt_and_is_idempotent)
+Test: src/work_task_executor.rs (tester_harness_repair_writer_restores_rejection_and_retries_through_real_executor)
+
+### B10o
+
+IF a resumed Tester-harness repair candidate is dirty or is not descended from
+its approved candidate, THEN THE SYSTEM SHALL reject the retry without cleaning
+or moving the candidate.
+Test: src/work_task_executor.rs (tester_harness_repair_start_restores_rejected_descendant_for_retry)
 
 ### B11
 

@@ -32,6 +32,14 @@ both, but neither route may silently move the candidate. For code-producing
 Work this final Tester runs after reviewers and blocks Learning; review-only
 Work retains its Tester-first boundary before reviewers.
 
+Failed Tester results are diagnostic inputs to this scoped Writer, not a set of
+product correction requirements. Do not import their ordinary failed commands
+into the repair Writer's completion matrix. If a repair Writer commits outside
+the two-file boundary, record the rejected commit and restore the exact clean
+approved candidate before pausing so public resume can retry. Perform legacy
+normalization only after durable Task reservation, and only for a clean linear
+descendant; dirty state and unrelated drift remain human-owned and fail closed.
+
 Persist all command records accumulated before a harness failure in the Tester
 artifact. An empty command list is accurate only for failures that occurred
 before command execution; discarding executed command outcomes removes the

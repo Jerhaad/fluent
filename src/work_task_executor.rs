@@ -697,7 +697,7 @@ fn run_write_task_with_coder(
     )?);
     preflight_write_worktree(config.project_root, &workspace_path, &branch_name)?;
     if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
-        ensure_tester_harness_repair_start(config.project_root, &plan.task, &workspace_path)?;
+        inspect_tester_harness_repair_start(config.project_root, &plan.task, &workspace_path)?;
     }
     let writer_cache = crate::writer_cache::preflight_writer_dependency_cache(
         config.project_root,
@@ -843,7 +843,7 @@ fn run_write_task_with_coder(
                 &source_branch,
             )?;
             if reservation.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
-                ensure_tester_harness_repair_start(
+                prepare_tester_harness_repair_start(
                     config.project_root,
                     &reservation.task,
                     &workspace_path,
@@ -975,6 +975,18 @@ fn run_write_task_with_coder(
     if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
         && let Err(error) = ensure_tester_harness_repair_scope(&workspace_path, &baseline_commit)
     {
+        let error = match reject_and_restore_tester_harness_repair(
+            config.project_root,
+            &plan.task,
+            &workspace_path,
+            &baseline_commit,
+            &error,
+        ) {
+            Ok(()) => error,
+            Err(restore_error) => anyhow::anyhow!(
+                "{error:#}; additionally failed to restore the approved Tester-harness candidate: {restore_error:#}"
+            ),
+        };
         mark_task_failed_attempt_needs_user(
             config.store,
             config.project_root,
@@ -6125,6 +6137,14 @@ pub(crate) fn writer_completion_findings(
     task: &crate::work_model::Task,
 ) -> Result<Vec<crate::work_model::WriterCompletionFinding>> {
     let mut findings = BTreeMap::new();
+    // A Tester-harness repair is authorized by its explicit operator decision.
+    // The failed Tester result remains immutable prompt evidence for diagnosing
+    // that repair, but its ordinary command failures are not product obligations:
+    // importing them here would invite the narrowly scoped Writer to edit product
+    // code outside `.fluent/tester.yaml` and the extractor.
+    if task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+        return Ok(findings.into_values().collect());
+    }
     for artifact in &task.input_artifacts {
         let relative = Path::new(&artifact.path);
         let is_review = relative.file_name().is_some_and(|name| {
@@ -6249,7 +6269,34 @@ pub(crate) fn materialize_writer_completion_before_writer(
                 path.display()
             );
         }
-        Ok(_) => return Ok(Some(path)),
+        Ok(_) => {
+            if task.role != crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+                return Ok(Some(path));
+            }
+            let existing: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_slice(&fs::read(&path).with_context(|| {
+                    format!("read existing Writer completion matrix: {}", path.display())
+                })?)
+                .with_context(|| {
+                    format!(
+                        "parse existing Writer completion matrix: {}",
+                        path.display()
+                    )
+                })?;
+            let imported_tester_result = existing.rows.iter().any(|row| {
+                row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
+                    && Path::new(&row.source)
+                        .file_name()
+                        .is_some_and(|name| name == "tester-results.json")
+            });
+            if !imported_tester_result {
+                return Ok(Some(path));
+            }
+            // Compatibility for repair Tasks materialized by older Fluent builds:
+            // rebuild from the immutable contract and the prior Writer instead of
+            // preserving obligations that the scoped repair was never authorized
+            // to address.
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
@@ -8140,11 +8187,18 @@ fn ensure_tester_harness_repair_scope(workspace_path: &Path, baseline_commit: &s
     Ok(())
 }
 
-fn ensure_tester_harness_repair_start(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TesterHarnessRepairStart {
+    ApprovedCandidate,
+    ScopedDescendant,
+    RejectedDescendant { reason: String },
+}
+
+fn inspect_tester_harness_repair_start(
     project_root: &Path,
     task: &crate::work_model::Task,
     workspace_path: &Path,
-) -> Result<()> {
+) -> Result<TesterHarnessRepairStart> {
     let context = task
         .review_context
         .as_ref()
@@ -8168,7 +8222,7 @@ fn ensure_tester_harness_repair_start(
         .transpose()?
         .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no artifact area"))?;
 
-    match fs::read_to_string(&baseline_path) {
+    let state = match fs::read_to_string(&baseline_path) {
         Ok(persisted) => {
             let persisted = persisted.trim();
             if persisted != context.candidate_commit {
@@ -8193,7 +8247,15 @@ fn ensure_tester_harness_repair_start(
                         context.candidate_commit
                     );
                 }
-                ensure_tester_harness_repair_scope(workspace_path, &context.candidate_commit)?;
+                match ensure_tester_harness_repair_scope(workspace_path, &context.candidate_commit)
+                {
+                    Ok(()) => TesterHarnessRepairStart::ScopedDescendant,
+                    Err(error) => TesterHarnessRepairStart::RejectedDescendant {
+                        reason: error.to_string(),
+                    },
+                }
+            } else {
+                TesterHarnessRepairStart::ApprovedCandidate
             }
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -8203,6 +8265,7 @@ fn ensure_tester_harness_repair_start(
                     context.candidate_commit
                 );
             }
+            TesterHarnessRepairStart::ApprovedCandidate
         }
         Err(error) => {
             return Err(anyhow::Error::new(error).context(format!(
@@ -8210,8 +8273,72 @@ fn ensure_tester_harness_repair_start(
                 baseline_path.display()
             )));
         }
-    }
+    };
     ensure_clean_worktree(workspace_path)?;
+    Ok(state)
+}
+
+fn prepare_tester_harness_repair_start(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+) -> Result<()> {
+    if let TesterHarnessRepairStart::RejectedDescendant { reason } =
+        inspect_tester_harness_repair_start(project_root, task, workspace_path)?
+    {
+        let baseline = task
+            .review_context
+            .as_ref()
+            .expect("inspector requires repair context")
+            .candidate_commit
+            .clone();
+        reject_and_restore_tester_harness_repair(
+            project_root,
+            task,
+            workspace_path,
+            &baseline,
+            &anyhow::anyhow!(reason),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_and_restore_tester_harness_repair(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+    baseline_commit: &str,
+    scope_error: &anyhow::Error,
+) -> Result<()> {
+    ensure_clean_worktree(workspace_path)?;
+    let rejected_commit = head_commit(workspace_path)?;
+    let artifact_dir = task
+        .artifact_area
+        .as_ref()
+        .map(|area| resolve_managed_artifact_area_path(project_root, &area.path))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no artifact area"))?;
+    fs::create_dir_all(&artifact_dir)?;
+    let receipt = serde_json::json!({
+        "schema_version": 1,
+        "task_id": task.id,
+        "approved_candidate": baseline_commit,
+        "rejected_commit": rejected_commit,
+        "reason": scope_error.to_string(),
+    });
+    let receipt_path = artifact_dir.join(format!(
+        "rejected-repair-{}.json",
+        rejected_commit.get(..12).unwrap_or(&rejected_commit)
+    ));
+    crate::atomic_write::atomic_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
+    reset_worktree_head(workspace_path, baseline_commit)?;
+    let restored = head_commit(workspace_path)?;
+    ensure_clean_worktree(workspace_path)?;
+    if restored != baseline_commit {
+        bail!(
+            "restored Tester-harness candidate HEAD {restored} does not match approved candidate {baseline_commit}"
+        );
+    }
     Ok(())
 }
 
@@ -13156,7 +13283,7 @@ mod tests {
     }
 
     #[test]
-    fn tester_harness_repair_start_rejects_drift_but_allows_scoped_resume() {
+    fn tester_harness_repair_start_restores_rejected_descendant_for_retry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let workspace = tmp.path();
         let git = |args: &[&str]| {
@@ -13212,7 +13339,10 @@ mod tests {
             completed_at: None,
         };
 
-        ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert_eq!(
+            inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap(),
+            TesterHarnessRepairStart::ApprovedCandidate
+        );
 
         fs::write(
             workspace.join(".fluent/extract-tester-results"),
@@ -13222,7 +13352,7 @@ mod tests {
         git(&["add", ".fluent/extract-tester-results"]);
         git(&["commit", "-q", "-m", "repair extractor"]);
         let repair_commit = head_commit(workspace).unwrap();
-        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -13232,21 +13362,57 @@ mod tests {
         let baseline_path = workspace.join(artifact_area).join("write-baseline-commit");
         fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
         fs::write(&baseline_path, &baseline).unwrap();
-        ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert_eq!(
+            inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap(),
+            TesterHarnessRepairStart::ScopedDescendant
+        );
 
         fs::write(workspace.join("product.txt"), "changed\n").unwrap();
         git(&["add", "product.txt"]);
         git(&["commit", "-q", "-m", "change product"]);
-        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
-        assert!(error.to_string().contains("product.txt"));
+        let rejected = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert!(matches!(
+            &rejected,
+            TesterHarnessRepairStart::RejectedDescendant { reason, .. }
+                if reason.contains("product.txt")
+        ));
+        let rejected_commit = head_commit(workspace).unwrap();
+        prepare_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+        assert_eq!(head_commit(workspace).unwrap(), baseline);
+        assert!(
+            workspace
+                .join(artifact_area)
+                .join(format!("rejected-repair-{}.json", &rejected_commit[..12]))
+                .is_file()
+        );
 
         git(&["reset", "--hard", &repair_commit]);
         fs::write(workspace.join("product.txt"), "dirty\n").unwrap();
-        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
         assert!(error.to_string().contains("uncommitted changes"));
+
+        git(&["reset", "--hard", &baseline]);
+        let tree = crate::git::run_stdout(
+            workspace,
+            &["rev-parse", &format!("{baseline}^{{tree}}")],
+            "resolve unrelated repair fixture tree",
+        )
+        .unwrap();
+        let unrelated = crate::git::run_stdout(
+            workspace,
+            &["commit-tree", &tree, "-m", "unrelated"],
+            "create unrelated repair fixture commit",
+        )
+        .unwrap();
+        git(&["reset", "--hard", &unrelated]);
+        let error = inspect_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(error.to_string().contains("is not descended from approved"));
+        assert_eq!(head_commit(workspace).unwrap(), unrelated);
     }
 
-    struct TesterHarnessRepairCommitCoder;
+    struct TesterHarnessRepairCommitCoder {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
 
     impl crate::coder::Coder for TesterHarnessRepairCommitCoder {
         fn run(
@@ -13272,15 +13438,23 @@ mod tests {
             _session: crate::coder::CoderSession<'_>,
         ) -> crate::coder::CoderRunCompletion {
             let terminal = (|| {
+                let run = self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if run == 0 {
+                    fs::write(working_dir.join("product.txt"), "unauthorized\n")?;
+                } else if fs::read_to_string(working_dir.join("product.txt"))? != "unchanged\n" {
+                    bail!("retry did not start from the restored approved candidate");
+                }
                 fs::write(
                     working_dir.join(".fluent/extract-tester-results"),
                     "#!/bin/sh\necho '[]' | awk '!seen[$0]++'\n",
                 )?;
-                crate::git::run(
-                    working_dir,
-                    &["add", ".fluent/extract-tester-results"],
-                    "stage Tester-harness repair",
-                )?;
+                let mut paths = vec![".fluent/extract-tester-results"];
+                if run == 0 {
+                    paths.push("product.txt");
+                }
+                let mut add = vec!["add"];
+                add.extend(paths);
+                crate::git::run(working_dir, &add, "stage Tester-harness repair")?;
                 crate::git::run(
                     working_dir,
                     &["commit", "-q", "-m", "Repair Tester extractor"],
@@ -13306,7 +13480,7 @@ mod tests {
     }
 
     #[test]
-    fn tester_harness_repair_writer_commits_through_the_real_executor() {
+    fn tester_harness_repair_writer_restores_rejection_and_retries_through_real_executor() {
         use crate::work_model::{
             AttemptReviewState, ReviewContext, Task, TaskArtifactArea, WorkspaceAccess,
             WorkspaceRef, work_artifact_path,
@@ -13446,8 +13620,62 @@ mod tests {
             })
             .unwrap();
         let resolver = ContentResolver::new(Some(&project));
-        let make_coder =
-            |_sandbox| Box::new(TesterHarnessRepairCommitCoder) as Box<dyn crate::coder::Coder>;
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_coder = |_sandbox| {
+            Box::new(TesterHarnessRepairCommitCoder { runs: runs.clone() })
+                as Box<dyn crate::coder::Coder>
+        };
+        let first_error = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &approved.task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap_err();
+        assert!(first_error.to_string().contains("product.txt"));
+        assert_eq!(head_commit(&workspace).unwrap(), candidate);
+        assert!(
+            crate::git::run_stdout(
+                &workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "verify rejected repair restoration",
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let repair_area = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == approved.task_id)
+            .unwrap()
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path
+            .clone();
+        assert!(
+            fs::read_dir(project.join(repair_area))
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rejected-repair-"))
+        );
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
         let result = run_write_task_with_coder(
             WorkTaskRunConfig {
                 project_root: &project,
@@ -17836,6 +18064,83 @@ mod tests {
                 .iter()
                 .any(|row| row.requirement.contains("fmt"))
         );
+    }
+
+    #[test]
+    fn tester_harness_repair_matrix_excludes_and_sanitizes_failed_tester_commands() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Tester harness repair");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Tester\n\n### B1\n\nWHEN verification runs, THE SYSTEM SHALL report results.\nTest: tests/binary.rs (reports_results)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let tester_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json";
+        let tester_path = project.path().join(tester_rel);
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [
+                    {"command": "cargo test", "test_harness": "cargo", "exit_code": 101, "duration_ms": 1, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"},
+                    {"command": "docker run smoke", "test_harness": "shell", "exit_code": 1, "duration_ms": 1, "stdout_log": "commands/1-stdout.log", "stderr_log": "commands/1-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+        writer.input_artifacts = vec![crate::work_model::ArtifactRef {
+            producer_id: "attempt-1-tester-2".to_string(),
+            path: tester_rel.to_string(),
+        }];
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut stale: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stale.rows.len(), 1);
+        stale.rows.push(crate::work_model::WriterCompletionRow {
+            id: "finding:tester:legacy".to_string(),
+            kind: crate::work_model::WriterCompletionRequirementKind::Finding,
+            source: tester_rel.to_string(),
+            requirement: "Address tester review finding: failed command".to_string(),
+            verification_refs: Vec::new(),
+            state: crate::work_model::WriterCompletionState::Complete,
+            implementation_evidence: vec!["product.txt".to_string()],
+            verification: Vec::new(),
+            applicable_constraints: Vec::new(),
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+
+        materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(repaired.rows.len(), 1);
+        assert!(repaired.rows.iter().all(|row| {
+            row.kind != crate::work_model::WriterCompletionRequirementKind::Finding
+        }));
     }
 
     #[test]

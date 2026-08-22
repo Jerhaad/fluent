@@ -621,6 +621,17 @@ and the final Tester then bind to the repair Writer's commit. Repeating the same
 repair request or scheduler resume reuses its existing durable record; ordinary
 candidate drift still fails closed.
 
+The repair Writer receives the immutable failed Tester artifacts as diagnostic
+context, but the completion-matrix host does not translate their ordinary
+command failures into product obligations. Its authority is the operator's
+recorded repair decision and its accepted Git surface remains the two Tester
+files. If the Writer nevertheless commits outside that surface, Fluent records
+the rejected commit in the Writer artifact area and restores the managed
+candidate to the approved commit before pausing. A retry may normalize a clean,
+linear rejected descendant produced by an older Fluent build only after the
+Task start is durably reserved. It never cleans a dirty workspace, accepts a
+non-descendant, or moves the candidate during read-only preflight.
+
 The `behaviors.md` format supports two markers on EARS statements:
 - `Test:` — names a test that verifies the behavior.
 - `Untestable:` — marks a behavior as genuinely untestable with a reason.
