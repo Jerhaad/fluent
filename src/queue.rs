@@ -499,6 +499,13 @@ pub fn resume_with_tester_no_sandbox(
     )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
+        Some(previous) if previous.status == DispatchStatus::Canceled => {
+            // A canceled dispatch is immutable history, not the suspension this
+            // new command authorizes. The current Work-model frontier above is
+            // the authority, so append a fresh exact resume without linking it
+            // to an older (and possibly differently bound) canceled dispatch.
+            None
+        }
         Some(previous) => {
             if previous.status != DispatchStatus::NeedsUser
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
@@ -1538,6 +1545,38 @@ mod tests {
         let replayed = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
         assert_eq!(replayed.dispatches.len(), 2);
         assert_eq!(replayed.active().unwrap().priority, 11);
+    }
+
+    #[test]
+    fn resume_after_canceled_history_uses_the_current_exact_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-1", "attempt-2");
+        suspend_attempt(dir.path(), "wi-1", "attempt-2", PauseKind::WriterCompletion);
+        let mut canceled = Dispatch::new_resume("wi-1", "attempt-1", 0, None, false, 1);
+        canceled.status = DispatchStatus::Canceled;
+        put_ledger(
+            dir.path(),
+            &DispatchLedger {
+                work_item_id: "wi-1".to_string(),
+                dispatches: vec![canceled],
+            },
+        );
+
+        assert_eq!(
+            resume(dir.path(), "wi-1", "attempt-2", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::Canceled);
+        let active = ledger.active().unwrap();
+        assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-2"));
+        assert_eq!(active.resume_of_dispatch_id, None);
+
+        let token = claim(dir.path(), "wi-1", "attempt-2")
+            .unwrap()
+            .expect("the fresh exact resume remains claimable");
+        assert_eq!(token.bound_attempt_id, "attempt-2");
     }
 
     #[test]

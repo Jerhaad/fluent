@@ -3197,6 +3197,10 @@ needs-user dispatch exists. Repeating the command while that same resume is
 active is idempotent; a later needs-user outcome requires a new explicit
 authorization. Mismatched Attempts, unsupported pause kinds, unrelated active
 dispatches, and contradictory terminal history fail without queue mutation.
+An earlier canceled dispatch remains terminal history and does not authorize or
+block a new explicit resume. The new dispatch binds the exact currently eligible
+Attempt without linking itself to the canceled dispatch, whose binding may name
+an older Attempt.
 For an uncertain-review pause, queue admission calls the same read-only
 `lifecycle_recovery` inspection as foreground execution before it appends the
 resume dispatch. The scheduler later launches the bound Attempt through the

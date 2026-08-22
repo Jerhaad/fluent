@@ -5767,6 +5767,13 @@ WHEN an operator repeats the same scheduler resume, THE SYSTEM SHALL reuse the
 existing resume dispatch.
 Test: tests/binary.rs (tester_harness_repair_public_workflow_is_audited_and_idempotent)
 
+### B10k
+
+WHEN an eligible suspended Attempt has no active dispatch and its latest
+dispatch is canceled, THE SYSTEM SHALL append a fresh resume bound to the exact
+current Attempt without reviving or linking the canceled dispatch.
+Test: src/queue.rs (resume_after_canceled_history_uses_the_current_exact_attempt)
+
 ### B11
 
 IF `.fluent/extract-tester-results` exits non-zero or emits output

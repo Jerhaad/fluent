@@ -19,6 +19,13 @@ distinction in the durable ledger:
 5. If the resumed run pauses again, terminalize only the new dispatch and
    require another explicit resume.
 
+A canceled dispatch is terminal history, not a resumable suspension and not an
+active conflict. A later explicit resume may append a fresh dispatch when the
+current exact Attempt independently passes the recovery predicate. Do not link
+the new dispatch to the canceled entry or require its binding to match; it may
+belong to an older Attempt. Preserve the canceled record unchanged, and bind
+the new resume before claim.
+
 This shape makes command retries idempotent while the matching dispatch is
 active, survives coordinator restart, and prevents ordinary queue replay or a
 stale bound id from impersonating human authorization. Tests must prove the
