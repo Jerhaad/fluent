@@ -4432,6 +4432,63 @@ impl Attempt {
             .is_some_and(|task| task.id == task_id)
     }
 
+    /// Return whether a failed ordinary Writer was planned before an earlier
+    /// Tester-harness repair finished. This ordering cannot represent a valid
+    /// post-repair correction: it is a stale continuation created while the
+    /// repair Writer was still unresolved.
+    pub fn is_superseded_tester_harness_followup(&self, task_id: &str) -> bool {
+        let Some((task_index, task)) = self
+            .tasks
+            .iter()
+            .enumerate()
+            .find(|(_, task)| task.id == task_id)
+        else {
+            return false;
+        };
+        if task.kind != TaskKind::Write
+            || task.role == TESTER_HARNESS_REPAIR_ROLE
+            || task.status != TaskStatus::Failed
+        {
+            return false;
+        }
+        let Some(created_at) = task.created_at.as_deref() else {
+            return false;
+        };
+        let Ok(created_at) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+            return false;
+        };
+        self.tasks[..task_index].iter().rev().any(|repair| {
+            let completed_before_creation = repair
+                .completed_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|completed_at| created_at <= completed_at);
+            let has_receipt = self.artifacts.iter().any(|artifact| {
+                artifact.producer_id == "tester-harness-recovery"
+                    && artifact.path.ends_with(&format!(
+                        "/tester-harness-repairs/{}/superseded-followups.json",
+                        repair.id
+                    ))
+            });
+            repair.kind == TaskKind::Write
+                && repair.role == TESTER_HARNESS_REPAIR_ROLE
+                && repair.status == TaskStatus::Complete
+                && repair.output.is_some()
+                && completed_before_creation
+                && has_receipt
+        })
+    }
+
+    pub fn materialized_write_rounds(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.kind == TaskKind::Write
+                    && !self.is_superseded_tester_harness_followup(&task.id)
+            })
+            .count()
+    }
+
     /// Validate that this exact suspended Attempt can be explicitly resumed.
     ///
     /// Both direct Attempt execution and scheduler resume dispatches use this
@@ -4455,6 +4512,7 @@ impl Attempt {
             task.status == TaskStatus::Executing
                 || (task.status == TaskStatus::Failed
                     && !failed_candidate_gate_correction
+                    && !self.is_superseded_tester_harness_followup(&task.id)
                     && !self.has_tester_harness_repair_for(&task.id))
         }) {
             return Err(ineligible(
@@ -4507,11 +4565,7 @@ impl Attempt {
                     .to_string(),
             )),
             Some(PauseKind::RoundCap) => {
-                let write_rounds = self
-                    .tasks
-                    .iter()
-                    .filter(|task| task.kind == TaskKind::Write)
-                    .count();
+                let write_rounds = self.materialized_write_rounds();
                 if self.review_state == Some(AttemptReviewState::Failed)
                     && self
                         .round_cap_extensions
@@ -4616,11 +4670,7 @@ impl Attempt {
                 )
             },
         );
-        let materialized_write_rounds = self
-            .tasks
-            .iter()
-            .filter(|task| task.kind == TaskKind::Write)
-            .count();
+        let materialized_write_rounds = self.materialized_write_rounds();
         configured_cap.max(materialized_write_rounds)
     }
 
@@ -4987,6 +5037,7 @@ impl Attempt {
             if self.status == AttemptStatus::Complete
                 && task.status != TaskStatus::Complete
                 && task.kind != TaskKind::Rebase
+                && !self.is_superseded_tester_harness_followup(&task.id)
                 && !self.has_tester_harness_repair_for(&task.id)
             {
                 return Err(WorkModelError::CompleteAttemptHasIncompleteTask {

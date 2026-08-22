@@ -186,11 +186,7 @@ pub fn extend_round_cap(
         }) {
             return Ok(extension.clone());
         }
-        let write_rounds = attempt
-            .tasks
-            .iter()
-            .filter(|task| task.kind == TaskKind::Write)
-            .count();
+        let write_rounds = attempt.materialized_write_rounds();
         if write_rounds != effective_cap {
             return Err(round_cap_ineligible(format!(
                 "the paused frontier has {write_rounds} Writer rounds, not its current cap {effective_cap}"
@@ -768,6 +764,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         }
         if let Some(task) = attempt.tasks.iter().find(|task| {
             matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                && !attempt.is_superseded_tester_harness_followup(&task.id)
                 && !attempt.has_tester_harness_repair_for(&task.id)
                 && !attempt.active_evidence_recovery().is_some_and(|recovery| {
                     task.kind == TaskKind::Write
@@ -1143,7 +1140,14 @@ fn reopen_resumable_attempt(
                 "the pause changed to round-cap before the recovery transaction",
             ));
         }
-        let writer_completion_artifacts = (attempt.pause_kind == Some(PauseKind::WriterCompletion))
+        let repair_retry = attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && attempt.tasks.iter().rev().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+                    && task.status == TaskStatus::NeedsUser
+            });
+        let writer_completion_artifacts = (attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && !repair_retry)
             .then(|| writer_completion_resume_artifacts(attempt));
         crate::work_model::reopen_attempt(&mut item.attempts[attempt_index]);
         if let Some(artifacts) = writer_completion_artifacts {
@@ -1533,11 +1537,7 @@ fn reopen_approved_round_cap_attempt(
             .round_cap_extensions
             .last()
             .ok_or_else(|| round_cap_ineligible("the pause has no approved extension"))?;
-        let write_rounds = attempt
-            .tasks
-            .iter()
-            .filter(|task| task.kind == TaskKind::Write)
-            .count();
+        let write_rounds = attempt.materialized_write_rounds();
         if extension.new_cap <= write_rounds {
             return Err(round_cap_ineligible(
                 "the approved Writer-round cap is exhausted",
@@ -1898,11 +1898,7 @@ fn reclassify_legacy_provider_pause(
 ///   does NOT contribute to the no-progress streak — the rule is
 ///   lenient on purpose.
 fn can_advance_loop(project_root: &Path, attempt: &Attempt) -> Result<bool> {
-    let total_rounds = attempt
-        .tasks
-        .iter()
-        .filter(|task| task.kind == TaskKind::Write)
-        .count();
+    let total_rounds = attempt.materialized_write_rounds();
     if total_rounds >= attempt.effective_write_round_cap(max_total_write_rounds()) {
         return Ok(false);
     }
@@ -5833,11 +5829,7 @@ fn advance_failed_command_recheck(
     }
 
     let work_item_id = item.id.clone();
-    let write_rounds = item.attempts[attempt_index]
-        .tasks
-        .iter()
-        .filter(|task| task.kind == TaskKind::Write)
-        .count();
+    let write_rounds = item.attempts[attempt_index].materialized_write_rounds();
     let round_cap_reached = write_rounds
         >= item.attempts[attempt_index].effective_write_round_cap(max_total_write_rounds());
     if round_cap_reached {
@@ -7335,11 +7327,7 @@ fn interpret_reviews(
             return Ok(WorkAttemptRunOutcome::ReviewOnlyFailed);
         }
         if !followup_budget_available {
-            let write_rounds = item.attempts[attempt_index]
-                .tasks
-                .iter()
-                .filter(|task| task.kind == TaskKind::Write)
-                .count();
+            let write_rounds = item.attempts[attempt_index].materialized_write_rounds();
             let round_cap_reached = write_rounds
                 >= item.attempts[attempt_index].effective_write_round_cap(max_total_write_rounds());
             // Settle the RoundCap pause through the fresh, precedence-aware reducer:
@@ -18657,6 +18645,95 @@ mod tests {
         assert_eq!(attempt.status, AttemptStatus::Planned);
         assert_eq!(attempt.tasks[0].status, TaskStatus::Failed);
         assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn writer_completion_retry_replans_repair_without_appending_author_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let failed_tester_id = "attempt-1-tester";
+        let mut item = WorkItem::planned("work-1", "Retry Tester repair");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.tasks[0].status = TaskStatus::Failed;
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].role = "tester".to_string();
+        attempt.tasks[0].id = failed_tester_id.to_string();
+        attempt.tasks[0].artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", failed_tester_id),
+        });
+        attempt.tasks[0].review_context = Some(crate::work_model::ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+            source_branch: "main".to_string(),
+            candidate_commit: "abc123".to_string(),
+            base_commit: None,
+        });
+        attempt.tasks.push(Task {
+            id: "attempt-1-write-2".to_string(),
+            kind: TaskKind::Write,
+            status: TaskStatus::NeedsUser,
+            role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+            instructions: Some("Repair the project Tester harness.".to_string()),
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess {
+                reads: Vec::new(),
+                writes: vec![crate::work_model::WorkspaceRef {
+                    id: "candidate".to_string(),
+                    path: "../work-4-work-1-attempt-1".to_string(),
+                }],
+            },
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-2"),
+            }),
+            review_context: Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: "abc123".to_string(),
+                base_commit: None,
+            }),
+            evidence_review_context: None,
+            input_artifacts: vec![
+                ArtifactRef {
+                    producer_id: "tester-harness-repair-authority".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "tester-harness-repairs/attempt-1-write-2/repair.json",
+                    ),
+                },
+                ArtifactRef {
+                    producer_id: failed_tester_id.to_string(),
+                    path: format!(
+                        "{}/tester-results.json",
+                        work_artifact_path("work-1", "attempt-1", failed_tester_id)
+                    ),
+                },
+            ],
+            depends_on: None,
+            output: None,
+            created_at: Some("2026-08-22T12:00:00Z".to_string()),
+            started_at: Some("2026-08-22T12:01:00Z".to_string()),
+            completed_at: Some("2026-08-22T12:02:00Z".to_string()),
+        });
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.completed_at = Some("2026-08-22T12:02:00Z".to_string());
+        store.create_work_item(&item).unwrap();
+
+        reopen_resumable_attempt(&store, "work-1", "attempt-1").unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.tasks.len(), 2);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
+        assert_eq!(
+            attempt.tasks[1].role,
+            crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+        );
     }
 
     #[test]
