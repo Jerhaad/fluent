@@ -11008,6 +11008,103 @@ mod tests {
         assert!(status_action.contains("--recheck-artifact"));
         assert!(handoff.contains(&status_action));
 
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let final_writer_index = attempt.latest_materialized_write_index().unwrap();
+                let final_writer = attempt.tasks[final_writer_index].clone();
+                let mut failed_tester = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Tester)
+                    .unwrap()
+                    .clone();
+                failed_tester.id = "attempt-1-tester-harness-history".to_string();
+                failed_tester.status = TaskStatus::Failed;
+                failed_tester.output = None;
+                failed_tester.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-tester-harness-history",
+                    ),
+                });
+
+                let mut repair = final_writer.clone();
+                repair.id = "attempt-1-write-repair-history".to_string();
+                repair.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+                repair.output.as_mut().unwrap().no_change = None;
+                repair.created_at = Some("2026-08-21T00:00:00Z".to_string());
+                repair.completed_at = Some("2026-08-21T00:02:00Z".to_string());
+                repair.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-write-repair-history",
+                    ),
+                });
+                let repair_output = repair.output.clone().unwrap();
+                repair.review_context = Some(crate::work_model::ReviewContext {
+                    candidate_workspace_id: repair_output.workspace_id.clone(),
+                    candidate_workspace_path: repair_output.workspace_path.clone(),
+                    source_branch: repair_output.source_branch.clone(),
+                    candidate_commit: repair_output.commit.clone(),
+                    base_commit: repair_output.base_commit.clone(),
+                });
+                repair.workspace_access.writes = vec![crate::work_model::WorkspaceRef {
+                    id: repair_output.workspace_id.clone(),
+                    path: repair_output.workspace_path.clone(),
+                }];
+                repair.depends_on = None;
+                repair.input_artifacts = vec![
+                    ArtifactRef {
+                        producer_id: "tester-harness-repair-authority".to_string(),
+                        path: work_artifact_path(
+                            "work-1",
+                            "attempt-1",
+                            "tester-harness-repairs/attempt-1-write-repair-history/repair.json",
+                        ),
+                    },
+                    ArtifactRef {
+                        producer_id: failed_tester.id.clone(),
+                        path: format!(
+                            "{}/tester-results.json",
+                            failed_tester.artifact_area.as_ref().unwrap().path
+                        ),
+                    },
+                ];
+
+                let mut superseded_writer = final_writer;
+                superseded_writer.id = "attempt-1-write-superseded-history".to_string();
+                superseded_writer.status = TaskStatus::Failed;
+                superseded_writer.output = None;
+                superseded_writer.created_at = Some("2026-08-21T00:01:00Z".to_string());
+                superseded_writer.completed_at = Some("2026-08-21T00:03:00Z".to_string());
+                superseded_writer.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-write-superseded-history",
+                    ),
+                });
+                superseded_writer.input_artifacts.clear();
+
+                attempt.tasks.splice(
+                    final_writer_index..final_writer_index,
+                    [failed_tester, repair.clone(), superseded_writer],
+                );
+                attempt.artifacts.push(ArtifactRef {
+                    producer_id: "tester-harness-recovery".to_string(),
+                    path: format!(
+                        ".fluent/work/artifacts/work-1/attempt-1/tester-harness-repairs/{}/superseded-followups.json",
+                        repair.id
+                    ),
+                });
+                assert!(!attempt.has_round_cap_task_blocker());
+                Ok(())
+            })
+            .unwrap();
+
         let manifest = format!(
             "{}/failed-command-recheck.json",
             recheck.artifact_area.as_ref().unwrap().path

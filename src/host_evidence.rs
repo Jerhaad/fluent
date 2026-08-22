@@ -931,12 +931,7 @@ fn validate_recheck_evidence_frontier(
     if attempt.status != work_model::AttemptStatus::NeedsUser
         || attempt.pause_kind != Some(work_model::PauseKind::RoundCap)
         || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
-        || attempt.tasks.iter().any(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Planned | TaskStatus::Executing | TaskStatus::Failed
-            )
-        })
+        || attempt.has_round_cap_task_blocker()
         || item.merge_candidates.iter().any(|candidate| {
             candidate.attempt_id == attempt_id && candidate.candidate_commit == candidate_commit
         })
