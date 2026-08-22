@@ -35,7 +35,8 @@ Work retains its Tester-first boundary before reviewers.
 Failed Tester results are diagnostic inputs to this scoped Writer, not a set of
 product correction requirements. Do not import their ordinary failed commands
 into the repair Writer's completion matrix or generated execution-context
-findings. If a repair Writer commits outside
+findings. Render the recorded operator decision and two-file boundary directly
+in the correction prompt. If a repair Writer commits outside
 the two-file boundary, record the rejected commit and restore the exact clean
 approved candidate before pausing so public resume can retry. Perform legacy
 normalization only after durable Task reservation, and only for a clean linear

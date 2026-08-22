@@ -4609,6 +4609,12 @@ fn build_reviewed_correction_prompt(
     let writer_completion_allowed_constraints =
         writer_completion_allowed_constraints(item, attempt_id);
     let correction_artifacts_list = prior_reviews_block(correction_artifacts, "  ");
+    let tester_harness_repair = task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE;
+    let tester_harness_repair_instructions = if tester_harness_repair {
+        task.instructions.as_deref().unwrap_or_default()
+    } else {
+        ""
+    };
     let human_resolution = attempt
         .round_cap_extensions
         .iter()
@@ -4688,6 +4694,14 @@ fn build_reviewed_correction_prompt(
                 },
             ),
             ("correction_artifacts_list", &correction_artifacts_list),
+            (
+                "is_tester_harness_repair",
+                if tester_harness_repair { "yes" } else { "" },
+            ),
+            (
+                "tester_harness_repair_instructions",
+                tester_harness_repair_instructions,
+            ),
             ("human_resolution", human_resolution),
             (
                 "has_human_resolution",
@@ -16394,8 +16408,12 @@ mod tests {
             .find(|task| task.id == task_id)
             .unwrap();
         task.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+        task.instructions = Some(
+            "Operator decision: deduplicate normalized results. Change only the two Tester files."
+                .to_string(),
+        );
 
-        build_reviewed_correction_prompt(
+        let prompt = build_reviewed_correction_prompt(
             &item,
             "attempt-1",
             &task_id,
@@ -16412,6 +16430,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
 
         assert!(context.current_findings.is_empty());
+        assert!(prompt.contains("## Tester-harness repair authority"));
+        assert!(prompt.contains("deduplicate normalized results"));
+        assert!(prompt.contains("Failed Tester commands are diagnostic evidence"));
+        assert!(prompt.contains("repair product code or product tests"));
         assert_eq!(
             context.historical_artifacts,
             [tester_path.display().to_string()]

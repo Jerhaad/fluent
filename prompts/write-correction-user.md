@@ -16,6 +16,16 @@ the authoritative index for this correction:
 Current correction artifacts (complete, untruncated paths):
 {{correction_artifacts_list}}
 
+{{#if is_tester_harness_repair}}
+## Tester-harness repair authority
+
+This is a narrowly scoped project Tester repair. The operator's recorded decision below is the
+complete correction authority. Failed Tester commands are diagnostic evidence, not permission to
+repair product code or product tests.
+
+{{tester_harness_repair_instructions}}
+{{/if}}
+
 {{#if has_human_resolution}}
 ## Human resolution
 
