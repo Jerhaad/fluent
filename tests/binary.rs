@@ -23472,6 +23472,21 @@ fn attempt_evidence_attach_plans_targeted_reviews_without_writer() {
         .assert()
         .success();
 
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "queue",
+            "resume",
+            "evidence-target",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Queued resume of Attempt attempt-1 for Work Item evidence-target",
+        ));
+
     let shown = work_item_value(&project, "evidence-target");
     let tasks = shown["attempts"][0]["tasks"].as_array().unwrap();
     assert_eq!(

@@ -4550,8 +4550,12 @@ impl Attempt {
             reason,
         };
         let failed_candidate_gate_correction = self.is_failed_candidate_gate_correction();
+        let pending_evidence_reviews = self.has_pending_evidence_review_tasks();
 
-        if self.status != AttemptStatus::NeedsUser && !failed_candidate_gate_correction {
+        if self.status != AttemptStatus::NeedsUser
+            && !failed_candidate_gate_correction
+            && !pending_evidence_reviews
+        {
             return Err(ineligible(format!(
                 "Attempt is {} and is not paused at needs-user",
                 self.status.as_str()
@@ -4570,6 +4574,9 @@ impl Attempt {
             ));
         }
         if failed_candidate_gate_correction {
+            return Ok(());
+        }
+        if pending_evidence_reviews {
             return Ok(());
         }
 
@@ -4881,6 +4888,49 @@ impl Attempt {
             .iter()
             .rev()
             .find(|recovery| recovery.is_active())
+    }
+
+    /// Return whether host evidence has already moved this Attempt into one
+    /// exact, scheduler-resumable targeted review frontier.
+    pub fn has_pending_evidence_review_tasks(&self) -> bool {
+        let Some(recovery) = self.active_evidence_recovery() else {
+            return false;
+        };
+        if self.status != AttemptStatus::Reviewing
+            || self.review_state != Some(AttemptReviewState::NotReviewed)
+            || recovery.targets.is_empty()
+        {
+            return false;
+        }
+        let target_task_ids = recovery
+            .targets
+            .iter()
+            .filter_map(|target| target.review_task_id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        target_task_ids.len() == recovery.targets.len()
+            && recovery.targets.iter().all(|target| {
+                target.review_task_id.as_deref().is_some_and(|task_id| {
+                    self.tasks.iter().any(|task| {
+                        task.id == task_id
+                            && task.kind == TaskKind::Review
+                            && task.role == target.role
+                            && task.status == TaskStatus::Planned
+                            && task
+                                .evidence_review_context
+                                .as_ref()
+                                .is_some_and(|context| {
+                                    context.recovery_id == recovery.id
+                                        && context.candidate_commit == recovery.candidate_commit
+                                        && context.attachment == recovery.attachment
+                                        && context.prior_review_artifact
+                                            == target.prior_review_artifact
+                                })
+                    })
+                })
+            })
+            && self.tasks.iter().all(|task| {
+                task.status != TaskStatus::Planned || target_task_ids.contains(task.id.as_str())
+            })
     }
 
     /// Materialize the authoritative `## Required completion` section into the
@@ -10368,6 +10418,53 @@ random banner prose that must be ignored
             recovery
         );
         assert_eq!(attempt.evidence_recoveries, vec![recovery]);
+    }
+
+    #[test]
+    fn attached_host_evidence_reviews_are_queue_resumable() {
+        let attachment = EvidenceAttachment {
+            snapshot_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/proof.json"
+                .to_string(),
+            digest: "sha256:proof".to_string(),
+        };
+        let recovery = EvidenceRecovery {
+            id: "host-evidence-proof".to_string(),
+            candidate_commit: "candidate".to_string(),
+            attachment: attachment.clone(),
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact:
+                    ".fluent/work/artifacts/work-1/attempt-1/host-evidence/binding.json".to_string(),
+                review_task_id: Some("attempt-1-evidence-proof-tests".to_string()),
+            }],
+            state: EvidenceRecoveryState::Reviewing,
+            created_at: "2026-08-22T20:00:00Z".to_string(),
+        };
+        let mut review = task(TaskKind::Review, Vec::new());
+        review.id = "attempt-1-evidence-proof-tests".to_string();
+        review.role = "tests".to_string();
+        review.evidence_review_context = Some(EvidenceReviewContext {
+            recovery_id: recovery.id.clone(),
+            candidate_commit: recovery.candidate_commit.clone(),
+            attachment,
+            prior_review_artifact: recovery.targets[0].prior_review_artifact.clone(),
+        });
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::Reviewing,
+            review_state: Some(AttemptReviewState::NotReviewed),
+            tasks: vec![review],
+            evidence_recoveries: vec![recovery],
+            ..Attempt::default()
+        };
+
+        assert!(attempt.has_pending_evidence_review_tasks());
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.tasks.push(task(TaskKind::Write, Vec::new()));
+        assert!(!attempt.has_pending_evidence_review_tasks());
+        assert!(attempt.ensure_resume_ready().is_err());
     }
 
     #[test]
