@@ -18805,6 +18805,203 @@ fn cleanup_work_items_removes_terminal_merge_candidate_artifacts_and_worktree() 
     assert!(!branch_check.status.success());
 }
 
+#[test]
+fn tester_harness_repair_public_workflow_is_audited_and_idempotent() {
+    use fluent::queue::{self, DispatchStatus};
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, PauseKind, ReviewContext, TESTER_HARNESS_REPAIR_ROLE,
+        Task, TaskArtifactArea, TaskKind, TaskOutput, TaskStatus, WorkItem, WorkspaceAccess,
+        WorkspaceRef, work_artifact_path,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let workspace_path =
+        fluent::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+    let workspace = main_dir
+        .parent()
+        .unwrap()
+        .join(Path::new(&workspace_path).file_name().unwrap());
+    git::run(
+        &main_dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "work/tester-harness-repair",
+            workspace.to_str().unwrap(),
+            "HEAD",
+        ],
+        "create Tester-harness repair candidate",
+    )
+    .unwrap();
+    let candidate = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "candidate").unwrap();
+
+    let store = WorkModelStore::new(&main_dir);
+    let mut item = WorkItem::planned("work-1", "Repair Tester harness");
+    item.add_initial_attempt("attempt-1").unwrap();
+    let attempt = &mut item.attempts[0];
+    let writer = &mut attempt.tasks[0];
+    writer.status = TaskStatus::Complete;
+    writer.workspace_access = WorkspaceAccess {
+        reads: vec![WorkspaceRef {
+            id: "target".to_string(),
+            path: ".".to_string(),
+        }],
+        writes: vec![WorkspaceRef {
+            id: "candidate".to_string(),
+            path: workspace_path.clone(),
+        }],
+    };
+    writer.output = Some(TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: workspace_path.clone(),
+        source_branch: "main".to_string(),
+        base_commit: Some(candidate.clone()),
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    let tester_id = "attempt-1-tester";
+    let tester_area = work_artifact_path("work-1", "attempt-1", tester_id);
+    attempt.tasks.push(Task {
+        id: tester_id.to_string(),
+        kind: TaskKind::Tester,
+        status: TaskStatus::NeedsUser,
+        role: "tester".to_string(),
+        instructions: None,
+        work_item_id: "work-1".to_string(),
+        attempt_id: Some("attempt-1".to_string()),
+        workspace_access: WorkspaceAccess::read_only(vec![WorkspaceRef {
+            id: "candidate".to_string(),
+            path: workspace_path.clone(),
+        }]),
+        artifact_area: Some(TaskArtifactArea {
+            path: tester_area.clone(),
+        }),
+        review_context: Some(ReviewContext {
+            candidate_workspace_id: "candidate".to_string(),
+            candidate_workspace_path: workspace_path,
+            source_branch: "main".to_string(),
+            candidate_commit: candidate.clone(),
+            base_commit: None,
+        }),
+        evidence_review_context: None,
+        input_artifacts: Vec::new(),
+        depends_on: None,
+        output: None,
+        created_at: None,
+        started_at: None,
+        completed_at: None,
+    });
+    attempt.tasks.last_mut().unwrap().status = TaskStatus::Planned;
+    attempt.status = AttemptStatus::Reviewing;
+    attempt.review_state = Some(AttemptReviewState::Passed);
+    store.create_work_item(&mut item).unwrap();
+    fs::create_dir_all(main_dir.join(&tester_area)).unwrap();
+    fs::write(main_dir.join(&tester_area).join("commands.json"), "[]\n").unwrap();
+    fs::write(
+        main_dir.join(&tester_area).join("tester-results.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": {
+                "kind": "duplicate_test_ids",
+                "message": "Duplicate test ids: model_test",
+                "details": ""
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let handoff = main_dir.join(work_artifact_path("work-1", "attempt-1", "needs-user.md"));
+    fs::write(&handoff, "Tester needs repair.\n").unwrap();
+
+    queue::add(&main_dir, "work-1", None).unwrap();
+    let token = queue::claim(&main_dir, "work-1", "attempt-1")
+        .unwrap()
+        .unwrap();
+    let token = queue::mark_running(&main_dir, &token).unwrap();
+    store
+        .mutate_work_item("work-1", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.tasks.last_mut().unwrap().status = TaskStatus::NeedsUser;
+            fluent::work_model::suspend_attempt(attempt, PauseKind::TesterHarness);
+            Ok(())
+        })
+        .unwrap();
+    queue::reconcile(&main_dir, &token, DispatchStatus::NeedsUser).unwrap();
+
+    let status = fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status_stderr = String::from_utf8(status.stderr).unwrap();
+    assert!(
+        status_stderr.contains(
+            "→ Next: fluent attempt repair-tester work-1 attempt-1 --resolution \"<describe the Tester repair>\""
+        ),
+        "{status_stderr}"
+    );
+    for expected in ["Approved Tester repair Writer", "already recorded"] {
+        fluent_cmd()
+            .current_dir(&main_dir)
+            .args([
+                "attempt",
+                "repair-tester",
+                "work-1",
+                "attempt-1",
+                "--resolution",
+                "Deduplicate repeated nextest failures while preserving the authoritative failure.",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(expected));
+    }
+
+    let stored = store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+    let repair = attempt
+        .tasks
+        .iter()
+        .find(|task| task.role == TESTER_HARNESS_REPAIR_ROLE)
+        .unwrap();
+    assert_eq!(repair.status, TaskStatus::Planned);
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.role == TESTER_HARNESS_REPAIR_ROLE)
+            .count(),
+        1
+    );
+    assert!(stored.transitions.iter().any(|transition| {
+        transition
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("approve Tester-harness repair"))
+    }));
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queued resume"));
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already queued"));
+}
+
 // -------------------------------------------------------------------------
 // Shared test helpers
 // -------------------------------------------------------------------------

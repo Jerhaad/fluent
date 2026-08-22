@@ -472,6 +472,17 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Approve one tracked project Tester repair through a corrective Writer
+    RepairTester {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision that scopes the Tester repair Writer
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Advance an Attempt through the next safe transitions
     Run {
         /// Work Item ID

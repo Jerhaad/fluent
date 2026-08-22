@@ -21,9 +21,16 @@ evidence is untrustworthy. Pause that same Tester Task and Attempt with a
 resumable harness state. After an environmental repair that leaves the reviewed
 candidate unchanged, resume only that Tester so completed Writer and review
 work remains complete. A candidate-owned Tester contract repair must return
-through Writer and review rather than changing the frozen worktree. For
-code-producing Work this final Tester runs after reviewers and blocks Learning;
-review-only Work retains its Tester-first boundary before reviewers.
+through the explicit `fluent attempt repair-tester` transition rather than
+changing the frozen worktree. That transition preserves the failed Tester,
+pins one corrective Writer to the exact clean reviewed commit and operator
+decision, and confines the accepted net change to `.fluent/tester.yaml` and
+`.fluent/extract-tester-results`. The repaired commit becomes the source for
+fresh review and final Tester contexts. Keep environment-only retry and tracked
+project repair as separate recoveries; an ambiguous harness failure may offer
+both, but neither route may silently move the candidate. For code-producing
+Work this final Tester runs after reviewers and blocks Learning; review-only
+Work retains its Tester-first boundary before reviewers.
 
 Persist all command records accumulated before a harness failure in the Tester
 artifact. An empty command list is accurate only for failures that occurred

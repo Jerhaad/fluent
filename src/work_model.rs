@@ -30,6 +30,7 @@ pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
 pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
+pub const TESTER_HARNESS_REPAIR_ROLE: &str = "tester-harness-repair";
 
 fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
     let source = Path::new(path);
@@ -4399,6 +4400,38 @@ impl Default for Attempt {
 }
 
 impl Attempt {
+    /// Return the failed Tester superseded by one explicit harness-repair
+    /// Writer. The Writer's immutable input binds it to that Tester Task, so a
+    /// generic failed Task can never be ignored by merely using the role name.
+    pub fn active_tester_harness_repair_source(&self) -> Option<&Task> {
+        let repair = self.tasks.iter().rev().find(|task| {
+            task.kind == TaskKind::Write
+                && task.role == TESTER_HARNESS_REPAIR_ROLE
+                && !matches!(task.status, TaskStatus::Failed)
+        })?;
+        let mut sources = self.tasks.iter().filter(|task| {
+            if task.kind != TaskKind::Tester || task.status != TaskStatus::Failed {
+                return false;
+            }
+            let Some(area) = task.artifact_area.as_ref() else {
+                return false;
+            };
+            repair.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == task.id
+                    && ["tester-results.json", "commands.json"]
+                        .iter()
+                        .any(|name| artifact.path == format!("{}/{name}", area.path))
+            })
+        });
+        let source = sources.next()?;
+        sources.next().is_none().then_some(source)
+    }
+
+    pub fn has_tester_harness_repair_for(&self, task_id: &str) -> bool {
+        self.active_tester_harness_repair_source()
+            .is_some_and(|task| task.id == task_id)
+    }
+
     /// Validate that this exact suspended Attempt can be explicitly resumed.
     ///
     /// Both direct Attempt execution and scheduler resume dispatches use this
@@ -4420,7 +4453,9 @@ impl Attempt {
         }
         if self.tasks.iter().any(|task| {
             task.status == TaskStatus::Executing
-                || (task.status == TaskStatus::Failed && !failed_candidate_gate_correction)
+                || (task.status == TaskStatus::Failed
+                    && !failed_candidate_gate_correction
+                    && !self.has_tester_harness_repair_for(&task.id))
         }) {
             return Err(ineligible(
                 "Attempt paused on recoverable infrastructure or completion evidence but also has a hard-failed or still-running Task; resolve it before re-running."
@@ -4940,9 +4975,19 @@ impl Attempt {
         }
         for task in &self.tasks {
             task.validate()?;
+            if task.kind == TaskKind::Write
+                && task.role == TESTER_HARNESS_REPAIR_ROLE
+                && task.status != TaskStatus::Failed
+                && self.active_tester_harness_repair_source().is_none()
+            {
+                return Err(WorkModelError::InvalidTesterHarnessRepairTask {
+                    task_id: task.id.clone(),
+                });
+            }
             if self.status == AttemptStatus::Complete
                 && task.status != TaskStatus::Complete
                 && task.kind != TaskKind::Rebase
+                && !self.has_tester_harness_repair_for(&task.id)
             {
                 return Err(WorkModelError::CompleteAttemptHasIncompleteTask {
                     attempt_id: self.id.clone(),
@@ -5417,6 +5462,48 @@ impl Task {
                 || !source_is_bound
             {
                 return Err(WorkModelError::InvalidFailedCommandRecheckTask {
+                    task_id: self.id.clone(),
+                });
+            }
+        }
+        if self.role == TESTER_HARNESS_REPAIR_ROLE {
+            let context_matches_write = self.review_context.as_ref().is_some_and(|context| {
+                self.workspace_access
+                    .writes
+                    .as_slice()
+                    .first()
+                    .is_some_and(|workspace| {
+                        self.workspace_access.writes.len() == 1
+                            && workspace.id == context.candidate_workspace_id
+                            && workspace.path == context.candidate_workspace_path
+                    })
+            });
+            let authority_path = self.attempt_id.as_deref().map(|attempt_id| {
+                work_artifact_path(
+                    &self.work_item_id,
+                    attempt_id,
+                    &format!("tester-harness-repairs/{}/repair.json", self.id),
+                )
+            });
+            let has_authority = authority_path.as_deref().is_some_and(|expected| {
+                self.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id == "tester-harness-repair-authority"
+                        && artifact.path == expected
+                })
+            });
+            let has_source_evidence = self.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id != "tester-harness-repair-authority"
+                    && (is_canonical_work_artifact_file(&artifact.path, "tester-results.json")
+                        || is_canonical_work_artifact_file(&artifact.path, "commands.json"))
+            });
+            if self.kind != TaskKind::Write
+                || self.artifact_area.is_none()
+                || !context_matches_write
+                || !has_authority
+                || !has_source_evidence
+                || self.depends_on.is_some()
+            {
+                return Err(WorkModelError::InvalidTesterHarnessRepairTask {
                     task_id: self.id.clone(),
                 });
             }
@@ -6125,6 +6212,9 @@ pub enum WorkModelError {
     AttemptEvidenceRecoveryConflict {
         attempt_id: String,
     },
+    TesterHarnessRepairIneligible {
+        reason: String,
+    },
     LegacyLifecycleRecoveryConflict {
         attempt_id: String,
     },
@@ -6227,6 +6317,9 @@ pub enum WorkModelError {
     InvalidFailedCommandRecheckTask {
         task_id: String,
     },
+    InvalidTesterHarnessRepairTask {
+        task_id: String,
+    },
     CompleteAttemptHasIncompleteTask {
         attempt_id: String,
         task_id: String,
@@ -6309,6 +6402,9 @@ impl fmt::Display for WorkModelError {
                     f,
                     "Attempt {attempt_id:?} already has an active evidence recovery"
                 )
+            }
+            Self::TesterHarnessRepairIneligible { reason } => {
+                write!(f, "Tester-harness repair is not eligible: {reason}")
             }
             Self::LegacyLifecycleRecoveryConflict { attempt_id } => write!(
                 f,
@@ -6480,6 +6576,12 @@ impl fmt::Display for WorkModelError {
                 write!(
                     f,
                     "task {task_id} has invalid failed-command recheck context"
+                )
+            }
+            Self::InvalidTesterHarnessRepairTask { task_id } => {
+                write!(
+                    f,
+                    "task {task_id} has invalid Tester-harness repair context"
                 )
             }
             Self::CompleteAttemptHasIncompleteTask {

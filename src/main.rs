@@ -802,6 +802,31 @@ fn cmd_attempt(
                 extension.candidate_commit
             );
         }
+        AttemptCommands::RepairTester {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::tester_harness_recovery::request(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_requested {
+                println!(
+                    "Tester repair Writer {} is already recorded for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Approved Tester repair Writer {} for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            }
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::Run {
             work_item_id,
             attempt_id,

@@ -108,6 +108,23 @@ pub enum TesterOutcome {
     HarnessError,
 }
 
+/// Return whether persisted harness evidence requires a tracked project Tester
+/// repair rather than an environment-only retry of the unchanged candidate.
+pub fn harness_error_requires_project_repair(artifact_dir: &Path) -> bool {
+    let Ok(bytes) = fs::read(artifact_dir.join("tester-results.json")) else {
+        return false;
+    };
+    let Ok(results) = serde_json::from_slice::<TesterResults>(&bytes) else {
+        return false;
+    };
+    results.error.as_ref().is_some_and(|error| {
+        matches!(
+            error.kind.as_str(),
+            "extractor_missing" | "duplicate_test_ids"
+        )
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TesterConfig {
     commands: Vec<TesterCommand>,
@@ -1117,6 +1134,31 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn persisted_harness_error_distinguishes_project_repair_from_environment_retry() {
+        let project_owned = TempDir::new().unwrap();
+        persist_harness_error(
+            project_owned.path(),
+            "duplicate_test_ids",
+            "Duplicate test ids".to_string(),
+            String::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(harness_error_requires_project_repair(project_owned.path()));
+
+        let environmental = TempDir::new().unwrap();
+        persist_harness_error(
+            environmental.path(),
+            "process_settlement_infrastructure",
+            "Unable to inspect processes".to_string(),
+            String::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!harness_error_requires_project_repair(environmental.path()));
+    }
 
     fn make_workspace(dir: &Path) {
         let fluent_dir = dir.join(".fluent");

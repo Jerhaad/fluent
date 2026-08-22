@@ -768,6 +768,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         }
         if let Some(task) = attempt.tasks.iter().find(|task| {
             matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                && !attempt.has_tester_harness_repair_for(&task.id)
                 && !attempt.active_evidence_recovery().is_some_and(|recovery| {
                     task.kind == TaskKind::Write
                         || recovery.targets.iter().any(|target| {
@@ -18392,6 +18393,7 @@ mod tests {
         // as a terminal write-round cap.
         let mut attempt = Attempt {
             id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
             status: AttemptStatus::NeedsUser,
             pause_kind: Some(PauseKind::TranscriptPump),
             tasks: vec![Task {
@@ -18554,6 +18556,107 @@ mod tests {
             TaskStatus::Planned,
             "recovery must replan the paused Tester task"
         );
+    }
+
+    #[test]
+    fn tester_harness_repair_resume_preserves_failed_tester_and_plans_writer() {
+        let failed_tester_id = "attempt-1-tester";
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            work_item_id: "work-1".to_string(),
+            status: AttemptStatus::NeedsUser,
+            pause_kind: Some(PauseKind::TesterHarness),
+            tasks: vec![
+                Task {
+                    id: failed_tester_id.to_string(),
+                    kind: TaskKind::Tester,
+                    status: TaskStatus::Failed,
+                    role: "tester".to_string(),
+                    instructions: None,
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: Vec::new(),
+                    },
+                    artifact_area: Some(TaskArtifactArea {
+                        path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester"
+                            .to_string(),
+                    }),
+                    review_context: Some(crate::work_model::ReviewContext {
+                        candidate_workspace_id: "candidate".to_string(),
+                        candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                        source_branch: "main".to_string(),
+                        candidate_commit: "abc123".to_string(),
+                        base_commit: None,
+                    }),
+                    evidence_review_context: None,
+                    input_artifacts: Vec::new(),
+                    depends_on: None,
+                    output: None,
+                    created_at: None,
+                    started_at: None,
+                    completed_at: Some("2026-08-22T11:50:00Z".to_string()),
+                },
+                Task {
+                    id: "attempt-1-write-2".to_string(),
+                    kind: TaskKind::Write,
+                    status: TaskStatus::Planned,
+                    role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+                    instructions: Some("Repair the project Tester harness.".to_string()),
+                    work_item_id: "work-1".to_string(),
+                    attempt_id: Some("attempt-1".to_string()),
+                    workspace_access: WorkspaceAccess {
+                        reads: Vec::new(),
+                        writes: vec![crate::work_model::WorkspaceRef {
+                            id: "candidate".to_string(),
+                            path: "../work-4-work-1-attempt-1".to_string(),
+                        }],
+                    },
+                    artifact_area: Some(TaskArtifactArea {
+                        path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2"
+                            .to_string(),
+                    }),
+                    review_context: Some(crate::work_model::ReviewContext {
+                        candidate_workspace_id: "candidate".to_string(),
+                        candidate_workspace_path: "../work-4-work-1-attempt-1".to_string(),
+                        source_branch: "main".to_string(),
+                        candidate_commit: "abc123".to_string(),
+                        base_commit: None,
+                    }),
+                    evidence_review_context: None,
+                    input_artifacts: vec![
+                        ArtifactRef {
+                            producer_id: "tester-harness-repair-authority".to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/tester-harness-repairs/attempt-1-write-2/repair.json".to_string(),
+                        },
+                        ArtifactRef {
+                            producer_id: failed_tester_id.to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester/tester-results.json".to_string(),
+                        },
+                    ],
+                    depends_on: None,
+                    output: None,
+                    created_at: Some("2026-08-22T12:00:00Z".to_string()),
+                    started_at: None,
+                    completed_at: None,
+                },
+            ],
+            completed_at: Some("2026-08-22T12:00:00Z".to_string()),
+            ..Default::default()
+        };
+
+        attempt.validate("work-1").unwrap();
+        assert!(matches!(
+            reject_terminal_attempt(&attempt).unwrap(),
+            TerminalCheck::Reopen
+        ));
+
+        crate::work_model::reopen_attempt(&mut attempt);
+
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].status, TaskStatus::Failed);
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Planned);
     }
 
     #[test]

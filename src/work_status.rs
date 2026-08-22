@@ -823,6 +823,17 @@ pub fn attempt_recovery_next_action(
 ) -> Option<String> {
     let attempt = attempt?;
     if attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::TesterHarness)
+        && attempt.pause_recovery.is_none()
+        && attempt.active_tester_harness_repair_source().is_none()
+        && project_root.is_some_and(|root| tester_pause_requires_project_repair(root, attempt))
+    {
+        return Some(format!(
+            "fluent attempt repair-tester {} {} --resolution \"<describe the Tester repair>\"",
+            attempt.work_item_id, attempt.id
+        ));
+    }
+    if attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_recovery == Some(PauseRecovery::TesterNoSandbox)
     {
         return Some(format!(
@@ -923,6 +934,16 @@ pub fn attempt_recovery_next_action(
             "fluent queue resume {} --attempt {}",
             attempt.work_item_id, attempt.id
         )
+    })
+}
+
+fn tester_pause_requires_project_repair(project_root: &Path, attempt: &Attempt) -> bool {
+    attempt.tasks.iter().rev().any(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::NeedsUser
+            && task.artifact_area.as_ref().is_some_and(|area| {
+                crate::tester::harness_error_requires_project_repair(&project_root.join(&area.path))
+            })
     })
 }
 
@@ -1738,6 +1759,67 @@ mod tests {
         assert_eq!(row.action, "needs-user");
         assert_eq!(
             row.next_action.as_deref(),
+            Some("fluent queue resume work-1 --attempt attempt-1")
+        );
+    }
+
+    #[test]
+    fn project_tester_error_status_names_repair_command() {
+        let root = tempfile::tempdir().unwrap();
+        let artifact = ".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester";
+        std::fs::create_dir_all(root.path().join(artifact)).unwrap();
+        std::fs::write(
+            root.path().join(artifact).join("tester-results.json"),
+            serde_json::to_vec_pretty(&crate::tester::TesterResults {
+                candidate_commit: Some("abc123".to_string()),
+                commands: Vec::new(),
+                tests: Vec::new(),
+                summary: crate::tester::Summary {
+                    total: 0,
+                    pass: 0,
+                    fail: 0,
+                    skipped: 0,
+                },
+                error: Some(crate::tester::TesterError {
+                    kind: "duplicate_test_ids".to_string(),
+                    message: "Duplicate test ids".to_string(),
+                    details: String::new(),
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut item = WorkItem::planned("work-1", "Repair project Tester");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::TesterHarness);
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        attempt.tasks[0].artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: artifact.to_string(),
+        });
+
+        assert_eq!(
+            attempt_recovery_next_action(Some(attempt), Some(root.path())).as_deref(),
+            Some(
+                "fluent attempt repair-tester work-1 attempt-1 --resolution \"<describe the Tester repair>\""
+            )
+        );
+    }
+
+    #[test]
+    fn environmental_tester_error_status_names_same_candidate_resume() {
+        let mut item = WorkItem::planned("work-1", "Repair Tester environment");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::TesterHarness);
+        attempt.tasks[0].kind = TaskKind::Tester;
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+
+        assert_eq!(
+            attempt_recovery_next_action(Some(attempt), None).as_deref(),
             Some("fluent queue resume work-1 --attempt attempt-1")
         );
     }

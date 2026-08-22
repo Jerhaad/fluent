@@ -5718,6 +5718,55 @@ status, completed Tester, candidate commit, and current tracked status still
 match; otherwise it SHALL leave the candidate unchanged.
 Test: src/work_attempt_loop.rs (explicit_final_tester_gate_resume_restores_matching_legacy_tracked_mutation)
 
+### B10d
+
+WHEN a project-owned Tester harness failure requires a tracked configuration or
+extractor repair, THE SYSTEM SHALL name an eligible `fluent attempt
+repair-tester` command with the affected Work Item and Attempt.
+Test: tests/binary.rs (tester_harness_repair_public_workflow_is_audited_and_idempotent)
+
+### B10e
+
+WHEN an operator approves a repair from the exact clean Tester candidate, THE
+SYSTEM SHALL create one audited repair Writer bound to the decision, that
+candidate, and the failed Tester evidence.
+Test: src/tester_harness_recovery.rs (request_records_repair_writer_with_source_provenance)
+
+### B10f
+
+WHEN the repair Writer completes, THE SYSTEM SHALL accept a commit only when its
+net changes are confined to `.fluent/tester.yaml` and
+`.fluent/extract-tester-results`.
+Test: src/work_task_executor.rs (tester_harness_repair_scope_accepts_only_config_and_extractor)
+Test: src/work_task_executor.rs (tester_harness_repair_writer_commits_through_the_real_executor)
+
+### B10g
+
+WHEN Fluent accepts a Tester repair commit, THE SYSTEM SHALL bind subsequent
+review and Tester evidence to an Attempt history that retains the failed Tester,
+original candidate, and repair commit.
+Test: src/tester_harness_recovery.rs (repaired_writer_output_pins_fresh_review_and_tester_contexts)
+
+### B10h
+
+IF the repair candidate is dirty or its HEAD differs from the failed Tester's
+pinned candidate, THEN THE SYSTEM SHALL reject the recovery without changing the
+Attempt.
+Test: src/tester_harness_recovery.rs (request_rejects_dirty_candidate_without_mutating_state)
+Test: src/tester_harness_recovery.rs (request_rejects_drifted_candidate_without_mutating_state)
+
+### B10i
+
+WHEN an operator repeats the same accepted repair request, THE SYSTEM SHALL
+reuse the existing repair Writer.
+Test: src/tester_harness_recovery.rs (repeated_request_reuses_existing_repair_writer)
+
+### B10j
+
+WHEN an operator repeats the same scheduler resume, THE SYSTEM SHALL reuse the
+existing resume dispatch.
+Test: tests/binary.rs (tester_harness_repair_public_workflow_is_audited_and_idempotent)
+
 ### B11
 
 IF `.fluent/extract-tester-results` exits non-zero or emits output

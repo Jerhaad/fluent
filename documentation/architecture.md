@@ -609,9 +609,17 @@ problem and rerun `fluent tester check`. The same failures from a production
 Tester Task pause its existing Attempt as a Tester harness error. An
 environmental repair can resume that exact Tester while completed Writer work
 remains complete because the reviewed candidate stays frozen. A repair to
-candidate-owned `tester.yaml` or the extractor must instead return through
-Writer and review; committing it directly in the candidate makes the exact
-Tester retry fail closed on candidate identity.
+candidate-owned `tester.yaml` or the extractor instead uses `fluent attempt
+repair-tester <work-item-id> <attempt-id> --resolution "<repair needed>"`.
+That explicit transition records the operator's decision and the failed Tester
+evidence, preserves the original candidate and failed Tester as history, and
+plans one `tester-harness-repair` Writer on the existing candidate workspace.
+The host admits the Writer only from the exact clean reviewed commit and accepts
+only a clean descendant whose net change is confined to `.fluent/tester.yaml`
+and `.fluent/extract-tester-results`, both still regular files. Fresh reviews
+and the final Tester then bind to the repair Writer's commit. Repeating the same
+repair request or scheduler resume reuses its existing durable record; ordinary
+candidate drift still fails closed.
 
 The `behaviors.md` format supports two markers on EARS statements:
 - `Test:` — names a test that verifies the behavior.
@@ -2767,6 +2775,7 @@ fluent/main/
     review.rs                ← Review verdict parsing and state
     review_diff_command.rs   ← Review diff CLI subcommand
     scheduler.rs             ← Elected coordinator running a capacity-limited worker pool
+    tester_harness_recovery.rs ← Audited project-owned Tester repair transition
     transcript.rs            ← Parse stream-json transcripts incrementally
     update.rs                ← Self-update and update-check nudge
     usage.rs                 ← Per-turn usage row logging and summary cache

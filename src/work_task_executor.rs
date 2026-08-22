@@ -696,6 +696,9 @@ fn run_write_task_with_coder(
         &plan.task.input_artifacts,
     )?);
     preflight_write_worktree(config.project_root, &workspace_path, &branch_name)?;
+    if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+        ensure_tester_harness_repair_start(config.project_root, &plan.task, &workspace_path)?;
+    }
     let writer_cache = crate::writer_cache::preflight_writer_dependency_cache(
         config.project_root,
         config.work_item_id,
@@ -839,6 +842,13 @@ fn run_write_task_with_coder(
                 &branch_name,
                 &source_branch,
             )?;
+            if reservation.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+                ensure_tester_harness_repair_start(
+                    config.project_root,
+                    &reservation.task,
+                    &workspace_path,
+                )?;
+            }
             worktree::disable_commit_signing(&workspace_path)?;
             let baseline_commit = resolve_or_persist_write_baseline(
                 config.project_root,
@@ -962,6 +972,20 @@ fn run_write_task_with_coder(
             return Err(error);
         }
     };
+    if plan.task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
+        && let Err(error) = ensure_tester_harness_repair_scope(&workspace_path, &baseline_commit)
+    {
+        mark_task_failed_attempt_needs_user(
+            config.store,
+            config.project_root,
+            config.work_item_id,
+            config.attempt_id,
+            config.task_id,
+            &TaskFailure::WriterCompletion(error.to_string()),
+            &crate::notify::notify,
+        )?;
+        return Err(error);
+    }
     let no_change = if produced_count == 0 {
         match validate_followup_no_change(&config, &workspace_path) {
             Ok(no_change) => Some(no_change),
@@ -2036,7 +2060,7 @@ fn run_tester_task_with_settlement_preparer(
     ) {
         Ok(sandbox) => sandbox,
         Err(error) => {
-            settle_tester_harness_failure(&config, false)?;
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
             return Err(error);
         }
     };
@@ -2080,15 +2104,22 @@ fn run_tester_task_with_settlement_preparer(
         Ok(crate::tester::TesterOutcome::Passed | crate::tester::TesterOutcome::TestFailures) => {}
         Ok(crate::tester::TesterOutcome::HarnessError) => {
             let error = anyhow::anyhow!("Tester harness could not produce trustworthy evidence");
-            settle_tester_harness_failure(
-                &config,
-                crate::tester::is_nested_swiftpm_harness_error(&artifact_dir),
-            )?;
+            let nested_swiftpm = crate::tester::is_nested_swiftpm_harness_error(&artifact_dir);
+            let project_repair =
+                crate::tester::harness_error_requires_project_repair(&artifact_dir);
+            let failure_kind = if nested_swiftpm {
+                TesterHarnessFailureKind::NestedSwiftPm
+            } else if project_repair {
+                TesterHarnessFailureKind::ProjectRepair
+            } else {
+                TesterHarnessFailureKind::Environment
+            };
+            settle_tester_harness_failure(&config, failure_kind)?;
             return Err(error);
         }
         Err(error) => {
             eprintln!("  Tester error: {error:#}");
-            settle_tester_harness_failure(&config, false)?;
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
             return Err(error);
         }
     }
@@ -2096,7 +2127,7 @@ fn run_tester_task_with_settlement_preparer(
     if let Err(error) =
         crate::tester::bind_candidate_commit(&artifact_dir, &review_context.candidate_commit)
     {
-        settle_tester_harness_failure(&config, false)?;
+        settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
         return Err(error);
     }
 
@@ -2111,7 +2142,7 @@ fn run_tester_task_with_settlement_preparer(
     }
 
     if !results_path.is_file() {
-        settle_tester_harness_failure(&config, false)?;
+        settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
         bail!(
             "Tester Task {:?} completed without writing {}",
             config.task_id,
@@ -2125,7 +2156,7 @@ fn run_tester_task_with_settlement_preparer(
     match complete_tester_task(&config, &results_path) {
         Ok(result) => Ok(result),
         Err(error) => {
-            settle_tester_harness_failure(&config, false)?;
+            settle_tester_harness_failure(&config, TesterHarnessFailureKind::Environment)?;
             Err(error)
         }
     }
@@ -2408,26 +2439,29 @@ fn plan_failed_command_recheck(
 /// Settle an unlaunched or failed Tester through the recoverable pause boundary.
 /// If that persistence fails, record a hard Task failure so this reservation is
 /// never left executing.
+#[derive(Clone, Copy)]
+enum TesterHarnessFailureKind {
+    Environment,
+    ProjectRepair,
+    NestedSwiftPm,
+}
+
 fn settle_tester_harness_failure(
     config: &WorkTaskRunConfig<'_>,
-    nested_swiftpm_sandbox: bool,
+    failure_kind: TesterHarnessFailureKind,
 ) -> Result<()> {
-    settle_tester_harness_failure_with_notify(
-        config,
-        nested_swiftpm_sandbox,
-        &crate::notify::notify,
-    )
+    settle_tester_harness_failure_with_notify(config, failure_kind, &crate::notify::notify)
 }
 
 fn settle_tester_harness_failure_with_notify(
     config: &WorkTaskRunConfig<'_>,
-    nested_swiftpm_sandbox: bool,
+    failure_kind: TesterHarnessFailureKind,
     notify_fn: &dyn Fn(&str, &str),
 ) -> Result<()> {
-    let failure = if nested_swiftpm_sandbox {
-        TaskFailure::TesterNestedSwiftPmSandbox
-    } else {
-        TaskFailure::TesterHarness
+    let failure = match failure_kind {
+        TesterHarnessFailureKind::Environment => TaskFailure::TesterHarness,
+        TesterHarnessFailureKind::ProjectRepair => TaskFailure::TesterProjectHarness,
+        TesterHarnessFailureKind::NestedSwiftPm => TaskFailure::TesterNestedSwiftPmSandbox,
     };
     if let Err(pause_error) = lock_mark_task_failed_attempt_needs_user(
         config.store,
@@ -2861,8 +2895,12 @@ enum TaskFailure {
     /// The enclosing host sandbox rejected Fluent's production profile, or a
     /// provider runtime could not initialize inside that exact boundary.
     HostSandbox(String),
-    /// Tester configuration, sandbox, extraction, or result persistence failed.
+    /// Tester sandbox, environment, extraction, or result persistence failed
+    /// without evidence that proves a tracked repair is required.
     TesterHarness,
+    /// Persisted Tester evidence identifies a tracked extractor or normalized
+    /// result defect that must return through an audited repair Writer.
+    TesterProjectHarness,
     /// Xcode's embedded SwiftPM could not create its manifest sandbox inside
     /// Fluent's outer Tester sandbox. An explicit one-dispatch approval may
     /// retry the same Tester Task without the outer sandbox.
@@ -3034,6 +3072,7 @@ fn mark_task_failed_attempt_needs_user(
             | TaskFailure::TranscriptPump(_)
             | TaskFailure::HostSandbox(_)
             | TaskFailure::TesterHarness
+            | TaskFailure::TesterProjectHarness
             | TaskFailure::TesterNestedSwiftPmSandbox
             | TaskFailure::WriterCompletion(_) => TaskStatus::NeedsUser,
             TaskFailure::ProviderUnavailable(_) => TaskStatus::NeedsUser,
@@ -3149,9 +3188,9 @@ fn task_failure_pause_kind(failure: &TaskFailure) -> PauseKind {
         TaskFailure::Auth(_) => PauseKind::Auth,
         TaskFailure::TranscriptPump(_) => PauseKind::TranscriptPump,
         TaskFailure::HostSandbox(_) => PauseKind::HostSandbox,
-        TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox => {
-            PauseKind::TesterHarness
-        }
+        TaskFailure::TesterHarness
+        | TaskFailure::TesterProjectHarness
+        | TaskFailure::TesterNestedSwiftPmSandbox => PauseKind::TesterHarness,
         TaskFailure::WriterCompletion(_) => PauseKind::WriterCompletion,
         TaskFailure::ProviderUnavailable(_) => PauseKind::ProviderUnavailable,
         TaskFailure::Generic => PauseKind::RoundCap,
@@ -3180,7 +3219,15 @@ fn notify_task_failure(
         }
         TaskFailure::TesterHarness => notify_fn(
             "Fluent",
-            "Tester harness failed. Repair the project Tester, then 'fluent attempt run' to retry the same Tester Task.",
+            &format!(
+                "Tester harness failed. For an environment-only repair, resume with 'fluent attempt run {work_item_id} {attempt_id}'. If tracked Tester files must change, use the audited repair command in the handoff."
+            ),
+        ),
+        TaskFailure::TesterProjectHarness => notify_fn(
+            "Fluent",
+            &format!(
+                "Tester harness failed. Approve a tracked project Tester repair with 'fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<repair needed>\"'."
+            ),
         ),
         TaskFailure::TesterNestedSwiftPmSandbox => notify_fn(
             "Fluent",
@@ -3274,7 +3321,10 @@ fn render_task_error_handoff(
             crate::os::HOST_SANDBOX_RECOVERY_GUIDANCE
         ),
         TaskFailure::TesterHarness => format!(
-            "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Repair the Tester configuration, extractor, sandbox, or result persistence, then retry this Attempt.\n"
+            "# Tester needs diagnosis\n\nTester Task {task_id:?} could not produce trustworthy evidence, but its persisted result does not prove whether the repair belongs to the host environment or tracked project files.\n\nIf the candidate can stay unchanged, repair the environment and run `fluent queue resume {work_item_id} --attempt {attempt_id}` for scheduler recovery, or `fluent attempt run {work_item_id} {attempt_id}` in the foreground. Fluent will retry the same Tester Task.\n\nIf the diagnosis requires a tracked change to `.fluent/tester.yaml` or `.fluent/extract-tester-results`, approve an audited repair Writer instead:\n\n    fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<describe the Tester repair>\"\n"
+        ),
+        TaskFailure::TesterProjectHarness => format!(
+            "# Tester needs repair\n\nTester Task {task_id:?} could not produce trustworthy test evidence. Ordinary resume keeps the reviewed candidate immutable, so a tracked project Tester repair must return through an audited Writer. Approve that bounded repair with:\n\n    fluent attempt repair-tester {work_item_id} {attempt_id} --resolution \"<describe the Tester repair>\"\n\nThe repair Writer may change `.fluent/tester.yaml` and `.fluent/extract-tester-results`, commits the repair on the existing candidate workspace, and causes Fluent to bind fresh review and Tester evidence to the repaired commit. Then run `fluent queue resume {work_item_id} --attempt {attempt_id}` for scheduler recovery, or `fluent attempt run {work_item_id} {attempt_id}` in the foreground.\n"
         ),
         TaskFailure::TesterNestedSwiftPmSandbox => format!(
             "# Tester needs explicit sandbox approval\n\nTester Task {task_id:?} could not produce trustworthy evidence because Xcode's embedded SwiftPM cannot create its manifest sandbox inside Fluent's Tester sandbox. Fluent kept its sandbox enabled and did not modify the project.\n\nIf you trust this candidate, approve one exact scheduler recovery with:\n\n    fluent queue resume {work_item_id} --attempt {attempt_id} --no-sandbox\n\nThen run or reuse `fluent scheduler run` from a host shell that is not itself sandboxed. Fluent will retry this same Tester Task without its outer Tester sandbox; the candidate's test commands will run with the scheduler process's host permissions. Any enclosing agent sandbox still applies and can reproduce the same Xcode failure. The approval is recorded on this resume dispatch only.\n"
@@ -3321,7 +3371,9 @@ fn lock_mark_task_failed_attempt_needs_user(
         == Some("fail")
         && matches!(
             failure,
-            TaskFailure::TesterHarness | TaskFailure::TesterNestedSwiftPmSandbox
+            TaskFailure::TesterHarness
+                | TaskFailure::TesterProjectHarness
+                | TaskFailure::TesterNestedSwiftPmSandbox
         )
     {
         bail!("test-injected Tester pause persistence failure");
@@ -8039,6 +8091,130 @@ fn commits_ahead(workspace_path: &Path, source_ref: &str) -> Result<u32> {
     Ok(stdout.parse()?)
 }
 
+fn ensure_tester_harness_repair_scope(workspace_path: &Path, baseline_commit: &str) -> Result<()> {
+    let range = format!("{baseline_commit}..HEAD");
+    let changed = git::run_stdout(
+        workspace_path,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--diff-filter=ACMRD",
+            &range,
+            "--",
+        ],
+        "inspect Tester-harness repair scope",
+    )?;
+    let paths = changed
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        bail!("Tester-harness repair did not change tracked Tester files");
+    }
+    let outside = paths
+        .iter()
+        .copied()
+        .filter(|path| {
+            !matches!(
+                *path,
+                ".fluent/tester.yaml" | ".fluent/extract-tester-results"
+            )
+        })
+        .collect::<Vec<_>>();
+    if !outside.is_empty() {
+        bail!(
+            "Tester-harness repair changed files outside the approved Tester boundary:\n{}",
+            outside.join("\n")
+        );
+    }
+    for required in [".fluent/tester.yaml", ".fluent/extract-tester-results"] {
+        let is_regular = fs::symlink_metadata(workspace_path.join(required))
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        if !is_regular {
+            bail!(
+                "Tester-harness repair removed or replaced required regular Tester file {required}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_tester_harness_repair_start(
+    project_root: &Path,
+    task: &crate::work_model::Task,
+    workspace_path: &Path,
+) -> Result<()> {
+    let context = task
+        .review_context
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no pinned candidate context"))?;
+    let writable = task.workspace_access.writes.as_slice();
+    if writable.len() != 1
+        || writable[0].id != context.candidate_workspace_id
+        || writable[0].path != context.candidate_workspace_path
+    {
+        bail!("Tester-harness repair workspace does not match its pinned candidate context");
+    }
+
+    let head = head_commit(workspace_path)?;
+    let baseline_path = task
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|dir| dir.join("write-baseline-commit"))
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Tester-harness repair has no artifact area"))?;
+
+    match fs::read_to_string(&baseline_path) {
+        Ok(persisted) => {
+            let persisted = persisted.trim();
+            if persisted != context.candidate_commit {
+                bail!(
+                    "Tester-harness repair baseline {persisted:?} does not match approved candidate {}",
+                    context.candidate_commit
+                );
+            }
+            if head != context.candidate_commit {
+                let ancestry = git::run_raw(
+                    workspace_path,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &context.candidate_commit,
+                        &head,
+                    ],
+                )?;
+                if !ancestry.status.success() {
+                    bail!(
+                        "Tester-harness repair HEAD {head} is not descended from approved candidate {}",
+                        context.candidate_commit
+                    );
+                }
+                ensure_tester_harness_repair_scope(workspace_path, &context.candidate_commit)?;
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if head != context.candidate_commit {
+                bail!(
+                    "Tester-harness repair must start at approved candidate {}; found {head}",
+                    context.candidate_commit
+                );
+            }
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "read Tester-harness repair baseline {}",
+                baseline_path.display()
+            )));
+        }
+    }
+    ensure_clean_worktree(workspace_path)?;
+    Ok(())
+}
+
 fn head_commit(workspace_path: &Path) -> Result<String> {
     git::run_stdout(
         workspace_path,
@@ -8709,6 +8885,42 @@ mod tests {
     }
 
     #[test]
+    fn tester_harness_handoff_names_eligible_repair_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterProjectHarness,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(
+            handoff.contains("fluent attempt repair-tester work-1 attempt-1 --resolution"),
+            "{handoff}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_tester_handoff_offers_unchanged_retry_and_tracked_repair() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_task_error_handoff(
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-8",
+            &TaskFailure::TesterHarness,
+        )
+        .unwrap();
+
+        let handoff = fs::read_to_string(tmp.path().join(path)).unwrap();
+        assert!(handoff.contains("fluent attempt run work-1 attempt-1"));
+        assert!(handoff.contains("fluent attempt repair-tester work-1 attempt-1"));
+    }
+
+    #[test]
     fn tester_pause_replaces_a_resumed_round_cap_current_handoff() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = WorkModelStore::new(tmp.path());
@@ -8813,9 +9025,12 @@ mod tests {
         };
         let notified = std::cell::Cell::new(false);
 
-        let error =
-            settle_tester_harness_failure_with_notify(&config, true, &|_, _| notified.set(true))
-                .unwrap_err();
+        let error = settle_tester_harness_failure_with_notify(
+            &config,
+            TesterHarnessFailureKind::NestedSwiftPm,
+            &|_, _| notified.set(true),
+        )
+        .unwrap_err();
 
         assert!(format!("{error:#}").contains("current needs-user handoff"));
         assert!(
@@ -12884,6 +13099,394 @@ mod tests {
         assert!(
             commits_ahead(&workspace, &resumed).unwrap() >= 1,
             "the pre-failure commit must count as produced work on resume"
+        );
+    }
+
+    #[test]
+    fn tester_harness_repair_scope_accepts_only_config_and_extractor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let git = |args: &[&str]| {
+            crate::git::run(workspace, args, "prepare Tester repair scope fixture").unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(workspace.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("product.txt"), "original\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "baseline"]);
+        let baseline = head_commit(workspace).unwrap();
+
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not change tracked Tester files")
+        );
+
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho deduplicated\n",
+        )
+        .unwrap();
+        git(&["add", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "repair extractor"]);
+        ensure_tester_harness_repair_scope(workspace, &baseline).unwrap();
+
+        fs::write(workspace.join("product.txt"), "changed\n").unwrap();
+        git(&["add", "product.txt"]);
+        git(&["commit", "-q", "-m", "change product"]);
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(error.to_string().contains("product.txt"));
+
+        git(&["reset", "--hard", &baseline]);
+        git(&["rm", "-q", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "remove extractor"]);
+        let error = ensure_tester_harness_repair_scope(workspace, &baseline).unwrap_err();
+        assert!(error.to_string().contains(
+            "removed or replaced required regular Tester file .fluent/extract-tester-results"
+        ));
+    }
+
+    #[test]
+    fn tester_harness_repair_start_rejects_drift_but_allows_scoped_resume() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let git = |args: &[&str]| {
+            crate::git::run(workspace, args, "prepare Tester repair start fixture").unwrap();
+        };
+        git(&["init", "-q"]);
+        fs::write(workspace.join(".git/info/exclude"), ".fluent/work/\n").unwrap();
+        git(&["config", "user.email", "t@t.co"]);
+        git(&["config", "user.name", "t"]);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(workspace.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("product.txt"), "original\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "baseline"]);
+        let baseline = head_commit(workspace).unwrap();
+        let artifact_area = ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2";
+        let task = crate::work_model::Task {
+            id: "attempt-1-write-2".to_string(),
+            kind: crate::work_model::TaskKind::Write,
+            status: TaskStatus::Planned,
+            role: crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string(),
+            instructions: Some("Repair the Tester harness.".to_string()),
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: crate::work_model::WorkspaceAccess {
+                reads: Vec::new(),
+                writes: vec![crate::work_model::WorkspaceRef {
+                    id: "candidate".to_string(),
+                    path: ".".to_string(),
+                }],
+            },
+            artifact_area: Some(crate::work_model::TaskArtifactArea {
+                path: artifact_area.to_string(),
+            }),
+            review_context: Some(crate::work_model::ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: ".".to_string(),
+                source_branch: "main".to_string(),
+                candidate_commit: baseline.clone(),
+                base_commit: None,
+            }),
+            evidence_review_context: None,
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: None,
+            started_at: None,
+            completed_at: None,
+        };
+
+        ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho repaired\n",
+        )
+        .unwrap();
+        git(&["add", ".fluent/extract-tester-results"]);
+        git(&["commit", "-q", "-m", "repair extractor"]);
+        let repair_commit = head_commit(workspace).unwrap();
+        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must start at approved candidate")
+        );
+
+        let baseline_path = workspace.join(artifact_area).join("write-baseline-commit");
+        fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        fs::write(&baseline_path, &baseline).unwrap();
+        ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap();
+
+        fs::write(workspace.join("product.txt"), "changed\n").unwrap();
+        git(&["add", "product.txt"]);
+        git(&["commit", "-q", "-m", "change product"]);
+        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(error.to_string().contains("product.txt"));
+
+        git(&["reset", "--hard", &repair_commit]);
+        fs::write(workspace.join("product.txt"), "dirty\n").unwrap();
+        let error = ensure_tester_harness_repair_start(workspace, &task, workspace).unwrap_err();
+        assert!(error.to_string().contains("uncommitted changes"));
+    }
+
+    struct TesterHarnessRepairCommitCoder;
+
+    impl crate::coder::Coder for TesterHarnessRepairCommitCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the Writer route launches through the session boundary")
+        }
+
+        fn run_captured_reported_session(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+            _session: crate::coder::CoderSession<'_>,
+        ) -> crate::coder::CoderRunCompletion {
+            let terminal = (|| {
+                fs::write(
+                    working_dir.join(".fluent/extract-tester-results"),
+                    "#!/bin/sh\necho '[]' | awk '!seen[$0]++'\n",
+                )?;
+                crate::git::run(
+                    working_dir,
+                    &["add", ".fluent/extract-tester-results"],
+                    "stage Tester-harness repair",
+                )?;
+                crate::git::run(
+                    working_dir,
+                    &["commit", "-q", "-m", "Repair Tester extractor"],
+                    "commit Tester-harness repair",
+                )?;
+                Ok(0)
+            })();
+            crate::coder::CoderRunCompletion {
+                terminal,
+                report: Default::default(),
+            }
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the Writer route never runs interactively")
+        }
+    }
+
+    #[test]
+    fn tester_harness_repair_writer_commits_through_the_real_executor() {
+        use crate::work_model::{
+            AttemptReviewState, ReviewContext, Task, TaskArtifactArea, WorkspaceAccess,
+            WorkspaceRef, work_artifact_path,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project = tmp.path().join("main");
+        fs::create_dir_all(project.join(".fluent/expertise")).unwrap();
+        fs::write(
+            project.join(".fluent/expertise/INDEX.md"),
+            "# Project Expertise Index\n",
+        )
+        .unwrap();
+        fs::write(project.join(".fluent/tester.yaml"), "commands: []\n").unwrap();
+        fs::write(
+            project.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        fs::write(project.join("product.txt"), "unchanged\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"] as &[&str],
+            &["config", "user.name", "Mrinal Wadhwa"],
+            &["config", "user.email", "mrinal.wadhwa@gmail.com"],
+            &["add", "."],
+            &["commit", "-q", "-m", "Create repair fixture"],
+        ] {
+            crate::git::run(&project, args, "prepare Tester repair route fixture").unwrap();
+        }
+        let workspace_path =
+            crate::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+        let workspace = project
+            .parent()
+            .unwrap()
+            .join(Path::new(&workspace_path).file_name().unwrap());
+        crate::git::run(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/tester-repair",
+                workspace.to_str().unwrap(),
+            ],
+            "create Tester repair candidate",
+        )
+        .unwrap();
+        let candidate = head_commit(&workspace).unwrap();
+
+        let mut item = WorkItem::planned("work-1", "Repair Tester harness");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = CoderKind::Codex;
+        let writer = &mut attempt.tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.workspace_access = WorkspaceAccess {
+            reads: vec![WorkspaceRef {
+                id: "target".to_string(),
+                path: ".".to_string(),
+            }],
+            writes: vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: workspace_path.clone(),
+            }],
+        };
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: workspace_path.clone(),
+            source_branch: "main".to_string(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let tester_id = "attempt-1-tester";
+        let tester_area = work_artifact_path("work-1", "attempt-1", tester_id);
+        attempt.tasks.push(Task {
+            id: tester_id.to_string(),
+            kind: TaskKind::Tester,
+            status: TaskStatus::NeedsUser,
+            role: "tester".to_string(),
+            instructions: None,
+            work_item_id: "work-1".to_string(),
+            attempt_id: Some("attempt-1".to_string()),
+            workspace_access: WorkspaceAccess::read_only(vec![WorkspaceRef {
+                id: "candidate".to_string(),
+                path: workspace_path,
+            }]),
+            artifact_area: Some(TaskArtifactArea {
+                path: tester_area.clone(),
+            }),
+            review_context: Some(ReviewContext {
+                candidate_workspace_id: "candidate".to_string(),
+                candidate_workspace_path: crate::work_model::initial_candidate_workspace_path(
+                    "work-1",
+                    "attempt-1",
+                ),
+                source_branch: "main".to_string(),
+                candidate_commit: candidate.clone(),
+                base_commit: None,
+            }),
+            evidence_review_context: None,
+            input_artifacts: Vec::new(),
+            depends_on: None,
+            output: None,
+            created_at: Some(crate::work_model::now_iso8601()),
+            started_at: Some(crate::work_model::now_iso8601()),
+            completed_at: Some(crate::work_model::now_iso8601()),
+        });
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::TesterHarness);
+        attempt.review_state = Some(AttemptReviewState::Passed);
+        attempt.completed_at = Some(crate::work_model::now_iso8601());
+        let store = WorkModelStore::new(&project);
+        store.create_work_item(&mut item).unwrap();
+        fs::create_dir_all(project.join(&tester_area)).unwrap();
+        fs::write(project.join(&tester_area).join("commands.json"), "[]\n").unwrap();
+        fs::write(
+            project.join(&tester_area).join("tester-results.json"),
+            r#"{"candidate_commit":null,"commands":[],"tests":[],"summary":{"total":0,"pass":0,"fail":0,"skipped":0},"error":{"kind":"duplicate_test_ids","message":"duplicate","details":""}}"#,
+        )
+        .unwrap();
+
+        let approved = crate::tester_harness_recovery::request(
+            &project,
+            &store,
+            "work-1",
+            "attempt-1",
+            "Deduplicate repeated nextest failures while preserving the authoritative failure.",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+        let resolver = ContentResolver::new(Some(&project));
+        let make_coder =
+            |_sandbox| Box::new(TesterHarnessRepairCommitCoder) as Box<dyn crate::coder::Coder>;
+        let result = run_write_task_with_coder(
+            WorkTaskRunConfig {
+                project_root: &project,
+                store: &store,
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: &approved.task_id,
+                resolver: &resolver,
+                extra_args: &[],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+        )
+        .unwrap();
+
+        assert_ne!(result.output, candidate);
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Failed);
+        let repair = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == approved.task_id)
+            .unwrap();
+        assert_eq!(repair.status, TaskStatus::Complete);
+        assert_eq!(repair.output.as_ref().unwrap().commit, result.output);
+        assert_eq!(
+            repair.output.as_ref().unwrap().base_commit.as_deref(),
+            Some(candidate.as_str())
+        );
+        assert!(
+            crate::git::run_stdout(
+                &workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "verify repaired candidate cleanliness",
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 

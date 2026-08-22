@@ -67,5 +67,6 @@ pub mod slack_collaboration;
 pub(crate) mod test_lock_probe;
 pub mod tester;
 pub(crate) mod tester_evidence;
+pub mod tester_harness_recovery;
 pub mod update;
 pub mod usage;
