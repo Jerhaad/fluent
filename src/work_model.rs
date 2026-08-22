@@ -4489,6 +4489,55 @@ impl Attempt {
             .count()
     }
 
+    /// Return the latest Writer that remains part of the accepted execution
+    /// history. Reconciled stale follow-ups stay in the audit trail but cannot
+    /// become the candidate frontier again.
+    pub fn latest_materialized_write_index(&self) -> Option<usize> {
+        self.tasks
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, task)| {
+                (task.kind == TaskKind::Write
+                    && !self.is_superseded_tester_harness_followup(&task.id))
+                .then_some(index)
+            })
+    }
+
+    /// Return whether live work or a hard failure prevents a round-cap
+    /// approval. Failed Tasks already superseded by an accepted Tester repair
+    /// remain as audit history and do not block that recovery.
+    pub fn has_round_cap_task_blocker(&self) -> bool {
+        self.tasks.iter().any(|task| {
+            matches!(task.status, TaskStatus::Planned | TaskStatus::Executing)
+                || (task.status == TaskStatus::Failed
+                    && !self.is_superseded_tester_harness_followup(&task.id)
+                    && !self.has_tester_harness_repair_for(&task.id))
+        })
+    }
+
+    /// Return whether this Attempt carries the durable receipt produced when
+    /// an accepted Tester-harness repair superseded stale Writer follow-ups.
+    /// This is the exact recovery shape whose older scheduler dispatch may
+    /// already be recorded as blocked.
+    pub fn has_reconciled_tester_harness_repair(&self) -> bool {
+        self.status == AttemptStatus::NeedsUser
+            && self.pause_kind == Some(PauseKind::TesterHarness)
+            && self.tasks.iter().any(|repair| {
+                repair.kind == TaskKind::Write
+                    && repair.role == TESTER_HARNESS_REPAIR_ROLE
+                    && repair.status == TaskStatus::Complete
+                    && repair.output.is_some()
+                    && self.artifacts.iter().any(|artifact| {
+                        artifact.producer_id == "tester-harness-recovery"
+                            && artifact.path.ends_with(&format!(
+                                "/tester-harness-repairs/{}/superseded-followups.json",
+                                repair.id
+                            ))
+                    })
+            })
+    }
+
     /// Validate that this exact suspended Attempt can be explicitly resumed.
     ///
     /// Both direct Attempt execution and scheduler resume dispatches use this

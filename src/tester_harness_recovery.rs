@@ -1077,6 +1077,16 @@ mod tests {
             assert!(attempt.is_superseded_tester_harness_followup(id));
         }
         assert_eq!(attempt.materialized_write_rounds(), 2);
+        assert_eq!(attempt.latest_materialized_write_index(), Some(3));
+        assert_eq!(attempt.tasks[3].id, requested.task_id);
+        assert!(!attempt.has_round_cap_task_blocker());
+        let mut hard_failure = attempt.clone();
+        let mut failed_review = hard_failure.tasks[1].clone();
+        failed_review.id = "attempt-1-review-hard-failure".to_string();
+        failed_review.status = TaskStatus::Failed;
+        failed_review.created_at = Some("2026-08-22T14:00:00Z".to_string());
+        hard_failure.tasks.push(failed_review);
+        assert!(hard_failure.has_round_cap_task_blocker());
         let progress = fs::read_to_string(progress).unwrap();
         assert!(progress.contains("Keep accepted repair"));
         assert!(!progress.contains("Remove rejected product work"));
@@ -1111,6 +1121,39 @@ mod tests {
             Some(PauseKind::TesterHarness)
         );
         normalized.attempts[0].ensure_resume_ready().unwrap();
+
+        let queue_dir = fixture.main.join(".fluent/work/queue");
+        fs::create_dir_all(&queue_dir).unwrap();
+        fs::write(
+            queue_dir.join("work-1.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "work_item_id": "work-1",
+                "dispatches": [{
+                    "dispatch_id": "dispatch-1",
+                    "work_item_id": "work-1",
+                    "queued_at": "2026-08-22T11:00:00Z",
+                    "priority": 0,
+                    "status": "blocked",
+                    "generation": 3,
+                    "bound_attempt_id": "attempt-1",
+                    "blocked_reason": "repair Writer stopped before queue reconciliation"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::queue::resume(&fixture.main, "work-1", "attempt-1", None).unwrap(),
+            crate::queue::ResumeDispatchOutcome::Created
+        );
+        let ledger = crate::queue::read_ledger(&fixture.main, "work-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(
+            ledger.active().unwrap().resume_of_dispatch_id.as_deref(),
+            Some("dispatch-1")
+        );
 
         fs::write(fixture.candidate.join("product.txt"), "later drift\n").unwrap();
         let error = request(

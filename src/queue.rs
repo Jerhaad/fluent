@@ -455,6 +455,11 @@ pub fn resume_with_tester_no_sandbox(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .is_some_and(crate::work_model::Attempt::is_failed_candidate_gate_correction);
+    let reconciled_tester_harness_repair = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(crate::work_model::Attempt::has_reconciled_tester_harness_repair);
     let learner_retry = crate::lifecycle_recovery::is_learner_retry_recovery(&item, attempt_id);
     let legacy_learner_tester_evidence =
         crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
@@ -510,6 +515,7 @@ pub fn resume_with_tester_no_sandbox(
             if previous.status != DispatchStatus::NeedsUser
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
                 && !(previous.status == DispatchStatus::Blocked && learner_retry)
+                && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
                 && !(legacy_learner_tester_evidence
                     && matches!(
                         previous.status,
@@ -1939,6 +1945,7 @@ mod tests {
         for (id, status) in [
             ("wi-live", DispatchStatus::Running),
             ("wi-terminal", DispatchStatus::Failed),
+            ("wi-blocked", DispatchStatus::Blocked),
         ] {
             write_planned_attempt(dir.path(), id, "attempt-1");
             suspend_attempt(dir.path(), id, "attempt-1", PauseKind::WriterCompletion);

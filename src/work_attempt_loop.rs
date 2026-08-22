@@ -110,12 +110,7 @@ pub fn extend_round_cap(
             return Err(round_cap_ineligible("a landing owns this Attempt"));
         }
         let attempt = &mut item.attempts[attempt_index];
-        if attempt.tasks.iter().any(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Planned | TaskStatus::Executing | TaskStatus::Failed
-            )
-        }) {
+        if attempt.has_round_cap_task_blocker() {
             return Err(round_cap_ineligible(
                 "a live or failed Task owns this Attempt",
             ));
@@ -793,7 +788,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
 
         if !attempt.kind.is_review_only_like()
             && has_completed_write(attempt.tasks.as_slice())
-            && !has_review_after_latest_write(attempt.tasks.as_slice())
+            && !has_review_after_latest_write(attempt)
         {
             let outcome = plan_after_completed_writer(
                 config.project_root,
@@ -809,7 +804,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             continue;
         }
 
-        if completed_review_tasks_after_latest_write(attempt.tasks.as_slice())
+        if completed_review_tasks_after_latest_write(attempt)
             .next()
             .is_some()
             && !has_open_review_round(attempt.tasks.as_slice())
@@ -1524,11 +1519,7 @@ fn reopen_approved_round_cap_attempt(
                 "the approved round-cap pause is no longer current",
             ));
         }
-        if attempt
-            .tasks
-            .iter()
-            .any(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::Executing))
-        {
+        if attempt.has_round_cap_task_blocker() {
             return Err(round_cap_ineligible(
                 "a live or failed Task owns this Attempt",
             ));
@@ -1985,11 +1976,11 @@ fn has_open_review_round(tasks: &[Task]) -> bool {
     false
 }
 
-fn has_review_after_latest_write(tasks: &[Task]) -> bool {
-    let Some(last_write_index) = tasks.iter().rposition(|task| task.kind == TaskKind::Write) else {
+fn has_review_after_latest_write(attempt: &Attempt) -> bool {
+    let Some(last_write_index) = attempt.latest_materialized_write_index() else {
         return false;
     };
-    tasks[last_write_index + 1..]
+    attempt.tasks[last_write_index + 1..]
         .iter()
         .any(|task| is_review_phase_task(task))
 }
@@ -5268,13 +5259,12 @@ fn all_tester_artifact_paths(
         .collect()
 }
 
-fn completed_review_tasks_after_latest_write(tasks: &[Task]) -> impl Iterator<Item = &Task> {
-    let start = tasks
-        .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
+fn completed_review_tasks_after_latest_write(attempt: &Attempt) -> impl Iterator<Item = &Task> {
+    let start = attempt
+        .latest_materialized_write_index()
         .map(|index| index + 1)
         .unwrap_or(0);
-    tasks[start..]
+    attempt.tasks[start..]
         .iter()
         .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
 }
@@ -5297,10 +5287,7 @@ fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<
     {
         return Some(source);
     }
-    let latest_write_index = attempt
-        .tasks
-        .iter()
-        .rposition(|task| task.kind == TaskKind::Write);
+    let latest_write_index = attempt.latest_materialized_write_index();
     let start = latest_write_index.map(|index| index + 1).unwrap_or(0);
     attempt.tasks[start..]
         .iter()
@@ -5706,9 +5693,7 @@ fn plan_after_completed_writer(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
     let latest_write_index = attempt
-        .tasks
-        .iter()
-        .rposition(|task| task.kind == TaskKind::Write)
+        .latest_materialized_write_index()
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} has no Writer Task", attempt_id))?;
     let latest_write = &attempt.tasks[latest_write_index];
     if latest_write.status == TaskStatus::Planned {
