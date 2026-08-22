@@ -4578,7 +4578,7 @@ fn build_reviewed_correction_prompt(
     let candidate_commit = head_commit(workspace_path)?;
     let base_commit = writer_context_base_commit(item, attempt_id, workspace_path);
     let correction_lineage = correction_lineage(&candidate_commit, correction_artifacts);
-    let context_path = write_execution_context(
+    let context_path = write_execution_context_with_finding_policy(
         &artifact_dir,
         workspace_path,
         &candidate_commit,
@@ -4586,6 +4586,7 @@ fn build_reviewed_correction_prompt(
         &unresolved_steps,
         correction_artifacts,
         Some(correction_lineage.clone()),
+        task.role != crate::work_model::TESTER_HARNESS_REPAIR_ROLE,
     )?;
     let corrective_authority_path = if let Some(authority) = corrective_execution_context(item) {
         let path = artifact_dir.join("corrective-authority.md");
@@ -4845,6 +4846,29 @@ fn write_execution_context(
     input_artifacts: &[PathBuf],
     correction_lineage: Option<ExecutionContextCorrectionLineage>,
 ) -> Result<PathBuf> {
+    write_execution_context_with_finding_policy(
+        artifact_dir,
+        workspace,
+        candidate_commit,
+        base_commit,
+        unresolved_steps,
+        input_artifacts,
+        correction_lineage,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_execution_context_with_finding_policy(
+    artifact_dir: &Path,
+    workspace: &Path,
+    candidate_commit: &str,
+    base_commit: Option<&str>,
+    unresolved_steps: &[String],
+    input_artifacts: &[PathBuf],
+    correction_lineage: Option<ExecutionContextCorrectionLineage>,
+    include_tester_findings: bool,
+) -> Result<PathBuf> {
     let changed_files = if let Some(base_commit) = base_commit.filter(|value| !value.is_empty()) {
         git_stdout(
             workspace,
@@ -4871,7 +4895,7 @@ fn write_execution_context(
         .iter()
         .map(|step| truncate_utf8(step, 500))
         .collect::<Vec<_>>();
-    let current_findings = execution_context_findings(input_artifacts);
+    let current_findings = execution_context_findings(input_artifacts, include_tester_findings);
     let (passing_evidence, executed_commands) =
         execution_context_evidence(input_artifacts, candidate_commit);
     let historical_artifacts = input_artifacts
@@ -4948,7 +4972,10 @@ fn bounded_execution_context_json(context: &mut ExecutionContextV1) -> Result<St
     }
 }
 
-fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionContextFinding> {
+fn execution_context_findings(
+    input_artifacts: &[PathBuf],
+    include_tester_findings: bool,
+) -> Vec<ExecutionContextFinding> {
     let mut findings = BTreeMap::new();
     for path in input_artifacts.iter().filter(|path| {
         path.file_name().is_some_and(|name| {
@@ -5012,8 +5039,10 @@ fn execution_context_findings(input_artifacts: &[PathBuf]) -> Vec<ExecutionConte
         }
     }
     for path in input_artifacts.iter().filter(|path| {
-        path.file_name()
-            .is_some_and(|name| name == "tester-results.json")
+        include_tester_findings
+            && path
+                .file_name()
+                .is_some_and(|name| name == "tester-results.json")
             && path
                 .parent()
                 .and_then(Path::file_name)
@@ -16266,6 +16295,126 @@ mod tests {
                 .current_findings
                 .iter()
                 .all(|finding| !finding.title.contains("cargo fmt --check"))
+        );
+    }
+
+    #[test]
+    fn tester_harness_repair_execution_context_keeps_artifact_without_tester_findings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let artifact = tmp.path().join("repair-writer-artifact");
+        let tester_dir = tmp.path().join("attempt-1-tester-8");
+        let tester_results = tester_dir.join("tester-results.json");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&tester_dir).unwrap();
+        fs::write(
+            &tester_results,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "abc123",
+                "commands": [
+                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let context_path = write_execution_context_with_finding_policy(
+            &artifact,
+            &workspace,
+            "abc123",
+            Some("base123"),
+            &[],
+            std::slice::from_ref(&tester_results),
+            None,
+            false,
+        )
+        .unwrap();
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert!(context.current_findings.is_empty());
+        assert_eq!(context.executed_commands, ["cargo test --lib"]);
+        assert_eq!(
+            context.historical_artifacts,
+            [tester_results.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn reviewed_repair_prompt_selects_scoped_execution_context_policy() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "candidate"],
+        ] {
+            crate::git::run(workspace.path(), args, "prepare scoped prompt fixture").unwrap();
+        }
+        let tester_path = project
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-tester-2/tester-results.json");
+        fs::create_dir_all(tester_path.parent().unwrap()).unwrap();
+        fs::write(
+            &tester_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": head_commit(workspace.path()).unwrap(),
+                "commands": [
+                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
+                ],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut item = review_item();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-tester-2".to_string(),
+                    path: tester_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                }],
+            )
+            .unwrap();
+        let task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        task.role = crate::work_model::TESTER_HARNESS_REPAIR_ROLE.to_string();
+
+        build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            std::slice::from_ref(&tester_path),
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        let context_path = project
+            .path()
+            .join(work_artifact_path("work-1", "attempt-1", &task_id))
+            .join("execution-context.json");
+        let context: ExecutionContextV1 =
+            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+        assert!(context.current_findings.is_empty());
+        assert_eq!(
+            context.historical_artifacts,
+            [tester_path.display().to_string()]
         );
     }
 

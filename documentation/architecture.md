@@ -622,10 +622,11 @@ repair request or scheduler resume reuses its existing durable record; ordinary
 candidate drift still fails closed.
 
 The repair Writer receives the immutable failed Tester artifacts as diagnostic
-context, but the completion-matrix host does not translate their ordinary
-command failures into product obligations. Its authority is the operator's
-recorded repair decision and its accepted Git surface remains the two Tester
-files. If the Writer nevertheless commits outside that surface, Fluent records
+context, but neither the completion matrix nor the generated execution context
+translates their ordinary command failures into product obligations. The
+operator's recorded repair decision is its authority, and its accepted Git
+surface remains the two Tester files. If the Writer nevertheless commits outside
+that surface, Fluent records
 the rejected commit in the Writer artifact area and restores the managed
 candidate to the approved commit before pausing. A retry may normalize a clean,
 linear rejected descendant produced by an older Fluent build only after the

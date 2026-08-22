@@ -5781,6 +5781,8 @@ provide the failed Tester artifacts for diagnosis without turning ordinary
 failed Tester commands into completion-matrix obligations for that narrowly
 scoped repair.
 Test: src/work_task_executor.rs (tester_harness_repair_matrix_excludes_and_sanitizes_failed_tester_commands)
+Test: src/work_task_executor.rs (tester_harness_repair_execution_context_keeps_artifact_without_tester_findings)
+Test: src/work_task_executor.rs (reviewed_repair_prompt_selects_scoped_execution_context_policy)
 
 ### B10m
 
