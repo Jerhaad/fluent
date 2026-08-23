@@ -6268,6 +6268,56 @@ pub(crate) fn writer_completion_findings(
     }
     for artifact in &task.input_artifacts {
         let relative = Path::new(&artifact.path);
+        let is_candidate_gate = relative
+            .file_name()
+            .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE);
+        if !is_candidate_gate {
+            continue;
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let source = fs::read(&path).with_context(|| {
+            format!(
+                "read candidate gate findings for Writer completion matrix: {}",
+                path.display()
+            )
+        })?;
+        let evidence =
+            serde_json::from_slice::<crate::candidate_gate::CandidateGateEvidence>(&source)
+                .with_context(|| {
+                    format!(
+                        "parse candidate gate findings for Writer completion matrix: {}",
+                        path.display()
+                    )
+                })?;
+        if evidence.disposition != crate::candidate_gate::CandidateGateDisposition::Rejected {
+            continue;
+        }
+        for check in evidence
+            .checks
+            .iter()
+            .filter(|check| check.status == crate::candidate_gate::CandidateCheckStatus::Failed)
+        {
+            let diagnostics = if check.diagnostics.is_empty() {
+                vec![format!("{} check failed", check.name)]
+            } else {
+                check.diagnostics.clone()
+            };
+            for diagnostic in diagnostics {
+                let role = "candidate-gate";
+                let identity = crate::review::finding_identity(role, &diagnostic);
+                findings
+                    .entry((role.to_string(), identity.clone()))
+                    .or_insert(crate::work_model::WriterCompletionFinding {
+                        id: format!("finding:{role}:{identity}"),
+                        role: role.to_string(),
+                        source: artifact.path.clone(),
+                        requirement: diagnostic,
+                    });
+            }
+        }
+    }
+    for artifact in &task.input_artifacts {
+        let relative = Path::new(&artifact.path);
         let is_tester_results = relative.file_name().is_some_and(|name| {
             name == "tester-results.json"
                 && relative
@@ -18297,6 +18347,112 @@ mod tests {
             fs::read(path).unwrap(),
             before,
             "retry must not overwrite claims"
+        );
+    }
+
+    #[test]
+    fn metadata_repair_matrix_adds_host_owned_candidate_gate_finding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Repair candidate metadata");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Metadata\n\n### B1\n\nWHEN a candidate is committed, THE SYSTEM SHALL preserve valid metadata.\nTest: tests/metadata.rs (valid_metadata)\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap();
+        let first_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut first: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(&first_path).unwrap()).unwrap();
+        first.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+        first.rows[0].implementation_evidence = vec!["src/metadata.rs".to_string()];
+        first.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+            command: "cargo test valid_metadata".to_string(),
+            result: crate::work_model::WriterVerificationResult::Pass,
+        }];
+        fs::write(&first_path, serde_json::to_vec_pretty(&first).unwrap()).unwrap();
+        let first_task = &mut item.attempts[0].tasks[0];
+        first_task.status = TaskStatus::Complete;
+        first_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "rejected".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        let gate_rel = ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json";
+        let gate_path = project.path().join(gate_rel);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let diagnostic = "commit rejected body line exceeds 72 characters";
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".to_string(),
+            candidate_commit: "rejected".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "commit-metadata".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![diagnostic.to_string()],
+                log_path: None,
+            }],
+        };
+        fs::write(&gate_path, serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-write-1".to_string(),
+                    path: gate_rel.to_string(),
+                }],
+            )
+            .unwrap();
+
+        let path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(matrix.rows.len(), 2);
+        assert_eq!(
+            matrix.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            matrix.rows[1].id,
+            format!(
+                "finding:candidate-gate:{}",
+                crate::review::finding_identity("candidate-gate", diagnostic)
+            )
+        );
+        assert_eq!(matrix.rows[1].source, gate_rel);
+        assert_eq!(
+            matrix.rows[1].requirement,
+            format!("Address candidate-gate review finding: {diagnostic}")
+        );
+        assert_eq!(
+            matrix.rows[1].state,
+            crate::work_model::WriterCompletionState::Pending
         );
     }
 
