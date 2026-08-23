@@ -62,6 +62,14 @@ drop, or replace it, and verify that it remains an ancestor of `HEAD`. Rewrite o
 that protected base. Fluent will verify the tree identity and protected-base ancestry afterward.
 {{/if}}
 
+{{#if has_recovered_protected_base}}
+This Attempt contains an audited host ancestry repair. Commit
+`{{recovered_protected_base}}` and all history before it are immutable at this
+frontier. Do not rewrite their metadata even if a review finding requests it;
+record that the host boundary supersedes that part of the finding and address
+only product content and commits after the protected base.
+{{/if}}
+
 {{#if has_failed_tester_inspection}}
 Failed final-Tester evidence is attached. Read every artifact below before deciding that no
 candidate change is needed:

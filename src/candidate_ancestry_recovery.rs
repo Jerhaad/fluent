@@ -39,6 +39,8 @@ struct CandidateAncestryRecoveryEvidence {
     candidate_tree: String,
     source_gate_path: String,
     prior_gate_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_recovery_path: Option<String>,
     preserved_ref: String,
     resolution: String,
     resolution_digest: String,
@@ -72,6 +74,7 @@ struct EligibleRecovery {
     source_candidate_commit: String,
     source_gate_path: String,
     authorization: CandidateAncestryRepairAuthorization,
+    prior_recovery_path: Option<String>,
     task_id: String,
 }
 
@@ -106,15 +109,23 @@ pub fn repair(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
     if let Some(repair) = completed_repair(project_root, attempt)? {
-        reconcile_completed_repair_review_inputs(store, work_item_id, attempt_id, &repair)?;
-        reconcile_superseded_queue_admissions(
-            project_root,
-            store,
-            work_item_id,
-            attempt_id,
-            &repair,
-        )?;
-        return Ok(repair);
+        let latest_write_id = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .map(|task| task.id.as_str());
+        if latest_write_id == Some(repair.task_id.as_str()) {
+            reconcile_completed_repair_review_inputs(store, work_item_id, attempt_id, &repair)?;
+            reconcile_superseded_queue_admissions(
+                project_root,
+                store,
+                work_item_id,
+                attempt_id,
+                &repair,
+            )?;
+            return Ok(repair);
+        }
     }
     let eligible = inspect_eligible(project_root, attempt)?;
     let workspace = resolve_managed_sibling_workspace_path(
@@ -154,6 +165,19 @@ pub fn repair(
                     eligible.authorization.candidate_tree
                 );
             }
+            let source_message = crate::git::run_stdout(
+                &workspace,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%B",
+                    &eligible.source_candidate_commit,
+                ],
+                "read candidate ancestry recovery message",
+            )?;
+            if source_message.trim().is_empty() {
+                bail!("candidate ancestry repair source has an empty commit message");
+            }
             let recovered = crate::git::run_stdout(
                 &workspace,
                 &[
@@ -162,9 +186,7 @@ pub fn repair(
                     "-p",
                     &eligible.authorization.protected_base_commit,
                     "-m",
-                    "Recover candidate ancestry",
-                    "-m",
-                    "Preserve the verified candidate tree and protected base.",
+                    &source_message,
                 ],
                 "create candidate ancestry recovery commit",
             )?;
@@ -188,6 +210,7 @@ pub fn repair(
                 candidate_tree: tree,
                 source_gate_path: eligible.source_gate_path.clone(),
                 prior_gate_path: eligible.authorization.prior_gate_path.clone(),
+                prior_recovery_path: eligible.prior_recovery_path.clone(),
                 preserved_ref,
                 resolution: resolution.clone(),
                 resolution_digest: round_cap_resolution_digest(&resolution),
@@ -596,8 +619,18 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     if gate.candidate_commit != output.commit {
         bail!("candidate ancestry gate does not match the latest Writer output");
     }
-    let authorization = candidate_ancestry_repair_authorization(&gate)
-        .ok_or_else(|| anyhow::anyhow!("candidate gate is not eligible for ancestry repair"))?;
+    let (authorization, prior_recovery_path) = if let Some(authorization) =
+        candidate_ancestry_repair_authorization(&gate)
+    {
+        (authorization, None)
+    } else {
+        let prior = completed_repair(project_root, attempt)?
+            .ok_or_else(|| anyhow::anyhow!("candidate gate is not eligible for ancestry repair"))?;
+        let prior_path = recovery_artifact_path(&attempt.work_item_id, &attempt.id, &prior.task_id);
+        let authorization = followup_repair_authorization(project_root, output, &gate, &prior)?
+            .ok_or_else(|| anyhow::anyhow!("candidate gate is not eligible for ancestry repair"))?;
+        (authorization, Some(prior_path))
+    };
     let next_round = attempt
         .tasks
         .iter()
@@ -613,8 +646,103 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         source_candidate_commit: output.commit.clone(),
         source_gate_path: gate_ref.path.clone(),
         authorization,
+        prior_recovery_path,
         task_id: format!("{}-write-{next_round}", attempt.id),
     })
+}
+
+fn followup_repair_authorization(
+    project_root: &Path,
+    output: &crate::work_model::TaskOutput,
+    gate: &CandidateGateEvidence,
+    prior: &CandidateAncestryRepair,
+) -> Result<Option<CandidateAncestryRepairAuthorization>> {
+    if gate.schema_version == 0
+        || gate.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || gate.phase != crate::candidate_gate::CandidateGatePhase::Writer
+        || gate.disposition != crate::candidate_gate::CandidateGateDisposition::Blocked
+        || gate.candidate_commit != output.commit
+        || gate.metadata_rewrite.is_some()
+    {
+        return Ok(None);
+    }
+    let expected_checks = [
+        "candidate-identity",
+        "whitespace",
+        "commit-metadata",
+        "behavior-references",
+        "tester-reference-evidence",
+        "project-check",
+    ];
+    if gate.checks.len() != expected_checks.len()
+        || expected_checks.iter().any(|name| {
+            gate.checks
+                .iter()
+                .filter(|check| check.name == *name)
+                .count()
+                != 1
+        })
+    {
+        return Ok(None);
+    }
+    let mut blocking = gate.checks.iter().filter(|check| {
+        matches!(
+            check.status,
+            crate::candidate_gate::CandidateCheckStatus::Failed
+                | crate::candidate_gate::CandidateCheckStatus::Error
+        )
+    });
+    let Some(identity) = blocking.next() else {
+        return Ok(None);
+    };
+    let expected = format!(
+        "base commit {} is not an ancestor of candidate {}",
+        gate.base_commit, gate.candidate_commit
+    );
+    if identity.name != "candidate-identity"
+        || identity.status != crate::candidate_gate::CandidateCheckStatus::Error
+        || identity.diagnostics.as_slice() != [expected]
+        || blocking.next().is_some()
+    {
+        return Ok(None);
+    }
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "candidate ancestry follow-up recovery workspace",
+    )?;
+    let base_tree = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", &format!("{}^{{tree}}", gate.base_commit)],
+        "resolve follow-up recovery base tree",
+    )?;
+    let candidate_tree = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", &format!("{}^{{tree}}", gate.candidate_commit)],
+        "resolve follow-up recovery candidate tree",
+    )?;
+    if base_tree != candidate_tree
+        || !crate::git::run_raw(
+            &workspace,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &prior.recovered_candidate_commit,
+                &gate.base_commit,
+            ],
+        )?
+        .status
+        .success()
+    {
+        return Ok(None);
+    }
+    Ok(Some(CandidateAncestryRepairAuthorization {
+        protected_base_commit: gate.base_commit.clone(),
+        rejected_candidate_commit: gate.candidate_commit.clone(),
+        candidate_commit: gate.candidate_commit.clone(),
+        candidate_tree,
+        prior_gate_path: String::new(),
+    }))
 }
 
 fn verify_live_candidate(workspace: &Path, eligible: &EligibleRecovery) -> Result<()> {
@@ -641,6 +769,31 @@ fn verify_live_candidate(workspace: &Path, eligible: &EligibleRecovery) -> Resul
 }
 
 fn verify_gate_provenance(project_root: &Path, eligible: &EligibleRecovery) -> Result<()> {
+    if let Some(prior_recovery_path) = eligible.prior_recovery_path.as_deref() {
+        let prior = read_recovery_evidence(project_root, prior_recovery_path)?
+            .ok_or_else(|| anyhow::anyhow!("prior candidate ancestry recovery is missing"))?;
+        if prior.schema_version != RECOVERY_SCHEMA_VERSION
+            || prior.recovered_candidate_commit == eligible.source_candidate_commit
+            || !crate::git::run_raw(
+                &resolve_managed_sibling_workspace_path(
+                    project_root,
+                    &eligible.workspace_path,
+                    "candidate ancestry follow-up provenance workspace",
+                )?,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &prior.recovered_candidate_commit,
+                    &eligible.authorization.protected_base_commit,
+                ],
+            )?
+            .status
+            .success()
+        {
+            bail!("prior candidate ancestry recovery does not authorize this follow-up repair");
+        }
+        return Ok(());
+    }
     let prior_path = crate::work_task_executor::resolve_managed_artifact_area_path(
         project_root,
         &eligible.authorization.prior_gate_path,
@@ -850,6 +1003,7 @@ fn validate_recovery_evidence(
         || evidence.candidate_tree != eligible.authorization.candidate_tree
         || evidence.source_gate_path != eligible.source_gate_path
         || evidence.prior_gate_path != eligible.authorization.prior_gate_path
+        || evidence.prior_recovery_path != eligible.prior_recovery_path
         || evidence.preserved_ref != expected_ref
         || evidence.resolution.trim().is_empty()
         || evidence.resolution_digest != round_cap_resolution_digest(&evidence.resolution)
@@ -1313,6 +1467,25 @@ mod tests {
             .status
             .success()
         );
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%B",
+                    &repair_result.recovered_candidate_commit
+                ],
+                "read recovered candidate message",
+            )
+            .unwrap(),
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["show", "-s", "--format=%B", &fixture.replacement],
+                "read source candidate message",
+            )
+            .unwrap()
+        );
         let stored = fixture.store.read_work_item("work-1").unwrap();
         let recovered_task = stored.attempts[0].tasks.last().unwrap();
         assert_eq!(recovered_task.role, CANDIDATE_ANCESTRY_REPAIR_ROLE);
@@ -1493,6 +1666,215 @@ mod tests {
     }
 
     #[test]
+    fn repairs_a_later_tree_identical_rewrite_after_an_earlier_recovery() {
+        let fixture = Fixture::new();
+        let first = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Recover the first authorized ancestry failure.",
+        )
+        .unwrap();
+        fs::write(fixture.workspace.join("followup.txt"), "corrected\n").unwrap();
+        crate::git::run(
+            &fixture.workspace,
+            &["add", "followup.txt"],
+            "stage substantive follow-up",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Improve lifecycle recovery",
+                "-m",
+                "Preserve the running revision until unloading begins.",
+            ],
+            "commit substantive follow-up",
+        )
+        .unwrap();
+        let substantive = crate::git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD"],
+            "read substantive follow-up",
+        )
+        .unwrap();
+        let substantive_tree = crate::git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD^{tree}"],
+            "read substantive follow-up tree",
+        )
+        .unwrap();
+        let rewritten_message =
+            "Improve lifecycle recovery\n\nExplain the operator-visible failure boundary.";
+        let rewritten = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "commit-tree",
+                &substantive_tree,
+                "-p",
+                &first.recovered_candidate_commit,
+                "-m",
+                rewritten_message,
+            ],
+            "rewrite follow-up metadata",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.workspace,
+            &["update-ref", "HEAD", &rewritten, &substantive],
+            "install rewritten follow-up",
+        )
+        .unwrap();
+
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                let substantive_task = item.add_next_write_round("attempt-1", Vec::new())?;
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == substantive_task)
+                    .unwrap();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: format!(
+                        "../{}",
+                        fixture.workspace.file_name().unwrap().to_string_lossy()
+                    ),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: Some(first.recovered_candidate_commit.clone()),
+                    commit: substantive.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                let rewrite_task = item.add_next_write_round("attempt-1", Vec::new())?;
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == rewrite_task)
+                    .unwrap();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: format!(
+                        "../{}",
+                        fixture.workspace.file_name().unwrap().to_string_lossy()
+                    ),
+                    source_branch: "work/attempt-1".to_string(),
+                    base_commit: Some(substantive.clone()),
+                    commit: rewritten.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let before_gate = fixture.store.read_work_item("work-1").unwrap();
+        let source_task = before_gate.attempts[0].tasks.last().unwrap().id.clone();
+        clone_completion_matrix(
+            &fixture.project,
+            &before_gate.attempts[0],
+            &first.task_id,
+            &source_task,
+        )
+        .unwrap();
+        let gate_relative = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &format!("candidate-gates/{source_task}/candidate-gate.json"),
+        );
+        let gate = run_candidate_gate(CandidateGateRequest {
+            project_root: &fixture.project,
+            workspace: &fixture.workspace,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: Some(&source_task),
+            phase: CandidateGatePhase::Writer,
+            base_commit: &substantive,
+            candidate_commit: &rewritten,
+            completion_contract: None,
+            allow_tree_identical_metadata_rewrite: false,
+            tester_results_path: None,
+            artifact_path: &fixture.project.join(&gate_relative),
+        })
+        .unwrap();
+        assert_eq!(gate.disposition, CandidateGateDisposition::Blocked);
+        assert!(candidate_ancestry_repair_authorization(&gate).is_none());
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.artifacts.push(ArtifactRef {
+                    producer_id: source_task.clone(),
+                    path: gate_relative.clone(),
+                });
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::CandidateGate);
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                Ok(())
+            })
+            .unwrap();
+
+        let second = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Recover the later tree-identical rewrite without discarding its substantive base.",
+        )
+        .unwrap();
+
+        assert_ne!(second.task_id, first.task_id);
+        assert_eq!(second.protected_base_commit, substantive);
+        let parents = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                &second.recovered_candidate_commit,
+            ],
+            "read second recovery parent",
+        )
+        .unwrap();
+        assert_eq!(
+            parents.split_whitespace().collect::<Vec<_>>(),
+            vec![
+                second.recovered_candidate_commit.as_str(),
+                substantive.as_str()
+            ]
+        );
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &[
+                    "show",
+                    "-s",
+                    "--format=%B",
+                    &second.recovered_candidate_commit
+                ],
+                "read second recovery message",
+            )
+            .unwrap(),
+            rewritten_message
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.role == CANDIDATE_ANCESTRY_REPAIR_ROLE)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn rejects_dirty_candidate_without_mutating_history_or_state() {
         let fixture = Fixture::new();
         fs::write(fixture.workspace.join("candidate.txt"), "dirty\n").unwrap();
@@ -1617,6 +1999,7 @@ mod tests {
             candidate_tree: fixture.tree.clone(),
             source_gate_path: eligible.source_gate_path.clone(),
             prior_gate_path: eligible.authorization.prior_gate_path.clone(),
+            prior_recovery_path: eligible.prior_recovery_path.clone(),
             preserved_ref,
             resolution: resolution.to_string(),
             resolution_digest: round_cap_resolution_digest(resolution),

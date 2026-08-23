@@ -13,6 +13,15 @@ The Writer's workspace and commits:
 - Workspace: {{candidate_workspace_path}}
 - Commits: {{source_branch}}..{{candidate_commit}}
 
+{{#if has_recovered_protected_base}}
+This candidate passed an audited host ancestry repair. Commit
+`{{recovered_protected_base}}` and all earlier history are immutable recovery
+history. Review their product content as part of the candidate, but do not fail
+the candidate or ask the Writer to rewrite commit metadata at or before that
+boundary. Apply commit-metadata review only to later commits; Fluent's
+deterministic gate remains authoritative for the protected history.
+{{/if}}
+
 Open the supplied absolute paths directly; do not discover them by listing parent directories.
 Fluent grants the exact candidate workspace and named evidence files, while their parent and
 sibling directories may remain intentionally unreadable.

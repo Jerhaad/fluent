@@ -6518,6 +6518,23 @@ SYSTEM SHALL display that bound Attempt as the Work Item's current action while
 retaining later superseded Attempts in history.
 Test: src/work_status.rs (status_uses_the_attempt_bound_to_the_latest_dispatch)
 
+### B25q
+
+IF a later Writer performs another tree-identical history rewrite after an
+ancestry repair, THEN the public repair command SHALL create a new recovery only
+when the later substantive base descends from the earlier recovered commit and
+all other candidate checks pass.
+Test: src/candidate_ancestry_recovery.rs (repairs_a_later_tree_identical_rewrite_after_an_earlier_recovery)
+
+### B25r
+
+WHEN Fluent reconstructs a candidate after an ancestry failure, THE SYSTEM
+SHALL retain the metadata-valid source message and instruct subsequent Writers
+and Reviewers not to request metadata rewrites at or before the latest protected
+base.
+Test: src/candidate_ancestry_recovery.rs (repairs_a_later_tree_identical_rewrite_after_an_earlier_recovery)
+Test: src/work_task_executor.rs (recovered_ancestry_prompts_protect_immutable_history)
+
 ### B26
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL resolve every

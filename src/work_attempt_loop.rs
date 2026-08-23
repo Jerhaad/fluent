@@ -6232,14 +6232,25 @@ fn write_candidate_gate_handoff(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let recovery = crate::candidate_gate::candidate_ancestry_repair_authorization(evidence)
-        .map(|_| {
+    let ancestry_action = WorkModelStore::new(project_root)
+        .read_work_item(work_item_id)
+        .ok()
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| {
+                    crate::candidate_ancestry_recovery::recovery_action(project_root, attempt)
+                })
+        });
+    let recovery = ancestry_action
+        .map(|action| {
             let scheduler_action = crate::candidate_ancestry_recovery::scheduler_action(
                 work_item_id,
                 attempt_id,
             );
             format!(
-                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`fluent attempt repair-candidate-ancestry {work_item_id} {attempt_id} --resolution \"<describe the approved ancestry repair>\"`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
+                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`{action}`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
             )
         })
         .unwrap_or_else(|| {

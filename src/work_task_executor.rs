@@ -4580,6 +4580,8 @@ fn build_reviewed_correction_prompt(
     let candidate_commit = head_commit(workspace_path)?;
     let base_commit = writer_context_base_commit(item, attempt_id, workspace_path);
     let correction_lineage = correction_lineage(&candidate_commit, correction_artifacts);
+    let recovered_protected_base =
+        latest_candidate_ancestry_protected_base(item, attempt_id).unwrap_or_default();
     let context_path = write_execution_context_with_finding_policy(
         &artifact_dir,
         workspace_path,
@@ -4702,6 +4704,15 @@ fn build_reviewed_correction_prompt(
                     .as_deref()
                     .unwrap_or_default(),
             ),
+            (
+                "has_recovered_protected_base",
+                if recovered_protected_base.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            ("recovered_protected_base", &recovered_protected_base),
             ("correction_artifacts_list", &correction_artifacts_list),
             (
                 "is_tester_harness_repair",
@@ -4791,6 +4802,24 @@ fn correction_lineage(
         prior_candidate_commit: prior_candidate_commit.to_string(),
         protected_base_commit,
     }
+}
+
+fn latest_candidate_ancestry_protected_base(item: &WorkItem, attempt_id: &str) -> Option<String> {
+    item.attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)?
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Write
+                && task.role == crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE
+                && task.status == TaskStatus::Complete
+        })?
+        .output
+        .as_ref()?
+        .base_commit
+        .clone()
 }
 
 fn writer_completion_allowed_constraints(item: &WorkItem, attempt_id: &str) -> String {
@@ -7129,6 +7158,8 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
     )?
     .display()
     .to_string();
+    let recovered_protected_base =
+        latest_candidate_ancestry_protected_base(input.item, input.attempt_id).unwrap_or_default();
 
     let resolver = ContentResolver::new(input.readable_workspaces.first().map(|p| p.as_path()));
 
@@ -7184,6 +7215,15 @@ fn build_work_review_prompts(input: WorkReviewPromptInput<'_>) -> Result<WorkRev
             ("candidate_workspace_path", &candidate_workspace_display),
             ("source_branch", &review_context.source_branch),
             ("candidate_commit", &review_context.candidate_commit),
+            (
+                "has_recovered_protected_base",
+                if recovered_protected_base.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            ("recovered_protected_base", &recovered_protected_base),
             ("evidence_review_context", evidence_review_context),
             ("evidence_snapshot_path", evidence_snapshot_path),
             ("evidence_prior_review_path", evidence_prior_review_path),
@@ -17685,6 +17725,80 @@ mod tests {
         assert_eq!(context["correction-lineage"]["mode"], "append-only");
         assert!(prompt.contains("append-only"));
         assert!(!prompt.contains("tree-identical-metadata-rewrite"));
+    }
+
+    #[test]
+    fn recovered_ancestry_prompts_protect_immutable_history() {
+        let project = tempfile::tempdir_in("target").unwrap();
+        let workspace = tempfile::tempdir_in("target").unwrap();
+        for args in [
+            &["init", "-q"] as &[&str],
+            &["config", "user.name", "Fluent Test"],
+            &["config", "user.email", "fluent@example.test"],
+            &["commit", "-q", "--allow-empty", "-m", "Improve candidate"],
+        ] {
+            crate::git::run(workspace.path(), args, "prepare recovered prompt fixture").unwrap();
+        }
+        let mut item = review_item_with_role("documentation");
+        let repair = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        repair.role = crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE.to_string();
+        repair.output.as_mut().unwrap().base_commit = Some("protected123".to_string());
+
+        let review_artifact = project.path().join("review-artifact");
+        let review_path = review_artifact.join("review.md");
+        let prompts = build_work_review_prompts(WorkReviewPromptInput {
+            item: &item,
+            attempt_id: "attempt-1",
+            task_id: "attempt-1-review-documentation",
+            project_root: project.path(),
+            artifact_dir: &review_artifact,
+            review_path: &review_path,
+            readable_workspaces: &[workspace.path().to_path_buf()],
+            input_artifacts: &[],
+            review_only: false,
+        })
+        .unwrap();
+        assert!(prompts.review_prompt.contains("protected123"));
+        assert!(
+            prompts.review_prompt.contains(
+                "do not fail\nthe candidate or ask the Writer to rewrite commit metadata"
+            )
+        );
+
+        let task_id = "attempt-1-write-2".to_string();
+        let mut correction_task = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap()
+            .clone();
+        correction_task.id = task_id.clone();
+        correction_task.role = "corrective-writer".to_string();
+        correction_task.status = TaskStatus::Planned;
+        correction_task.output = None;
+        correction_task.input_artifacts.clear();
+        correction_task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", &task_id),
+        });
+        item.attempts[0].tasks.push(correction_task);
+        let correction = build_reviewed_correction_prompt(
+            &item,
+            "attempt-1",
+            &task_id,
+            &[],
+            workspace.path(),
+            project.path(),
+        )
+        .unwrap();
+        assert!(correction.contains("protected123"));
+        assert!(
+            correction
+                .contains("Do not rewrite their metadata even if a review finding requests it")
+        );
     }
 
     #[test]
