@@ -317,8 +317,14 @@ trees, and the protected ancestry. It preserves the rejected replacement under
 a recovery ref, records durable recovery intent, then creates one host-owned
 Writer result whose unchanged tree has the protected base as its sole parent.
 The intent record makes retries safe before or after the branch advances. The
-same Attempt then returns through the ordinary candidate gate and review
-lifecycle; unrelated candidate drift remains ineligible.
+same Attempt is rebound through an exact `queue resume` dispatch and then
+returns through the ordinary candidate gate and review lifecycle; ordinary
+`queue add` is never used because it can allocate a fresh Attempt. If older
+guidance already admitted one later Attempt, the public repair retry supersedes
+it only after local cancellation has left one interrupted, output-free initial
+Writer. A durable receipt preserves that admission as history and authorizes
+the earlier repaired Attempt; any output, additional task, or different pause
+fails closed. Unrelated candidate drift remains ineligible.
 An attached review, Tester, or candidate-gate correction artifact selects this
 route even when the preceding Writer run was recorded as a pre-review
 continuation; corrective evidence takes precedence over that older outcome.

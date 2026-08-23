@@ -14,13 +14,16 @@ use crate::candidate_gate::{
 use crate::work_model::{
     ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, CANDIDATE_ANCESTRY_REPAIR_ROLE,
     DurableTransitionMetadata, DurableTransitionOrigin, MAX_ROUND_CAP_RESOLUTION_BYTES, PauseKind,
-    TaskKind, TaskStatus, WorkModelError, WorkModelStore, WriterCompletionMatrix,
-    resolve_managed_sibling_workspace_path, round_cap_resolution_digest, work_artifact_path,
+    TaskKind, TaskStatus, WorkItem, WorkModelError, WorkModelStore, WriterCompletionMatrix,
+    now_iso8601, resolve_managed_sibling_workspace_path, round_cap_resolution_digest,
+    work_artifact_path,
 };
 
 const RECOVERY_SCHEMA_VERSION: u32 = 1;
 const RECOVERY_PRODUCER: &str = "candidate-ancestry-recovery";
 const RECOVERY_FILE: &str = "recovery.json";
+const SUPERSEDED_ATTEMPTS_FILE: &str = "superseded-attempts.json";
+const SUPERSEDED_ATTEMPT_ROLE: &str = "superseded-candidate-ancestry-queue-admission";
 const MAX_RECOVERY_EVIDENCE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +42,16 @@ struct CandidateAncestryRecoveryEvidence {
     preserved_ref: String,
     resolution: String,
     resolution_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct SupersededAttemptsEvidence {
+    schema_version: u32,
+    repair_task_id: String,
+    resumed_attempt_id: String,
+    superseded_attempt_ids: Vec<String>,
+    recovery_artifact: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +84,8 @@ pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String>
     })
 }
 
-pub fn scheduler_action(work_item_id: &str) -> String {
-    format!("fluent queue add {work_item_id}")
+pub fn scheduler_action(work_item_id: &str, attempt_id: &str) -> String {
+    format!("fluent queue resume {work_item_id} --attempt {attempt_id}")
 }
 
 pub fn repair(
@@ -94,6 +107,13 @@ pub fn repair(
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
     if let Some(repair) = completed_repair(project_root, attempt)? {
         reconcile_completed_repair_review_inputs(store, work_item_id, attempt_id, &repair)?;
+        reconcile_superseded_queue_admissions(
+            project_root,
+            store,
+            work_item_id,
+            attempt_id,
+            &repair,
+        )?;
         return Ok(repair);
     }
     let eligible = inspect_eligible(project_root, attempt)?;
@@ -275,6 +295,192 @@ pub fn repair(
         protected_base_commit: protected_base,
         already_repaired: false,
     })
+}
+
+/// Whether an exact Attempt repaired by the host can be rebound to a resume
+/// dispatch. Any later Attempt must be an audited, output-free queue admission
+/// that this recovery explicitly superseded; ordinary candidate drift remains
+/// ineligible.
+pub fn is_resume_ready(project_root: &Path, item: &WorkItem, attempt_id: &str) -> Result<bool> {
+    let Some(index) = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(false);
+    };
+    let Some(repair) = completed_repair(project_root, &item.attempts[index])? else {
+        return Ok(false);
+    };
+    if !matches!(
+        item.attempts[index].status,
+        AttemptStatus::Planned | AttemptStatus::Reviewing
+    ) {
+        return Ok(false);
+    }
+    let later = &item.attempts[index + 1..];
+    if later.is_empty() {
+        return Ok(true);
+    }
+    let evidence_path = superseded_attempts_artifact_path(&item.id, attempt_id, &repair.task_id);
+    let bytes = match fs::read(project_root.join(&evidence_path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let evidence: SupersededAttemptsEvidence = serde_json::from_slice(&bytes)
+        .context("parse superseded candidate-ancestry queue admissions")?;
+    let expected_ids = later
+        .iter()
+        .map(|attempt| attempt.id.clone())
+        .collect::<Vec<_>>();
+    if evidence.schema_version != RECOVERY_SCHEMA_VERSION
+        || evidence.repair_task_id != repair.task_id
+        || evidence.resumed_attempt_id != attempt_id
+        || evidence.superseded_attempt_ids != expected_ids
+        || evidence.recovery_artifact
+            != recovery_artifact_path(&item.id, attempt_id, &repair.task_id)
+    {
+        return Ok(false);
+    }
+    Ok(later.iter().all(|attempt| {
+        attempt.status == AttemptStatus::Failed
+            && attempt.pause_kind.is_none()
+            && attempt.tasks.len() == 1
+            && attempt.tasks[0].status == TaskStatus::Superseded
+            && attempt.tasks[0].role == SUPERSEDED_ATTEMPT_ROLE
+            && attempt.tasks[0].output.is_none()
+            && attempt.tasks[0].input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == RECOVERY_PRODUCER && artifact.path == evidence_path
+            })
+    }))
+}
+
+fn reconcile_superseded_queue_admissions(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    repair: &CandidateAncestryRepair,
+) -> Result<()> {
+    let current = store.read_work_item(work_item_id)?;
+    let index = current
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let later = &current.attempts[index + 1..];
+    if later.is_empty() {
+        return Ok(());
+    }
+    let evidence_path =
+        superseded_attempts_artifact_path(work_item_id, attempt_id, &repair.task_id);
+    if is_resume_ready(project_root, &current, attempt_id)? {
+        return Ok(());
+    }
+    for attempt in later {
+        if !is_safe_interrupted_queue_admission(attempt) {
+            bail!(
+                "Attempt {:?} followed the repaired Attempt and is not an interrupted, output-free queue admission; Fluent will not supersede it",
+                attempt.id
+            );
+        }
+    }
+    let superseded_attempt_ids = later
+        .iter()
+        .map(|attempt| attempt.id.clone())
+        .collect::<Vec<_>>();
+    let evidence = SupersededAttemptsEvidence {
+        schema_version: RECOVERY_SCHEMA_VERSION,
+        repair_task_id: repair.task_id.clone(),
+        resumed_attempt_id: attempt_id.to_string(),
+        superseded_attempt_ids: superseded_attempt_ids.clone(),
+        recovery_artifact: recovery_artifact_path(work_item_id, attempt_id, &repair.task_id),
+    };
+    write_bytes_once(
+        &project_root.join(&evidence_path),
+        &serde_json::to_vec_pretty(&evidence)?,
+    )?;
+    let artifact = ArtifactRef {
+        producer_id: RECOVERY_PRODUCER.to_string(),
+        path: evidence_path.clone(),
+    };
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some(
+            "supersede accidental queue admission after candidate ancestry repair".to_string(),
+        ),
+        evidence_ref: Some(evidence_path),
+    };
+    store.mutate_work_item_with_transition(work_item_id, &transition, |item| {
+        let target_index = item
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let fresh_ids = item.attempts[target_index + 1..]
+            .iter()
+            .map(|attempt| attempt.id.clone())
+            .collect::<Vec<_>>();
+        if fresh_ids != superseded_attempt_ids
+            || item.attempts[target_index + 1..]
+                .iter()
+                .any(|attempt| !is_safe_interrupted_queue_admission(attempt))
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "a later queue admission changed before ancestry recovery reconciliation"
+                    .to_string(),
+            });
+        }
+        for attempt in &mut item.attempts[target_index + 1..] {
+            let task = &mut attempt.tasks[0];
+            task.status = TaskStatus::Superseded;
+            task.role = SUPERSEDED_ATTEMPT_ROLE.to_string();
+            task.completed_at.get_or_insert_with(now_iso8601);
+            if !task.input_artifacts.contains(&artifact) {
+                task.input_artifacts.push(artifact.clone());
+            }
+            attempt.status = AttemptStatus::Failed;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at.get_or_insert_with(now_iso8601);
+            if !attempt.artifacts.contains(&artifact) {
+                attempt.artifacts.push(artifact.clone());
+            }
+        }
+        Ok(())
+    })?;
+    let refreshed = store.read_work_item(work_item_id)?;
+    if !is_resume_ready(project_root, &refreshed, attempt_id)? {
+        bail!(
+            "candidate ancestry queue-admission reconciliation did not produce a resumable exact Attempt"
+        );
+    }
+    Ok(())
+}
+
+fn is_safe_interrupted_queue_admission(attempt: &Attempt) -> bool {
+    attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::Interrupted)
+        && attempt.tasks.len() == 1
+        && attempt.tasks[0].kind == TaskKind::Write
+        && attempt.tasks[0].status == TaskStatus::NeedsUser
+        && attempt.tasks[0].output.is_none()
+}
+
+fn superseded_attempts_artifact_path(
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+) -> String {
+    work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("candidate-ancestry-repairs/{task_id}/{SUPERSEDED_ATTEMPTS_FILE}"),
+    )
 }
 
 fn reconcile_completed_repair_review_inputs(
@@ -1066,7 +1272,10 @@ mod tests {
                 "fluent attempt repair-candidate-ancestry work-1 attempt-1 --resolution \"<describe the approved ancestry repair>\""
             )
         );
-        assert_eq!(scheduler_action("work-1"), "fluent queue add work-1");
+        assert_eq!(
+            scheduler_action("work-1", "attempt-1"),
+            "fluent queue resume work-1 --attempt attempt-1"
+        );
         let repair_result = repair(
             &fixture.project,
             &fixture.store,
@@ -1197,6 +1406,89 @@ mod tests {
                 .filter(|task| task.role == CANDIDATE_ANCESTRY_REPAIR_ROLE)
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair() {
+        let fixture = Fixture::new();
+        let repair_result = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Preserve the protected base and resume this exact Attempt.",
+        )
+        .unwrap();
+        crate::work_attempt_loop::plan_after_completed_writer(
+            &fixture.project,
+            &fixture.store,
+            fixture.store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        crate::queue::add(&fixture.project, "work-1", None).unwrap();
+        crate::queue::claim(&fixture.project, "work-1", "attempt-2")
+            .unwrap()
+            .unwrap();
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.add_initial_attempt("attempt-2")?;
+                let accidental = item.attempts.last_mut().unwrap();
+                crate::work_model::set_task_terminal(
+                    &mut accidental.tasks[0],
+                    TaskStatus::NeedsUser,
+                );
+                crate::work_model::suspend_attempt(accidental, PauseKind::Interrupted);
+                Ok(())
+            })
+            .unwrap();
+        crate::queue::remove(&fixture.project, "work-1").unwrap();
+
+        let repeated = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Reconcile the accidental queue admission without changing the candidate.",
+        )
+        .unwrap();
+        assert!(repeated.already_repaired);
+        assert_eq!(repeated.task_id, repair_result.task_id);
+        let reconciled = fixture.store.read_work_item("work-1").unwrap();
+        assert!(is_resume_ready(&fixture.project, &reconciled, "attempt-1").unwrap());
+        let accidental = &reconciled.attempts[1];
+        assert_eq!(accidental.status, AttemptStatus::Failed);
+        assert_eq!(accidental.tasks[0].status, TaskStatus::Superseded);
+        assert_eq!(accidental.tasks[0].role, SUPERSEDED_ATTEMPT_ROLE);
+
+        assert_eq!(
+            crate::queue::resume(&fixture.project, "work-1", "attempt-1", None).unwrap(),
+            crate::queue::ResumeDispatchOutcome::Created
+        );
+        let dispatch = crate::queue::show(&fixture.project, "work-1").unwrap();
+        assert_eq!(dispatch.bound_attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(dispatch.intent, crate::queue::DispatchIntent::ResumeAttempt);
+
+        let again = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "A repeated recovery remains idempotent.",
+        )
+        .unwrap();
+        assert!(again.already_repaired);
+        assert_eq!(
+            fixture
+                .store
+                .read_work_item("work-1")
+                .unwrap()
+                .attempts
+                .len(),
+            2
         );
     }
 

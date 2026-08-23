@@ -460,6 +460,8 @@ pub fn resume_with_tester_no_sandbox(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .is_some_and(crate::work_model::Attempt::has_reconciled_tester_harness_repair);
+    let reconciled_candidate_ancestry_repair =
+        crate::candidate_ancestry_recovery::is_resume_ready(project_root, &item, attempt_id)?;
     let learner_retry = crate::lifecycle_recovery::is_learner_retry_recovery(&item, attempt_id);
     let legacy_learner_tester_evidence =
         crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
@@ -501,6 +503,7 @@ pub fn resume_with_tester_no_sandbox(
         id,
         attempt_id,
         legacy_learner_tester_evidence,
+        reconciled_candidate_ancestry_repair,
     )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
@@ -785,18 +788,33 @@ fn ensure_resume_eligible(
     id: &str,
     attempt_id: &str,
     known_legacy_learner_tester_evidence: bool,
+    known_candidate_ancestry_repair: bool,
 ) -> Result<()> {
     item.ensure_not_abandoned()?;
     item.ensure_execution_ready()?;
     let attempt = item
         .attempts
-        .last()
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
-    if attempt.id != attempt_id {
+    let candidate_ancestry_repair = known_candidate_ancestry_repair
+        || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
+    if item
+        .attempts
+        .last()
+        .is_some_and(|current| current.id != attempt_id)
+        && !candidate_ancestry_repair
+    {
         bail!(
             "Work Item {id:?} current Attempt is {:?}, not {attempt_id:?}",
-            attempt.id
+            item.attempts
+                .last()
+                .map(|attempt| attempt.id.as_str())
+                .unwrap_or_default()
         );
+    }
+    if candidate_ancestry_repair {
+        return Ok(());
     }
     let legacy_learner_tester_evidence = known_legacy_learner_tester_evidence
         || crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
@@ -921,6 +939,7 @@ pub fn claim(
                 &item,
                 work_item_id,
                 persisted_attempt_id,
+                false,
                 false,
             )?;
             ensure_tester_no_sandbox_eligible(

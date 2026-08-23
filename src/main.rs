@@ -854,7 +854,7 @@ fn cmd_attempt(
             }
             println!(
                 "Next: {}",
-                fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id)
+                fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id, &attempt_id)
             );
         }
         AttemptCommands::Run {

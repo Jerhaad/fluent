@@ -6465,6 +6465,7 @@ Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_a
 WHEN Fluent repairs candidate ancestry, THE SYSTEM SHALL resume the same Attempt
 through its ordinary candidate gate and review lifecycle.
 Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+Test: src/candidate_ancestry_recovery.rs (supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair)
 
 ### B25j
 
@@ -6501,6 +6502,14 @@ IF unstarted reviewers from a completed candidate-ancestry repair reference an
 absent model transcript, THEN repeating the public repair command SHALL replace
 that reference with the durable host recovery evidence.
 Test: src/candidate_ancestry_recovery.rs (repeated_repair_reconciles_planned_review_inputs_without_fake_transcript)
+
+### B25o
+
+IF obsolete recovery guidance admitted a fresh Attempt after a completed
+candidate-ancestry repair, THEN repeating the public repair command SHALL
+supersede only an interrupted, output-free initial Writer, preserve an audited
+receipt, and authorize an exact resume of the repaired Attempt.
+Test: src/candidate_ancestry_recovery.rs (supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair)
 
 ### B26
 
