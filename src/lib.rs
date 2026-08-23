@@ -1,6 +1,7 @@
 pub mod atomic_write;
 pub mod auto_merge;
 pub(crate) mod baseline_cache;
+pub mod candidate_ancestry_recovery;
 pub mod candidate_gate;
 pub mod claude_auth;
 pub mod claude_diagnostics;

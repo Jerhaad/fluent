@@ -854,6 +854,11 @@ pub fn attempt_recovery_next_action(
     }) {
         return Some(action);
     }
+    if let Some(action) = project_root
+        .and_then(|root| crate::candidate_ancestry_recovery::recovery_action(root, attempt))
+    {
+        return Some(action);
+    }
     if attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(PauseKind::TesterHarness)
         && attempt.pause_recovery.is_none()

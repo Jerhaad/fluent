@@ -31,6 +31,7 @@ pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
 pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
 pub const TESTER_HARNESS_REPAIR_ROLE: &str = "tester-harness-repair";
+pub const CANDIDATE_ANCESTRY_REPAIR_ROLE: &str = "candidate-ancestry-repair";
 
 fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
     let source = Path::new(path);
@@ -1474,6 +1475,91 @@ impl WorkItem {
         attempt.status = AttemptStatus::Planned;
         attempt.review_state = Some(AttemptReviewState::Failed);
 
+        self.validate()?;
+        Ok(task_id)
+    }
+
+    /// Record one host-owned candidate ancestry repair as a completed Writer
+    /// frontier. The source Writer and its rejected gate remain unchanged in
+    /// history; ordinary gates and reviewers consume this new exact commit.
+    pub(crate) fn add_completed_candidate_ancestry_repair(
+        &mut self,
+        attempt_id: &str,
+        protected_base_commit: &str,
+        recovered_commit: &str,
+        recovery_artifact: ArtifactRef,
+    ) -> Result<String, WorkModelError> {
+        self.ensure_not_abandoned()?;
+        let preserved_recovery = self.with_preserved_inputs(vec![recovery_artifact]);
+        let Some(attempt) = self
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Err(WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            });
+        };
+        let source = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.clone())
+            .ok_or_else(|| WorkModelError::AttemptMissingCompletedWriteTask {
+                attempt_id: attempt_id.to_string(),
+            })?;
+        let next_round = attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count()
+            + 1;
+        let task_id = format!("{attempt_id}-write-{next_round}");
+        validate_id("task", &task_id)?;
+        if attempt.tasks.iter().any(|task| task.id == task_id) {
+            return Err(WorkModelError::TaskAlreadyExists { id: task_id });
+        }
+        let timestamp = now_iso8601();
+        attempt.tasks.push(Task {
+            id: task_id.clone(),
+            kind: TaskKind::Write,
+            status: TaskStatus::Complete,
+            role: CANDIDATE_ANCESTRY_REPAIR_ROLE.to_string(),
+            instructions: None,
+            work_item_id: self.id.clone(),
+            attempt_id: Some(attempt_id.to_string()),
+            workspace_access: WorkspaceAccess {
+                reads: Vec::new(),
+                writes: vec![WorkspaceRef {
+                    id: source.workspace_id.clone(),
+                    path: source.workspace_path.clone(),
+                }],
+            },
+            artifact_area: Some(TaskArtifactArea {
+                path: work_artifact_path(&self.id, attempt_id, &task_id),
+            }),
+            review_context: None,
+            evidence_review_context: None,
+            input_artifacts: preserved_recovery,
+            depends_on: None,
+            output: Some(TaskOutput {
+                workspace_id: source.workspace_id,
+                workspace_path: source.workspace_path,
+                source_branch: source.source_branch,
+                base_commit: Some(protected_base_commit.to_string()),
+                commit: recovered_commit.to_string(),
+                no_change: None,
+                learner_canonicalization: None,
+            }),
+            created_at: Some(timestamp.clone()),
+            started_at: Some(timestamp.clone()),
+            completed_at: Some(timestamp),
+        });
+        attempt.status = AttemptStatus::Planned;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.pause_kind = None;
+        attempt.completed_at = None;
         self.validate()?;
         Ok(task_id)
     }
@@ -5664,6 +5750,47 @@ impl Task {
                 });
             }
         }
+        if self.role == CANDIDATE_ANCESTRY_REPAIR_ROLE {
+            let output_matches_write = self.output.as_ref().is_some_and(|output| {
+                self.workspace_access
+                    .writes
+                    .as_slice()
+                    .first()
+                    .is_some_and(|workspace| {
+                        self.workspace_access.writes.len() == 1
+                            && workspace.id == output.workspace_id
+                            && workspace.path == output.workspace_path
+                            && output.base_commit.is_some()
+                            && output.no_change.is_none()
+                            && output.learner_canonicalization.is_none()
+                    })
+            });
+            let evidence_path = self.attempt_id.as_deref().map(|attempt_id| {
+                work_artifact_path(
+                    &self.work_item_id,
+                    attempt_id,
+                    &format!("candidate-ancestry-repairs/{}/recovery.json", self.id),
+                )
+            });
+            let has_evidence = evidence_path.as_deref().is_some_and(|expected| {
+                self.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id == "candidate-ancestry-recovery"
+                        && artifact.path == expected
+                })
+            });
+            if self.kind != TaskKind::Write
+                || self.status != TaskStatus::Complete
+                || self.artifact_area.is_none()
+                || !output_matches_write
+                || !has_evidence
+                || self.review_context.is_some()
+                || self.depends_on.is_some()
+            {
+                return Err(WorkModelError::InvalidCandidateAncestryRepairTask {
+                    task_id: self.id.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -6480,6 +6607,9 @@ pub enum WorkModelError {
     InvalidTesterHarnessRepairTask {
         task_id: String,
     },
+    InvalidCandidateAncestryRepairTask {
+        task_id: String,
+    },
     CompleteAttemptHasIncompleteTask {
         attempt_id: String,
         task_id: String,
@@ -6742,6 +6872,12 @@ impl fmt::Display for WorkModelError {
                 write!(
                     f,
                     "task {task_id} has invalid Tester-harness repair context"
+                )
+            }
+            Self::InvalidCandidateAncestryRepairTask { task_id } => {
+                write!(
+                    f,
+                    "task {task_id} has invalid candidate ancestry repair context"
                 )
             }
             Self::CompleteAttemptHasIncompleteTask {

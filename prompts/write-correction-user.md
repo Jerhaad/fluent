@@ -57,7 +57,9 @@ drop, or replace the prior candidate commit. Before finishing, verify that
 Fluent explicitly authorizes a tree-identical metadata rewrite of
 `{{prior_candidate_commit}}`. Change commit metadata only; the resulting candidate tree must
 remain exactly identical to that prior candidate's tree. Do not change file content as part of
-this rewrite. Fluent will verify the tree identity and original-base ancestry afterward.
+this rewrite. Commit `{{protected_base_commit}}` is the protected base: do not amend, rebase,
+drop, or replace it, and verify that it remains an ancestor of `HEAD`. Rewrite only commits after
+that protected base. Fluent will verify the tree identity and protected-base ancestry afterward.
 {{/if}}
 
 {{#if has_failed_tester_inspection}}

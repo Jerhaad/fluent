@@ -119,6 +119,8 @@ impl ExecutionContextCorrectionLineageMode {
 struct ExecutionContextCorrectionLineage {
     mode: ExecutionContextCorrectionLineageMode,
     prior_candidate_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protected_base_commit: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -4693,6 +4695,13 @@ fn build_reviewed_correction_prompt(
                     ""
                 },
             ),
+            (
+                "protected_base_commit",
+                correction_lineage
+                    .protected_base_commit
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
             ("correction_artifacts_list", &correction_artifacts_list),
             (
                 "is_tester_harness_repair",
@@ -4764,11 +4773,15 @@ fn correction_lineage(
                 .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE)
         })
         .collect::<Vec<_>>();
-    let mode = if candidate_gates.len() == 1
-        && crate::candidate_gate::authorizes_tree_identical_metadata_rewrite(
-            candidate_gates[0],
-            prior_candidate_commit,
-        ) {
+    let protected_base_commit = (candidate_gates.len() == 1)
+        .then(|| {
+            crate::candidate_gate::authorized_tree_identical_metadata_rewrite_base(
+                candidate_gates[0],
+                prior_candidate_commit,
+            )
+        })
+        .flatten();
+    let mode = if protected_base_commit.is_some() {
         ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
     } else {
         ExecutionContextCorrectionLineageMode::AppendOnly
@@ -4776,6 +4789,7 @@ fn correction_lineage(
     ExecutionContextCorrectionLineage {
         mode,
         prior_candidate_commit: prior_candidate_commit.to_string(),
+        protected_base_commit,
     }
 }
 
@@ -17634,10 +17648,12 @@ mod tests {
             serde_json::json!({
                 "mode": "tree-identical-metadata-rewrite",
                 "prior-candidate-commit": prior_candidate,
+                "protected-base-commit": gate.base_commit.clone(),
             })
         );
         assert!(prompt.contains("tree-identical-metadata-rewrite"));
         assert!(prompt.contains(&prior_candidate));
+        assert!(prompt.contains(&gate.base_commit));
         assert!(!prompt.contains("{{"));
 
         let whitespace = gate

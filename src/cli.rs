@@ -483,6 +483,17 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Repair a tree-identical metadata rewrite that replaced a protected base
+    RepairCandidateAncestry {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision approving the exact ancestry repair
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Advance an Attempt through the next safe transitions
     Run {
         /// Work Item ID
@@ -1110,6 +1121,32 @@ mod tests {
                     }
                 }
             }) if review_artifact.is_empty() && recheck.ends_with("failed-command-recheck.json")
+        ));
+    }
+
+    #[test]
+    fn candidate_ancestry_repair_parses_operator_resolution() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "repair-candidate-ancestry",
+            "work-1",
+            "attempt-1",
+            "--resolution",
+            "Preserve the protected base.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::RepairCandidateAncestry {
+                    work_item_id,
+                    attempt_id,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && resolution == "Preserve the protected base."
         ));
     }
 }

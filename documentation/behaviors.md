@@ -6440,6 +6440,54 @@ tree, and prior gate path in the replacement gate evidence.
 Test: src/candidate_gate.rs (accepts_tree_identical_metadata_rewrite_from_legacy_gate)
 Test: src/work_attempt_loop.rs (metadata_only_history_repair_reaches_review)
 
+### B25f
+
+WHEN Fluent authorizes a tree-identical commit-metadata rewrite, THE SYSTEM
+SHALL provide the corrective Writer with the exact commit that must remain the
+replacement candidate's protected ancestor.
+Test: src/work_task_executor.rs (metadata_only_gate_explicitly_authorizes_tree_identical_rewrite_guidance)
+
+### B25g
+
+WHEN the operator approves candidate-ancestry repair for an authorized
+tree-identical metadata rewrite that replaced its protected base, THE SYSTEM
+SHALL reconstruct the unchanged candidate tree on the protected base.
+Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+
+### B25h
+
+WHEN Fluent repairs candidate ancestry, THE SYSTEM SHALL preserve the rejected
+candidate history.
+Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+
+### B25i
+
+WHEN Fluent repairs candidate ancestry, THE SYSTEM SHALL resume the same Attempt
+through its ordinary candidate gate and review lifecycle.
+Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+
+### B25j
+
+IF the candidate worktree is dirty or its HEAD, tree, protected base, rejected
+candidate, or gate evidence has drifted, THEN THE SYSTEM SHALL reject the
+candidate-ancestry repair without changing Attempt state or candidate history.
+Test: src/candidate_ancestry_recovery.rs (rejects_dirty_candidate_without_mutating_history_or_state)
+Test: src/candidate_ancestry_recovery.rs (rejects_clean_candidate_head_drift_without_mutating_attempt_state)
+
+### B25k
+
+WHEN an operator repeats a completed candidate-ancestry repair request, THE
+SYSTEM SHALL return the recorded repair without creating another recovered
+candidate or recovery record.
+Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+
+### B25l
+
+WHEN an interrupted candidate-ancestry repair is retried after its durable
+recovery record was written, THE SYSTEM SHALL reconcile either the original or
+already-reconstructed candidate into the same recorded Attempt transition.
+Test: src/candidate_ancestry_recovery.rs (reconciles_interrupted_repair_after_branch_move)
+
 ### B26
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL resolve every

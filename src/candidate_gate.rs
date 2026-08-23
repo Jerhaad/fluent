@@ -75,6 +75,18 @@ pub struct CandidateMetadataRewriteEvidence {
     pub candidate_tree: String,
 }
 
+/// Exact host-owned authority for repairing a metadata rewrite that preserved
+/// the candidate tree but accidentally removed the protected base from its
+/// ancestry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateAncestryRepairAuthorization {
+    pub protected_base_commit: String,
+    pub rejected_candidate_commit: String,
+    pub candidate_commit: String,
+    pub candidate_tree: String,
+    pub prior_gate_path: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CandidateMetadataRewriteAuthorization {
@@ -365,7 +377,7 @@ pub(crate) fn read_prior_writer_gate(
         .map_err(|error| format!("prior candidate gate is malformed: {error}"))
 }
 
-fn validate_prior_writer_gate(
+pub(crate) fn validate_prior_writer_gate(
     prior: &CandidateGateEvidence,
     expected_candidate: &str,
 ) -> std::result::Result<(), String> {
@@ -430,28 +442,88 @@ fn validate_prior_writer_gate(
     Ok(())
 }
 
-/// Return whether a prior host-owned gate explicitly permits replacing the
-/// current candidate commit solely to repair its commit metadata.
-///
-/// Prompt guidance treats every missing, malformed, mismatched, or otherwise
-/// untrusted gate as append-only. The candidate gate still performs the final
-/// tree-identity verification after the Writer produces a replacement.
-pub(crate) fn authorizes_tree_identical_metadata_rewrite(
+/// Return the protected base when one rejected metadata gate authorizes an
+/// exact tree-identical rewrite of `expected_candidate`.
+pub(crate) fn authorized_tree_identical_metadata_rewrite_base(
     path: &Path,
     expected_candidate: &str,
-) -> bool {
-    let Ok(prior) = read_prior_writer_gate(path) else {
-        return false;
-    };
-    if validate_prior_writer_gate(&prior, expected_candidate).is_err() {
-        return false;
-    }
+) -> Option<String> {
+    let prior = read_prior_writer_gate(path).ok()?;
+    validate_prior_writer_gate(&prior, expected_candidate).ok()?;
     prior
         .checks
         .iter()
         .filter(|check| check.status == CandidateCheckStatus::Failed)
         .map(|check| check.name.as_str())
         .eq(["commit-metadata"])
+        .then_some(prior.base_commit)
+}
+
+/// Recognize only the blocked gate shape produced when an otherwise valid,
+/// tree-identical metadata repair replaced its protected base commit.
+pub(crate) fn candidate_ancestry_repair_authorization(
+    evidence: &CandidateGateEvidence,
+) -> Option<CandidateAncestryRepairAuthorization> {
+    if evidence.schema_version == 0
+        || evidence.schema_version > CANDIDATE_GATE_SCHEMA_VERSION
+        || evidence.phase != CandidateGatePhase::Writer
+        || evidence.disposition != CandidateGateDisposition::Blocked
+    {
+        return None;
+    }
+    let rewrite = evidence.metadata_rewrite.as_ref()?;
+    if rewrite.authorization != CandidateMetadataRewriteAuthorization::RejectedMetadataGate
+        || evidence.base_commit != rewrite.original_base_commit
+        || evidence.candidate_commit != rewrite.replacement_candidate_commit
+    {
+        return None;
+    }
+    let prior_gate_path = rewrite.prior_gate_path.clone()?;
+    let expected_checks = [
+        "candidate-identity",
+        "whitespace",
+        "commit-metadata",
+        "behavior-references",
+        "tester-reference-evidence",
+        "project-check",
+    ];
+    if evidence.checks.len() != expected_checks.len()
+        || expected_checks.iter().any(|name| {
+            evidence
+                .checks
+                .iter()
+                .filter(|check| check.name == *name)
+                .count()
+                != 1
+        })
+    {
+        return None;
+    }
+    let expected_diagnostic = format!(
+        "original base commit {} is not an ancestor of candidate {}",
+        rewrite.original_base_commit, evidence.candidate_commit
+    );
+    let mut blocking_checks = evidence.checks.iter().filter(|check| {
+        matches!(
+            check.status,
+            CandidateCheckStatus::Failed | CandidateCheckStatus::Error
+        )
+    });
+    let identity = blocking_checks.next()?;
+    if identity.name != "candidate-identity"
+        || identity.status != CandidateCheckStatus::Error
+        || identity.diagnostics.as_slice() != [expected_diagnostic]
+        || blocking_checks.next().is_some()
+    {
+        return None;
+    }
+    Some(CandidateAncestryRepairAuthorization {
+        protected_base_commit: rewrite.original_base_commit.clone(),
+        rejected_candidate_commit: rewrite.rejected_candidate_commit.clone(),
+        candidate_commit: evidence.candidate_commit.clone(),
+        candidate_tree: rewrite.candidate_tree.clone(),
+        prior_gate_path,
+    })
 }
 
 fn validate_metadata_only_rewrite(
@@ -1365,6 +1437,77 @@ mod tests {
         let evidence = run_candidate_gate(request).unwrap();
 
         assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+    }
+
+    #[test]
+    fn recognizes_only_tree_identical_protected_base_ancestry_failures() {
+        let protected = "a".repeat(40);
+        let rejected = "b".repeat(40);
+        let candidate = "c".repeat(40);
+        let diagnostic =
+            format!("original base commit {protected} is not an ancestor of candidate {candidate}");
+        let mut evidence = CandidateGateEvidence {
+            schema_version: CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: CandidateGatePhase::Writer,
+            disposition: CandidateGateDisposition::Blocked,
+            base_commit: protected.clone(),
+            candidate_commit: candidate.clone(),
+            tester_results_path: None,
+            metadata_rewrite: Some(CandidateMetadataRewriteEvidence {
+                prior_gate_path: Some(".fluent/work/prior/candidate-gate.json".to_string()),
+                authorization: CandidateMetadataRewriteAuthorization::RejectedMetadataGate,
+                original_base_commit: protected.clone(),
+                rejected_candidate_commit: rejected.clone(),
+                replacement_candidate_commit: candidate.clone(),
+                candidate_tree: "tree".to_string(),
+            }),
+            checks: vec![
+                CandidateCheckEvidence {
+                    name: "candidate-identity".to_string(),
+                    status: CandidateCheckStatus::Error,
+                    diagnostics: vec![diagnostic],
+                    log_path: None,
+                },
+                CandidateCheckEvidence {
+                    name: "whitespace".to_string(),
+                    status: CandidateCheckStatus::Passed,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+                CandidateCheckEvidence {
+                    name: "commit-metadata".to_string(),
+                    status: CandidateCheckStatus::Passed,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+                CandidateCheckEvidence {
+                    name: "behavior-references".to_string(),
+                    status: CandidateCheckStatus::Passed,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+                CandidateCheckEvidence {
+                    name: "tester-reference-evidence".to_string(),
+                    status: CandidateCheckStatus::Skipped,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+                CandidateCheckEvidence {
+                    name: "project-check".to_string(),
+                    status: CandidateCheckStatus::Skipped,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+            ],
+        };
+
+        let authorization = candidate_ancestry_repair_authorization(&evidence).unwrap();
+        assert_eq!(authorization.protected_base_commit, protected);
+        assert_eq!(authorization.rejected_candidate_commit, rejected);
+        assert_eq!(authorization.candidate_commit, candidate);
+
+        evidence.checks[1].status = CandidateCheckStatus::Failed;
+        assert!(candidate_ancestry_repair_authorization(&evidence).is_none());
     }
 
     #[test]

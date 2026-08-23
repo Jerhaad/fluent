@@ -5677,7 +5677,7 @@ fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
     })
 }
 
-fn plan_after_completed_writer(
+pub(crate) fn plan_after_completed_writer(
     project_root: &Path,
     store: &WorkModelStore,
     mut item: WorkItem,
@@ -6232,10 +6232,21 @@ fn write_candidate_gate_handoff(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let recovery = crate::candidate_gate::candidate_ancestry_repair_authorization(evidence)
+        .map(|_| {
+            format!(
+                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`fluent attempt repair-candidate-ancestry {work_item_id} {attempt_id} --resolution \"<describe the approved ancestry repair>\"`\n\nAfter the repair, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "After resolving the reported condition, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
+            )
+        });
     fs::write(
         &path,
         format!(
-            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\nAfter resolving the reported condition, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
+            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\n{recovery}\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
         ),
     )?;
     Ok(relative_path)
@@ -6788,7 +6799,11 @@ fn record_writer_run(
         task_id: task.id.clone(),
         outcome,
         kind,
-        provider: attempt.coder_mapping.write.coder.as_str().to_string(),
+        provider: if task.role == crate::work_model::CANDIDATE_ANCESTRY_REPAIR_ROLE {
+            "fluent-host".to_string()
+        } else {
+            attempt.coder_mapping.write.coder.as_str().to_string()
+        },
         session_id,
         continuation,
         checked_required,

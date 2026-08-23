@@ -827,6 +827,33 @@ fn cmd_attempt(
             }
             println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
         }
+        AttemptCommands::RepairCandidateAncestry {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::candidate_ancestry_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_repaired {
+                println!(
+                    "Candidate ancestry repair {} is already recorded at {}",
+                    repair.task_id, repair.recovered_candidate_commit
+                );
+            } else {
+                println!(
+                    "Repaired candidate ancestry {} -> {} with protected base {}",
+                    repair.source_candidate_commit,
+                    repair.recovered_candidate_commit,
+                    repair.protected_base_commit
+                );
+            }
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::Run {
             work_item_id,
             attempt_id,

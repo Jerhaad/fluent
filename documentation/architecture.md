@@ -304,9 +304,21 @@ unwanted content still requires a new correction commit, and the preceding
 candidate must remain an ancestor. Fluent renders
 `tree-identical-metadata-rewrite` only when one validated rejected gate names the
 current candidate and commit metadata is its sole failed check. That mode tells
-the Writer to change metadata without changing the tree. These instructions
-reduce avoidable correction failures; the deterministic candidate gate remains
-the enforcement boundary and independently verifies the resulting history.
+the Writer to change metadata without changing the tree and supplies the exact
+protected base that must remain an ancestor. These instructions reduce
+avoidable correction failures; the deterministic candidate gate remains the
+enforcement boundary and independently verifies the resulting history.
+
+If the Writer nevertheless replaces that protected base, and this is the only
+blocking check, the gate offers the public `fluent attempt
+repair-candidate-ancestry` transition. The host revalidates the current gate,
+its prior metadata-only gate, the clean registered worktree, both candidate
+trees, and the protected ancestry. It preserves the rejected replacement under
+a recovery ref, records durable recovery intent, then creates one host-owned
+Writer result whose unchanged tree has the protected base as its sole parent.
+The intent record makes retries safe before or after the branch advances. The
+same Attempt then returns through the ordinary candidate gate and review
+lifecycle; unrelated candidate drift remains ineligible.
 An attached review, Tester, or candidate-gate correction artifact selects this
 route even when the preceding Writer run was recorded as a pre-review
 continuation; corrective evidence takes precedence over that older outcome.
