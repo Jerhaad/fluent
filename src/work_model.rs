@@ -1173,10 +1173,21 @@ impl WorkItem {
                 .as_ref()
                 .map(|area| area.path.clone())
                 .unwrap_or_else(|| work_artifact_path(&self.id, attempt_id, &latest_write.id));
-            task_input_artifacts.push(ArtifactRef {
-                producer_id: latest_write.id.clone(),
-                path: format!("{writer_artifact_path}/transcript.jsonl"),
-            });
+            if latest_write.role == CANDIDATE_ANCESTRY_REPAIR_ROLE {
+                for artifact in latest_write.input_artifacts.iter().filter(|artifact| {
+                    artifact.producer_id == "candidate-ancestry-recovery"
+                        && artifact.path.ends_with("/recovery.json")
+                }) {
+                    if !task_input_artifacts.contains(artifact) {
+                        task_input_artifacts.push(artifact.clone());
+                    }
+                }
+            } else {
+                task_input_artifacts.push(ArtifactRef {
+                    producer_id: latest_write.id.clone(),
+                    path: format!("{writer_artifact_path}/transcript.jsonl"),
+                });
+            }
             if attempt.writer_completion_contract.is_some() {
                 let completion = attempt
                     .artifacts

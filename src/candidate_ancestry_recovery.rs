@@ -93,6 +93,7 @@ pub fn repair(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
     if let Some(repair) = completed_repair(project_root, attempt)? {
+        reconcile_completed_repair_review_inputs(store, work_item_id, attempt_id, &repair)?;
         return Ok(repair);
     }
     let eligible = inspect_eligible(project_root, attempt)?;
@@ -274,6 +275,82 @@ pub fn repair(
         protected_base_commit: protected_base,
         already_repaired: false,
     })
+}
+
+fn reconcile_completed_repair_review_inputs(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    repair: &CandidateAncestryRepair,
+) -> Result<()> {
+    let evidence_path = recovery_artifact_path(work_item_id, attempt_id, &repair.task_id);
+    let evidence = ArtifactRef {
+        producer_id: RECOVERY_PRODUCER.to_string(),
+        path: evidence_path.clone(),
+    };
+    let current = store.read_work_item(work_item_id)?;
+    let current_attempt = current
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let needs_reconciliation = current_attempt.tasks.iter().any(|task| {
+        task.kind == TaskKind::Review
+            && task.review_context.as_ref().is_some_and(|context| {
+                context.candidate_commit == repair.recovered_candidate_commit
+            })
+            && (task.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == repair.task_id
+                    && artifact.path.ends_with("/transcript.jsonl")
+            }) || !task.input_artifacts.contains(&evidence))
+    });
+    if !needs_reconciliation {
+        return Ok(());
+    }
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("reconcile candidate ancestry review inputs".to_string()),
+        evidence_ref: Some(evidence_path),
+    };
+    store.mutate_work_item_with_transition(work_item_id, &transition, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        for task in attempt.tasks.iter_mut().filter(|task| {
+            task.kind == TaskKind::Review
+                && task.review_context.as_ref().is_some_and(|context| {
+                    context.candidate_commit == repair.recovered_candidate_commit
+                })
+        }) {
+            let stale_transcript = task.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == repair.task_id
+                    && artifact.path.ends_with("/transcript.jsonl")
+            });
+            let missing_evidence = !task.input_artifacts.contains(&evidence);
+            if (stale_transcript || missing_evidence) && task.status != TaskStatus::Planned {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!(
+                        "review Task {:?} advanced before host recovery inputs were reconciled",
+                        task.id
+                    ),
+                });
+            }
+            task.input_artifacts.retain(|artifact| {
+                !(artifact.producer_id == repair.task_id
+                    && artifact.path.ends_with("/transcript.jsonl"))
+            });
+            if missing_evidence {
+                task.input_artifacts.push(evidence.clone());
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRecovery> {
@@ -1079,11 +1156,25 @@ mod tests {
             crate::work_attempt_loop::WorkAttemptRunOutcome::PlannedReviews { .. }
         ));
         let resumed = fixture.store.read_work_item("work-1").unwrap();
-        assert!(resumed.attempts[0].tasks.iter().any(|task| {
-            task.kind == TaskKind::Review
-                && task.review_context.as_ref().is_some_and(|context| {
-                    context.candidate_commit == repair_result.recovered_candidate_commit
-                })
+        let reviewers = resumed.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+            .collect::<Vec<_>>();
+        assert!(!reviewers.is_empty());
+        assert!(reviewers.iter().all(|task| {
+            task.review_context.as_ref().is_some_and(|context| {
+                context.candidate_commit == repair_result.recovered_candidate_commit
+            })
+        }));
+        assert!(reviewers.iter().all(|task| {
+            task.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == RECOVERY_PRODUCER
+                    && artifact.path.ends_with("/recovery.json")
+            }) && !task.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == repair_result.task_id
+                    && artifact.path.ends_with("/transcript.jsonl")
+            })
         }));
 
         let repeated = repair(
@@ -1267,5 +1358,71 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn repeated_repair_reconciles_planned_review_inputs_without_fake_transcript() {
+        let fixture = Fixture::new();
+        let repair_result = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Preserve the accepted protected base and unchanged final tree.",
+        )
+        .unwrap();
+        crate::work_attempt_loop::plan_after_completed_writer(
+            &fixture.project,
+            &fixture.store,
+            fixture.store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                for task in item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task.kind == TaskKind::Review)
+                {
+                    task.input_artifacts
+                        .retain(|artifact| artifact.producer_id != RECOVERY_PRODUCER);
+                    task.input_artifacts.push(ArtifactRef {
+                        producer_id: repair_result.task_id.clone(),
+                        path: format!(
+                            ".fluent/work/artifacts/work-1/attempt-1/{}/transcript.jsonl",
+                            repair_result.task_id
+                        ),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let repeated = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "A repeated invocation reconciles its planned reviewers.",
+        )
+        .unwrap();
+        assert!(repeated.already_repaired);
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        for reviewer in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(reviewer.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == RECOVERY_PRODUCER
+                    && artifact.path.ends_with("/recovery.json")
+            }));
+            assert!(!reviewer.input_artifacts.iter().any(|artifact| {
+                artifact.producer_id == repair_result.task_id
+                    && artifact.path.ends_with("/transcript.jsonl")
+            }));
+        }
     }
 }

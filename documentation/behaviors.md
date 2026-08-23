@@ -6488,6 +6488,20 @@ recovery record was written, THE SYSTEM SHALL reconcile either the original or
 already-reconstructed candidate into the same recorded Attempt transition.
 Test: src/candidate_ancestry_recovery.rs (reconciles_interrupted_repair_after_branch_move)
 
+### B25m
+
+WHEN Fluent plans reviewers for a host-owned candidate-ancestry repair, THE
+SYSTEM SHALL provide its durable recovery evidence without requiring a model
+Writer transcript.
+Test: src/candidate_ancestry_recovery.rs (repairs_exact_tree_on_protected_base_and_is_idempotent)
+
+### B25n
+
+IF unstarted reviewers from a completed candidate-ancestry repair reference an
+absent model transcript, THEN repeating the public repair command SHALL replace
+that reference with the durable host recovery evidence.
+Test: src/candidate_ancestry_recovery.rs (repeated_repair_reconciles_planned_review_inputs_without_fake_transcript)
+
 ### B26
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL resolve every
