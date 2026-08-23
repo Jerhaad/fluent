@@ -210,6 +210,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                 merge_candidate_id: candidate.id.clone(),
                 merged_commit: merged_commit.to_string(),
             };
+            reconcile_landed_attempt(config.store, config.work_item_id, &candidate.id)?;
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
                 eprintln!(
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
@@ -223,6 +224,7 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
                 merge_candidate_id: candidate.id.clone(),
                 merged_commit,
             };
+            reconcile_landed_attempt(config.store, config.work_item_id, &candidate.id)?;
             if let Err(error) = process_landed_follow_ups(&config, &outcome) {
                 eprintln!(
                     "  Warning: failed to update follow-up-processing recovery state: {error}"
@@ -1942,7 +1944,20 @@ fn record_candidate_merged(
     check_artifacts: Vec<ArtifactRef>,
     review_artifacts: Vec<ArtifactRef>,
 ) -> Result<()> {
-    update_candidate(store, work_item_id, candidate_id, |candidate| {
+    let mut item = read_work_item_or_not_found(store, work_item_id)?;
+    let candidate_index = item
+        .merge_candidates
+        .iter()
+        .position(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Merge Candidate {:?} not found in Work Item {:?}",
+                candidate_id,
+                work_item_id
+            )
+        })?;
+    {
+        let candidate = &mut item.merge_candidates[candidate_index];
         candidate.merge_review_state = MergeReviewState::Passed;
         candidate.merge_state = MergeCandidateMergeState {
             status: MergeCandidateMergeStatus::Merged,
@@ -1957,7 +1972,71 @@ fn record_candidate_merged(
             candidate,
             MergeCandidateMergeStatus::Merged,
         );
-    })
+    }
+    reconcile_landed_attempt_in_item(&mut item, candidate_index);
+    store.write_work_item_with_transition(&item, &landing_transition())?;
+    Ok(())
+}
+
+/// Close a landing-owned host-sandbox pause once its Merge Candidate is
+/// authoritatively merged. The failed handoff and lifecycle transition remain
+/// durable history, while the old Rebase Task becomes explicitly non-actionable.
+fn reconcile_landed_attempt(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    candidate_id: &str,
+) -> Result<()> {
+    let mut item = read_work_item_or_not_found(store, work_item_id)?;
+    let candidate_index = item
+        .merge_candidates
+        .iter()
+        .position(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Merge Candidate {:?} not found in Work Item {:?}",
+                candidate_id,
+                work_item_id
+            )
+        })?;
+    if !reconcile_landed_attempt_in_item(&mut item, candidate_index) {
+        return Ok(());
+    }
+    store.write_work_item_with_transition(&item, &landing_transition())?;
+    Ok(())
+}
+
+fn reconcile_landed_attempt_in_item(item: &mut WorkItem, candidate_index: usize) -> bool {
+    let candidate = &item.merge_candidates[candidate_index];
+    if candidate.merge_state.status != MergeCandidateMergeStatus::Merged
+        || candidate.merge_state.merged_commit.is_none()
+    {
+        return false;
+    }
+    let attempt_id = candidate.attempt_id.clone();
+    let Some(attempt) = item
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for task in &mut attempt.tasks {
+        if task.kind == TaskKind::Rebase && task.status == TaskStatus::NeedsUser {
+            crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+            changed = true;
+        }
+    }
+    if attempt.status == crate::work_model::AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(crate::work_model::PauseKind::HostSandbox)
+    {
+        attempt.status = crate::work_model::AttemptStatus::Complete;
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        changed = true;
+    }
+    changed
 }
 
 fn update_candidate(

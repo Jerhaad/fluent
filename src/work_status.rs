@@ -135,7 +135,15 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .map(format_attempt)
             .unwrap_or_else(|| "-".to_string()),
         task: attempt
-            .and_then(select_task)
+            .and_then(|attempt| {
+                if merge_candidate.is_some_and(|candidate| {
+                    candidate.merge_state.status == MergeCandidateMergeStatus::Merged
+                }) {
+                    attempt.tasks.last()
+                } else {
+                    select_task(attempt)
+                }
+            })
             .map(|task| format_task_with_liveness(task, item, project_root))
             .unwrap_or_else(|| "-".to_string()),
         review: attempt
@@ -151,7 +159,13 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .unwrap_or_else(|| "-".to_string()),
         action: action_label_with_liveness(item, attempt, merge_candidate, project_root)
             .to_string(),
-        next_action: attempt_recovery_next_action(attempt, project_root),
+        next_action: if merge_candidate.is_some_and(|candidate| {
+            candidate.merge_state.status == MergeCandidateMergeStatus::Merged
+        }) {
+            None
+        } else {
+            attempt_recovery_next_action(attempt, project_root)
+        },
         metrics: work_metrics(item, project_root),
         compatibility_warnings: item.compatibility_warnings(),
         release: item
@@ -731,6 +745,14 @@ fn action_label_with_liveness(
 ) -> &'static str {
     if item.abandonment.is_some() {
         return "abandoned";
+    }
+
+    // A merged Merge Candidate is the authoritative terminal result. Historical
+    // Attempt or Task pauses must never turn it back into actionable Work.
+    if merge_candidate
+        .is_some_and(|candidate| candidate.merge_state.status == MergeCandidateMergeStatus::Merged)
+    {
+        return "merged";
     }
 
     if let Some(attempt) = attempt {
@@ -1375,6 +1397,36 @@ mod tests {
 
         assert_eq!(row.task, "write:attempt-1-write-1 [needs-user]");
         assert_eq!(row.action, "needs-user");
+    }
+
+    #[test]
+    fn merged_candidate_suppresses_stale_attempt_recovery_guidance() {
+        let (mut item, _) = passed_attempt_with_candidate(None);
+        let attempt = &mut item.attempts[0];
+        let mut completed_rebase = attempt.tasks[0].clone();
+        attempt.tasks[0].id = "attempt-1-rebase".to_string();
+        attempt.tasks[0].kind = TaskKind::Rebase;
+        attempt.tasks[0].role = "rebase".to_string();
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        attempt.tasks[0].output = None;
+        completed_rebase.id = "attempt-1-rebase-2".to_string();
+        completed_rebase.kind = TaskKind::Rebase;
+        completed_rebase.role = "rebase".to_string();
+        completed_rebase.status = TaskStatus::Complete;
+        completed_rebase.output = None;
+        attempt.tasks.push(completed_rebase);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::HostSandbox);
+        let candidate = &mut item.merge_candidates[0];
+        candidate.merge_review_state = MergeReviewState::Passed;
+        candidate.merge_state.status = MergeCandidateMergeStatus::Merged;
+        candidate.merge_state.merged_commit = Some("abc123".to_string());
+
+        let row = summarize_work_item(&item, None);
+
+        assert_eq!(row.task, "rebase:attempt-1-rebase-2 [complete]");
+        assert_eq!(row.action, "merged");
+        assert_eq!(row.next_action, None);
     }
 
     #[test]

@@ -281,7 +281,10 @@ fn attempt_is_terminal(attempt: &Attempt) -> bool {
 }
 
 fn task_is_terminal(task: &Task) -> bool {
-    matches!(task.status, TaskStatus::Complete | TaskStatus::Failed)
+    matches!(
+        task.status,
+        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::Superseded
+    )
 }
 
 fn merge_candidate_is_terminal(candidate: &MergeCandidate) -> bool {

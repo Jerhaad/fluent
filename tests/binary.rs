@@ -13674,6 +13674,194 @@ fn work_merge_candidate_rerun_after_cleanup_preserves_landed_state() {
 }
 
 #[test]
+fn approved_land_retry_supersedes_the_host_sandbox_pause() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Reconcile landing pause",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let bin_dir = tmp.path().join("bin-land-retry");
+    write_mock_claude(&bin_dir, &rebase_mock_script("pass"));
+    write_mock_security(&bin_dir, "landing-retry-token");
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+    write_mock_sandbox_exec(&bin_dir);
+
+    let land_args = [
+        "merge-candidate",
+        "land",
+        "work-1",
+        "attempt-1-merge-candidate",
+    ];
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(land_args)
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+
+    let paused = work_item_value(&main_dir, "work-1");
+    assert_eq!(paused["attempts"][0]["status"], "needs-user");
+    assert_eq!(paused["attempts"][0]["pause_kind"], "host-sandbox");
+    assert_eq!(
+        paused["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "attempt-1-rebase")
+            .unwrap()["status"],
+        "needs-user"
+    );
+    let handoff =
+        main_dir.join(".fluent/work/artifacts/work-1/attempt-1/needs-user-attempt-1-rebase.md");
+    assert!(handoff.is_file(), "the first failure must remain durable");
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(land_args)
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged Merge Candidate attempt-1-merge-candidate",
+        ));
+
+    let landed = work_item_value(&main_dir, "work-1");
+    let attempt = &landed["attempts"][0];
+    assert_eq!(attempt["status"], "complete");
+    assert_eq!(attempt["pause_kind"], serde_json::Value::Null);
+    let rebase_tasks = attempt["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "rebase")
+        .collect::<Vec<_>>();
+    assert_eq!(rebase_tasks.len(), 2);
+    assert_eq!(rebase_tasks[0]["status"], "superseded");
+    assert_eq!(rebase_tasks[1]["status"], "complete");
+    assert_eq!(
+        landed["merge_candidates"][0]["merge_state"]["status"],
+        "merged"
+    );
+    assert!(
+        handoff.is_file(),
+        "superseding must retain the first handoff"
+    );
+    let transitions = landed["transitions"].as_array().unwrap();
+    assert!(
+        transitions.iter().any(|event| {
+            event["object_id"] == "attempt-1-rebase"
+                && event["new_state"] == "superseded"
+                && event["origin"] == "landing"
+        }),
+        "transitions: {}",
+        serde_json::to_string_pretty(transitions).unwrap()
+    );
+
+    let status = fluent_cmd()
+        .current_dir(&main_dir)
+        .arg("status")
+        .output()
+        .unwrap();
+    let status_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(status.status.success(), "{status_output}");
+    assert!(status_output.contains("merged"), "{status_output}");
+    assert!(!status_output.contains("queue resume"), "{status_output}");
+    assert!(
+        !status_output.contains("merge-candidate land"),
+        "{status_output}"
+    );
+
+    // Simulate the exact legacy state left by a successful old-version land:
+    // the candidate is merged, but its first landing pause is still actionable.
+    let store = WorkModelStore::new(&main_dir);
+    store
+        .mutate_work_item("work-1", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::HostSandbox);
+            attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == "attempt-1-rebase")
+                .unwrap()
+                .status = fluent::work_model::TaskStatus::NeedsUser;
+            Ok(())
+        })
+        .unwrap();
+    let legacy_status = fluent_cmd()
+        .current_dir(&main_dir)
+        .arg("status")
+        .output()
+        .unwrap();
+    let legacy_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&legacy_status.stdout),
+        String::from_utf8_lossy(&legacy_status.stderr)
+    );
+    assert!(legacy_output.contains("merged"), "{legacy_output}");
+    assert!(!legacy_output.contains("queue resume"), "{legacy_output}");
+
+    // An already-merged retry repairs that stale state without merging again.
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(land_args)
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .assert()
+        .success();
+    let replayed = work_item_value(&main_dir, "work-1");
+    assert_eq!(replayed["attempts"][0]["status"], "complete");
+    assert_eq!(
+        replayed["attempts"][0]["pause_kind"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        replayed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "attempt-1-rebase")
+            .unwrap()["status"],
+        "superseded"
+    );
+    assert_eq!(
+        replayed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "rebase")
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn work_merge_candidate_rejects_stale_stored_provenance_without_rewrite() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);

@@ -5672,6 +5672,9 @@ pub enum TaskStatus {
     Complete,
     Failed,
     NeedsUser,
+    /// A later authoritative result made this terminal Task outcome
+    /// non-actionable while preserving it as durable history.
+    Superseded,
 }
 
 impl TaskStatus {
@@ -5682,6 +5685,7 @@ impl TaskStatus {
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::NeedsUser => "needs-user",
+            Self::Superseded => "superseded",
         }
     }
 }
@@ -6186,7 +6190,7 @@ pub fn mark_task_started(task: &mut Task) {
 pub fn set_task_terminal(task: &mut Task, status: TaskStatus) {
     debug_assert!(matches!(
         status,
-        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser
+        TaskStatus::Complete | TaskStatus::Failed | TaskStatus::NeedsUser | TaskStatus::Superseded
     ));
     task.status = status;
     task.completed_at.get_or_insert_with(now_iso8601);
