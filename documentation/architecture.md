@@ -324,8 +324,12 @@ returns through the ordinary candidate gate and review lifecycle; ordinary
 guidance already admitted one later Attempt, the public repair retry supersedes
 it only after local cancellation has left one interrupted, output-free initial
 Writer. A durable receipt preserves that admission as history and authorizes
-the earlier repaired Attempt; any output, additional task, or different pause
-fails closed. Unrelated candidate drift remains ineligible.
+the earlier repaired Attempt; any preexisting output, additional task, or
+different pause fails closed. Unrelated candidate drift remains ineligible.
+If the interrupted Writer settles after its audited supersession, its task,
+output commit, and branch remain durable history. A later repair can carry that
+supersession forward only by validating the earlier receipt and exact
+single-task admission; the late output never becomes the recovered candidate.
 If a later Writer again rewrites history while making no tree change, Fluent
 accepts a second repair only when the new protected base descends from the
 earlier recovered commit and every other deterministic gate check passed. The

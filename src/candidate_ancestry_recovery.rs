@@ -370,9 +370,7 @@ pub fn is_resume_ready(project_root: &Path, item: &WorkItem, attempt_id: &str) -
         attempt.status == AttemptStatus::Failed
             && attempt.pause_kind.is_none()
             && attempt.tasks.len() == 1
-            && attempt.tasks[0].status == TaskStatus::Superseded
-            && attempt.tasks[0].role == SUPERSEDED_ATTEMPT_ROLE
-            && attempt.tasks[0].output.is_none()
+            && has_preserved_superseded_task(attempt)
             && attempt.tasks[0].input_artifacts.iter().any(|artifact| {
                 artifact.producer_id == RECOVERY_PRODUCER && artifact.path == evidence_path
             })
@@ -470,7 +468,11 @@ fn reconcile_superseded_queue_admissions(
         }
         for attempt in &mut item.attempts[target_index + 1..] {
             let task = &mut attempt.tasks[0];
-            task.status = TaskStatus::Superseded;
+            task.status = if task.output.is_some() {
+                TaskStatus::Complete
+            } else {
+                TaskStatus::Superseded
+            };
             task.role = SUPERSEDED_ATTEMPT_ROLE.to_string();
             task.completed_at.get_or_insert_with(now_iso8601);
             if !task.input_artifacts.contains(&artifact) {
@@ -509,11 +511,24 @@ fn is_superseded_queue_admission(attempt: &Attempt, artifact: &ArtifactRef) -> b
         && attempt.pause_kind.is_none()
         && attempt.tasks.len() == 1
         && attempt.tasks[0].kind == TaskKind::Write
-        && attempt.tasks[0].status == TaskStatus::Superseded
-        && attempt.tasks[0].role == SUPERSEDED_ATTEMPT_ROLE
-        && attempt.tasks[0].output.is_none()
+        && has_preserved_superseded_task(attempt)
         && attempt.tasks[0].input_artifacts.contains(artifact)
         && attempt.artifacts.contains(artifact)
+}
+
+fn has_preserved_superseded_task(attempt: &Attempt) -> bool {
+    let task = &attempt.tasks[0];
+    if task.role != SUPERSEDED_ATTEMPT_ROLE {
+        return false;
+    }
+    match (&task.status, &task.output) {
+        (TaskStatus::Superseded, None) => true,
+        (TaskStatus::Complete, Some(output)) => attempt
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.producer_id == task.id && artifact.path == output.commit),
+        _ => false,
+    }
 }
 
 fn prior_superseded_admissions_artifact(
@@ -1793,6 +1808,29 @@ mod tests {
             "Supersede the accidental admission before later corrections.",
         )
         .unwrap();
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                let accidental = &mut item.attempts[1];
+                let task = &mut accidental.tasks[0];
+                let workspace = task.workspace_access.writes[0].clone();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: workspace.id,
+                    workspace_path: workspace.path,
+                    source_branch: "work/attempt-2".to_string(),
+                    base_commit: Some(fixture.protected.clone()),
+                    commit: first.recovered_candidate_commit.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                accidental.artifacts.push(ArtifactRef {
+                    producer_id: task.id.clone(),
+                    path: first.recovered_candidate_commit.clone(),
+                });
+                Ok(())
+            })
+            .unwrap();
         fs::write(fixture.workspace.join("followup.txt"), "corrected\n").unwrap();
         crate::git::run(
             &fixture.workspace,

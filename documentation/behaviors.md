@@ -6511,6 +6511,14 @@ supersede only an interrupted, output-free initial Writer, preserve an audited
 receipt, and authorize an exact resume of the repaired Attempt.
 Test: src/candidate_ancestry_recovery.rs (supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair)
 
+### B25oa
+
+IF a superseded queue admission's initially output-free Writer settles after
+its audited supersession, THEN THE SYSTEM SHALL retain that output as history,
+keep it ineligible as the recovered candidate, and allow a later ancestry
+repair to carry the validated supersession receipt forward.
+Test: src/candidate_ancestry_recovery.rs (repairs_a_later_tree_identical_rewrite_after_an_earlier_recovery)
+
 ### B25p
 
 WHEN the latest queue dispatch is bound to an earlier recovered Attempt, THE
