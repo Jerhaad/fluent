@@ -120,7 +120,7 @@ pub fn load_work_status(project_root: &Path) -> Result<WorkStatus, anyhow::Error
 }
 
 pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> WorkItemStatus {
-    let attempt = item.attempts.last();
+    let attempt = display_attempt(item, project_root);
     let merge_candidate = attempt.and_then(|attempt| {
         item.merge_candidates
             .iter()
@@ -384,16 +384,34 @@ pub fn work_item_show_value(
     if !warnings.is_empty() {
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
     }
-    if item
-        .attempts
-        .last()
-        .is_some_and(|attempt| attempt.pause_recovery.is_some())
-        && let Some(next_action) =
-            attempt_recovery_next_action(item.attempts.last(), Some(project_root))
+    let attempt = display_attempt(item, Some(project_root));
+    if attempt.is_some_and(|attempt| attempt.pause_recovery.is_some())
+        && let Some(next_action) = attempt_recovery_next_action(attempt, Some(project_root))
     {
         output["next-action"] = serde_json::to_value(next_action)?;
     }
     Ok(output)
+}
+
+/// Select the Attempt owned by the latest dispatch when queue history carries
+/// an exact binding. This keeps status aligned with an older Attempt resumed by
+/// an audited recovery while preserving later superseded Attempts in history.
+fn display_attempt<'a>(item: &'a WorkItem, project_root: Option<&Path>) -> Option<&'a Attempt> {
+    let bound_attempt = project_root
+        .and_then(|root| crate::queue::read_ledger(root, &item.id).ok().flatten())
+        .and_then(|ledger| {
+            ledger
+                .latest()
+                .and_then(|dispatch| dispatch.bound_attempt_id.clone())
+        });
+    bound_attempt
+        .as_deref()
+        .and_then(|attempt_id| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+        })
+        .or_else(|| item.attempts.last())
 }
 
 fn compute_work_metrics(item: &WorkItem, persisted: &PersistedFilesystemMetrics) -> WorkMetrics {
@@ -1080,6 +1098,29 @@ mod tests {
         assert_eq!(row.attempt, "attempt-1 [planned]");
         assert_eq!(row.task, "write:attempt-1-write-1 [planned]");
         assert_eq!(row.review, "-");
+        assert_eq!(row.action, "task-ready");
+    }
+
+    #[test]
+    fn status_uses_the_attempt_bound_to_the_latest_dispatch() {
+        let project = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(project.path());
+        let mut item = WorkItem::planned("work-1", "Resume an older repaired Attempt");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.add_initial_attempt("attempt-2").unwrap();
+        let later = item.attempts.last_mut().unwrap();
+        crate::work_model::set_task_terminal(&mut later.tasks[0], TaskStatus::Failed);
+        crate::work_model::set_attempt_terminal(later, AttemptStatus::Failed);
+        store.create_work_item(&item).unwrap();
+        crate::queue::add(project.path(), "work-1", None).unwrap();
+        crate::queue::claim(project.path(), "work-1", "attempt-1")
+            .unwrap()
+            .unwrap();
+
+        let row = summarize_work_item(&item, Some(project.path()));
+
+        assert_eq!(row.attempt, "attempt-1 [planned]");
+        assert_eq!(row.task, "write:attempt-1-write-1 [planned]");
         assert_eq!(row.action, "task-ready");
     }
 

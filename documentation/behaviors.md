@@ -6511,6 +6511,13 @@ supersede only an interrupted, output-free initial Writer, preserve an audited
 receipt, and authorize an exact resume of the repaired Attempt.
 Test: src/candidate_ancestry_recovery.rs (supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair)
 
+### B25p
+
+WHEN the latest queue dispatch is bound to an earlier recovered Attempt, THE
+SYSTEM SHALL display that bound Attempt as the Work Item's current action while
+retaining later superseded Attempts in history.
+Test: src/work_status.rs (status_uses_the_attempt_bound_to_the_latest_dispatch)
+
 ### B26
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL resolve every
