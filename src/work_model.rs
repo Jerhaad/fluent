@@ -4620,6 +4620,10 @@ impl Attempt {
                 "Attempt has an unsupported uncertain pause shape; resuming it is not yet supported."
                     .to_string(),
             )),
+            Some(PauseKind::HostEvidence) => Err(ineligible(
+                "Attempt is waiting for candidate-bound host evidence. Attach the requested evidence before resuming."
+                    .to_string(),
+            )),
             Some(PauseKind::RoundCap) => {
                 let write_rounds = self.materialized_write_rounds();
                 if self.review_state == Some(AttemptReviewState::Failed)
@@ -4846,7 +4850,9 @@ impl Attempt {
     }
 
     /// Record one immutable host-evidence recovery, or return the existing
-    /// recovery when the same candidate and attachment were already accepted.
+    /// recovery when the same candidate, attachment, and frontier were accepted.
+    /// Completed evidence bytes may support a later distinct frontier; its
+    /// recovery keeps a separate identity and review history.
     pub fn attach_evidence_recovery(
         &mut self,
         recovery: EvidenceRecovery,
@@ -4854,21 +4860,15 @@ impl Attempt {
         if let Some(existing) = self.evidence_recoveries.iter().find(|existing| {
             existing.candidate_commit == recovery.candidate_commit
                 && existing.attachment == recovery.attachment
-        }) {
-            let same_targets = existing.targets.len() == recovery.targets.len()
+                && existing.targets.len() == recovery.targets.len()
                 && existing.targets.iter().all(|target| {
                     recovery.targets.iter().any(|candidate| {
                         candidate.role == target.role
                             && candidate.prior_review_artifact == target.prior_review_artifact
                     })
-                });
-            return if same_targets {
-                Ok(existing.clone())
-            } else {
-                Err(WorkModelError::AttemptEvidenceRecoveryConflict {
-                    attempt_id: self.id.clone(),
                 })
-            };
+        }) {
+            return Ok(existing.clone());
         }
         if self
             .evidence_recoveries
@@ -5321,6 +5321,10 @@ pub enum PauseKind {
     /// not verify it. Explicit recovery either plans one corrective Writer for
     /// a rejected gate or rechecks an environment-blocked gate.
     CandidateGate,
+    /// The candidate needs immutable evidence from a compatible host before its
+    /// targeted review and canonical gates can continue. Re-running the Attempt
+    /// cannot satisfy this pause; the operator must attach candidate-bound evidence.
+    HostEvidence,
     RoundCap,
     /// A transcript-pump infrastructure failure (capture, status persistence, or
     /// transcript phase preservation) stopped the coder. The console transport,
@@ -5361,6 +5365,7 @@ impl PauseKind {
             Self::Uncertain => "uncertain",
             Self::WriterCompletion => "writer-completion",
             Self::CandidateGate => "candidate-gate",
+            Self::HostEvidence => "host-evidence",
             Self::RoundCap => "round-cap",
             Self::TranscriptPump => "transcript-pump",
             Self::HostSandbox => "host-sandbox",
@@ -5396,6 +5401,7 @@ impl<'de> Deserialize<'de> for PauseKind {
             "uncertain" => Self::Uncertain,
             "writer-completion" => Self::WriterCompletion,
             "candidate-gate" => Self::CandidateGate,
+            "host-evidence" => Self::HostEvidence,
             "round-cap" => Self::RoundCap,
             "transcript-pump" => Self::TranscriptPump,
             "host-sandbox" => Self::HostSandbox,
@@ -10422,6 +10428,50 @@ random banner prose that must be ignored
             recovery
         );
         assert_eq!(attempt.evidence_recoveries, vec![recovery]);
+    }
+
+    #[test]
+    fn completed_host_evidence_attachment_can_support_a_distinct_frontier() {
+        let attachment = EvidenceAttachment {
+            snapshot_path: ".fluent/work/artifacts/work/attempt-1/host-evidence/123.json"
+                .to_string(),
+            digest: "sha256:123".to_string(),
+        };
+        let mut attempt = Attempt {
+            id: "attempt-1".to_string(),
+            ..Attempt::default()
+        };
+        let prior = EvidenceRecovery {
+            id: "host-evidence-123".to_string(),
+            candidate_commit: "abc123".to_string(),
+            attachment: attachment.clone(),
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: "first-review.md".to_string(),
+                review_task_id: Some("first-review".to_string()),
+            }],
+            state: EvidenceRecoveryState::Complete,
+            created_at: "2026-08-23T10:00:00Z".to_string(),
+        };
+        attempt.attach_evidence_recovery(prior).unwrap();
+        let later = EvidenceRecovery {
+            id: "host-evidence-123-recheck".to_string(),
+            candidate_commit: "abc123".to_string(),
+            attachment,
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: "failed-recheck-binding.json".to_string(),
+                review_task_id: None,
+            }],
+            state: EvidenceRecoveryState::Reviewing,
+            created_at: "2026-08-23T11:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            attempt.attach_evidence_recovery(later.clone()).unwrap(),
+            later
+        );
+        assert_eq!(attempt.evidence_recoveries.len(), 2);
     }
 
     #[test]

@@ -5383,11 +5383,7 @@ fn failed_command_recheck_source(
     let source_task = attempt.tasks[..latest_write_index]
         .iter()
         .find(|task| task.id == source.producer_id)
-        .filter(|task| {
-            task.kind == TaskKind::Tester
-                && task.status == TaskStatus::Complete
-                && !task.is_failed_command_recheck()
-        })
+        .filter(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "failed-Tester no-change Writer {:?} references unknown source Tester {:?}",
@@ -5768,6 +5764,44 @@ fn advance_failed_command_recheck(
         return Ok(None);
     };
 
+    let source_is_failed_recheck = item.attempts[attempt_index].tasks[..latest_write_index]
+        .iter()
+        .find(|task| task.id == source_results.producer_id)
+        .is_some_and(|task| task.is_failed_command_recheck());
+    if source_is_failed_recheck {
+        let correction = item.attempts[attempt_index].tasks[..latest_write_index]
+            .iter()
+            .find(|task| task.id == source_results.producer_id)
+            .map(|task| failed_command_recheck_correction_artifacts(project_root, task))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(action) = crate::host_evidence::pending_failed_recheck_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            let work_item_id = item.id.clone();
+            return Ok(Some(settle_review_pause(
+                store,
+                project_root,
+                &work_item_id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                PauseKind::HostEvidence,
+                &correction,
+                |root, work_item_id, attempt_id, findings| {
+                    write_failed_recheck_evidence_handoff(
+                        root,
+                        work_item_id,
+                        attempt_id,
+                        findings,
+                        &action,
+                    )
+                },
+                &|_| {},
+            )?));
+        }
+    }
+
     let existing = item.attempts[attempt_index].tasks[latest_write_index + 1..]
         .iter()
         .find(|task| task.is_failed_command_recheck())
@@ -5828,7 +5862,7 @@ fn advance_failed_command_recheck(
                 &work_item_id,
                 attempt_id,
                 AttemptReviewState::Failed,
-                PauseKind::RoundCap,
+                PauseKind::HostEvidence,
                 &correction,
                 |root, work_item_id, attempt_id, findings| {
                     write_failed_recheck_evidence_handoff(
@@ -10224,6 +10258,16 @@ mod tests {
         let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
             panic!("failed final evidence must plan a corrective Writer")
         };
+        complete_planned_no_change_writer(project_root, store, candidate, &task_id);
+        task_id
+    }
+
+    fn complete_planned_no_change_writer(
+        project_root: &Path,
+        store: &WorkModelStore,
+        candidate: &str,
+        task_id: &str,
+    ) {
         let item = store.read_work_item("work-1").unwrap();
         crate::work_task_executor::materialize_writer_completion_before_writer(
             project_root,
@@ -10236,10 +10280,10 @@ mod tests {
             project_root,
             &item,
             "attempt-1",
-            &task_id,
+            task_id,
         )
         .unwrap();
-        let matrix_path = project_root.join(work_artifact_path("work-1", "attempt-1", &task_id));
+        let matrix_path = project_root.join(work_artifact_path("work-1", "attempt-1", task_id));
         let matrix_path =
             matrix_path.join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
         let mut matrix: crate::work_model::WriterCompletionMatrix =
@@ -10270,7 +10314,7 @@ mod tests {
                 let writer = item.attempts[0]
                     .tasks
                     .iter_mut()
-                    .find(|task| task.id == task_id)
+                    .find(|task| task.id == *task_id)
                     .unwrap();
                 crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
                 writer.output = Some(TaskOutput {
@@ -10283,7 +10327,7 @@ mod tests {
                         schema_version: 1,
                         declaration_path: format!(
                             "{}/no-change.json",
-                            work_artifact_path("work-1", "attempt-1", &task_id)
+                            work_artifact_path("work-1", "attempt-1", task_id)
                         ),
                         reason: "The candidate already contains the correction.".to_string(),
                         verification: vec![crate::work_model::NoChangeVerification {
@@ -10296,7 +10340,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        task_id
     }
 
     fn write_recheck_result(project_root: &Path, task: &Task, candidate: &str, exit_code: i32) {
@@ -10449,6 +10492,276 @@ mod tests {
             stored.attempts[0].tasks[prior_writer_index + 1..new_writer_index]
                 .iter()
                 .all(|task| task.kind != TaskKind::Review)
+        );
+    }
+
+    fn failed_recheck_no_change_fixture(
+        project: &tempfile::TempDir,
+    ) -> (WorkModelStore, tempfile::TempDir, String) {
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                item.add_review_tasks("attempt-1", &["tests"])?;
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .rev()
+                    .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let tests_review = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
+            .unwrap()
+            .clone();
+        let tests_review_dir = project
+            .path()
+            .join(&tests_review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&tests_review_dir).unwrap();
+        fs::write(tests_review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("the first failed recheck may request one corrective Writer")
+        };
+        complete_planned_no_change_writer(project.path(), &store, &candidate, &task_id);
+        (store, _workspace, candidate)
+    }
+
+    #[test]
+    fn no_change_after_failed_recheck_requests_host_evidence_with_capacity_remaining() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = failed_recheck_no_change_fixture(&project);
+        let before = store.read_work_item("work-1").unwrap();
+        assert!(
+            before.attempts[0].materialized_write_rounds()
+                < before.attempts[0].effective_write_round_cap(max_total_write_rounds()),
+            "the regression requires Writer capacity to remain"
+        );
+        let tester_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count();
+
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, before, "attempt-1").unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("an unchanged candidate must request compatible-host evidence, got {outcome:?}")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            tester_count,
+            "the no-change declaration must not schedule another focused recheck"
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("--recheck-artifact"));
+        assert!(
+            crate::work_status::attempt_recovery_next_action(
+                Some(&stored.attempts[0]),
+                Some(project.path()),
+            )
+            .is_some_and(|action| action.contains("--recheck-artifact"))
+        );
+        assert_eq!(
+            crate::work_status::summarize_work_item(&stored, Some(project.path())).action,
+            "evidence-needed"
+        );
+    }
+
+    #[test]
+    fn terminalized_recheck_no_change_accepts_reused_evidence_idempotently() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "producer": "Linux ARM64 host",
+            "check": "xcodebuild test",
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-08-23T12:00:00Z",
+            "output": "passed on the compatible host"
+        }))
+        .unwrap();
+        let evidence_path = project.path().join("external-evidence.json");
+        fs::write(&evidence_path, &evidence_bytes).unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(&evidence_bytes));
+        let snapshot_path = format!(
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
+            &digest[7..]
+        );
+        fs::create_dir_all(
+            project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence"),
+        )
+        .unwrap();
+        fs::write(project.path().join(&snapshot_path), &evidence_bytes).unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        id: format!("host-evidence-{}", &digest[7..19]),
+                        candidate_commit: candidate.clone(),
+                        attachment: crate::work_model::EvidenceAttachment {
+                            snapshot_path: snapshot_path.clone(),
+                            digest: digest.clone(),
+                        },
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "tests".to_string(),
+                            prior_review_artifact:
+                                ".fluent/work/artifacts/work-1/attempt-1/prior-tests/review.md"
+                                    .to_string(),
+                            review_task_id: Some("attempt-1-prior-evidence-tests".to_string()),
+                        }],
+                        state: EvidenceRecoveryState::Complete,
+                        created_at: "2026-08-23T11:00:00Z".to_string(),
+                    });
+                attempt.status = AttemptStatus::Complete;
+                attempt.pause_kind = None;
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        let legacy = store.read_work_item("work-1").unwrap();
+        assert!(
+            crate::work_status::attempt_recovery_next_action(
+                Some(&legacy.attempts[0]),
+                Some(project.path()),
+            )
+            .is_some_and(|action| action.contains("--recheck-artifact")),
+            "the public recovery command must be visible for the terminalized legacy shape"
+        );
+        let recheck = legacy.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "legacy recovery must remain candidate-bound"
+        );
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(".fluent/work/artifacts/work-1/attempt-1/unrelated.json"),
+            )
+            .is_err(),
+            "legacy recovery must reject unrelated artifacts"
+        );
+        let dirty_path = _workspace.path().join("untracked-recovery-input");
+        fs::write(&dirty_path, "dirty\n").unwrap();
+        assert!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .is_err(),
+            "legacy recovery must preserve clean-worktree enforcement"
+        );
+        fs::remove_file(&dirty_path).unwrap();
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .unwrap();
+        assert_ne!(
+            recovery.id,
+            format!("host-evidence-{}", &digest[7..19]),
+            "reusing immutable bytes for a distinct frontier needs a distinct audit identity"
+        );
+        let recovered = store.read_work_item("work-1").unwrap();
+        assert_eq!(recovered.attempts[0].status, AttemptStatus::Reviewing);
+        assert_eq!(
+            recovered.attempts[0].review_state,
+            Some(AttemptReviewState::NotReviewed)
+        );
+        assert_eq!(recovered.attempts[0].evidence_recoveries.len(), 2);
+        assert_eq!(
+            crate::host_evidence::attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                &[],
+                Some(&manifest),
+            )
+            .unwrap()
+            .id,
+            recovery.id,
+            "retrying the public recovery command must be idempotent"
         );
     }
 

@@ -766,6 +766,11 @@ fn action_label_with_liveness(
         {
             return "evidence-needed";
         }
+        if project_root.is_some_and(|root| {
+            crate::host_evidence::failed_recheck_evidence_recovery_action(root, attempt).is_some()
+        }) {
+            return "evidence-needed";
+        }
         if attempt.status == AttemptStatus::NeedsUser
             || attempt
                 .tasks
@@ -844,6 +849,11 @@ pub fn attempt_recovery_next_action(
     project_root: Option<&Path>,
 ) -> Option<String> {
     let attempt = attempt?;
+    if let Some(action) = project_root.and_then(|root| {
+        crate::host_evidence::failed_recheck_evidence_recovery_action(root, attempt)
+    }) {
+        return Some(action);
+    }
     if attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(PauseKind::TesterHarness)
         && attempt.pause_recovery.is_none()
@@ -903,11 +913,6 @@ pub fn attempt_recovery_next_action(
             Some(PauseKind::RoundCap | PauseKind::Uncertain)
         )
     {
-        if let Some(action) = project_root.and_then(|root| {
-            crate::host_evidence::failed_recheck_evidence_recovery_action(root, attempt)
-        }) {
-            return Some(action);
-        }
         let (writer_index, candidate_commit) = attempt
             .tasks
             .iter()
