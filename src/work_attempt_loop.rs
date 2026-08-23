@@ -6234,8 +6234,10 @@ fn write_candidate_gate_handoff(
         .join("\n");
     let recovery = crate::candidate_gate::candidate_ancestry_repair_authorization(evidence)
         .map(|_| {
+            let scheduler_action =
+                crate::candidate_ancestry_recovery::scheduler_action(work_item_id);
             format!(
-                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`fluent attempt repair-candidate-ancestry {work_item_id} {attempt_id} --resolution \"<describe the approved ancestry repair>\"`\n\nAfter the repair, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
+                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`fluent attempt repair-candidate-ancestry {work_item_id} {attempt_id} --resolution \"<describe the approved ancestry repair>\"`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
             )
         })
         .unwrap_or_else(|| {

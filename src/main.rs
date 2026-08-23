@@ -852,7 +852,10 @@ fn cmd_attempt(
                     repair.protected_base_commit
                 );
             }
-            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+            println!(
+                "Next: {}",
+                fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id)
+            );
         }
         AttemptCommands::Run {
             work_item_id,

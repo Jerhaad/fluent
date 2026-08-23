@@ -71,6 +71,10 @@ pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String>
     })
 }
 
+pub fn scheduler_action(work_item_id: &str) -> String {
+    format!("fluent queue add {work_item_id}")
+}
+
 pub fn repair(
     project_root: &Path,
     store: &WorkModelStore,
@@ -985,6 +989,7 @@ mod tests {
                 "fluent attempt repair-candidate-ancestry work-1 attempt-1 --resolution \"<describe the approved ancestry repair>\""
             )
         );
+        assert_eq!(scheduler_action("work-1"), "fluent queue add work-1");
         let repair_result = repair(
             &fixture.project,
             &fixture.store,
