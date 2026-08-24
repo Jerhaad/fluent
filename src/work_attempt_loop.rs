@@ -405,9 +405,20 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         }
 
         // A prior Fluent build could pause after a failed-command recheck even
-        // when both the final Tester and its recheck were fully covered by the
-        // immutable Attempt baseline. Clear only that exact stale pause before
-        // the ordinary round-cap gate asks for another Writer authorization.
+        // An accepted focused host check may already cover the exact command
+        // that the canonical Tester could not run in its local environment.
+        // Clear only that exact stale pause before asking for another Writer.
+        if reopen_review_evidence_covered_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+        // A prior Fluent build could also pause after both the final Tester and
+        // its recheck were fully covered by the immutable Attempt baseline.
+        // Clear only that exact stale pause before the ordinary round-cap gate.
         if reopen_baseline_covered_round_cap_attempt(
             config.project_root,
             config.store,
@@ -1639,6 +1650,48 @@ fn reopen_baseline_covered_round_cap_attempt(
                 ))
             })?;
         if !evidence_is_covered || !failed_frontier.is_empty() {
+            return Ok(false);
+        }
+        crate::work_model::reopen_attempt(attempt);
+        Ok(true)
+    })?)
+}
+
+fn reopen_review_evidence_covered_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || attempt.review_state != Some(AttemptReviewState::Failed)
+            || attempt
+                .tasks
+                .iter()
+                .any(|task| task.status != TaskStatus::Complete)
+        {
+            return Ok(false);
+        }
+        let Some(tester_results) = latest_tester_results_path(project_root, attempt) else {
+            return Ok(false);
+        };
+        let baseline = baseline_tester_results_path(project_root, attempt);
+        if !crate::host_evidence::completed_review_evidence_covers_tester_failure(
+            project_root,
+            attempt,
+            &tester_results,
+            baseline.as_deref(),
+        ) {
             return Ok(false);
         }
         crate::work_model::reopen_attempt(attempt);
@@ -7273,11 +7326,21 @@ fn interpret_reviews(
     )
     .is_some();
     let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
+    let tester_review_evidence_is_recovered = tester_result_path.as_ref().is_some_and(|path| {
+        crate::host_evidence::completed_review_evidence_covers_tester_failure(
+            project_root,
+            &item.attempts[attempt_index],
+            path,
+            baseline_path.as_deref(),
+        )
+    });
+    let tester_external_evidence_is_recovered =
+        tester_recheck_is_recovered || tester_review_evidence_is_recovered;
     let tester_fail_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
         .map(|p| {
-            if tester_recheck_is_recovered {
+            if tester_external_evidence_is_recovered {
                 0
             } else {
                 introduced_tester_failures(p, baseline_path.as_deref())
@@ -7289,13 +7352,13 @@ fn interpret_reviews(
     let tester_has_error = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
-        .map(|p| !p.is_file() || (!tester_recheck_is_recovered && tester_errored(p)))
+        .map(|p| !p.is_file() || (!tester_external_evidence_is_recovered && tester_errored(p)))
         .unwrap_or(false);
     let tester_failed_command_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
         .map(|path| {
-            if tester_recheck_is_recovered {
+            if tester_external_evidence_is_recovered {
                 0
             } else {
                 unexplained_failed_tester_commands(path, baseline_path.as_deref())
@@ -12653,6 +12716,180 @@ mod tests {
                 .count(),
             writer_count
         );
+    }
+
+    fn add_completed_focused_tests_evidence(
+        project_root: &Path,
+        store: &WorkModelStore,
+        command: &str,
+    ) {
+        let prior_id = "attempt-1-review-behaviors";
+        let prior_path = format!(
+            "{}/review.md",
+            work_artifact_path("work-1", "attempt-1", prior_id)
+        );
+        fs::write(
+            project_root.join(&prior_path),
+            format!("Verdict: fail\nEvidence-Command: {command}\nEvidence-Working-Directory: .\n"),
+        )
+        .unwrap();
+        let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "producer": "compatible host",
+            "check": command,
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-08-24T01:00:00Z",
+            "output": "passed"
+        }))
+        .unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(&evidence_bytes));
+        let snapshot = format!(
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
+            &digest[7..]
+        );
+        fs::create_dir_all(project_root.join(&snapshot).parent().unwrap()).unwrap();
+        fs::write(project_root.join(&snapshot), &evidence_bytes).unwrap();
+
+        let targeted_id = "attempt-1-evidence-compatible-tests";
+        let targeted_area = work_artifact_path("work-1", "attempt-1", targeted_id);
+        fs::create_dir_all(project_root.join(&targeted_area)).unwrap();
+        fs::write(
+            project_root.join(&targeted_area).join("review.md"),
+            "Verdict: pass\n",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == prior_id)
+                    .unwrap()
+                    .role = "tests".to_string();
+                let attachment = crate::work_model::EvidenceAttachment {
+                    snapshot_path: snapshot.clone(),
+                    digest: digest.clone(),
+                };
+                let recovery_id = "host-evidence-compatible".to_string();
+                attempt
+                    .evidence_recoveries
+                    .push(crate::work_model::EvidenceRecovery {
+                        id: recovery_id.clone(),
+                        candidate_commit: "abc123".to_string(),
+                        attachment: attachment.clone(),
+                        targets: vec![crate::work_model::EvidenceReviewTarget {
+                            role: "tests".to_string(),
+                            prior_review_artifact: prior_path.clone(),
+                            review_task_id: Some(targeted_id.to_string()),
+                        }],
+                        state: EvidenceRecoveryState::Complete,
+                        created_at: "2026-08-24T01:00:00Z".to_string(),
+                    });
+                let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_area);
+                targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
+                    recovery_id,
+                    candidate_commit: "abc123".to_string(),
+                    attachment,
+                    prior_review_artifact: prior_path,
+                });
+                attempt.tasks.push(targeted);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn accepted_pre_tester_host_evidence_supersedes_same_final_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let command = "./tests/container-smoke.sh";
+        let mut results: serde_json::Value = serde_json::from_str(
+            &tester_json_with_failed_command(&[&format!("command-0:{command}")], command, 1),
+        )
+        .unwrap();
+        results["candidate_commit"] = serde_json::json!("abc123");
+        let tester_json = serde_json::to_string(&results).unwrap();
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(&tester_json));
+        add_completed_focused_tests_evidence(tmp.path(), &store, command);
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            reopen_review_evidence_covered_round_cap_attempt(
+                tmp.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap(),
+            "the public resume path must reopen the stale round-cap pause"
+        );
+        let reopened = store.read_work_item("work-1").unwrap();
+        let writer_count = reopened.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome =
+            interpret_reviews(tmp.path(), &store, reopened, "attempt-1", false, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::MergeCandidateReady { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count,
+            "accepted exact evidence must not schedule a redundant Writer"
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| !task.is_failed_command_recheck())
+        );
+    }
+
+    #[test]
+    fn pre_tester_host_evidence_does_not_cover_a_different_final_tester_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actual = "./tests/container-smoke.sh";
+        let mut results: serde_json::Value = serde_json::from_str(
+            &tester_json_with_failed_command(&[&format!("command-0:{actual}")], actual, 1),
+        )
+        .unwrap();
+        results["candidate_commit"] = serde_json::json!("abc123");
+        let tester_json = serde_json::to_string(&results).unwrap();
+        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(&tester_json));
+        add_completed_focused_tests_evidence(tmp.path(), &store, "./tests/other-smoke.sh");
+        let tester_commands = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester/commands",
+        ));
+        fs::create_dir_all(&tester_commands).unwrap();
+        fs::write(tester_commands.join("0-stdout.log"), "").unwrap();
+        fs::write(tester_commands.join("0-stderr.log"), "unavailable host\n").unwrap();
+
+        let item = store.read_work_item("work-1").unwrap();
+        let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
     }
 
     #[test]
