@@ -428,6 +428,19 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             continue;
         }
 
+        // Fluent 0.2.0 could let one Review Task's completion finalizer fail the
+        // Attempt while a parallel peer was still executing. Reconcile only the
+        // ledger-proven shape whose failed Task retained a real fail verdict and
+        // whose peer completed afterward, then interpret the settled round.
+        if reconcile_premature_parallel_review_failure(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
                 if candidate_gate_pause {
@@ -1003,8 +1016,58 @@ fn run_parallel_reviews(
     }
 
     if let Some(error) = first_error {
+        settle_parallel_review_task_failures(
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+            task_ids,
+        )?;
         return Err(error);
     }
+    Ok(())
+}
+
+/// Derive a hard parallel-review execution failure only after every Task launched
+/// for the round has settled. Individual Task finalizers may record their own
+/// failure while a peer is still running, but they must not terminalize the
+/// aggregate before the join boundary has observed the whole round.
+fn settle_parallel_review_task_failures(
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_ids: &[String],
+) -> Result<()> {
+    mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let tasks = task_ids
+            .iter()
+            .map(|task_id| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *task_id)
+                    .ok_or_else(|| WorkModelError::TaskNotFound {
+                        id: task_id.clone(),
+                    })
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if tasks
+            .iter()
+            .any(|task| matches!(task.status, TaskStatus::Planned | TaskStatus::Executing))
+        {
+            return Ok(());
+        }
+        if tasks.iter().any(|task| task.status == TaskStatus::Failed) {
+            crate::work_model::set_attempt_terminal(attempt, AttemptStatus::Failed);
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1118,6 +1181,149 @@ fn reject_terminal_attempt(attempt: &Attempt) -> Result<TerminalCheck> {
         }
         _ => Ok(TerminalCheck::Continue),
     }
+}
+
+fn reconcile_premature_parallel_review_failure(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let metadata = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("reconcile premature parallel review settlement".to_string()),
+        evidence_ref: None,
+    };
+    Ok(
+        store.mutate_work_item_with_transition(work_item_id, &metadata, |item| {
+            let Some(attempt_index) = item
+                .attempts
+                .iter()
+                .position(|attempt| attempt.id == attempt_id)
+            else {
+                return Ok(false);
+            };
+            let attempt = &item.attempts[attempt_index];
+            if attempt.status != AttemptStatus::Failed
+                || attempt.pause_kind.is_some()
+                || !matches!(
+                    attempt.review_state,
+                    None | Some(AttemptReviewState::NotReviewed)
+                )
+            {
+                return Ok(false);
+            }
+            let Some(write_index) = attempt.latest_materialized_write_index() else {
+                return Ok(false);
+            };
+            let Some(candidate_commit) = attempt.tasks[write_index]
+                .output
+                .as_ref()
+                .map(|output| output.commit.as_str())
+            else {
+                return Ok(false);
+            };
+            let round = &attempt.tasks[write_index + 1..];
+            if round.len() < 2
+                || round.iter().any(|task| {
+                    task.kind != TaskKind::Review
+                        || !matches!(task.status, TaskStatus::Complete | TaskStatus::Failed)
+                        || task
+                            .review_context
+                            .as_ref()
+                            .is_none_or(|context| context.candidate_commit != candidate_commit)
+                })
+            {
+                return Ok(false);
+            }
+            let failed = round
+                .iter()
+                .filter(|task| task.status == TaskStatus::Failed)
+                .collect::<Vec<_>>();
+            if failed.is_empty() || round.iter().all(|task| task.status == TaskStatus::Failed) {
+                return Ok(false);
+            }
+            let failed_ids = failed
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>();
+            let mut review_artifacts = Vec::with_capacity(failed.len());
+            for task in failed {
+                let Some(area) = task.artifact_area.as_ref() else {
+                    return Ok(false);
+                };
+                let review_path = match work_task_executor::resolve_managed_artifact_area_path(
+                    project_root,
+                    &area.path,
+                ) {
+                    Ok(path) => path.join("review.md"),
+                    Err(_) => return Ok(false),
+                };
+                let content = match fs::read_to_string(&review_path) {
+                    Ok(content) => content,
+                    Err(_) => return Ok(false),
+                };
+                if review::extract_verdict(&content) != Verdict::Fail {
+                    return Ok(false);
+                }
+                review_artifacts.push(ArtifactRef {
+                    producer_id: task.id.clone(),
+                    path: format!("{}/review.md", area.path),
+                });
+            }
+
+            let Some(attempt_failure) = item.transitions.iter().rev().find(|transition| {
+                transition.object_kind == "attempt"
+                    && transition.object_id == attempt_id
+                    && transition.old_state.as_deref() == Some("reviewing")
+                    && transition.new_state == "failed"
+                    && transition.origin == DurableTransitionOrigin::TaskExecutor
+            }) else {
+                return Ok(false);
+            };
+            let failed_tasks_were_recorded = failed_ids.iter().all(|task_id| {
+                item.transitions.iter().any(|transition| {
+                    transition.object_kind == "task"
+                        && transition.object_id == *task_id
+                        && transition.old_state.as_deref() == Some("executing")
+                        && transition.new_state == "failed"
+                        && transition.origin == DurableTransitionOrigin::TaskExecutor
+                        && transition.sequence >= attempt_failure.sequence
+                })
+            });
+            let peer_completed_late = round.iter().any(|task| {
+                task.status == TaskStatus::Complete
+                    && item.transitions.iter().any(|transition| {
+                        transition.object_kind == "task"
+                            && transition.object_id == task.id
+                            && transition.old_state.as_deref() == Some("executing")
+                            && transition.new_state == "complete"
+                            && transition.origin == DurableTransitionOrigin::TaskExecutor
+                            && transition.sequence > attempt_failure.sequence
+                    })
+            });
+            if !failed_tasks_were_recorded || !peer_completed_late {
+                return Ok(false);
+            }
+
+            let attempt = &mut item.attempts[attempt_index];
+            for task in &mut attempt.tasks[write_index + 1..] {
+                if failed_ids.contains(&task.id) {
+                    crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                }
+            }
+            for artifact in review_artifacts {
+                if !attempt.artifacts.contains(&artifact) {
+                    attempt.artifacts.push(artifact);
+                }
+            }
+            attempt.status = AttemptStatus::Reviewing;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at = None;
+            Ok(true)
+        })?,
+    )
 }
 
 /// Reopen a supported pause from a fresh Work-model aggregate.
@@ -9963,6 +10169,170 @@ mod tests {
                 .iter()
                 .all(|task| task.kind != TaskKind::Tester)
         );
+    }
+
+    #[test]
+    fn public_resume_reconciles_failure_recorded_before_parallel_peer_settled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover parallel review settlement");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let attempt_metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::AttemptExecutor,
+            reason: None,
+            evidence_ref: None,
+        };
+        let task_metadata = DurableTransitionMetadata {
+            origin: DurableTransitionOrigin::TaskExecutor,
+            reason: None,
+            evidence_ref: None,
+        };
+
+        store
+            .mutate_work_item_with_transition("work-1", &attempt_metadata, |item| {
+                let writer = &mut item.attempts[0].tasks[0];
+                crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".to_string(),
+                    workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate"
+                        .to_string(),
+                    source_branch: "main".to_string(),
+                    base_commit: Some("base123".to_string()),
+                    commit: "candidate123".to_string(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])?;
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                for task in &mut item.attempts[0].tasks[1..] {
+                    task.status = TaskStatus::Executing;
+                    crate::work_model::mark_task_started(task);
+                }
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                crate::work_model::set_attempt_terminal(
+                    &mut item.attempts[0],
+                    AttemptStatus::Failed,
+                );
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[1],
+                    TaskStatus::Failed,
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .mutate_work_item_with_transition("work-1", &task_metadata, |item| {
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[2],
+                    TaskStatus::Complete,
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        for task in &store.read_work_item("work-1").unwrap().attempts[0].tasks[1..] {
+            let area = task.artifact_area.as_ref().unwrap();
+            let dir = tmp.path().join(&area.path);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("review.md"),
+                format!("Verdict: fail\n\n- [ ] {} correction\n", task.role),
+            )
+            .unwrap();
+        }
+
+        assert!(
+            reconcile_premature_parallel_review_failure(tmp.path(), &store, "work-1", "attempt-1",)
+                .unwrap()
+        );
+        let reconciled = store.read_work_item("work-1").unwrap();
+        assert_eq!(reconciled.attempts[0].status, AttemptStatus::Reviewing);
+        assert!(reconciled.attempts[0].completed_at.is_none());
+        assert!(
+            reconciled.attempts[0].tasks[1..]
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete)
+        );
+        assert!(reconciled.transitions.iter().any(|transition| {
+            transition.object_id == "attempt-1"
+                && transition.old_state.as_deref() == Some("reviewing")
+                && transition.new_state == "failed"
+        }));
+        assert!(!reconcile_premature_parallel_review_failure(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap());
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, reconciled, "attempt-1", true, None).unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let writer = stored.attempts[0].tasks.last().unwrap();
+        assert_eq!(writer.kind, TaskKind::Write);
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| { artifact.producer_id == "attempt-1-review-behaviors" })
+        );
+        assert!(
+            writer
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.producer_id == "attempt-1-review-tests")
+        );
+    }
+
+    #[test]
+    fn parallel_review_failure_terminalizes_only_at_join_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Settle parallel failure");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let task_ids = item
+            .add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[1], TaskStatus::Failed);
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[2], TaskStatus::Complete);
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        item.attempts[0].completed_at = None;
+        store.create_work_item(&item).unwrap();
+
+        settle_parallel_review_task_failures(&store, "work-1", "attempt-1", &task_ids).unwrap();
+        let settled = store.read_work_item("work-1").unwrap();
+        assert_eq!(settled.attempts[0].status, AttemptStatus::Failed);
+        let completed_at = settled.attempts[0].completed_at.clone();
+
+        settle_parallel_review_task_failures(&store, "work-1", "attempt-1", &task_ids).unwrap();
+        let repeated = store.read_work_item("work-1").unwrap();
+        assert_eq!(repeated.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(repeated.attempts[0].completed_at, completed_at);
     }
 
     #[test]

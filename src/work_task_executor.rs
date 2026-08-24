@@ -959,6 +959,7 @@ fn run_write_task_with_coder(
             config.work_item_id,
             config.attempt_id,
             config.task_id,
+            config.store_lock.is_some(),
         )?;
         return Err(error);
     }
@@ -970,6 +971,7 @@ fn run_write_task_with_coder(
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
+                config.store_lock.is_some(),
             )?;
             return Err(error);
         }
@@ -1038,6 +1040,7 @@ fn run_write_task_with_coder(
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
+                config.store_lock.is_some(),
             );
             Err(error)
         }
@@ -1837,46 +1840,53 @@ fn complete_review_task(
         let _lock = config
             .store_lock
             .map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut completed_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
-        let (attempt_index, task_index) =
-            find_attempt_task_indexes(&completed_item, config.attempt_id, config.task_id)
-                .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
-        crate::work_model::set_task_terminal(
-            &mut completed_item.attempts[attempt_index].tasks[task_index],
-            TaskStatus::Complete,
-        );
-        completed_item.attempts[attempt_index]
-            .artifacts
-            .push(ArtifactRef {
-                producer_id: config.task_id.to_string(),
-                path: path_for_model(config.project_root, review_path),
-            });
-        if let Some(path) = review_inspection_path {
-            completed_item.attempts[attempt_index]
-                .artifacts
-                .push(ArtifactRef {
-                    producer_id: config.task_id.to_string(),
-                    path: path_for_model(config.project_root, path),
-                });
-        }
-        let all_complete = completed_item.attempts[attempt_index]
-            .tasks
-            .iter()
-            .all(|task| task.status == TaskStatus::Complete);
-        let next_status = if all_complete {
-            AttemptStatus::Complete
-        } else {
-            AttemptStatus::Reviewing
-        };
-        // Under the store lock, advance only through the precedence boundary so a
-        // reviewer finishing after a peer recorded a terminal pause/failure
-        // updates its own Task but never overwrites the terminal Attempt.
-        crate::work_model::transition_attempt(
-            &mut completed_item.attempts[attempt_index],
-            next_status,
-            None,
-        );
-        write_task_work_item(config.store, &completed_item)?;
+        let review_artifact = path_for_model(config.project_root, review_path);
+        let inspection_artifact =
+            review_inspection_path.map(|path| path_for_model(config.project_root, path));
+        mutate_task_work_item(config.store, config.work_item_id, |item| {
+            let (attempt_index, task_index) =
+                find_attempt_task_indexes(item, config.attempt_id, config.task_id).ok_or_else(
+                    || WorkModelError::TaskNotFound {
+                        id: config.task_id.to_string(),
+                    },
+                )?;
+            crate::work_model::set_task_terminal(
+                &mut item.attempts[attempt_index].tasks[task_index],
+                TaskStatus::Complete,
+            );
+            for path in std::iter::once(&review_artifact).chain(inspection_artifact.as_ref()) {
+                if !item.attempts[attempt_index]
+                    .artifacts
+                    .iter()
+                    .any(|artifact| {
+                        artifact.producer_id == config.task_id && artifact.path == *path
+                    })
+                {
+                    item.attempts[attempt_index].artifacts.push(ArtifactRef {
+                        producer_id: config.task_id.to_string(),
+                        path: path.clone(),
+                    });
+                }
+            }
+            let all_complete = item.attempts[attempt_index]
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete);
+            let next_status = if all_complete {
+                AttemptStatus::Complete
+            } else {
+                AttemptStatus::Reviewing
+            };
+            // Advance only through the precedence boundary so a reviewer finishing
+            // after a peer recorded a terminal pause/failure updates its own Task
+            // but never overwrites the terminal Attempt.
+            crate::work_model::transition_attempt(
+                &mut item.attempts[attempt_index],
+                next_status,
+                None,
+            );
+            Ok(())
+        })?;
     }
 
     Ok(WorkTaskRunResult {
@@ -2758,20 +2768,40 @@ fn mark_task_failed(
     work_item_id: &str,
     attempt_id: &str,
     task_id: &str,
+    defer_parallel_review_outcome: bool,
 ) -> Result<()> {
-    let mut item = read_work_item_or_not_found(store, work_item_id)?;
-    if let Some((attempt_index, task_index)) = find_attempt_task_indexes(&item, attempt_id, task_id)
-    {
+    mutate_task_work_item(store, work_item_id, |item| {
+        let Some((attempt_index, task_index)) =
+            find_attempt_task_indexes(item, attempt_id, task_id)
+        else {
+            return Ok(());
+        };
+        let task_kind = item.attempts[attempt_index].tasks[task_index].kind;
         crate::work_model::set_task_terminal(
             &mut item.attempts[attempt_index].tasks[task_index],
             TaskStatus::Failed,
         );
-        crate::work_model::set_attempt_terminal(
-            &mut item.attempts[attempt_index],
-            AttemptStatus::Failed,
-        );
-        write_task_work_item(store, &item)?;
-    }
+        let parallel_review_peer_is_open = defer_parallel_review_outcome
+            && task_kind == TaskKind::Review
+            && item.attempts[attempt_index]
+                .tasks
+                .iter()
+                .enumerate()
+                .any(|(index, task)| {
+                    index != task_index
+                        && task.kind == TaskKind::Review
+                        && task.status == TaskStatus::Executing
+                        && task.review_context
+                            == item.attempts[attempt_index].tasks[task_index].review_context
+                });
+        if !parallel_review_peer_is_open {
+            crate::work_model::set_attempt_terminal(
+                &mut item.attempts[attempt_index],
+                AttemptStatus::Failed,
+            );
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3365,7 +3395,13 @@ fn lock_mark_task_failed(
     task_id: &str,
 ) -> Result<()> {
     let _lock = store_lock.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
-    mark_task_failed(store, work_item_id, attempt_id, task_id)
+    mark_task_failed(
+        store,
+        work_item_id,
+        attempt_id,
+        task_id,
+        store_lock.is_some(),
+    )
 }
 
 fn lock_mark_task_failed_attempt_needs_user(
@@ -20502,6 +20538,92 @@ mod tests {
             TaskStatus::Complete,
             "the peer's own Task is still recorded complete"
         );
+    }
+
+    #[test]
+    fn failed_reviewer_waits_for_parallel_peer_before_failing_attempt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Settle the whole review round");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        for task in &mut item.attempts[0].tasks[1..] {
+            task.status = TaskStatus::Executing;
+            crate::work_model::mark_task_started(task);
+        }
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed(
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+            true,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Failed);
+        assert_eq!(stored.attempts[0].tasks[2].status, TaskStatus::Executing);
+        assert_eq!(
+            stored.attempts[0].status,
+            AttemptStatus::Reviewing,
+            "one reviewer must not terminalize the Attempt while its peer is running"
+        );
+        assert!(stored.attempts[0].completed_at.is_none());
+    }
+
+    #[test]
+    fn failed_standalone_reviewer_terminalizes_attempt_immediately() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Fail a standalone review");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])
+            .unwrap();
+        for task in &mut item.attempts[0].tasks[1..] {
+            task.status = TaskStatus::Executing;
+            crate::work_model::mark_task_started(task);
+        }
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed(
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-behaviors",
+            false,
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Failed);
+        assert_eq!(stored.attempts[0].tasks[2].status, TaskStatus::Executing);
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Failed);
+        assert!(stored.attempts[0].completed_at.is_some());
     }
 
     #[test]
