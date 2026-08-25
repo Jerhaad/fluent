@@ -1062,7 +1062,6 @@ fn validate_candidate_gate_evidence_frontier(
         || item.merge_candidates.iter().any(|candidate| {
             candidate.attempt_id == attempt_id && candidate.candidate_commit == candidate_commit
         })
-        || document.result != EvidenceResult::Pass
         || document.working_directory != "."
     {
         return Err(rejected());
@@ -2694,6 +2693,50 @@ mod tests {
             )
             .unwrap(),
             completed.attempts[0].evidence_recoveries[0]
+        );
+    }
+
+    #[test]
+    fn failed_candidate_gate_host_check_reaches_targeted_tests_review() {
+        let command = "python3 tests/readiness.py";
+        let (project, _workspace, store, candidate, gate_path, evidence_path) =
+            candidate_gate_evidence_fixture(command);
+        let mut document: EvidenceDocument =
+            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        document.result = EvidenceResult::Fail;
+        document.output = "public readiness workflow failed".to_string();
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+
+        let recovery = attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            std::slice::from_ref(&gate_path),
+            None,
+        )
+        .expect("a failed authorized-host result still needs targeted Tests review");
+
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        assert_eq!(attempt.status, work_model::AttemptStatus::Reviewing);
+        assert_eq!(recovery.state, EvidenceRecoveryState::Reviewing);
+        let targeted_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        assert!(attempt.tasks.iter().any(|task| {
+            task.id == *targeted_id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Planned
+        }));
+        assert!(
+            completed_candidate_gate_evidence_commands(project.path(), attempt).is_empty(),
+            "failed evidence must never satisfy the candidate gate"
         );
     }
 

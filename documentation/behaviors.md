@@ -314,9 +314,11 @@ Test: src/candidate_gate.rs (rejected_gate_does_not_request_ambiguous_or_unrelat
 
 ### B13
 
-WHEN an operator attaches passing evidence for the exact requested command and
-candidate, THE SYSTEM SHALL preserve immutable gate and evidence snapshots.
+WHEN an operator attaches a passing or failing result for the exact requested
+command and candidate, THE SYSTEM SHALL preserve immutable gate and evidence
+snapshots and send the result to a targeted Tests Review.
 Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+Test: src/host_evidence.rs (failed_candidate_gate_host_check_reaches_targeted_tests_review)
 
 ### B14
 
@@ -329,6 +331,14 @@ Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_
 WHEN the targeted Tests Review accepts candidate-gate host evidence, THE SYSTEM
 SHALL credit only its exact command when the candidate gate runs again.
 Test: src/candidate_gate.rs (python_command_reference_matches_accepted_candidate_bound_host_evidence)
+
+### B15a
+
+IF the exact authorized-host command fails because of a candidate defect, THEN
+THE SYSTEM SHALL preserve the failed result for targeted Tests Review without
+crediting the command as passing evidence, so the reviewer can request a
+corrective Writer through the existing evidence disposition.
+Test: src/host_evidence.rs (failed_candidate_gate_host_check_reaches_targeted_tests_review)
 
 ### B16
 
