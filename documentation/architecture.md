@@ -193,7 +193,11 @@ host-owned `tester-results.json`, and its dependency names that completed source
 Tester. The executor derives the exact nonzero command indexes from that result,
 requires the same indexes, commands, and harnesses in the candidate's current
 `.fluent/tester.yaml`, and runs only that immutable subset through the ordinary
-Tester sandbox. It persists `failed-command-recheck.json`, structured results,
+Tester sandbox. That sandbox grants read-only access to the candidate's common
+Git directory, including a linked worktree's external metadata, and appends an
+explicit write denial for that directory after its broader candidate grants.
+Tester commands can therefore resolve candidate identity without gaining a Git
+mutation path. It persists `failed-command-recheck.json`, structured results,
 and command logs in the Task artifact area. This Task does not participate in
 the parallel review phase and does not seed the landed-baseline cache.
 

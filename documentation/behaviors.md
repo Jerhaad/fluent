@@ -193,6 +193,21 @@ WHEN the same accepted Test-reference revision is repeated, THE SYSTEM SHALL
 reuse its audit and schedule no additional reviews.
 Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
 
+## Canonical Tester confinement
+
+### B1
+
+WHILE a canonical Tester runs in a linked candidate worktree, THE SYSTEM SHALL
+allow configured commands to read that worktree's Git metadata and resolve the
+exact candidate repository.
+Test: src/tester.rs (tester_sandbox_reads_but_cannot_write_linked_worktree_git_metadata)
+
+### B2
+
+WHILE a canonical Tester runs, THE SYSTEM SHALL deny configured commands write
+access to the candidate's common Git metadata.
+Test: src/tester.rs (tester_sandbox_reads_but_cannot_write_linked_worktree_git_metadata)
+
 ## Actionable final Tester evidence
 
 ### B1

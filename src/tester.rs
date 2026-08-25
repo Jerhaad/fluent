@@ -263,6 +263,16 @@ fn tester_writable_roots(candidate: &Path, artifact: &Path, home: &Path) -> Vec<
     roots
 }
 
+/// Resolve the Git metadata a candidate's test commands may inspect but never
+/// mutate. Linked worktrees keep this directory outside the candidate root, so
+/// granting only the checkout would make ordinary `git` discovery fail inside
+/// the Tester sandbox.
+fn tester_git_metadata_root(candidate: &Path) -> Result<PathBuf> {
+    let common = crate::worktree::git_common_dir(candidate)?;
+    fs::canonicalize(&common)
+        .with_context(|| format!("canonicalize Tester Git metadata {}", common.display()))
+}
+
 pub fn run(
     candidate_workspace: &Path,
     artifact_dir: &Path,
@@ -486,7 +496,15 @@ pub fn render_sandbox_profile(
         fs::canonicalize(artifact_dir).unwrap_or_else(|_| artifact_dir.to_path_buf());
     let mut writable_roots = tester_writable_roots(&candidate_abs, &artifact_abs, Path::new(&home));
     writable_roots.extend(settlement_directories.iter().flatten().cloned());
-    match os::render_profile_common_only(resolver, &home, &writable_roots, &[]) {
+    let common_git_dir = tester_git_metadata_root(&candidate_abs)?;
+    match os::render_profile_common_only_with_denied_access(
+        resolver,
+        &home,
+        &writable_roots,
+        std::slice::from_ref(&common_git_dir),
+        &[],
+        std::slice::from_ref(&common_git_dir),
+    ) {
         Ok(profile) => {
             os::preflight_profile(&profile)?;
             Ok(TesterSandbox {
@@ -2443,5 +2461,74 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
             roots.contains(&xdg_store),
             "writable roots should include the XDG pnpm store; got: {roots:?}"
         );
+    }
+
+    #[test]
+    fn tester_sandbox_reads_but_cannot_write_linked_worktree_git_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        fs::create_dir_all(&main).unwrap();
+        crate::git::run(&main, &["init", "-q"], "initialize Tester fixture").unwrap();
+        crate::git::run(
+            &main,
+            &["config", "user.name", "Test Author"],
+            "configure Tester fixture author",
+        )
+        .unwrap();
+        crate::git::run(
+            &main,
+            &["config", "user.email", "test@example.com"],
+            "configure Tester fixture email",
+        )
+        .unwrap();
+        fs::write(main.join("tracked.txt"), "base\n").unwrap();
+        crate::git::run(&main, &["add", "tracked.txt"], "stage Tester fixture").unwrap();
+        crate::git::run(&main, &["commit", "-qm", "Base"], "commit Tester fixture").unwrap();
+
+        let candidate = tmp.path().join("candidate");
+        crate::git::run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "tester-candidate",
+                candidate.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create linked Tester candidate",
+        )
+        .unwrap();
+        let common = tester_git_metadata_root(&candidate).unwrap();
+        assert_eq!(common, main.join(".git").canonicalize().unwrap());
+
+        let artifact = tmp.path().join("artifact");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&artifact).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let writable = tester_writable_roots(&candidate, &artifact, &home);
+        let profile = os::render_profile_common_only_with_denied_access(
+            &ContentResolver::new(None),
+            &home.to_string_lossy(),
+            &writable,
+            std::slice::from_ref(&common),
+            &[],
+            std::slice::from_ref(&common),
+        )
+        .unwrap();
+        let content = fs::read_to_string(profile.path).unwrap();
+        assert!(content.contains(&format!(
+            "(allow file-read*  (subpath \"{}\"))",
+            common.display()
+        )));
+        assert!(content.contains(&format!(
+            "(deny file-write* (subpath \"{}\"))",
+            common.display()
+        )));
+        assert!(!content.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            common.display()
+        )));
     }
 }
