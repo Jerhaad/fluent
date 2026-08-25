@@ -165,6 +165,34 @@ extension from the actual Writer frontier.
 Test: src/work_model.rs (evidence_code_changes_advance_the_effective_write_cap)
 Test: tests/binary.rs (attempt_extend_counts_repeated_evidence_corrections)
 
+### B6
+
+WHEN an operator authorizes replacement `Test:` references for selected behavior
+requirements on a failed-review `round-cap` Attempt, THE SYSTEM SHALL record the
+old and new references and authorization and update the Work Item planning
+context and Attempt completion contract to the same selected references.
+Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
+
+### B7
+
+WHEN Fluent accepts a Test-reference revision, THE SYSTEM SHALL preserve the
+candidate and prior review history and schedule fresh Behaviors and Tests
+reviews without consuming a Writer round.
+Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
+
+### B8
+
+IF the selected requirement is not a behavior, the Attempt is no longer at the
+authorized frontier, or planning bytes changed before the revision commits, THEN
+THE SYSTEM SHALL reject the Test-reference revision without changing the Attempt.
+Test: src/planning_reference_recovery.rs (rejects_unknown_behavior_without_partial_output)
+
+### B9
+
+WHEN the same accepted Test-reference revision is repeated, THE SYSTEM SHALL
+reuse its audit and schedule no additional reviews.
+Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
+
 ## Actionable final Tester evidence
 
 ### B1
@@ -8487,6 +8515,11 @@ built-in reviewer context in the final passing review round — exact through
 Learner. Earlier corrective-round contexts are historical evidence, not competing
 current pointers.
 
+Every Learner provider launch also receives `FLUENT_TASK_KIND=learner`, the
+resolved `FLUENT_LEARNER_MODE`, and the exact managed
+`FLUENT_LEARNER_DRAFT_PATH`. Provider integrations can identify the task and
+output boundary without parsing prompt prose.
+
 ### B1
 
 WHEN `fluent work-item create` omits `--learner-mode`, receives
@@ -8721,6 +8754,13 @@ Test: src/work_merge_executor.rs (no_expertise_land_records_follow_up_outcome_be
 Test: src/work_merge_executor.rs (no_expertise_merged_resume_requires_reviewed_sha_for_every_learning_state)
 Test: src/work_merge_executor.rs (no_expertise_dirty_target_fails_before_side_effects)
 Test: src/work_merge_executor.rs (no_expertise_land_rechecks_target_cleanliness_after_isolated_check)
+
+### B15
+
+WHEN Fluent launches a Learner provider in any execution mode, THE SYSTEM SHALL
+pass the explicit Learner task kind, resolved mode, and exact managed draft path
+through the provider environment after applying trusted environment filtering.
+Test: src/work_task_executor.rs (learner_production_launch_prompts_cover_every_mode_and_invocation)
 
 ## Corrective classification and Work authorization
 

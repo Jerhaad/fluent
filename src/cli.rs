@@ -494,6 +494,20 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Revise selected behavior Test references on a paused Attempt
+    ReviseTestReferences {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Replacement in `behavior-requirement-id=Test reference` form
+        #[arg(long, value_name = "ID=REFERENCE", required = true)]
+        reference: Vec<String>,
+        /// Human decision authorizing the exact planning correction
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Advance an Attempt through the next safe transitions
     Run {
         /// Work Item ID
@@ -1147,6 +1161,38 @@ mod tests {
             }) if work_item_id == "work-1"
                 && attempt_id == "attempt-1"
                 && resolution == "Preserve the protected base."
+        ));
+    }
+
+    #[test]
+    fn test_reference_revision_parses_repeated_selected_requirements() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "revise-test-references",
+            "work-1",
+            "attempt-1",
+            "--reference",
+            "behavior:readiness:b1=python3 tests/readiness.py",
+            "--reference",
+            "behavior:readiness:b2=python3 tests/readiness.py",
+            "--resolution",
+            "Use the owning public workflow.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::ReviseTestReferences {
+                    work_item_id,
+                    attempt_id,
+                    reference,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && reference.len() == 2
+                && resolution == "Use the owning public workflow."
         ));
     }
 }

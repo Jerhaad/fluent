@@ -5838,6 +5838,24 @@ fn run_learner_with_coder_with_provider_readiness(
     if let Some(worker) = &codex_worker {
         extra_env.push(worker.launch_env());
     }
+    // Providers and deterministic doubles must not infer the public Task identity
+    // or managed output destination from prompt wording. These values describe the
+    // same host-owned boundary already rendered into the prompt and granted by the
+    // sandbox profile.
+    extra_env.push(("FLUENT_TASK_KIND".to_string(), "learner".to_string()));
+    extra_env.push((
+        "FLUENT_LEARNER_MODE".to_string(),
+        match mode {
+            LearnerExecutionMode::Capture => "capture",
+            LearnerExecutionMode::PreLandNoExpertise => "no-expertise",
+            LearnerExecutionMode::PostLandHandoffOnly => "post-land-handoff-only",
+        }
+        .to_string(),
+    ));
+    extra_env.push((
+        "FLUENT_LEARNER_DRAFT_PATH".to_string(),
+        draft_path.display().to_string(),
+    ));
 
     if let Some(parent) = capture.as_ref().and_then(|c| c.path().parent()) {
         fs::create_dir_all(parent)
@@ -19572,7 +19590,7 @@ mod tests {
     /// pair through the real `run_captured` route and reports a clean success, so a
     /// launch-route test observes exactly what the production route hands the coder.
     struct PromptRecordingCoder {
-        launches: Arc<Mutex<Vec<(String, String)>>>,
+        launches: Arc<Mutex<Vec<(String, String, Vec<(String, String)>)>>>,
     }
 
     impl crate::coder::Coder for PromptRecordingCoder {
@@ -19594,13 +19612,14 @@ mod tests {
             system_prompt: &str,
             _working_dir: &Path,
             _extra_args: &[String],
-            _extra_env: &[(String, String)],
+            extra_env: &[(String, String)],
             _capture: Option<&crate::coder::TranscriptCapture<'_>>,
         ) -> Result<i32> {
-            self.launches
-                .lock()
-                .unwrap()
-                .push((system_prompt.to_string(), prompt.to_string()));
+            self.launches.lock().unwrap().push((
+                system_prompt.to_string(),
+                prompt.to_string(),
+                extra_env.to_vec(),
+            ));
             Ok(0)
         }
 
@@ -19729,7 +19748,7 @@ mod tests {
                     1,
                     "{mode_name}/{invocation}: the coder launches exactly once"
                 );
-                let (system, user) = &launches[0];
+                let (system, user, environment) = &launches[0];
                 assert!(
                     !system.is_empty() && !user.is_empty(),
                     "{mode_name}/{invocation}: both prompts are non-empty"
@@ -19737,6 +19756,35 @@ mod tests {
                 assert!(
                     !system.contains("{{") && !system.contains("}}") && !user.contains("{{"),
                     "{mode_name}/{invocation}: no template placeholder leaks to the coder"
+                );
+                let environment = environment
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(
+                    environment.get("FLUENT_TASK_KIND").map(String::as_str),
+                    Some("learner")
+                );
+                assert_eq!(
+                    environment
+                        .get("FLUENT_LEARNER_DRAFT_PATH")
+                        .map(String::as_str),
+                    Some(
+                        handoff_dir
+                            .join(crate::learner::DRAFT_FILE_NAME)
+                            .to_string_lossy()
+                            .as_ref()
+                    ),
+                    "{mode_name}/{invocation}: the provider receives the managed draft destination"
+                );
+                assert_eq!(
+                    environment.get("FLUENT_LEARNER_MODE").map(String::as_str),
+                    Some(match mode {
+                        LearnerExecutionMode::Capture => "capture",
+                        LearnerExecutionMode::PreLandNoExpertise => "no-expertise",
+                        LearnerExecutionMode::PostLandHandoffOnly => "post-land-handoff-only",
+                    }),
+                    "{mode_name}/{invocation}: the provider receives the explicit Learner mode"
                 );
 
                 // The system prompt carries the mode-accurate directive for every

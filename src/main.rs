@@ -857,6 +857,46 @@ fn cmd_attempt(
                 fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id, &attempt_id)
             );
         }
+        AttemptCommands::ReviseTestReferences {
+            work_item_id,
+            attempt_id,
+            reference,
+            resolution,
+        } => {
+            let updates = reference
+                .iter()
+                .map(|value| {
+                    let (id, reference) = value.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("invalid --reference {value:?}; expected ID=REFERENCE")
+                    })?;
+                    Ok(fluent::planning_reference_recovery::TestReferenceUpdate {
+                        requirement_id: id.to_string(),
+                        reference: reference.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let revision = fluent::planning_reference_recovery::revise(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &updates,
+                &resolution,
+            )?;
+            if revision.already_applied {
+                println!(
+                    "Test-reference revision {} is already applied to Attempt {}",
+                    revision.revision_id, attempt_id
+                );
+            } else {
+                println!(
+                    "Revised {} behavior Test reference(s) on Attempt {}",
+                    revision.updated_requirements, attempt_id
+                );
+            }
+            println!("Audit: {}", revision.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::Run {
             work_item_id,
             attempt_id,

@@ -1194,12 +1194,13 @@ impl WorkItem {
                     .iter()
                     .rev()
                     .find(|artifact| {
-                        artifact.producer_id == "writer-completion-repair"
-                            && artifact.path.contains(&format!(
-                                "/writer-completion-repairs/{}/",
-                                latest_write.id
-                            ))
-                            && artifact.path.ends_with("/writer-completion.json")
+                        artifact.path.ends_with("/writer-completion.json")
+                            && ((artifact.producer_id == "writer-completion-repair"
+                                && artifact.path.contains(&format!(
+                                    "/writer-completion-repairs/{}/",
+                                    latest_write.id
+                                )))
+                                || artifact.producer_id == "planning-reference-recovery")
                     })
                     .cloned()
                     .unwrap_or_else(|| ArtifactRef {
