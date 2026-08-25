@@ -404,6 +404,19 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             }
         }
 
+        // A prior Fluent build could persist a round-cap pause after the
+        // candidate-bound failed-command evidence Review had already passed.
+        // Restore that exact unsettled Review frontier before any round-cap
+        // admission check; no Writer capacity is granted.
+        if reopen_completed_recheck_evidence_review_round_cap_attempt(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
         // A prior Fluent build could leave this at the round cap even when an
         // accepted focused host check already covered the exact command that
         // the canonical Tester could not run in its local environment.
@@ -1884,6 +1897,70 @@ fn reopen_review_evidence_covered_round_cap_attempt(
         crate::work_model::reopen_attempt(attempt);
         Ok(true)
     })?)
+}
+
+fn reopen_completed_recheck_evidence_review_round_cap_attempt(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if !completed_recheck_evidence_review_round_cap_is_eligible(project_root, attempt) {
+            return Ok(false);
+        }
+        attempt.status = AttemptStatus::Reviewing;
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.completed_at = None;
+        Ok(true)
+    })?)
+}
+
+/// Recognize a legacy race where the exact failed-command evidence Review is
+/// durably complete but its recovery receipt and Attempt state were not
+/// settled before another finalizer recorded the round cap.
+pub(crate) fn completed_recheck_evidence_review_round_cap_is_eligible(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> bool {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::RoundCap)
+        || attempt.review_state != Some(AttemptReviewState::Failed)
+        || attempt.has_round_cap_task_blocker()
+    {
+        return false;
+    }
+    let Some(recovery) = attempt.active_evidence_recovery() else {
+        return false;
+    };
+    if recovery.state != EvidenceRecoveryState::Reviewing {
+        return false;
+    }
+
+    // Reuse the canonical immutable-binding validator by evaluating the state
+    // that the ordinary Review settlement would write. No persisted state is
+    // changed until every candidate, artifact, digest, command, and passing
+    // targeted Review check succeeds.
+    let mut settled = attempt.clone();
+    let Some(entry) = settled
+        .evidence_recoveries
+        .iter_mut()
+        .find(|entry| entry.id == recovery.id)
+    else {
+        return false;
+    };
+    entry.state = EvidenceRecoveryState::Complete;
+    crate::host_evidence::completed_recheck_evidence_source(project_root, &settled).is_some()
 }
 
 /// Recognize the exact legacy round-cap shape whose sole final Tester failure
@@ -9131,7 +9208,7 @@ mod tests {
         };
 
         assert!(error.to_string().contains("is abandoned"));
-        let stored = store.read_work_item("work-1").unwrap();
+        let mut stored = store.read_work_item("work-1").unwrap();
         assert!(stored.abandonment.is_some());
         assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
         assert_eq!(stored.attempts[0].tasks[0].status, TaskStatus::Planned);
@@ -12286,7 +12363,42 @@ mod tests {
             .join(&review.artifact_area.as_ref().unwrap().path);
         fs::create_dir_all(&review_dir).unwrap();
         fs::write(review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        let stale = store.read_work_item("work-1").unwrap();
+        assert!(completed_recheck_evidence_review_round_cap_is_eligible(
+            project.path(),
+            &stale.attempts[0]
+        ));
+        assert!(
+            reopen_completed_recheck_evidence_review_round_cap_attempt(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
         let mut stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        assert_eq!(stored.attempts[0].pause_kind, None);
+        assert_eq!(
+            stored.attempts[0]
+                .evidence_recoveries
+                .iter()
+                .find(|entry| entry.id == recovery.id)
+                .unwrap()
+                .state,
+            EvidenceRecoveryState::Reviewing,
+            "ordinary Review interpretation still owns receipt settlement"
+        );
         stored.attempts[0]
             .evidence_recoveries
             .iter_mut()

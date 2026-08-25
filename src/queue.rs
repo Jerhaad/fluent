@@ -1096,7 +1096,15 @@ fn ensure_resume_eligible(
                 project_root,
                 attempt,
             );
-        ensure_attempt_resume_ready(attempt, legacy_review_evidence_round_cap)?;
+        let completed_recheck_evidence_round_cap =
+            crate::work_attempt_loop::completed_recheck_evidence_review_round_cap_is_eligible(
+                project_root,
+                attempt,
+            );
+        ensure_attempt_resume_ready(
+            attempt,
+            legacy_review_evidence_round_cap || completed_recheck_evidence_round_cap,
+        )?;
         if attempt.is_uncertain_review_pause() {
             crate::lifecycle_recovery::inspect_uncertain_review_recovery(
                 project_root,
