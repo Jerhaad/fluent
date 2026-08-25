@@ -5100,6 +5100,30 @@ IF Fluent cannot publish the managed current handoff after recording its pause,
 THEN THE SYSTEM SHALL NOT notify the user that the recovery action was recorded.
 Test: src/work_task_executor.rs (current_handoff_failure_surfaces_after_the_pause_is_durable)
 
+### B2u
+
+WHEN an Attempt has a planned evidence-targeted Review, THE SYSTEM SHALL reject
+ordinary `fluent queue add` before it can create another Attempt and SHALL
+accept `fluent queue resume ... --attempt <that-attempt>` after a blocked
+dispatch.
+Test: src/queue.rs (add_rejects_pending_evidence_review_instead_of_creating_new_attempt,
+resume_accepts_pending_evidence_review_after_blocked_dispatch)
+
+### B2v
+
+IF an older Fluent dispatch already created a later initial Writer while that
+evidence Review remained pending, and the later Writer is interrupted without
+output in a clean worktree still at project HEAD, THEN the exact public resume
+SHALL preserve it as superseded history and bind the new dispatch to the
+evidence Review's Attempt.
+Test: src/queue.rs (resume_supersedes_clean_interrupted_accidental_queue_admission)
+
+### B2w
+
+IF that later Writer has a live owner or candidate work, THEN THE SYSTEM SHALL
+reject reconciliation without changing either Attempt or the queue.
+Test: src/queue.rs (resume_supersedes_clean_interrupted_accidental_queue_admission)
+
 ### B3
 
 WHEN `fluent queue list` is invoked,

@@ -18,7 +18,20 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{FlockOperation, flock};
 
-use crate::work_model::{AttemptStatus, PauseRecovery, WorkItem, WorkModelStore};
+use crate::work_model::{
+    ArtifactRef, AttemptStatus, DurableTransitionMetadata, DurableTransitionOrigin, PauseKind,
+    PauseRecovery, TaskKind, TaskStatus, WorkItem, WorkModelError, WorkModelStore,
+};
+
+const SUPERSEDED_QUEUE_ADMISSION_ROLE: &str = "superseded-queue-admission";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QueueResumeReconciliation {
+    schema_version: u32,
+    resumed_attempt_id: String,
+    superseded_attempt_ids: Vec<String>,
+    reason: String,
+}
 
 /// Execution status of a single dispatch.
 ///
@@ -426,6 +439,226 @@ pub fn add(project_root: &Path, id: &str, priority: Option<i64>) -> Result<()> {
 /// and carries both the authorization intent and Attempt binding before any
 /// scheduler claim. Repeating the command while that same resume is active is
 /// idempotent; a later needs-user outcome requires another explicit resume.
+fn reconcile_interrupted_evidence_queue_admissions(
+    project_root: &Path,
+    id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let store = WorkModelStore::new(project_root);
+    let snapshot = store.read_work_item(id)?;
+    let Some(target_index) = snapshot
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(false);
+    };
+    let target = &snapshot.attempts[target_index];
+    let later = &snapshot.attempts[target_index + 1..];
+    if later.is_empty() || !target.has_pending_evidence_review_tasks() {
+        return Ok(false);
+    }
+    let evidence_path = format!(
+        "{}/superseded-attempts.json",
+        crate::work_model::work_artifact_path(id, attempt_id, "queue-resume-reconciliation")
+    );
+    let evidence_ref = ArtifactRef {
+        producer_id: "queue-resume-reconciliation".to_string(),
+        path: evidence_path.clone(),
+    };
+    if has_reconciled_interrupted_evidence_queue_admission(project_root, &snapshot, attempt_id) {
+        return Ok(true);
+    }
+    if later.iter().any(|attempt| {
+        attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::Interrupted)
+            || attempt.tasks.len() != 1
+            || attempt.tasks[0].kind != TaskKind::Write
+            || attempt.tasks[0].status != TaskStatus::NeedsUser
+            || attempt.tasks[0].output.is_some()
+    }) {
+        return Ok(false);
+    }
+
+    // Own every interrupted Task while checking its worktree and publishing
+    // the reconciliation. A live or concurrently resumed Writer therefore
+    // fails before any Work state changes.
+    let mut task_leases = Vec::with_capacity(later.len());
+    for attempt in later {
+        task_leases.push(crate::lease::acquire(&crate::lease::task_lock_path(
+            project_root,
+            id,
+            &attempt.tasks[0].id,
+        ))?);
+    }
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    let project_head = crate::git::run_stdout(
+        project_root,
+        &["rev-parse", "HEAD"],
+        "resolve queue-resume project HEAD",
+    )?;
+    for attempt in later {
+        let task = &attempt.tasks[0];
+        let [workspace] = task.workspace_access.writes.as_slice() else {
+            bail!(
+                "interrupted queue admission {:?} does not own one exact Writer workspace",
+                attempt.id
+            );
+        };
+        let workspace_path = PathBuf::from(&workspace.path);
+        let workspace_path = if workspace_path.is_absolute() {
+            workspace_path
+        } else {
+            project_root.join(workspace_path)
+        };
+        let workspace_path = workspace_path.canonicalize()?;
+        let workspace_head = crate::git::run_stdout(
+            &workspace_path,
+            &["rev-parse", "HEAD"],
+            "resolve interrupted queue-admission HEAD",
+        )?;
+        let dirty = crate::git::run_stdout(
+            &workspace_path,
+            &["status", "--porcelain", "--untracked-files=all", "--", "."],
+            "inspect interrupted queue-admission workspace",
+        )?;
+        if workspace_head != project_head || !dirty.is_empty() {
+            bail!(
+                "interrupted queue admission {:?} contains candidate work and cannot be superseded",
+                attempt.id
+            );
+        }
+    }
+
+    let superseded_attempt_ids = later
+        .iter()
+        .map(|attempt| attempt.id.clone())
+        .collect::<Vec<_>>();
+    let evidence = QueueResumeReconciliation {
+        schema_version: 1,
+        resumed_attempt_id: attempt_id.to_string(),
+        superseded_attempt_ids: superseded_attempt_ids.clone(),
+        reason: "resume an existing evidence Review instead of an accidental new Attempt"
+            .to_string(),
+    };
+    let evidence_bytes = serde_json::to_vec_pretty(&evidence)?;
+    let evidence_file = project_root.join(&evidence_path);
+    if let Some(parent) = evidence_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if evidence_file.exists() {
+        if fs::read(&evidence_file)? != evidence_bytes {
+            bail!("queue-resume reconciliation evidence changed at a stable path");
+        }
+    } else {
+        crate::atomic_write::atomic_write(&evidence_file, &evidence_bytes)?;
+    }
+
+    let later_snapshot = later.to_vec();
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::Fluent,
+        reason: Some("supersede accidental queue admission during exact Attempt resume".into()),
+        evidence_ref: Some(evidence_path),
+    };
+    store.mutate_work_item_with_transition(id, &transition, |item| {
+        let fresh_target_index = item
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        if !item.attempts[fresh_target_index].has_pending_evidence_review_tasks()
+            || item.attempts[fresh_target_index + 1..] != later_snapshot
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "the evidence-review or later Attempt frontier changed during queue reconciliation"
+                    .to_string(),
+            });
+        }
+        if !item.attempts[fresh_target_index]
+            .artifacts
+            .contains(&evidence_ref)
+        {
+            item.attempts[fresh_target_index]
+                .artifacts
+                .push(evidence_ref.clone());
+        }
+        for attempt in &mut item.attempts[fresh_target_index + 1..] {
+            let task = &mut attempt.tasks[0];
+            crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+            task.role = SUPERSEDED_QUEUE_ADMISSION_ROLE.to_string();
+            if !task.input_artifacts.contains(&evidence_ref) {
+                task.input_artifacts.push(evidence_ref.clone());
+            }
+            attempt.status = AttemptStatus::Failed;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            if !attempt.artifacts.contains(&evidence_ref) {
+                attempt.artifacts.push(evidence_ref.clone());
+            }
+        }
+        Ok(())
+    })?;
+    drop(task_leases);
+    Ok(true)
+}
+
+fn has_reconciled_interrupted_evidence_queue_admission(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> bool {
+    let Some(target_index) = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+    else {
+        return false;
+    };
+    let target = &item.attempts[target_index];
+    let later = &item.attempts[target_index + 1..];
+    if later.is_empty() || !target.has_pending_evidence_review_tasks() {
+        return false;
+    }
+    let evidence_ref = ArtifactRef {
+        producer_id: "queue-resume-reconciliation".to_string(),
+        path: format!(
+            "{}/superseded-attempts.json",
+            crate::work_model::work_artifact_path(
+                &item.id,
+                attempt_id,
+                "queue-resume-reconciliation"
+            )
+        ),
+    };
+    let expected_evidence = QueueResumeReconciliation {
+        schema_version: 1,
+        resumed_attempt_id: attempt_id.to_string(),
+        superseded_attempt_ids: later.iter().map(|attempt| attempt.id.clone()).collect(),
+        reason: "resume an existing evidence Review instead of an accidental new Attempt"
+            .to_string(),
+    };
+    fs::read(project_root.join(&evidence_ref.path))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<QueueResumeReconciliation>(&bytes).ok())
+        .as_ref()
+        == Some(&expected_evidence)
+        && target.artifacts.contains(&evidence_ref)
+        && later.iter().all(|attempt| {
+            attempt.status == AttemptStatus::Failed
+                && attempt.pause_kind.is_none()
+                && attempt.tasks.len() == 1
+                && attempt.tasks[0].kind == TaskKind::Write
+                && attempt.tasks[0].status == TaskStatus::Superseded
+                && attempt.tasks[0].role == SUPERSEDED_QUEUE_ADMISSION_ROLE
+                && attempt.tasks[0].output.is_none()
+                && attempt.tasks[0].input_artifacts.contains(&evidence_ref)
+                && attempt.artifacts.contains(&evidence_ref)
+        })
+}
+
 pub fn resume(
     project_root: &Path,
     id: &str,
@@ -447,6 +680,7 @@ pub fn resume_with_tester_no_sandbox(
     if !work_item_exists(project_root, id) {
         bail!("Work Item {id:?} not found");
     }
+    let _ = reconcile_interrupted_evidence_queue_admissions(project_root, id, attempt_id)?;
     let store = WorkModelStore::new(project_root);
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
@@ -463,6 +697,13 @@ pub fn resume_with_tester_no_sandbox(
     let reconciled_candidate_ancestry_repair =
         crate::candidate_ancestry_recovery::is_resume_ready(project_root, &item, attempt_id)?;
     let learner_retry = crate::lifecycle_recovery::is_learner_retry_recovery(&item, attempt_id);
+    let pending_evidence_review = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(crate::work_model::Attempt::has_pending_evidence_review_tasks);
+    let reconciled_evidence_queue_admission =
+        has_reconciled_interrupted_evidence_queue_admission(project_root, &item, attempt_id);
     let legacy_learner_tester_evidence =
         crate::lifecycle_recovery::is_legacy_learner_tester_evidence_failure(
             project_root,
@@ -521,6 +762,7 @@ pub fn resume_with_tester_no_sandbox(
                     && reconciled_candidate_ancestry_repair)
                 && !(previous.status == DispatchStatus::Blocked && learner_retry)
                 && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
+                && !(previous.status == DispatchStatus::Blocked && pending_evidence_review)
                 && !(legacy_learner_tester_evidence
                     && matches!(
                         previous.status,
@@ -537,6 +779,7 @@ pub fn resume_with_tester_no_sandbox(
                 .bound_attempt_id
                 .as_deref()
                 .is_some_and(|bound| bound != attempt_id)
+                && !reconciled_evidence_queue_admission
             {
                 bail!(
                     "Work Item {id:?} latest resumable dispatch is bound to Attempt {:?}, not {attempt_id:?}",
@@ -772,6 +1015,17 @@ fn ensure_lifecycle_eligible(item: &WorkItem, id: &str) -> Result<()> {
             attempt.id
         );
     }
+    if let Some(attempt) = item
+        .attempts
+        .last()
+        .filter(|attempt| attempt.has_pending_evidence_review_tasks())
+    {
+        bail!(
+            "Work Item {id:?} has pending evidence Review work on Attempt {:?}; run `fluent queue resume {id} --attempt {}` instead of creating another Attempt",
+            attempt.id,
+            attempt.id
+        );
+    }
     if let Some(candidate) = item.merge_candidates.iter().find(|candidate| {
         candidate.merge_state.status == crate::work_model::MergeCandidateMergeStatus::Pending
     }) {
@@ -801,11 +1055,14 @@ fn ensure_resume_eligible(
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
+    let evidence_queue_reconciliation =
+        has_reconciled_interrupted_evidence_queue_admission(project_root, item, attempt_id);
     if item
         .attempts
         .last()
         .is_some_and(|current| current.id != attempt_id)
         && !candidate_ancestry_repair
+        && !evidence_queue_reconciliation
     {
         bail!(
             "Work Item {id:?} current Attempt is {:?}, not {attempt_id:?}",
@@ -1136,7 +1393,8 @@ fn with_matching_active(
 mod tests {
     use super::*;
     use crate::work_model::{
-        ArtifactRef, AttemptLearning, AttemptReviewState, LearningFailureKind,
+        ArtifactRef, AttemptLearning, AttemptReviewState, EvidenceAttachment, EvidenceRecovery,
+        EvidenceRecoveryState, EvidenceReviewContext, EvidenceReviewTarget, LearningFailureKind,
         MergeCandidateMergeStatus, MergeReviewState, PauseKind, TaskKind, TaskOutput, TaskStatus,
     };
 
@@ -1174,6 +1432,67 @@ mod tests {
         let store = WorkModelStore::new(tmp);
         let mut item = WorkItem::planned(id, "Test");
         item.add_initial_attempt(attempt_id).unwrap();
+        store.create_work_item(&item).unwrap();
+    }
+
+    fn write_pending_evidence_review(tmp: &Path, id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(tmp);
+        let candidate =
+            crate::git::run_stdout(tmp, &["rev-parse", "HEAD"], "read candidate").unwrap();
+        let mut item = WorkItem::planned(id, "Resume pending evidence Review");
+        item.add_initial_attempt(attempt_id).unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: tmp.display().to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks(attempt_id, &["tests"]).unwrap();
+        let prior = item.attempts[0].tasks.last_mut().unwrap();
+        prior.status = TaskStatus::Complete;
+        let prior_path = format!("{}/review.md", prior.artifact_area.as_ref().unwrap().path);
+        let mut targeted = prior.clone();
+        targeted.id = format!("{attempt_id}-evidence-proof-tests");
+        targeted.status = TaskStatus::Planned;
+        targeted.artifact_area = Some(crate::work_model::TaskArtifactArea {
+            path: crate::work_model::work_artifact_path(id, attempt_id, &targeted.id),
+        });
+        targeted.started_at = None;
+        targeted.completed_at = None;
+        let attachment = EvidenceAttachment {
+            snapshot_path: format!(
+                ".fluent/work/artifacts/{id}/{attempt_id}/host-evidence/proof.json"
+            ),
+            digest: "sha256:proof".to_string(),
+        };
+        let recovery_id = "host-evidence-proof".to_string();
+        targeted.evidence_review_context = Some(EvidenceReviewContext {
+            recovery_id: recovery_id.clone(),
+            candidate_commit: candidate.clone(),
+            attachment: attachment.clone(),
+            prior_review_artifact: prior_path.clone(),
+        });
+        let attempt = &mut item.attempts[0];
+        attempt.tasks.push(targeted.clone());
+        attempt.status = AttemptStatus::Reviewing;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.evidence_recoveries.push(EvidenceRecovery {
+            id: recovery_id,
+            candidate_commit: candidate,
+            attachment,
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: prior_path,
+                review_task_id: Some(targeted.id),
+            }],
+            state: EvidenceRecoveryState::Reviewing,
+            created_at: "2026-08-25T10:00:00Z".to_string(),
+        });
         store.create_work_item(&item).unwrap();
     }
 
@@ -1572,6 +1891,181 @@ mod tests {
         let replayed = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
         assert_eq!(replayed.dispatches.len(), 2);
         assert_eq!(replayed.active().unwrap().priority, 11);
+    }
+
+    fn initialize_queue_resume_git_project(project: &Path) {
+        fs::create_dir_all(project).unwrap();
+        crate::git::run(project, &["init", "-q"], "initialize queue resume fixture").unwrap();
+        crate::git::run(
+            project,
+            &["config", "user.name", "Test Author"],
+            "configure author",
+        )
+        .unwrap();
+        crate::git::run(
+            project,
+            &["config", "user.email", "test@example.com"],
+            "configure email",
+        )
+        .unwrap();
+        fs::write(project.join("tracked.txt"), "base\n").unwrap();
+        crate::git::run(project, &["add", "tracked.txt"], "stage fixture").unwrap();
+        crate::git::run(project, &["commit", "-m", "Base"], "commit fixture").unwrap();
+    }
+
+    #[test]
+    fn resume_accepts_pending_evidence_review_after_blocked_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_queue_resume_git_project(dir.path());
+        write_pending_evidence_review(dir.path(), "wi-evidence", "attempt-1");
+        let mut blocked = Dispatch::new_queued("wi-evidence", 0, None, 1);
+        blocked.status = DispatchStatus::Blocked;
+        blocked.bound_attempt_id = Some("attempt-1".to_string());
+        put_ledger(
+            dir.path(),
+            &DispatchLedger {
+                work_item_id: "wi-evidence".to_string(),
+                dispatches: vec![blocked],
+            },
+        );
+
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-evidence").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::Blocked);
+        assert_eq!(
+            ledger.active().unwrap().bound_attempt_id.as_deref(),
+            Some("attempt-1")
+        );
+    }
+
+    #[test]
+    fn add_rejects_pending_evidence_review_instead_of_creating_new_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_queue_resume_git_project(dir.path());
+        write_pending_evidence_review(dir.path(), "wi-evidence", "attempt-1");
+
+        let error = add(dir.path(), "wi-evidence", None).unwrap_err();
+        assert!(error.to_string().contains("queue resume"));
+        assert!(read_ledger(dir.path(), "wi-evidence").unwrap().is_none());
+        let item = WorkModelStore::new(dir.path())
+            .read_work_item("wi-evidence")
+            .unwrap();
+        assert_eq!(item.attempts.len(), 1);
+        assert!(item.attempts[0].has_pending_evidence_review_tasks());
+    }
+
+    #[test]
+    fn resume_supersedes_clean_interrupted_accidental_queue_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_queue_resume_git_project(dir.path());
+        write_pending_evidence_review(dir.path(), "wi-evidence", "attempt-1");
+        let accidental_workspace = dir.path().join("accidental-attempt");
+        crate::git::run(
+            dir.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "accidental-attempt",
+                accidental_workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create accidental queue workspace",
+        )
+        .unwrap();
+        let store = WorkModelStore::new(dir.path());
+        store
+            .mutate_work_item("wi-evidence", |item| {
+                item.add_initial_attempt("attempt-2")?;
+                let attempt = item.attempts.last_mut().unwrap();
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::Interrupted);
+                let writer = &mut attempt.tasks[0];
+                writer.status = TaskStatus::NeedsUser;
+                writer.workspace_access.writes = vec![crate::work_model::WorkspaceRef {
+                    id: "candidate".to_string(),
+                    path: accidental_workspace.display().to_string(),
+                }];
+                Ok(())
+            })
+            .unwrap();
+        let mut accidental = Dispatch::new_queued("wi-evidence", 0, None, 1);
+        accidental.status = DispatchStatus::NeedsUser;
+        accidental.bound_attempt_id = Some("attempt-2".to_string());
+        put_ledger(
+            dir.path(),
+            &DispatchLedger {
+                work_item_id: "wi-evidence".to_string(),
+                dispatches: vec![accidental],
+            },
+        );
+
+        fs::write(accidental_workspace.join("tracked.txt"), "candidate work\n").unwrap();
+        assert!(resume(dir.path(), "wi-evidence", "attempt-1", None).is_err());
+        assert_eq!(
+            store.read_work_item("wi-evidence").unwrap().attempts[1].status,
+            AttemptStatus::NeedsUser
+        );
+        crate::git::run(
+            &accidental_workspace,
+            &["checkout", "--", "tracked.txt"],
+            "restore accidental workspace fixture",
+        )
+        .unwrap();
+        let task_lease = crate::lease::acquire(&crate::lease::task_lock_path(
+            dir.path(),
+            "wi-evidence",
+            "attempt-2-write-1",
+        ))
+        .unwrap();
+        assert!(resume(dir.path(), "wi-evidence", "attempt-1", None).is_err());
+        drop(task_lease);
+
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let item = store.read_work_item("wi-evidence").unwrap();
+        assert!(item.attempts[0].has_pending_evidence_review_tasks());
+        assert_eq!(item.attempts[1].status, AttemptStatus::Failed);
+        assert_eq!(item.attempts[1].pause_kind, None);
+        assert_eq!(item.attempts[1].tasks[0].status, TaskStatus::Superseded);
+        assert_eq!(
+            item.attempts[1].tasks[0].role,
+            SUPERSEDED_QUEUE_ADMISSION_ROLE
+        );
+        let ledger = read_ledger(dir.path(), "wi-evidence").unwrap().unwrap();
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(
+            ledger.active().unwrap().bound_attempt_id.as_deref(),
+            Some("attempt-1")
+        );
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
+        let evidence_path = dir.path().join(
+            item.attempts[0]
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.producer_id == "queue-resume-reconciliation")
+                .unwrap()
+                .path
+                .clone(),
+        );
+        let evidence_bytes = fs::read(&evidence_path).unwrap();
+        fs::write(&evidence_path, b"{}").unwrap();
+        assert!(claim(dir.path(), "wi-evidence", "attempt-1").is_err());
+        fs::write(&evidence_path, evidence_bytes).unwrap();
+        let claimed = claim(dir.path(), "wi-evidence", "attempt-1")
+            .unwrap()
+            .expect("reconciled evidence resume remains claimable");
+        assert_eq!(claimed.bound_attempt_id, "attempt-1");
     }
 
     #[test]
