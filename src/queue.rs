@@ -517,6 +517,8 @@ pub fn resume_with_tester_no_sandbox(
         Some(previous) => {
             if previous.status != DispatchStatus::NeedsUser
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
+                && !(previous.status == DispatchStatus::Failed
+                    && reconciled_candidate_ancestry_repair)
                 && !(previous.status == DispatchStatus::Blocked && learner_retry)
                 && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
                 && !(legacy_learner_tester_evidence

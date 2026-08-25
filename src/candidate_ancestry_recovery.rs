@@ -2004,6 +2004,56 @@ mod tests {
     }
 
     #[test]
+    fn repaired_attempt_can_resume_after_its_prior_dispatch_failed() {
+        let fixture = Fixture::new();
+        let repair_result = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Preserve the accepted protected base and unchanged final tree.",
+        )
+        .unwrap();
+        crate::queue::add(&fixture.project, "work-1", None).unwrap();
+        let token = crate::queue::claim(&fixture.project, "work-1", "attempt-1")
+            .unwrap()
+            .unwrap();
+        crate::queue::reconcile(
+            &fixture.project,
+            &token,
+            crate::queue::DispatchStatus::Failed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::queue::resume(&fixture.project, "work-1", "attempt-1", None).unwrap(),
+            crate::queue::ResumeDispatchOutcome::Created
+        );
+        let ledger = crate::queue::read_ledger(&fixture.project, "work-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(
+            ledger.dispatches[0].status,
+            crate::queue::DispatchStatus::Failed
+        );
+        let resumed = ledger.active().unwrap();
+        assert_eq!(resumed.bound_attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(resumed.resume_of_dispatch_id.as_deref(), Some("dispatch-1"));
+        assert_eq!(
+            repair_result.recovered_candidate_commit,
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .last()
+                .unwrap()
+                .output
+                .as_ref()
+                .unwrap()
+                .commit
+        );
+    }
+
+    #[test]
     fn supersedes_interrupted_fresh_queue_admission_and_resumes_exact_repair() {
         let fixture = Fixture::new();
         let repair_result = repair(
