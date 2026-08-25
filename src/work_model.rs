@@ -5023,6 +5023,12 @@ impl Attempt {
 
     /// Return whether host evidence has already moved this Attempt into one
     /// exact, scheduler-resumable targeted review frontier.
+    ///
+    /// A completed targeted Review remains pending here until the Attempt loop
+    /// consumes its verdict. Scheduler dispatches can become blocked while the
+    /// provider is still running, so the next exact queue resume must be able
+    /// to settle that immutable completed Task instead of requiring a direct
+    /// Attempt invocation.
     pub fn has_pending_evidence_review_tasks(&self) -> bool {
         let Some(recovery) = self.active_evidence_recovery() else {
             return false;
@@ -5045,7 +5051,7 @@ impl Attempt {
                         task.id == task_id
                             && task.kind == TaskKind::Review
                             && task.role == target.role
-                            && task.status == TaskStatus::Planned
+                            && matches!(task.status, TaskStatus::Planned | TaskStatus::Complete)
                             && task
                                 .evidence_review_context
                                 .as_ref()
@@ -10696,6 +10702,16 @@ random banner prose that must be ignored
 
         assert!(attempt.has_pending_evidence_review_tasks());
         assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.tasks[0].status = TaskStatus::Complete;
+        assert!(attempt.has_pending_evidence_review_tasks());
+        assert!(attempt.ensure_resume_ready().is_ok());
+
+        attempt.tasks[0].status = TaskStatus::Executing;
+        assert!(!attempt.has_pending_evidence_review_tasks());
+        assert!(attempt.ensure_resume_ready().is_err());
+
+        attempt.tasks[0].status = TaskStatus::Complete;
 
         attempt.tasks.push(task(TaskKind::Write, Vec::new()));
         assert!(!attempt.has_pending_evidence_review_tasks());

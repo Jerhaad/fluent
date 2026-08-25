@@ -1946,11 +1946,55 @@ mod tests {
     }
 
     #[test]
+    fn resume_accepts_completed_unsettled_evidence_review_after_blocked_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_queue_resume_git_project(dir.path());
+        write_pending_evidence_review(dir.path(), "wi-evidence", "attempt-1");
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-evidence", |item| {
+                item.attempts[0].tasks.last_mut().unwrap().status = TaskStatus::Complete;
+                Ok(())
+            })
+            .unwrap();
+        let mut blocked = Dispatch::new_queued("wi-evidence", 0, None, 1);
+        blocked.status = DispatchStatus::Blocked;
+        blocked.bound_attempt_id = Some("attempt-1".to_string());
+        put_ledger(
+            dir.path(),
+            &DispatchLedger {
+                work_item_id: "wi-evidence".to_string(),
+                dispatches: vec![blocked],
+            },
+        );
+
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let ledger = read_ledger(dir.path(), "wi-evidence").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::Blocked);
+        assert_eq!(
+            ledger.active().unwrap().bound_attempt_id.as_deref(),
+            Some("attempt-1")
+        );
+    }
+
+    #[test]
     fn add_rejects_pending_evidence_review_instead_of_creating_new_attempt() {
         let dir = tempfile::tempdir().unwrap();
         initialize_queue_resume_git_project(dir.path());
         write_pending_evidence_review(dir.path(), "wi-evidence", "attempt-1");
 
+        let error = add(dir.path(), "wi-evidence", None).unwrap_err();
+        assert!(error.to_string().contains("queue resume"));
+        assert!(read_ledger(dir.path(), "wi-evidence").unwrap().is_none());
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-evidence", |item| {
+                item.attempts[0].tasks.last_mut().unwrap().status = TaskStatus::Complete;
+                Ok(())
+            })
+            .unwrap();
         let error = add(dir.path(), "wi-evidence", None).unwrap_err();
         assert!(error.to_string().contains("queue resume"));
         assert!(read_ledger(dir.path(), "wi-evidence").unwrap().is_none());

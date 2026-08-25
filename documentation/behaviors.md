@@ -5117,12 +5117,13 @@ Test: src/work_task_executor.rs (current_handoff_failure_surfaces_after_the_paus
 
 ### B2u
 
-WHEN an Attempt has a planned evidence-targeted Review, THE SYSTEM SHALL reject
-ordinary `fluent queue add` before it can create another Attempt and SHALL
-accept `fluent queue resume ... --attempt <that-attempt>` after a blocked
-dispatch.
+WHEN an Attempt has an evidence-targeted Review that is planned or completed
+but not yet consumed by the Attempt loop, THE SYSTEM SHALL reject ordinary
+`fluent queue add` before it can create another Attempt and SHALL accept
+`fluent queue resume ... --attempt <that-attempt>` after a blocked dispatch.
 Test: src/queue.rs (add_rejects_pending_evidence_review_instead_of_creating_new_attempt,
-resume_accepts_pending_evidence_review_after_blocked_dispatch)
+resume_accepts_pending_evidence_review_after_blocked_dispatch,
+resume_accepts_completed_unsettled_evidence_review_after_blocked_dispatch)
 
 ### B2v
 

@@ -3264,8 +3264,11 @@ ordinary Attempt loop, which revalidates the frontier before reopening only the
 uncertain roles.
 
 A pending evidence-targeted Review is also resumed through that exact Attempt
-binding, even when its preceding dispatch is `blocked`; ordinary `queue add`
-rejects this frontier so it cannot allocate a replacement Attempt. Fluent also
+binding, even when its preceding dispatch is `blocked`; this includes the brief
+frontier where the Review Task is complete but its verdict has not yet been
+consumed by the Attempt loop. An executing Review remains ineligible so a
+second dispatch cannot duplicate live work. Ordinary `queue add` rejects this
+frontier so it cannot allocate a replacement Attempt. Fluent also
 reconciles the narrow historical case where an older scheduler already created
 a later initial Writer: every later Attempt must contain exactly one interrupted
 output-free Writer, have no live task lease, and own a clean worktree still at
