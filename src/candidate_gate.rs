@@ -107,6 +107,9 @@ pub struct CandidateGateRequest<'a> {
     pub completion_contract: Option<&'a WriterCompletionContract>,
     pub allow_tree_identical_metadata_rewrite: bool,
     pub tester_results_path: Option<&'a Path>,
+    /// Exact candidate-bound commands whose failed canonical Tester result was
+    /// superseded by accepted host evidence and a passing targeted Tests review.
+    pub accepted_tester_commands: &'a [String],
     pub artifact_path: &'a Path,
 }
 
@@ -828,6 +831,48 @@ fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, S
     })
 }
 
+/// Resolve one exact command-shaped Test reference that a rejected final
+/// candidate gate could not find in canonical Tester evidence. Selector-only
+/// diagnostics remain code/test-contract corrections rather than host runs.
+pub(crate) fn requested_host_evidence_command(evidence: &CandidateGateEvidence) -> Option<String> {
+    if evidence.schema_version == 0
+        || evidence.schema_version > CANDIDATE_GATE_SCHEMA_VERSION
+        || evidence.phase != CandidateGatePhase::FinalTester
+        || evidence.disposition != CandidateGateDisposition::Rejected
+    {
+        return None;
+    }
+    let mut blocking = evidence.checks.iter().filter(|check| {
+        matches!(
+            check.status,
+            CandidateCheckStatus::Failed | CandidateCheckStatus::Error
+        )
+    });
+    let tester = blocking.next()?;
+    if tester.name != "tester-reference-evidence"
+        || tester.status != CandidateCheckStatus::Failed
+        || blocking.next().is_some()
+    {
+        return None;
+    }
+    let mut commands = tester
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            diagnostic
+                .strip_prefix("no passing Tester result matches ")
+                .and_then(|reference| parse_test_reference(reference).ok())
+                .and_then(|reference| reference.command)
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    let [command] = commands.as_slice() else {
+        return None;
+    };
+    Some(command.clone())
+}
+
 fn parse_python_test_command(
     reference: &str,
 ) -> std::result::Result<Option<TestReference>, String> {
@@ -987,10 +1032,13 @@ fn check_tester_evidence(
     let mut missing_references = Vec::new();
     for reference in references {
         let matched = if let Some(expected_command) = reference.command.as_deref() {
-            results
-                .commands
+            request
+                .accepted_tester_commands
                 .iter()
-                .any(|command| command.exit_code == 0 && command.command.trim() == expected_command)
+                .any(|command| command.trim() == expected_command)
+                || results.commands.iter().any(|command| {
+                    command.exit_code == 0 && command.command.trim() == expected_command
+                })
         } else {
             results.tests.iter().any(|test| {
                 if test.status != "pass" {
@@ -1004,6 +1052,11 @@ fn check_tester_evidence(
                         test.id == selector
                             || test.id.ends_with(&format!("::{selector}"))
                             || test.id.ends_with(&format!("${selector}"))
+                            || test
+                                .id
+                                .split_whitespace()
+                                .next_back()
+                                .is_some_and(|identity| identity == selector)
                     }
                     None => test.id == reference.path,
                 }
@@ -1022,12 +1075,13 @@ fn check_tester_evidence(
     let mut diagnostics = Vec::new();
     if !missing_references.is_empty() {
         let artifact_dir = path.parent().unwrap_or(path);
-        for (index, command) in results
-            .commands
-            .iter()
-            .enumerate()
-            .filter(|(_, command)| command.exit_code != 0)
-        {
+        for (index, command) in results.commands.iter().enumerate().filter(|(_, command)| {
+            command.exit_code != 0
+                && !request
+                    .accepted_tester_commands
+                    .iter()
+                    .any(|accepted| accepted.trim() == command.command.trim())
+        }) {
             diagnostics.push(format!(
                 "Tester command {index} exited {}: {}",
                 command.exit_code, command.command
@@ -1282,6 +1336,7 @@ mod tests {
                 completion_contract: contract,
                 allow_tree_identical_metadata_rewrite: false,
                 tester_results_path,
+                accepted_tester_commands: &[],
                 artifact_path,
             }
         }
@@ -2073,6 +2128,82 @@ mod tests {
     }
 
     #[test]
+    fn python_command_reference_matches_accepted_candidate_bound_host_evidence() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/fluent_merge_readiness.py",
+            "#!/usr/bin/env python3\n",
+            "Add readiness journey\n\n- Cover the public workflow",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "python3 tests/fluent_merge_readiness.py",
+                "test_harness": "shell-harness",
+                "exit_code": 1,
+                "duration_ms": 1,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
+        let accepted = vec!["python3 tests/fluent_merge_readiness.py".to_string()];
+        let mut request = fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+        request.accepted_tester_commands = &accepted;
+
+        let evidence = run_candidate_gate(request).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn nextest_binary_and_test_identity_matches_exact_selector() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/dashboard.rs",
+            "#[test]\nfn preserves_selection() {}\n",
+            "Add dashboard test\n\n- Cover dashboard selection",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{
+                "id": "dashboard-tests::dashboard preserves_selection",
+                "test_harness": "cargo-nextest",
+                "status": "pass",
+                "duration_ms": 1,
+                "failure_excerpt": null
+            }],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("tests/dashboard.rs (preserves_selection)");
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+    }
+
+    #[test]
     fn python_command_reference_rejects_different_passing_tester_command() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
@@ -2372,5 +2503,64 @@ mod tests {
             check(&evidence, "project-check").status,
             CandidateCheckStatus::Error
         );
+    }
+
+    fn rejected_reference_gate(diagnostics: &[&str]) -> CandidateGateEvidence {
+        CandidateGateEvidence {
+            schema_version: CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: CandidateGatePhase::FinalTester,
+            disposition: CandidateGateDisposition::Rejected,
+            base_commit: "base".to_string(),
+            candidate_commit: "candidate".to_string(),
+            tester_results_path: Some("tester-results.json".to_string()),
+            metadata_rewrite: None,
+            checks: vec![CandidateCheckEvidence {
+                name: "tester-reference-evidence".to_string(),
+                status: CandidateCheckStatus::Failed,
+                diagnostics: diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.to_string())
+                    .collect(),
+                log_path: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn rejected_gate_requests_one_exact_command_for_host_evidence() {
+        let evidence = rejected_reference_gate(&[
+            "no passing Tester result matches python3 tests/fluent_merge_readiness.py",
+            "no passing Tester result matches python3 tests/fluent_merge_readiness.py",
+            "no passing Tester result matches tests/readiness.py::current_frontier",
+        ]);
+
+        assert_eq!(
+            requested_host_evidence_command(&evidence).as_deref(),
+            Some("python3 tests/fluent_merge_readiness.py")
+        );
+    }
+
+    #[test]
+    fn rejected_gate_does_not_request_ambiguous_or_unrelated_host_evidence() {
+        let multiple_commands = rejected_reference_gate(&[
+            "no passing Tester result matches python3 tests/one.py",
+            "no passing Tester result matches python3 tests/two.py",
+        ]);
+        assert_eq!(requested_host_evidence_command(&multiple_commands), None);
+
+        let mut unrelated_failure =
+            rejected_reference_gate(&["no passing Tester result matches python3 tests/one.py"]);
+        unrelated_failure.checks.push(CandidateCheckEvidence {
+            name: "candidate-identity".to_string(),
+            status: CandidateCheckStatus::Failed,
+            diagnostics: vec!["candidate is dirty".to_string()],
+            log_path: None,
+        });
+        assert_eq!(requested_host_evidence_command(&unrelated_failure), None);
+
+        let selector_only = rejected_reference_gate(&[
+            "no passing Tester result matches tests/readiness.py::current_frontier",
+        ]);
+        assert_eq!(requested_host_evidence_command(&selector_only), None);
     }
 }

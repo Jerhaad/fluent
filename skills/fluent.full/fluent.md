@@ -257,9 +257,10 @@ prior transcripts.
 
 ### Recover a host-evidence finding
 
-Use this only when the candidate does not need a source change and the failed
-review explicitly asks for proof that a trusted host can run. Create one JSON
-file on that host, for example:
+Use this only when the candidate does not need a source change and either a
+failed review asks for proof that a trusted host can run or the final candidate
+gate asks for one command-shaped `Test:` reference that canonical Tester did
+not run. Create one JSON file on that host, for example:
 
 ```json
 {"schema_version":1,"producer":"release-host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"...captured output..."}
@@ -274,6 +275,12 @@ fluent attempt evidence attach <work-item-id> <attempt-id> \
   --candidate <candidate-sha> --evidence-file host-evidence.json \
   --review-artifact .fluent/work/artifacts/.../review.md
 ```
+
+For a candidate-gate pause, run the exact command in `needs-user.md` against
+the unchanged candidate and pass the rejected `candidate-gate.json` path as the
+single `--review-artifact`. Set the evidence document's `check` to that exact
+command and `working_directory` to `.`. Fluent accepts this only when that gate
+has one missing complete command and no unrelated failure.
 
 Fluent snapshots the exact document, binds it to that candidate, and reruns
 only the named reviewers. Do not edit the candidate or invent a commit. Inspect

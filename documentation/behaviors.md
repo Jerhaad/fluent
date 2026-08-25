@@ -302,6 +302,48 @@ replace the prior failed Tester evidence with the passing recheck result.
 Test: src/work_model.rs (passing_recheck_supersedes_failed_tester_review_evidence)
 Test: src/work_attempt_loop.rs (passing_failed_command_recheck_allows_normal_reviews)
 
+### B12
+
+IF the final candidate gate's only missing evidence is one command-shaped
+`Test:` reference that canonical Tester did not run, and the exact candidate
+already has a passing Tests Review, THEN THE SYSTEM SHALL pause before another
+Writer and provide an eligible command to attach candidate-bound host evidence
+to that rejected gate.
+Test: src/work_attempt_loop.rs (missing_command_reference_pauses_for_exact_host_evidence_before_writer)
+Test: src/candidate_gate.rs (rejected_gate_does_not_request_ambiguous_or_unrelated_host_evidence)
+
+### B13
+
+WHEN an operator attaches passing evidence for the exact requested command and
+candidate, THE SYSTEM SHALL preserve immutable gate and evidence snapshots.
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+
+### B14
+
+WHEN Fluent accepts candidate-gate host evidence, THE SYSTEM SHALL require a
+targeted Tests Review before crediting the command.
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+
+### B15
+
+WHEN the targeted Tests Review accepts candidate-gate host evidence, THE SYSTEM
+SHALL credit only its exact command when the candidate gate runs again.
+Test: src/candidate_gate.rs (python_command_reference_matches_accepted_candidate_bound_host_evidence)
+
+### B16
+
+WHEN an operator repeats the same candidate-gate evidence attachment, THE
+SYSTEM SHALL return the existing recovery without creating another review.
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+
+### B17
+
+IF the candidate, command, working directory, rejected gate, or related gate
+failures do not match the authorized evidence frontier, THEN THE SYSTEM SHALL
+reject the attachment without accepting stale evidence.
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+Test: src/candidate_gate.rs (rejected_gate_does_not_request_ambiguous_or_unrelated_host_evidence)
+
 ## Persisted status accounting
 
 ### B1
@@ -6715,10 +6757,12 @@ Test: src/candidate_gate.rs (python_command_reference_requires_committed_script_
 ### B25g
 
 WHEN final Tester evidence is checked for a Python command `Test:` reference,
-THE SYSTEM SHALL require a passing Tester command that exactly matches the
-approved complete command.
+THE SYSTEM SHALL require either a passing Tester command that exactly matches
+the approved complete command or passing candidate-bound host evidence for that
+same command accepted by a targeted Tests Review.
 Test: src/candidate_gate.rs (python_command_reference_matches_exact_passing_tester_command)
 Test: src/candidate_gate.rs (python_command_reference_rejects_different_passing_tester_command)
+Test: src/candidate_gate.rs (python_command_reference_matches_accepted_candidate_bound_host_evidence)
 
 ### B27e
 

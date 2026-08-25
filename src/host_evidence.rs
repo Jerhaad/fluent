@@ -73,12 +73,37 @@ struct ValidatedRecheckFrontier {
     correction_artifacts: Vec<ArtifactRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateGateEvidenceBinding {
+    schema_version: u32,
+    candidate_commit: String,
+    gate_artifact: BoundRecheckArtifact,
+    gate_evidence: crate::candidate_gate::CandidateGateEvidence,
+    command: String,
+    working_directory: String,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedCandidateGateFrontier {
+    prior_tests_review: Task,
+    binding_path: String,
+    binding_bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedEvidenceRun {
     pub recovery: EvidenceRecovery,
     pub result: EvidenceResult,
     pub command: String,
     pub working_directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CandidateGateEvidenceAction {
+    pub command: String,
+    pub gate_artifact: String,
+    pub attach_command: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -647,6 +672,20 @@ pub fn attach(
         {
             return Ok(prior.clone());
         }
+        if recheck_artifact.is_none()
+            && review_artifacts.len() == 1
+            && review_artifacts[0].ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+            && let Some(prior) = existing_candidate_gate_recovery(
+                project_root,
+                existing,
+                candidate_commit,
+                &digest,
+                &snapshot_path,
+                &review_artifacts[0],
+            )
+        {
+            return Ok(prior.clone());
+        }
         let recheck_frontier = recheck_artifact
             .map(|artifact| {
                 validate_recheck_evidence_frontier(
@@ -659,9 +698,25 @@ pub fn attach(
                 )
             })
             .transpose()?;
-        let prior_reviews = match &recheck_frontier {
-            Some(frontier) => vec![frontier.prior_tests_review.clone()],
-            None => validate_evidence_frontier(
+        let candidate_gate_frontier = if recheck_frontier.is_none()
+            && review_artifacts.len() == 1
+            && review_artifacts[0].ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        {
+            Some(validate_candidate_gate_evidence_frontier(
+                project_root,
+                item,
+                attempt_id,
+                candidate_commit,
+                &review_artifacts[0],
+                &document,
+            )?)
+        } else {
+            None
+        };
+        let prior_reviews = match (&recheck_frontier, &candidate_gate_frontier) {
+            (Some(frontier), _) => vec![frontier.prior_tests_review.clone()],
+            (None, Some(frontier)) => vec![frontier.prior_tests_review.clone()],
+            (None, None) => validate_evidence_frontier(
                 project_root,
                 item,
                 attempt_id,
@@ -669,15 +724,17 @@ pub fn attach(
                 review_artifacts,
             )?,
         };
-        let interrupted_correction_id = (recheck_frontier.is_none())
-            .then(|| {
-                interrupted_evidence_correction(existing, candidate_commit, review_artifacts)
-                    .map(|task| task.id.clone())
-            })
-            .flatten();
-        let target_artifacts = match &recheck_frontier {
-            Some(frontier) => vec![frontier.binding_path.clone()],
-            None => review_artifacts.to_vec(),
+        let interrupted_correction_id = (recheck_frontier.is_none()
+            && candidate_gate_frontier.is_none())
+        .then(|| {
+            interrupted_evidence_correction(existing, candidate_commit, review_artifacts)
+                .map(|task| task.id.clone())
+        })
+        .flatten();
+        let target_artifacts = match (&recheck_frontier, &candidate_gate_frontier) {
+            (Some(frontier), _) => vec![frontier.binding_path.clone()],
+            (None, Some(frontier)) => vec![frontier.binding_path.clone()],
+            (None, None) => review_artifacts.to_vec(),
         };
         if let Some(prior) = existing.evidence_recoveries.iter().find(|prior| {
             prior.candidate_commit == candidate_commit
@@ -724,6 +781,16 @@ pub fn attach(
                 id: attempt_id.to_string(),
             })?;
         }
+        if let Some(frontier) = &candidate_gate_frontier {
+            publish_snapshot(
+                project_root,
+                &frontier.binding_path,
+                &frontier.binding_bytes,
+            )
+            .map_err(|_| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        }
         let attempt = item
             .attempts
             .iter_mut()
@@ -744,7 +811,9 @@ pub fn attach(
                 .iter()
                 .map(|role| EvidenceReviewTarget {
                     role: role.clone(),
-                    prior_review_artifact: if recheck_frontier.is_some() {
+                    prior_review_artifact: if recheck_frontier.is_some()
+                        || candidate_gate_frontier.is_some()
+                    {
                         target_artifacts.first().cloned().unwrap_or_default()
                     } else {
                         review_artifacts
@@ -786,6 +855,12 @@ pub fn attach(
                     });
                     inputs.extend(frontier.correction_artifacts.clone());
                 }
+                if let Some(frontier) = &candidate_gate_frontier {
+                    inputs.push(ArtifactRef {
+                        producer_id: "candidate-gate".to_string(),
+                        path: frontier.binding_path.clone(),
+                    });
+                }
                 inputs.push(ArtifactRef {
                     producer_id: "host-evidence".to_string(),
                     path: snapshot_path.clone(),
@@ -797,6 +872,11 @@ pub fn attach(
                 let prior_review_artifact = recheck_frontier
                     .as_ref()
                     .map(|frontier| frontier.binding_path.clone())
+                    .or_else(|| {
+                        candidate_gate_frontier
+                            .as_ref()
+                            .map(|frontier| frontier.binding_path.clone())
+                    })
                     .unwrap_or_else(|| review_artifact_path(&prior).unwrap());
                 attempt.tasks.push(Task {
                     id: task_id.clone(),
@@ -838,7 +918,12 @@ pub fn attach(
         attempt.review_state = Some(work_model::AttemptReviewState::NotReviewed);
         attempt.pause_kind = None;
         attempt.pause_recovery = None;
-        Ok(recovery)
+        Ok(attempt
+            .evidence_recoveries
+            .iter()
+            .find(|entry| entry.id == recovery.id)
+            .cloned()
+            .expect("attached recovery remains present"))
     })?;
     let _ = document; // validation intentionally happens before publication.
     Ok(recovery)
@@ -887,6 +972,148 @@ fn existing_recheck_recovery<'a>(
         (binding.candidate_commit == candidate_commit
             && expected.as_deref() == Some(recheck_artifact))
         .then_some(recovery)
+    })
+}
+
+fn existing_candidate_gate_recovery<'a>(
+    project_root: &Path,
+    attempt: &'a work_model::Attempt,
+    candidate_commit: &str,
+    evidence_digest: &str,
+    evidence_snapshot_path: &str,
+    gate_artifact: &str,
+) -> Option<&'a EvidenceRecovery> {
+    attempt.evidence_recoveries.iter().find_map(|recovery| {
+        if recovery.candidate_commit != candidate_commit
+            || recovery.attachment.digest != evidence_digest
+            || recovery.attachment.snapshot_path != evidence_snapshot_path
+            || recovery.targets.len() != 1
+        {
+            return None;
+        }
+        let binding_path = &recovery.targets[0].prior_review_artifact;
+        let binding_bytes = fs::read(project_root.join(binding_path)).ok()?;
+        let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+        if snapshot_path(&attempt.work_item_id, &attempt.id, &binding_digest)
+            .ok()?
+            .as_str()
+            != binding_path
+            || format!(
+                "sha256:{:x}",
+                Sha256::digest(fs::read(project_root.join(evidence_snapshot_path)).ok()?)
+            ) != evidence_digest
+        {
+            return None;
+        }
+        let binding: CandidateGateEvidenceBinding = serde_json::from_slice(&binding_bytes).ok()?;
+        if binding.schema_version != 1
+            || binding.candidate_commit != candidate_commit
+            || binding.gate_artifact.path != gate_artifact
+        {
+            return None;
+        }
+        let current_gate_bytes = fs::read(project_root.join(gate_artifact)).ok()?;
+        let current_gate_digest = format!("sha256:{:x}", Sha256::digest(&current_gate_bytes));
+        let original_frontier_is_unchanged = current_gate_digest == binding.gate_artifact.digest;
+        let completed_frontier_now_passes = recovery.state == EvidenceRecoveryState::Complete
+            && serde_json::from_slice::<crate::candidate_gate::CandidateGateEvidence>(
+                &current_gate_bytes,
+            )
+            .ok()
+            .is_some_and(|gate| {
+                gate.candidate_commit == candidate_commit
+                    && gate.phase == crate::candidate_gate::CandidateGatePhase::FinalTester
+                    && gate.disposition == crate::candidate_gate::CandidateGateDisposition::Passed
+            });
+        (original_frontier_is_unchanged || completed_frontier_now_passes).then_some(recovery)
+    })
+}
+
+fn validate_candidate_gate_evidence_frontier(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+    candidate_commit: &str,
+    gate_artifact: &str,
+    document: &EvidenceDocument,
+) -> Result<ValidatedCandidateGateFrontier, WorkModelError> {
+    let rejected = || WorkModelError::AttemptNotFound {
+        id: attempt_id.to_string(),
+    };
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(rejected)?;
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || !matches!(
+            attempt.pause_kind,
+            Some(
+                work_model::PauseKind::RoundCap
+                    | work_model::PauseKind::CandidateGate
+                    | work_model::PauseKind::HostEvidence
+            )
+        )
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+        || attempt
+            .tasks
+            .iter()
+            .any(|task| task.status == TaskStatus::Executing)
+        || item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id && candidate.candidate_commit == candidate_commit
+        })
+        || document.result != EvidenceResult::Pass
+        || document.working_directory != "."
+    {
+        return Err(rejected());
+    }
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(rejected)?;
+    if writer.commit != candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit)
+        || !attempt
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.path == gate_artifact)
+    {
+        return Err(rejected());
+    }
+    let gate_path = project_root.join(gate_artifact);
+    let gate_bytes = fs::read(&gate_path).map_err(|_| rejected())?;
+    let gate: crate::candidate_gate::CandidateGateEvidence =
+        serde_json::from_slice(&gate_bytes).map_err(|_| rejected())?;
+    let requested =
+        crate::candidate_gate::requested_host_evidence_command(&gate).ok_or_else(rejected)?;
+    if gate.candidate_commit != candidate_commit || document.check != requested {
+        return Err(rejected());
+    }
+    let prior_tests_review = latest_passing_tests_review(project_root, attempt, candidate_commit)
+        .cloned()
+        .ok_or_else(rejected)?;
+    let binding = CandidateGateEvidenceBinding {
+        schema_version: 1,
+        candidate_commit: candidate_commit.to_string(),
+        gate_artifact: BoundRecheckArtifact {
+            path: gate_artifact.to_string(),
+            digest: format!("sha256:{:x}", Sha256::digest(&gate_bytes)),
+        },
+        gate_evidence: gate,
+        command: requested,
+        working_directory: ".".to_string(),
+    };
+    let binding_bytes = serde_json::to_vec_pretty(&binding).map_err(|_| rejected())?;
+    let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+    let binding_path =
+        snapshot_path(item.id.as_str(), attempt_id, &binding_digest).map_err(|_| rejected())?;
+    Ok(ValidatedCandidateGateFrontier {
+        prior_tests_review,
+        binding_path,
+        binding_bytes,
     })
 }
 
@@ -1590,6 +1817,138 @@ pub(crate) fn completed_recheck_evidence_source(
     Some(source_path)
 }
 
+/// Resolve command-shaped Test references whose host execution was bound to a
+/// rejected final candidate gate and accepted by a targeted Tests review.
+pub(crate) fn completed_candidate_gate_evidence_commands(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Vec<String> {
+    let latest_candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+    let Some(latest_candidate) = latest_candidate else {
+        return Vec::new();
+    };
+    let mut commands = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|recovery| {
+            if recovery.state != EvidenceRecoveryState::Complete
+                || recovery.candidate_commit != latest_candidate
+                || recovery.targets.len() != 1
+                || recovery.targets[0].role != "tests"
+            {
+                return None;
+            }
+            let target = &recovery.targets[0];
+            let binding_bytes = fs::read(project_root.join(&target.prior_review_artifact)).ok()?;
+            let binding: CandidateGateEvidenceBinding =
+                serde_json::from_slice(&binding_bytes).ok()?;
+            let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+            if binding.schema_version != 1
+                || binding.candidate_commit != recovery.candidate_commit
+                || snapshot_path(
+                    attempt.work_item_id.as_str(),
+                    attempt.id.as_str(),
+                    &binding_digest,
+                )
+                .ok()
+                .as_deref()
+                    != Some(target.prior_review_artifact.as_str())
+            {
+                return None;
+            }
+            if binding.gate_evidence.candidate_commit != recovery.candidate_commit
+                || crate::candidate_gate::requested_host_evidence_command(&binding.gate_evidence)
+                    .as_deref()
+                    != Some(binding.command.as_str())
+            {
+                return None;
+            }
+            let evidence_bytes =
+                fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
+            if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
+            {
+                return None;
+            }
+            let evidence = parse_document(&evidence_bytes).ok()?;
+            if evidence.result != EvidenceResult::Pass
+                || evidence.check != binding.command
+                || evidence.working_directory != binding.working_directory
+            {
+                return None;
+            }
+            let review_task_id = target.review_task_id.as_ref()?;
+            let review = attempt.tasks.iter().find(|task| {
+                task.id == *review_task_id
+                    && task.kind == TaskKind::Review
+                    && task.role == "tests"
+                    && task.status == TaskStatus::Complete
+                    && task
+                        .evidence_review_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            context.recovery_id == recovery.id
+                                && context.candidate_commit == recovery.candidate_commit
+                                && context.attachment == recovery.attachment
+                                && context.prior_review_artifact == target.prior_review_artifact
+                        })
+            })?;
+            (read_verdict(project_root, review) == Some(Verdict::Pass)).then_some(binding.command)
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+pub(crate) fn pending_candidate_gate_evidence_recovery_action(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Option<CandidateGateEvidenceAction> {
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)?
+        .output
+        .as_ref()?;
+    if !candidate_workspace_is_clean_at(project_root, writer, &writer.commit)
+        || latest_passing_tests_review(project_root, attempt, &writer.commit).is_none()
+    {
+        return None;
+    }
+    attempt.artifacts.iter().rev().find_map(|artifact| {
+        if !artifact.path.ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE) {
+            return None;
+        }
+        let gate: crate::candidate_gate::CandidateGateEvidence = serde_json::from_slice(
+            &fs::read(project_root.join(&artifact.path)).ok()?,
+        )
+        .ok()?;
+        let command = crate::candidate_gate::requested_host_evidence_command(&gate)?;
+        if gate.candidate_commit != writer.commit
+            || completed_candidate_gate_evidence_commands(project_root, attempt)
+                .iter()
+                .any(|accepted| accepted == &command)
+        {
+            return None;
+        }
+        Some(CandidateGateEvidenceAction {
+            command,
+            gate_artifact: artifact.path.clone(),
+            attach_command: format!(
+                "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path> --review-artifact {}",
+                attempt.work_item_id, attempt.id, writer.commit, artifact.path
+            ),
+        })
+    })
+}
+
 /// Return true when one otherwise-unexplained final Tester command is exactly
 /// the focused command already accepted for this candidate by a targeted Tests
 /// review. This is the pre-Tester evidence path: the canonical Tester still
@@ -1872,6 +2231,165 @@ fn publish_snapshot(project_root: &Path, relative: &str, bytes: &[u8]) -> Result
 mod tests {
     use super::*;
 
+    fn candidate_gate_evidence_fixture(
+        command: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        WorkModelStore,
+        String,
+        String,
+        PathBuf,
+    ) {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize evidence fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Test Author"],
+            "configure fixture author",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure fixture email",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "README.md"],
+            "stage fixture base",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Create fixture"],
+            "commit fixture base",
+        )
+        .unwrap();
+        let base = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read fixture base",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path().join("tests")).unwrap();
+        fs::write(
+            workspace.path().join("tests/readiness.py"),
+            "#!/usr/bin/env python3\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "tests/readiness.py"],
+            "stage candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add readiness check"],
+            "commit candidate",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read fixture candidate",
+        )
+        .unwrap();
+
+        let store = WorkModelStore::new(project.path());
+        let mut item = work_model::WorkItem::planned("work-1", "Attach gate evidence");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(work_model::TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: workspace.path().display().to_string(),
+            source_branch: "main".to_string(),
+            base_commit: Some(base.clone()),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+        let review = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap();
+        work_model::set_task_terminal(review, TaskStatus::Complete);
+        let review_path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(project.path().join(&review_path).parent().unwrap()).unwrap();
+        fs::write(project.path().join(&review_path), "Verdict: pass\n").unwrap();
+
+        let gate_path = work_model::work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-tester-final-candidate-gate",
+        ) + "/candidate-gate.json";
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: base,
+            candidate_commit: candidate.clone(),
+            tester_results_path: Some("tester-results.json".to_string()),
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "tester-reference-evidence".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![format!("no passing Tester result matches {command}")],
+                log_path: None,
+            }],
+        };
+        fs::create_dir_all(project.path().join(&gate_path).parent().unwrap()).unwrap();
+        fs::write(
+            project.path().join(&gate_path),
+            serde_json::to_vec_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: "candidate-gate".to_string(),
+            path: gate_path.clone(),
+        });
+        item.attempts[0].review_state = Some(work_model::AttemptReviewState::Failed);
+        work_model::suspend_attempt(&mut item.attempts[0], work_model::PauseKind::HostEvidence);
+        store.create_work_item(&item).unwrap();
+
+        let evidence_path = project.path().join("evidence.json");
+        let document = EvidenceDocument {
+            schema_version: 1,
+            producer: "authorized host".to_string(),
+            check: command.to_string(),
+            working_directory: ".".to_string(),
+            result: EvidenceResult::Pass,
+            run_at: "2026-08-25T12:00:00Z".to_string(),
+            output: "passed on the authorized host".to_string(),
+        };
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+
+        (
+            project,
+            workspace,
+            store,
+            candidate,
+            gate_path,
+            evidence_path,
+        )
+    }
+
     #[test]
     fn evidence_document_requires_versioned_complete_host_claim() {
         let accepted = br#"{"schema_version":1,"producer":"host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
@@ -2005,6 +2523,152 @@ mod tests {
                 b"different"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent() {
+        let command = "python3 tests/readiness.py";
+        let (project, _workspace, store, candidate, gate_path, evidence_path) =
+            candidate_gate_evidence_fixture(command);
+
+        assert!(
+            attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &evidence_path,
+                std::slice::from_ref(&gate_path),
+                None,
+            )
+            .is_err()
+        );
+
+        let recovery = attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            std::slice::from_ref(&gate_path),
+            None,
+        )
+        .unwrap();
+
+        let original_gate = fs::read(project.path().join(&gate_path)).unwrap();
+        let mut changed_gate: serde_json::Value = serde_json::from_slice(&original_gate).unwrap();
+        changed_gate["checks"][0]["diagnostics"] = serde_json::json!([
+            "no passing Tester result matches python3 tests/a_different_check.py"
+        ]);
+        fs::write(
+            project.path().join(&gate_path),
+            serde_json::to_vec_pretty(&changed_gate).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                std::slice::from_ref(&gate_path),
+                None,
+            )
+            .is_err(),
+            "an old attachment must not match a different rejected gate at the same path"
+        );
+        fs::write(project.path().join(&gate_path), &original_gate).unwrap();
+
+        let repeated = attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            std::slice::from_ref(&gate_path),
+            None,
+        )
+        .unwrap();
+        assert_eq!(repeated, recovery);
+
+        let attached = store.read_work_item("work-1").unwrap();
+        let attempt = &attached.attempts[0];
+        assert_eq!(attempt.status, work_model::AttemptStatus::Reviewing);
+        assert_eq!(attempt.evidence_recoveries.len(), 1);
+        let review_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        let review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == *review_id)
+            .unwrap();
+        assert_eq!(review.status, TaskStatus::Planned);
+        assert_eq!(review.role, "tests");
+        assert_eq!(
+            review
+                .evidence_review_context
+                .as_ref()
+                .unwrap()
+                .candidate_commit,
+            candidate
+        );
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let review = attempt
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == *review_id)
+                    .unwrap();
+                work_model::set_task_terminal(review, TaskStatus::Complete);
+                let artifact = review.artifact_area.as_ref().unwrap().path.clone();
+                fs::create_dir_all(project.path().join(&artifact)).unwrap();
+                fs::write(
+                    project.path().join(artifact).join("review.md"),
+                    "Verdict: pass\n",
+                )
+                .unwrap();
+                attempt.evidence_recoveries[0].state = EvidenceRecoveryState::Complete;
+                Ok(())
+            })
+            .unwrap();
+
+        // A later candidate-gate run may replace the original mutable path.
+        // The accepted command remains derived from the immutable binding.
+        let passed_gate = crate::candidate_gate::CandidateGateEvidence {
+            disposition: crate::candidate_gate::CandidateGateDisposition::Passed,
+            checks: vec![],
+            ..serde_json::from_slice(&original_gate).unwrap()
+        };
+        fs::write(
+            project.path().join(&gate_path),
+            serde_json::to_vec_pretty(&passed_gate).unwrap(),
+        )
+        .unwrap();
+        let completed = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            completed_candidate_gate_evidence_commands(project.path(), &completed.attempts[0]),
+            vec![command.to_string()]
+        );
+        assert_eq!(
+            attach(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                &candidate,
+                &evidence_path,
+                std::slice::from_ref(&gate_path),
+                None,
+            )
+            .unwrap(),
+            completed.attempts[0].evidence_recoveries[0]
         );
     }
 

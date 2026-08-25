@@ -359,8 +359,17 @@ After the final Tester, the host runs a final-Tester candidate gate before it
 creates a Merge Candidate or launches the Learner. The gate matches each `Test:`
 reference to its passing structured result. Rust selectors match the harness
 test ID; shell selectors use the script path because that is the shell harness's
-native test identity. Missing evidence starts a corrective Writer round and
-invalidates the superseded review and Tester frontier. When missing evidence
+native test identity. A nextest result may use its native `binary test-name`
+identity; the gate matches only the exact final test-name token rather than a
+substring. Missing selector evidence starts a corrective Writer round and
+invalidates the superseded review and Tester frontier. When the only missing
+evidence is one complete command-shaped `Test:` reference that did not run in
+canonical Tester, Fluent pauses before another Writer. It binds
+host-run evidence to the exact rejected gate and candidate, then asks a targeted
+Tests Reviewer to accept or reject that evidence. A passing review credits only
+the exact command when the candidate gate runs again. Multiple missing commands,
+another failing gate check, candidate drift, and selector-only gaps remain
+ineligible for this route. When missing evidence
 coincides with failed Tester commands, the gate records every failed command,
 its exit code, and its durable stdout and stderr paths so the Writer can inspect
 the harness failure instead of renaming a test blindly. The correction Task
@@ -928,7 +937,11 @@ Evidence-targeted reviewers receive the immutable snapshot and the prior
 decision artifact. This is normally their failed review; after an unexplained
 failed-command recheck at the Writer-round cap, it is a content-addressed
 binding of the source Tester result, recheck manifest, command, logs, and exact
-candidate. A passing result replaces only that role's result for the same
+candidate. A command-shaped Test reference rejected by the final candidate gate
+uses the same attachment command with `--review-artifact <candidate-gate.json>`.
+Fluent snapshots the rejected gate inside a content-addressed binding so a
+later gate run cannot erase the decision that authorized the host evidence.
+A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
 `Disposition: code-change`. The former waits for another attachment without a
 Writer round. The latter closes evidence recovery and follows the normal

@@ -1370,6 +1370,12 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
         make_workspace(workspace.path());
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize rendered sandbox fixture",
+        )
+        .unwrap();
         write_tester_yaml(
             workspace.path(),
             "commands:\n  - command: true\n    test_harness: shell-harness\n    reject_process_leaks: true\n",

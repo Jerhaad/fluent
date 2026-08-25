@@ -4096,6 +4096,7 @@ fn run_learner_candidate_gate(
         .map(|task| task.id.as_str());
     let artifact_path = run_dir.join(crate::candidate_gate::CANDIDATE_GATE_FILE);
     let tester_results = latest_tester_results_path(project_root, attempt);
+    let accepted_tester_commands = accepted_external_tester_commands(project_root, attempt);
     let evidence =
         crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
             project_root,
@@ -4109,6 +4110,7 @@ fn run_learner_candidate_gate(
             completion_contract: attempt.writer_completion_contract.as_ref(),
             allow_tree_identical_metadata_rewrite: false,
             tester_results_path: tester_results.as_deref(),
+            accepted_tester_commands: &accepted_tester_commands,
             artifact_path: &artifact_path,
         })?;
     match evidence.disposition {
@@ -5568,6 +5570,32 @@ fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<
         })
 }
 
+/// Resolve only commands whose immutable failed Tester result has been
+/// superseded by passing candidate-bound host evidence and a targeted Tests
+/// review. The candidate gate may credit those exact commands while retaining
+/// the original Tester result as history.
+fn accepted_external_tester_commands(project_root: &Path, attempt: &Attempt) -> Vec<String> {
+    let mut commands =
+        crate::host_evidence::completed_recheck_evidence_source(project_root, attempt)
+            .and_then(|source| fs::read(source).ok())
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+            .map(|results| {
+                results
+                    .commands
+                    .into_iter()
+                    .filter(|command| command.exit_code != 0)
+                    .map(|command| command.command)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    commands.extend(
+        crate::host_evidence::completed_candidate_gate_evidence_commands(project_root, attempt),
+    );
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
 fn no_change_source_tester_results_path(
     project_root: &Path,
     attempt: &Attempt,
@@ -6249,6 +6277,7 @@ fn gate_candidate_after_writer(
                     && artifact.path.ends_with("writer-completion.json")
             }),
             tester_results_path: None,
+            accepted_tester_commands: &[],
             artifact_path: &project_root.join(&artifact.path),
         },
         prior_candidate_gate_path.as_deref(),
@@ -6366,6 +6395,8 @@ fn gate_candidate_after_final_tester(
             crate::candidate_gate::CANDIDATE_GATE_FILE
         ),
     };
+    let accepted_tester_commands =
+        accepted_external_tester_commands(project_root, &item.attempts[attempt_index]);
     let evidence =
         crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
             project_root,
@@ -6381,6 +6412,7 @@ fn gate_candidate_after_final_tester(
             completion_contract: attempt.writer_completion_contract.as_ref(),
             allow_tree_identical_metadata_rewrite: false,
             tester_results_path: Some(tester_results_path),
+            accepted_tester_commands: &accepted_tester_commands,
             artifact_path: &project_root.join(&artifact.path),
         })?;
     if !item.attempts[attempt_index].artifacts.contains(&artifact) {
@@ -7650,6 +7682,31 @@ fn interpret_reviews(
         }
 
         item.attempts[attempt_index].review_state = Some(AttemptReviewState::Failed);
+        if let Some(action) = crate::host_evidence::pending_candidate_gate_evidence_recovery_action(
+            project_root,
+            &item.attempts[attempt_index],
+        ) {
+            let gate = ArtifactRef {
+                producer_id: "candidate-gate".to_string(),
+                path: action.gate_artifact.clone(),
+            };
+            // Persist the gate reference before the pause so the public attach
+            // command can revalidate the exact frontier under the land lock.
+            write_attempt_work_item(store, &item)?;
+            return settle_review_pause(
+                store,
+                project_root,
+                &item.id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                crate::work_model::PauseKind::HostEvidence,
+                std::slice::from_ref(&gate),
+                |root, work_item_id, attempt_id, _| {
+                    write_candidate_gate_evidence_handoff(root, work_item_id, attempt_id, &action)
+                },
+                &|_| {},
+            );
+        }
         if item.attempts[attempt_index].kind.is_review_only_like() {
             crate::work_model::set_attempt_terminal(
                 &mut item.attempts[attempt_index],
@@ -8187,6 +8244,28 @@ fn write_focused_evidence_handoff(
         format!(
             "# Attempt needs focused test evidence\n\nThe failed Tests Review requested one focused check against the unchanged candidate. Fluent did not plan another Writer.\n\nReview: `{}`\n\nTo authorize the exact command recorded in that review, run:\n\n`fluent attempt evidence run {} {} --review-artifact {}`\n",
             review.path, work_item_id, attempt_id, review.path
+        )
+        .as_bytes(),
+    )?;
+    Ok(relative_path)
+}
+
+fn write_candidate_gate_evidence_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    action: &crate::host_evidence::CandidateGateEvidenceAction,
+) -> Result<String> {
+    let relative_path = work_artifact_path(work_item_id, attempt_id, "needs-user.md");
+    let path = project_root.join(&relative_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    crate::atomic_write::atomic_write(
+        &path,
+        format!(
+            "# Attempt needs candidate-gate host evidence\n\nThe final candidate gate requires one command-shaped Test reference that did not run inside canonical Tester. Run this exact command on an authorized host against the unchanged candidate:\n\n`{}`\n\nRecord its passing result as a schema-version-1 evidence document whose `check` is that exact command and whose `working_directory` is `.`, then attach it to the immutable rejected gate:\n\n`{}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nRejected gate: `{}`\n",
+            action.command, action.attach_command, action.gate_artifact
         )
         .as_bytes(),
     )?;
@@ -10696,6 +10775,82 @@ mod tests {
     }
 
     #[test]
+    fn missing_command_reference_pauses_for_exact_host_evidence_before_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut tests_review = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review)
+                    .cloned()
+                    .unwrap();
+                tests_review.id = "attempt-1-review-tests".to_string();
+                tests_review.role = "tests".to_string();
+                tests_review.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: work_artifact_path("work-1", "attempt-1", "attempt-1-review-tests"),
+                });
+                let tests_review_dir = project
+                    .path()
+                    .join(&tests_review.artifact_area.as_ref().unwrap().path);
+                fs::create_dir_all(&tests_review_dir).unwrap();
+                fs::write(tests_review_dir.join("review.md"), "Verdict: pass\n").unwrap();
+                item.attempts[0].tasks.push(tests_review);
+                let context = crate::work_model::PlanningContext {
+                    behaviors: Some(
+                        "### B1\n\nWHEN the feature runs, THE SYSTEM SHALL preserve it.\n\
+                         Test: python3 tests/behavior.rs\n"
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                };
+                item.attempts[0].writer_completion_contract =
+                    crate::work_model::WriterCompletionContract::from_planning_context(&context);
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+            panic!("a command outside canonical Tester must request exact host evidence")
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1,
+            "host-only verification must not spend a corrective Writer round"
+        );
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains("python3 tests/behavior.rs"));
+        assert!(handoff.contains("`working_directory` is `.`"));
+        assert!(handoff.contains(&format!("--candidate {candidate}")));
+        assert!(handoff.contains("--review-artifact"));
+        let action = crate::host_evidence::pending_candidate_gate_evidence_recovery_action(
+            project.path(),
+            attempt,
+        )
+        .expect("the handoff's public recovery remains eligible");
+        assert_eq!(action.command, "python3 tests/behavior.rs");
+    }
+
+    #[test]
     fn failed_final_tester_logs_are_exact_writer_correction_inputs() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
@@ -12794,6 +12949,7 @@ mod tests {
                 completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
                 allow_tree_identical_metadata_rewrite: false,
                 tester_results_path: Some(&tester_results),
+                accepted_tester_commands: &[],
                 artifact_path: &learner_gate,
             },
         )
@@ -18307,7 +18463,20 @@ mod tests {
                 // an invalid draft to force a schema repair.
                 fs::write(ws.join("scratch.md"), "note").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "scratch"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "scratch",
+                    ],
+                    "commit",
+                )
+                .unwrap();
                 fs::create_dir_all(request.handoff_dir).unwrap();
                 fs::write(
                     request.handoff_dir.join(crate::learner::DRAFT_FILE_NAME),
@@ -18357,14 +18526,40 @@ mod tests {
             ("source commit", |ws| {
                 fs::write(ws.join("src.rs"), "fn changed() {}").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "change"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "change",
+                    ],
+                    "commit",
+                )
+                .unwrap();
             }),
             ("expertise-only commit", |ws| {
                 let dir = ws.join(".fluent/expertise");
                 fs::create_dir_all(&dir).unwrap();
                 fs::write(dir.join("note.md"), "note").unwrap();
                 git::run(ws, &["add", "-A"], "add").unwrap();
-                git::run(ws, &["commit", "-m", "Update expertise"], "commit").unwrap();
+                git::run(
+                    ws,
+                    &[
+                        "-c",
+                        "user.name=Test Author",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "Update expertise",
+                    ],
+                    "commit",
+                )
+                .unwrap();
             }),
             ("staged change", |ws| {
                 fs::write(ws.join("src.rs"), "fn staged() {}").unwrap();

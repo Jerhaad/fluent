@@ -1682,6 +1682,7 @@ mod tests {
                 completion_contract: None,
                 allow_tree_identical_metadata_rewrite: false,
                 tester_results_path: None,
+                accepted_tester_commands: &[],
                 artifact_path: &prior_gate_path,
             })
             .unwrap();
@@ -1754,6 +1755,7 @@ mod tests {
                     completion_contract: None,
                     allow_tree_identical_metadata_rewrite: false,
                     tester_results_path: None,
+                    accepted_tester_commands: &[],
                     artifact_path: &blocked_gate_path,
                 },
                 Some(&prior_gate_path),
@@ -1942,6 +1944,7 @@ mod tests {
             completion_contract: None,
             allow_tree_identical_metadata_rewrite: false,
             tester_results_path: None,
+            accepted_tester_commands: &[],
             artifact_path: &gate_path,
         })
         .unwrap();
@@ -2327,6 +2330,7 @@ mod tests {
             completion_contract: None,
             allow_tree_identical_metadata_rewrite: false,
             tester_results_path: None,
+            accepted_tester_commands: &[],
             artifact_path: &fixture.project.join(&gate_relative),
         })
         .unwrap();
@@ -2716,6 +2720,7 @@ mod tests {
             completion_contract: None,
             allow_tree_identical_metadata_rewrite: false,
             tester_results_path: None,
+            accepted_tester_commands: &[],
             artifact_path: &fixture.project.join(&gate_relative),
         })
         .unwrap();
