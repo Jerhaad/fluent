@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -44,6 +45,22 @@ struct CandidateAncestryRecoveryEvidence {
     preserved_ref: String,
     resolution: String,
     resolution_digest: String,
+    #[serde(default)]
+    recovery_mode: RecoveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_candidate_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_extension_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_resolution_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RecoveryMode {
+    #[default]
+    ReconstructProtectedBase,
+    AcceptAuthorizedHistoryRewrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +93,9 @@ struct EligibleRecovery {
     authorization: CandidateAncestryRepairAuthorization,
     prior_recovery_path: Option<String>,
     task_id: String,
+    recovery_mode: RecoveryMode,
+    authorization_extension_id: Option<String>,
+    authorization_resolution_digest: Option<String>,
 }
 
 pub fn recovery_action(project_root: &Path, attempt: &Attempt) -> Option<String> {
@@ -165,31 +185,38 @@ pub fn repair(
                     eligible.authorization.candidate_tree
                 );
             }
-            let source_message = crate::git::run_stdout(
-                &workspace,
-                &[
-                    "show",
-                    "-s",
-                    "--format=%B",
-                    &eligible.source_candidate_commit,
-                ],
-                "read candidate ancestry recovery message",
-            )?;
-            if source_message.trim().is_empty() {
-                bail!("candidate ancestry repair source has an empty commit message");
-            }
-            let recovered = crate::git::run_stdout(
-                &workspace,
-                &[
-                    "commit-tree",
-                    &tree,
-                    "-p",
-                    &eligible.authorization.protected_base_commit,
-                    "-m",
-                    &source_message,
-                ],
-                "create candidate ancestry recovery commit",
-            )?;
+            let recovered = match eligible.recovery_mode {
+                RecoveryMode::ReconstructProtectedBase => {
+                    let source_message = crate::git::run_stdout(
+                        &workspace,
+                        &[
+                            "show",
+                            "-s",
+                            "--format=%B",
+                            &eligible.source_candidate_commit,
+                        ],
+                        "read candidate ancestry recovery message",
+                    )?;
+                    if source_message.trim().is_empty() {
+                        bail!("candidate ancestry repair source has an empty commit message");
+                    }
+                    crate::git::run_stdout(
+                        &workspace,
+                        &[
+                            "commit-tree",
+                            &tree,
+                            "-p",
+                            &eligible.authorization.protected_base_commit,
+                            "-m",
+                            &source_message,
+                        ],
+                        "create candidate ancestry recovery commit",
+                    )?
+                }
+                RecoveryMode::AcceptAuthorizedHistoryRewrite => {
+                    eligible.source_candidate_commit.clone()
+                }
+            };
             let preserved_ref = format!(
                 "refs/fluent/recovery/{work_item_id}/{attempt_id}/candidate-ancestry-{}",
                 eligible.source_candidate_commit
@@ -214,6 +241,19 @@ pub fn repair(
                 preserved_ref,
                 resolution: resolution.clone(),
                 resolution_digest: round_cap_resolution_digest(&resolution),
+                recovery_mode: eligible.recovery_mode,
+                superseded_candidate_ref: (eligible.recovery_mode
+                    == RecoveryMode::AcceptAuthorizedHistoryRewrite)
+                    .then(|| {
+                        format!(
+                            "refs/fluent/recovery/{work_item_id}/{attempt_id}/superseded-candidate-{}",
+                            eligible.authorization.rejected_candidate_commit
+                        )
+                    }),
+                authorization_extension_id: eligible.authorization_extension_id.clone(),
+                authorization_resolution_digest: eligible
+                    .authorization_resolution_digest
+                    .clone(),
             };
             validate_recovery_evidence(&workspace, &eligible, &evidence)?;
             write_evidence_once(project_root, &recovery_path, &evidence)?;
@@ -225,6 +265,13 @@ pub fn repair(
         &evidence.preserved_ref,
         &eligible.source_candidate_commit,
     )?;
+    if let Some(reference) = evidence.superseded_candidate_ref.as_deref() {
+        preserve_source_ref(
+            &workspace,
+            reference,
+            &eligible.authorization.rejected_candidate_commit,
+        )?;
+    }
     clone_completion_matrix(
         project_root,
         attempt,
@@ -718,17 +765,47 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
     if gate.candidate_commit != output.commit {
         bail!("candidate ancestry gate does not match the latest Writer output");
     }
-    let (authorization, prior_recovery_path) = if let Some(authorization) =
-        candidate_ancestry_repair_authorization(&gate)
+    let (
+        authorization,
+        prior_recovery_path,
+        recovery_mode,
+        authorization_extension_id,
+        authorization_resolution_digest,
+    ) = if let Some(authorization) = candidate_ancestry_repair_authorization(&gate) {
+        (
+            authorization,
+            None,
+            RecoveryMode::ReconstructProtectedBase,
+            None,
+            None,
+        )
+    } else if let Some(authorization) =
+        authorized_history_rewrite(project_root, attempt, output, &gate)?
     {
-        (authorization, None)
+        let extension = attempt
+            .round_cap_extensions
+            .last()
+            .expect("authorized rewrite requires a round-cap extension");
+        (
+            authorization,
+            None,
+            RecoveryMode::AcceptAuthorizedHistoryRewrite,
+            Some(extension.id.clone()),
+            Some(extension.human_resolution_digest.clone()),
+        )
     } else {
         let prior = completed_repair(project_root, attempt)?
             .ok_or_else(|| anyhow::anyhow!("candidate gate is not eligible for ancestry repair"))?;
         let prior_path = recovery_artifact_path(&attempt.work_item_id, &attempt.id, &prior.task_id);
         let authorization = followup_repair_authorization(project_root, output, &gate, &prior)?
             .ok_or_else(|| anyhow::anyhow!("candidate gate is not eligible for ancestry repair"))?;
-        (authorization, Some(prior_path))
+        (
+            authorization,
+            Some(prior_path),
+            RecoveryMode::ReconstructProtectedBase,
+            None,
+            None,
+        )
     };
     let next_round = attempt
         .tasks
@@ -747,7 +824,216 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         authorization,
         prior_recovery_path,
         task_id: format!("{}-write-{next_round}", attempt.id),
+        recovery_mode,
+        authorization_extension_id,
+        authorization_resolution_digest,
     })
+}
+
+/// Recognize an explicitly approved Writer rewrite that changes only commit
+/// messages while preserving the protected base and the complete linear suffix.
+fn authorized_history_rewrite(
+    project_root: &Path,
+    attempt: &Attempt,
+    output: &crate::work_model::TaskOutput,
+    gate: &CandidateGateEvidence,
+) -> Result<Option<CandidateAncestryRepairAuthorization>> {
+    if gate.metadata_rewrite.is_some()
+        || gate.candidate_commit != output.commit
+        || output.base_commit.as_deref() != Some(gate.base_commit.as_str())
+        || !only_candidate_identity_blocks(gate)
+    {
+        return Ok(None);
+    }
+    let Some(extension) = attempt.round_cap_extensions.last() else {
+        return Ok(None);
+    };
+    extension
+        .validate_human_resolution()
+        .map_err(anyhow::Error::msg)?;
+    if extension.human_resolution.is_empty() {
+        return Ok(None);
+    }
+    for approved in &extension.failed_reviews {
+        let path = crate::work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &approved.artifact.path,
+        )?;
+        let bytes = fs::read(path)?;
+        if approved.digest != format!("sha256:{:x}", Sha256::digest(&bytes)) {
+            bail!("authorized history rewrite review evidence digest changed");
+        }
+    }
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "authorized history rewrite workspace",
+    )?;
+    if !crate::git::run_raw(
+        &workspace,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &extension.candidate_commit,
+            &gate.base_commit,
+        ],
+    )?
+    .status
+    .success()
+    {
+        return Ok(None);
+    }
+    let protected_base = attempt
+        .tasks
+        .iter()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .and_then(|output| output.base_commit.clone())
+        .ok_or_else(|| anyhow::anyhow!("authorized history rewrite has no protected base"))?;
+    if !verify_equivalent_message_only_suffix(
+        &workspace,
+        &protected_base,
+        &gate.base_commit,
+        &gate.candidate_commit,
+        &extension.human_resolution,
+    )? {
+        return Ok(None);
+    }
+    let candidate_tree = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", &format!("{}^{{tree}}", gate.candidate_commit)],
+        "resolve authorized rewritten candidate tree",
+    )?;
+    Ok(Some(CandidateAncestryRepairAuthorization {
+        protected_base_commit: protected_base,
+        rejected_candidate_commit: gate.base_commit.clone(),
+        candidate_commit: gate.candidate_commit.clone(),
+        candidate_tree,
+        prior_gate_path: String::new(),
+    }))
+}
+
+fn only_candidate_identity_blocks(gate: &CandidateGateEvidence) -> bool {
+    if gate.schema_version == 0
+        || gate.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || gate.phase != crate::candidate_gate::CandidateGatePhase::Writer
+        || gate.disposition != crate::candidate_gate::CandidateGateDisposition::Blocked
+    {
+        return false;
+    }
+    let expected = format!(
+        "base commit {} is not an ancestor of candidate {}",
+        gate.base_commit, gate.candidate_commit
+    );
+    let blocking = gate
+        .checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                check.status,
+                crate::candidate_gate::CandidateCheckStatus::Failed
+                    | crate::candidate_gate::CandidateCheckStatus::Error
+            )
+        })
+        .collect::<Vec<_>>();
+    blocking.len() == 1
+        && blocking[0].name == "candidate-identity"
+        && blocking[0].status == crate::candidate_gate::CandidateCheckStatus::Error
+        && blocking[0].diagnostics.as_slice() == [expected]
+}
+
+fn verify_equivalent_message_only_suffix(
+    workspace: &Path,
+    protected_base: &str,
+    old_tip: &str,
+    new_tip: &str,
+    authorization: &str,
+) -> Result<bool> {
+    let old = linear_suffix(workspace, protected_base, old_tip)?;
+    let new = linear_suffix(workspace, protected_base, new_tip)?;
+    if old.len() != new.len() || old.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = 0usize;
+    for (old_commit, new_commit) in old.iter().zip(&new) {
+        let old_fields = commit_identity(workspace, old_commit)?;
+        let new_fields = commit_identity(workspace, new_commit)?;
+        if old_fields.len() != 5 || new_fields.len() != 5 || old_fields[..3] != new_fields[..3] {
+            return Ok(false);
+        }
+        if old_fields[4] != new_fields[4] {
+            changed += 1;
+            if !authorization_names_commit(workspace, authorization, old_commit)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(changed > 0)
+}
+
+fn authorization_names_commit(workspace: &Path, authorization: &str, commit: &str) -> Result<bool> {
+    for length in 7..=commit.len() {
+        let prefix = &commit[..length];
+        if !authorization.contains(prefix) {
+            continue;
+        }
+        let resolved = crate::git::run_raw(
+            workspace,
+            &["rev-parse", "--verify", &format!("{prefix}^{{commit}}")],
+        )?;
+        if resolved.status.success() && String::from_utf8_lossy(&resolved.stdout).trim() == commit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn linear_suffix(workspace: &Path, base: &str, tip: &str) -> Result<Vec<String>> {
+    if !crate::git::run_raw(workspace, &["merge-base", "--is-ancestor", base, tip])?
+        .status
+        .success()
+    {
+        return Ok(Vec::new());
+    }
+    let raw = crate::git::run_stdout(
+        workspace,
+        &[
+            "rev-list",
+            "--reverse",
+            "--first-parent",
+            &format!("{base}..{tip}"),
+        ],
+        "enumerate candidate rewrite suffix",
+    )?;
+    let commits = raw.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut parent = base;
+    for commit in &commits {
+        let row = crate::git::run_stdout(
+            workspace,
+            &["rev-list", "--parents", "-n", "1", commit],
+            "verify candidate rewrite linearity",
+        )?;
+        let fields = row.split_whitespace().collect::<Vec<_>>();
+        if fields.as_slice() != [commit.as_str(), parent] {
+            return Ok(Vec::new());
+        }
+        parent = commit;
+    }
+    Ok(commits)
+}
+
+fn commit_identity(workspace: &Path, commit: &str) -> Result<Vec<String>> {
+    let raw = crate::git::run_stdout(
+        workspace,
+        &[
+            "show",
+            "-s",
+            "--format=%T%x00%an%x00%ae%x00%aI%x00%B",
+            commit,
+        ],
+        "read candidate rewrite commit identity",
+    )?;
+    Ok(raw.split('\0').map(str::to_string).collect())
 }
 
 fn followup_repair_authorization(
@@ -868,6 +1154,11 @@ fn verify_live_candidate(workspace: &Path, eligible: &EligibleRecovery) -> Resul
 }
 
 fn verify_gate_provenance(project_root: &Path, eligible: &EligibleRecovery) -> Result<()> {
+    if eligible.recovery_mode == RecoveryMode::AcceptAuthorizedHistoryRewrite {
+        // Eligibility already bound the exact round-cap decision, its immutable
+        // review bytes, and both commit suffixes while the recovery lock was held.
+        return Ok(());
+    }
     if let Some(prior_recovery_path) = eligible.prior_recovery_path.as_deref() {
         let prior = read_recovery_evidence(project_root, prior_recovery_path)?
             .ok_or_else(|| anyhow::anyhow!("prior candidate ancestry recovery is missing"))?;
@@ -1093,6 +1384,15 @@ fn validate_recovery_evidence(
         "refs/fluent/recovery/{}/{}/candidate-ancestry-{}",
         eligible.work_item_id, eligible.attempt_id, eligible.source_candidate_commit
     );
+    let expected_superseded_ref =
+        (eligible.recovery_mode == RecoveryMode::AcceptAuthorizedHistoryRewrite).then(|| {
+            format!(
+                "refs/fluent/recovery/{}/{}/superseded-candidate-{}",
+                eligible.work_item_id,
+                eligible.attempt_id,
+                eligible.authorization.rejected_candidate_commit
+            )
+        });
     if evidence.schema_version != RECOVERY_SCHEMA_VERSION
         || evidence.task_id != eligible.task_id
         || evidence.source_task_id != eligible.source_task_id
@@ -1106,6 +1406,10 @@ fn validate_recovery_evidence(
         || evidence.preserved_ref != expected_ref
         || evidence.resolution.trim().is_empty()
         || evidence.resolution_digest != round_cap_resolution_digest(&evidence.resolution)
+        || evidence.recovery_mode != eligible.recovery_mode
+        || evidence.superseded_candidate_ref != expected_superseded_ref
+        || evidence.authorization_extension_id != eligible.authorization_extension_id
+        || evidence.authorization_resolution_digest != eligible.authorization_resolution_digest
     {
         bail!("candidate ancestry recovery evidence does not match the blocked frontier");
     }
@@ -1120,27 +1424,45 @@ fn validate_recovery_evidence(
     if recovered_tree != evidence.candidate_tree {
         bail!("recorded candidate ancestry recovery has a different tree");
     }
-    let ancestry = crate::git::run_stdout(
-        workspace,
-        &[
-            "rev-list",
-            "--parents",
-            "-n",
-            "1",
-            &evidence.recovered_candidate_commit,
-        ],
-        "verify recovered candidate parent",
-    )?;
-    let commits = ancestry.split_whitespace().collect::<Vec<_>>();
-    if commits.as_slice()
-        != [
-            evidence.recovered_candidate_commit.as_str(),
-            evidence.protected_base_commit.as_str(),
-        ]
-    {
-        bail!(
-            "recorded candidate ancestry recovery does not have the protected base as its sole parent"
-        );
+    match evidence.recovery_mode {
+        RecoveryMode::ReconstructProtectedBase => {
+            let ancestry = crate::git::run_stdout(
+                workspace,
+                &[
+                    "rev-list",
+                    "--parents",
+                    "-n",
+                    "1",
+                    &evidence.recovered_candidate_commit,
+                ],
+                "verify recovered candidate parent",
+            )?;
+            let commits = ancestry.split_whitespace().collect::<Vec<_>>();
+            if commits.as_slice()
+                != [
+                    evidence.recovered_candidate_commit.as_str(),
+                    evidence.protected_base_commit.as_str(),
+                ]
+            {
+                bail!(
+                    "recorded candidate ancestry recovery does not have the protected base as its sole parent"
+                );
+            }
+        }
+        RecoveryMode::AcceptAuthorizedHistoryRewrite => {
+            if evidence.recovered_candidate_commit != evidence.source_candidate_commit
+                || linear_suffix(
+                    workspace,
+                    &evidence.protected_base_commit,
+                    &evidence.recovered_candidate_commit,
+                )?
+                .is_empty()
+            {
+                bail!(
+                    "recorded authorized history rewrite no longer preserves its protected linear ancestry"
+                );
+            }
+        }
     }
     let head = crate::git::run_stdout(workspace, &["rev-parse", "HEAD"], "verify recovery HEAD")?;
     if head != evidence.source_candidate_commit && head != evidence.recovered_candidate_commit {
@@ -2176,6 +2498,10 @@ mod tests {
             preserved_ref,
             resolution: resolution.to_string(),
             resolution_digest: round_cap_resolution_digest(resolution),
+            recovery_mode: RecoveryMode::ReconstructProtectedBase,
+            superseded_candidate_ref: None,
+            authorization_extension_id: None,
+            authorization_resolution_digest: None,
         };
         let recovery_path = recovery_artifact_path("work-1", "attempt-1", &eligible.task_id);
         validate_recovery_evidence(&fixture.workspace, &eligible, &evidence).unwrap();
@@ -2272,5 +2598,295 @@ mod tests {
                     && artifact.path.ends_with("/transcript.jsonl")
             }));
         }
+    }
+
+    #[test]
+    fn accepts_audited_message_only_suffix_rewrite_without_flattening_history() {
+        let fixture = Fixture::new();
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        let protected_base = attempt.tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .base_commit
+            .clone()
+            .unwrap();
+        let old_tip = attempt.tasks[1].output.as_ref().unwrap().commit.clone();
+        let old_parent = crate::git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", &format!("{old_tip}^")],
+            "read authorized rewrite parent",
+        )
+        .unwrap();
+        let rewritten = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "commit-tree",
+                &fixture.tree,
+                "-p",
+                &old_parent,
+                "-m",
+                "Correct candidate terminology",
+                "-m",
+                "Use project-approved wording without changing content.",
+            ],
+            "create authorized message-only rewrite",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.workspace,
+            &["update-ref", "HEAD", &rewritten],
+            "install authorized history rewrite",
+        )
+        .unwrap();
+
+        let review_relative = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-1-documentation/review.md",
+        );
+        let review_bytes = format!("Rewrite commit {old_tip} message only.\n").into_bytes();
+        fs::create_dir_all(fixture.project.join(&review_relative).parent().unwrap()).unwrap();
+        fs::write(fixture.project.join(&review_relative), &review_bytes).unwrap();
+        let gate_relative = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "candidate-gates/attempt-1-write-3/candidate-gate.json",
+        );
+        let gate = run_candidate_gate(CandidateGateRequest {
+            project_root: &fixture.project,
+            workspace: &fixture.workspace,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: Some("attempt-1-write-3"),
+            phase: CandidateGatePhase::Writer,
+            base_commit: &old_tip,
+            candidate_commit: &rewritten,
+            completion_contract: None,
+            allow_tree_identical_metadata_rewrite: false,
+            tester_results_path: None,
+            artifact_path: &fixture.project.join(&gate_relative),
+        })
+        .unwrap();
+        assert!(only_candidate_identity_blocks(&gate));
+
+        let resolution = format!(
+            "Through Fluent's audited Writer workflow, rewrite only commit {} while preserving authorship, tree content, and linear history.",
+            &old_tip[..7]
+        );
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let source = attempt.tasks.last_mut().unwrap();
+                source.output.as_mut().unwrap().base_commit = Some(old_tip.clone());
+                source.output.as_mut().unwrap().commit = rewritten.clone();
+                attempt.artifacts.clear();
+                attempt.artifacts.push(ArtifactRef {
+                    producer_id: source.id.clone(),
+                    path: gate_relative.clone(),
+                });
+                attempt
+                    .round_cap_extensions
+                    .push(crate::work_model::RoundCapExtension {
+                        id: "round-cap-3-4".to_string(),
+                        old_cap: 3,
+                        new_cap: 4,
+                        additional_write_rounds: 1,
+                        evidence_write_rounds: 0,
+                        candidate_commit: old_parent.clone(),
+                        failed_reviews: vec![crate::work_model::RoundCapReviewArtifact {
+                            artifact: ArtifactRef {
+                                producer_id: "attempt-1-review-1-documentation".to_string(),
+                                path: review_relative.clone(),
+                            },
+                            digest: format!("sha256:{:x}", Sha256::digest(&review_bytes)),
+                        }],
+                        human_resolution: resolution.clone(),
+                        human_resolution_digest: round_cap_resolution_digest(&resolution),
+                        approved_at: now_iso8601(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+
+        let result = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Accept the exact audited message-only rewrite.",
+        )
+        .unwrap();
+        assert_eq!(result.source_candidate_commit, rewritten);
+        assert_eq!(result.recovered_candidate_commit, rewritten);
+        assert_eq!(result.protected_base_commit, protected_base);
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(recovered.attempts[0].status, AttemptStatus::Planned);
+        let evidence = read_recovery_evidence(
+            &fixture.project,
+            &recovery_artifact_path("work-1", "attempt-1", &result.task_id),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            evidence.recovery_mode,
+            RecoveryMode::AcceptAuthorizedHistoryRewrite
+        );
+        assert_eq!(
+            evidence.authorization_extension_id.as_deref(),
+            Some("round-cap-3-4")
+        );
+        assert_eq!(
+            evidence.authorization_resolution_digest.as_deref(),
+            Some(round_cap_resolution_digest(&resolution).as_str())
+        );
+        let superseded_ref = evidence.superseded_candidate_ref.unwrap();
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", &superseded_ref],
+                "read preserved superseded candidate",
+            )
+            .unwrap(),
+            old_tip
+        );
+        assert_eq!(
+            linear_suffix(&fixture.workspace, &protected_base, &rewritten)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_unauthorized_or_non_equivalent_history_rewrites() {
+        let fixture = Fixture::new();
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        let protected_base = attempt.tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .base_commit
+            .clone()
+            .unwrap();
+        let old_tip = attempt.tasks[1].output.as_ref().unwrap().commit.clone();
+        let old_parent = crate::git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", &format!("{old_tip}^")],
+            "read rejected rewrite parent",
+        )
+        .unwrap();
+        let rewritten = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "commit-tree",
+                &fixture.tree,
+                "-p",
+                &old_parent,
+                "-m",
+                "Rewrite candidate message",
+                "-m",
+                "Change only approved terminology.",
+            ],
+            "create message-only rewrite",
+        )
+        .unwrap();
+        assert!(
+            !verify_equivalent_message_only_suffix(
+                &fixture.workspace,
+                &protected_base,
+                &old_tip,
+                &rewritten,
+                "Rewrite some other commit.",
+            )
+            .unwrap()
+        );
+
+        let changed_author = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "-c",
+                "user.name=Different Author",
+                "-c",
+                "user.email=different@example.com",
+                "commit-tree",
+                &fixture.tree,
+                "-p",
+                &old_parent,
+                "-m",
+                "Rewrite candidate message",
+            ],
+            "create authorship-changing rewrite",
+        )
+        .unwrap();
+        assert!(
+            !verify_equivalent_message_only_suffix(
+                &fixture.workspace,
+                &protected_base,
+                &old_tip,
+                &changed_author,
+                &format!("Rewrite only {old_tip}."),
+            )
+            .unwrap()
+        );
+
+        let changed_tree = crate::git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", &format!("{}^{{tree}}", fixture.protected)],
+            "read content-changing tree",
+        )
+        .unwrap();
+        let content_change = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "commit-tree",
+                &changed_tree,
+                "-p",
+                &old_parent,
+                "-m",
+                "Rewrite candidate message",
+            ],
+            "create content-changing rewrite",
+        )
+        .unwrap();
+        assert!(
+            !verify_equivalent_message_only_suffix(
+                &fixture.workspace,
+                &protected_base,
+                &old_tip,
+                &content_change,
+                &format!("Rewrite only {old_tip}."),
+            )
+            .unwrap()
+        );
+
+        let merge = crate::git::run_stdout(
+            &fixture.workspace,
+            &[
+                "commit-tree",
+                &fixture.tree,
+                "-p",
+                &old_parent,
+                "-p",
+                &protected_base,
+                "-m",
+                "Rewrite candidate message",
+            ],
+            "create nonlinear rewrite",
+        )
+        .unwrap();
+        assert!(
+            !verify_equivalent_message_only_suffix(
+                &fixture.workspace,
+                &protected_base,
+                &old_tip,
+                &merge,
+                &format!("Rewrite only {old_tip}."),
+            )
+            .unwrap()
+        );
     }
 }
