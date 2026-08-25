@@ -1906,6 +1906,98 @@ pub(crate) fn completed_candidate_gate_evidence_commands(
     commands
 }
 
+/// Resolve focused Tests Review commands whose candidate-bound host evidence
+/// was accepted by the targeted follow-up Review. Older Attempts can carry
+/// this evidence before their final Tester, so candidate gating must credit
+/// the exact command as well as the Tester settlement logic.
+pub(crate) fn completed_review_evidence_commands(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Vec<String> {
+    let latest_candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+    let Some(latest_candidate) = latest_candidate else {
+        return Vec::new();
+    };
+    let mut commands = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|recovery| {
+            if recovery.state != EvidenceRecoveryState::Complete
+                || recovery.candidate_commit != latest_candidate
+            {
+                return None;
+            }
+            let evidence_bytes =
+                fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
+            if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
+            {
+                return None;
+            }
+            let evidence = parse_document(&evidence_bytes).ok()?;
+            if evidence.result != EvidenceResult::Pass {
+                return None;
+            }
+
+            recovery.targets.iter().find_map(|target| {
+                if target.role != "tests" {
+                    return None;
+                }
+                let prior_review =
+                    fs::read_to_string(project_root.join(&target.prior_review_artifact)).ok()?;
+                let request = review::extract_focused_evidence_request(&prior_review)?;
+                if evidence.check != request.command
+                    || request.working_directory != "."
+                    || evidence.working_directory != request.working_directory
+                {
+                    return None;
+                }
+                let prior_task_is_bound = attempt.tasks.iter().any(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role == "tests"
+                        && task.status == TaskStatus::Complete
+                        && task
+                            .review_context
+                            .as_ref()
+                            .map(|context| context.candidate_commit.as_str())
+                            == Some(latest_candidate)
+                        && review_artifact_path(task).as_deref()
+                            == Some(target.prior_review_artifact.as_str())
+                        && read_verdict(project_root, task) == Some(Verdict::Fail)
+                });
+                let targeted_review_passed = target.review_task_id.as_ref().is_some_and(|id| {
+                    attempt.tasks.iter().any(|task| {
+                        task.id == *id
+                            && task.kind == TaskKind::Review
+                            && task.role == "tests"
+                            && task.status == TaskStatus::Complete
+                            && task
+                                .evidence_review_context
+                                .as_ref()
+                                .is_some_and(|context| {
+                                    context.recovery_id == recovery.id
+                                        && context.candidate_commit == recovery.candidate_commit
+                                        && context.attachment == recovery.attachment
+                                        && context.prior_review_artifact
+                                            == target.prior_review_artifact
+                                })
+                            && read_verdict(project_root, task) == Some(Verdict::Pass)
+                    })
+                });
+                (prior_task_is_bound && targeted_review_passed).then_some(request.command)
+            })
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
 pub(crate) fn pending_candidate_gate_evidence_recovery_action(
     project_root: &Path,
     attempt: &work_model::Attempt,
@@ -2015,76 +2107,9 @@ pub(crate) fn completed_review_evidence_covers_tester_failure(
         return false;
     }
 
-    attempt.evidence_recoveries.iter().rev().any(|recovery| {
-        if recovery.state != EvidenceRecoveryState::Complete
-            || recovery.candidate_commit != candidate
-        {
-            return false;
-        }
-        let evidence_bytes = match fs::read(project_root.join(&recovery.attachment.snapshot_path)) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
-        };
-        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
-            return false;
-        }
-        let evidence = match parse_document(&evidence_bytes) {
-            Ok(evidence) if evidence.result == EvidenceResult::Pass => evidence,
-            _ => return false,
-        };
-
-        recovery.targets.iter().any(|target| {
-            if target.role != "tests" {
-                return false;
-            }
-            let prior_review =
-                match fs::read_to_string(project_root.join(&target.prior_review_artifact)) {
-                    Ok(review) => review,
-                    Err(_) => return false,
-                };
-            let Some(request) = review::extract_focused_evidence_request(&prior_review) else {
-                return false;
-            };
-            if request.command != command.command
-                || request.working_directory != "."
-                || evidence.working_directory != request.working_directory
-            {
-                return false;
-            }
-            let prior_task_is_bound = attempt.tasks.iter().any(|task| {
-                task.kind == TaskKind::Review
-                    && task.role == "tests"
-                    && task.status == TaskStatus::Complete
-                    && task
-                        .review_context
-                        .as_ref()
-                        .map(|context| context.candidate_commit.as_str())
-                        == Some(candidate)
-                    && review_artifact_path(task).as_deref()
-                        == Some(target.prior_review_artifact.as_str())
-                    && read_verdict(project_root, task) == Some(Verdict::Fail)
-            });
-            let targeted_review_passed = target.review_task_id.as_ref().is_some_and(|id| {
-                attempt.tasks.iter().any(|task| {
-                    task.id == *id
-                        && task.kind == TaskKind::Review
-                        && task.role == "tests"
-                        && task.status == TaskStatus::Complete
-                        && task
-                            .evidence_review_context
-                            .as_ref()
-                            .is_some_and(|context| {
-                                context.recovery_id == recovery.id
-                                    && context.candidate_commit == recovery.candidate_commit
-                                    && context.attachment == recovery.attachment
-                                    && context.prior_review_artifact == target.prior_review_artifact
-                            })
-                        && read_verdict(project_root, task) == Some(Verdict::Pass)
-                })
-            });
-            prior_task_is_bound && targeted_review_passed
-        })
-    })
+    completed_review_evidence_commands(project_root, attempt)
+        .iter()
+        .any(|accepted| accepted == &command.command)
 }
 
 fn candidate_workspace_is_clean_at(

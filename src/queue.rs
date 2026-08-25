@@ -1091,7 +1091,12 @@ fn ensure_resume_eligible(
         return Ok(());
     }
     if !legacy_learner_tester_evidence {
-        attempt.ensure_resume_ready()?;
+        let legacy_review_evidence_round_cap =
+            crate::work_attempt_loop::review_evidence_covered_round_cap_resume_is_eligible(
+                project_root,
+                attempt,
+            );
+        ensure_attempt_resume_ready(attempt, legacy_review_evidence_round_cap)?;
         if attempt.is_uncertain_review_pause() {
             crate::lifecycle_recovery::inspect_uncertain_review_recovery(
                 project_root,
@@ -1101,6 +1106,17 @@ fn ensure_resume_eligible(
         }
     }
     Ok(())
+}
+
+fn ensure_attempt_resume_ready(
+    attempt: &crate::work_model::Attempt,
+    legacy_review_evidence_round_cap: bool,
+) -> Result<(), WorkModelError> {
+    if legacy_review_evidence_round_cap {
+        Ok(())
+    } else {
+        attempt.ensure_resume_ready()
+    }
 }
 
 fn ensure_tester_no_sandbox_eligible(
@@ -2403,6 +2419,24 @@ mod tests {
             .unwrap();
         assert!(resume(dir.path(), "wi-1", "attempt-1", None).is_err());
         assert_eq!(fs::read(queue_file(dir.path(), "wi-1")).unwrap(), before);
+    }
+
+    #[test]
+    fn accepted_host_evidence_admits_legacy_round_cap_resume() {
+        let mut item = WorkItem::planned("wi-1", "Legacy evidence recovery");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.tasks[0].status = TaskStatus::Complete;
+
+        assert!(
+            ensure_attempt_resume_ready(attempt, false).is_err(),
+            "an ordinary exhausted round-cap pause still requires an extension"
+        );
+        ensure_attempt_resume_ready(attempt, true)
+            .expect("validated exact host evidence admits scheduler resume");
     }
 
     #[test]

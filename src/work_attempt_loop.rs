@@ -404,9 +404,9 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             }
         }
 
-        // A prior Fluent build could pause after a failed-command recheck even
-        // An accepted focused host check may already cover the exact command
-        // that the canonical Tester could not run in its local environment.
+        // A prior Fluent build could leave this at the round cap even when an
+        // accepted focused host check already covered the exact command that
+        // the canonical Tester could not run in its local environment.
         // Clear only that exact stale pause before asking for another Writer.
         if reopen_review_evidence_covered_round_cap_attempt(
             config.project_root,
@@ -1878,31 +1878,42 @@ fn reopen_review_evidence_covered_round_cap_attempt(
             .ok_or_else(|| WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
-        if attempt.status != AttemptStatus::NeedsUser
-            || attempt.pause_kind != Some(PauseKind::RoundCap)
-            || attempt.review_state != Some(AttemptReviewState::Failed)
-            || attempt
-                .tasks
-                .iter()
-                .any(|task| task.status != TaskStatus::Complete)
-        {
-            return Ok(false);
-        }
-        let Some(tester_results) = latest_tester_results_path(project_root, attempt) else {
-            return Ok(false);
-        };
-        let baseline = baseline_tester_results_path(project_root, attempt);
-        if !crate::host_evidence::completed_review_evidence_covers_tester_failure(
-            project_root,
-            attempt,
-            &tester_results,
-            baseline.as_deref(),
-        ) {
+        if !review_evidence_covered_round_cap_resume_is_eligible(project_root, attempt) {
             return Ok(false);
         }
         crate::work_model::reopen_attempt(attempt);
         Ok(true)
     })?)
+}
+
+/// Recognize the exact legacy round-cap shape whose sole final Tester failure
+/// already has candidate-bound host evidence and a passing targeted Tests
+/// Review. Queue admission calls this read-only predicate; the Attempt loop
+/// repeats it under its mutation lock before reopening the Attempt.
+pub(crate) fn review_evidence_covered_round_cap_resume_is_eligible(
+    project_root: &Path,
+    attempt: &Attempt,
+) -> bool {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::RoundCap)
+        || attempt.review_state != Some(AttemptReviewState::Failed)
+        || attempt
+            .tasks
+            .iter()
+            .any(|task| task.status != TaskStatus::Complete)
+    {
+        return false;
+    }
+    let Some(tester_results) = latest_tester_results_path(project_root, attempt) else {
+        return false;
+    };
+    let baseline = baseline_tester_results_path(project_root, attempt);
+    crate::host_evidence::completed_review_evidence_covers_tester_failure(
+        project_root,
+        attempt,
+        &tester_results,
+        baseline.as_deref(),
+    )
 }
 
 fn validate_round_cap_frontier(
@@ -5588,6 +5599,10 @@ fn accepted_external_tester_commands(project_root: &Path, attempt: &Attempt) -> 
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+    commands.extend(crate::host_evidence::completed_review_evidence_commands(
+        project_root,
+        attempt,
+    ));
     commands.extend(
         crate::host_evidence::completed_candidate_gate_evidence_commands(project_root, attempt),
     );
