@@ -669,6 +669,12 @@ pub fn attach(
                 review_artifacts,
             )?,
         };
+        let interrupted_correction_id = (recheck_frontier.is_none())
+            .then(|| {
+                interrupted_evidence_correction(existing, candidate_commit, review_artifacts)
+                    .map(|task| task.id.clone())
+            })
+            .flatten();
         let target_artifacts = match &recheck_frontier {
             Some(frontier) => vec![frontier.binding_path.clone()],
             None => review_artifacts.to_vec(),
@@ -759,6 +765,11 @@ pub fn attach(
             state: EvidenceRecoveryState::Reviewing,
             created_at: work_model::now_iso8601(),
         })?;
+        if let Some(task_id) = interrupted_correction_id
+            && let Some(task) = attempt.tasks.iter_mut().find(|task| task.id == task_id)
+        {
+            work_model::set_task_terminal(task, TaskStatus::Superseded);
+        }
         for role in roles {
             let prior = prior_reviews
                 .iter()
@@ -825,6 +836,8 @@ pub fn attach(
         }
         attempt.status = work_model::AttemptStatus::Reviewing;
         attempt.review_state = Some(work_model::AttemptReviewState::NotReviewed);
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
         Ok(recovery)
     })?;
     let _ = document; // validation intentionally happens before publication.
@@ -945,10 +958,21 @@ fn validate_evidence_frontier(
                         })
                 })
         });
+    let interrupted_correction =
+        interrupted_evidence_correction(attempt, candidate_commit, review_artifacts).filter(
+            |task| {
+                !crate::lease::is_leased(&crate::lease::task_lock_path(
+                    project_root,
+                    &attempt.work_item_id,
+                    &task.id,
+                ))
+            },
+        );
     if !(attempt.status == work_model::AttemptStatus::Reviewing
         || is_failed_review_pause
         || is_legacy
-        || is_paused_evidence_recovery)
+        || is_paused_evidence_recovery
+        || interrupted_correction.is_some())
     {
         return Err(rejected());
     }
@@ -991,6 +1015,80 @@ fn validate_evidence_frontier(
         selected.push(task.clone());
     }
     Ok(selected)
+}
+
+/// Resolve an output-free corrective Writer that was interrupted after an
+/// evidence-targeted reviewer requested a code change.
+///
+/// The operator may replace the failed evidence only when the interrupted
+/// Writer is the final Task, its exact inputs are the selected evidence Review,
+/// and the prior recovery record binds that Review to the unchanged candidate.
+/// This keeps ordinary interrupted Writers on their normal resume path.
+fn interrupted_evidence_correction<'a>(
+    attempt: &'a work_model::Attempt,
+    candidate_commit: &str,
+    review_artifacts: &[String],
+) -> Option<&'a Task> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::Interrupted)
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+        || review_artifacts.is_empty()
+    {
+        return None;
+    }
+    let writer = attempt.tasks.last()?;
+    if writer.kind != TaskKind::Write
+        || writer.status != TaskStatus::NeedsUser
+        || writer.output.is_some()
+        || writer.input_artifacts.len() != review_artifacts.len()
+    {
+        return None;
+    }
+    let selected_reviews = writer
+        .input_artifacts
+        .iter()
+        .map(|input| {
+            attempt.tasks.iter().find(|task| {
+                task.id == input.producer_id
+                    && task.kind == TaskKind::Review
+                    && task.status == TaskStatus::Complete
+                    && review_artifact_path(task).as_deref() == Some(input.path.as_str())
+                    && review_artifacts.contains(&input.path)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if selected_reviews.len() != review_artifacts.len()
+        || !review_artifacts.iter().all(|path| {
+            writer
+                .input_artifacts
+                .iter()
+                .any(|input| input.path == *path)
+        })
+    {
+        return None;
+    }
+    attempt.evidence_recoveries.iter().rev().find(|recovery| {
+        recovery.state == EvidenceRecoveryState::CodeChange
+            && recovery.candidate_commit == candidate_commit
+            && recovery.targets.len() == selected_reviews.len()
+            && recovery.targets.iter().all(|target| {
+                target.review_task_id.as_deref().is_some_and(|task_id| {
+                    selected_reviews.iter().any(|review| {
+                        review.id == task_id
+                            && review.role == target.role
+                            && review
+                                .evidence_review_context
+                                .as_ref()
+                                .is_some_and(|context| {
+                                    context.recovery_id == recovery.id
+                                        && context.prior_review_artifact
+                                            == target.prior_review_artifact
+                                })
+                    })
+                })
+            })
+    })?;
+    Some(writer)
 }
 
 /// Resolve the failed-command recheck that currently needs host evidence.

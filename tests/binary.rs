@@ -24493,6 +24493,195 @@ fn attempt_evidence_attach_recovers_failed_no_change_writer_in_same_attempt() {
 }
 
 #[test]
+fn attempt_evidence_attach_supersedes_interrupted_output_free_evidence_correction() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path, evidence) =
+        setup_failed_evidence_recovery_fixture(&tmp, "evidence-interrupted-correction");
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-interrupted-correction",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success();
+
+    let store = fluent::work_model::WorkModelStore::new(&project);
+    let targeted_review_path = store
+        .mutate_work_item("evidence-interrupted-correction", |item| {
+            let attempt = &mut item.attempts[0];
+            let targeted = attempt.tasks.last_mut().unwrap();
+            targeted.status = fluent::work_model::TaskStatus::Complete;
+            targeted.completed_at = Some(fluent::work_model::now_iso8601());
+            let path = format!(
+                "{}/review.md",
+                targeted.artifact_area.as_ref().unwrap().path
+            );
+            Ok((targeted.id.clone(), path))
+        })
+        .unwrap();
+    fs::create_dir_all(project.join(&targeted_review_path.1).parent().unwrap()).unwrap();
+    fs::write(
+        project.join(&targeted_review_path.1),
+        "Verdict: fail\nDisposition: code-change\n",
+    )
+    .unwrap();
+    store
+        .mutate_work_item("evidence-interrupted-correction", |item| {
+            item.add_next_write_round(
+                "attempt-1",
+                vec![fluent::work_model::ArtifactRef {
+                    producer_id: targeted_review_path.0.clone(),
+                    path: targeted_review_path.1.clone(),
+                }],
+            )?;
+            let attempt = &mut item.attempts[0];
+            let correction = attempt.tasks.last_mut().unwrap();
+            correction.status = fluent::work_model::TaskStatus::NeedsUser;
+            correction.completed_at = Some(fluent::work_model::now_iso8601());
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::Interrupted);
+            attempt.review_state = Some(fluent::work_model::AttemptReviewState::Failed);
+            attempt.evidence_recoveries[0].state =
+                fluent::work_model::EvidenceRecoveryState::Complete;
+            Ok(())
+        })
+        .unwrap();
+
+    let replacement = tmp.path().join("replacement-evidence.json");
+    fs::write(&replacement, br#"{"schema_version":1,"producer":"host","check":"check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T18:01:47Z","output":"replacement passed"}"#).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-interrupted-correction",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            replacement.to_str().unwrap(),
+            "--review-artifact",
+            &targeted_review_path.1,
+        ])
+        .assert()
+        .failure();
+    let rejected = work_item_value(&project, "evidence-interrupted-correction");
+    assert_eq!(rejected["attempts"][0]["status"], "needs-user");
+    assert_eq!(
+        rejected["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        rejected["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["kind"] == "write" && task["status"] == "needs-user")
+    );
+    store
+        .mutate_work_item("evidence-interrupted-correction", |item| {
+            item.attempts[0].evidence_recoveries[0].state =
+                fluent::work_model::EvidenceRecoveryState::CodeChange;
+            Ok(())
+        })
+        .unwrap();
+    let correction_id = rejected["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let live_owner = fluent::lease::acquire(&fluent::lease::task_lock_path(
+        &project,
+        "evidence-interrupted-correction",
+        correction_id,
+    ))
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-interrupted-correction",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            replacement.to_str().unwrap(),
+            "--review-artifact",
+            &targeted_review_path.1,
+        ])
+        .assert()
+        .failure();
+    drop(live_owner);
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-interrupted-correction",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            replacement.to_str().unwrap(),
+            "--review-artifact",
+            &targeted_review_path.1,
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-interrupted-correction",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            replacement.to_str().unwrap(),
+            "--review-artifact",
+            &targeted_review_path.1,
+        ])
+        .assert()
+        .success();
+
+    let shown = work_item_value(&project, "evidence-interrupted-correction");
+    let attempt = &shown["attempts"][0];
+    assert_eq!(attempt["status"], "reviewing");
+    assert!(attempt["pause_kind"].is_null());
+    assert_eq!(attempt["evidence_recoveries"].as_array().unwrap().len(), 2);
+    let tasks = attempt["tasks"].as_array().unwrap();
+    assert!(tasks.iter().any(|task| {
+        task["kind"] == "write"
+            && task["status"] == "superseded"
+            && task["output"].is_null()
+            && task["input_artifacts"][0]["producer_id"] == targeted_review_path.0
+    }));
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
 fn attempt_evidence_attach_rejects_ineligible_failed_attempt() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, review_path, evidence) =

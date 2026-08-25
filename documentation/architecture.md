@@ -928,6 +928,14 @@ Writer, Tester, and reviewer path. Once every targeted role passes and the
 unchanged candidate's remaining exact-commit evidence passes, the Attempt
 continues to Learning without rerunning the Writer or Tester.
 
+If that code-change disposition plans a corrective Writer and the operator
+interrupts it before it produces output, replacement evidence remains eligible
+only against that exact evidence Review and unchanged clean candidate. Accepting
+the replacement marks the output-free Writer `superseded`, retains the failed
+evidence and review as history, clears the interruption, and plans a new targeted
+Review. Ordinary interrupted Writers, changed candidates, different review
+inputs, and live task owners remain ineligible.
+
 For a failed-command recheck, `fluent attempt evidence attach` accepts
 `--recheck-artifact` instead of `--review-artifact`. Fluent accepts this route
 only for one unexplained failed command, requires passing evidence for that

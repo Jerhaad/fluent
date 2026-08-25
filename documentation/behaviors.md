@@ -428,13 +428,13 @@ WHILE a focused evidence check runs, THE SYSTEM SHALL provide a private writable
 scratch path for build and cache state.
 Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
 
-### B11f
+### B11h
 
 WHILE a focused evidence check runs in a linked candidate worktree, THE SYSTEM
 SHALL allow the check to read that worktree's Git metadata.
 Test: src/host_evidence.rs (focused_evidence_includes_linked_git_metadata_in_read_and_deny_boundaries)
 
-### B11g
+### B11i
 
 WHILE a focused evidence check runs in a linked candidate worktree, THE SYSTEM
 SHALL deny writes to that worktree's Git metadata.
@@ -474,6 +474,14 @@ IF a failed Attempt ends in a no-output Writer whose exact inputs are the failed
 review artifacts named by the attachment, THEN THE SYSTEM SHALL recover in that
 same Attempt.
 Test: tests/binary.rs (attempt_evidence_attach_recovers_failed_no_change_writer_in_same_attempt)
+
+### B14a
+
+IF an evidence-targeted Review requests a code change, its exact corrective
+Writer is interrupted before producing output, and the candidate remains clean
+and unchanged, THEN THE SYSTEM SHALL allow replacement evidence for that Review,
+preserve the Writer as superseded history, and resume only the targeted Review.
+Test: tests/binary.rs (attempt_evidence_attach_supersedes_interrupted_output_free_evidence_correction)
 
 ### B15
 
