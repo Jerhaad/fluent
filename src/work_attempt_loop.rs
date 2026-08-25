@@ -12461,6 +12461,35 @@ mod tests {
             .is_some(),
             "restored exact bytes must recover the accepted evidence frontier"
         );
+        let mut later_tests_evidence = stored_recovery.clone();
+        later_tests_evidence.id = "host-evidence-later-candidate-gate".to_string();
+        later_tests_evidence.targets[0].prior_review_artifact =
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/later-candidate-gate.json"
+                .to_string();
+        fs::create_dir_all(
+            project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence"),
+        )
+        .unwrap();
+        fs::write(
+            project
+                .path()
+                .join(&later_tests_evidence.targets[0].prior_review_artifact),
+            b"{}\n",
+        )
+        .unwrap();
+        stored.attempts[0]
+            .evidence_recoveries
+            .push(later_tests_evidence);
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(
+                project.path(),
+                &stored.attempts[0],
+            )
+            .is_some(),
+            "later completed Tests evidence for another frontier must not hide accepted recheck evidence"
+        );
         let tester_count = store.read_work_item("work-1").unwrap().attempts[0]
             .tasks
             .iter()

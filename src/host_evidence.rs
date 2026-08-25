@@ -1696,11 +1696,26 @@ pub(crate) fn completed_recheck_evidence_source(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Option<PathBuf> {
-    let recovery = attempt.evidence_recoveries.iter().rev().find(|recovery| {
-        recovery.state == EvidenceRecoveryState::Complete
-            && recovery.targets.len() == 1
-            && recovery.targets[0].role == "tests"
-    })?;
+    attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find_map(|recovery| {
+            completed_recheck_evidence_source_for_recovery(project_root, attempt, recovery)
+        })
+}
+
+fn completed_recheck_evidence_source_for_recovery(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+) -> Option<PathBuf> {
+    if recovery.state != EvidenceRecoveryState::Complete
+        || recovery.targets.len() != 1
+        || recovery.targets[0].role != "tests"
+    {
+        return None;
+    }
     let target = &recovery.targets[0];
     let binding_bytes = fs::read(project_root.join(&target.prior_review_artifact)).ok()?;
     let binding: FailedCommandRecheckEvidenceBinding =
