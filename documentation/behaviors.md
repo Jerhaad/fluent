@@ -6616,6 +6616,22 @@ return that same Attempt to a corrective Writer with normalized post-Tester gate
 evidence.
 Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt)
 
+### B25f
+
+WHEN a behavior `Test:` reference is a supported Python command with a direct
+project-relative script operand, THE SYSTEM SHALL accept the reference only when
+that script path exists in the candidate commit.
+Test: src/candidate_gate.rs (python_command_reference_validates_committed_script_operand)
+Test: src/candidate_gate.rs (python_command_reference_requires_committed_script_operand)
+
+### B25g
+
+WHEN final Tester evidence is checked for a Python command `Test:` reference,
+THE SYSTEM SHALL require a passing Tester command that exactly matches the
+approved complete command.
+Test: src/candidate_gate.rs (python_command_reference_matches_exact_passing_tester_command)
+Test: src/candidate_gate.rs (python_command_reference_rejects_different_passing_tester_command)
+
 ### B27e
 
 WHEN Fluent returns that exact older Attempt to its corrective Writer, THE

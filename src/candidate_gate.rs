@@ -750,26 +750,26 @@ fn check_behavior_references(
                 continue;
             }
             match parse_test_reference(reference) {
-                Ok((path, selector)) => {
-                    let object = format!("{}:{path}", request.candidate_commit);
+                Ok(test_reference) => {
+                    let object = format!("{}:{}", request.candidate_commit, test_reference.path);
                     let output = crate::git::run_raw(request.workspace, &["show", &object])?;
                     if !output.status.success() {
                         diagnostics.push(format!(
-                            "{} references missing committed test path {path}",
-                            requirement.source
+                            "{} references missing committed test path {}",
+                            requirement.source, test_reference.path
                         ));
                         continue;
                     }
-                    if let Some(selector) = selector.as_deref()
+                    if let Some(selector) = test_reference.selector.as_deref()
                         && !String::from_utf8_lossy(&output.stdout).contains(selector)
                     {
                         diagnostics.push(format!(
-                            "{} references test identifier {selector:?}, which is absent from {path}",
-                            requirement.source
+                            "{} references test identifier {selector:?}, which is absent from {}",
+                            requirement.source, test_reference.path
                         ));
                         continue;
                     }
-                    test_references.push(TestReference { path, selector });
+                    test_references.push(test_reference);
                 }
                 Err(reason) => diagnostics.push(format!(
                     "{} has malformed Test: reference {reference:?}: {reason}",
@@ -792,12 +792,16 @@ fn check_behavior_references(
 struct TestReference {
     path: String,
     selector: Option<String>,
+    command: Option<String>,
 }
 
-fn parse_test_reference(reference: &str) -> std::result::Result<(String, Option<String>), String> {
+fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, String> {
     let reference = reference.trim();
     if reference.is_empty() {
         return Err("reference is empty".to_string());
+    }
+    if let Some(command) = parse_python_test_command(reference)? {
+        return Ok(command);
     }
     let (path, selector) = if let Some(prefix) = reference.strip_suffix(')') {
         if let Some((path, selector)) = prefix.rsplit_once(" (") {
@@ -810,6 +814,112 @@ fn parse_test_reference(reference: &str) -> std::result::Result<(String, Option<
     } else {
         (reference, None)
     };
+    validate_test_path(path)?;
+    if selector
+        .as_ref()
+        .is_some_and(|selector| selector.is_empty())
+    {
+        return Err("test identifier is empty".to_string());
+    }
+    Ok(TestReference {
+        path: path.to_string(),
+        selector,
+        command: None,
+    })
+}
+
+fn parse_python_test_command(
+    reference: &str,
+) -> std::result::Result<Option<TestReference>, String> {
+    let fields = reference.split_whitespace().collect::<Vec<_>>();
+    let mut executable = 0;
+    while fields
+        .get(executable)
+        .is_some_and(|field| is_environment_assignment(field))
+    {
+        executable += 1;
+    }
+    let Some(launcher) = fields.get(executable) else {
+        return Ok(None);
+    };
+    if !is_python_launcher(launcher) {
+        return Ok(None);
+    }
+    if fields
+        .iter()
+        .any(|field| field.contains(['\'', '"', '\\', ';', '|', '&', '<', '>']))
+    {
+        return Err("Python command must not contain quoting or shell operators".to_string());
+    }
+    let mut operand = executable + 1;
+    while let Some(field) = fields.get(operand) {
+        if *field == "--" {
+            operand += 1;
+            break;
+        }
+        if matches!(
+            *field,
+            "-B" | "-b"
+                | "-bb"
+                | "-d"
+                | "-E"
+                | "-I"
+                | "-O"
+                | "-OO"
+                | "-P"
+                | "-q"
+                | "-s"
+                | "-S"
+                | "-u"
+                | "-v"
+                | "-V"
+                | "-x"
+        ) {
+            operand += 1;
+            continue;
+        }
+        if field.starts_with('-') {
+            return Err(format!(
+                "unsupported Python option {field:?}; Test: must name a project script directly"
+            ));
+        }
+        break;
+    }
+    let path = fields
+        .get(operand)
+        .ok_or_else(|| "Python command has no project script operand".to_string())?;
+    validate_test_path(path)?;
+    Ok(Some(TestReference {
+        path: (*path).to_string(),
+        selector: None,
+        command: Some(reference.to_string()),
+    }))
+}
+
+fn is_environment_assignment(field: &str) -> bool {
+    let Some((name, _)) = field.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn is_python_launcher(field: &str) -> bool {
+    if field == "python" {
+        return true;
+    }
+    field.strip_prefix("python").is_some_and(|version| {
+        version.chars().any(|character| character.is_ascii_digit())
+            && version
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+    })
+}
+
+fn validate_test_path(path: &str) -> std::result::Result<(), String> {
     let parsed = Path::new(path);
     if parsed.is_absolute()
         || path.is_empty()
@@ -819,13 +929,7 @@ fn parse_test_reference(reference: &str) -> std::result::Result<(String, Option<
     {
         return Err("path must be a normalized project-relative path".to_string());
     }
-    if selector
-        .as_ref()
-        .is_some_and(|selector| selector.is_empty())
-    {
-        return Err("test identifier is empty".to_string());
-    }
-    Ok((path.to_string(), selector))
+    Ok(())
 }
 
 fn check_tester_evidence(
@@ -882,29 +986,36 @@ fn check_tester_evidence(
     }
     let mut missing_references = Vec::new();
     for reference in references {
-        let matched = results.tests.iter().any(|test| {
-            if test.status != "pass" {
-                return false;
-            }
-            if test.test_harness == "shell-harness" && test.id == reference.path {
-                return true;
-            }
-            match reference.selector.as_deref() {
-                Some(selector) => {
-                    test.id == selector
-                        || test.id.ends_with(&format!("::{selector}"))
-                        || test.id.ends_with(&format!("${selector}"))
+        let matched = if let Some(expected_command) = reference.command.as_deref() {
+            results
+                .commands
+                .iter()
+                .any(|command| command.exit_code == 0 && command.command.trim() == expected_command)
+        } else {
+            results.tests.iter().any(|test| {
+                if test.status != "pass" {
+                    return false;
                 }
-                None => test.id == reference.path,
-            }
-        });
+                if test.test_harness == "shell-harness" && test.id == reference.path {
+                    return true;
+                }
+                match reference.selector.as_deref() {
+                    Some(selector) => {
+                        test.id == selector
+                            || test.id.ends_with(&format!("::{selector}"))
+                            || test.id.ends_with(&format!("${selector}"))
+                    }
+                    None => test.id == reference.path,
+                }
+            })
+        };
         if !matched {
             missing_references.push(format!(
                 "no passing Tester result matches {}",
-                reference
+                reference.command.as_deref().unwrap_or_else(|| reference
                     .selector
                     .as_deref()
-                    .unwrap_or(reference.path.as_str())
+                    .unwrap_or(reference.path.as_str()))
             ));
         }
     }
@@ -1199,25 +1310,78 @@ mod tests {
 
     #[test]
     fn parses_supported_test_reference_forms() {
-        assert_eq!(
-            parse_test_reference("tests/example.rs::module::works").unwrap(),
-            (
-                "tests/example.rs".to_string(),
-                Some("module::works".to_string())
-            )
-        );
-        assert_eq!(
-            parse_test_reference("tests/example.rs (module::works)").unwrap(),
-            (
-                "tests/example.rs".to_string(),
-                Some("module::works".to_string())
-            )
-        );
-        assert_eq!(
-            parse_test_reference("tests/behaviors/example.sh").unwrap(),
-            ("tests/behaviors/example.sh".to_string(), None)
-        );
+        let double_colon = parse_test_reference("tests/example.rs::module::works").unwrap();
+        assert_eq!(double_colon.path, "tests/example.rs");
+        assert_eq!(double_colon.selector.as_deref(), Some("module::works"));
+        assert!(double_colon.command.is_none());
+
+        let parenthesized = parse_test_reference("tests/example.rs (module::works)").unwrap();
+        assert_eq!(parenthesized.path, "tests/example.rs");
+        assert_eq!(parenthesized.selector.as_deref(), Some("module::works"));
+        assert!(parenthesized.command.is_none());
+
+        let path = parse_test_reference("tests/behaviors/example.sh").unwrap();
+        assert_eq!(path.path, "tests/behaviors/example.sh");
+        assert!(path.selector.is_none());
+        assert!(path.command.is_none());
         assert!(parse_test_reference("tests/example.rs::").is_err());
+    }
+
+    #[test]
+    fn parses_python_command_reference_as_committed_script() {
+        let reference = parse_test_reference(
+            "PYTHONDONTWRITEBYTECODE=1 python3 -I tests/fluent_merge_readiness.py",
+        )
+        .unwrap();
+
+        assert_eq!(reference.path, "tests/fluent_merge_readiness.py");
+        assert!(reference.selector.is_none());
+        assert_eq!(
+            reference.command.as_deref(),
+            Some("PYTHONDONTWRITEBYTECODE=1 python3 -I tests/fluent_merge_readiness.py")
+        );
+        assert!(parse_test_reference("python3 -m pytest tests/readiness.py").is_err());
+        assert!(parse_test_reference("python3 tests/readiness.py | tee output").is_err());
+    }
+
+    #[test]
+    fn python_command_reference_validates_committed_script_operand() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/fluent_merge_readiness.py",
+            "#!/usr/bin/env python3\n",
+            "Add readiness journey\n\n- Cover the public workflow",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn python_command_reference_requires_committed_script_operand() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit("README.md", "fixture changed\n", "Update fixture");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("python3 tests/missing.py");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+
+        assert!(
+            check(&evidence, "behavior-references")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("missing committed test path tests/missing.py"))
+        );
     }
 
     #[test]
@@ -1859,6 +2023,96 @@ mod tests {
         assert_eq!(
             check(&evidence, "tester-reference-evidence").status,
             CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn python_command_reference_matches_exact_passing_tester_command() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/fluent_merge_readiness.py",
+            "#!/usr/bin/env python3\n",
+            "Add readiness journey\n\n- Cover the public workflow",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "python3 tests/fluent_merge_readiness.py",
+                "test_harness": "shell-harness",
+                "exit_code": 0,
+                "duration_ms": 1,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            evidence.disposition,
+            CandidateGateDisposition::Passed,
+            "{evidence:#?}"
+        );
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn python_command_reference_rejects_different_passing_tester_command() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/fluent_merge_readiness.py",
+            "#!/usr/bin/env python3\n",
+            "Add readiness journey\n\n- Cover the public workflow",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [{
+                "command": "python3 tests/a_different_journey.py",
+                "test_harness": "shell-harness",
+                "exit_code": 0,
+                "duration_ms": 1,
+                "stdout_log": "commands/0-stdout.log",
+                "stderr_log": "commands/0-stderr.log"
+            }],
+            "tests": [],
+            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").diagnostics,
+            vec![
+                "no passing Tester result matches python3 tests/fluent_merge_readiness.py"
+                    .to_string()
+            ]
         );
     }
 
