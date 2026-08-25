@@ -440,9 +440,11 @@ command, exit code, and exact stdout and stderr logs, while its stable identity
 uses the command index and command text rather than round-specific artifact
 paths. After the Writer returns a corrected candidate, the tests reviewer alone
 receives that structured result and its failed-command logs. If an unchanged
-candidate first passes a failed-command recheck, the recheck result replaces the
-older failure for review; later unrelated correction rounds do not inherit stale
-Tester evidence.
+Writer follows the failed Tester, correction artifacts resolve the exact
+candidate-bound Tester result by path rather than assuming a newer Tester must
+follow that Writer. If an unchanged candidate first passes a failed-command
+recheck, the recheck result replaces the older failure for review; later
+unrelated correction rounds do not inherit stale Tester evidence.
 
 Every Writer persists `writer-context-usage.json` beside its transcript. The
 sidecar records prompt kind and bytes, execution-context and transcript bytes,

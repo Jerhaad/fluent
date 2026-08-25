@@ -5722,8 +5722,22 @@ fn failed_tester_command_artifacts(
         .output
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("final-Tester correction Writer has no output"))?;
-    let tester = latest_completed_final_tester_after(attempt, last_write_index)
-        .ok_or_else(|| anyhow::anyhow!("final-Tester correction has no completed Tester"))?;
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+                && task.artifact_area.as_ref().is_some_and(|area| {
+                    work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                        .is_ok_and(|dir| dir.join("tester-results.json") == tester_results_path)
+                })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("final-Tester correction has no matching completed Tester")
+        })?;
     let area = tester
         .artifact_area
         .as_ref()
@@ -11534,6 +11548,37 @@ mod tests {
             latest_tester_results_path(project.path(), &stored.attempts[0]).as_deref(),
             Some(source.as_path()),
             "the no-change Writer preserves the candidate-bound final Tester"
+        );
+    }
+
+    #[test]
+    fn final_tester_correction_preserves_source_before_no_change_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        let tester = attempt
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester && !task.is_failed_command_recheck())
+            .unwrap();
+        let results_path = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+
+        let artifacts =
+            failed_tester_command_artifacts(project.path(), attempt, &results_path).unwrap();
+
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.producer_id == tester.id && artifact.path.ends_with("/tester-results.json")
+        }));
+        assert!(
+            artifacts
+                .iter()
+                .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
         );
     }
 

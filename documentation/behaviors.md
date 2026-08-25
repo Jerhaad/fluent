@@ -282,6 +282,10 @@ failed command as a current correction finding with its exit code and durable
 stdout and stderr log paths.
 Test: src/work_task_executor.rs (execution_context_surfaces_each_failed_tester_command)
 Test: src/work_attempt_loop.rs (failed_configured_tester_command_returns_exact_evidence_to_writer)
+IF a later no-change Writer preserves that Tester's candidate, THEN THE SYSTEM
+SHALL continue to use the exact candidate-bound source Tester as the correction
+frontier instead of requiring a new Tester after the no-change Writer.
+Test: src/work_attempt_loop.rs (final_tester_correction_preserves_source_before_no_change_writer)
 
 ### B10
 
