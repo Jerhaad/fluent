@@ -886,7 +886,10 @@ an already-created private run directory available as
 `$FLUENT_EVIDENCE_SCRATCH`; this keeps Foundation-backed macOS caches private
 even when a tool resolves the account home without reading `HOME`. The profile
 may read installed user toolchains but explicitly denies Claude, Codex, and
-agent session trees. The child environment is rebuilt from a small toolchain
+agent session trees. It may also read the candidate's linked-worktree Git
+common directory, while denying writes to both the candidate and that metadata,
+so Git-aware verification can inspect the unchanged commit. The child
+environment is rebuilt from a small toolchain
 allowlist, so provider credentials and enclosing-agent variables do not reach
 the check. Each run owns a process group and a
 bounded deadline; timeout advances only after Fluent confirms cleanup. Fluent

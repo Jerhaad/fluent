@@ -3232,6 +3232,39 @@ impl WriterCompletionMatrixStatus {
 }
 
 impl WriterCompletionMatrix {
+    /// Carry forward completed planning claims from an authoritative earlier
+    /// matrix without changing findings or any claim the current Writer already
+    /// made. Host-produced planning repairs use this when a later Writer was
+    /// materialized from the superseded task artifact.
+    pub(crate) fn inherit_completed_planning_claims(&mut self, prior: &Self) -> usize {
+        let mut inherited = 0;
+        for row in &mut self.rows {
+            if row.kind == WriterCompletionRequirementKind::Finding
+                || row.state != WriterCompletionState::Pending
+                || !row.implementation_evidence.is_empty()
+                || !row.verification.is_empty()
+                || !row.applicable_constraints.is_empty()
+            {
+                continue;
+            }
+            let Some(previous) = prior.rows.iter().find(|previous| {
+                previous.id == row.id
+                    && previous.kind == row.kind
+                    && previous.source == row.source
+                    && previous.requirement == row.requirement
+                    && previous.verification_refs == row.verification_refs
+                    && previous.state == WriterCompletionState::Complete
+            }) else {
+                continue;
+            };
+            row.state = previous.state;
+            row.implementation_evidence = previous.implementation_evidence.clone();
+            row.verification = previous.verification.clone();
+            inherited += 1;
+        }
+        inherited
+    }
+
     fn expected_against(
         &self,
         contract: &WriterCompletionContract,

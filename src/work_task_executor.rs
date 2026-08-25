@@ -6448,6 +6448,13 @@ pub(crate) fn materialize_writer_completion_before_writer(
     let Some(path) = managed_writer_completion_matrix_path(project_root, task)? else {
         anyhow::bail!("Writer Task {task_id:?} has no artifact area for its completion matrix");
     };
+    let prior = attempt.tasks[..task_index]
+        .iter()
+        .rev()
+        .find(|candidate| candidate.kind == TaskKind::Write)
+        .map(|candidate| authoritative_writer_completion_matrix(project_root, attempt, candidate))
+        .transpose()?
+        .flatten();
     match fs::metadata(&path) {
         Ok(metadata)
             if metadata.len() > crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64 =>
@@ -6461,6 +6468,28 @@ pub(crate) fn materialize_writer_completion_before_writer(
         }
         Ok(_) => {
             if task.role != crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
+                if let Some(prior) = prior.as_ref() {
+                    let source = fs::read_to_string(&path).with_context(|| {
+                        format!("read existing Writer completion matrix: {}", path.display())
+                    })?;
+                    let mut existing: crate::work_model::WriterCompletionMatrix =
+                        serde_json::from_str(&source).with_context(|| {
+                            format!(
+                                "parse existing Writer completion matrix: {}",
+                                path.display()
+                            )
+                        })?;
+                    if existing.inherit_completed_planning_claims(prior) > 0 {
+                        let bytes = serde_json::to_vec_pretty(&existing)
+                            .context("serialize inherited Writer completion matrix")?;
+                        crate::atomic_write::atomic_write(&path, &bytes).with_context(|| {
+                            format!(
+                                "inherit authoritative Writer completion claims: {}",
+                                path.display()
+                            )
+                        })?;
+                    }
+                }
                 return Ok(Some(path));
             }
             let existing: crate::work_model::WriterCompletionMatrix =
@@ -6497,30 +6526,6 @@ pub(crate) fn materialize_writer_completion_before_writer(
             });
         }
     }
-    let prior = attempt.tasks[..task_index]
-        .iter()
-        .rev()
-        .find(|candidate| candidate.kind == TaskKind::Write)
-        .map(|candidate| managed_writer_completion_matrix_path(project_root, candidate))
-        .transpose()?
-        .flatten()
-        .map(|prior_path| {
-            let source = fs::read_to_string(&prior_path).with_context(|| {
-                format!(
-                    "read prior Writer completion matrix: {}",
-                    prior_path.display()
-                )
-            })?;
-            serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&source).with_context(
-                || {
-                    format!(
-                        "parse prior Writer completion matrix: {}",
-                        prior_path.display()
-                    )
-                },
-            )
-        })
-        .transpose()?;
     let findings = writer_completion_findings(project_root, task)?;
     let matrix = crate::work_model::WriterCompletionMatrix::skeleton(
         contract,
@@ -6541,6 +6546,65 @@ pub(crate) fn materialize_writer_completion_before_writer(
     crate::atomic_write::atomic_write(&path, &bytes)
         .with_context(|| format!("install Writer completion matrix: {}", path.display()))?;
     Ok(Some(path))
+}
+
+/// Resolve the completion matrix that currently represents one Writer. An
+/// audited host repair for that same task supersedes the original task-owned
+/// matrix; later Writers then carry its claims forward normally.
+fn authoritative_writer_completion_matrix(
+    project_root: &Path,
+    attempt: &crate::work_model::Attempt,
+    writer: &Task,
+) -> Result<Option<crate::work_model::WriterCompletionMatrix>> {
+    let mut recovered_matrices = Vec::new();
+    let recovered = attempt.artifacts.iter().rev().filter(|artifact| {
+        matches!(
+            artifact.producer_id.as_str(),
+            "writer-completion-repair" | "planning-reference-recovery"
+        ) && artifact.path.ends_with("/writer-completion.json")
+    });
+    for artifact in recovered {
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("inspect recovered completion matrix: {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.len() <= crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64,
+            "recovered Writer completion matrix is {} bytes; maximum is {}: {}",
+            metadata.len(),
+            crate::work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES,
+            path.display()
+        );
+        let matrix: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&path).with_context(|| {
+                format!("read recovered completion matrix: {}", path.display())
+            })?)
+            .with_context(|| format!("parse recovered completion matrix: {}", path.display()))?;
+        recovered_matrices.push(matrix);
+    }
+
+    let mut matrix = if let Some(recovered) = recovered_matrices
+        .iter()
+        .find(|matrix| matrix.task_id == writer.id)
+        .cloned()
+    {
+        recovered
+    } else {
+        let Some(path) = managed_writer_completion_matrix_path(project_root, writer)? else {
+            return Ok(None);
+        };
+        let source = fs::read_to_string(&path)
+            .with_context(|| format!("read prior Writer completion matrix: {}", path.display()))?;
+        serde_json::from_str(&source)
+            .with_context(|| format!("parse prior Writer completion matrix: {}", path.display()))?
+    };
+    // A preserved Attempt may already contain several stale continuation
+    // matrices created after the host repair. Exact immutable-row matching
+    // allows the audited source to restore only claims that remain empty all
+    // the way through that damaged lineage.
+    for recovered in &recovered_matrices {
+        matrix.inherit_completed_planning_claims(recovered);
+    }
+    Ok(Some(matrix))
 }
 
 /// Compute the absolute paths the writer/reviewer prompts reference for each
@@ -18402,6 +18466,182 @@ mod tests {
             before,
             "retry must not overwrite claims"
         );
+    }
+
+    #[test]
+    fn corrective_writer_inherits_audited_reference_revision_matrix() {
+        let project = tempfile::TempDir::new().unwrap();
+        let mut item = WorkItem::planned("work-1", "Revised verification boundary");
+        item.planning_context = Some(crate::work_model::PlanningContext {
+            behaviors: Some(
+                "## Readiness\n\n### B1\n\nWHEN checked, THE SYSTEM SHALL use the public workflow.\nTest: python3 tests/readiness.py\n\n### B2\n\nWHEN rejected, THE SYSTEM SHALL report the current reason.\nTest: python3 tests/readiness.py\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let first_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            "attempt-1-write-1",
+        )
+        .unwrap()
+        .unwrap();
+        let mut revised: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&first_path).unwrap()).unwrap();
+        for row in &mut revised.rows {
+            row.state = crate::work_model::WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["tests/readiness.py".to_string()];
+            row.verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "python3 tests/readiness.py".to_string(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+        }
+        let revised_rel = ".fluent/work/artifacts/work-1/attempt-1/planning-reference-revisions/revision-1/writer-completion.json";
+        let revised_path = project.path().join(revised_rel);
+        fs::create_dir_all(revised_path.parent().unwrap()).unwrap();
+        fs::write(&revised_path, serde_json::to_vec_pretty(&revised).unwrap()).unwrap();
+        item.attempts[0]
+            .artifacts
+            .push(crate::work_model::ArtifactRef {
+                producer_id: "planning-reference-recovery".to_string(),
+                path: revised_rel.to_string(),
+            });
+
+        let first = &mut item.attempts[0].tasks[0];
+        first.status = TaskStatus::Complete;
+        first.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: None,
+            commit: "commit-1".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let review_rel =
+            ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-1-tests/review.md";
+        let review_path = project.path().join(review_rel);
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            review_path,
+            "Verdict: fail\n\n## Findings\n\n- [ ] Report stale readiness data (blocking)\n",
+        )
+        .unwrap();
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![crate::work_model::ArtifactRef {
+                    producer_id: "attempt-1-review-1-tests".to_string(),
+                    path: review_rel.to_string(),
+                }],
+            )
+            .unwrap();
+        let second_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &task_id,
+        )
+        .unwrap()
+        .unwrap();
+        let inherited: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(
+            inherited.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            inherited.rows[0].implementation_evidence,
+            ["tests/readiness.py"]
+        );
+        assert_eq!(
+            inherited.rows[1].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(
+            inherited.rows[2].kind,
+            crate::work_model::WriterCompletionRequirementKind::Finding
+        );
+        assert_eq!(
+            inherited.rows[2].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+
+        // A retry may encounter a stale matrix materialized by an older Fluent
+        // build. Reapply only the missing host-authorized planning claims.
+        let mut stale = inherited.clone();
+        stale.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+        stale.rows[0].implementation_evidence.clear();
+        stale.rows[0].verification.clear();
+        stale.rows[1].implementation_evidence = vec!["current Writer claim".to_string()];
+        fs::write(&second_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        materialize_writer_completion_before_writer(project.path(), &item, "attempt-1", &task_id)
+            .unwrap();
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&second_path).unwrap()).unwrap();
+        assert_eq!(
+            repaired.rows[0].state,
+            crate::work_model::WriterCompletionState::Complete
+        );
+        assert_eq!(repaired.rows[0].verification.len(), 1);
+        assert_eq!(
+            repaired.rows[1].implementation_evidence,
+            ["current Writer claim"]
+        );
+        assert_eq!(
+            repaired.rows[2].state,
+            crate::work_model::WriterCompletionState::Pending
+        );
+
+        // Preserve recovery across a chain that an older Fluent build already
+        // materialized from the stale task artifact.
+        let mut damaged_prior = repaired;
+        for row in damaged_prior
+            .rows
+            .iter_mut()
+            .filter(|row| row.kind != crate::work_model::WriterCompletionRequirementKind::Finding)
+        {
+            row.state = crate::work_model::WriterCompletionState::Pending;
+            row.implementation_evidence.clear();
+            row.verification.clear();
+        }
+        fs::write(
+            &second_path,
+            serde_json::to_vec_pretty(&damaged_prior).unwrap(),
+        )
+        .unwrap();
+        let second = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        second.status = TaskStatus::Complete;
+        second.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some("commit-1".to_string()),
+            commit: "commit-2".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let third_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        let third_path = materialize_writer_completion_before_writer(
+            project.path(),
+            &item,
+            "attempt-1",
+            &third_id,
+        )
+        .unwrap()
+        .unwrap();
+        let recovered_chain: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(third_path).unwrap()).unwrap();
+        assert!(recovered_chain.rows.iter().all(|row| {
+            row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
+                || row.state == crate::work_model::WriterCompletionState::Complete
+        }));
     }
 
     #[test]

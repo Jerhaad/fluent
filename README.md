@@ -217,6 +217,13 @@ When a metadata-only correction accidentally rewrites the candidate's protected 
 
 If a failed review shows that stored behavior `Test:` references name the wrong verification boundary, use `fluent attempt revise-test-references <work-item-id> <attempt-id> --reference '<behavior-requirement-id>=<replacement>' --resolution '<authorization>'`. Repeat `--reference` for each selected requirement. Fluent changes only those references, records the before/after values and authorization, rebuilds the Attempt's host-owned completion contract, and schedules fresh Behaviors and Tests reviews on the unchanged candidate. The command accepts only a failed-review round-cap frontier; retrying an accepted revision creates no additional review round.
 
+The revised completion matrix remains authoritative for the next corrective
+Writer. Fluent carries its completed planning claims forward and repairs a
+stale pending matrix created by an older Fluent build when the same Writer is
+retried, including when stale continuation matrices separate it from the
+revision. Current review findings and claims already made by that Writer remain
+unchanged; only planning rows whose immutable fields match exactly inherit.
+
 When the final Tester itself fails before Fluent can create a candidate gate, the same command binds the approval to that candidate's structured Tester result and exact failed-command logs. Fluent accepts only the latest completed final Tester after the latest Writer; it rejects a failed-command recheck as well as passing, stale, missing, malformed, or candidate-mismatched evidence. If a candidate gate exists, that gate remains the authoritative Tester evidence.
 
 If that Writer verifies the existing candidate and makes no commit, Fluent independently reruns only the Tester commands that previously failed before paying for another review round. The recheck uses the same project Tester configuration and sandbox. Another failure returns directly to correction. At the Writer-round cap, one unexplained failed command can instead accept candidate-bound passing evidence from a host that can run it; a targeted Tests Review must approve that evidence before Fluent continues without rerunning the incompatible command. Other failure shapes retain the explicit Writer-extension path. A passing recheck continues to Reviewers, followed by the ordinary complete final Tester.

@@ -437,6 +437,22 @@ fn host_rustup_environment(source_home: &Path) -> RustupEnvironment {
     RustupEnvironment { home, toolchain }
 }
 
+fn focused_evidence_candidate_boundaries(
+    candidate_workspace: &Path,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let common_git_dir = crate::worktree::git_common_dir(candidate_workspace)?;
+    let common_git_dir = common_git_dir.canonicalize().with_context(|| {
+        format!(
+            "canonicalize focused evidence Git metadata {}",
+            common_git_dir.display()
+        )
+    })?;
+    Ok((
+        vec![candidate_workspace.to_path_buf(), common_git_dir.clone()],
+        vec![candidate_workspace.to_path_buf(), common_git_dir],
+    ))
+}
+
 fn execute_focused_command(
     candidate_workspace: &Path,
     working_directory: &Path,
@@ -463,14 +479,15 @@ fn execute_focused_command(
         .into_iter()
         .map(|path| source_home.join(path))
         .collect::<Vec<_>>();
+    let (mut readable_roots, candidate_denied_writes) =
+        focused_evidence_candidate_boundaries(candidate_workspace)?;
     let mut denied_writes = denied_agent_state.clone();
+    denied_writes.extend(candidate_denied_writes);
     denied_writes.extend([
-        candidate_workspace.to_path_buf(),
         source_home.join(".local/state"),
         source_home.join(".claude.json"),
         source_home.join(".claude.json.lock"),
     ]);
-    let mut readable_roots = vec![candidate_workspace.to_path_buf()];
     if let Some(rustup_home) = &rustup.home {
         denied_writes.push(rustup_home.clone());
         readable_roots.push(rustup_home.clone());
@@ -1815,6 +1832,48 @@ mod tests {
                 "must reject {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn focused_evidence_includes_linked_git_metadata_in_read_and_deny_boundaries() {
+        let root = tempfile::TempDir::new().unwrap();
+        let main = root.path().join("main");
+        let candidate = root.path().join("candidate");
+        fs::create_dir_all(&main).unwrap();
+        crate::git::run(&main, &["init", "-q", "-b", "main"], "init test repo").unwrap();
+        crate::git::run(
+            &main,
+            &["config", "user.name", "Test User"],
+            "configure test repo",
+        )
+        .unwrap();
+        crate::git::run(
+            &main,
+            &["config", "user.email", "test@example.com"],
+            "configure test repo",
+        )
+        .unwrap();
+        fs::write(main.join("README.md"), "candidate\n").unwrap();
+        crate::git::run(&main, &["add", "README.md"], "stage test candidate").unwrap();
+        crate::git::run(
+            &main,
+            &["commit", "-q", "-m", "Add candidate"],
+            "commit test candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            &main,
+            &["worktree", "add", "-q", candidate.to_str().unwrap()],
+            "create linked candidate",
+        )
+        .unwrap();
+        let candidate = candidate.canonicalize().unwrap();
+        let common = main.join(".git").canonicalize().unwrap();
+
+        let (readable, denied_writes) = focused_evidence_candidate_boundaries(&candidate).unwrap();
+
+        assert_eq!(readable, [candidate.clone(), common.clone()]);
+        assert_eq!(denied_writes, [candidate, common]);
     }
 
     #[test]

@@ -430,6 +430,18 @@ Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private
 
 ### B11f
 
+WHILE a focused evidence check runs in a linked candidate worktree, THE SYSTEM
+SHALL allow the check to read that worktree's Git metadata.
+Test: src/host_evidence.rs (focused_evidence_includes_linked_git_metadata_in_read_and_deny_boundaries)
+
+### B11g
+
+WHILE a focused evidence check runs in a linked candidate worktree, THE SYSTEM
+SHALL deny writes to that worktree's Git metadata.
+Test: src/host_evidence.rs (focused_evidence_includes_linked_git_metadata_in_read_and_deny_boundaries)
+
+### B11f
+
 WHILE a focused evidence check runs, THE SYSTEM SHALL withhold provider
 credential environment variables and files under the caller's Claude, Codex,
 and agent state directories from the child command.
@@ -6395,6 +6407,21 @@ boundary, THE SYSTEM SHALL preserve existing Writer claims and SHALL NOT create
 a duplicate Writer continuation.
 Test: src/work_task_executor.rs (corrective_writer_matrix_carries_planning_rows_and_adds_open_findings)
 Test: src/work_attempt_loop.rs (incomplete_writer_completion_retry_does_not_duplicate_continuation)
+
+### B21a
+
+WHEN an audited host transition revises a Writer completion matrix, THE SYSTEM
+SHALL use that matrix as the source for the next Writer and carry its completed
+planning claims into later Writers.
+Test: src/work_task_executor.rs (corrective_writer_inherits_audited_reference_revision_matrix)
+
+### B21b
+
+WHEN Fluent retries a Writer whose pending completion matrix descends through
+stale continuation matrices from an audited host revision, THE SYSTEM SHALL add
+the revision's missing exactly matching planning claims without replacing
+current Writer claims or review findings.
+Test: src/work_task_executor.rs (corrective_writer_inherits_audited_reference_revision_matrix)
 
 ### B22
 
