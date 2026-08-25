@@ -5115,7 +5115,9 @@ IF an older Fluent dispatch already created a later initial Writer while that
 evidence Review remained pending, and the later Writer is interrupted without
 output in a clean worktree still at project HEAD, THEN the exact public resume
 SHALL preserve it as superseded history and bind the new dispatch to the
-evidence Review's Attempt.
+evidence Review's Attempt. IF that recovered Attempt later pauses again, THEN
+another exact public resume SHALL continue to accept the recovered Attempt
+without restoring the superseded later Attempt as current.
 Test: src/queue.rs (resume_supersedes_clean_interrupted_accidental_queue_admission)
 
 ### B2w

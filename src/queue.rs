@@ -455,7 +455,7 @@ fn reconcile_interrupted_evidence_queue_admissions(
     };
     let target = &snapshot.attempts[target_index];
     let later = &snapshot.attempts[target_index + 1..];
-    if later.is_empty() || !target.has_pending_evidence_review_tasks() {
+    if later.is_empty() {
         return Ok(false);
     }
     let evidence_path = format!(
@@ -468,6 +468,9 @@ fn reconcile_interrupted_evidence_queue_admissions(
     };
     if has_reconciled_interrupted_evidence_queue_admission(project_root, &snapshot, attempt_id) {
         return Ok(true);
+    }
+    if !target.has_pending_evidence_review_tasks() {
+        return Ok(false);
     }
     if later.iter().any(|attempt| {
         attempt.status != AttemptStatus::NeedsUser
@@ -619,7 +622,7 @@ fn has_reconciled_interrupted_evidence_queue_admission(
     };
     let target = &item.attempts[target_index];
     let later = &item.attempts[target_index + 1..];
-    if later.is_empty() || !target.has_pending_evidence_review_tasks() {
+    if later.is_empty() {
         return false;
     }
     let evidence_ref = ArtifactRef {
@@ -2066,6 +2069,34 @@ mod tests {
             .unwrap()
             .expect("reconciled evidence resume remains claimable");
         assert_eq!(claimed.bound_attempt_id, "attempt-1");
+        reconcile_active(dir.path(), "wi-evidence", DispatchStatus::NeedsUser).unwrap();
+        store
+            .mutate_work_item("wi-evidence", |item| {
+                let target = &mut item.attempts[0];
+                target
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == "attempt-1-evidence-proof-tests")
+                    .unwrap()
+                    .status = TaskStatus::Complete;
+                target.status = AttemptStatus::NeedsUser;
+                target.pause_kind = Some(PauseKind::WriterCompletion);
+                Ok(())
+            })
+            .unwrap();
+        assert!(has_reconciled_interrupted_evidence_queue_admission(
+            dir.path(),
+            &store.read_work_item("wi-evidence").unwrap(),
+            "attempt-1"
+        ));
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        assert_eq!(
+            resume(dir.path(), "wi-evidence", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
     }
 
     #[test]

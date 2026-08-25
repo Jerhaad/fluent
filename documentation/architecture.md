@@ -3267,6 +3267,9 @@ a later initial Writer: every later Attempt must contain exactly one interrupted
 output-free Writer, have no live task lease, and own a clean worktree still at
 project `HEAD`. The resume records immutable reconciliation evidence, marks
 those Writers `superseded`, and binds the dispatch to the older evidence Review.
+A valid reconciliation remains the Attempt-selection authority after that
+Review settles, so later explicit resumes of the same recovered Attempt do not
+fall back to the superseded later Attempt merely because the frontier changed.
 A dirty, advanced, live, multi-task, or output-bearing later Attempt fails
 closed. Queue history and superseded Attempts remain available for audit.
 
