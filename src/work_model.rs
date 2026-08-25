@@ -5272,6 +5272,7 @@ impl Attempt {
             }
             if self.status == AttemptStatus::Complete
                 && task.status != TaskStatus::Complete
+                && task.status != TaskStatus::Superseded
                 && task.kind != TaskKind::Rebase
                 && !self.is_superseded_tester_harness_followup(&task.id)
                 && !self.has_tester_harness_repair_for(&task.id)
@@ -14603,6 +14604,23 @@ random banner prose that must be ignored
         set_attempt_terminal(&mut attempt, AttemptStatus::Complete);
         assert_eq!(attempt.status, AttemptStatus::Complete);
         assert!(attempt.completed_at.is_some());
+    }
+
+    #[test]
+    fn complete_attempt_accepts_superseded_task_history() {
+        let mut item = work_item_with_completed_write("work-1");
+        let attempt = &mut item.attempts[0];
+        let mut superseded = attempt.tasks[0].clone();
+        superseded.id = "attempt-1-write-superseded".to_string();
+        superseded.status = TaskStatus::Superseded;
+        superseded.output = None;
+        superseded.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", &superseded.id),
+        });
+        attempt.tasks.insert(0, superseded);
+        set_attempt_terminal(attempt, AttemptStatus::Complete);
+
+        attempt.validate("work-1").unwrap();
     }
 
     fn attempt_in(status: AttemptStatus, pause: Option<PauseKind>) -> Attempt {
