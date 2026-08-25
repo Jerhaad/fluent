@@ -549,6 +549,13 @@ SYSTEM SHALL retain an extension frontier bound to the unchanged candidate and
 recheck artifacts.
 Test: src/work_attempt_loop.rs (failed_recheck_is_a_round_cap_extension_frontier)
 
+### B22
+
+WHEN a rejected final-Tester gate remains unresolved after a no-change Writer,
+THE SYSTEM SHALL retain that exact candidate-bound gate, Tester result, and
+failed-command logs as an eligible round-cap extension frontier.
+Test: src/work_attempt_loop.rs (rejected_final_tester_gate_remains_round_cap_frontier_after_no_change_writer)
+
 ## Test harnesses
 
 | Harness | Runs | Usage |

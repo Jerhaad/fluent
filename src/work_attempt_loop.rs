@@ -7959,7 +7959,38 @@ fn rejected_final_tester_gate_frontier(
     let Some(output) = write_task.output.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(tester) = latest_completed_final_tester_after(attempt, last_write_index) else {
+    let tester = attempt.tasks.iter().rev().find(|task| {
+        if task.kind != TaskKind::Tester
+            || task.status != TaskStatus::Complete
+            || task.is_failed_command_recheck()
+        {
+            return false;
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return false;
+        };
+        let results_path = match work_task_executor::resolve_managed_artifact_area_path(
+            project_root,
+            &area.path,
+        ) {
+            Ok(path) => path.join("tester-results.json"),
+            Err(_) => return false,
+        };
+        let candidate_matches = fs::read(&results_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+            .and_then(|results| results.candidate_commit)
+            .as_deref()
+            == Some(output.commit.as_str());
+        let gate_path = project_root.join(format!(
+            "{}/{}/{}",
+            work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+            task.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ));
+        candidate_matches && gate_path.is_file()
+    });
+    let Some(tester) = tester else {
         return Ok(Vec::new());
     };
     let artifact = ArtifactRef {
@@ -11579,6 +11610,42 @@ mod tests {
             artifacts
                 .iter()
                 .any(|artifact| crate::tester::is_command_log_path(Path::new(&artifact.path)))
+        );
+    }
+
+    #[test]
+    fn rejected_final_tester_gate_remains_round_cap_frontier_after_no_change_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("rejected final Tester gate must plan a corrective Writer")
+        };
+        complete_planned_no_change_writer(project.path(), &store, &candidate, &task_id);
+        let item = store.read_work_item("work-1").unwrap();
+
+        let frontier =
+            rejected_final_tester_gate_frontier(project.path(), &item.attempts[0]).unwrap();
+
+        assert!(frontier.iter().any(|entry| {
+            entry
+                .artifact
+                .path
+                .ends_with("/attempt-1-tester/candidate-gate.json")
+        }));
+        assert!(
+            frontier
+                .iter()
+                .any(|entry| entry.artifact.path.ends_with("/tester-results.json"))
         );
     }
 

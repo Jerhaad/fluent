@@ -788,11 +788,13 @@ candidate worktree, exact candidate commit, exhausted current cap, and the exact
 SHA-256-bound failed correction bytes. The correction frontier includes failed
 review output and, for a rejected final-Tester gate, the gate, structured Tester
 result, and attached failed-command logs. A rejected gate owns the Tester
-frontier whenever it exists. A final Tester with a structured failure or harness
-error stops before that gate; in that no-gate path, Fluent instead accepts only
-the latest completed final Tester after the latest Writer, requires its result
-to name that Writer's exact candidate commit, and binds the result plus the exact
-logs for its failed commands. Passing, stale, missing, malformed, or
+frontier whenever it exists. If a no-change Writer follows it, Fluent resolves
+the gate's exact Tester by candidate-bound result and gate path instead of
+requiring the Tester to follow that Writer. A final Tester with a structured
+failure or harness error stops before that gate; in that no-gate path, Fluent
+instead accepts only the latest completed final Tester after the latest Writer,
+requires its result to name that Writer's exact candidate commit, and binds the
+result plus the exact logs for its failed commands. Passing, stale, missing, malformed, or
 candidate-mismatched Tester evidence cannot authorize an extension. The
 extension path advertised by either round-cap handoff is therefore executable
 without approving mutable or unreadable evidence. The append-only approval does
