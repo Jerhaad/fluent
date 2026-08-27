@@ -576,9 +576,10 @@ Test: src/review.rs (evidence_targeted_disposition_is_fail_only_and_typed)
 ### B18
 
 WHEN one unexplained failed-command recheck reaches the Writer-round cap, THE
-SYSTEM SHALL show a candidate-bound evidence attachment command accepted by
-that Attempt state.
+SYSTEM SHALL show a candidate-bound evidence attachment command that accepts a
+passing or failing authorized-host result and plans a targeted Tests Review.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+Test: src/work_attempt_loop.rs (failed_recheck_host_evidence_can_request_corrective_writer)
 
 ### B19
 
@@ -586,6 +587,13 @@ WHEN a targeted Tests Review accepts passing evidence for the unchanged
 candidate and exact failed command, THE SYSTEM SHALL continue to Learning
 without rerunning that command.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+
+### B19a
+
+WHEN an authorized-host run exposes a candidate defect for the exact unchanged
+candidate and failed-command recheck, THE SYSTEM SHALL preserve that failed
+evidence and let a targeted Tests Review request a corrective Writer.
+Test: src/work_attempt_loop.rs (failed_recheck_host_evidence_can_request_corrective_writer)
 
 ### B20
 

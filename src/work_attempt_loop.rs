@@ -8421,7 +8421,7 @@ fn write_failed_recheck_evidence_handoff(
     crate::atomic_write::atomic_write(
         &path,
         format!(
-            "# Attempt needs external test evidence\n\nThe unchanged candidate reached the Writer-round cap after one failed-command recheck. Attach passing evidence from a host that can run the exact command:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
+            "# Attempt needs external test evidence\n\nThe unchanged candidate stopped after one failed-command recheck. Run the exact command on an authorized host and attach a schema-version-1 evidence document with `result: pass` when it succeeds or `result: fail` when it exposes a candidate defect:\n\n`{action}`\n\nFluent binds either result to the unchanged candidate and immutable recheck, then sends it to a targeted Tests Review. Accepted passing evidence can supersede the host-only failure; reviewed failing evidence can request a corrective Writer.\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
         )
         .as_bytes(),
     )?;
@@ -11347,6 +11347,7 @@ mod tests {
         );
         let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
         assert!(handoff.contains("--recheck-artifact"));
+        assert!(handoff.contains("`result: fail`"));
         assert!(
             crate::work_status::attempt_recovery_next_action(
                 Some(&stored.attempts[0]),
@@ -11358,6 +11359,167 @@ mod tests {
             crate::work_status::summarize_work_item(&stored, Some(project.path())).action,
             "evidence-needed"
         );
+    }
+
+    #[test]
+    fn failed_recheck_host_evidence_can_request_corrective_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("failed-host-evidence.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": "xcodebuild test",
+                "working_directory": ".",
+                "result": "fail",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "candidate cleanup failed on the authorized host"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("failed exact host evidence must reach targeted Tests review");
+        let repeated = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("repeating the same failed evidence attachment must be idempotent");
+        assert_eq!(repeated, recovery);
+
+        let reviewing = store.read_work_item("work-1").unwrap();
+        let attempt = &reviewing.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(recovery.state, EvidenceRecoveryState::Reviewing);
+        let review_task_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        let review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == *review_task_id)
+            .unwrap()
+            .clone();
+        assert_eq!(review.kind, TaskKind::Review);
+        assert_eq!(review.role, "tests");
+        assert_eq!(review.status, TaskStatus::Planned);
+        assert_eq!(
+            review
+                .evidence_review_context
+                .as_ref()
+                .unwrap()
+                .candidate_commit,
+            candidate
+        );
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(project.path(), attempt,)
+                .is_none(),
+            "failed evidence must not supersede the failed Tester command"
+        );
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == *review_task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(review, TaskStatus::Complete);
+                Ok(())
+            })
+            .unwrap();
+        let review_dir = project
+            .path()
+            .join(&review.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&review_dir).unwrap();
+        fs::write(
+            review_dir.join("review.md"),
+            "Verdict: fail\nDisposition: code-change\n",
+        )
+        .unwrap();
+
+        let writer_count = reviewing.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            false,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("reviewed failed host evidence must plan a corrective Writer")
+        };
+        let corrected = store.read_work_item("work-1").unwrap();
+        let attempt = &corrected.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(
+            attempt
+                .evidence_recoveries
+                .iter()
+                .find(|entry| entry.id == recovery.id)
+                .unwrap()
+                .state,
+            EvidenceRecoveryState::CodeChange
+        );
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count + 1
+        );
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(writer.status, TaskStatus::Planned);
+        assert_eq!(writer.input_artifacts.len(), 1);
+        assert_eq!(writer.input_artifacts[0].producer_id, *review_task_id);
     }
 
     #[test]

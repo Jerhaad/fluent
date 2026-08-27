@@ -1429,7 +1429,6 @@ fn validate_recheck_evidence_frontier(
         || item.merge_candidates.iter().any(|candidate| {
             candidate.attempt_id == attempt_id && candidate.candidate_commit == candidate_commit
         })
-        || document.result != EvidenceResult::Pass
         || document.working_directory != "."
     {
         return Err(rejected());
