@@ -1208,15 +1208,6 @@ mod tests {
                 .unwrap();
                 assert_rejected_without_mutation(tmp, store);
             },
-            |_: &tempfile::TempDir, store: &WorkModelStore| {
-                store
-                    .mutate_work_item("work-1", |item| {
-                        let output = item.attempts[0].tasks[0].output.clone().unwrap();
-                        item.attempts[0].tasks.last_mut().unwrap().output = Some(output);
-                        Ok(())
-                    })
-                    .unwrap();
-            },
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
                 let path = tmp.path().join(work_artifact_path(
                     "work-1",
@@ -1288,6 +1279,27 @@ mod tests {
             mutate(&tmp, &store);
             assert_rejected_without_mutation(&tmp, &store);
         }
+
+        let (tmp, store) = legacy_terminal_fixture();
+        let before = serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap();
+        let mut attempt = store.read_work_item("work-1").unwrap().attempts.remove(0);
+        let output = attempt.tasks[0].output.clone().unwrap();
+        attempt.tasks.last_mut().unwrap().output = Some(output);
+        let failed = attempt.tasks.last().unwrap();
+        assert!(legacy_reconciliation_receipt(tmp.path(), &attempt, failed).is_err());
+        assert_eq!(
+            serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            !tmp.path()
+                .join(work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "planning-approach-revisions"
+                ))
+                .exists()
+        );
 
         let (tmp, store) = fixture();
         store
