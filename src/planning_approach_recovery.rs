@@ -672,6 +672,13 @@ mod tests {
                 .iter()
                 .any(|artifact| artifact.producer_id == PRODUCER)
         );
+        let mut completed = store.read_work_item("work-1").unwrap();
+        let recovered = &mut completed.attempts[0];
+        let writer = recovered.tasks.last_mut().unwrap();
+        writer.status = TaskStatus::Complete;
+        writer.output = candidate;
+        recovered.status = AttemptStatus::Complete;
+        assert!(recovered.validate("work-1").is_ok());
     }
 
     #[test]

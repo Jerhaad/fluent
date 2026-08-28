@@ -5298,6 +5298,7 @@ impl Attempt {
                 && task.kind != TaskKind::Rebase
                 && !self.is_superseded_tester_harness_followup(&task.id)
                 && !self.has_tester_harness_repair_for(&task.id)
+                && !self.is_approach_revision_superseded_task(&task.id)
             {
                 return Err(WorkModelError::CompleteAttemptHasIncompleteTask {
                     attempt_id: self.id.clone(),
