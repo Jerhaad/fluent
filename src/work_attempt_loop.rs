@@ -16622,9 +16622,18 @@ mod tests {
                 failed_launch.id = "attempt-1-review-2-architecture".to_string();
                 crate::work_model::set_task_terminal(&mut failed_launch, TaskStatus::Failed);
                 attempt.tasks.push(failed_launch.clone());
-                attempt
-                    .approach_revision_superseded_tasks
-                    .push(failed_launch.id.clone());
+                attempt.approach_revision_superseded_tasks.push(
+                    crate::work_model::ApproachRevisionSupersession {
+                        failed_task_id: failed_launch.id.clone(),
+                        audit_artifact: ArtifactRef {
+                            producer_id: "planning-approach-recovery".to_string(),
+                            path: ".fluent/work/artifacts/work-1/attempt-1/audit.json".to_string(),
+                        },
+                        source_review_task_id: "attempt-1-review-architecture".to_string(),
+                        candidate_commit: output.commit.clone(),
+                        corrective_writer_task_id: "pending".to_string(),
+                    },
+                );
                 let corrective_id = item.add_next_write_round("attempt-1", review_inputs)?;
                 let corrective = item.attempts[0]
                     .tasks
@@ -16633,6 +16642,13 @@ mod tests {
                     .unwrap();
                 crate::work_model::set_task_terminal(corrective, TaskStatus::Complete);
                 corrective.output = Some(output);
+                let audit = ArtifactRef {
+                    producer_id: "planning-approach-recovery".to_string(),
+                    path: ".fluent/work/artifacts/work-1/attempt-1/audit.json".to_string(),
+                };
+                item.attempts[0].artifacts.push(audit.clone());
+                item.attempts[0].approach_revision_superseded_tasks[0].corrective_writer_task_id =
+                    corrective_id;
                 item.attempts[0].status = AttemptStatus::Planned;
                 Ok(())
             })

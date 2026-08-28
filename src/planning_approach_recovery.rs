@@ -8,9 +8,10 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::work_model::{
-    ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata,
-    DurableTransitionOrigin, PauseKind, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
-    WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
+    ApproachRevisionSupersession, ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus,
+    DurableTransitionMetadata, DurableTransitionOrigin, PauseKind, Task, TaskKind, TaskStatus,
+    WorkModelError, WorkModelStore, WriterCompletionContract, WriterCompletionRequirementKind,
+    work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
@@ -176,17 +177,19 @@ pub fn revise(
                 id: failed_id.clone(),
             });
         }
-        if let Some(failed_id) = &failed_id
-            && !attempt.approach_revision_superseded_tasks.contains(failed_id)
-        {
-            attempt
-                .approach_revision_superseded_tasks
-                .push(failed_id.clone());
-        }
         let writer = attempt.tasks.iter_mut().find(|task| task.id == task_id)
             .ok_or_else(|| WorkModelError::TaskNotFound { id: task_id.clone() })?;
         writer.role = CORRECTIVE_WRITER_ROLE.to_string();
         writer.instructions = Some(format!("Implement the approved Approach revision and resolve every actionable finding from the settled review round. Human resolution: {resolution}"));
+        if let Some(failed_task_id) = failed_id {
+            attempt.approach_revision_superseded_tasks.push(ApproachRevisionSupersession {
+                failed_task_id,
+                audit_artifact: audit_ref.clone(),
+                source_review_task_id: source_id.clone(),
+                candidate_commit: candidate_commit.clone(),
+                corrective_writer_task_id: task_id.clone(),
+            });
+        }
         attempt.status = AttemptStatus::Planned;
         attempt.pause_kind = None;
         attempt.pause_recovery = None;
@@ -223,13 +226,8 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         if last.kind != TaskKind::Review
             || last.status != TaskStatus::Failed
             || last.output.is_some()
-            || !attempt.artifacts.iter().any(|artifact| {
-                artifact.producer_id == last.id
-                    && artifact.path.ends_with("/needs-user.md")
-                    && fs::read_to_string(project_root.join(&artifact.path)).is_ok_and(|text| {
-                        text.starts_with("# Provider arguments need repair")
-                            && text.contains("pass-through provider arguments")
-                    })
+            || attempt.artifacts.iter().any(|artifact| {
+                artifact.producer_id == last.id && artifact.path.ends_with("/review.md")
             })
         {
             bail!("terminal Attempt is not the exact artifact-free reviewer launch failure");
@@ -607,18 +605,6 @@ mod tests {
                 failed.output = None;
                 failed.review_context = item.attempts[0].tasks[1].review_context.clone();
                 item.attempts[0].tasks.push(failed);
-                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
-                let handoff_path = tmp.path().join(&handoff);
-                fs::create_dir_all(handoff_path.parent().unwrap()).unwrap();
-                fs::write(
-                    &handoff_path,
-                    "# Provider arguments need repair\n\npass-through provider arguments\n",
-                )
-                .unwrap();
-                item.attempts[0].artifacts.push(ArtifactRef {
-                    producer_id: "attempt-1-review-2-architecture".to_string(),
-                    path: handoff,
-                });
                 item.attempts[0].status = AttemptStatus::Failed;
                 Ok(())
             })
@@ -726,6 +712,46 @@ mod tests {
                 .unwrap()
                 .contains("every actionable finding")
         );
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                let corrective = item.attempts[0].tasks.last_mut().unwrap();
+                corrective.status = TaskStatus::Complete;
+                corrective.output = Some(TaskOutput {
+                    base_commit: None,
+                    ..output
+                });
+                item.attempts[0].writer_completion_contract = None;
+                item.attempts[0].progress_contract = None;
+                Ok(())
+            })
+            .unwrap();
+        let outcome = crate::work_attempt_loop::plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let crate::work_attempt_loop::WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome
+        else {
+            panic!("the completed corrective Writer must re-enter targeted reviews: {outcome:?}");
+        };
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        let mut roles = task_ids
+            .iter()
+            .map(|id| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .unwrap()
+                    .role
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        roles.sort_unstable();
+        assert_eq!(roles, vec!["architecture", "documentation"]);
     }
 
     #[test]
@@ -829,6 +855,7 @@ mod tests {
             .mutate_work_item("work-1", |item| {
                 let mut failed = item.attempts[0].tasks[1].clone();
                 failed.id = "attempt-1-review-2-architecture".to_string();
+                failed.kind = TaskKind::Tester;
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
                 item.attempts[0].tasks.push(failed);

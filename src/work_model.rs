@@ -4481,7 +4481,7 @@ pub struct Attempt {
     /// Failed Reviewer launches retained as history but explicitly superseded
     /// by an audited Approach-revision corrective Writer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approach_revision_superseded_tasks: Vec<String>,
+    pub approach_revision_superseded_tasks: Vec<ApproachRevisionSupersession>,
     /// Append-only host-derived Writer outcomes and provider continuation
     /// identities. Legacy Attempts deserialize with no records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4507,6 +4507,16 @@ pub struct Attempt {
     /// Explicit approvals for legitimate write-round-cap pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub round_cap_extensions: Vec<RoundCapExtension>,
+}
+
+/// Bind one preserved failed Reviewer launch to its audited Approach revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproachRevisionSupersession {
+    pub failed_task_id: String,
+    pub audit_artifact: ArtifactRef,
+    pub source_review_task_id: String,
+    pub candidate_commit: String,
+    pub corrective_writer_task_id: String,
 }
 
 impl Default for Attempt {
@@ -4541,7 +4551,44 @@ impl Attempt {
     pub fn is_approach_revision_superseded_task(&self, task_id: &str) -> bool {
         self.approach_revision_superseded_tasks
             .iter()
-            .any(|superseded| superseded == task_id)
+            .any(|superseded| {
+                if superseded.failed_task_id != task_id
+                    || !self.artifacts.contains(&superseded.audit_artifact)
+                {
+                    return false;
+                }
+                let Some(failed) = self.tasks.iter().find(|task| task.id == task_id) else {
+                    return false;
+                };
+                let Some(source) = self
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == superseded.source_review_task_id)
+                else {
+                    return false;
+                };
+                let Some(writer) = self
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == superseded.corrective_writer_task_id)
+                else {
+                    return false;
+                };
+                failed.kind == TaskKind::Review
+                    && failed.status == TaskStatus::Failed
+                    && failed.review_context.as_ref().is_some_and(|context| {
+                        context.candidate_commit == superseded.candidate_commit
+                    })
+                    && source.kind == TaskKind::Review
+                    && source.role == "architecture"
+                    && source.status == TaskStatus::Complete
+                    && source.review_context.as_ref().is_some_and(|context| {
+                        context.candidate_commit == superseded.candidate_commit
+                    })
+                    && writer.kind == TaskKind::Write
+                    && writer.role == "approach-revision-correction"
+                    && writer.input_artifacts.contains(&superseded.audit_artifact)
+            })
     }
 
     pub fn all_tasks_complete_or_approach_superseded(&self) -> bool {
@@ -7373,7 +7420,7 @@ struct AttemptRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence_recoveries: Vec<EvidenceRecovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    approach_revision_superseded_tasks: Vec<String>,
+    approach_revision_superseded_tasks: Vec<ApproachRevisionSupersession>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     writer_runs: Vec<WriterRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
