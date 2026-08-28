@@ -508,6 +508,29 @@ mod tests {
         );
     }
 
+    fn assert_rejected_state_unchanged(
+        tmp: &tempfile::TempDir,
+        store: &WorkModelStore,
+        replacement: &[u8],
+    ) {
+        let before = serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            revise(
+                tmp.path(),
+                store,
+                "work-1",
+                "attempt-1",
+                replacement,
+                "Approve recovery."
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn behavior_selector_manifest_covers_recovery_regressions() {
         assert_eq!(BEHAVIOR_TEST_SELECTORS.len(), 5);
@@ -768,6 +791,32 @@ mod tests {
             "attempt-1-review-architecture/review.md",
         ));
         fs::write(review, "Verdict: findings\n").unwrap();
+        assert_rejected_without_mutation(&tmp, &store);
+
+        let (tmp, store) = fixture();
+        revise(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            REPLACEMENT.as_bytes(),
+            "Approve recovery.",
+        )
+        .unwrap();
+        assert_rejected_state_unchanged(&tmp, &store, b"# A different replacement\n");
+
+        let (tmp, store) = fixture();
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut failed = item.attempts[0].tasks[1].clone();
+                failed.id = "attempt-1-review-2-architecture".to_string();
+                failed.status = TaskStatus::Failed;
+                failed.output = None;
+                item.attempts[0].tasks.push(failed);
+                item.attempts[0].status = AttemptStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
         assert_rejected_without_mutation(&tmp, &store);
     }
 }

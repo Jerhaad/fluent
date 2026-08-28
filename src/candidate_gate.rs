@@ -614,15 +614,15 @@ fn check_whitespace(
 
 fn check_commit_metadata(
     request: &CandidateGateRequest<'_>,
-    _base_commit: &str,
+    base_commit: &str,
 ) -> Result<CandidateCheckEvidence> {
+    let range = format!("{base_commit}..{}", request.candidate_commit);
     let output = crate::git::run_raw(
         request.workspace,
         &[
             "log",
             "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e",
-            "-1",
-            request.candidate_commit,
+            &range,
         ],
     )?;
     if !output.status.success() {
@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_valid_append_only_correction_after_rejected_metadata() {
+    fn rejects_an_invalid_append_only_ancestor() {
         let fixture = Fixture::new();
         fixture.commit(
             "src/lib.rs",
@@ -1486,7 +1486,7 @@ mod tests {
 
         assert_eq!(
             check(&evidence, "commit-metadata").status,
-            CandidateCheckStatus::Passed
+            CandidateCheckStatus::Failed
         );
     }
 
