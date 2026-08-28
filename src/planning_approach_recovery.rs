@@ -352,12 +352,15 @@ fn legacy_reconciliation_receipt(
     if directory.join("review.md").exists() {
         bail!("legacy failed reviewer launch has review output");
     }
+    let expected_handoff = work_artifact_path(
+        &attempt.work_item_id,
+        &attempt.id,
+        &format!("needs-user-{}.md", failed.id),
+    );
     let handoff = attempt
         .artifacts
         .iter()
-        .find(|artifact| {
-            artifact.producer_id == failed.id && artifact.path.ends_with("/needs-user.md")
-        })
+        .find(|artifact| artifact.producer_id == failed.id && artifact.path == expected_handoff)
         .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no generic handoff"))?;
     let handoff_bytes = fs::read(project_root.join(&handoff.path))?;
     let handoff_text = std::str::from_utf8(&handoff_bytes)?;
@@ -751,7 +754,11 @@ mod tests {
                 failed.output = None;
                 failed.review_context = item.attempts[0].tasks[1].review_context.clone();
                 item.attempts[0].tasks.push(failed);
-                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                let handoff = work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "needs-user-attempt-1-review-2-documentation.md",
+                );
                 fs::write(
                     tmp.path().join(&handoff),
                     "# Attempt needs user input\n\nThe reviewer failed before producing output.\n",
