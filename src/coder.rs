@@ -1099,6 +1099,53 @@ fn classify_codex_provider_argument_failure(
     completion
 }
 
+#[cfg(test)]
+mod provider_argument_tests {
+    use super::*;
+
+    #[test]
+    fn codex_parser_failure_becomes_typed_provider_argument_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(
+            provider_stderr_path(&transcript),
+            format!(
+                "error: unexpected argument '--bad' found\n{}\n\nUsage: codex exec [OPTIONS] [PROMPT]",
+                "x".repeat(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT * 2)
+            ),
+        )
+        .unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--bad".to_string()],
+        );
+        let error = completion.terminal.expect_err("parser failure is typed");
+        let typed = error.downcast_ref::<ProviderArgumentError>().unwrap();
+        assert_eq!(typed.provider, CoderKind::Codex);
+        assert_eq!(typed.exit_status, 2);
+        assert_eq!(typed.invocation, "--bad");
+        assert!(typed.diagnostic.len() <= PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT);
+    }
+
+    #[test]
+    fn codex_non_parser_failure_keeps_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(provider_stderr_path(&transcript), "provider unavailable\n").unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--bad".to_string()],
+        );
+        assert_eq!(completion.terminal.unwrap(), 2);
+    }
+}
+
 /// Pi (pi.dev) coding agent backed by a local vllm-mlx model.
 pub struct PiCode {
     pub sandbox_profile: Option<String>,
