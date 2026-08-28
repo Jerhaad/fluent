@@ -604,29 +604,33 @@ impl Coder for SandboxedClaudeCode {
         let want_transcript = capture.is_some();
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_writer_command(working_dir, session);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.args(["--verbose", "--output-format", "stream-json"]);
-                } else {
-                    // Optional autonomous probes (for example project-model
-                    // seeding) have no artifact boundary. Give Claude stable
-                    // device streams instead of inheriting scheduler logs that
-                    // may live outside the Seatbelt profile.
-                    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                }
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
-            true,
+        classify_claude_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_writer_command(working_dir, session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.args(["--verbose", "--output-format", "stream-json"]);
+                    } else {
+                        // Optional autonomous probes (for example project-model
+                        // seeding) have no artifact boundary. Give Claude stable
+                        // device streams instead of inheriting scheduler logs that
+                        // may live outside the Seatbelt profile.
+                        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                    }
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                true,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -805,32 +809,36 @@ impl Coder for BareClaudeCode {
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let model = self.effective_model();
         let effort = self.effort.clone();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_writer_command(working_dir, session);
-                apply_coder_env(&mut cmd, extra_env);
-                cmd.args(["--dangerously-skip-permissions"]);
-                if let Some(ref m) = model {
-                    cmd.args(["--model", m]);
-                }
-                if let Some(ref e) = effort {
-                    cmd.args(["--effort", e]);
-                }
-                if want_transcript {
-                    cmd.args(["--verbose", "--output-format", "stream-json"]);
-                } else {
-                    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                }
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
-            true,
+        classify_claude_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_writer_command(working_dir, session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    cmd.args(["--dangerously-skip-permissions"]);
+                    if let Some(ref m) = model {
+                        cmd.args(["--model", m]);
+                    }
+                    if let Some(ref e) = effort {
+                        cmd.args(["--effort", e]);
+                    }
+                    if want_transcript {
+                        cmd.args(["--verbose", "--output-format", "stream-json"]);
+                    } else {
+                        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+                    }
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                true,
+            ),
+            capture,
+            extra_args,
         )
     }
 
@@ -1055,9 +1063,34 @@ impl CodexCode {
 }
 
 fn classify_codex_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Codex)
+}
+
+fn classify_claude_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Claude)
+}
+
+fn classify_pi_provider_argument_failure(
+    completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    classify_provider_argument_failure(completion, capture, extra_args, CoderKind::Pi)
+}
+
+fn classify_provider_argument_failure(
     mut completion: CoderRunCompletion,
     capture: Option<&TranscriptCapture<'_>>,
     extra_args: &[String],
+    provider: CoderKind,
 ) -> CoderRunCompletion {
     let Ok(exit_status) = completion.terminal else {
         return completion;
@@ -1072,19 +1105,20 @@ fn classify_codex_provider_argument_failure(
         return completion;
     };
     let normalized = stderr.to_ascii_lowercase();
-    if ![
-        "unknown option",
-        "unknown argument",
-        "unexpected argument",
-        "invalid argument",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+    if !normalized.contains(&format!("usage: {}", provider.as_str()))
+        || ![
+            "unknown option",
+            "unknown argument",
+            "unexpected argument",
+            "invalid argument",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
     {
         return completion;
     }
     completion.terminal = Err(anyhow::Error::new(ProviderArgumentError {
-        provider: CoderKind::Codex,
+        provider,
         exit_status,
         diagnostic: stderr
             .chars()
@@ -1143,6 +1177,57 @@ mod provider_argument_tests {
             &["--bad".to_string()],
         );
         assert_eq!(completion.terminal.unwrap(), 2);
+    }
+
+    #[test]
+    fn claude_and_pi_parser_failures_become_typed_provider_argument_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+
+        for (provider, classify, stderr) in [
+            (
+                CoderKind::Claude,
+                classify_claude_provider_argument_failure
+                    as fn(
+                        CoderRunCompletion,
+                        Option<&TranscriptCapture<'_>>,
+                        &[String],
+                    ) -> CoderRunCompletion,
+                "error: unknown option '--bad'\nUsage: claude [options]",
+            ),
+            (
+                CoderKind::Pi,
+                classify_pi_provider_argument_failure
+                    as fn(
+                        CoderRunCompletion,
+                        Option<&TranscriptCapture<'_>>,
+                        &[String],
+                    ) -> CoderRunCompletion,
+                "Unknown option: --bad\nUsage: pi [options]",
+            ),
+        ] {
+            std::fs::write(provider_stderr_path(&transcript), stderr).unwrap();
+            let completion = classify(
+                CoderRunCompletion::terminal_only(Ok(2)),
+                Some(&capture),
+                &["--bad".to_string()],
+            );
+            let error = completion.terminal.expect_err("parser failure is typed");
+            let typed = error.downcast_ref::<ProviderArgumentError>().unwrap();
+            assert_eq!(typed.provider, provider);
+            assert_eq!(typed.exit_status, 2);
+            assert_eq!(typed.invocation, "--bad");
+            assert!(typed.diagnostic.len() <= PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT);
+
+            std::fs::write(provider_stderr_path(&transcript), "provider unavailable\n").unwrap();
+            let generic = classify(
+                CoderRunCompletion::terminal_only(Ok(2)),
+                Some(&capture),
+                &["--bad".to_string()],
+            );
+            assert_eq!(generic.terminal.unwrap(), 2);
+        }
     }
 }
 
@@ -1239,24 +1324,28 @@ impl Coder for PiCode {
         let want_transcript = capture.is_some();
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
-        run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_command(working_dir);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.args(["--mode", "json"]);
-                }
-                cmd.args(["--thinking", "off"]);
-                cmd.args(["--append-system-prompt", system_prompt]);
-                cmd.args(["-p", prompt]);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
-            false,
+        classify_pi_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_command(working_dir);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.args(["--mode", "json"]);
+                    }
+                    cmd.args(["--thinking", "off"]);
+                    cmd.args(["--append-system-prompt", system_prompt]);
+                    cmd.args(["-p", prompt]);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                false,
+            ),
+            capture,
+            extra_args,
         )
     }
 
