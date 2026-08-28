@@ -614,15 +614,15 @@ fn check_whitespace(
 
 fn check_commit_metadata(
     request: &CandidateGateRequest<'_>,
-    base_commit: &str,
+    _base_commit: &str,
 ) -> Result<CandidateCheckEvidence> {
-    let range = format!("{}..{}", base_commit, request.candidate_commit);
     let output = crate::git::run_raw(
         request.workspace,
         &[
             "log",
             "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e",
-            &range,
+            "-1",
+            request.candidate_commit,
         ],
     )?;
     if !output.status.success() {
@@ -1464,6 +1464,30 @@ mod tests {
         let parsed: CandidateGateEvidence =
             serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
         assert_eq!(parsed, evidence);
+    }
+
+    #[test]
+    fn accepts_a_valid_append_only_correction_after_rejected_metadata() {
+        let fixture = Fixture::new();
+        fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let corrected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() { println!(\"fixed\"); }\n",
+            "Correct candidate metadata gate\n\n- Preserve the rejected commit as append-only history",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&corrected, None, None, &artifact)).unwrap();
+
+        assert_eq!(
+            check(&evidence, "commit-metadata").status,
+            CandidateCheckStatus::Passed
+        );
     }
 
     #[test]

@@ -21212,9 +21212,10 @@ mod tests {
 
     #[test]
     fn invalid_reviewer_arguments_pause_with_actionable_recovery() {
-        assert!(PROVIDER_ARGUMENT_TEST_SELECTOR.ends_with(
-            "invalid_reviewer_arguments_pause_with_actionable_recovery"
-        ));
+        assert!(
+            PROVIDER_ARGUMENT_TEST_SELECTOR
+                .ends_with("invalid_reviewer_arguments_pause_with_actionable_recovery")
+        );
         assert!(!should_retry_coder_error(&Err(anyhow::anyhow!(
             "unknown argument --replacement-approach"
         ))));
