@@ -897,6 +897,37 @@ fn cmd_attempt(
             println!("Audit: {}", revision.audit_artifact);
             println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
         }
+        AttemptCommands::ReviseApproach {
+            work_item_id,
+            attempt_id,
+            approach_file,
+            resolution,
+        } => {
+            let bytes = fs::read(&approach_file).with_context(|| {
+                format!("read replacement Approach {}", approach_file.display())
+            })?;
+            let revision = fluent::planning_approach_recovery::revise(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &bytes,
+                &resolution,
+            )?;
+            if revision.already_applied {
+                println!(
+                    "Approach revision {} is already applied to Attempt {}",
+                    revision.revision_id, attempt_id
+                );
+            } else {
+                println!(
+                    "Approved corrective Writer {} for Approach revision {}",
+                    revision.writer_task_id, revision.revision_id
+                );
+            }
+            println!("Audit: {}", revision.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::Run {
             work_item_id,
             attempt_id,

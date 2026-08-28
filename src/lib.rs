@@ -30,6 +30,7 @@ pub mod lineage_lock;
 pub mod notify;
 pub mod os;
 pub mod plan;
+pub mod planning_approach_recovery;
 pub mod planning_reference_recovery;
 pub mod post_merge_review;
 pub mod prep;

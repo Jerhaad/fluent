@@ -2922,6 +2922,10 @@ fn should_retry_coder_error(result: &Result<()>) -> bool {
             .as_ref()
             .err()
             .is_some_and(|error| error.is::<crate::provider_evidence::ProviderUnavailableError>())
+        && !result
+            .as_ref()
+            .err()
+            .is_some_and(is_invalid_provider_arguments)
 }
 
 /// How a Task's terminal failure should be recorded in durable Attempt state and
@@ -2954,6 +2958,8 @@ enum TaskFailure {
     /// operator inspects the completion failure.
     WriterCompletion(String),
     ProviderUnavailable(String),
+    /// The provider rejected pass-through CLI arguments before producing work.
+    ProviderArguments(String),
     /// Any other persistent failure (generic coder error at the retry cap, a
     /// tester error, and the like).
     Generic,
@@ -3019,9 +3025,25 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
         TaskFailure::HostSandbox(host.message().to_string())
     } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxLaunchError>() {
         TaskFailure::HostSandbox(host.message().to_string())
+    } else if is_invalid_provider_arguments(error) {
+        TaskFailure::ProviderArguments(format!(
+            "{error}. Remove or correct the pass-through provider arguments, then run 'fluent attempt run' to retry the same Task."
+        ))
     } else {
         TaskFailure::Generic
     }
+}
+
+fn is_invalid_provider_arguments(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "unknown option",
+        "unknown argument",
+        "unexpected argument",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn provider_pause_error(
@@ -3119,7 +3141,9 @@ fn mark_task_failed_attempt_needs_user(
             | TaskFailure::TesterProjectHarness
             | TaskFailure::TesterNestedSwiftPmSandbox
             | TaskFailure::WriterCompletion(_) => TaskStatus::NeedsUser,
-            TaskFailure::ProviderUnavailable(_) => TaskStatus::NeedsUser,
+            TaskFailure::ProviderUnavailable(_) | TaskFailure::ProviderArguments(_) => {
+                TaskStatus::NeedsUser
+            }
             TaskFailure::Generic => TaskStatus::Failed,
         };
         crate::work_model::set_task_terminal(
@@ -3237,6 +3261,7 @@ fn task_failure_pause_kind(failure: &TaskFailure) -> PauseKind {
         | TaskFailure::TesterNestedSwiftPmSandbox => PauseKind::TesterHarness,
         TaskFailure::WriterCompletion(_) => PauseKind::WriterCompletion,
         TaskFailure::ProviderUnavailable(_) => PauseKind::ProviderUnavailable,
+        TaskFailure::ProviderArguments(_) => PauseKind::ProviderUnavailable,
         TaskFailure::Generic => PauseKind::RoundCap,
     }
 }
@@ -3284,6 +3309,7 @@ fn notify_task_failure(
             "Writer completion evidence is missing or invalid. Inspect the handoff, then resume the same Writer Task.",
         ),
         TaskFailure::ProviderUnavailable(message) => notify_fn("Fluent", message),
+        TaskFailure::ProviderArguments(message) => notify_fn("Fluent", message),
         TaskFailure::Generic => {}
     }
 }
@@ -3378,6 +3404,9 @@ fn render_task_error_handoff(
         ),
         TaskFailure::ProviderUnavailable(message) => format!(
             "# Provider unavailable\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
+        ),
+        TaskFailure::ProviderArguments(message) => format!(
+            "# Provider arguments need repair\n\nTask {task_id:?} paused before usable model progress:\n\n{message}\n"
         ),
         TaskFailure::Generic => format!(
             "# Attempt needs user input\n\nTask {task_id:?} failed after {} retries. \
@@ -21175,5 +21204,20 @@ mod tests {
             !capture.effectively_sandboxed(requested_no_sandbox),
             "capture honors --no-sandbox and runs unconfined"
         );
+    }
+
+    #[test]
+    fn invalid_reviewer_arguments_pause_with_actionable_recovery() {
+        assert!(!should_retry_coder_error(&Err(anyhow::anyhow!(
+            "unknown argument --replacement-approach"
+        ))));
+        let error = anyhow::anyhow!("unknown argument --replacement-approach");
+        match classify_task_failure(&error) {
+            TaskFailure::ProviderArguments(message) => {
+                assert!(message.contains("pass-through provider arguments"));
+                assert!(message.contains("fluent attempt run"));
+            }
+            _ => panic!("invalid reviewer arguments must use a recoverable provider pause"),
+        }
     }
 }

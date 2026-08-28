@@ -508,6 +508,20 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Replace an approved Approach at an audited uncertain-review frontier
+    ReviseApproach {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Complete replacement Approach document
+        #[arg(long, value_name = "PATH")]
+        approach_file: std::path::PathBuf,
+        /// Human decision authorizing the exact Approach revision
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Advance an Attempt through the next safe transitions
     Run {
         /// Work Item ID
