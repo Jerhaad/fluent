@@ -294,9 +294,15 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         .tasks
         .last()
         .ok_or_else(|| anyhow::anyhow!("Attempt has no Tasks"))?;
-    let legacy_reconciliation = terminal_failure
-        .then(|| legacy_reconciliation_receipt(project_root, attempt, last))
-        .transpose()?;
+    let legacy_reconciliation = if terminal_failure {
+        if has_typed_provider_argument_handoff(project_root, attempt, last)? {
+            None
+        } else {
+            Some(legacy_reconciliation_receipt(project_root, attempt, last)?)
+        }
+    } else {
+        None
+    };
     let failed_launch = terminal_failure.then_some(last);
     let search = if terminal_failure {
         &attempt.tasks[..attempt.tasks.len() - 1]
@@ -386,12 +392,7 @@ fn legacy_reconciliation_receipt(
     attempt: &Attempt,
     failed: &Task,
 ) -> Result<LegacyReconciliationReceipt> {
-    if failed.kind != TaskKind::Review
-        || failed.status != TaskStatus::Failed
-        || failed.output.is_some()
-    {
-        bail!("terminal Attempt is not an artifact-free failed reviewer launch");
-    }
+    validate_artifact_free_failed_reviewer_launch(project_root, attempt, failed)?;
     if attempt
         .tasks
         .iter()
@@ -400,22 +401,6 @@ fn legacy_reconciliation_receipt(
         != 1
     {
         bail!("legacy recovery requires exactly one failed reviewer launch");
-    }
-    if attempt
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.producer_id == failed.id && artifact.path.ends_with("/review.md"))
-    {
-        bail!("legacy failed reviewer launch has a review artifact");
-    }
-    let area = failed
-        .artifact_area
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no artifact area"))?;
-    let directory =
-        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
-    if directory.join("review.md").exists() {
-        bail!("legacy failed reviewer launch has review output");
     }
     let expected_handoff = work_artifact_path(
         &attempt.work_item_id,
@@ -432,6 +417,12 @@ fn legacy_reconciliation_receipt(
     if !handoff_text.starts_with("# Attempt needs user input") {
         bail!("legacy reviewer handoff is not the preserved generic form");
     }
+    let area = failed
+        .artifact_area
+        .as_ref()
+        .expect("artifact-free validation requires an artifact area");
+    let directory =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
     let stderr_bytes = fs::read(directory.join(crate::coder::PROVIDER_STDERR_FILENAME))?;
     let stderr = std::str::from_utf8(&stderr_bytes)?;
     let excerpt = legacy_codex_parser_excerpt(stderr).ok_or_else(|| {
@@ -456,6 +447,52 @@ fn legacy_reconciliation_receipt(
         execution_sha256: digest(&execution_bytes),
         diagnostic_excerpt: excerpt,
     })
+}
+
+fn has_typed_provider_argument_handoff(
+    project_root: &Path,
+    attempt: &Attempt,
+    failed: &Task,
+) -> Result<bool> {
+    validate_artifact_free_failed_reviewer_launch(project_root, attempt, failed)?;
+    Ok(attempt.artifacts.iter().any(|artifact| {
+        artifact.producer_id == failed.id
+            && artifact.path.ends_with("/needs-user.md")
+            && fs::read_to_string(project_root.join(&artifact.path)).is_ok_and(|text| {
+                text.starts_with("# Provider arguments need repair")
+                    && text.contains("pass-through provider arguments")
+            })
+    }))
+}
+
+fn validate_artifact_free_failed_reviewer_launch(
+    project_root: &Path,
+    attempt: &Attempt,
+    failed: &Task,
+) -> Result<()> {
+    if failed.kind != TaskKind::Review
+        || failed.status != TaskStatus::Failed
+        || failed.output.is_some()
+    {
+        bail!("terminal Attempt is not an artifact-free failed reviewer launch");
+    }
+    if attempt
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.producer_id == failed.id && artifact.path.ends_with("/review.md"))
+    {
+        bail!("legacy failed reviewer launch has a review artifact");
+    }
+    let area = failed
+        .artifact_area
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no artifact area"))?;
+    let directory =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    if directory.join("review.md").exists() {
+        bail!("legacy failed reviewer launch has review output");
+    }
+    Ok(())
 }
 
 fn legacy_codex_parser_excerpt(stderr: &str) -> Option<String> {
@@ -725,19 +762,24 @@ mod tests {
     fn legacy_terminal_fixture() -> (tempfile::TempDir, WorkModelStore) {
         let (tmp, store) = fixture();
         store.mutate_work_item("work-1", |item| {
-            item.attempts[0].tasks[1].id = "attempt-1-review-2-architecture".to_string();
+            item.attempts[0].tasks[1].id = "attempt-1-review-38-architecture".to_string();
+            item.attempts[0].tasks[2].id = "attempt-1-review-38-documentation".to_string();
             let mut failed = item.attempts[0].tasks[1].clone();
-            failed.id = "attempt-1-review-2-documentation".to_string();
+            failed.id = "attempt-1-review-39-architecture".to_string();
             failed.artifact_area.as_mut().unwrap().path = work_artifact_path(
-                "work-1", "attempt-1", "attempt-1-review-2-documentation",
+                "work-1", "attempt-1", "attempt-1-review-39-architecture",
             );
             failed.status = TaskStatus::Failed;
             failed.output = None;
             item.attempts[0].tasks.push(failed);
-            let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+            let handoff = work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "needs-user-attempt-1-review-39-architecture.md",
+            );
             fs::write(tmp.path().join(&handoff), "# Attempt needs user input\n\nlaunch failed\n").unwrap();
             item.attempts[0].artifacts.push(ArtifactRef {
-                producer_id: "attempt-1-review-2-documentation".to_string(), path: handoff,
+                producer_id: "attempt-1-review-39-architecture".to_string(), path: handoff,
             });
             item.attempts[0].status = AttemptStatus::Failed;
             let area = item.attempts[0].tasks.last().unwrap().artifact_area.as_ref().unwrap();
@@ -749,6 +791,30 @@ mod tests {
                 r#"{"schema_version":1,"state":"settled","owner_pid":1,"leader_pid":1,"process_group_id":1,"started_at":"now","heartbeat_at":"now","settled_at":"now"}"#).unwrap();
             Ok(())
         }).unwrap();
+        (tmp, store)
+    }
+
+    fn typed_terminal_fixture() -> (tempfile::TempDir, WorkModelStore) {
+        let (tmp, store) = legacy_terminal_fixture();
+        store
+            .mutate_work_item("work-1", |item| {
+                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                fs::write(
+                    tmp.path().join(&handoff),
+                    "# Provider arguments need repair\n\npass-through provider arguments\n",
+                )
+                .unwrap();
+                let failed_id = item.attempts[0].tasks.last().unwrap().id.clone();
+                item.attempts[0]
+                    .artifacts
+                    .retain(|artifact| artifact.producer_id != failed_id);
+                item.attempts[0].artifacts.push(ArtifactRef {
+                    producer_id: failed_id,
+                    path: handoff,
+                });
+                Ok(())
+            })
+            .unwrap();
         (tmp, store)
     }
 
@@ -953,6 +1019,29 @@ mod tests {
     }
 
     #[test]
+    fn recovers_typed_provider_argument_handoff_alongside_legacy_adapter() {
+        let (tmp, store) = typed_terminal_fixture();
+        let revision = revise(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            REPLACEMENT.as_bytes(),
+            "Recover the typed provider failure.",
+        )
+        .unwrap();
+
+        let audit: RevisionAudit =
+            serde_json::from_slice(&fs::read(tmp.path().join(revision.audit_artifact)).unwrap())
+                .unwrap();
+        assert!(audit.legacy_reconciliation.is_none());
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0].status,
+            AttemptStatus::Planned
+        );
+    }
+
+    #[test]
     fn schedules_documentation_correction_and_targeted_reviews() {
         let (tmp, store) = fixture();
         revise(
@@ -1107,7 +1196,11 @@ mod tests {
 
         for mutate in [
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
-                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                let handoff = work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "needs-user-attempt-1-review-39-architecture.md",
+                );
                 fs::write(
                     tmp.path().join(handoff),
                     "# Provider arguments need repair\n\npass-through provider arguments\n",
@@ -1119,7 +1212,7 @@ mod tests {
                 let path = tmp.path().join(work_artifact_path(
                     "work-1",
                     "attempt-1",
-                    "attempt-1-review-2-documentation/review.md",
+                    "attempt-1-review-39-architecture/review.md",
                 ));
                 fs::write(path, "Verdict: findings\n").unwrap();
                 assert_rejected_without_mutation(tmp, store);
@@ -1172,22 +1265,19 @@ mod tests {
                     })
                     .unwrap();
             },
+            |_: &tempfile::TempDir, store: &WorkModelStore| {
+                store
+                    .mutate_work_item("work-1", |item| {
+                        item.attempts[0].tasks.last_mut().unwrap().id =
+                            "attempt-1-review-40-architecture".to_string();
+                        Ok(())
+                    })
+                    .unwrap();
+            },
         ] {
             let (tmp, store) = legacy_terminal_fixture();
             mutate(&tmp, &store);
-            let failed = store.read_work_item("work-1").unwrap().attempts[0]
-                .tasks
-                .last()
-                .unwrap()
-                .clone();
-            if failed.kind != TaskKind::Review
-                || failed
-                    .review_context
-                    .as_ref()
-                    .is_some_and(|context| context.candidate_commit == "other-candidate")
-            {
-                assert_rejected_without_mutation(&tmp, &store);
-            }
+            assert_rejected_without_mutation(&tmp, &store);
         }
 
         let (tmp, store) = fixture();
