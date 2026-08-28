@@ -89,6 +89,16 @@ pub fn revise(
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
     let mut revised_context = context.clone();
     revised_context.approach = Some(replacement.clone());
+    if let Some(combined) = revised_context
+        .combined
+        .as_mut()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if combined.matches(prior_approach).count() != 1 {
+            bail!("combined planning authority cannot be revised safely");
+        }
+        *combined = combined.replacen(prior_approach, &replacement, 1);
+    }
     revised_context.approved_revisions.insert(
         "approach".to_string(),
         ApprovedPlanningRevision {
@@ -291,6 +301,9 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         if failed_context.candidate_commit != context.candidate_commit {
             bail!("failed reviewer launch is not bound to the uncertain review frontier");
         }
+        if review_round(failed_launch) != review_round(source_review) {
+            bail!("failed reviewer launch is not in the uncertain review round");
+        }
     }
     let source_artifact = review_artifact(source_review)?;
     if !fs::read_to_string(project_root.join(source_artifact.path))
@@ -305,19 +318,20 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
     })
 }
 
+fn review_round(task: &Task) -> Option<String> {
+    task.id
+        .split("-review-")
+        .nth(1)
+        .and_then(|value| value.split('-').next())
+        .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
+        .map(str::to_owned)
+}
+
 fn settled_round_review_artifacts(attempt: &Attempt, source: &Task) -> Result<Vec<ArtifactRef>> {
     let candidate = source
         .review_context
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Architecture review has no candidate context"))?;
-    let review_round = |task: &Task| {
-        task.id
-            .split("-review-")
-            .nth(1)
-            .and_then(|value| value.split('-').next())
-            .filter(move |value| value.chars().all(|character| character.is_ascii_digit()))
-            .map(str::to_owned)
-    };
     let round = review_round(source);
     let mut artifacts = Vec::new();
     for task in &attempt.tasks {
@@ -613,11 +627,12 @@ mod tests {
         let (tmp, store) = fixture();
         store
             .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].id = "attempt-1-review-2-architecture".to_string();
                 let failed = item.attempts[0].tasks[1].clone();
                 let mut failed = failed;
-                failed.id = "attempt-1-review-2-architecture".to_string();
+                failed.id = "attempt-1-review-2-documentation".to_string();
                 failed.artifact_area.as_mut().unwrap().path =
-                    work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-architecture");
+                    work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-documentation");
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
                 failed.review_context = item.attempts[0].tasks[1].review_context.clone();
@@ -629,7 +644,7 @@ mod tests {
                 )
                 .unwrap();
                 item.attempts[0].artifacts.push(ArtifactRef {
-                    producer_id: "attempt-1-review-2-architecture".to_string(),
+                    producer_id: "attempt-1-review-2-documentation".to_string(),
                     path: handoff,
                 });
                 item.attempts[0].status = AttemptStatus::Failed;
@@ -659,7 +674,7 @@ mod tests {
             attempt
                 .tasks
                 .iter()
-                .find(|task| task.id == "attempt-1-review-2-architecture")
+                .find(|task| task.id == "attempt-1-review-2-documentation")
                 .unwrap()
                 .status,
             TaskStatus::Failed
