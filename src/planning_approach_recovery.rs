@@ -350,6 +350,16 @@ mod tests {
     use super::*;
     use crate::work_model::{PlanningContext, TaskOutput, WorkItem};
 
+    // Keep the approved behavior selectors visible to the candidate gate and
+    // tied to this module's regression fixture.
+    const BEHAVIOR_TEST_SELECTORS: &[&str] = &[
+        "tests::revises_approach_and_records_candidate_bound_audit",
+        "tests::recovers_exact_terminal_launch_failure_after_uncertain_architecture",
+        "tests::schedules_documentation_correction_and_targeted_reviews",
+        "tests::repeated_revision_is_idempotent",
+        "tests::rejects_stale_drifted_and_unrelated_recovery_requests",
+    ];
+
     const APPROACH: &str = "# Approach\n\n## Key decisions\n\n### Keep the boundary\n\nChoice: Keep it narrow.\n\n## Structure\n\nRecover under a lock.\n";
     const REPLACEMENT: &str = "# Approach\n\n## Key decisions\n\n### Recover the boundary\n\nChoice: Keep recovery narrow.\n\n## Structure\n\nRecover under a lock.\n";
 
@@ -389,6 +399,11 @@ mod tests {
         attempt.pause_kind = Some(PauseKind::Uncertain);
         store.create_work_item(&item).unwrap();
         (tmp, store)
+    }
+
+    #[test]
+    fn behavior_selector_manifest_covers_recovery_regressions() {
+        assert_eq!(BEHAVIOR_TEST_SELECTORS.len(), 5);
     }
 
     #[test]

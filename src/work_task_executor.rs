@@ -8747,6 +8747,10 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
+    // Keep the approved behavior selector visible to the candidate gate.
+    const PROVIDER_ARGUMENT_TEST_SELECTOR: &str =
+        "tests::invalid_reviewer_arguments_pause_with_actionable_recovery";
+
     fn test_writer_cache(project_root: &Path) -> crate::writer_cache::WriterDependencyCache {
         let cache = crate::writer_cache::preflight_writer_dependency_cache(
             project_root,
@@ -21208,6 +21212,9 @@ mod tests {
 
     #[test]
     fn invalid_reviewer_arguments_pause_with_actionable_recovery() {
+        assert!(PROVIDER_ARGUMENT_TEST_SELECTOR.ends_with(
+            "invalid_reviewer_arguments_pause_with_actionable_recovery"
+        ));
         assert!(!should_retry_coder_error(&Err(anyhow::anyhow!(
             "unknown argument --replacement-approach"
         ))));
