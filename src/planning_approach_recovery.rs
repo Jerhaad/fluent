@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::work_model::{
     ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata,
     DurableTransitionOrigin, PauseKind, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
-    WriterCompletionContract, WriterCompletionRequirementKind, now_iso8601, work_artifact_path,
+    WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
@@ -41,7 +41,6 @@ struct RevisionAudit {
     replacement_approach: String,
     resolution: String,
     resolution_sha256: String,
-    created_at: String,
 }
 
 /// Replace the approved Approach only at the narrowly audited review frontier.
@@ -99,6 +98,7 @@ pub fn revise(
     let new_contract = WriterCompletionContract::from_planning_context(&revised_context)
         .ok_or_else(|| anyhow::anyhow!("replacement Approach lost the completion contract"))?;
     validate_contract_delta(&old_contract, &new_contract)?;
+    let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
 
     let revision_id = format!(
         "revision-{}",
@@ -126,7 +126,6 @@ pub fn revise(
         replacement_approach: replacement,
         resolution: resolution.to_string(),
         resolution_sha256: digest(resolution.as_bytes()),
-        created_at: now_iso8601(),
     };
     write_once(
         &project_root.join(&audit_artifact),
@@ -137,7 +136,6 @@ pub fn revise(
         producer_id: PRODUCER.to_string(),
         path: audit_artifact.clone(),
     };
-    let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
     let source_id = audited_frontier.source_review.id.clone();
     let failed_id = audited_frontier
         .failed_launch
@@ -287,23 +285,22 @@ fn settled_round_review_artifacts(attempt: &Attempt, source: &Task) -> Result<Ve
         .review_context
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Architecture review has no candidate context"))?;
-    let round = source
-        .id
-        .split("-review-")
-        .nth(1)
-        .and_then(|value| value.split('-').next());
+    let review_round = |task: &Task| {
+        task.id
+            .split("-review-")
+            .nth(1)
+            .and_then(|value| value.split('-').next())
+            .filter(move |value| value.chars().all(|character| character.is_ascii_digit()))
+            .map(str::to_owned)
+    };
+    let round = review_round(source);
     let mut artifacts = Vec::new();
     for task in &attempt.tasks {
         if task.kind != TaskKind::Review || task.status != TaskStatus::Complete {
             continue;
         }
-        let same_round = match (
-            round,
-            task.id
-                .split("-review-")
-                .nth(1)
-                .and_then(|value| value.split('-').next()),
-        ) {
+        let task_round = review_round(task);
+        let same_round = match (round.as_deref(), task_round.as_deref()) {
             (Some(expected), Some(actual)) => expected == actual,
             (None, None) => true,
             _ => false,
@@ -501,11 +498,34 @@ mod tests {
         )
         .unwrap();
         let stored = store.read_work_item("work-1").unwrap();
+        let audit: RevisionAudit =
+            serde_json::from_slice(&fs::read(tmp.path().join(&revision.audit_artifact)).unwrap())
+                .unwrap();
+        let context = stored.planning_context.as_ref().unwrap();
+        assert_eq!(context.approach.as_deref(), Some(REPLACEMENT));
+        assert_eq!(audit.work_item_id, "work-1");
+        assert_eq!(audit.attempt_id, "attempt-1");
+        assert_eq!(audit.candidate_commit, "candidate");
+        assert_eq!(audit.source_review_task_id, "attempt-1-review-architecture");
+        assert_eq!(audit.prior_approach, APPROACH);
+        assert_eq!(audit.replacement_approach, REPLACEMENT);
+        assert_eq!(audit.prior_approach_sha256, digest(APPROACH.as_bytes()));
         assert_eq!(
-            stored.planning_context.unwrap().approach.as_deref(),
-            Some(REPLACEMENT)
+            audit.replacement_approach_sha256,
+            digest(REPLACEMENT.as_bytes())
         );
-        assert!(tmp.path().join(&revision.audit_artifact).is_file());
+        assert_eq!(
+            audit.resolution,
+            "Adopt the reviewed recovery architecture."
+        );
+        assert_eq!(
+            audit.resolution_sha256,
+            digest("Adopt the reviewed recovery architecture.".as_bytes())
+        );
+        assert_eq!(
+            stored.attempts[0].writer_completion_contract,
+            WriterCompletionContract::from_planning_context(context)
+        );
         assert_eq!(
             stored.attempts[0].tasks.last().unwrap().role,
             CORRECTIVE_WRITER_ROLE
@@ -540,6 +560,15 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let before = store.read_work_item("work-1").unwrap();
+        let candidate = before.attempts[0].tasks[0].output.clone();
+        let prior_reviews: Vec<_> = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
+            .map(|task| task.id.clone())
+            .collect();
+        let prior_artifacts = before.attempts[0].artifacts.clone();
         revise(
             tmp.path(),
             &store,
@@ -560,6 +589,26 @@ mod tests {
             TaskStatus::Superseded
         );
         assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.tasks[0].output, candidate);
+        assert!(prior_reviews.iter().all(|id| {
+            attempt
+                .tasks
+                .iter()
+                .any(|task| &task.id == id && task.status == TaskStatus::Complete)
+        }));
+        assert!(
+            prior_artifacts
+                .iter()
+                .all(|artifact| attempt.artifacts.contains(artifact))
+        );
+        let corrective = attempt.tasks.last().unwrap();
+        assert_eq!(corrective.role, CORRECTIVE_WRITER_ROLE);
+        assert!(
+            corrective
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.producer_id == PRODUCER)
+        );
     }
 
     #[test]
@@ -576,6 +625,17 @@ mod tests {
         .unwrap();
         let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
         let writer = attempt.tasks.last().unwrap();
+        let settled_reviews: Vec<_> = attempt
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.kind == TaskKind::Review
+                    && task.status == TaskStatus::Complete
+                    && matches!(task.role.as_str(), "architecture" | "documentation")
+            })
+            .map(review_artifact)
+            .collect::<Result<_>>()
+            .unwrap();
         assert!(
             writer
                 .input_artifacts
@@ -583,10 +643,18 @@ mod tests {
                 .any(|artifact| artifact.producer_id == PRODUCER)
         );
         assert!(
-            writer
-                .input_artifacts
+            settled_reviews
                 .iter()
-                .any(|artifact| artifact.path.ends_with("/review.md"))
+                .all(|artifact| writer.input_artifacts.contains(artifact)),
+            "expected {settled_reviews:?} in {:?}",
+            writer.input_artifacts
+        );
+        assert!(
+            writer
+                .instructions
+                .as_deref()
+                .unwrap()
+                .contains("every actionable finding")
         );
     }
 
@@ -602,6 +670,18 @@ mod tests {
             "Approve recovery.",
         )
         .unwrap();
+        let after_first = store.read_work_item("work-1").unwrap();
+        let audit_count = after_first.attempts[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == PRODUCER)
+            .count();
+        let task_count = after_first.attempts[0].tasks.len();
+        let review_count = after_first.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+            .count();
         let second = revise(
             tmp.path(),
             &store,
@@ -613,6 +693,24 @@ mod tests {
         .unwrap();
         assert!(second.already_applied);
         assert_eq!(first.writer_task_id, second.writer_task_id);
+        let after_second = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            after_second.attempts[0]
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.producer_id == PRODUCER)
+                .count(),
+            audit_count
+        );
+        assert_eq!(after_second.attempts[0].tasks.len(), task_count);
+        assert_eq!(
+            after_second.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .count(),
+            review_count
+        );
     }
 
     #[test]

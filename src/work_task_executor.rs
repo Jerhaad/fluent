@@ -1359,7 +1359,7 @@ fn run_review_task_with_coder(
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
-                &classify_task_failure(&error),
+                &classify_reviewer_launch_failure(&error, &review_path),
                 &crate::notify::notify,
             )?;
             return Err(error);
@@ -1388,7 +1388,7 @@ fn run_review_task_with_coder(
                 config.work_item_id,
                 config.attempt_id,
                 config.task_id,
-                &classify_task_failure(&error),
+                &classify_reviewer_launch_failure(&error, &review_path),
                 &crate::notify::notify,
             )?;
             return Err(error);
@@ -1750,7 +1750,7 @@ fn finalize_review_outcome(
     // A non-resumable coder error with a clean workspace pauses the Task for
     // needs-user handling.
     if let Err(error) = run_result {
-        let failure = classify_task_failure(&error);
+        let failure = classify_reviewer_launch_failure(&error, review_path);
         if let Err(state_error) = lock_mark_task_failed_attempt_needs_user(
             config.store,
             config.store_lock,
@@ -3025,12 +3025,21 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
         TaskFailure::HostSandbox(host.message().to_string())
     } else if let Some(host) = error.downcast_ref::<crate::os::HostSandboxLaunchError>() {
         TaskFailure::HostSandbox(host.message().to_string())
-    } else if is_invalid_provider_arguments(error) {
+    } else {
+        TaskFailure::Generic
+    }
+}
+
+/// Treat invalid pass-through arguments as recoverable only before a Reviewer
+/// has produced its review artifact. Writer and post-artifact Reviewer errors
+/// remain ordinary failures because they are outside the launch frontier.
+fn classify_reviewer_launch_failure(error: &anyhow::Error, review_path: &Path) -> TaskFailure {
+    if !review_path.exists() && is_invalid_provider_arguments(error) {
         TaskFailure::ProviderArguments(format!(
             "{error}. Remove or correct the pass-through provider arguments, then run 'fluent attempt run' to retry the same Task."
         ))
     } else {
-        TaskFailure::Generic
+        classify_task_failure(error)
     }
 }
 
@@ -21219,8 +21228,9 @@ mod tests {
         assert!(!should_retry_coder_error(&Err(anyhow::anyhow!(
             "unknown argument --replacement-approach"
         ))));
+        let tmp = tempfile::TempDir::new().unwrap();
         let error = anyhow::anyhow!("unknown argument --replacement-approach");
-        let failure = classify_task_failure(&error);
+        let failure = classify_reviewer_launch_failure(&error, &tmp.path().join("review.md"));
         match &failure {
             TaskFailure::ProviderArguments(message) => {
                 assert!(message.contains("pass-through provider arguments"));
@@ -21229,7 +21239,6 @@ mod tests {
             _ => panic!("invalid reviewer arguments must use a recoverable provider pause"),
         }
 
-        let tmp = tempfile::TempDir::new().unwrap();
         let store = WorkModelStore::new(tmp.path());
         let mut item = WorkItem::planned("work-1", "Pause invalid reviewer arguments");
         item.add_initial_attempt("attempt-1").unwrap();
@@ -21280,5 +21289,23 @@ mod tests {
         .unwrap();
         assert!(handoff.starts_with("# Provider arguments need repair"));
         assert!(handoff.contains("Remove or correct the pass-through provider arguments"));
+        assert!(handoff.contains("unknown argument --replacement-approach"));
+    }
+
+    #[test]
+    fn invalid_provider_arguments_require_pre_artifact_reviewer_frontier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = anyhow::anyhow!("unknown argument --replacement-approach");
+        assert!(matches!(
+            classify_task_failure(&error),
+            TaskFailure::Generic
+        ));
+
+        let review = tmp.path().join("review.md");
+        fs::write(&review, "Verdict: findings\n").unwrap();
+        assert!(matches!(
+            classify_reviewer_launch_failure(&error, &review),
+            TaskFailure::Generic
+        ));
     }
 }
