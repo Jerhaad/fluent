@@ -42,6 +42,21 @@ struct RevisionAudit {
     replacement_approach: String,
     resolution: String,
     resolution_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_reconciliation: Option<LegacyReconciliationReceipt>,
+}
+
+/// Evidence that permits one pre-typed provider failure to enter the ordinary
+/// Approach-revision transaction without rewriting its historical Task state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct LegacyReconciliationReceipt {
+    failed_review_task_id: String,
+    candidate_commit: String,
+    handoff_sha256: String,
+    stderr_sha256: String,
+    execution_sha256: String,
+    diagnostic_excerpt: String,
 }
 
 /// Replace the approved Approach only at the narrowly audited review frontier.
@@ -142,6 +157,7 @@ pub fn revise(
         replacement_approach: replacement,
         resolution: resolution.to_string(),
         resolution_sha256: digest(resolution.as_bytes()),
+        legacy_reconciliation: audited_frontier.legacy_reconciliation.clone(),
     };
     write_once(
         &project_root.join(&audit_artifact),
@@ -223,6 +239,7 @@ struct Frontier<'a> {
     source_review: &'a Task,
     failed_launch: Option<&'a Task>,
     candidate_commit: String,
+    legacy_reconciliation: Option<LegacyReconciliationReceipt>,
 }
 
 fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a>> {
@@ -237,35 +254,10 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         .tasks
         .last()
         .ok_or_else(|| anyhow::anyhow!("Attempt has no Tasks"))?;
-    let failed_launch = if terminal_failure {
-        if last.kind != TaskKind::Review
-            || last.status != TaskStatus::Failed
-            || last.output.is_some()
-            || attempt.artifacts.iter().any(|artifact| {
-                artifact.producer_id == last.id && artifact.path.ends_with("/review.md")
-            })
-            || last.artifact_area.as_ref().is_some_and(|area| {
-                crate::work_task_executor::resolve_managed_artifact_area_path(
-                    project_root,
-                    &area.path,
-                )
-                .is_ok_and(|path| path.join("review.md").exists())
-            })
-            || !attempt.artifacts.iter().any(|artifact| {
-                artifact.producer_id == last.id
-                    && artifact.path.ends_with("/needs-user.md")
-                    && fs::read_to_string(project_root.join(&artifact.path)).is_ok_and(|text| {
-                        text.starts_with("# Provider arguments need repair")
-                            && text.contains("pass-through provider arguments")
-                    })
-            })
-        {
-            bail!("terminal Attempt is not the exact artifact-free reviewer launch failure");
-        }
-        Some(last)
-    } else {
-        None
-    };
+    let legacy_reconciliation = terminal_failure
+        .then(|| legacy_reconciliation_receipt(project_root, attempt, last))
+        .transpose()?;
+    let failed_launch = terminal_failure.then_some(last);
     let search = if terminal_failure {
         &attempt.tasks[..attempt.tasks.len() - 1]
     } else {
@@ -320,7 +312,69 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         source_review,
         failed_launch,
         candidate_commit,
+        legacy_reconciliation,
     })
+}
+
+fn legacy_reconciliation_receipt(
+    project_root: &Path,
+    attempt: &Attempt,
+    failed: &Task,
+) -> Result<LegacyReconciliationReceipt> {
+    if failed.kind != TaskKind::Review || failed.status != TaskStatus::Failed || failed.output.is_some() {
+        bail!("terminal Attempt is not an artifact-free failed reviewer launch");
+    }
+    if attempt.tasks.iter().filter(|task| task.status == TaskStatus::Failed).count() != 1 {
+        bail!("legacy recovery requires exactly one failed reviewer launch");
+    }
+    if attempt.artifacts.iter().any(|artifact| artifact.producer_id == failed.id && artifact.path.ends_with("/review.md")) {
+        bail!("legacy failed reviewer launch has a review artifact");
+    }
+    let area = failed.artifact_area.as_ref().ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no artifact area"))?;
+    let directory = crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    if directory.join("review.md").exists() {
+        bail!("legacy failed reviewer launch has review output");
+    }
+    let handoff = attempt.artifacts.iter().find(|artifact| {
+        artifact.producer_id == failed.id && artifact.path.ends_with("/needs-user.md")
+    }).ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no generic handoff"))?;
+    let handoff_bytes = fs::read(project_root.join(&handoff.path))?;
+    let handoff_text = std::str::from_utf8(&handoff_bytes)?;
+    if !handoff_text.starts_with("# Attempt needs user input") {
+        bail!("legacy reviewer handoff is not the preserved generic form");
+    }
+    let stderr_bytes = fs::read(directory.join(crate::coder::PROVIDER_STDERR_FILENAME))?;
+    let stderr = std::str::from_utf8(&stderr_bytes)?;
+    let excerpt = legacy_codex_parser_excerpt(stderr)
+        .ok_or_else(|| anyhow::anyhow!("legacy reviewer stderr is not a Codex CLI parser rejection"))?;
+    let execution_bytes = fs::read(directory.join("execution.json"))?;
+    let execution: crate::execution::ExecutionRecord = serde_json::from_slice(&execution_bytes)?;
+    if execution.state != crate::execution::ExecutionState::Settled {
+        bail!("legacy reviewer execution record is not settled");
+    }
+    let candidate_commit = failed.review_context.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no candidate context"))?
+        .candidate_commit.clone();
+    Ok(LegacyReconciliationReceipt {
+        failed_review_task_id: failed.id.clone(),
+        candidate_commit,
+        handoff_sha256: digest(&handoff_bytes),
+        stderr_sha256: digest(&stderr_bytes),
+        execution_sha256: digest(&execution_bytes),
+        diagnostic_excerpt: excerpt,
+    })
+}
+
+fn legacy_codex_parser_excerpt(stderr: &str) -> Option<String> {
+    let normalized = stderr.to_ascii_lowercase();
+    if !normalized.contains("usage: codex")
+        || !["unknown argument", "unexpected argument", "unknown option"]
+            .iter()
+            .any(|marker| normalized.contains(marker))
+    {
+        return None;
+    }
+    Some(stderr.chars().take(512).collect())
 }
 
 fn review_round(task: &Task) -> Option<String> {
@@ -462,10 +516,10 @@ mod tests {
     // tied to this module's regression fixture.
     const BEHAVIOR_TEST_SELECTORS: &[&str] = &[
         "tests::revises_approach_and_records_candidate_bound_audit",
-        "tests::recovers_exact_terminal_launch_failure_after_uncertain_architecture",
+        "tests::recovers_legacy_generic_handoff_with_codex_parser_diagnostics",
         "tests::schedules_documentation_correction_and_targeted_reviews",
         "tests::repeated_revision_is_idempotent",
-        "tests::rejects_stale_drifted_and_unrelated_recovery_requests",
+        "tests::rejects_unrelated_legacy_launch_failures_without_mutation",
     ];
 
     const APPROACH: &str = "# Approach\n\n## Key decisions\n\n### Keep the boundary\n\nChoice: Keep it narrow.\n\n## Structure\n\nRecover under a lock.\n";
@@ -628,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn recovers_exact_terminal_launch_failure_after_uncertain_architecture() {
+    fn recovers_legacy_generic_handoff_with_codex_parser_diagnostics() {
         let (tmp, store) = fixture();
         store
             .mutate_work_item("work-1", |item| {
@@ -645,7 +699,7 @@ mod tests {
                 let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
                 fs::write(
                     tmp.path().join(&handoff),
-                    "# Provider arguments need repair\n\npass-through provider arguments\n",
+                    "# Attempt needs user input\n\nThe reviewer failed before producing output.\n",
                 )
                 .unwrap();
                 item.attempts[0].artifacts.push(ArtifactRef {
@@ -653,6 +707,19 @@ mod tests {
                     path: handoff,
                 });
                 item.attempts[0].status = AttemptStatus::Failed;
+                let area = item.attempts[0].tasks.last().unwrap().artifact_area.as_ref().unwrap();
+                let directory = tmp.path().join(&area.path);
+                fs::create_dir_all(&directory).unwrap();
+                fs::write(
+                    directory.join(crate::coder::PROVIDER_STDERR_FILENAME),
+                    "error: unexpected argument '--replacement-approach' found\n\nUsage: codex exec [OPTIONS] [PROMPT]\n",
+                )
+                .unwrap();
+                fs::write(
+                    directory.join("execution.json"),
+                    r#"{"schema_version":1,"state":"settled","owner_pid":1,"leader_pid":1,"process_group_id":1,"started_at":"now","heartbeat_at":"now","settled_at":"now"}"#,
+                )
+                .unwrap();
                 Ok(())
             })
             .unwrap();
@@ -665,7 +732,7 @@ mod tests {
             .map(|task| task.id.clone())
             .collect();
         let prior_artifacts = before.attempts[0].artifacts.clone();
-        revise(
+        let revision = revise(
             tmp.path(),
             &store,
             "work-1",
@@ -674,6 +741,14 @@ mod tests {
             "Recover the failed launch.",
         )
         .unwrap();
+        let audit: RevisionAudit = serde_json::from_slice(
+            &fs::read(tmp.path().join(revision.audit_artifact)).unwrap(),
+        )
+        .unwrap();
+        let receipt = audit.legacy_reconciliation.expect("legacy evidence receipt");
+        assert_eq!(receipt.candidate_commit, "candidate");
+        assert_eq!(receipt.failed_review_task_id, "attempt-1-review-2-documentation");
+        assert!(receipt.diagnostic_excerpt.contains("unexpected argument"));
         let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
         assert_eq!(
             attempt
@@ -857,11 +932,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_stale_drifted_and_unrelated_recovery_requests() {
+    fn rejects_unrelated_legacy_launch_failures_without_mutation() {
         let (tmp, store) = fixture();
         store
             .mutate_work_item("work-1", |item| {
                 item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+                Ok(())
+            })
+            .unwrap();
+        assert_rejected_without_mutation(&tmp, &store);
+
+        let (tmp, store) = fixture();
+        store
+            .mutate_work_item("work-1", |item| {
+                let mut failed = item.attempts[0].tasks[1].clone();
+                failed.id = "attempt-1-review-2-documentation".to_string();
+                failed.status = TaskStatus::Failed;
+                failed.output = None;
+                item.attempts[0].tasks.push(failed);
+                item.attempts[0].status = AttemptStatus::Failed;
                 Ok(())
             })
             .unwrap();
