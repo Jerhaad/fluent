@@ -1084,10 +1084,8 @@ fn complete_write_task(
             producer_id: config.task_id.to_string(),
             path: commit.clone(),
         });
-    let all_complete = completed_item.attempts[attempt_index]
-        .tasks
-        .iter()
-        .all(|task| task.status == TaskStatus::Complete);
+    let all_complete =
+        completed_item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
     let (next_status, next_pause) = if all_complete {
         (AttemptStatus::Complete, None)
     } else {
@@ -1868,10 +1866,8 @@ fn complete_review_task(
                     });
                 }
             }
-            let all_complete = item.attempts[attempt_index]
-                .tasks
-                .iter()
-                .all(|task| task.status == TaskStatus::Complete);
+            let all_complete =
+                item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
             let next_status = if all_complete {
                 AttemptStatus::Complete
             } else {
@@ -2540,10 +2536,8 @@ fn complete_tester_task(
                 producer_id: config.task_id.to_string(),
                 path: path_for_model(config.project_root, results_path),
             });
-        let all_complete = completed_item.attempts[attempt_index]
-            .tasks
-            .iter()
-            .all(|task| task.status == TaskStatus::Complete);
+        let all_complete =
+            completed_item.attempts[attempt_index].all_tasks_complete_or_approach_superseded();
         let next_status = if all_complete {
             AttemptStatus::Complete
         } else {

@@ -1209,4 +1209,34 @@ mod tests {
                 && resolution == "Use the owning public workflow."
         ));
     }
+
+    #[test]
+    fn approach_revision_parses_authorized_replacement() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "revise-approach",
+            "work-1",
+            "attempt-1",
+            "--approach-file",
+            "replacement.md",
+            "--resolution",
+            "Adopt the reviewed design.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::ReviseApproach {
+                    work_item_id,
+                    attempt_id,
+                    approach_file,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && approach_file == std::path::PathBuf::from("replacement.md")
+                && resolution == "Adopt the reviewed design."
+        ));
+    }
 }

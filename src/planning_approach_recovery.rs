@@ -176,6 +176,13 @@ pub fn revise(
                 id: failed_id.clone(),
             });
         }
+        if let Some(failed_id) = &failed_id
+            && !attempt.approach_revision_superseded_tasks.contains(failed_id)
+        {
+            attempt
+                .approach_revision_superseded_tasks
+                .push(failed_id.clone());
+        }
         let writer = attempt.tasks.iter_mut().find(|task| task.id == task_id)
             .ok_or_else(|| WorkModelError::TaskNotFound { id: task_id.clone() })?;
         writer.role = CORRECTIVE_WRITER_ROLE.to_string();

@@ -4478,6 +4478,10 @@ pub struct Attempt {
     /// exceptional evidence-only route that supersedes them operationally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_recoveries: Vec<EvidenceRecovery>,
+    /// Failed Reviewer launches retained as history but explicitly superseded
+    /// by an audited Approach-revision corrective Writer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approach_revision_superseded_tasks: Vec<String>,
     /// Append-only host-derived Writer outcomes and provider continuation
     /// identities. Legacy Attempts deserialize with no records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4519,6 +4523,7 @@ impl Default for Attempt {
             pause_recovery: None,
             artifacts: Vec::new(),
             evidence_recoveries: Vec::new(),
+            approach_revision_superseded_tasks: Vec::new(),
             writer_runs: Vec::new(),
             created_at: None,
             completed_at: None,
@@ -4531,6 +4536,21 @@ impl Default for Attempt {
 }
 
 impl Attempt {
+    /// Return whether an audited Approach revision explicitly superseded this
+    /// failed Reviewer launch while preserving its terminal Task outcome.
+    pub fn is_approach_revision_superseded_task(&self, task_id: &str) -> bool {
+        self.approach_revision_superseded_tasks
+            .iter()
+            .any(|superseded| superseded == task_id)
+    }
+
+    pub fn all_tasks_complete_or_approach_superseded(&self) -> bool {
+        self.tasks.iter().all(|task| {
+            task.status == TaskStatus::Complete
+                || (task.status == TaskStatus::Failed
+                    && self.is_approach_revision_superseded_task(&task.id))
+        })
+    }
     /// Return the failed Tester superseded by one explicit harness-repair
     /// Writer. The Writer's immutable input binds it to that Tester Task, so a
     /// generic failed Task can never be ignored by merely using the role name.
@@ -4643,7 +4663,8 @@ impl Attempt {
             matches!(task.status, TaskStatus::Planned | TaskStatus::Executing)
                 || (task.status == TaskStatus::Failed
                     && !self.is_superseded_tester_harness_followup(&task.id)
-                    && !self.has_tester_harness_repair_for(&task.id))
+                    && !self.has_tester_harness_repair_for(&task.id)
+                    && !self.is_approach_revision_superseded_task(&task.id))
         })
     }
 
@@ -4697,7 +4718,8 @@ impl Attempt {
                 || (task.status == TaskStatus::Failed
                     && !failed_candidate_gate_correction
                     && !self.is_superseded_tester_harness_followup(&task.id)
-                    && !self.has_tester_harness_repair_for(&task.id))
+                    && !self.has_tester_harness_repair_for(&task.id)
+                    && !self.is_approach_revision_superseded_task(&task.id))
         }) {
             return Err(ineligible(
                 "Attempt paused on recoverable infrastructure or completion evidence but also has a hard-failed or still-running Task; resolve it before re-running."
@@ -7350,6 +7372,8 @@ struct AttemptRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     evidence_recoveries: Vec<EvidenceRecovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    approach_revision_superseded_tasks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     writer_runs: Vec<WriterRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
@@ -7441,6 +7465,7 @@ impl AttemptRecord {
             pause_recovery: attempt.pause_recovery,
             artifacts: attempt.artifacts.clone(),
             evidence_recoveries: attempt.evidence_recoveries.clone(),
+            approach_revision_superseded_tasks: attempt.approach_revision_superseded_tasks.clone(),
             writer_runs: attempt.writer_runs.clone(),
             created_at: attempt.created_at.clone(),
             completed_at: attempt.completed_at.clone(),
@@ -7466,6 +7491,7 @@ impl From<AttemptRecord> for Attempt {
             pause_recovery: record.pause_recovery,
             artifacts: record.artifacts,
             evidence_recoveries: record.evidence_recoveries,
+            approach_revision_superseded_tasks: record.approach_revision_superseded_tasks,
             writer_runs: record.writer_runs,
             created_at: record.created_at,
             completed_at: record.completed_at,
