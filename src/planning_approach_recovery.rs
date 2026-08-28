@@ -629,6 +629,36 @@ mod tests {
         );
     }
 
+    fn legacy_terminal_fixture() -> (tempfile::TempDir, WorkModelStore) {
+        let (tmp, store) = fixture();
+        store.mutate_work_item("work-1", |item| {
+            item.attempts[0].tasks[1].id = "attempt-1-review-2-architecture".to_string();
+            let mut failed = item.attempts[0].tasks[1].clone();
+            failed.id = "attempt-1-review-2-documentation".to_string();
+            failed.artifact_area.as_mut().unwrap().path = work_artifact_path(
+                "work-1", "attempt-1", "attempt-1-review-2-documentation",
+            );
+            failed.status = TaskStatus::Failed;
+            failed.output = None;
+            item.attempts[0].tasks.push(failed);
+            let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+            fs::write(tmp.path().join(&handoff), "# Attempt needs user input\n\nlaunch failed\n").unwrap();
+            item.attempts[0].artifacts.push(ArtifactRef {
+                producer_id: "attempt-1-review-2-documentation".to_string(), path: handoff,
+            });
+            item.attempts[0].status = AttemptStatus::Failed;
+            let area = item.attempts[0].tasks.last().unwrap().artifact_area.as_ref().unwrap();
+            let directory = tmp.path().join(&area.path);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(crate::coder::PROVIDER_STDERR_FILENAME),
+                "error: unexpected argument '--replacement-approach' found\n\nUsage: codex exec [OPTIONS] [PROMPT]\n").unwrap();
+            fs::write(directory.join("execution.json"),
+                r#"{"schema_version":1,"state":"settled","owner_pid":1,"leader_pid":1,"process_group_id":1,"started_at":"now","heartbeat_at":"now","settled_at":"now"}"#).unwrap();
+            Ok(())
+        }).unwrap();
+        (tmp, store)
+    }
+
     #[test]
     fn behavior_selector_manifest_covers_recovery_regressions() {
         assert_eq!(BEHAVIOR_TEST_SELECTORS.len(), 5);
@@ -941,6 +971,39 @@ mod tests {
             })
             .unwrap();
         assert_rejected_without_mutation(&tmp, &store);
+
+        for mutate in [
+            |tmp: &tempfile::TempDir, store: &WorkModelStore| {
+                let path = tmp.path().join(work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-documentation/review.md"));
+                fs::write(path, "Verdict: findings\n").unwrap();
+                assert_rejected_without_mutation(tmp, store);
+            },
+            |tmp: &tempfile::TempDir, store: &WorkModelStore| {
+                let failed = store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().clone();
+                let directory = tmp.path().join(failed.artifact_area.unwrap().path);
+                fs::write(directory.join(crate::coder::PROVIDER_STDERR_FILENAME), "ordinary error mentioning argument\n").unwrap();
+                assert_rejected_without_mutation(tmp, store);
+            },
+            |tmp: &tempfile::TempDir, store: &WorkModelStore| {
+                let failed = store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().clone();
+                let directory = tmp.path().join(failed.artifact_area.unwrap().path);
+                fs::write(directory.join("execution.json"), r#"{"schema_version":1,"state":"running","owner_pid":1,"leader_pid":1,"process_group_id":1,"started_at":"now","heartbeat_at":"now"}"#).unwrap();
+                assert_rejected_without_mutation(tmp, store);
+            },
+            |_: &tempfile::TempDir, store: &WorkModelStore| {
+                store.mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks.last_mut().unwrap().review_context.as_mut().unwrap().candidate_commit = "other-candidate".to_string();
+                    Ok(())
+                }).unwrap();
+                // The candidate mismatch must reject before changing durable state.
+            },
+        ] {
+            let (tmp, store) = legacy_terminal_fixture();
+            mutate(&tmp, &store);
+            if store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().review_context.as_ref().unwrap().candidate_commit == "other-candidate" {
+                assert_rejected_without_mutation(&tmp, &store);
+            }
+        }
 
         let (tmp, store) = fixture();
         store
