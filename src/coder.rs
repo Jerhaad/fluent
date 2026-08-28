@@ -9,6 +9,26 @@ use std::time::{Duration, Instant, SystemTime};
 const DEFAULT_PI_MODEL: &str = "qwen3.6-35b-a3b";
 pub(crate) const PROVIDER_STDERR_FILENAME: &str = "provider-stderr.log";
 pub(crate) const PROVIDER_TIMING_FILENAME: &str = "provider-timing.json";
+const PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT: usize = 512;
+
+/// A provider process rejected Fluent's configured command-line arguments
+/// before it could produce role output. This preserves process-level origin so
+/// task settlement never infers recoverability from arbitrary error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderArgumentError {
+    pub provider: CoderKind,
+    pub exit_status: i32,
+    pub diagnostic: String,
+    pub invocation: String,
+}
+
+impl std::fmt::Display for ProviderArgumentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} rejected provider arguments (exit {}): {}", self.provider.as_str(), self.exit_status, self.diagnostic)
+    }
+}
+
+impl std::error::Error for ProviderArgumentError {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ProviderRetryTiming {
@@ -911,7 +931,7 @@ impl Coder for CodexCode {
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let combined_prompt = format!("{system_prompt}\n\n---\n\n{prompt}");
-        run_with_transcript_retrying_reported(
+        classify_codex_provider_argument_failure(run_with_transcript_retrying_reported(
             || {
                 let mut cmd = self.build_writer_command(working_dir, session);
                 apply_coder_env(&mut cmd, extra_env);
@@ -927,7 +947,7 @@ impl Coder for CodexCode {
             &crate::notify::notify,
             &real_credential_refresh,
             false,
-        )
+        ), capture, extra_args)
     }
 
     fn run_interactive(
@@ -1022,6 +1042,30 @@ impl CodexCode {
         cmd.current_dir(working_dir);
         cmd
     }
+}
+
+fn classify_codex_provider_argument_failure(
+    mut completion: CoderRunCompletion,
+    capture: Option<&TranscriptCapture<'_>>,
+    extra_args: &[String],
+) -> CoderRunCompletion {
+    let Ok(exit_status) = completion.terminal else { return completion; };
+    if exit_status == 0 { return completion; }
+    let Some(path) = capture.map(|capture| provider_stderr_path(capture.path)) else { return completion; };
+    let Ok(stderr) = std::fs::read_to_string(path) else { return completion; };
+    let normalized = stderr.to_ascii_lowercase();
+    if !["unknown option", "unknown argument", "unexpected argument", "invalid argument"]
+        .iter().any(|marker| normalized.contains(marker))
+    {
+        return completion;
+    }
+    completion.terminal = Err(anyhow::Error::new(ProviderArgumentError {
+        provider: CoderKind::Codex,
+        exit_status,
+        diagnostic: stderr.chars().take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT).collect(),
+        invocation: extra_args.join(" ").chars().take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT).collect(),
+    }));
+    completion
 }
 
 /// Pi (pi.dev) coding agent backed by a local vllm-mlx model.

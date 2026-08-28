@@ -2919,7 +2919,7 @@ fn should_retry_coder_error(result: &Result<()>) -> bool {
         && !result
             .as_ref()
             .err()
-            .is_some_and(is_invalid_provider_arguments)
+            .is_some_and(|error| error.is::<crate::coder::ProviderArgumentError>())
 }
 
 /// How a Task's terminal failure should be recorded in durable Attempt state and
@@ -3028,25 +3028,15 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
 /// has produced its review artifact. Writer and post-artifact Reviewer errors
 /// remain ordinary failures because they are outside the launch frontier.
 fn classify_reviewer_launch_failure(error: &anyhow::Error, review_path: &Path) -> TaskFailure {
-    if !review_path.exists() && is_invalid_provider_arguments(error) {
+    if !review_path.exists()
+        && let Some(provider) = error.downcast_ref::<crate::coder::ProviderArgumentError>()
+    {
         TaskFailure::ProviderArguments(format!(
-            "{error}. Remove or correct the pass-through provider arguments, then run 'fluent attempt run' to retry the same Task."
+            "{provider}. Remove or correct the pass-through provider arguments, then run 'fluent attempt run' to retry the same Task."
         ))
     } else {
         classify_task_failure(error)
     }
-}
-
-fn is_invalid_provider_arguments(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    [
-        "unknown option",
-        "unknown argument",
-        "unexpected argument",
-        "invalid argument",
-    ]
-    .iter()
-    .any(|marker| message.contains(marker))
 }
 
 fn provider_pause_error(
@@ -8752,7 +8742,7 @@ mod tests {
 
     // Keep the approved behavior selector visible to the candidate gate.
     const PROVIDER_ARGUMENT_TEST_SELECTOR: &str =
-        "tests::invalid_reviewer_arguments_pause_with_actionable_recovery";
+        "tests::reviewer_execution_propagates_typed_provider_argument_failure";
 
     fn test_writer_cache(project_root: &Path) -> crate::writer_cache::WriterDependencyCache {
         let cache = crate::writer_cache::preflight_writer_dependency_cache(
@@ -12663,7 +12653,12 @@ mod tests {
             _capture: Option<&crate::coder::TranscriptCapture<'_>>,
         ) -> Result<i32> {
             *self.launches.lock().unwrap() += 1;
-            Err(anyhow::anyhow!("unknown argument --replacement-approach"))
+            Err(anyhow::Error::new(crate::coder::ProviderArgumentError {
+                provider: CoderKind::Codex,
+                exit_status: 2,
+                diagnostic: "unknown argument --replacement-approach".to_string(),
+                invocation: "--replacement-approach".to_string(),
+            }))
         }
 
         fn run_interactive(
@@ -21351,16 +21346,25 @@ mod tests {
     }
 
     #[test]
-    fn invalid_reviewer_arguments_pause_with_actionable_recovery() {
+    fn reviewer_execution_propagates_typed_provider_argument_failure() {
         assert!(
             PROVIDER_ARGUMENT_TEST_SELECTOR
-                .ends_with("invalid_reviewer_arguments_pause_with_actionable_recovery")
+                .ends_with("reviewer_execution_propagates_typed_provider_argument_failure")
         );
-        assert!(!should_retry_coder_error(&Err(anyhow::anyhow!(
-            "unknown argument --replacement-approach"
-        ))));
+        let typed = anyhow::Error::new(crate::coder::ProviderArgumentError {
+            provider: CoderKind::Codex,
+            exit_status: 2,
+            diagnostic: "unknown argument --replacement-approach".to_string(),
+            invocation: "--replacement-approach".to_string(),
+        });
+        assert!(!should_retry_coder_error(&Err(typed)));
         let tmp = tempfile::TempDir::new().unwrap();
-        let error = anyhow::anyhow!("unknown argument --replacement-approach");
+        let error = anyhow::Error::new(crate::coder::ProviderArgumentError {
+            provider: CoderKind::Codex,
+            exit_status: 2,
+            diagnostic: "unknown argument --replacement-approach".to_string(),
+            invocation: "--replacement-approach".to_string(),
+        });
         let failure = classify_reviewer_launch_failure(&error, &tmp.path().join("review.md"));
         match &failure {
             TaskFailure::ProviderArguments(message) => {
@@ -21424,7 +21428,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_provider_arguments_require_pre_artifact_reviewer_frontier() {
+    fn argument_words_without_typed_failure_remain_generic() {
         let tmp = tempfile::TempDir::new().unwrap();
         let error = anyhow::anyhow!("unknown argument --replacement-approach");
         assert!(matches!(
