@@ -85,6 +85,11 @@ pub fn revise(
         return Ok(existing);
     }
     let audited_frontier = frontier(project_root, attempt)?;
+    if attempt.materialized_write_rounds()
+        >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
+    {
+        bail!("Approach revision has no remaining authorized Writer round");
+    }
     let old_contract = WriterCompletionContract::from_planning_context(context)
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
     let mut revised_context = context.clone();
