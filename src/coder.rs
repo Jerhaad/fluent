@@ -24,7 +24,13 @@ pub struct ProviderArgumentError {
 
 impl std::fmt::Display for ProviderArgumentError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} rejected provider arguments (exit {}): {}", self.provider.as_str(), self.exit_status, self.diagnostic)
+        write!(
+            formatter,
+            "{} rejected provider arguments (exit {}): {}",
+            self.provider.as_str(),
+            self.exit_status,
+            self.diagnostic
+        )
     }
 }
 
@@ -931,23 +937,27 @@ impl Coder for CodexCode {
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let combined_prompt = format!("{system_prompt}\n\n---\n\n{prompt}");
-        classify_codex_provider_argument_failure(run_with_transcript_retrying_reported(
-            || {
-                let mut cmd = self.build_writer_command(working_dir, session);
-                apply_coder_env(&mut cmd, extra_env);
-                if want_transcript {
-                    cmd.arg("--json");
-                }
-                cmd.arg(&combined_prompt);
-                cmd.args(extra_args);
-                cmd
-            },
-            transcript_file,
-            &config,
-            &crate::notify::notify,
-            &real_credential_refresh,
-            false,
-        ), capture, extra_args)
+        classify_codex_provider_argument_failure(
+            run_with_transcript_retrying_reported(
+                || {
+                    let mut cmd = self.build_writer_command(working_dir, session);
+                    apply_coder_env(&mut cmd, extra_env);
+                    if want_transcript {
+                        cmd.arg("--json");
+                    }
+                    cmd.arg(&combined_prompt);
+                    cmd.args(extra_args);
+                    cmd
+                },
+                transcript_file,
+                &config,
+                &crate::notify::notify,
+                &real_credential_refresh,
+                false,
+            ),
+            capture,
+            extra_args,
+        )
     }
 
     fn run_interactive(
@@ -1049,21 +1059,42 @@ fn classify_codex_provider_argument_failure(
     capture: Option<&TranscriptCapture<'_>>,
     extra_args: &[String],
 ) -> CoderRunCompletion {
-    let Ok(exit_status) = completion.terminal else { return completion; };
-    if exit_status == 0 { return completion; }
-    let Some(path) = capture.map(|capture| provider_stderr_path(capture.path)) else { return completion; };
-    let Ok(stderr) = std::fs::read_to_string(path) else { return completion; };
+    let Ok(exit_status) = completion.terminal else {
+        return completion;
+    };
+    if exit_status == 0 {
+        return completion;
+    }
+    let Some(path) = capture.map(|capture| provider_stderr_path(capture.path)) else {
+        return completion;
+    };
+    let Ok(stderr) = std::fs::read_to_string(path) else {
+        return completion;
+    };
     let normalized = stderr.to_ascii_lowercase();
-    if !["unknown option", "unknown argument", "unexpected argument", "invalid argument"]
-        .iter().any(|marker| normalized.contains(marker))
+    if ![
+        "unknown option",
+        "unknown argument",
+        "unexpected argument",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
     {
         return completion;
     }
     completion.terminal = Err(anyhow::Error::new(ProviderArgumentError {
         provider: CoderKind::Codex,
         exit_status,
-        diagnostic: stderr.chars().take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT).collect(),
-        invocation: extra_args.join(" ").chars().take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT).collect(),
+        diagnostic: stderr
+            .chars()
+            .take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT)
+            .collect(),
+        invocation: extra_args
+            .join(" ")
+            .chars()
+            .take(PROVIDER_ARGUMENT_DIAGNOSTIC_LIMIT)
+            .collect(),
     }));
     completion
 }

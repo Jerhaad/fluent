@@ -21431,8 +21431,10 @@ mod tests {
 
     #[test]
     fn argument_words_without_typed_failure_remain_generic() {
-        assert!(PROVIDER_ARGUMENT_TEST_SELECTORS[1]
-            .ends_with("argument_words_without_typed_failure_remain_generic"));
+        assert!(
+            PROVIDER_ARGUMENT_TEST_SELECTORS[1]
+                .ends_with("argument_words_without_typed_failure_remain_generic")
+        );
         let tmp = tempfile::TempDir::new().unwrap();
         let error = anyhow::anyhow!("unknown argument --replacement-approach");
         assert!(matches!(

@@ -321,23 +321,44 @@ fn legacy_reconciliation_receipt(
     attempt: &Attempt,
     failed: &Task,
 ) -> Result<LegacyReconciliationReceipt> {
-    if failed.kind != TaskKind::Review || failed.status != TaskStatus::Failed || failed.output.is_some() {
+    if failed.kind != TaskKind::Review
+        || failed.status != TaskStatus::Failed
+        || failed.output.is_some()
+    {
         bail!("terminal Attempt is not an artifact-free failed reviewer launch");
     }
-    if attempt.tasks.iter().filter(|task| task.status == TaskStatus::Failed).count() != 1 {
+    if attempt
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count()
+        != 1
+    {
         bail!("legacy recovery requires exactly one failed reviewer launch");
     }
-    if attempt.artifacts.iter().any(|artifact| artifact.producer_id == failed.id && artifact.path.ends_with("/review.md")) {
+    if attempt
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.producer_id == failed.id && artifact.path.ends_with("/review.md"))
+    {
         bail!("legacy failed reviewer launch has a review artifact");
     }
-    let area = failed.artifact_area.as_ref().ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no artifact area"))?;
-    let directory = crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
+    let area = failed
+        .artifact_area
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no artifact area"))?;
+    let directory =
+        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
     if directory.join("review.md").exists() {
         bail!("legacy failed reviewer launch has review output");
     }
-    let handoff = attempt.artifacts.iter().find(|artifact| {
-        artifact.producer_id == failed.id && artifact.path.ends_with("/needs-user.md")
-    }).ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no generic handoff"))?;
+    let handoff = attempt
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == failed.id && artifact.path.ends_with("/needs-user.md")
+        })
+        .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no generic handoff"))?;
     let handoff_bytes = fs::read(project_root.join(&handoff.path))?;
     let handoff_text = std::str::from_utf8(&handoff_bytes)?;
     if !handoff_text.starts_with("# Attempt needs user input") {
@@ -345,16 +366,20 @@ fn legacy_reconciliation_receipt(
     }
     let stderr_bytes = fs::read(directory.join(crate::coder::PROVIDER_STDERR_FILENAME))?;
     let stderr = std::str::from_utf8(&stderr_bytes)?;
-    let excerpt = legacy_codex_parser_excerpt(stderr)
-        .ok_or_else(|| anyhow::anyhow!("legacy reviewer stderr is not a Codex CLI parser rejection"))?;
+    let excerpt = legacy_codex_parser_excerpt(stderr).ok_or_else(|| {
+        anyhow::anyhow!("legacy reviewer stderr is not a Codex CLI parser rejection")
+    })?;
     let execution_bytes = fs::read(directory.join("execution.json"))?;
     let execution: crate::execution::ExecutionRecord = serde_json::from_slice(&execution_bytes)?;
     if execution.state != crate::execution::ExecutionState::Settled {
         bail!("legacy reviewer execution record is not settled");
     }
-    let candidate_commit = failed.review_context.as_ref()
+    let candidate_commit = failed
+        .review_context
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("legacy failed reviewer launch has no candidate context"))?
-        .candidate_commit.clone();
+        .candidate_commit
+        .clone();
     Ok(LegacyReconciliationReceipt {
         failed_review_task_id: failed.id.clone(),
         candidate_commit,
@@ -771,13 +796,17 @@ mod tests {
             "Recover the failed launch.",
         )
         .unwrap();
-        let audit: RevisionAudit = serde_json::from_slice(
-            &fs::read(tmp.path().join(revision.audit_artifact)).unwrap(),
-        )
-        .unwrap();
-        let receipt = audit.legacy_reconciliation.expect("legacy evidence receipt");
+        let audit: RevisionAudit =
+            serde_json::from_slice(&fs::read(tmp.path().join(revision.audit_artifact)).unwrap())
+                .unwrap();
+        let receipt = audit
+            .legacy_reconciliation
+            .expect("legacy evidence receipt");
         assert_eq!(receipt.candidate_commit, "candidate");
-        assert_eq!(receipt.failed_review_task_id, "attempt-1-review-2-documentation");
+        assert_eq!(
+            receipt.failed_review_task_id,
+            "attempt-1-review-2-documentation"
+        );
         assert!(receipt.diagnostic_excerpt.contains("unexpected argument"));
         let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
         assert_eq!(
@@ -974,33 +1003,67 @@ mod tests {
 
         for mutate in [
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
-                let path = tmp.path().join(work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-documentation/review.md"));
+                let path = tmp.path().join(work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "attempt-1-review-2-documentation/review.md",
+                ));
                 fs::write(path, "Verdict: findings\n").unwrap();
                 assert_rejected_without_mutation(tmp, store);
             },
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
-                let failed = store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().clone();
+                let failed = store.read_work_item("work-1").unwrap().attempts[0]
+                    .tasks
+                    .last()
+                    .unwrap()
+                    .clone();
                 let directory = tmp.path().join(failed.artifact_area.unwrap().path);
-                fs::write(directory.join(crate::coder::PROVIDER_STDERR_FILENAME), "ordinary error mentioning argument\n").unwrap();
+                fs::write(
+                    directory.join(crate::coder::PROVIDER_STDERR_FILENAME),
+                    "ordinary error mentioning argument\n",
+                )
+                .unwrap();
                 assert_rejected_without_mutation(tmp, store);
             },
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
-                let failed = store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().clone();
+                let failed = store.read_work_item("work-1").unwrap().attempts[0]
+                    .tasks
+                    .last()
+                    .unwrap()
+                    .clone();
                 let directory = tmp.path().join(failed.artifact_area.unwrap().path);
                 fs::write(directory.join("execution.json"), r#"{"schema_version":1,"state":"running","owner_pid":1,"leader_pid":1,"process_group_id":1,"started_at":"now","heartbeat_at":"now"}"#).unwrap();
                 assert_rejected_without_mutation(tmp, store);
             },
             |_: &tempfile::TempDir, store: &WorkModelStore| {
-                store.mutate_work_item("work-1", |item| {
-                    item.attempts[0].tasks.last_mut().unwrap().review_context.as_mut().unwrap().candidate_commit = "other-candidate".to_string();
-                    Ok(())
-                }).unwrap();
+                store
+                    .mutate_work_item("work-1", |item| {
+                        item.attempts[0]
+                            .tasks
+                            .last_mut()
+                            .unwrap()
+                            .review_context
+                            .as_mut()
+                            .unwrap()
+                            .candidate_commit = "other-candidate".to_string();
+                        Ok(())
+                    })
+                    .unwrap();
                 // The candidate mismatch must reject before changing durable state.
             },
         ] {
             let (tmp, store) = legacy_terminal_fixture();
             mutate(&tmp, &store);
-            if store.read_work_item("work-1").unwrap().attempts[0].tasks.last().unwrap().review_context.as_ref().unwrap().candidate_commit == "other-candidate" {
+            if store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .last()
+                .unwrap()
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_commit
+                == "other-candidate"
+            {
                 assert_rejected_without_mutation(&tmp, &store);
             }
         }
