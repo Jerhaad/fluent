@@ -12636,6 +12636,47 @@ mod tests {
         }
     }
 
+    struct InvalidReviewerArgumentsCoder {
+        launches: Arc<Mutex<usize>>,
+    }
+
+    impl crate::coder::Coder for InvalidReviewerArgumentsCoder {
+        fn run(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _transcript_file: Option<&Path>,
+        ) -> Result<i32> {
+            unreachable!("the review route launches through run_captured")
+        }
+
+        fn run_captured(
+            &self,
+            _prompt: &str,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+            _capture: Option<&crate::coder::TranscriptCapture<'_>>,
+        ) -> Result<i32> {
+            *self.launches.lock().unwrap() += 1;
+            Err(anyhow::anyhow!("unknown argument --replacement-approach"))
+        }
+
+        fn run_interactive(
+            &self,
+            _system_prompt: &str,
+            _working_dir: &Path,
+            _extra_args: &[String],
+            _extra_env: &[(String, String)],
+        ) -> Result<i32> {
+            unreachable!("the review route never runs interactively")
+        }
+    }
+
     #[derive(Default)]
     struct WriterInputBoundaryObservation {
         prompt_named_input: bool,
@@ -21211,6 +21252,102 @@ mod tests {
             !capture.effectively_sandboxed(requested_no_sandbox),
             "capture honors --no-sandbox and runs unconfined"
         );
+    }
+
+    #[test]
+    fn invalid_reviewer_arguments_pause_through_execution_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        crate::git::run(project_root, &["init", "-q", "-b", "main"], "init fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.email", "t@t.co"],
+            "configure fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            project_root,
+            &["config", "user.name", "t"],
+            "configure fixture",
+        )
+        .unwrap();
+        fs::write(project_root.join("tracked.txt"), "baseline").unwrap();
+        crate::git::run(project_root, &["add", "."], "add fixture").unwrap();
+        crate::git::run(
+            project_root,
+            &["commit", "-q", "-m", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let head =
+            crate::git::run_stdout(project_root, &["rev-parse", "HEAD"], "resolve head").unwrap();
+        let store = WorkModelStore::new(project_root);
+        let mut item = WorkItem {
+            id: "invalid-arguments-work".to_string(),
+            title: "Pause invalid reviewer arguments".to_string(),
+            ..Default::default()
+        };
+        item.add_review_only_attempt(
+            "invalid-arguments-attempt",
+            &["architecture"],
+            "main",
+            head.trim(),
+            true,
+        )
+        .unwrap();
+        item.attempts[0].coder_mapping.review.coder = CoderKind::Claude;
+        let task_id = item.attempts[0].tasks[0].id.clone();
+        store.create_work_item(&item).unwrap();
+        let resolver = ContentResolver::new(Some(project_root));
+        let launches = Arc::new(Mutex::new(0));
+        let launches_for_coder = Arc::clone(&launches);
+        let make_coder = move |_sandbox| {
+            Box::new(InvalidReviewerArgumentsCoder {
+                launches: Arc::clone(&launches_for_coder),
+            }) as Box<dyn crate::coder::Coder>
+        };
+
+        run_review_task_with_coder(
+            WorkTaskRunConfig {
+                project_root,
+                store: &store,
+                work_item_id: "invalid-arguments-work",
+                attempt_id: "invalid-arguments-attempt",
+                task_id: &task_id,
+                resolver: &resolver,
+                extra_args: &["--replacement-approach".to_string()],
+                no_sandbox: true,
+                store_lock: None,
+            },
+            Some(&make_coder),
+            &FilesystemReviewerCacheAdmission,
+            &report_reviewer_cache,
+        )
+        .expect_err("invalid provider arguments pause the same Review Task");
+
+        assert_eq!(*launches.lock().unwrap(), 1);
+        let stored = store.read_work_item("invalid-arguments-work").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        let artifact_dir = project_root.join(
+            attempt.tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path
+                .clone(),
+        );
+        assert!(!artifact_dir.join("review.md").exists());
+        let handoff = fs::read_to_string(project_root.join(work_artifact_path(
+            "invalid-arguments-work",
+            "invalid-arguments-attempt",
+            "needs-user.md",
+        )))
+        .unwrap();
+        assert!(handoff.contains("unknown argument --replacement-approach"));
+        assert!(handoff.contains("pass-through provider arguments"));
     }
 
     #[test]

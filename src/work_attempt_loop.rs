@@ -796,6 +796,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         }
         if let Some(task) = attempt.tasks.iter().find(|task| {
             matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                && !attempt.is_approach_revision_superseded_task(&task.id)
                 && !attempt.is_superseded_tester_harness_followup(&task.id)
                 && !attempt.has_tester_harness_repair_for(&task.id)
                 && !attempt.active_evidence_recovery().is_some_and(|recovery| {
@@ -16591,6 +16592,77 @@ mod tests {
             fs::write(directory.join("review.md"), format!("Verdict: {verdict}\n")).unwrap();
         }
         (store, workspace)
+    }
+
+    #[test]
+    fn approach_revision_corrective_writer_schedules_targeted_reviews() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        store
+            .mutate_work_item("work-1", |item| {
+                let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                item.add_review_tasks("attempt-1", &["architecture", "documentation"])?;
+                let attempt = &mut item.attempts[0];
+                for task in attempt
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task.kind == TaskKind::Review)
+                {
+                    crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                }
+                let review_inputs = attempt.tasks[1..]
+                    .iter()
+                    .map(|task| ArtifactRef {
+                        producer_id: task.id.clone(),
+                        path: format!("{}/review.md", task.artifact_area.as_ref().unwrap().path),
+                    })
+                    .collect::<Vec<_>>();
+                let mut failed_launch = attempt.tasks[1].clone();
+                failed_launch.id = "attempt-1-review-2-architecture".to_string();
+                crate::work_model::set_task_terminal(&mut failed_launch, TaskStatus::Failed);
+                attempt.tasks.push(failed_launch.clone());
+                attempt
+                    .approach_revision_superseded_tasks
+                    .push(failed_launch.id.clone());
+                let corrective_id = item.add_next_write_round("attempt-1", review_inputs)?;
+                let corrective = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == corrective_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(corrective, TaskStatus::Complete);
+                corrective.output = Some(output);
+                item.attempts[0].status = AttemptStatus::Planned;
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("a completed corrective Writer must schedule targeted reviews");
+        };
+        let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
+        let mut roles = task_ids
+            .iter()
+            .map(|id| {
+                attempt
+                    .tasks
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .unwrap()
+                    .role
+                    .as_str()
+            })
+            .collect::<Vec<_>>();
+        roles.sort_unstable();
+        assert_eq!(roles, vec!["architecture", "documentation"]);
     }
 
     #[test]
