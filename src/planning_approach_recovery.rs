@@ -229,6 +229,21 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
             || attempt.artifacts.iter().any(|artifact| {
                 artifact.producer_id == last.id && artifact.path.ends_with("/review.md")
             })
+            || last.artifact_area.as_ref().is_some_and(|area| {
+                crate::work_task_executor::resolve_managed_artifact_area_path(
+                    project_root,
+                    &area.path,
+                )
+                .is_ok_and(|path| path.join("review.md").exists())
+            })
+            || !attempt.artifacts.iter().any(|artifact| {
+                artifact.producer_id == last.id
+                    && artifact.path.ends_with("/needs-user.md")
+                    && fs::read_to_string(project_root.join(&artifact.path)).is_ok_and(|text| {
+                        text.starts_with("# Provider arguments need repair")
+                            && text.contains("pass-through provider arguments")
+                    })
+            })
         {
             bail!("terminal Attempt is not the exact artifact-free reviewer launch failure");
         }
@@ -601,10 +616,22 @@ mod tests {
                 let failed = item.attempts[0].tasks[1].clone();
                 let mut failed = failed;
                 failed.id = "attempt-1-review-2-architecture".to_string();
+                failed.artifact_area.as_mut().unwrap().path =
+                    work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-architecture");
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
                 failed.review_context = item.attempts[0].tasks[1].review_context.clone();
                 item.attempts[0].tasks.push(failed);
+                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                fs::write(
+                    tmp.path().join(&handoff),
+                    "# Provider arguments need repair\n\npass-through provider arguments\n",
+                )
+                .unwrap();
+                item.attempts[0].artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-2-architecture".to_string(),
+                    path: handoff,
+                });
                 item.attempts[0].status = AttemptStatus::Failed;
                 Ok(())
             })

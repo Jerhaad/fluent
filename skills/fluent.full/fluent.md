@@ -263,6 +263,10 @@ complete replacement Approach and run:
 
     fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'
 
+Then run `fluent queue resume <work-item-id> --attempt <attempt-id>`, or run
+`fluent attempt run <work-item-id> <attempt-id>` in the foreground, to execute
+the corrective Writer.
+
 Fluent records the decision and the before/after Approach, preserves a qualifying
 reviewer launch failure as superseded history, and gives the corrective Writer the
 settled review artifacts for the current candidate.
