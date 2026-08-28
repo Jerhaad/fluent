@@ -8741,8 +8741,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     // Keep the approved behavior selector visible to the candidate gate.
-    const PROVIDER_ARGUMENT_TEST_SELECTOR: &str =
-        "tests::reviewer_execution_propagates_typed_provider_argument_failure";
+    const PROVIDER_ARGUMENT_TEST_SELECTORS: &[&str] = &[
+        "tests::reviewer_execution_propagates_typed_provider_argument_failure",
+        "tests::argument_words_without_typed_failure_remain_generic",
+    ];
 
     fn test_writer_cache(project_root: &Path) -> crate::writer_cache::WriterDependencyCache {
         let cache = crate::writer_cache::preflight_writer_dependency_cache(
@@ -21348,7 +21350,7 @@ mod tests {
     #[test]
     fn reviewer_execution_propagates_typed_provider_argument_failure() {
         assert!(
-            PROVIDER_ARGUMENT_TEST_SELECTOR
+            PROVIDER_ARGUMENT_TEST_SELECTORS[0]
                 .ends_with("reviewer_execution_propagates_typed_provider_argument_failure")
         );
         let typed = anyhow::Error::new(crate::coder::ProviderArgumentError {
@@ -21429,6 +21431,8 @@ mod tests {
 
     #[test]
     fn argument_words_without_typed_failure_remain_generic() {
+        assert!(PROVIDER_ARGUMENT_TEST_SELECTORS[1]
+            .ends_with("argument_words_without_typed_failure_remain_generic"));
         let tmp = tempfile::TempDir::new().unwrap();
         let error = anyhow::anyhow!("unknown argument --replacement-approach");
         assert!(matches!(
