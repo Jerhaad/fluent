@@ -480,6 +480,34 @@ mod tests {
         (tmp, store)
     }
 
+    fn assert_rejected_without_mutation(tmp: &tempfile::TempDir, store: &WorkModelStore) {
+        let before = serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            revise(
+                tmp.path(),
+                store,
+                "work-1",
+                "attempt-1",
+                REPLACEMENT.as_bytes(),
+                "Approve recovery."
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_vec(&store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+        assert!(
+            !tmp.path()
+                .join(work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "planning-approach-revisions"
+                ))
+                .exists()
+        );
+    }
+
     #[test]
     fn behavior_selector_manifest_covers_recovery_regressions() {
         assert_eq!(BEHAVIOR_TEST_SELECTORS.len(), 5);
@@ -722,16 +750,24 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(
-            revise(
-                tmp.path(),
-                &store,
-                "work-1",
-                "attempt-1",
-                REPLACEMENT.as_bytes(),
-                "Approve recovery."
-            )
-            .is_err()
-        );
+        assert_rejected_without_mutation(&tmp, &store);
+
+        let (tmp, store) = fixture();
+        store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[0].output.as_mut().unwrap().commit = "stale".to_string();
+                Ok(())
+            })
+            .unwrap();
+        assert_rejected_without_mutation(&tmp, &store);
+
+        let (tmp, store) = fixture();
+        let review = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-review-architecture/review.md",
+        ));
+        fs::write(review, "Verdict: findings\n").unwrap();
+        assert_rejected_without_mutation(&tmp, &store);
     }
 }
