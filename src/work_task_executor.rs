@@ -21343,7 +21343,7 @@ mod tests {
             "needs-user.md",
         )))
         .unwrap();
-        assert!(handoff.contains("unexpected argument '--replacement-approach'"));
+        assert!(handoff.contains("unknown argument --replacement-approach"));
         assert!(handoff.contains("pass-through provider arguments"));
     }
 
