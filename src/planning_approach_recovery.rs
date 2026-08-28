@@ -1003,6 +1003,15 @@ mod tests {
 
         for mutate in [
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
+                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                fs::write(
+                    tmp.path().join(handoff),
+                    "# Provider arguments need repair\n\npass-through provider arguments\n",
+                )
+                .unwrap();
+                assert_rejected_without_mutation(tmp, store);
+            },
+            |tmp: &tempfile::TempDir, store: &WorkModelStore| {
                 let path = tmp.path().join(work_artifact_path(
                     "work-1",
                     "attempt-1",
@@ -1051,18 +1060,27 @@ mod tests {
                     .unwrap();
                 // The candidate mismatch must reject before changing durable state.
             },
+            |_: &tempfile::TempDir, store: &WorkModelStore| {
+                store
+                    .mutate_work_item("work-1", |item| {
+                        item.attempts[0].tasks.last_mut().unwrap().kind = TaskKind::Tester;
+                        Ok(())
+                    })
+                    .unwrap();
+            },
         ] {
             let (tmp, store) = legacy_terminal_fixture();
             mutate(&tmp, &store);
-            if store.read_work_item("work-1").unwrap().attempts[0]
+            let failed = store.read_work_item("work-1").unwrap().attempts[0]
                 .tasks
                 .last()
                 .unwrap()
-                .review_context
-                .as_ref()
-                .unwrap()
-                .candidate_commit
-                == "other-candidate"
+                .clone();
+            if failed.kind != TaskKind::Review
+                || failed
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == "other-candidate")
             {
                 assert_rejected_without_mutation(&tmp, &store);
             }
