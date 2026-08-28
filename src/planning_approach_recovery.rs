@@ -84,7 +84,7 @@ pub fn revise(
     if let Some(existing) = existing_revision(project_root, attempt, &replacement, resolution)? {
         return Ok(existing);
     }
-    let audited_frontier = frontier(attempt)?;
+    let audited_frontier = frontier(project_root, attempt)?;
     let old_contract = WriterCompletionContract::from_planning_context(context)
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
     let mut revised_context = context.clone();
@@ -137,7 +137,7 @@ pub fn revise(
         producer_id: PRODUCER.to_string(),
         path: audit_artifact.clone(),
     };
-    let source_review_ref = review_artifact(audited_frontier.source_review)?;
+    let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
     let source_id = audited_frontier.source_review.id.clone();
     let failed_id = audited_frontier
         .failed_launch
@@ -155,12 +155,16 @@ pub fn revise(
         }
         let index = fresh.attempts.iter().position(|attempt| attempt.id == attempt_id)
             .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
-        let current = frontier(&fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
+        let current = frontier(project_root, &fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
         if current.candidate_commit != candidate_commit || current.source_review.id != source_id || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref() {
             return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "candidate or review frontier changed before Approach revision".to_string() });
         }
         fresh.planning_context = Some(revised_context.clone());
-        let task_id = fresh.add_next_write_round(attempt_id, vec![audit_ref.clone(), source_review_ref.clone()])?;
+        let mut inputs = vec![audit_ref.clone()];
+        for review in &review_refs {
+            if !inputs.contains(review) { inputs.push(review.clone()); }
+        }
+        let task_id = fresh.add_next_write_round(attempt_id, inputs)?;
         let attempt = &mut fresh.attempts[index];
         attempt.writer_completion_contract = Some(new_contract.clone());
         if !attempt.artifacts.contains(&audit_ref) { attempt.artifacts.push(audit_ref.clone()); }
@@ -172,7 +176,7 @@ pub fn revise(
         let writer = attempt.tasks.iter_mut().find(|task| task.id == task_id)
             .ok_or_else(|| WorkModelError::TaskNotFound { id: task_id.clone() })?;
         writer.role = CORRECTIVE_WRITER_ROLE.to_string();
-        writer.instructions = Some(format!("Implement the approved Approach revision and resolve the Architecture finding. Human resolution: {resolution}"));
+        writer.instructions = Some(format!("Implement the approved Approach revision and resolve every actionable finding from the settled review round. Human resolution: {resolution}"));
         attempt.status = AttemptStatus::Planned;
         attempt.pause_kind = None;
         attempt.pause_recovery = None;
@@ -193,7 +197,7 @@ struct Frontier<'a> {
     candidate_commit: String,
 }
 
-fn frontier(attempt: &Attempt) -> Result<Frontier<'_>> {
+fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a>> {
     let terminal_failure = attempt.status == AttemptStatus::Failed;
     if !(attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(PauseKind::Uncertain))
@@ -209,6 +213,14 @@ fn frontier(attempt: &Attempt) -> Result<Frontier<'_>> {
         if last.kind != TaskKind::Review
             || last.status != TaskStatus::Failed
             || last.output.is_some()
+            || !attempt.artifacts.iter().any(|artifact| {
+                artifact.producer_id == last.id
+                    && artifact.path.ends_with("/needs-user.md")
+                    && fs::read_to_string(project_root.join(&artifact.path)).is_ok_and(|text| {
+                        text.starts_with("# Provider arguments need repair")
+                            && text.contains("pass-through provider arguments")
+                    })
+            })
         {
             bail!("terminal Attempt is not the exact artifact-free reviewer launch failure");
         }
@@ -248,11 +260,66 @@ fn frontier(attempt: &Attempt) -> Result<Frontier<'_>> {
     if context.candidate_commit != candidate_commit {
         bail!("Architecture review is not bound to the current candidate");
     }
+    if let Some(failed_launch) = failed_launch {
+        let failed_context = failed_launch
+            .review_context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("failed reviewer launch has no candidate context"))?;
+        if failed_context.candidate_commit != context.candidate_commit {
+            bail!("failed reviewer launch is not bound to the uncertain review frontier");
+        }
+    }
+    let source_artifact = review_artifact(source_review)?;
+    if !fs::read_to_string(project_root.join(source_artifact.path))
+        .is_ok_and(|text| text.contains("Verdict: uncertain"))
+    {
+        bail!("Architecture review did not record an uncertain verdict");
+    }
     Ok(Frontier {
         source_review,
         failed_launch,
         candidate_commit,
     })
+}
+
+fn settled_round_review_artifacts(attempt: &Attempt, source: &Task) -> Result<Vec<ArtifactRef>> {
+    let candidate = source
+        .review_context
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Architecture review has no candidate context"))?;
+    let round = source
+        .id
+        .split("-review-")
+        .nth(1)
+        .and_then(|value| value.split('-').next());
+    let mut artifacts = Vec::new();
+    for task in &attempt.tasks {
+        if task.kind != TaskKind::Review || task.status != TaskStatus::Complete {
+            continue;
+        }
+        let same_round = match (
+            round,
+            task.id
+                .split("-review-")
+                .nth(1)
+                .and_then(|value| value.split('-').next()),
+        ) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, None) => true,
+            _ => false,
+        };
+        if same_round
+            && task
+                .review_context
+                .as_ref()
+                .is_some_and(|context| context.candidate_commit == candidate.candidate_commit)
+        {
+            artifacts.push(review_artifact(task)?);
+        }
+    }
+    (!artifacts.is_empty())
+        .then_some(artifacts)
+        .ok_or_else(|| anyhow::anyhow!("settled review round has no review artifacts"))
 }
 
 fn review_artifact(task: &Task) -> Result<ArtifactRef> {
@@ -397,6 +464,21 @@ mod tests {
         }
         attempt.status = AttemptStatus::NeedsUser;
         attempt.pause_kind = Some(PauseKind::Uncertain);
+        for task in attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            let area = task.artifact_area.as_ref().unwrap();
+            let path = tmp.path().join(&area.path).join("review.md");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let body = if task.role == "architecture" {
+                "# Architecture review\n\nVerdict: uncertain\n\nArchitecture finding.\n"
+            } else {
+                "# Documentation review\n\nVerdict: findings\n\nDocumentation finding.\n"
+            };
+            fs::write(path, body).unwrap();
+        }
         store.create_work_item(&item).unwrap();
         (tmp, store)
     }
@@ -440,7 +522,20 @@ mod tests {
                 failed.id = "attempt-1-review-2-architecture".to_string();
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
+                failed.review_context = item.attempts[0].tasks[1].review_context.clone();
                 item.attempts[0].tasks.push(failed);
+                let handoff = work_artifact_path("work-1", "attempt-1", "needs-user.md");
+                let handoff_path = tmp.path().join(&handoff);
+                fs::create_dir_all(handoff_path.parent().unwrap()).unwrap();
+                fs::write(
+                    &handoff_path,
+                    "# Provider arguments need repair\n\npass-through provider arguments\n",
+                )
+                .unwrap();
+                item.attempts[0].artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-2-architecture".to_string(),
+                    path: handoff,
+                });
                 item.attempts[0].status = AttemptStatus::Failed;
                 Ok(())
             })

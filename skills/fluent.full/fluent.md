@@ -248,12 +248,24 @@ records the dispatch as blocked. Run `fluent queue resume <work-item-id>
 reviewed candidate is still clean and unchanged before queueing and again at
 claim, then retries only the Learner. Use `fluent attempt run <work-item-id>
 <attempt-id>` for the equivalent foreground recovery.
-When the pause is `provider-unavailable`, wait for provider capacity, then run
-`fluent attempt run <work-item-id> [attempt-id]` without new input. For a hung or
-interrupted local coder, run `fluent attempt cancel <work-item-id> <attempt-id>`;
+When the pause is `provider-unavailable`, read the needs-user handoff first.
+If it identifies invalid pass-through provider arguments, remove or correct those
+arguments, then run `fluent attempt run <work-item-id> [attempt-id]` to retry the
+same Task. If it identifies exhausted provider capacity, wait for capacity, then
+run that same command without new input. For a hung or interrupted local coder,
+run `fluent attempt cancel <work-item-id> <attempt-id>`;
 after Fluent confirms its owned process group stopped, the same `attempt run`
 command replans only the canceled Task. Fluent keeps completed peer Tasks and
 prior transcripts.
+
+When an uncertain Architecture review has a ratified replacement design, save the
+complete replacement Approach and run:
+
+    fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'
+
+Fluent records the decision and the before/after Approach, preserves a qualifying
+reviewer launch failure as superseded history, and gives the corrective Writer the
+settled review artifacts for the current candidate.
 
 ### Recover a host-evidence finding
 

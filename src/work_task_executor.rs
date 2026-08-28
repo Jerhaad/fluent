@@ -21220,12 +21220,65 @@ mod tests {
             "unknown argument --replacement-approach"
         ))));
         let error = anyhow::anyhow!("unknown argument --replacement-approach");
-        match classify_task_failure(&error) {
+        let failure = classify_task_failure(&error);
+        match &failure {
             TaskFailure::ProviderArguments(message) => {
                 assert!(message.contains("pass-through provider arguments"));
                 assert!(message.contains("fluent attempt run"));
             }
             _ => panic!("invalid reviewer arguments must use a recoverable provider pause"),
         }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Pause invalid reviewer arguments");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].status = TaskStatus::Complete;
+        item.attempts[0].tasks[0].output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../candidate".to_string(),
+            source_branch: "work-1".to_string(),
+            base_commit: Some("base".to_string()),
+            commit: "candidate".to_string(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks("attempt-1", &["architecture"])
+            .unwrap();
+        let task_id = item.attempts[0].tasks[1].id.clone();
+        store.create_work_item(&item).unwrap();
+
+        mark_task_failed_attempt_needs_user(
+            &store,
+            tmp.path(),
+            "work-1",
+            "attempt-1",
+            &task_id,
+            &failure,
+            &|_, _| {},
+        )
+        .unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::NeedsUser);
+        assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .unwrap()
+                .status,
+            TaskStatus::NeedsUser
+        );
+        let handoff = fs::read_to_string(tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "needs-user.md",
+        )))
+        .unwrap();
+        assert!(handoff.starts_with("# Provider arguments need repair"));
+        assert!(handoff.contains("Remove or correct the pass-through provider arguments"));
     }
 }
