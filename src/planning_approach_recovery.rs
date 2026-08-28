@@ -9,9 +9,9 @@ use std::path::Path;
 
 use crate::work_model::{
     ApproachRevisionSupersession, ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus,
-    DurableTransitionMetadata, DurableTransitionOrigin, PauseKind, Task, TaskKind, TaskStatus,
-    WorkModelError, WorkModelStore, WriterCompletionContract, WriterCompletionRequirementKind,
-    work_artifact_path,
+    DurableTransitionMetadata, DurableTransitionOrigin, PauseKind, RoundCapExtensionRequest,
+    RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
+    WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
@@ -100,8 +100,10 @@ pub fn revise(
         return Ok(existing);
     }
     let audited_frontier = frontier(project_root, attempt)?;
+    let legacy_cap_extension = audited_frontier.legacy_reconciliation.is_some();
     if attempt.materialized_write_rounds()
         >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
+        && !legacy_cap_extension
     {
         bail!("Approach revision has no remaining authorized Writer round");
     }
@@ -130,6 +132,22 @@ pub fn revise(
         .ok_or_else(|| anyhow::anyhow!("replacement Approach lost the completion contract"))?;
     validate_contract_delta(&old_contract, &new_contract)?;
     let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
+    let round_cap_reviews = legacy_cap_extension
+        .then(|| {
+            review_refs
+                .iter()
+                .map(|artifact| {
+                    Ok(RoundCapReviewArtifact {
+                        artifact: artifact.clone(),
+                        digest: format!(
+                            "sha256:{}",
+                            digest(&fs::read(project_root.join(&artifact.path))?)
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
 
     let revision_id = format!(
         "revision-{}",
@@ -185,9 +203,31 @@ pub fn revise(
         }
         let index = fresh.attempts.iter().position(|attempt| attempt.id == attempt_id)
             .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
-        let current = frontier(project_root, &fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
-        if current.candidate_commit != candidate_commit || current.source_review.id != source_id || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref() {
-            return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "candidate or review frontier changed before Approach revision".to_string() });
+        let current_is_legacy = {
+            let current = frontier(project_root, &fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
+            if current.candidate_commit != candidate_commit || current.source_review.id != source_id || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref() {
+                return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "candidate or review frontier changed before Approach revision".to_string() });
+            }
+            current.legacy_reconciliation.is_some()
+        };
+        let attempt = &mut fresh.attempts[index];
+        if legacy_cap_extension
+            && current_is_legacy
+            && attempt.materialized_write_rounds()
+                >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
+        {
+            let old_cap = attempt
+                .effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds());
+            attempt.record_round_cap_extension(
+                crate::work_attempt_loop::max_total_write_rounds(),
+                RoundCapExtensionRequest {
+                    old_cap,
+                    additional_write_rounds: 1,
+                    candidate_commit: candidate_commit.clone(),
+                    failed_reviews: round_cap_reviews.clone().unwrap_or_default(),
+                    human_resolution: resolution.to_string(),
+                },
+            )?;
         }
         fresh.planning_context = Some(revised_context.clone());
         let mut inputs = vec![audit_ref.clone()];
@@ -769,16 +809,41 @@ mod tests {
         let (tmp, store) = fixture();
         store
             .mutate_work_item("work-1", |item| {
-                item.attempts[0].tasks[1].id = "attempt-1-review-38-architecture".to_string();
-                item.attempts[0].tasks[2].id = "attempt-1-review-38-documentation".to_string();
-                let failed = item.attempts[0].tasks[1].clone();
+                let writer = item.attempts[0].tasks[0].clone();
+                for round in 2..=crate::work_attempt_loop::max_total_write_rounds() {
+                    let mut historical_writer = writer.clone();
+                    historical_writer.id = format!("attempt-1-write-{round}");
+                    historical_writer.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                        path: work_artifact_path(
+                            "work-1",
+                            "attempt-1",
+                            &historical_writer.id,
+                        ),
+                    });
+                    item.attempts[0].tasks.insert(1, historical_writer);
+                }
+                let source_index = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .position(|task| task.kind == TaskKind::Review && task.role == "architecture")
+                    .unwrap();
+                let documentation_index = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .position(|task| task.kind == TaskKind::Review && task.role == "documentation")
+                    .unwrap();
+                item.attempts[0].tasks[source_index].id =
+                    "attempt-1-review-38-architecture".to_string();
+                item.attempts[0].tasks[documentation_index].id =
+                    "attempt-1-review-38-documentation".to_string();
+                let failed = item.attempts[0].tasks[source_index].clone();
                 let mut failed = failed;
                 failed.id = "attempt-1-review-39-architecture".to_string();
                 failed.artifact_area.as_mut().unwrap().path =
                     work_artifact_path("work-1", "attempt-1", "attempt-1-review-39-architecture");
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
-                failed.review_context = item.attempts[0].tasks[1].review_context.clone();
+                failed.review_context = item.attempts[0].tasks[source_index].review_context.clone();
                 item.attempts[0].tasks.push(failed);
                 let handoff = work_artifact_path(
                     "work-1",
@@ -852,6 +917,12 @@ mod tests {
             TaskStatus::Failed
         );
         assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert_eq!(attempt.round_cap_extensions.len(), 1);
+        assert_eq!(attempt.round_cap_extensions[0].additional_write_rounds, 1);
+        assert_eq!(
+            attempt.round_cap_extensions[0].new_cap,
+            crate::work_attempt_loop::max_total_write_rounds() + 1
+        );
         assert_eq!(attempt.tasks[0].output, candidate);
         assert!(prior_reviews.iter().all(|id| {
             attempt
