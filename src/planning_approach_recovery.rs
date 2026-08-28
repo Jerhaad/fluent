@@ -166,10 +166,15 @@ pub fn revise(
         let attempt = &mut fresh.attempts[index];
         attempt.writer_completion_contract = Some(new_contract.clone());
         if !attempt.artifacts.contains(&audit_ref) { attempt.artifacts.push(audit_ref.clone()); }
-        if let Some(failed_id) = &failed_id {
-            let failed = attempt.tasks.iter_mut().find(|task| task.id == *failed_id)
-                .ok_or_else(|| WorkModelError::TaskNotFound { id: failed_id.clone() })?;
-            failed.status = TaskStatus::Superseded;
+        if let Some(failed_id) = &failed_id
+            && !attempt
+                .tasks
+                .iter()
+                .any(|task| task.id == *failed_id && task.status == TaskStatus::Failed)
+        {
+            return Err(WorkModelError::TaskNotFound {
+                id: failed_id.clone(),
+            });
         }
         let writer = attempt.tasks.iter_mut().find(|task| task.id == task_id)
             .ok_or_else(|| WorkModelError::TaskNotFound { id: task_id.clone() })?;
@@ -637,7 +642,7 @@ mod tests {
                 .find(|task| task.id == "attempt-1-review-2-architecture")
                 .unwrap()
                 .status,
-            TaskStatus::Superseded
+            TaskStatus::Failed
         );
         assert_eq!(attempt.status, AttemptStatus::Planned);
         assert_eq!(attempt.tasks[0].output, candidate);
