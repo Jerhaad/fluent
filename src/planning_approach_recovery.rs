@@ -1208,6 +1208,15 @@ mod tests {
                 .unwrap();
                 assert_rejected_without_mutation(tmp, store);
             },
+            |_: &tempfile::TempDir, store: &WorkModelStore| {
+                store
+                    .mutate_work_item("work-1", |item| {
+                        let output = item.attempts[0].tasks[0].output.clone().unwrap();
+                        item.attempts[0].tasks.last_mut().unwrap().output = Some(output);
+                        Ok(())
+                    })
+                    .unwrap();
+            },
             |tmp: &tempfile::TempDir, store: &WorkModelStore| {
                 let path = tmp.path().join(work_artifact_path(
                     "work-1",

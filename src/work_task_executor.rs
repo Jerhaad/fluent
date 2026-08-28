@@ -21343,7 +21343,7 @@ mod tests {
             "needs-user.md",
         )))
         .unwrap();
-        assert!(handoff.contains("unknown argument --replacement-approach"));
+        assert!(handoff.contains("unexpected argument '--replacement-approach'"));
         assert!(handoff.contains("pass-through provider arguments"));
     }
 
@@ -21353,20 +21353,48 @@ mod tests {
             PROVIDER_ARGUMENT_TEST_SELECTORS[0]
                 .ends_with("reviewer_execution_propagates_typed_provider_argument_failure")
         );
-        let typed = anyhow::Error::new(crate::coder::ProviderArgumentError {
-            provider: CoderKind::Codex,
-            exit_status: 2,
-            diagnostic: "unknown argument --replacement-approach".to_string(),
-            invocation: "--replacement-approach".to_string(),
-        });
-        assert!(!should_retry_coder_error(&Err(typed)));
         let tmp = tempfile::TempDir::new().unwrap();
-        let error = anyhow::Error::new(crate::coder::ProviderArgumentError {
-            provider: CoderKind::Codex,
-            exit_status: 2,
-            diagnostic: "unknown argument --replacement-approach".to_string(),
-            invocation: "--replacement-approach".to_string(),
-        });
+        let executable = tmp.path().join("codex-provider-double");
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho \"error: unexpected argument '--replacement-approach' found\" >&2\necho \"Usage: codex exec [OPTIONS] [PROMPT]\" >&2\nexit 2\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let transcript = tmp.path().join("reviewer-transcript.jsonl");
+        let capture = crate::coder::TranscriptCapture::with_config(&transcript, Default::default());
+        let coder = crate::coder::CodexCode {
+            sandbox_profile: None,
+            trusted_sandbox: false,
+            model_override: None,
+            effort: None,
+            executable,
+        };
+        let error = crate::coder::Coder::run_captured(
+            &coder,
+            "review prompt",
+            "review system prompt",
+            tmp.path(),
+            &["--replacement-approach".to_string()],
+            &[],
+            Some(&capture),
+        )
+        .expect_err("Codex parser exit becomes a typed provider argument error");
+        assert!(error.is::<crate::coder::ProviderArgumentError>());
+        assert!(!should_retry_coder_error(&Err(
+            error.context("typed provider error")
+        )));
+        let error = crate::coder::Coder::run_captured(
+            &coder,
+            "review prompt",
+            "review system prompt",
+            tmp.path(),
+            &["--replacement-approach".to_string()],
+            &[],
+            Some(&capture),
+        )
+        .expect_err("Codex parser exit remains available to reviewer settlement");
         let failure = classify_reviewer_launch_failure(&error, &tmp.path().join("review.md"));
         match &failure {
             TaskFailure::ProviderArguments(message) => {
@@ -21426,7 +21454,7 @@ mod tests {
         .unwrap();
         assert!(handoff.starts_with("# Provider arguments need repair"));
         assert!(handoff.contains("Remove or correct the pass-through provider arguments"));
-        assert!(handoff.contains("unknown argument --replacement-approach"));
+        assert!(handoff.contains("unexpected argument '--replacement-approach'"));
     }
 
     #[test]

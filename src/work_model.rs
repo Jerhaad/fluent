@@ -5725,7 +5725,9 @@ impl Task {
                     task_id: self.id.clone(),
                 });
             }
-        } else if self.output.is_some() {
+        } else if self.output.is_some()
+            && !(self.kind == TaskKind::Review && self.status == TaskStatus::Failed)
+        {
             return Err(WorkModelError::IncompleteTaskHasOutput {
                 task_id: self.id.clone(),
                 status: self.status.clone(),
