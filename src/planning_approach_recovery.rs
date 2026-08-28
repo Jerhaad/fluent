@@ -290,6 +290,12 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
     if context.candidate_commit != candidate_commit {
         bail!("Architecture review is not bound to the current candidate");
     }
+    let source_artifact = review_artifact(source_review)?;
+    if !fs::read_to_string(project_root.join(source_artifact.path))
+        .is_ok_and(|text| text.contains("Verdict: uncertain"))
+    {
+        bail!("Architecture review did not record an uncertain verdict");
+    }
     if let Some(failed_launch) = failed_launch {
         let failed_context = failed_launch
             .review_context
@@ -298,15 +304,34 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         if failed_context.candidate_commit != context.candidate_commit {
             bail!("failed reviewer launch is not bound to the uncertain review frontier");
         }
-        if review_round(failed_launch) != review_round(source_review) {
-            bail!("failed reviewer launch is not in the uncertain review round");
+        let source_index = attempt
+            .tasks
+            .iter()
+            .position(|task| task.id == source_review.id)
+            .ok_or_else(|| anyhow::anyhow!("Architecture review is not in the Attempt"))?;
+        let source_round = review_round(source_review)
+            .and_then(|round| round.parse::<usize>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Architecture review has no numbered review round"))?;
+        let failed_round = review_round(failed_launch)
+            .and_then(|round| round.parse::<usize>().ok())
+            .ok_or_else(|| {
+                anyhow::anyhow!("failed reviewer launch has no numbered review round")
+            })?;
+        if failed_round != source_round + 1
+            || attempt.tasks[source_index + 1..]
+                .iter()
+                .take_while(|task| task.id != failed_launch.id)
+                .any(|task| {
+                    task.kind != TaskKind::Review
+                        || task.status != TaskStatus::Complete
+                        || review_round(task).and_then(|round| round.parse::<usize>().ok())
+                            != Some(source_round)
+                })
+        {
+            bail!(
+                "failed reviewer launch does not immediately follow the uncertain review frontier"
+            );
         }
-    }
-    let source_artifact = review_artifact(source_review)?;
-    if !fs::read_to_string(project_root.join(source_artifact.path))
-        .is_ok_and(|text| text.contains("Verdict: uncertain"))
-    {
-        bail!("Architecture review did not record an uncertain verdict");
     }
     Ok(Frontier {
         source_review,
@@ -744,12 +769,13 @@ mod tests {
         let (tmp, store) = fixture();
         store
             .mutate_work_item("work-1", |item| {
-                item.attempts[0].tasks[1].id = "attempt-1-review-2-architecture".to_string();
+                item.attempts[0].tasks[1].id = "attempt-1-review-38-architecture".to_string();
+                item.attempts[0].tasks[2].id = "attempt-1-review-38-documentation".to_string();
                 let failed = item.attempts[0].tasks[1].clone();
                 let mut failed = failed;
-                failed.id = "attempt-1-review-2-documentation".to_string();
+                failed.id = "attempt-1-review-39-architecture".to_string();
                 failed.artifact_area.as_mut().unwrap().path =
-                    work_artifact_path("work-1", "attempt-1", "attempt-1-review-2-documentation");
+                    work_artifact_path("work-1", "attempt-1", "attempt-1-review-39-architecture");
                 failed.status = TaskStatus::Failed;
                 failed.output = None;
                 failed.review_context = item.attempts[0].tasks[1].review_context.clone();
@@ -757,7 +783,7 @@ mod tests {
                 let handoff = work_artifact_path(
                     "work-1",
                     "attempt-1",
-                    "needs-user-attempt-1-review-2-documentation.md",
+                    "needs-user-attempt-1-review-39-architecture.md",
                 );
                 fs::write(
                     tmp.path().join(&handoff),
@@ -765,7 +791,7 @@ mod tests {
                 )
                 .unwrap();
                 item.attempts[0].artifacts.push(ArtifactRef {
-                    producer_id: "attempt-1-review-2-documentation".to_string(),
+                    producer_id: "attempt-1-review-39-architecture".to_string(),
                     path: handoff,
                 });
                 item.attempts[0].status = AttemptStatus::Failed;
@@ -812,7 +838,7 @@ mod tests {
         assert_eq!(receipt.candidate_commit, "candidate");
         assert_eq!(
             receipt.failed_review_task_id,
-            "attempt-1-review-2-documentation"
+            "attempt-1-review-39-architecture"
         );
         assert!(receipt.diagnostic_excerpt.contains("unexpected argument"));
         let attempt = &store.read_work_item("work-1").unwrap().attempts[0];
@@ -820,7 +846,7 @@ mod tests {
             attempt
                 .tasks
                 .iter()
-                .find(|task| task.id == "attempt-1-review-2-documentation")
+                .find(|task| task.id == "attempt-1-review-39-architecture")
                 .unwrap()
                 .status,
             TaskStatus::Failed
