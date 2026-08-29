@@ -363,7 +363,9 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
             .ok_or_else(|| {
                 anyhow::anyhow!("failed reviewer launch has no numbered review round")
             })?;
-        if failed_round != source_round + 1
+        if source_round != 38
+            || failed_round != 39
+            || failed_round != source_round + 1
             || attempt.tasks[source_index + 1..]
                 .iter()
                 .take_while(|task| task.id != failed_launch.id)
