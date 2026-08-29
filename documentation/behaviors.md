@@ -6572,9 +6572,19 @@ Test: src/work_attempt_loop.rs (passing_candidate_gate_is_attached_to_every_revi
 ### B25
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL reject a candidate
-whose whitespace, linear commit metadata, or prohibited trailers do not satisfy
-the admission rules.
-Test: src/candidate_gate.rs (rejects_whitespace_errors_and_prohibited_commit_metadata)
+whose whitespace, linear history, author or committer identity, subject, or
+literal newline encoding does not satisfy the cross-project integrity rules.
+Test: src/candidate_gate.rs (rejects_whitespace_errors_and_malformed_commit_metadata)
+Test: src/candidate_gate.rs (rejects_merge_commits)
+Test: src/candidate_gate.rs (rejects_invalid_identities)
+
+### B25aa
+
+WHEN structurally valid commit metadata differs only in body presence, body
+line wrapping, or attribution-trailer style, THE SYSTEM SHALL leave its
+acceptance to the project's check hook.
+Test: src/candidate_gate.rs (accepts_subject_only_and_coauthored_commits_as_project_policy)
+Test: src/candidate_gate.rs (accepts_overlong_commit_body_lines_as_project_policy)
 
 ### B25a
 

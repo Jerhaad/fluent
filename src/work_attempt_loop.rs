@@ -16930,7 +16930,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_commit_body_returns_to_writer_before_review() {
+    fn missing_commit_body_reaches_review_without_a_project_policy_hook() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, workspace) =
             make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
@@ -16963,21 +16963,25 @@ mod tests {
 
         assert!(matches!(
             outcome,
-            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+            WorkAttemptRunOutcome::PlannedReviews { .. }
         ));
         let stored = store.read_work_item("work-1").unwrap();
         assert!(
             stored.attempts[0]
                 .tasks
                 .iter()
-                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+                .any(|task| task.kind == TaskKind::Review)
         );
-        let gate = &stored.attempts[0].tasks.last().unwrap().input_artifacts[0];
+        let gate = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .unwrap();
         let evidence: crate::candidate_gate::CandidateGateEvidence =
             serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
         assert_eq!(
             evidence.disposition,
-            crate::candidate_gate::CandidateGateDisposition::Rejected
+            crate::candidate_gate::CandidateGateDisposition::Passed
         );
         assert_eq!(
             evidence
@@ -16986,7 +16990,7 @@ mod tests {
                 .find(|check| check.name == "commit-metadata")
                 .unwrap()
                 .status,
-            crate::candidate_gate::CandidateCheckStatus::Failed
+            crate::candidate_gate::CandidateCheckStatus::Passed
         );
     }
 

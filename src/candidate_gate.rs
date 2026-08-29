@@ -669,37 +669,9 @@ fn check_commit_metadata(
         {
             diagnostics.push(format!("commit {commit} has an empty subject"));
         }
-        let mut message_lines = message.lines();
-        let _subject = message_lines.next();
-        let has_body = message_lines
-            .next()
-            .is_some_and(|separator| separator.trim().is_empty())
-            && message_lines.any(|line| !line.trim().is_empty());
-        if !has_body {
-            diagnostics.push(format!(
-                "commit {commit} has no body separated from its subject by a blank line"
-            ));
-        }
         if message.contains("\\n") {
             diagnostics.push(format!(
                 "commit {commit} contains literal \\n text instead of line breaks"
-            ));
-        }
-        for (index, line) in message.lines().enumerate().skip(1) {
-            if line.chars().count() > 72 {
-                diagnostics.push(format!(
-                    "commit {commit} body line {} exceeds 72 characters",
-                    index + 1
-                ));
-            }
-        }
-        if message.lines().any(|line| {
-            line.trim_start()
-                .to_ascii_lowercase()
-                .starts_with("co-authored-by:")
-        }) {
-            diagnostics.push(format!(
-                "commit {commit} contains a prohibited Co-Authored-By trailer"
             ));
         }
     }
@@ -1440,12 +1412,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_whitespace_errors_and_prohibited_commit_metadata() {
+    fn rejects_whitespace_errors_and_malformed_commit_metadata() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
             "src/lib.rs",
             "pub fn value() {    \n}\n",
-            "Add value\\n\\nCo-Authored-By: Bot <bot@example.invalid>",
+            "Add value\\n\\nExplain value",
         );
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
 
@@ -1464,6 +1436,84 @@ mod tests {
         let parsed: CandidateGateEvidence =
             serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
         assert_eq!(parsed, evidence);
+    }
+
+    #[test]
+    fn rejects_merge_commits() {
+        let merge_fixture = Fixture::new();
+        let branch = crate::git::run_stdout(
+            merge_fixture.root.path(),
+            &["branch", "--show-current"],
+            "read fixture branch",
+        )
+        .unwrap();
+        merge_fixture.commit("src/main.rs", "pub fn main_value() {}\n", "Add main value");
+        crate::git::run(
+            merge_fixture.root.path(),
+            &["checkout", "-q", "-b", "side", &merge_fixture.base],
+            "create side branch",
+        )
+        .unwrap();
+        merge_fixture.commit("src/side.rs", "pub fn side_value() {}\n", "Add side value");
+        crate::git::run(
+            merge_fixture.root.path(),
+            &["checkout", "-q", &branch],
+            "restore fixture branch",
+        )
+        .unwrap();
+        crate::git::run(
+            merge_fixture.root.path(),
+            &["merge", "--no-ff", "-q", "-m", "Merge side branch", "side"],
+            "create merge candidate",
+        )
+        .unwrap();
+        let merge_candidate = crate::git::run_stdout(
+            merge_fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read merge candidate",
+        )
+        .unwrap();
+        let merge_artifact = merge_fixture.artifacts.path().join("merge.json");
+        let merge_evidence = run_candidate_gate(merge_fixture.request(
+            &merge_candidate,
+            None,
+            None,
+            &merge_artifact,
+        ))
+        .unwrap();
+        assert!(
+            check(&merge_evidence, "commit-metadata")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("is a merge commit"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_identities() {
+        let identity_fixture = Fixture::new();
+        crate::git::run(
+            identity_fixture.root.path(),
+            &["config", "user.email", "writer@example.invalid"],
+            "configure invalid fixture identity",
+        )
+        .unwrap();
+        let identity_candidate =
+            identity_fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add value");
+        let identity_artifact = identity_fixture.artifacts.path().join("identity.json");
+        let identity_evidence = run_candidate_gate(identity_fixture.request(
+            &identity_candidate,
+            None,
+            None,
+            &identity_artifact,
+        ))
+        .unwrap();
+        assert!(
+            check(&identity_evidence, "commit-metadata")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("invalid author email"))
+        );
     }
 
     #[test]
@@ -1837,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_overlong_commit_body_lines() {
+    fn accepts_overlong_commit_body_lines_as_project_policy() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
             "src/lib.rs",
@@ -1849,34 +1899,26 @@ mod tests {
         let evidence =
             run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
 
-        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
-        assert!(
-            check(&evidence, "commit-metadata")
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("exceeds 72 characters"))
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            check(&evidence, "commit-metadata").status,
+            CandidateCheckStatus::Passed
         );
     }
 
     #[test]
-    fn rejects_commit_without_body() {
+    fn accepts_subject_only_and_coauthored_commits_as_project_policy() {
         let subject_only_fixture = Fixture::new();
         let subject_only = subject_only_fixture.commit(
             "src/subject_only.rs",
             "pub fn subject_only() {}\n",
             "Add subject-only candidate",
         );
-        let whitespace_only_fixture = Fixture::new();
-        let whitespace_only = whitespace_only_fixture.commit(
-            "src/whitespace_only.rs",
-            "pub fn whitespace_only() {}\n",
-            "Add whitespace-only candidate\n\n   ",
-        );
-        let valid_fixture = Fixture::new();
-        let valid = valid_fixture.commit(
-            "src/valid.rs",
-            "pub fn valid() {}\n",
-            "Add valid candidate\n\n- Explain the candidate",
+        let coauthored_fixture = Fixture::new();
+        let coauthored = coauthored_fixture.commit(
+            "src/coauthored.rs",
+            "pub fn coauthored() {}\n",
+            "Add coauthored candidate\n\nCo-Authored-By: Bot <bot@example.com>",
         );
 
         let subject_only_artifact = subject_only_fixture
@@ -1892,30 +1934,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             check(&subject_only_evidence, "commit-metadata").status,
-            CandidateCheckStatus::Failed
+            CandidateCheckStatus::Passed
         );
 
-        let whitespace_only_artifact = whitespace_only_fixture
-            .artifacts
-            .path()
-            .join("whitespace-only.json");
-        let whitespace_only_evidence = run_candidate_gate(whitespace_only_fixture.request(
-            &whitespace_only,
+        let coauthored_artifact = coauthored_fixture.artifacts.path().join("coauthored.json");
+        let coauthored_evidence = run_candidate_gate(coauthored_fixture.request(
+            &coauthored,
             None,
             None,
-            &whitespace_only_artifact,
+            &coauthored_artifact,
         ))
         .unwrap();
         assert_eq!(
-            check(&whitespace_only_evidence, "commit-metadata").status,
-            CandidateCheckStatus::Failed
-        );
-
-        let valid_artifact = valid_fixture.artifacts.path().join("valid.json");
-        let valid_evidence =
-            run_candidate_gate(valid_fixture.request(&valid, None, None, &valid_artifact)).unwrap();
-        assert_eq!(
-            check(&valid_evidence, "commit-metadata").status,
+            check(&coauthored_evidence, "commit-metadata").status,
             CandidateCheckStatus::Passed
         );
     }

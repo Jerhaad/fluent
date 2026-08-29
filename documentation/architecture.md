@@ -274,9 +274,11 @@ publication.
 Writers with a persisted base commit also cross a deterministic admission gate
 before matrix reconciliation or review. The host verifies the exact candidate
 and clean workspace, runs `git diff --check`, rejects merge commits, invalid
-identities, literal `\\n` message text, and `Co-Authored-By` trailers, and resolves
-approved behavior references against committed test files and native test
-identifiers. It stores the results under the Attempt's `candidate-gates/`
+identities, empty subjects, and literal `\\n` message text, and resolves approved
+behavior references against committed test files and native test identifiers.
+Commit-body presence, line wrapping, attribution trailers, and other repository
+style conventions remain project-owned and may be enforced by
+`check-pre-merge`. Fluent stores the results under the Attempt's `candidate-gates/`
 artifacts, separate from the Writer's private artifact directory. A first
 candidate defect becomes the sole input to one
 corrective Writer. Failed check diagnostics are also promoted into the
