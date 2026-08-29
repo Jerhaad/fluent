@@ -46,4 +46,19 @@ assert_rejected "exceeds 72 characters"
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n- Explain the candidate\n\nCo-Authored-By: Bot <bot@example.com>'
 assert_rejected "prohibited Co-Authored-By trailer"
 
+git -C "$FIXTURE" reset --hard -q "$BASE"
+git -C "$FIXTURE" checkout -q -b policy-feature
+printf 'legacy\n' >> "$FIXTURE/value.txt"
+git -C "$FIXTURE" commit -qam "Add legacy candidate"
+mkdir -p "$FIXTURE/scripts"
+cp "$CHECK" "$FIXTURE/scripts/check-commit-message-policy.sh"
+git -C "$FIXTURE" add scripts/check-commit-message-policy.sh
+git -C "$FIXTURE" commit -q -m $'Add commit policy\n\n- Enforce new commit conventions prospectively'
+printf 'current\n' >> "$FIXTURE/value.txt"
+git -C "$FIXTURE" commit -qam $'Add current candidate\n\n- Follow the active commit policy'
+(
+  cd "$FIXTURE"
+  "$CHECK"
+)
+
 echo "commit-message policy behavior passed"

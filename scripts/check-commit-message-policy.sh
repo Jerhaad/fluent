@@ -18,6 +18,14 @@ if ! git merge-base --is-ancestor "$base" "$candidate"; then
   exit 2
 fi
 
+policy_start=$(
+  git log --format='%H' --diff-filter=A "$candidate" -- \
+    scripts/check-commit-message-policy.sh | tail -n 1
+)
+if [ -n "$policy_start" ] && git merge-base --is-ancestor "$base" "$policy_start"; then
+  base=$(git rev-parse "$policy_start^")
+fi
+
 metadata=$(git log --format='%H%x1f%B%x1e' "$base..$candidate")
 printf '%s\n' "$metadata" | awk '
   BEGIN { RS = "\036"; FS = "\037"; failed = 0 }
