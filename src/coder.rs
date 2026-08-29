@@ -1114,6 +1114,9 @@ fn classify_provider_argument_failure(
         ]
         .iter()
         .any(|marker| normalized.contains(marker))
+        || !extra_args
+            .iter()
+            .any(|argument| argument.starts_with('-') && contains_cli_argument(&stderr, argument))
     {
         return completion;
     }
@@ -1131,6 +1134,20 @@ fn classify_provider_argument_failure(
             .collect(),
     }));
     completion
+}
+
+/// Match a command-line token without accepting it as a prefix of another
+/// option. Provider parser diagnostics use both quoted and unquoted options.
+fn contains_cli_argument(diagnostic: &str, argument: &str) -> bool {
+    diagnostic.match_indices(argument).any(|(offset, _)| {
+        let before = diagnostic[..offset].chars().next_back();
+        let after = diagnostic[offset + argument.len()..].chars().next();
+        !before.is_some_and(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        }) && !after.is_some_and(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1176,6 +1193,26 @@ mod provider_argument_tests {
             Some(&capture),
             &["--bad".to_string()],
         );
+        assert_eq!(completion.terminal.unwrap(), 2);
+    }
+
+    #[test]
+    fn codex_parser_failure_for_unconfigured_argument_keeps_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = directory.path().join("transcript.jsonl");
+        let capture = TranscriptCapture::with_config(&transcript, Default::default());
+        std::fs::write(
+            provider_stderr_path(&transcript),
+            "error: unexpected argument '--provider-internal' found\n\nUsage: codex exec [OPTIONS] [PROMPT]",
+        )
+        .unwrap();
+
+        let completion = classify_codex_provider_argument_failure(
+            CoderRunCompletion::terminal_only(Ok(2)),
+            Some(&capture),
+            &["--configured-pass-through".to_string()],
+        );
+
         assert_eq!(completion.terminal.unwrap(), 2);
     }
 
