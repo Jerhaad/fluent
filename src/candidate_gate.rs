@@ -1016,22 +1016,7 @@ fn check_tester_evidence(
                 if test.status != "pass" {
                     return false;
                 }
-                if test.test_harness == "shell-harness" && test.id == reference.path {
-                    return true;
-                }
-                match reference.selector.as_deref() {
-                    Some(selector) => {
-                        test.id == selector
-                            || test.id.ends_with(&format!("::{selector}"))
-                            || test.id.ends_with(&format!("${selector}"))
-                            || test
-                                .id
-                                .split_whitespace()
-                                .next_back()
-                                .is_some_and(|identity| identity == selector)
-                    }
-                    None => test.id == reference.path,
-                }
+                test_result_matches_reference(test, reference)
             })
         };
         if !matched {
@@ -1075,6 +1060,35 @@ fn check_tester_evidence(
         CandidateCheckStatus::Failed
     };
     Ok(check("tester-reference-evidence", status, diagnostics))
+}
+
+fn test_result_matches_reference(
+    test: &crate::tester::TestResult,
+    reference: &TestReference,
+) -> bool {
+    if test.test_harness == "shell-harness" && test.id == reference.path {
+        return true;
+    }
+    match reference.selector.as_deref() {
+        Some(selector) => {
+            // Cargo/nextest extractors in downstream projects commonly retain
+            // the source path in a human-readable identity such as
+            // `src/lib.rs (drain_is_idempotent)`. Treat that as the same
+            // selector represented by the documented `path (selector)`
+            // reference, while preserving the existing bare, `::`, and `$`
+            // forms.
+            test.id == selector
+                || test.id == format!("{} ({selector})", reference.path)
+                || test.id.ends_with(&format!("::{selector}"))
+                || test.id.ends_with(&format!("${selector}"))
+                || test
+                    .id
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|identity| identity == selector)
+        }
+        None => test.id == reference.path,
+    }
 }
 
 fn learner_only_delta(workspace: &Path, from: &str, to: &str) -> Result<bool> {
@@ -2120,6 +2134,48 @@ mod tests {
         .unwrap();
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
         let contract = behavior_contract("tests/dashboard.rs (preserves_selection)");
+
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn validates_parenthesized_source_path_test_identity() {
+        let fixture = Fixture::new();
+        let selector = "drain_is_idempotent";
+        let candidate = fixture.commit(
+            "src/lib.rs",
+            &format!("#[test]\nfn {selector}() {{}}\n"),
+            "Add drain lifecycle\n\n- Cover idempotent drain",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{
+                "id": format!("src/lib.rs ({selector})"),
+                "test_harness": "cargo-nextest",
+                "status": "pass",
+                "duration_ms": 1,
+                "failure_excerpt": null
+            }],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract(&format!("src/lib.rs ({selector})"));
 
         let evidence = run_candidate_gate(fixture.request(
             &candidate,
