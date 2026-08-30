@@ -2912,6 +2912,10 @@ fn should_retry_coder_error(result: &Result<()>) -> bool {
         && !result.as_ref().err().is_some_and(|error| {
             error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
         })
+        && !result.as_ref().err().is_some_and(|error| {
+            error.is::<crate::coder::CodexResponseLivenessExhaustedError>()
+                || error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>()
+        })
         && !result
             .as_ref()
             .err()
@@ -2978,6 +2982,16 @@ fn classify_task_failure(error: &anyhow::Error) -> TaskFailure {
             error
         ))
     } else if error.is::<crate::coder::ClaudeNoProgressExhaustedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>() {
+        TaskFailure::ProviderUnavailable(format!(
+            "{}. Inspect the provider cleanup evidence, then run 'fluent attempt run' to retry this same Task in the same Attempt.",
+            error
+        ))
+    } else if error.is::<crate::coder::CodexResponseLivenessExhaustedError>() {
         TaskFailure::ProviderUnavailable(format!(
             "{}. Run 'fluent attempt run' to retry this same Task in the same Attempt.",
             error
@@ -3060,6 +3074,8 @@ fn provider_pause_error(
                 || error.is::<crate::provider_readiness::ProviderReadinessError>()
                 || error.is::<crate::coder::ClaudeNoProgressExhaustedError>()
                 || error.is::<crate::coder::ClaudeNoProgressCleanupUnconfirmedError>()
+                || error.is::<crate::coder::CodexResponseLivenessExhaustedError>()
+                || error.is::<crate::coder::CodexResponseCleanupUnconfirmedError>()
             {
                 return Err(error);
             }
