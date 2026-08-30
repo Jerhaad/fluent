@@ -35,6 +35,10 @@ pub const DEFAULT_CLAUDE_NO_PROGRESS_TIMEOUT_SECONDS: u32 = 60;
 pub const DEFAULT_CLAUDE_NO_PROGRESS_RETRIES: u32 = 2;
 /// Built-in first delay before a safe Claude no-progress relaunch. Later delays double.
 pub const DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS: u32 = 5;
+/// Codex response silence allowed while no tool is active.
+pub const DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS: u32 = 10 * 60;
+/// Same-session Codex continuations allowed within one Fluent Task.
+pub const DEFAULT_CODEX_RESPONSE_CONTINUATIONS: u32 = 2;
 /// Built-in maximum managed reviewer cache footprint for one project.
 pub const DEFAULT_REVIEWER_CACHE_MAX_PROJECT_GIB: u64 = 50;
 /// Built-in filesystem space reserved after a reviewer cache admission.
@@ -245,6 +249,8 @@ pub struct ResolvedTranscriptPumpConfig {
     pub claude_no_progress_timeout_seconds: ResolvedLeaf<u32>,
     pub claude_no_progress_retries: ResolvedLeaf<u32>,
     pub claude_no_progress_backoff_seconds: ResolvedLeaf<u32>,
+    pub codex_response_timeout_seconds: ResolvedLeaf<u32>,
+    pub codex_response_continuations: ResolvedLeaf<u32>,
 }
 
 /// Reviewer cache limits resolved from project, then user, then built-in defaults.
@@ -846,12 +852,26 @@ pub(crate) fn resolve_transcript_pump_config_from(
         DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS,
         convert_count,
     )?;
+    let codex_response_timeout_seconds = resolve_leaf(
+        &layers,
+        &["provider-recovery", "codex", "response-timeout-seconds"],
+        DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS,
+        convert_positive_count,
+    )?;
+    let codex_response_continuations = resolve_leaf(
+        &layers,
+        &["provider-recovery", "codex", "automatic-continuations"],
+        DEFAULT_CODEX_RESPONSE_CONTINUATIONS,
+        convert_count,
+    )?;
     Ok(ResolvedTranscriptPumpConfig {
         console_preview_limit,
         status_flush_interval_ms,
         claude_no_progress_timeout_seconds,
         claude_no_progress_retries,
         claude_no_progress_backoff_seconds,
+        codex_response_timeout_seconds,
+        codex_response_continuations,
     })
 }
 
@@ -1364,6 +1384,14 @@ coders:
         assert_eq!(
             resolved.claude_no_progress_backoff_seconds.value,
             DEFAULT_CLAUDE_NO_PROGRESS_BACKOFF_SECONDS
+        );
+        assert_eq!(
+            resolved.codex_response_timeout_seconds.value,
+            DEFAULT_CODEX_RESPONSE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            resolved.codex_response_continuations.value,
+            DEFAULT_CODEX_RESPONSE_CONTINUATIONS
         );
     }
 

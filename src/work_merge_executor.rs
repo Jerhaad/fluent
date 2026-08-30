@@ -3538,6 +3538,7 @@ mod tests {
                                 message: Some("Operation not permitted".to_string()),
                             },
                         ),
+                        provider_liveness: None,
                     }],
                 },
             }

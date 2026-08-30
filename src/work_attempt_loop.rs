@@ -8599,6 +8599,7 @@ mod tests {
                                 message: None,
                             },
                         ),
+                        provider_liveness: None,
                     }],
                 },
             };
@@ -14897,6 +14898,7 @@ mod tests {
                             message: None,
                         },
                     ),
+                    provider_liveness: None,
                 }],
             },
         };

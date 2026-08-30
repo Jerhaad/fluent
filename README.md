@@ -232,6 +232,8 @@ If that Writer verifies the existing candidate and makes no commit, Fluent indep
 
 If a provider exhausts its retry budget before a model produces tokens or uses tools, Fluent pauses the Attempt as `provider-unavailable`. After provider capacity returns, run `fluent attempt run <work-item-id> [<attempt-id>]`; Fluent resumes the same unfinished Task and keeps completed peer Tasks and prior transcripts.
 
+Codex launches also have a response-liveness guard. After Codex has started a turn, Fluent waits up to ten minutes for the next model response while leaving active tool execution alone. If the stream remains idle, Fluent records the candidate-bound transcript and process cleanup, then continues the same Task and Codex session at most twice. Configure this per project under `provider-recovery.codex.response-timeout-seconds` and `provider-recovery.codex.automatic-continuations`; exhaustion is reported as `provider-unavailable` with the preserved liveness evidence.
+
 If a local coder hangs, `fluent attempt cancel <work-item-id> <attempt-id>` stops only Fluent's recorded process group and pauses the Attempt as `interrupted`. Run the same `attempt run` command to replan the canceled Task without repeating completed work.
 
 Once every Reviewer and the final Tester pass, the Learner examines the accepted change and the evidence from every round, updates Expertise when it finds something reusable, and records possible follow-ups in a handoff. The Attempt then produces a ready Merge Candidate.

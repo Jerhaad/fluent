@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_PI_MODEL: &str = "qwen3.6-35b-a3b";
 pub(crate) const PROVIDER_STDERR_FILENAME: &str = "provider-stderr.log";
@@ -628,6 +628,7 @@ impl Coder for SandboxedClaudeCode {
                 &crate::notify::notify,
                 &real_credential_refresh,
                 true,
+                None,
             ),
             capture,
             extra_args,
@@ -836,6 +837,7 @@ impl Coder for BareClaudeCode {
                 &crate::notify::notify,
                 &real_credential_refresh,
                 true,
+                None,
             ),
             capture,
             extra_args,
@@ -945,15 +947,30 @@ impl Coder for CodexCode {
         let transcript_file = capture.map(|c| c.path);
         let config = capture.map(|c| c.config.clone()).unwrap_or_default();
         let combined_prompt = format!("{system_prompt}\n\n---\n\n{prompt}");
+        let initial_session = if capture.is_some()
+            && config.codex_response_continuations > 0
+            && session == CoderSession::Ephemeral
+        {
+            CoderSession::FreshPersistent
+        } else {
+            session
+        };
         classify_codex_provider_argument_failure(
-            run_with_transcript_retrying_reported(
-                || {
-                    let mut cmd = self.build_writer_command(working_dir, session);
+            run_codex_response_recovery_reported(
+                |continuation_session| {
+                    let active_session = continuation_session
+                        .map(CoderSession::Resume)
+                        .unwrap_or(initial_session);
+                    let mut cmd = self.build_writer_command(working_dir, active_session);
                     apply_coder_env(&mut cmd, extra_env);
                     if want_transcript {
                         cmd.arg("--json");
                     }
-                    cmd.arg(&combined_prompt);
+                    if continuation_session.is_some() {
+                        cmd.arg("Continue the current Fluent Task from the existing session state. Do not repeat completed tool actions. Finish the requested work and report completion evidence.");
+                    } else {
+                        cmd.arg(&combined_prompt);
+                    }
                     cmd.args(extra_args);
                     cmd
                 },
@@ -961,7 +978,6 @@ impl Coder for CodexCode {
                 &config,
                 &crate::notify::notify,
                 &real_credential_refresh,
-                false,
             ),
             capture,
             extra_args,
@@ -982,6 +998,71 @@ impl Coder for CodexCode {
 
         let status = cmd.status()?;
         Ok(status.code().unwrap_or(1))
+    }
+}
+
+fn run_codex_response_recovery_reported<F>(
+    build_cmd: F,
+    transcript_file: Option<&Path>,
+    config: &crate::transcript_pump::TranscriptPumpConfig,
+    notify_fn: &dyn Fn(&str, &str),
+    refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
+) -> CoderRunCompletion
+where
+    F: Fn(Option<&str>) -> Command,
+{
+    let deadline = (transcript_file.is_some() && config.codex_response_continuations > 0)
+        .then_some(SupervisionDeadline::CodexResponse(
+            config.codex_response_timeout,
+        ));
+    let mut continuations = 0u32;
+    let mut session_id: Option<String> = None;
+    let mut aggregate = CoderSupervisionReport::default();
+    let mut phase = next_transcript_phase(transcript_file);
+
+    loop {
+        let completion = run_with_transcript_retrying_reported(
+            || build_cmd(session_id.as_deref()),
+            transcript_file,
+            config,
+            notify_fn,
+            refresh_fn,
+            false,
+            deadline,
+        );
+        aggregate.extend_ordered(completion.report);
+        let Err(error) = completion.terminal else {
+            return CoderRunCompletion {
+                terminal: completion.terminal,
+                report: aggregate,
+            };
+        };
+        let Some(timeout) = error.downcast_ref::<CodexResponseTimeoutError>() else {
+            return CoderRunCompletion {
+                terminal: Err(error),
+                report: aggregate,
+            };
+        };
+        if continuations >= config.codex_response_continuations || timeout.session_id().is_empty() {
+            return CoderRunCompletion {
+                terminal: Err(anyhow::Error::new(CodexResponseLivenessExhaustedError {
+                    continuations,
+                })),
+                report: aggregate,
+            };
+        }
+        session_id = Some(timeout.session_id().to_string());
+        if let Err(error) = prepare_transcript_retry_phase(transcript_file, &mut phase) {
+            return CoderRunCompletion {
+                terminal: Err(anyhow::Error::new(error)),
+                report: aggregate,
+            };
+        }
+        continuations = continuations.saturating_add(1);
+        eprintln!(
+            "  Codex model response exceeded the liveness deadline; continuing the same Task and session ({}/{}).",
+            continuations, config.codex_response_continuations
+        );
     }
 }
 
@@ -1380,6 +1461,7 @@ impl Coder for PiCode {
                 &crate::notify::notify,
                 &real_credential_refresh,
                 false,
+                None,
             ),
             capture,
             extra_args,
@@ -1476,11 +1558,26 @@ pub struct CoderLaunchSupervision {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exit_code: Option<i32>,
     pub group_sweep: GroupSweepDisposition,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub provider_liveness: Option<ProviderLivenessIntervention>,
+}
+
+/// One automatic provider-liveness intervention, persisted with the launch's
+/// cleanup result in `coder-supervision.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderLivenessIntervention {
+    pub provider: String,
+    pub timeout_ms: u64,
+    pub idle_ms: u64,
+    pub session_id: String,
+    pub phase: String,
+    pub last_event: String,
+    pub last_progress_at_ms: u64,
 }
 
 impl CoderLaunchSupervision {
     fn is_clean(&self) -> bool {
-        self.group_sweep.is_clean()
+        self.group_sweep.is_clean() && self.provider_liveness.is_none()
     }
 }
 
@@ -1642,7 +1739,7 @@ fn run_with_transcript_reported(
     mut cmd: Command,
     transcript_file: Option<&Path>,
     config: &crate::transcript_pump::TranscriptPumpConfig,
-    no_progress_deadline: Option<Duration>,
+    deadline: Option<SupervisionDeadline>,
 ) -> CoderRunCompletion {
     restrict_test_provider_credentials(&mut cmd);
     #[cfg(unix)]
@@ -1725,7 +1822,7 @@ fn run_with_transcript_reported(
                 }
             };
             supervisor.attach_pump(pump);
-            let supervised = supervisor.supervise(no_progress_deadline);
+            let supervised = supervisor.supervise(deadline);
             let terminal = supervisor.settle_execution(supervised);
             CoderRunCompletion {
                 report: CoderSupervisionReport::of_launch(supervisor.launch_supervision()),
@@ -1793,7 +1890,9 @@ fn safe_claude_no_progress_launch_is_terminated_and_typed() {
         command,
         Some(&transcript),
         &crate::transcript_pump::TranscriptPumpConfig::default(),
-        Some(Duration::from_millis(100)),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(100),
+        )),
     );
 
     let error = completion.terminal.unwrap_err();
@@ -1824,7 +1923,9 @@ fn claude_assistant_progress_disables_no_progress_termination() {
         command,
         Some(&transcript),
         &crate::transcript_pump::TranscriptPumpConfig::default(),
-        Some(Duration::from_millis(300)),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(300),
+        )),
     );
 
     assert_eq!(completion.terminal.unwrap(), 0);
@@ -1845,7 +1946,9 @@ fn partial_claude_record_at_deadline_disables_no_progress_termination() {
         command,
         Some(&transcript),
         &crate::transcript_pump::TranscriptPumpConfig::default(),
-        Some(Duration::from_millis(300)),
+        Some(SupervisionDeadline::ClaudeNoProgress(
+            Duration::from_millis(300),
+        )),
     );
 
     assert_eq!(completion.terminal.unwrap(), 0);
@@ -2513,6 +2616,13 @@ struct CoderSupervisor {
     /// one, and the transcript branch attaches it only after a successful spawn).
     pump: Option<crate::transcript_pump::PumpHandle>,
     execution: Option<crate::execution::ExecutionHeartbeat>,
+    provider_liveness: Option<ProviderLivenessIntervention>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionDeadline {
+    ClaudeNoProgress(Duration),
+    CodexResponse(Duration),
 }
 
 impl CoderSupervisor {
@@ -2521,6 +2631,7 @@ impl CoderSupervisor {
             managed: ManagedChild::new(Box::new(SystemLeader::new(child, child_id))),
             pump: None,
             execution: None,
+            provider_liveness: None,
         }
     }
 
@@ -2530,6 +2641,7 @@ impl CoderSupervisor {
             managed: ManagedChild::new(leader),
             pump: None,
             execution: None,
+            provider_liveness: None,
         }
     }
 
@@ -2568,6 +2680,7 @@ impl CoderSupervisor {
         CoderLaunchSupervision {
             exit_code: self.managed.exit_code(),
             group_sweep: self.managed.group_sweep_disposition(),
+            provider_liveness: self.provider_liveness.clone(),
         }
     }
 
@@ -2588,9 +2701,9 @@ impl CoderSupervisor {
     /// descendants before reaping. Every cleanup failure is composed with the pump
     /// outcome rather than discarded, and an unobservable leader is terminal rather
     /// than an infinite poll loop.
-    fn supervise(&mut self, no_progress_deadline: Option<Duration>) -> Result<i32> {
+    fn supervise(&mut self, deadline: Option<SupervisionDeadline>) -> Result<i32> {
         let started = Instant::now();
-        let mut no_progress_deadline = no_progress_deadline;
+        let mut deadline = deadline;
         loop {
             if let Some(execution) = self.execution.as_mut()
                 && let Err(error) = execution.heartbeat()
@@ -2618,7 +2731,7 @@ impl CoderSupervisor {
                 let outcome = self.pump_mut().wait_terminal();
                 return compose_terminal(outcome, cleanup);
             }
-            if no_progress_deadline.is_some()
+            if matches!(deadline, Some(SupervisionDeadline::ClaudeNoProgress(_)))
                 && self
                     .pump
                     .as_ref()
@@ -2627,10 +2740,10 @@ impl CoderSupervisor {
             {
                 // Any complete malformed, unknown, model, or tool record makes
                 // automatic relaunch unsafe for the rest of this launch.
-                no_progress_deadline = None;
+                deadline = None;
             }
-            if let Some(deadline) = no_progress_deadline
-                && started.elapsed() >= deadline
+            if let Some(SupervisionDeadline::ClaudeNoProgress(duration)) = deadline
+                && started.elapsed() >= duration
             {
                 if !self
                     .pump
@@ -2640,7 +2753,7 @@ impl CoderSupervisor {
                 {
                     // A partial record at the deadline may hide model or tool
                     // activity. Fail closed and let this launch finish naturally.
-                    no_progress_deadline = None;
+                    deadline = None;
                     continue;
                 }
                 let cleanup = self.managed.terminate_and_reap();
@@ -2650,7 +2763,7 @@ impl CoderSupervisor {
                     Ok(_) => match cleanup {
                         Ok(_) if self.managed.group_swept() => {
                             Err(anyhow::Error::new(ClaudeNoProgressTimeoutError {
-                                deadline,
+                                deadline: duration,
                             }))
                         }
                         Ok(_) => Err(anyhow::Error::new(
@@ -2661,6 +2774,52 @@ impl CoderSupervisor {
                         )),
                         Err(cleanup) => Err(anyhow::Error::new(
                             ClaudeNoProgressCleanupUnconfirmedError::new(cleanup.to_string()),
+                        )),
+                    },
+                };
+            }
+            if let Some(SupervisionDeadline::CodexResponse(timeout)) = deadline
+                && let Some(diagnostic) = self
+                    .pump
+                    .as_ref()
+                    .expect("supervise runs only after a pump is attached")
+                    .codex_response_idle(timeout)
+            {
+                let idle_since = diagnostic.response_idle_since_ms.unwrap_or_default();
+                let intervention = ProviderLivenessIntervention {
+                    provider: "codex".to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                    idle_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis() as u64)
+                        .unwrap_or_default()
+                        .saturating_sub(idle_since),
+                    session_id: diagnostic.session_id.unwrap_or_default(),
+                    phase: diagnostic.phase.unwrap_or_else(|| "unknown".to_string()),
+                    last_event: diagnostic
+                        .last_event
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    last_progress_at_ms: diagnostic.last_progress_at_ms.unwrap_or_default(),
+                };
+                self.provider_liveness = Some(intervention.clone());
+                let cleanup = self.managed.terminate_and_reap();
+                let pump = self.pump_mut().wait_terminal();
+                return match pump {
+                    Err(pump_error) => Err(compose_pump_error(pump_error, cleanup)),
+                    Ok(_) => match cleanup {
+                        Ok(_) if self.managed.group_swept() => {
+                            Err(anyhow::Error::new(CodexResponseTimeoutError {
+                                intervention,
+                            }))
+                        }
+                        Ok(_) => Err(anyhow::Error::new(
+                            CodexResponseCleanupUnconfirmedError::new(format!(
+                                "{:?}",
+                                self.managed.group_sweep_disposition()
+                            )),
+                        )),
+                        Err(cleanup) => Err(anyhow::Error::new(
+                            CodexResponseCleanupUnconfirmedError::new(cleanup.to_string()),
                         )),
                     },
                 };
@@ -2980,6 +3139,74 @@ impl std::fmt::Display for ClaudeNoProgressExhaustedError {
 }
 
 impl std::error::Error for ClaudeNoProgressExhaustedError {}
+
+/// Codex stopped emitting records while its stream proved that it was waiting
+/// for the model rather than running a tool.
+#[derive(Debug)]
+pub(crate) struct CodexResponseTimeoutError {
+    intervention: ProviderLivenessIntervention,
+}
+
+impl CodexResponseTimeoutError {
+    fn session_id(&self) -> &str {
+        &self.intervention.session_id
+    }
+}
+
+impl std::fmt::Display for CodexResponseTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex produced no model response for {} seconds after {}",
+            self.intervention.timeout_ms / 1000,
+            self.intervention.last_event
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseTimeoutError {}
+
+#[derive(Debug)]
+pub(crate) struct CodexResponseCleanupUnconfirmedError {
+    disposition: String,
+}
+
+impl CodexResponseCleanupUnconfirmedError {
+    fn new(disposition: impl Into<String>) -> Self {
+        Self {
+            disposition: disposition.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CodexResponseCleanupUnconfirmedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex response-liveness recovery stopped because process-group cleanup was not confirmed ({})",
+            self.disposition
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseCleanupUnconfirmedError {}
+
+#[derive(Debug)]
+pub(crate) struct CodexResponseLivenessExhaustedError {
+    continuations: u32,
+}
+
+impl std::fmt::Display for CodexResponseLivenessExhaustedError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Codex response liveness failed after {} automatic same-session continuations",
+            self.continuations
+        )
+    }
+}
+
+impl std::error::Error for CodexResponseLivenessExhaustedError {}
 
 fn ensure_not_expired_with_refresh() -> Result<(), crate::claude_auth::AuthError> {
     if crate::credential::hermetic_provider_test_mode() {
@@ -3335,6 +3562,7 @@ where
         notify_fn,
         refresh_fn,
         false,
+        None,
     )
     .into_result()
 }
@@ -3349,6 +3577,7 @@ fn run_with_transcript_retrying_reported<F>(
     notify_fn: &dyn Fn(&str, &str),
     refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
     claude_no_progress_recovery: bool,
+    launch_deadline: Option<SupervisionDeadline>,
 ) -> CoderRunCompletion
 where
     F: Fn() -> Command,
@@ -3360,6 +3589,7 @@ where
         notify_fn,
         refresh_fn,
         claude_no_progress_recovery,
+        launch_deadline,
         &|cmd, transcript, cfg, deadline| {
             run_with_transcript_reported(cmd, transcript, cfg, deadline)
         },
@@ -3392,6 +3622,7 @@ where
         notify_fn,
         refresh_fn,
         false,
+        None,
         &|cmd, transcript, cfg, _deadline| {
             CoderRunCompletion::terminal_only(run_fn(cmd, transcript, cfg))
         },
@@ -3409,11 +3640,12 @@ fn run_with_transcript_retrying_reported_using<F>(
     notify_fn: &dyn Fn(&str, &str),
     refresh_fn: &dyn Fn() -> Result<(), crate::claude_auth::AuthError>,
     claude_no_progress_recovery: bool,
+    launch_deadline: Option<SupervisionDeadline>,
     run_fn: &dyn Fn(
         Command,
         Option<&Path>,
         &crate::transcript_pump::TranscriptPumpConfig,
-        Option<Duration>,
+        Option<SupervisionDeadline>,
     ) -> CoderRunCompletion,
 ) -> CoderRunCompletion
 where
@@ -3435,10 +3667,14 @@ where
         // The one resolved config value is retained across every auth/rate-limit
         // phase of this launch, so a mid-launch retry never re-resolves or picks
         // up a different value.
-        let deadline = (claude_no_progress_recovery
-            && transcript_file.is_some()
-            && config.claude_no_progress_retries > 0)
-            .then_some(config.claude_no_progress_timeout);
+        let deadline = launch_deadline.or_else(|| {
+            (claude_no_progress_recovery
+                && transcript_file.is_some()
+                && config.claude_no_progress_retries > 0)
+                .then_some(SupervisionDeadline::ClaudeNoProgress(
+                    config.claude_no_progress_timeout,
+                ))
+        });
         let completion = run_fn(build_cmd(), transcript_file, config, deadline);
         aggregate.extend_ordered(completion.report);
         let exit = match completion.terminal {
@@ -4870,6 +5106,7 @@ mod pump_supervision_tests {
                 errno: Some(errno),
                 message: Some("Operation not permitted".to_string()),
             }),
+            provider_liveness: None,
         })
     }
 
@@ -4909,7 +5146,7 @@ mod pump_supervision_tests {
         let run_fn = |_cmd: Command,
                       _t: Option<&Path>,
                       _c: &crate::transcript_pump::TranscriptPumpConfig,
-                      _deadline: Option<Duration>|
+                      _deadline: Option<SupervisionDeadline>|
          -> CoderRunCompletion {
             let n = phase.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if n == 0 {
@@ -4924,6 +5161,7 @@ mod pump_supervision_tests {
                     report: CoderSupervisionReport::of_launch(CoderLaunchSupervision {
                         exit_code: Some(0),
                         group_sweep: GroupSweepDisposition::Delivered,
+                        provider_liveness: None,
                     }),
                 }
             }
@@ -4945,6 +5183,7 @@ mod pump_supervision_tests {
             &|_, _| {},
             &|| Ok(()),
             false,
+            None,
             &run_fn,
         );
         assert_eq!(completion.terminal.unwrap(), 0, "the final retry succeeds");
@@ -4974,9 +5213,13 @@ mod pump_supervision_tests {
         let run_fn = |_cmd: Command,
                       path: Option<&Path>,
                       _config: &crate::transcript_pump::TranscriptPumpConfig,
-                      deadline: Option<Duration>| {
+                      deadline: Option<SupervisionDeadline>| {
             let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            assert_eq!(deadline, Some(Duration::from_millis(25)));
+            assert!(matches!(
+                deadline,
+                Some(SupervisionDeadline::ClaudeNoProgress(value))
+                    if value == Duration::from_millis(25)
+            ));
             std::fs::write(
                 path.unwrap(),
                 "{\"type\":\"system\",\"subtype\":\"api_retry\",\"retry_delay_ms\":25}\n",
@@ -5006,6 +5249,7 @@ mod pump_supervision_tests {
             &|_, _| {},
             &|| Ok(()),
             true,
+            None,
             &run_fn,
         );
 
@@ -5030,7 +5274,7 @@ mod pump_supervision_tests {
         let run_fn = |_cmd: Command,
                       path: Option<&Path>,
                       _config: &crate::transcript_pump::TranscriptPumpConfig,
-                      _deadline: Option<Duration>| {
+                      _deadline: Option<SupervisionDeadline>| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::fs::write(
                 path.unwrap(),
@@ -5057,6 +5301,7 @@ mod pump_supervision_tests {
             &|_, _| {},
             &|| Ok(()),
             true,
+            None,
             &run_fn,
         );
 
@@ -5076,7 +5321,7 @@ mod pump_supervision_tests {
         let run_fn = |_cmd: Command,
                       _path: Option<&Path>,
                       _config: &crate::transcript_pump::TranscriptPumpConfig,
-                      deadline: Option<Duration>| {
+                      deadline: Option<SupervisionDeadline>| {
             assert_eq!(deadline, None);
             CoderRunCompletion::terminal_only(Ok(0))
         };
@@ -5092,6 +5337,7 @@ mod pump_supervision_tests {
             &|_, _| {},
             &|| Ok(()),
             true,
+            None,
             &run_fn,
         );
 
@@ -6217,6 +6463,7 @@ exit 1"#
                 waiting_since_ms: None,
                 resume_at_ms: None,
             },
+            provider_liveness: Default::default(),
             error: None,
             periodic_error: None,
             transport: Default::default(),
