@@ -577,9 +577,13 @@ Test: src/review.rs (evidence_targeted_disposition_is_fail_only_and_typed)
 
 WHEN one unexplained failed-command recheck reaches the Writer-round cap, THE
 SYSTEM SHALL show a candidate-bound evidence attachment command that accepts a
-passing or failing authorized-host result and plans a targeted Tests Review.
+passing or failing authorized-host result and plans a targeted Tests Review. A
+passing result SHALL name the exact failed command; a failing result MAY name a
+related direct command as diagnostic evidence, but SHALL remain bound to the
+exact recheck and SHALL NOT satisfy it.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
 Test: src/work_attempt_loop.rs (failed_recheck_host_evidence_can_request_corrective_writer)
+Test: src/work_attempt_loop.rs (failed_related_host_diagnostic_preserves_recheck_identity)
 
 ### B19
 
@@ -591,16 +595,23 @@ Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_
 ### B19a
 
 WHEN an authorized-host run exposes a candidate defect for the exact unchanged
-candidate and failed-command recheck, THE SYSTEM SHALL preserve that failed
-evidence and let a targeted Tests Review request a corrective Writer.
+candidate and failed-command recheck, or through a related direct diagnostic
+command, THE SYSTEM SHALL preserve that failed evidence and let a targeted
+Tests Review request a corrective Writer without treating the diagnostic as a
+passing recheck.
 Test: src/work_attempt_loop.rs (failed_recheck_host_evidence_can_request_corrective_writer)
+Test: src/work_attempt_loop.rs (failed_related_host_diagnostic_preserves_recheck_identity)
 
 ### B20
 
 IF attached evidence names another candidate or recheck, any bound evidence or
-failure bytes change, or the Tester result contains another failure, THEN THE
-SYSTEM SHALL reject command-only recovery without making the candidate ready.
+failure bytes change, a passing document names a different command than the
+recheck, or the Tester result contains another failure, THEN THE SYSTEM SHALL
+reject command-only recovery without making the candidate ready. A failing
+document may name a related direct command only as the diagnostic path
+described above.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+Test: src/work_attempt_loop.rs (passing_related_host_diagnostic_is_rejected_with_exact_command_guidance)
 
 ### B21
 

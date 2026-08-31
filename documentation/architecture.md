@@ -960,11 +960,15 @@ Review. Ordinary interrupted Writers, changed candidates, different review
 inputs, and live task owners remain ineligible.
 
 For a failed-command recheck, `fluent attempt evidence attach` accepts
-`--recheck-artifact` instead of `--review-artifact`. Fluent accepts this route
-only for one unexplained failed command, requires passing evidence for that
-exact command from the candidate root, and revalidates every bound byte before
-Learning. When this narrow route is not eligible, the immutable recheck
-artifacts remain a valid frontier for an explicit Writer extension.
+`--recheck-artifact` instead of `--review-artifact`. Fluent accepts a passing
+document only when its `check` names the exact failed command from the
+candidate root, and revalidates every bound byte before Learning. If an
+authorized host can run only a related direct command, it may attach a failing
+document as diagnostic evidence. Fluent records that command separately from
+the immutable recheck command and sends it to a targeted Tests Review; it can
+never satisfy the recheck or make the candidate landable by itself. When this
+narrow route is not eligible, the immutable recheck artifacts remain a valid
+frontier for an explicit Writer extension.
 
 `fluent work-item list` and `fluent work-item show <id>` expose the same durable
 Work Item model for inspection. These commands use `.fluent/work/items/`

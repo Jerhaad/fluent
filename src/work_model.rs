@@ -6618,6 +6618,12 @@ pub enum WorkModelError {
     AttemptNotFound {
         id: String,
     },
+    /// Host evidence was supplied for a real Attempt, but it no longer
+    /// matches the immutable recovery frontier that the public command names.
+    HostEvidenceRecoveryIneligible {
+        attempt_id: String,
+        reason: String,
+    },
     AttemptEvidenceRecoveryConflict {
         attempt_id: String,
     },
@@ -6808,6 +6814,12 @@ impl fmt::Display for WorkModelError {
             }
             Self::AttemptNotFound { id } => {
                 write!(f, "Attempt {id:?} not found")
+            }
+            Self::HostEvidenceRecoveryIneligible { attempt_id, reason } => {
+                write!(
+                    f,
+                    "host evidence for Attempt {attempt_id:?} is not eligible: {reason}"
+                )
             }
             Self::AttemptEvidenceRecoveryConflict { attempt_id } => {
                 write!(

@@ -8422,7 +8422,7 @@ fn write_failed_recheck_evidence_handoff(
     crate::atomic_write::atomic_write(
         &path,
         format!(
-            "# Attempt needs external test evidence\n\nThe unchanged candidate stopped after one failed-command recheck. Run the exact command on an authorized host and attach a schema-version-1 evidence document with `result: pass` when it succeeds or `result: fail` when it exposes a candidate defect:\n\n`{action}`\n\nFluent binds either result to the unchanged candidate and immutable recheck, then sends it to a targeted Tests Review. Accepted passing evidence can supersede the host-only failure; reviewed failing evidence can request a corrective Writer.\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
+            "# Attempt needs external test evidence\n\nThe unchanged candidate stopped after one failed-command recheck. Run the exact command on an authorized host and attach a schema-version-1 evidence document with `result: pass` when it succeeds. If a related direct public command exposes a candidate defect before the exact command can run, you may attach a `result: fail` diagnostic; Fluent will route it to a targeted Tests Review but will never treat that different command as a passing recheck.\n\n`{action}`\n\nFluent binds the evidence to the unchanged candidate and immutable recheck. Accepted passing evidence can supersede the host-only failure; reviewed failing evidence can request a corrective Writer.\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
         )
         .as_bytes(),
     )?;
@@ -11522,6 +11522,162 @@ mod tests {
         assert_eq!(writer.status, TaskStatus::Planned);
         assert_eq!(writer.input_artifacts.len(), 1);
         assert_eq!(writer.input_artifacts[0].producer_id, *review_task_id);
+    }
+
+    #[test]
+    fn failed_related_host_diagnostic_preserves_recheck_identity() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let diagnostic_check = "models/experiments/qwen3_8_27b/spark.sh start dflash-correctness";
+        let evidence_path = project.path().join("failed-host-diagnostic.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": diagnostic_check,
+                "working_directory": ".",
+                "result": "fail",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "Docker inspection metadata was not attested"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recovery = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("a failed related command must reach targeted Tests review");
+        let repeated = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect("repeating diagnostic attachment must be idempotent");
+        assert_eq!(repeated, recovery);
+
+        let reviewing = store.read_work_item("work-1").unwrap();
+        let attempt = &reviewing.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert!(
+            crate::host_evidence::completed_recheck_evidence_source(project.path(), attempt)
+                .is_none(),
+            "a different failed command must remain diagnostic until the exact recheck passes"
+        );
+        let review_task_id = recovery.targets[0].review_task_id.as_ref().unwrap();
+        let review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == *review_task_id)
+            .unwrap();
+        let binding_path = review
+            .evidence_review_context
+            .as_ref()
+            .unwrap()
+            .prior_review_artifact
+            .clone();
+        let binding: serde_json::Value =
+            serde_json::from_slice(&fs::read(project.path().join(binding_path)).unwrap()).unwrap();
+        assert_eq!(binding["command"], "xcodebuild test");
+        assert_eq!(binding["evidence_check"], diagnostic_check);
+    }
+
+    #[test]
+    fn passing_related_host_diagnostic_is_rejected_with_exact_command_guidance() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = failed_recheck_no_change_fixture(&project);
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+
+        let paused = store.read_work_item("work-1").unwrap();
+        let recheck = paused.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.is_failed_command_recheck())
+            .unwrap();
+        let manifest = format!(
+            "{}/failed-command-recheck.json",
+            recheck.artifact_area.as_ref().unwrap().path
+        );
+        let evidence_path = project.path().join("passing-related-host-check.json");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "producer": "authorized DGX host",
+                "check": "models/experiments/qwen3_8_27b/spark.sh start dflash-correctness",
+                "working_directory": ".",
+                "result": "pass",
+                "run_at": "2026-08-26T18:00:00Z",
+                "output": "Docker inspection metadata was accepted"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = crate::host_evidence::attach(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &evidence_path,
+            &[],
+            Some(&manifest),
+        )
+        .expect_err("a related command must not satisfy the exact recheck");
+        let message = error.to_string();
+        assert!(message.contains("does not match the failed-command recheck"));
+        assert!(message.contains("xcodebuild test"));
+        assert!(message.contains("spark.sh start dflash-correctness"));
+        let unchanged = store.read_work_item("work-1").unwrap();
+        assert_eq!(unchanged.attempts[0].status, AttemptStatus::NeedsUser);
+        assert!(unchanged.attempts[0].evidence_recoveries.is_empty());
+        assert!(
+            !project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/host-evidence")
+                .exists()
+        );
     }
 
     #[test]

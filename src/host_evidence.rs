@@ -61,6 +61,10 @@ struct FailedCommandRecheckEvidenceBinding {
     recheck_artifacts: Vec<BoundRecheckArtifact>,
     command_index: usize,
     command: String,
+    /// The command the authorized host actually ran. Older bindings used the
+    /// recheck command for both fields, so absence retains that interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_check: Option<String>,
     working_directory: String,
 }
 
@@ -1037,8 +1041,10 @@ fn validate_candidate_gate_evidence_frontier(
     gate_artifact: &str,
     document: &EvidenceDocument,
 ) -> Result<ValidatedCandidateGateFrontier, WorkModelError> {
-    let rejected = || WorkModelError::AttemptNotFound {
-        id: attempt_id.to_string(),
+    let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt_id.to_string(),
+        reason: "the supplied evidence does not match the immutable candidate-gate frontier"
+            .to_string(),
     };
     let attempt = item
         .attempts
@@ -1123,8 +1129,10 @@ fn validate_evidence_frontier(
     candidate_commit: &str,
     review_artifacts: &[String],
 ) -> Result<Vec<Task>, WorkModelError> {
-    let rejected = || WorkModelError::AttemptNotFound {
-        id: attempt_id.to_string(),
+    let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt_id.to_string(),
+        reason: "the supplied evidence does not match an eligible failed-review frontier"
+            .to_string(),
     };
     let attempt = item
         .attempts
@@ -1407,8 +1415,11 @@ fn validate_recheck_evidence_frontier(
     recheck_artifact: &str,
     document: &EvidenceDocument,
 ) -> Result<ValidatedRecheckFrontier, WorkModelError> {
-    let rejected = || WorkModelError::AttemptNotFound {
-        id: attempt_id.to_string(),
+    let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt_id.to_string(),
+        reason:
+            "the supplied evidence does not match the immutable failed-command recheck frontier"
+                .to_string(),
     };
     let attempt = item
         .attempts
@@ -1474,6 +1485,27 @@ fn validate_recheck_evidence_frontier(
     let [recheck_command] = results.commands.as_slice() else {
         return Err(rejected());
     };
+    let exact_recheck_command = document.check == recheck_command.command;
+    if !exact_recheck_command {
+        if document.result == EvidenceResult::Pass {
+            return Err(WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "passing evidence check {:?} does not match the failed-command recheck {:?}; rerun the exact command before claiming a pass",
+                    document.check, recheck_command.command
+                ),
+            });
+        }
+        if validate_focused_command(&document.check).is_err() {
+            return Err(WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "failed diagnostic evidence check {:?} must name one direct command",
+                    document.check
+                ),
+            });
+        }
+    }
     if results.error.is_some()
         || results.summary.fail
             != results
@@ -1492,7 +1524,6 @@ fn validate_recheck_evidence_frontier(
             .process_settlement
             .as_ref()
             .is_some_and(|settlement| !settlement.leaks.is_empty())
-        || document.check != recheck_command.command
     {
         return Err(rejected());
     }
@@ -1560,6 +1591,7 @@ fn validate_recheck_evidence_frontier(
             .collect::<Result<Vec<_>, _>>()?,
         command_index: *command_index,
         command: recheck_command.command.clone(),
+        evidence_check: Some(document.check.clone()),
         working_directory: ".".to_string(),
     };
     let binding_bytes = serde_json::to_vec_pretty(&binding).map_err(|_| rejected())?;
@@ -1746,8 +1778,13 @@ fn completed_recheck_evidence_source_for_recovery(
         return None;
     }
     let evidence = parse_document(&evidence_bytes).ok()?;
+    let evidence_check = binding
+        .evidence_check
+        .as_deref()
+        .unwrap_or(binding.command.as_str());
     if evidence.result != EvidenceResult::Pass
-        || evidence.check != binding.command
+        || evidence.check != evidence_check
+        || evidence_check != binding.command
         || evidence.working_directory != binding.working_directory
     {
         return None;
