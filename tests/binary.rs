@@ -5798,7 +5798,7 @@ exit 0
     let status_json: serde_json::Value =
         serde_json::from_slice(&fs::read(&status_file).unwrap()).unwrap();
     assert_eq!(status_json["state"], "complete");
-    assert_eq!(status_json["schema_version"], 4);
+    assert_eq!(status_json["schema_version"], 5);
 }
 
 #[cfg(unix)]
