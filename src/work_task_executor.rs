@@ -4712,6 +4712,15 @@ fn build_reviewed_correction_prompt(
         .map(|artifact| format!("  - {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
+    let candidate_metadata_rewrite_authority = task
+        .input_artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == crate::candidate_metadata_recovery::PRODUCER
+                && artifact.path.ends_with("/repair.json")
+        })
+        .map(|artifact| artifact.path.as_str())
+        .unwrap_or_default();
     let planning = compute_planning_paths(item, project_root);
     let template = ContentResolver::new(Some(workspace_path))
         .resolve_content("prompts/write-correction-user.md")
@@ -4789,6 +4798,18 @@ fn build_reviewed_correction_prompt(
             ("recovered_protected_base", &recovered_protected_base),
             ("correction_artifacts_list", &correction_artifacts_list),
             (
+                "candidate_metadata_rewrite_authority_path",
+                candidate_metadata_rewrite_authority,
+            ),
+            (
+                "has_candidate_metadata_rewrite_authority",
+                if candidate_metadata_rewrite_authority.is_empty() {
+                    ""
+                } else {
+                    "yes"
+                },
+            ),
+            (
                 "is_tester_harness_repair",
                 if tester_harness_repair { "yes" } else { "" },
             ),
@@ -4858,14 +4879,17 @@ fn correction_lineage(
                 .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE)
         })
         .collect::<Vec<_>>();
-    let protected_base_commit = (candidate_gates.len() == 1)
-        .then(|| {
-            crate::candidate_gate::authorized_tree_identical_metadata_rewrite_base(
-                candidate_gates[0],
-                prior_candidate_commit,
-            )
-        })
-        .flatten();
+    // A corrective Writer can receive more than one historical gate (for
+    // example after a mixed finding was repaired append-only).  Only the gate
+    // that names the exact candidate at this frontier can authorize the
+    // tree-identical metadata exception; older gates remain readable history,
+    // but must not downgrade the current Writer to append-only guidance.
+    let protected_base_commit = candidate_gates.iter().rev().find_map(|path| {
+        crate::candidate_gate::authorized_tree_identical_metadata_rewrite_base(
+            path,
+            prior_candidate_commit,
+        )
+    });
     let mode = if protected_base_commit.is_some() {
         ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
     } else {
@@ -17984,6 +18008,79 @@ mod tests {
         assert_eq!(context["correction-lineage"]["mode"], "append-only");
         assert!(prompt.contains("append-only"));
         assert!(!prompt.contains("tree-identical-metadata-rewrite"));
+    }
+
+    #[test]
+    fn latest_metadata_gate_wins_when_older_gate_history_is_preserved() {
+        let project = tempfile::tempdir().unwrap();
+        let checks = |metadata_status| {
+            [
+                (
+                    "candidate-identity",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                (
+                    "whitespace",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                ("commit-metadata", metadata_status),
+                (
+                    "behavior-references",
+                    crate::candidate_gate::CandidateCheckStatus::Passed,
+                ),
+                (
+                    "tester-reference-evidence",
+                    crate::candidate_gate::CandidateCheckStatus::Skipped,
+                ),
+                (
+                    "project-check",
+                    crate::candidate_gate::CandidateCheckStatus::Skipped,
+                ),
+            ]
+            .into_iter()
+            .map(
+                |(name, status)| crate::candidate_gate::CandidateCheckEvidence {
+                    name: name.to_string(),
+                    status,
+                    diagnostics: Vec::new(),
+                    log_path: None,
+                },
+            )
+            .collect::<Vec<_>>()
+        };
+        let write_gate = |path: &Path, candidate: &str, base: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                serde_json::to_vec_pretty(&crate::candidate_gate::CandidateGateEvidence {
+                    schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                    base_commit: base.to_string(),
+                    candidate_commit: candidate.to_string(),
+                    tester_results_path: None,
+                    metadata_rewrite: None,
+                    checks: checks(crate::candidate_gate::CandidateCheckStatus::Failed),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let older = project.path().join("older/candidate-gate.json");
+        let current = project.path().join("current/candidate-gate.json");
+        write_gate(&older, "older-candidate", "protected-base");
+        write_gate(&current, "current-candidate", "protected-base");
+
+        let lineage = correction_lineage("current-candidate", &[older, current]);
+        assert_eq!(
+            lineage.mode,
+            ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+        );
+        assert_eq!(lineage.prior_candidate_commit, "current-candidate");
+        assert_eq!(
+            lineage.protected_base_commit.as_deref(),
+            Some("protected-base")
+        );
     }
 
     #[test]

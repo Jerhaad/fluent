@@ -6706,15 +6706,33 @@ fn write_candidate_gate_handoff(
                     crate::candidate_ancestry_recovery::recovery_action(project_root, attempt)
                 })
         });
-    let recovery = ancestry_action
+    let metadata_action = WorkModelStore::new(project_root)
+        .read_work_item(work_item_id)
+        .ok()
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .and_then(|attempt| {
+                    crate::candidate_metadata_recovery::recovery_action(project_root, attempt)
+                })
+        });
+    let recovery = metadata_action
         .map(|action| {
-            let scheduler_action = crate::candidate_ancestry_recovery::scheduler_action(
-                work_item_id,
-                attempt_id,
-            );
             format!(
-                "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`{action}`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
+                "Fluent can authorize this exact tree-identical metadata correction through a public audited transition:\n\n`{action}`\n\nAfter authorization, queue this same planned Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
             )
+        })
+        .or_else(|| {
+            ancestry_action.map(|action| {
+                let scheduler_action = crate::candidate_ancestry_recovery::scheduler_action(
+                    work_item_id,
+                    attempt_id,
+                );
+                format!(
+                    "Fluent can repair this exact tree-identical ancestry failure through an audited host transition:\n\n`{action}`\n\nAfter the repair, queue this same planned Attempt through the scheduler:\n\n`{scheduler_action}`"
+                )
+            })
         })
         .unwrap_or_else(|| {
             format!(

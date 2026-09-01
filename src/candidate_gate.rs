@@ -581,6 +581,22 @@ fn validate_metadata_only_rewrite(
             "rewritten candidate tree {replacement_tree} does not match rejected tree {rejected_tree}"
         )));
     }
+    // A replacement that still descends from the protected base must preserve
+    // the exact linear, per-commit tree/author suffix.  If it replaced that
+    // base, retain the metadata-rewrite evidence so the dedicated ancestry
+    // recovery can classify and repair the protected-base failure.
+    if is_ancestor(
+        request.workspace,
+        &prior.base_commit,
+        request.candidate_commit,
+    )? && let Some(reason) = equivalent_message_only_suffix_mismatch(
+        request.workspace,
+        &prior.base_commit,
+        &prior.candidate_commit,
+        request.candidate_commit,
+    )? {
+        return Ok(Err(reason));
+    }
     Ok(Ok(CandidateMetadataRewriteEvidence {
         prior_gate_path: Some(evidence_path(request.project_root, prior_gate_path)),
         authorization: CandidateMetadataRewriteAuthorization::RejectedMetadataGate,
@@ -589,6 +605,85 @@ fn validate_metadata_only_rewrite(
         replacement_candidate_commit: request.candidate_commit.to_string(),
         candidate_tree: replacement_tree,
     }))
+}
+
+/// Return a diagnostic when a candidate rewrite changes anything beyond commit
+/// messages.  The rejected and replacement tips must expose the same linear
+/// suffix from the protected base, with identical trees and author identity at
+/// each position.  Committer timestamps may change as a consequence of the
+/// authorized rewrite; the candidate metadata gate still validates the new
+/// committer identity and message.
+fn equivalent_message_only_suffix_mismatch(
+    workspace: &Path,
+    protected_base: &str,
+    rejected_candidate: &str,
+    replacement_candidate: &str,
+) -> Result<Option<String>> {
+    let rejected = linear_commit_suffix(workspace, protected_base, rejected_candidate)?;
+    let replacement = linear_commit_suffix(workspace, protected_base, replacement_candidate)?;
+    if rejected.is_empty() || replacement.is_empty() {
+        return Ok(Some(
+            "metadata rewrite candidates must each contain a non-empty protected-base suffix"
+                .to_string(),
+        ));
+    }
+    if rejected.len() != replacement.len() {
+        return Ok(Some(format!(
+            "metadata rewrite changed the protected-base suffix length from {} to {}",
+            rejected.len(),
+            replacement.len()
+        )));
+    }
+    for (old, new) in rejected.iter().zip(&replacement) {
+        let old_identity = commit_author_identity(workspace, old)?;
+        let new_identity = commit_author_identity(workspace, new)?;
+        if old_identity != new_identity {
+            return Ok(Some(format!(
+                "metadata rewrite changed tree or author identity for commit {old}"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn linear_commit_suffix(workspace: &Path, base: &str, tip: &str) -> Result<Vec<String>> {
+    if !is_ancestor(workspace, base, tip)? {
+        return Ok(Vec::new());
+    }
+    let raw = crate::git::run_stdout(
+        workspace,
+        &[
+            "rev-list",
+            "--reverse",
+            "--first-parent",
+            &format!("{base}..{tip}"),
+        ],
+        "enumerate metadata rewrite suffix",
+    )?;
+    let commits = raw.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut parent = base.to_string();
+    for commit in &commits {
+        let row = crate::git::run_stdout(
+            workspace,
+            &["rev-list", "--parents", "-n", "1", commit],
+            "verify metadata rewrite linearity",
+        )?;
+        let fields = row.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || fields[0] != commit || fields[1] != parent {
+            return Ok(Vec::new());
+        }
+        parent = commit.clone();
+    }
+    Ok(commits)
+}
+
+fn commit_author_identity(workspace: &Path, commit: &str) -> Result<Vec<String>> {
+    let raw = crate::git::run_stdout(
+        workspace,
+        &["show", "-s", "--format=%T%x00%an%x00%ae%x00%aI", commit],
+        "read metadata rewrite author identity",
+    )?;
+    Ok(raw.split('\0').map(str::to_string).collect())
 }
 
 fn check_whitespace(
@@ -1675,6 +1770,123 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|line| line.contains("does not match rejected tree"))
+        );
+    }
+
+    #[test]
+    fn blocks_metadata_rewrite_when_commit_author_changes() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+
+        crate::git::run(
+            fixture.root.path(),
+            &[
+                "-c",
+                "user.name=Different Author",
+                "-c",
+                "user.email=different@example.com",
+                "commit",
+                "--amend",
+                "--reset-author",
+                "-q",
+                "-m",
+                "Add value\n\n- Explain value",
+            ],
+            "rewrite candidate with a different author",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert!(
+            check(&evidence, "candidate-identity")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("tree or author identity"))
+        );
+    }
+
+    #[test]
+    fn blocks_metadata_rewrite_when_history_shape_changes() {
+        let fixture = Fixture::new();
+        let rejected = fixture.commit(
+            "src/lib.rs",
+            "pub fn value() {}\n",
+            "Add value\\n\\nExplain value",
+        );
+        let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
+        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+
+        crate::git::run(
+            fixture.root.path(),
+            &["reset", "--hard", &fixture.base],
+            "rebuild metadata rewrite suffix",
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.root.path().join("src")).unwrap();
+        fs::write(
+            fixture.root.path().join("src/lib.rs"),
+            "pub fn value() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &["add", "src/lib.rs"],
+            "stage replacement",
+        )
+        .unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &["commit", "-q", "-m", "Add value\n\n- Explain value"],
+            "create first replacement commit",
+        )
+        .unwrap();
+        crate::git::run(
+            fixture.root.path(),
+            &[
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "Record metadata repair",
+            ],
+            "create extra replacement commit",
+        )
+        .unwrap();
+        let replacement = crate::git::run_stdout(
+            fixture.root.path(),
+            &["rev-parse", "HEAD"],
+            "read replacement",
+        )
+        .unwrap();
+        let artifact = fixture.artifacts.path().join("replacement-gate.json");
+        let mut request = fixture.request(&replacement, None, None, &artifact);
+        request.base_commit = &rejected;
+
+        let evidence = run_candidate_gate_with_prior(request, Some(&prior_artifact)).unwrap();
+
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert!(
+            check(&evidence, "candidate-identity")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("suffix length"))
         );
     }
 

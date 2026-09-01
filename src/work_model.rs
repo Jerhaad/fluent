@@ -32,6 +32,10 @@ pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
 pub const TESTER_HARNESS_REPAIR_ROLE: &str = "tester-harness-repair";
 pub const CANDIDATE_ANCESTRY_REPAIR_ROLE: &str = "candidate-ancestry-repair";
+/// Writer role used by the explicit, audited metadata-only candidate recovery.
+/// The role remains an ordinary Writer so its replacement candidate passes the
+/// normal candidate gate, Tester, reviewers, and Learner safeguards.
+pub const CANDIDATE_METADATA_REPAIR_ROLE: &str = "candidate-metadata-repair";
 
 fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
     let source = Path::new(path);
@@ -1183,6 +1187,16 @@ impl WorkItem {
                     }
                 }
             } else {
+                if latest_write.role == CANDIDATE_METADATA_REPAIR_ROLE {
+                    for artifact in latest_write.input_artifacts.iter().filter(|artifact| {
+                        artifact.producer_id == "candidate-metadata-recovery"
+                            && artifact.path.ends_with("/repair.json")
+                    }) {
+                        if !task_input_artifacts.contains(artifact) {
+                            task_input_artifacts.push(artifact.clone());
+                        }
+                    }
+                }
                 task_input_artifacts.push(ArtifactRef {
                     producer_id: latest_write.id.clone(),
                     path: format!("{writer_artifact_path}/transcript.jsonl"),
@@ -5913,6 +5927,39 @@ impl Task {
                 });
             }
         }
+        if self.role == CANDIDATE_METADATA_REPAIR_ROLE {
+            let authority_path = self.attempt_id.as_deref().map(|attempt_id| {
+                work_artifact_path(
+                    &self.work_item_id,
+                    attempt_id,
+                    &format!("candidate-metadata-repairs/{}/repair.json", self.id),
+                )
+            });
+            let has_authority = authority_path.as_deref().is_some_and(|expected| {
+                self.input_artifacts.iter().any(|artifact| {
+                    artifact.producer_id == "candidate-metadata-recovery"
+                        && artifact.path == expected
+                })
+            });
+            let has_source_gate = self.input_artifacts.iter().any(|artifact| {
+                is_canonical_work_artifact_file(
+                    &artifact.path,
+                    crate::candidate_gate::CANDIDATE_GATE_FILE,
+                )
+            });
+            if self.kind != TaskKind::Write
+                || self.artifact_area.is_none()
+                || self.workspace_access.writes.len() != 1
+                || !has_authority
+                || !has_source_gate
+                || self.review_context.is_some()
+                || self.depends_on.is_some()
+            {
+                return Err(WorkModelError::InvalidCandidateMetadataRepairTask {
+                    task_id: self.id.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -6738,6 +6785,9 @@ pub enum WorkModelError {
     InvalidCandidateAncestryRepairTask {
         task_id: String,
     },
+    InvalidCandidateMetadataRepairTask {
+        task_id: String,
+    },
     CompleteAttemptHasIncompleteTask {
         attempt_id: String,
         task_id: String,
@@ -7012,6 +7062,12 @@ impl fmt::Display for WorkModelError {
                 write!(
                     f,
                     "task {task_id} has invalid candidate ancestry repair context"
+                )
+            }
+            Self::InvalidCandidateMetadataRepairTask { task_id } => {
+                write!(
+                    f,
+                    "task {task_id} has invalid candidate metadata repair context"
                 )
             }
             Self::CompleteAttemptHasIncompleteTask {

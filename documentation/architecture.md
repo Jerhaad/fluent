@@ -300,20 +300,27 @@ rewrite those commits. The host revalidates the prior gate, proves that both
 candidates descend from its original base, requires identical Git trees, runs
 every gate check again over the replacement, and records both commit identities,
 the shared tree, and the prior artifact path. A changed tree, another prior
-failure, malformed evidence, or an ordinary non-ancestor candidate blocks before
-review.
+failure, changed author identity, changed linear suffix shape, malformed
+evidence, or an ordinary non-ancestor candidate blocks before review. Committer
+timestamps may change during the authorized rewrite, but the protected suffix's
+per-commit trees and authors remain fixed.
 
 Before that Writer launches, Fluent writes the immediately preceding candidate
 and a host-owned lineage mode into the generated execution context and renders
 both into the correction prompt. The default mode is `append-only`: removing
 unwanted content still requires a new correction commit, and the preceding
 candidate must remain an ancestor. Fluent renders
-`tree-identical-metadata-rewrite` only when one validated rejected gate names the
-current candidate and commit metadata is its sole failed check. That mode tells
-the Writer to change metadata without changing the tree and supplies the exact
-protected base that must remain an ancestor. These instructions reduce
-avoidable correction failures; the deterministic candidate gate remains the
-enforcement boundary and independently verifies the resulting history.
+`tree-identical-metadata-rewrite` when the latest validated rejected gate that
+names the current candidate has commit metadata as its sole failed check; older
+gate artifacts remain readable history but cannot override that current
+frontier. An operator can make this authorization explicit with
+`fluent attempt repair-candidate-metadata`. That transition records the exact
+gate, candidate tree, protected base, and human decision before scheduling the
+Writer. The mode tells the Writer to change metadata without changing the tree
+and supplies the exact protected base that must remain an ancestor. These
+instructions reduce avoidable correction failures; the deterministic candidate
+gate remains the enforcement boundary and independently verifies the resulting
+history.
 
 If the Writer nevertheless replaces that protected base, and this is the only
 blocking check, the gate offers the public `fluent attempt

@@ -6637,12 +6637,36 @@ tree, and prior gate path in the replacement gate evidence.
 Test: src/candidate_gate.rs (accepts_tree_identical_metadata_rewrite_from_legacy_gate)
 Test: src/work_attempt_loop.rs (metadata_only_history_repair_reaches_review)
 
+### B25ea
+
+WHEN Fluent admits a tree-identical commit-metadata rewrite, THE SYSTEM SHALL
+require the replacement to preserve the protected-base suffix's linear shape,
+per-commit trees, and author identities; only commit messages and committer
+metadata may change.
+Test: src/candidate_gate.rs (blocks_metadata_rewrite_when_commit_author_changes)
+Test: src/candidate_gate.rs (blocks_metadata_rewrite_when_history_shape_changes)
+
 ### B25f
 
 WHEN Fluent authorizes a tree-identical commit-metadata rewrite, THE SYSTEM
 SHALL provide the corrective Writer with the exact commit that must remain the
 replacement candidate's protected ancestor.
 Test: src/work_task_executor.rs (metadata_only_gate_explicitly_authorizes_tree_identical_rewrite_guidance)
+
+### B25fa
+
+WHEN an operator approves a rejected candidate whose only failed gate check is
+commit metadata, THE SYSTEM SHALL record the exact candidate, gate digest,
+protected base, candidate tree, and human decision before scheduling one
+corrective Writer.
+Test: src/candidate_metadata_recovery.rs (request_records_authority_and_is_idempotent)
+
+### B25fb
+
+WHEN a corrective Writer receives older candidate-gate artifacts alongside the
+current rejected metadata gate, THE SYSTEM SHALL use the gate naming the
+current candidate to select tree-identical metadata-rewrite guidance.
+Test: src/work_task_executor.rs (latest_metadata_gate_wins_when_older_gate_history_is_preserved)
 
 ### B25g
 

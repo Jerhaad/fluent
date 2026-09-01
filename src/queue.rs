@@ -710,6 +710,8 @@ pub fn resume_with_tester_no_sandbox(
         .is_some_and(crate::work_model::Attempt::has_reconciled_tester_harness_repair);
     let reconciled_candidate_ancestry_repair =
         crate::candidate_ancestry_recovery::is_resume_ready(project_root, &item, attempt_id)?;
+    let reconciled_candidate_metadata_repair =
+        crate::candidate_metadata_recovery::is_resume_ready(project_root, &item, attempt_id)?;
     let learner_retry = crate::lifecycle_recovery::is_learner_retry_recovery(&item, attempt_id);
     let pending_evidence_review = item
         .attempts
@@ -759,6 +761,7 @@ pub fn resume_with_tester_no_sandbox(
         attempt_id,
         legacy_learner_tester_evidence,
         reconciled_candidate_ancestry_repair,
+        reconciled_candidate_metadata_repair,
     )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
@@ -774,6 +777,10 @@ pub fn resume_with_tester_no_sandbox(
                 && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
                 && !(previous.status == DispatchStatus::Failed
                     && reconciled_candidate_ancestry_repair)
+                && !(previous.status == DispatchStatus::Failed
+                    && reconciled_candidate_metadata_repair)
+                && !(previous.status == DispatchStatus::Blocked
+                    && reconciled_candidate_metadata_repair)
                 && !(previous.status == DispatchStatus::Blocked && learner_retry)
                 && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
                 && !(previous.status == DispatchStatus::Blocked && pending_evidence_review)
@@ -1059,6 +1066,7 @@ fn ensure_resume_eligible(
     attempt_id: &str,
     known_legacy_learner_tester_evidence: bool,
     known_candidate_ancestry_repair: bool,
+    known_candidate_metadata_repair: bool,
 ) -> Result<()> {
     item.ensure_not_abandoned()?;
     item.ensure_execution_ready()?;
@@ -1069,6 +1077,8 @@ fn ensure_resume_eligible(
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
+    let candidate_metadata_repair = known_candidate_metadata_repair
+        || crate::candidate_metadata_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let evidence_queue_reconciliation =
         has_reconciled_interrupted_evidence_queue_admission(project_root, item, attempt_id);
     if item
@@ -1076,6 +1086,7 @@ fn ensure_resume_eligible(
         .last()
         .is_some_and(|current| current.id != attempt_id)
         && !candidate_ancestry_repair
+        && !candidate_metadata_repair
         && !evidence_queue_reconciliation
     {
         bail!(
@@ -1087,6 +1098,9 @@ fn ensure_resume_eligible(
         );
     }
     if candidate_ancestry_repair {
+        return Ok(());
+    }
+    if candidate_metadata_repair {
         return Ok(());
     }
     let legacy_learner_tester_evidence = known_legacy_learner_tester_evidence
@@ -1236,6 +1250,7 @@ pub fn claim(
                 &item,
                 work_item_id,
                 persisted_attempt_id,
+                false,
                 false,
                 false,
             )?;

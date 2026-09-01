@@ -494,6 +494,17 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Authorize a tree-identical commit-metadata rewrite for a rejected candidate
+    RepairCandidateMetadata {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Operator decision approving the exact metadata-only rewrite
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Revise selected behavior Test references on a paused Attempt
     ReviseTestReferences {
         /// Work Item ID
@@ -1175,6 +1186,32 @@ mod tests {
             }) if work_item_id == "work-1"
                 && attempt_id == "attempt-1"
                 && resolution == "Preserve the protected base."
+        ));
+    }
+
+    #[test]
+    fn candidate_metadata_repair_parses_operator_resolution() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "repair-candidate-metadata",
+            "work-1",
+            "attempt-1",
+            "--resolution",
+            "Rewrite only malformed commit messages.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::RepairCandidateMetadata {
+                    work_item_id,
+                    attempt_id,
+                    resolution,
+                }
+            }) if work_item_id == "work-1"
+                && attempt_id == "attempt-1"
+                && resolution == "Rewrite only malformed commit messages."
         ));
     }
 

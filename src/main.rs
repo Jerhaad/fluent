@@ -857,6 +857,32 @@ fn cmd_attempt(
                 fluent::candidate_ancestry_recovery::scheduler_action(&work_item_id, &attempt_id)
             );
         }
+        AttemptCommands::RepairCandidateMetadata {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::candidate_metadata_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_authorized {
+                println!(
+                    "Candidate metadata recovery Writer {} is already authorized for {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Authorized candidate metadata recovery Writer {} for {} (protected base {})",
+                    repair.task_id, repair.candidate_commit, repair.protected_base_commit
+                );
+            }
+            println!("Audit: {}", repair.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
         AttemptCommands::ReviseTestReferences {
             work_item_id,
             attempt_id,

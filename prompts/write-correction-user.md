@@ -16,6 +16,21 @@ the authoritative index for this correction:
 Current correction artifacts (complete, untruncated paths):
 {{correction_artifacts_list}}
 
+{{#if has_candidate_metadata_rewrite_authority}}
+## Candidate metadata-rewrite authority
+
+This Writer was created by an audited Fluent recovery for the exact rejected
+candidate. Read the complete authority record before changing Git history:
+
+- Authority: {{candidate_metadata_rewrite_authority_path}}
+
+It authorizes only a tree-identical commit-message rewrite after the protected
+base named in that record. Preserve the candidate tree and all protected
+ancestry. Do not use this authority to change product files, tests, or planning
+content. Fluent will verify the replacement candidate and rerun its ordinary
+candidate gate, Tester, reviewers, and Learner.
+{{/if}}
+
 {{#if is_tester_harness_repair}}
 ## Tester-harness repair authority
 
