@@ -934,6 +934,14 @@ pub fn attempt_recovery_next_action(
             attempt.work_item_id, attempt.id, recovery.candidate_commit
         ));
     }
+    if let Some(action) = project_root
+        .and_then(|root| crate::host_evidence::pending_plan_host_evidence_action(root, attempt))
+    {
+        return Some(format!(
+            "fluent attempt evidence attach {} {} --candidate {} --evidence-file <path> --plan-row {}",
+            attempt.work_item_id, attempt.id, action.candidate_commit, action.plan_row
+        ));
+    }
     if attempt.status == AttemptStatus::NeedsUser
         && attempt.review_state == Some(AttemptReviewState::Failed)
         && matches!(

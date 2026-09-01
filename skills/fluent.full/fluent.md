@@ -298,6 +298,23 @@ single `--review-artifact`. Set the evidence document's `check` to that exact
 command and `working_directory` to `.`. Fluent accepts this only when that gate
 has one missing complete command and no unrelated failure.
 
+If Writer completion pauses because a required Plan row is an authorized-host
+check, use the `--plan-row plan:step-N` attachment route named in the handoff:
+
+```sh
+fluent attempt evidence attach <work-item-id> <attempt-id> \
+  --candidate <candidate-sha> --evidence-file host-evidence.json \
+  --plan-row plan:step-N
+```
+
+The evidence `check` must exactly equal the Plan row's direct command. Fluent
+binds the result to the unchanged Writer candidate and source completion matrix,
+records an audited binding, and schedules one targeted Tests Review. Passing
+evidence can complete that host-owned row after the targeted Review and continue
+to the canonical gates; failing evidence remains a reviewed correction and does
+not make the row complete. Retrying the same command is idempotent. This route
+does not ask the Writer to create a source commit for host-only work.
+
 Fluent snapshots the exact document, binds it to that candidate, and reruns
 only the named reviewers. Do not edit the candidate or invent a commit. Inspect
 the Work Item again for the next action: `evidence-needed` means attach new

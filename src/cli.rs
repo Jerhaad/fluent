@@ -670,6 +670,9 @@ pub enum AttemptEvidenceCommands {
         /// Failed-command recheck manifest this evidence addresses
         #[arg(long, value_name = "PATH")]
         recheck_artifact: Option<String>,
+        /// Required Plan completion row completed by this authorized-host run
+        #[arg(long, value_name = "ROW", conflicts_with_all = ["review_artifact", "recheck_artifact"])]
+        plan_row: Option<String>,
     },
 }
 
@@ -1160,6 +1163,38 @@ mod tests {
                     }
                 }
             }) if review_artifact.is_empty() && recheck.ends_with("failed-command-recheck.json")
+        ));
+    }
+
+    #[test]
+    fn evidence_attach_parses_authorized_host_plan_row() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--evidence-file",
+            "evidence.json",
+            "--plan-row",
+            "plan:step-6",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Attach {
+                        plan_row: Some(row),
+                        review_artifact,
+                        recheck_artifact: None,
+                        ..
+                    }
+                }
+            }) if row == "plan:step-6" && review_artifact.is_empty()
         ));
     }
 

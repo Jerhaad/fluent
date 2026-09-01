@@ -15,13 +15,16 @@ use crate::review::{self, Verdict};
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
     EvidenceReviewContext, EvidenceReviewTarget, Task, TaskKind, TaskStatus, WorkModelError,
-    WorkModelStore,
+    WorkModelStore, WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionState,
+    WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
 };
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_FOCUSED_COMMAND_BYTES: usize = 4096;
 const MAX_FOCUSED_OUTPUT_BYTES: u64 = 384 * 1024;
 const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
+const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
+const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
 /// Version-one operator evidence document. Its serialized bytes, not a
 /// re-rendering, are the audited artifact.
@@ -93,6 +96,36 @@ struct ValidatedCandidateGateFrontier {
     prior_tests_review: Task,
     binding_path: String,
     binding_bytes: Vec<u8>,
+}
+
+/// A pending Plan row whose verification is an exact command that must run on
+/// an authorized host. The Writer cannot complete this row because it does not
+/// have that host's credentials or runtime; the operator binds its result to
+/// the unchanged candidate instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanHostEvidenceAction {
+    pub plan_row: String,
+    pub command: String,
+    pub candidate_commit: String,
+    pub matrix_artifact: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct PlanHostEvidenceBinding {
+    schema_version: u32,
+    work_item_id: String,
+    attempt_id: String,
+    writer_task_id: String,
+    candidate_commit: String,
+    plan_row: String,
+    requirement: String,
+    command: String,
+    working_directory: String,
+    source_matrix: BoundRecheckArtifact,
+    evidence: BoundRecheckArtifact,
+    result: EvidenceResult,
+    run_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +300,342 @@ pub fn run_focused(
         result,
         command,
         working_directory,
+    })
+}
+
+/// Return the exact pending Plan-row command that can be completed with
+/// candidate-bound host evidence. This is intentionally read-only: it is used
+/// to make a Writer-completion handoff name a recovery that is valid for the
+/// persisted candidate.
+pub(crate) fn pending_plan_host_evidence_action(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Option<PlanHostEvidenceAction> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::WriterCompletion)
+        || attempt.review_state != Some(work_model::AttemptReviewState::NotReviewed)
+    {
+        return None;
+    }
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)?;
+    let output = writer.output.as_ref()?;
+    if !candidate_workspace_is_clean_at(project_root, output, &output.commit) {
+        return None;
+    }
+    let matrix_ref = writer_completion_matrix_ref(project_root, attempt, writer)?;
+    let bytes = fs::read(project_root.join(&matrix_ref.path)).ok()?;
+    let matrix: WriterCompletionMatrix = serde_json::from_slice(&bytes).ok()?;
+    (matrix.task_id == writer.id).then_some(())?;
+    if let Some(contract) = attempt.writer_completion_contract.as_ref() {
+        let findings =
+            crate::work_task_executor::writer_completion_findings(project_root, writer).ok()?;
+        matrix
+            .status_against(contract, &writer.id, &findings)
+            .ok()?;
+    }
+    matrix.rows.into_iter().find_map(|row| {
+        if row.kind != WriterCompletionRequirementKind::Plan
+            || row.state != WriterCompletionState::Pending
+            || row.verification_refs.len() != 1
+        {
+            return None;
+        }
+        let command = row.verification_refs[0].trim().to_string();
+        validate_focused_command(&command).ok()?;
+        Some(PlanHostEvidenceAction {
+            plan_row: row.id,
+            command,
+            candidate_commit: output.commit.clone(),
+            matrix_artifact: matrix_ref.path.clone(),
+        })
+    })
+}
+
+/// Return a host-materialized completion matrix only after the evidence review
+/// that accepted it has passed. Before that review, the artifact remains an
+/// input to the reviewer but cannot satisfy the Writer completion gate.
+pub(crate) fn completed_plan_host_matrix_ref(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+) -> Option<ArtifactRef> {
+    attempt.artifacts.iter().rev().find_map(|artifact| {
+        if artifact.producer_id != PLAN_HOST_EVIDENCE_PRODUCER
+            || !artifact.path.ends_with("/writer-completion.json")
+        {
+            return None;
+        }
+        let binding_path = Path::new(&artifact.path).parent()?.join("binding.json");
+        let binding_bytes = fs::read(project_root.join(&binding_path)).ok()?;
+        let binding: PlanHostEvidenceBinding = serde_json::from_slice(&binding_bytes).ok()?;
+        if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
+            || binding.work_item_id != attempt.work_item_id
+            || binding.attempt_id != attempt.id
+            || binding.writer_task_id != writer.id
+            || binding.candidate_commit
+                != writer
+                    .output
+                    .as_ref()
+                    .map(|output| output.commit.as_str())?
+            || binding.result != EvidenceResult::Pass
+        {
+            return None;
+        }
+        let expected_source = writer_completion_matrix_ref(project_root, attempt, writer)?;
+        if binding.source_matrix.path != expected_source.path {
+            return None;
+        }
+        let source_bytes = fs::read(project_root.join(&binding.source_matrix.path)).ok()?;
+        if format!("sha256:{:x}", Sha256::digest(&source_bytes)) != binding.source_matrix.digest {
+            return None;
+        }
+        let source_matrix: WriterCompletionMatrix = serde_json::from_slice(&source_bytes).ok()?;
+        let source_row = source_matrix
+            .rows
+            .iter()
+            .find(|row| row.id == binding.plan_row)?;
+        if source_matrix.task_id != writer.id
+            || source_row.kind != WriterCompletionRequirementKind::Plan
+            || source_row.state != WriterCompletionState::Pending
+            || source_row.requirement != binding.requirement
+            || source_row.verification_refs.len() != 1
+            || source_row.verification_refs[0].trim() != binding.command
+        {
+            return None;
+        }
+        let evidence_bytes = fs::read(project_root.join(&binding.evidence.path)).ok()?;
+        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != binding.evidence.digest {
+            return None;
+        }
+        if snapshot_path(&attempt.work_item_id, &attempt.id, &binding.evidence.digest).ok()?
+            != binding.evidence.path
+        {
+            return None;
+        }
+        let evidence: EvidenceDocument = serde_json::from_slice(&evidence_bytes).ok()?;
+        if evidence.result != EvidenceResult::Pass
+            || evidence.check != binding.command
+            || evidence.working_directory != binding.working_directory
+        {
+            return None;
+        }
+        let recovery = attempt.evidence_recoveries.iter().find(|recovery| {
+            recovery.candidate_commit == binding.candidate_commit
+                && recovery.attachment.snapshot_path == binding.evidence.path
+                && recovery.attachment.digest == binding.evidence.digest
+                && recovery.targets.iter().any(|target| {
+                    target.role == "tests"
+                        && target.prior_review_artifact == binding_path.to_string_lossy()
+                        && target.review_task_id.as_ref().is_some_and(|task_id| {
+                            attempt.tasks.iter().any(|task| {
+                                task.id == *task_id
+                                    && task.kind == TaskKind::Review
+                                    && task.role == "tests"
+                                    && task.status == TaskStatus::Complete
+                                    && read_verdict(project_root, task) == Some(Verdict::Pass)
+                            })
+                        })
+                })
+        })?;
+        if recovery.state != EvidenceRecoveryState::Complete {
+            return None;
+        }
+        let matrix_bytes = fs::read(project_root.join(&artifact.path)).ok()?;
+        let matrix: WriterCompletionMatrix = serde_json::from_slice(&matrix_bytes).ok()?;
+        (matrix.task_id == writer.id
+            && matrix.rows.iter().any(|row| {
+                row.id == binding.plan_row && row.state == WriterCompletionState::Complete
+            }))
+        .then_some(artifact.clone())
+    })
+}
+
+/// Overlay accepted plan-host evidence onto the source Writer matrix. The
+/// overlay is only an in-memory view; the immutable Writer artifact is never
+/// rewritten. A later Writer-completion gate can therefore recognize the same
+/// host-owned completion without inventing a source commit.
+pub(crate) fn apply_completed_plan_host_evidence(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+    source_matrix: &ArtifactRef,
+    matrix: &mut WriterCompletionMatrix,
+) -> bool {
+    let Some(output) = writer.output.as_ref() else {
+        return false;
+    };
+    let source_bytes = fs::read(project_root.join(&source_matrix.path)).ok();
+    let source_digest = source_bytes
+        .as_deref()
+        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
+    let mut changed = false;
+    for artifact in attempt.artifacts.iter().filter(|artifact| {
+        artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
+            && artifact.path.ends_with("/binding.json")
+    }) {
+        let Ok(binding_bytes) = fs::read(project_root.join(&artifact.path)) else {
+            continue;
+        };
+        let Ok(binding) = serde_json::from_slice::<PlanHostEvidenceBinding>(&binding_bytes) else {
+            continue;
+        };
+        if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
+            || binding.work_item_id != attempt.work_item_id
+            || binding.attempt_id != attempt.id
+            || binding.writer_task_id != writer.id
+            || binding.candidate_commit != output.commit
+            || binding.source_matrix.path != source_matrix.path
+            || source_digest.as_deref() != Some(binding.source_matrix.digest.as_str())
+            || binding.result != EvidenceResult::Pass
+        {
+            continue;
+        }
+        if !writer_completion_matrix_ref(project_root, attempt, writer)
+            .is_some_and(|expected| expected.path == source_matrix.path)
+        {
+            continue;
+        }
+        let source_matrix_value = match source_bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<WriterCompletionMatrix>(bytes).ok())
+        {
+            Some(source) if source.task_id == writer.id => source,
+            _ => continue,
+        };
+        let Some(source_row) = source_matrix_value
+            .rows
+            .iter()
+            .find(|row| row.id == binding.plan_row)
+        else {
+            continue;
+        };
+        if source_row.kind != WriterCompletionRequirementKind::Plan
+            || source_row.state != WriterCompletionState::Pending
+            || source_row.requirement != binding.requirement
+            || source_row.verification_refs.len() != 1
+            || source_row.verification_refs[0].trim() != binding.command
+        {
+            continue;
+        }
+        let evidence_bytes = match fs::read(project_root.join(&binding.evidence.path)) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != binding.evidence.digest {
+            continue;
+        }
+        let Ok(evidence) = serde_json::from_slice::<EvidenceDocument>(&evidence_bytes) else {
+            continue;
+        };
+        if evidence.result != EvidenceResult::Pass
+            || evidence.check != binding.command
+            || evidence.working_directory != binding.working_directory
+        {
+            continue;
+        }
+        let Some(recovery) = attempt.evidence_recoveries.iter().find(|recovery| {
+            recovery.candidate_commit == binding.candidate_commit
+                && recovery.attachment.snapshot_path == binding.evidence.path
+                && recovery.attachment.digest == binding.evidence.digest
+                && recovery.state == EvidenceRecoveryState::Complete
+                && recovery.targets.iter().any(|target| {
+                    target.role == "tests"
+                        && target.prior_review_artifact == artifact.path
+                        && target.review_task_id.as_ref().is_some_and(|task_id| {
+                            attempt.tasks.iter().any(|task| {
+                                task.id == *task_id
+                                    && task.kind == TaskKind::Review
+                                    && task.role == "tests"
+                                    && task.status == TaskStatus::Complete
+                                    && read_verdict(project_root, task) == Some(Verdict::Pass)
+                            })
+                        })
+                })
+        }) else {
+            continue;
+        };
+        let _ = recovery;
+        let Some(row) = matrix.rows.iter_mut().find(|row| {
+            row.id == binding.plan_row && row.kind == WriterCompletionRequirementKind::Plan
+        }) else {
+            continue;
+        };
+        if !row
+            .verification_refs
+            .iter()
+            .any(|command| command == &binding.command)
+            || row.requirement != binding.requirement
+        {
+            continue;
+        }
+        if row.state != WriterCompletionState::Complete
+            || row.implementation_evidence != vec![artifact.path.clone()]
+            || row.verification
+                != vec![WriterVerificationClaim {
+                    command: binding.command.clone(),
+                    result: WriterVerificationResult::Pass,
+                }]
+        {
+            row.state = WriterCompletionState::Complete;
+            row.implementation_evidence = vec![artifact.path.clone()];
+            row.verification = vec![WriterVerificationClaim {
+                command: binding.command.clone(),
+                result: WriterVerificationResult::Pass,
+            }];
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn writer_completion_matrix_ref(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+) -> Option<ArtifactRef> {
+    // A planning-reference recovery can leave several immutable matrices in
+    // the Attempt. Select only the one whose task identity matches this
+    // Writer; otherwise an older recovery could make a valid current row look
+    // absent and produce an ineligible handoff.
+    for artifact in attempt.artifacts.iter().rev() {
+        if !artifact.path.ends_with("/writer-completion.json") {
+            continue;
+        }
+        if artifact.producer_id == "writer-completion-repair"
+            && !artifact
+                .path
+                .contains(&format!("/writer-completion-repairs/{}/", writer.id))
+        {
+            continue;
+        }
+        if artifact.producer_id != "writer-completion-repair"
+            && artifact.producer_id != "planning-reference-recovery"
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(project_root.join(&artifact.path)) else {
+            // An unreadable recovery artifact cannot be selected as the
+            // authoritative matrix; the task-owned fallback below still gives
+            // the caller a deterministic path to diagnose.
+            continue;
+        };
+        if serde_json::from_slice::<WriterCompletionMatrix>(&bytes)
+            .is_ok_and(|matrix| matrix.task_id == writer.id)
+        {
+            return Some(artifact.clone());
+        }
+    }
+    writer.artifact_area.as_ref().map(|area| ArtifactRef {
+        producer_id: writer.id.clone(),
+        path: format!(
+            "{}/{}",
+            area.path,
+            crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+        ),
     })
 }
 
@@ -931,6 +1300,384 @@ pub fn attach(
     })?;
     let _ = document; // validation intentionally happens before publication.
     Ok(recovery)
+}
+
+/// Attach evidence for a required Plan row whose verification must run on an
+/// authorized host. Unlike ordinary focused evidence, this frontier has no
+/// failed Review artifact yet: the completed Writer is paused before review
+/// planning because the Writer cannot access the host runtime. The evidence
+/// binding therefore creates the first targeted Tests Review directly against
+/// the unchanged candidate.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_plan_row(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    candidate_commit: &str,
+    plan_row: &str,
+    evidence_file: &Path,
+) -> Result<EvidenceRecovery> {
+    if fs::symlink_metadata(evidence_file)
+        .with_context(|| format!("inspect evidence file {}", evidence_file.display()))?
+        .file_type()
+        .is_symlink()
+    {
+        bail!("evidence file must not be a symlink");
+    }
+    let bytes = fs::read(evidence_file)
+        .with_context(|| format!("read evidence file {}", evidence_file.display()))?;
+    let document = parse_document(&bytes)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let snapshot_path = snapshot_path(work_item_id, attempt_id, &digest)?;
+    let plan_row = plan_row.trim().to_string();
+    anyhow::ensure!(
+        !plan_row.is_empty() && plan_row.len() <= MAX_FOCUSED_COMMAND_BYTES,
+        "plan row must name one completion-matrix row"
+    );
+
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
+        .context("acquire land lock before attaching Plan-row host evidence")?;
+    let recovery = store.mutate_work_item_from_external(
+        work_item_id,
+        format!("attach authorized-host evidence for Plan row {plan_row}"),
+        Some(snapshot_path.clone()),
+        |item| {
+            let attempt = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: attempt_id.to_string(),
+                })?;
+            let ineligible = |reason: &str| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: reason.to_string(),
+            };
+            if item
+                .attempts
+                .last()
+                .is_none_or(|current| current.id != attempt_id)
+            {
+                return Err(ineligible(
+                    "Plan-row host evidence requires the current Attempt",
+                ));
+            }
+            if item
+                .merge_candidates
+                .iter()
+                .any(|candidate| candidate.attempt_id == attempt_id)
+            {
+                return Err(ineligible(
+                    "Plan-row host evidence is not eligible after a Merge Candidate exists",
+                ));
+            }
+            if attempt
+                .tasks
+                .iter()
+                .any(|task| task.status == TaskStatus::Executing)
+            {
+                return Err(ineligible("the Attempt has an executing Task"));
+            }
+            let writer = attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .cloned()
+                .ok_or_else(|| ineligible("the Attempt has no completed Writer candidate"))?;
+            let output = writer
+                .output
+                .as_ref()
+                .ok_or_else(|| ineligible("the completed Writer has no candidate output"))?;
+            if output.commit != candidate_commit {
+                return Err(ineligible(&format!(
+                    "candidate {candidate_commit} does not match the latest Writer candidate {}",
+                    output.commit
+                )));
+            }
+            if !candidate_workspace_is_clean_at(project_root, output, candidate_commit) {
+                return Err(ineligible(
+                    "the candidate worktree must be clean before attaching host evidence",
+                ));
+            }
+            let matrix_ref = writer_completion_matrix_ref(project_root, attempt, &writer)
+                .ok_or_else(|| ineligible("the completed Writer has no completion matrix"))?;
+            let matrix_path = project_root.join(&matrix_ref.path);
+            let matrix_bytes = fs::read(&matrix_path).map_err(|error| {
+                ineligible(&format!(
+                    "read Writer completion matrix {}: {error}",
+                    matrix_path.display()
+                ))
+            })?;
+            let mut matrix: WriterCompletionMatrix = serde_json::from_slice(&matrix_bytes)
+                .map_err(|error| ineligible(&format!("completion matrix is malformed: {error}")))?;
+            if matrix.task_id != writer.id {
+                return Err(ineligible(
+                    "completion matrix is not bound to the latest Writer",
+                ));
+            }
+            if let Some(contract) = attempt.writer_completion_contract.as_ref() {
+                let findings =
+                    crate::work_task_executor::writer_completion_findings(project_root, &writer)
+                        .map_err(|error| {
+                            ineligible(&format!("read Writer completion findings: {error:#}"))
+                        })?;
+                matrix
+                    .status_against(contract, &writer.id, &findings)
+                    .map_err(|reason| {
+                        ineligible(&format!("completion matrix is invalid: {reason}"))
+                    })?;
+            }
+            let row = matrix
+                .rows
+                .iter()
+                .find(|row| row.id == plan_row)
+                .ok_or_else(|| ineligible(&format!("completion matrix has no row {plan_row:?}")))?;
+            if row.kind != WriterCompletionRequirementKind::Plan {
+                return Err(ineligible(&format!(
+                    "row {plan_row:?} is not a required Plan row"
+                )));
+            }
+            if row.state != WriterCompletionState::Pending {
+                return Err(ineligible(&format!(
+                    "Plan row {plan_row:?} is already complete"
+                )));
+            }
+            if row.verification_refs.len() != 1 {
+                return Err(ineligible(&format!(
+                    "Plan row {plan_row:?} must contain exactly one host verification command"
+                )));
+            }
+            let command = row.verification_refs[0].trim().to_string();
+            validate_focused_command(&command)
+                .map_err(|error| ineligible(&format!("Plan row command is invalid: {error}")))?;
+            if document.check != command {
+                return Err(ineligible(&format!(
+                    "evidence check {:?} does not match Plan row command {:?}",
+                    document.check, command
+                )));
+            }
+            let source_matrix_digest = format!("sha256:{:x}", Sha256::digest(&matrix_bytes));
+            let binding = PlanHostEvidenceBinding {
+                schema_version: PLAN_HOST_EVIDENCE_SCHEMA_VERSION,
+                work_item_id: work_item_id.to_string(),
+                attempt_id: attempt_id.to_string(),
+                writer_task_id: writer.id.clone(),
+                candidate_commit: candidate_commit.to_string(),
+                plan_row: plan_row.clone(),
+                requirement: row.requirement.clone(),
+                command: command.clone(),
+                working_directory: document.working_directory.clone(),
+                source_matrix: BoundRecheckArtifact {
+                    path: matrix_ref.path.clone(),
+                    digest: source_matrix_digest,
+                },
+                evidence: BoundRecheckArtifact {
+                    path: snapshot_path.clone(),
+                    digest: digest.clone(),
+                },
+                result: document.result.clone(),
+                run_at: document.run_at.clone(),
+            };
+            let binding_bytes = serde_json::to_vec_pretty(&binding).map_err(|error| {
+                ineligible(&format!("serialize host-evidence binding: {error}"))
+            })?;
+            let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+            let evidence_slug = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest.as_str())
+                .chars()
+                .take(16)
+                .collect::<String>();
+            let row_slug = plan_row_slug(&plan_row);
+            let directory = format!(
+                "plan-host-evidence/{}/{row_slug}-{evidence_slug}",
+                writer.id
+            );
+            let binding_path = work_artifact_path(
+                work_item_id,
+                attempt_id,
+                &format!("{directory}/binding.json"),
+            );
+            let matrix_path = work_artifact_path(
+                work_item_id,
+                attempt_id,
+                &format!("{directory}/writer-completion.json"),
+            );
+            let recovery_id = format!(
+                "plan-host-evidence-{}-{}",
+                &binding_digest
+                    .strip_prefix("sha256:")
+                    .unwrap_or(binding_digest.as_str())[..16],
+                row_slug
+            );
+            if let Some(existing) = attempt.evidence_recoveries.iter().find(|recovery| {
+                recovery.id == recovery_id
+                    || (recovery.candidate_commit == candidate_commit
+                        && recovery.attachment.digest == digest
+                        && recovery.targets.iter().any(|target| {
+                            target.role == "tests" && target.prior_review_artifact == binding_path
+                        }))
+            }) {
+                return Ok(existing.clone());
+            }
+
+            // Idempotent retries of the exact attachment are allowed after the
+            // first invocation has moved the Attempt into targeted review. A
+            // different attachment or Plan row must still begin at the original
+            // Writer-completion pause, so it cannot silently hijack a live
+            // recovery frontier.
+            if !(attempt.status == work_model::AttemptStatus::NeedsUser
+                && attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
+                && attempt.review_state == Some(work_model::AttemptReviewState::NotReviewed))
+            {
+                return Err(ineligible(
+                    "the Attempt is not paused at Writer completion for a pending Plan row",
+                ));
+            }
+
+            publish_snapshot(project_root, &snapshot_path, &bytes)
+                .map_err(|error| ineligible(&format!("publish host evidence: {error:#}")))?;
+            publish_snapshot(project_root, &binding_path, &binding_bytes).map_err(|error| {
+                ineligible(&format!("publish host-evidence binding: {error:#}"))
+            })?;
+
+            let host_matrix_ref = if document.result == EvidenceResult::Pass {
+                if let Some(row) = matrix.rows.iter_mut().find(|row| row.id == plan_row) {
+                    row.state = WriterCompletionState::Complete;
+                    row.implementation_evidence = vec![binding_path.clone()];
+                    row.verification = vec![WriterVerificationClaim {
+                        command: command.clone(),
+                        result: WriterVerificationResult::Pass,
+                    }];
+                }
+                let host_matrix_bytes = serde_json::to_vec_pretty(&matrix).map_err(|error| {
+                    ineligible(&format!("serialize host completion matrix: {error}"))
+                })?;
+                publish_snapshot(project_root, &matrix_path, &host_matrix_bytes).map_err(
+                    |error| ineligible(&format!("publish host completion matrix: {error:#}")),
+                )?;
+                Some(ArtifactRef {
+                    producer_id: PLAN_HOST_EVIDENCE_PRODUCER.to_string(),
+                    path: matrix_path.clone(),
+                })
+            } else {
+                None
+            };
+
+            let recovery = EvidenceRecovery {
+                id: recovery_id,
+                candidate_commit: candidate_commit.to_string(),
+                attachment: EvidenceAttachment {
+                    snapshot_path: snapshot_path.clone(),
+                    digest: digest.clone(),
+                },
+                targets: vec![EvidenceReviewTarget {
+                    role: "tests".to_string(),
+                    prior_review_artifact: binding_path.clone(),
+                    review_task_id: None,
+                }],
+                state: EvidenceRecoveryState::Reviewing,
+                created_at: work_model::now_iso8601(),
+            };
+            let recovery = item
+                .attempts
+                .iter_mut()
+                .find(|candidate| candidate.id == attempt_id)
+                .expect("validated Attempt remains present")
+                .attach_evidence_recovery(recovery)?;
+            let task_ids = item
+                .add_next_review_tasks(attempt_id, &["tests"])
+                .map_err(|error| ineligible(&format!("plan targeted Tests Review: {error}")))?;
+            let task_id = task_ids
+                .first()
+                .cloned()
+                .ok_or_else(|| ineligible("Plan-row evidence did not create a Tests Review"))?;
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|candidate| candidate.id == attempt_id)
+                .expect("validated Attempt remains present");
+            let evidence_ref = ArtifactRef {
+                producer_id: "host-evidence".to_string(),
+                path: snapshot_path.clone(),
+            };
+            let binding_ref = ArtifactRef {
+                producer_id: PLAN_HOST_EVIDENCE_PRODUCER.to_string(),
+                path: binding_path.clone(),
+            };
+            for artifact in [evidence_ref.clone(), binding_ref.clone()] {
+                if !attempt.artifacts.contains(&artifact) {
+                    attempt.artifacts.push(artifact.clone());
+                }
+            }
+            if let Some(host_matrix_ref) = host_matrix_ref.clone()
+                && !attempt.artifacts.contains(&host_matrix_ref)
+            {
+                attempt.artifacts.push(host_matrix_ref);
+            }
+            let review = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+                .ok_or_else(|| ineligible("created Tests Review disappeared"))?;
+            for artifact in [evidence_ref, binding_ref] {
+                if !review.input_artifacts.contains(&artifact) {
+                    review.input_artifacts.push(artifact);
+                }
+            }
+            if let Some(host_matrix_ref) = host_matrix_ref {
+                if !review.input_artifacts.contains(&host_matrix_ref) {
+                    review.input_artifacts.push(host_matrix_ref);
+                }
+            }
+            review.evidence_review_context = Some(EvidenceReviewContext {
+                recovery_id: recovery.id.clone(),
+                candidate_commit: candidate_commit.to_string(),
+                attachment: recovery.attachment.clone(),
+                prior_review_artifact: binding_path,
+            });
+            let target = attempt
+                .evidence_recoveries
+                .iter_mut()
+                .find(|entry| entry.id == recovery.id)
+                .and_then(|entry| {
+                    entry
+                        .targets
+                        .iter_mut()
+                        .find(|target| target.role == "tests")
+                })
+                .ok_or_else(|| ineligible("Plan-row evidence recovery target disappeared"))?;
+            target.review_task_id = Some(task_id);
+            Ok(attempt
+                .evidence_recoveries
+                .iter()
+                .find(|entry| entry.id == recovery.id)
+                .cloned()
+                .expect("attached Plan-row recovery remains present"))
+        },
+    )?;
+    Ok(recovery)
+}
+
+fn plan_row_slug(row: &str) -> String {
+    let slug = row
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "plan-row".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn existing_recheck_recovery<'a>(
@@ -2465,6 +3212,120 @@ mod tests {
         )
     }
 
+    fn plan_host_evidence_fixture(
+        command: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        WorkModelStore,
+        String,
+        PathBuf,
+    ) {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q", "-b", "main"],
+            "initialize Plan-row evidence fixture",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.name", "Test Author"],
+            "configure fixture author",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["config", "user.email", "test@example.com"],
+            "configure fixture email",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("README.md"), "base\n").unwrap();
+        fs::create_dir_all(workspace.path().join("tests")).unwrap();
+        fs::write(
+            workspace.path().join("tests/readiness.py"),
+            "#!/usr/bin/env python3\n",
+        )
+        .unwrap();
+        crate::git::run(workspace.path(), &["add", "."], "stage Plan-row fixture").unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Add readiness check"],
+            "commit Plan-row fixture",
+        )
+        .unwrap();
+        let candidate = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read Plan-row fixture candidate",
+        )
+        .unwrap();
+
+        let mut item = work_model::WorkItem::planned("work-1", "Attach Plan-row evidence");
+        item.planning_context = Some(work_model::PlanningContext {
+            plan: Some(format!(
+                "| # | State reached | Behaviors | Verification | Req? |\n\
+                 |---|---------------|-----------|--------------|------|\n\
+                 | 6 | Host check passed | | {command} | Yes |\n"
+            )),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(work_model::TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: workspace.path().display().to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let writer_id = writer.id.clone();
+        let matrix_path = format!(
+            "{}/{}",
+            writer.artifact_area.as_ref().unwrap().path,
+            crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+        );
+        let contract = item.attempts[0]
+            .writer_completion_contract
+            .as_ref()
+            .unwrap()
+            .clone();
+        let matrix = WriterCompletionMatrix::skeleton(&contract, &writer_id, &[], None).unwrap();
+        fs::create_dir_all(project.path().join(&matrix_path).parent().unwrap()).unwrap();
+        fs::write(
+            project.path().join(&matrix_path),
+            serde_json::to_vec_pretty(&matrix).unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].status = work_model::AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(work_model::PauseKind::WriterCompletion);
+        item.attempts[0].review_state = Some(work_model::AttemptReviewState::NotReviewed);
+        let store = WorkModelStore::new(project.path());
+        store.create_work_item(&item).unwrap();
+
+        let evidence_path = project.path().join("host-evidence.json");
+        let document = EvidenceDocument {
+            schema_version: 1,
+            producer: "authorized host".to_string(),
+            check: command.to_string(),
+            working_directory: ".".to_string(),
+            result: EvidenceResult::Pass,
+            run_at: "2026-08-25T12:00:00Z".to_string(),
+            output: "passed on the authorized host".to_string(),
+        };
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+
+        (project, workspace, store, candidate, evidence_path)
+    }
+
     #[test]
     fn evidence_document_requires_versioned_complete_host_claim() {
         let accepted = br#"{"schema_version":1,"producer":"host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
@@ -2475,6 +3336,197 @@ mod tests {
 
         let missing_check = br#"{"schema_version":1,"producer":"host","check":"","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
         assert!(parse_document(missing_check).is_err());
+    }
+
+    #[test]
+    fn plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent() {
+        let command = "python3 tests/readiness.py";
+        let (project, _workspace, store, candidate, evidence_path) =
+            plan_host_evidence_fixture(command);
+
+        let before = store.read_work_item("work-1").unwrap();
+        let action = pending_plan_host_evidence_action(project.path(), &before.attempts[0])
+            .expect("a pending Plan row advertises an authorized-host recovery");
+        assert_eq!(action.plan_row, "plan:step-6");
+        assert_eq!(action.command, command);
+        assert_eq!(action.candidate_commit, candidate);
+        let status_action = crate::work_status::attempt_recovery_next_action(
+            Some(&before.attempts[0]),
+            Some(project.path()),
+        )
+        .expect("status should expose the Plan-row attachment command");
+        assert!(status_action.starts_with(&format!(
+            "fluent attempt evidence attach work-1 attempt-1 --candidate {candidate}"
+        )));
+        assert!(status_action.ends_with("--evidence-file <path> --plan-row plan:step-6"));
+
+        assert!(
+            attach_plan_row(
+                project.path(),
+                &store,
+                "work-1",
+                "attempt-1",
+                "stale-candidate",
+                &action.plan_row,
+                &evidence_path,
+            )
+            .is_err(),
+            "host evidence must remain candidate-bound"
+        );
+
+        let recovery = attach_plan_row(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &action.plan_row,
+            &evidence_path,
+        )
+        .unwrap();
+        let after = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            after.attempts[0].status,
+            work_model::AttemptStatus::Reviewing
+        );
+        assert_eq!(
+            after.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(after.attempts[0].evidence_recoveries.len(), 1);
+        assert_eq!(recovery.targets.len(), 1);
+        let review_id = recovery.targets[0].review_task_id.clone().unwrap();
+        assert!(after.attempts[0].tasks.iter().any(|task| {
+            task.id == review_id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Planned
+        }));
+
+        let repeated = attach_plan_row(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &action.plan_row,
+            &evidence_path,
+        )
+        .unwrap();
+        assert_eq!(repeated, recovery);
+        let repeated_item = store.read_work_item("work-1").unwrap();
+        assert_eq!(repeated_item.attempts[0].evidence_recoveries.len(), 1);
+        assert_eq!(
+            repeated_item.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.id == review_id)
+                .count(),
+            1
+        );
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let review = attempt
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == review_id)
+                    .unwrap();
+                let review_path = review.artifact_area.as_ref().unwrap().path.clone();
+                fs::create_dir_all(project.path().join(&review_path)).unwrap();
+                fs::write(
+                    project.path().join(&review_path).join("review.md"),
+                    "Verdict: pass\n",
+                )
+                .unwrap();
+                work_model::set_task_terminal(review, TaskStatus::Complete);
+                attempt.evidence_recoveries[0].state = EvidenceRecoveryState::Complete;
+                Ok(())
+            })
+            .unwrap();
+
+        let completed = store.read_work_item("work-1").unwrap();
+        let attempt = &completed.attempts[0];
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        let host_matrix = completed_plan_host_matrix_ref(project.path(), attempt, writer)
+            .expect("a passing targeted Tests Review unlocks the host completion matrix");
+        let source = writer_completion_matrix_ref(project.path(), attempt, writer).unwrap();
+        let source_bytes = fs::read(project.path().join(&source.path)).unwrap();
+        let mut projected: WriterCompletionMatrix = serde_json::from_slice(&source_bytes).unwrap();
+        assert!(apply_completed_plan_host_evidence(
+            project.path(),
+            attempt,
+            writer,
+            &source,
+            &mut projected,
+        ));
+        assert_eq!(
+            projected
+                .rows
+                .iter()
+                .find(|row| row.id == action.plan_row)
+                .unwrap()
+                .state,
+            WriterCompletionState::Complete
+        );
+        assert!(host_matrix.path.ends_with("writer-completion.json"));
+        assert_eq!(
+            fs::read(project.path().join(&source.path)).unwrap(),
+            source_bytes,
+            "the immutable Writer matrix is not rewritten by host recovery"
+        );
+    }
+
+    #[test]
+    fn plan_row_host_evidence_rejects_wrong_command_without_mutation() {
+        let command = "python3 tests/readiness.py";
+        let (project, _workspace, store, candidate, evidence_path) =
+            plan_host_evidence_fixture(command);
+        let mut document: EvidenceDocument =
+            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        document.check = "python3 tests/another-check.py".to_string();
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&document).unwrap(),
+        )
+        .unwrap();
+
+        let error = attach_plan_row(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            "plan:step-6",
+            &evidence_path,
+        )
+        .expect_err("a Plan-row attachment must name the exact approved command");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match Plan row command")
+        );
+        let unchanged = store.read_work_item("work-1").unwrap();
+        assert!(unchanged.attempts[0].evidence_recoveries.is_empty());
+        assert_eq!(
+            unchanged.attempts[0].status,
+            work_model::AttemptStatus::NeedsUser
+        );
+        assert_eq!(
+            pending_plan_host_evidence_action(project.path(), &unchanged.attempts[0])
+                .unwrap()
+                .command,
+            command
+        );
     }
 
     #[test]

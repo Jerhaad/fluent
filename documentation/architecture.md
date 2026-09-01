@@ -977,6 +977,30 @@ never satisfy the recheck or make the candidate landable by itself. When this
 narrow route is not eligible, the immutable recheck artifacts remain a valid
 frontier for an explicit Writer extension.
 
+If the Writer-completion gate pauses because a required Plan row is an
+authorized-host check, the row is a different evidence frontier: completing it
+produces host proof, not a source commit. The handoff names the exact
+`plan:<step>` row, command, unchanged candidate, and Writer completion matrix.
+After running that command on the authorized host, create the same schema-
+version-1 evidence document and attach it with:
+
+```sh
+fluent attempt evidence attach <work-item> <attempt> \
+  --candidate <sha> \
+  --evidence-file <path> \
+  --plan-row plan:step-<n>
+```
+
+The external transition records the evidence snapshot, source-matrix digest,
+Writer identity, candidate, row, command, and operator reason. A passing
+attachment materializes an immutable completion-matrix overlay and schedules
+one targeted Tests Review; a failing attachment preserves the failed result
+for that Review and cannot complete the Plan row. An identical retry returns
+the existing recovery. Once the targeted Review passes, the normal Attempt
+loop credits the host-owned row, projects required progress, and continues to
+the canonical Tester and Learner without inventing a Writer commit or changing
+the approved Plan.
+
 `fluent work-item list` and `fluent work-item show <id>` expose the same durable
 Work Item model for inspection. These commands use `.fluent/work/items/`
 through the Rust storage model and validate stored objects.

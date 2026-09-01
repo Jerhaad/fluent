@@ -6091,6 +6091,57 @@ fn recover_legacy_learner_tester_evidence_failure(
 /// a reconciled one produces nothing, so a passing review advances normally.
 fn required_progress_finding(project_root: &Path, attempt: &Attempt) -> Option<ArtifactRef> {
     attempt.progress_contract.as_ref()?;
+    // A passed authorized-host Plan-row recovery owns a host-generated
+    // completion matrix. Project it before checking the durable progress
+    // manifest so the evidence-only path does not send the candidate back to a
+    // Writer for a commit it must not create.
+    if let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        && let Some(matrix_artifact) =
+            crate::host_evidence::completed_plan_host_matrix_ref(project_root, attempt, writer)
+        && let Ok(matrix_source) = fs::read_to_string(project_root.join(&matrix_artifact.path))
+        && let Ok(matrix) =
+            serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&matrix_source)
+        && let Some(progress_contract) = attempt.progress_contract.as_ref()
+        && let Ok(status) = progress_contract.status_against_writer_matrix(&matrix)
+        && status.is_complete()
+    {
+        let progress_rel = format!(
+            "{}/{}/{}/progress.md",
+            crate::work_model::WORK_PROGRESS_DIR,
+            attempt.work_item_id,
+            attempt.id
+        );
+        let progress_path = project_root.join(&progress_rel);
+        let source = fs::read_to_string(&progress_path).unwrap_or_default();
+        if let Ok(projected) = progress_contract.project_completed_required_progress(
+            &source,
+            &matrix,
+            &matrix_artifact.path,
+        ) {
+            if projected != source {
+                if let Some(parent) = progress_path.parent() {
+                    if fs::create_dir_all(parent).is_err() {
+                        return Some(ArtifactRef {
+                            producer_id: "required-progress".to_string(),
+                            path: progress_rel,
+                        });
+                    }
+                }
+                if crate::atomic_write::atomic_write(&progress_path, projected.as_bytes()).is_err()
+                {
+                    return Some(ArtifactRef {
+                        producer_id: "required-progress".to_string(),
+                        path: progress_rel,
+                    });
+                }
+            }
+            return None;
+        }
+    }
     let progress_rel = format!(
         "{}/{}/{}/progress.md",
         crate::work_model::WORK_PROGRESS_DIR,
@@ -6788,7 +6839,12 @@ fn gate_writer_completion_before_reviews(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .cloned()
         .expect("the completed Writer gate has a completed Writer");
-    let mut matrix_artifact = writer_completion_artifact(&latest_writer);
+    let mut matrix_artifact = crate::host_evidence::completed_plan_host_matrix_ref(
+        project_root,
+        &item.attempts[attempt_index],
+        &latest_writer,
+    )
+    .or_else(|| writer_completion_artifact(&latest_writer));
     let mut validated_matrix = None;
     let mut repaired_writer_claims = false;
     let completion_contract = item.attempts[attempt_index]
@@ -6917,6 +6973,13 @@ fn gate_writer_completion_before_reviews(
                 }
             }
         }
+        crate::host_evidence::apply_completed_plan_host_evidence(
+            project_root,
+            &item.attempts[attempt_index],
+            &latest_writer,
+            artifact,
+            &mut matrix,
+        );
         match matrix.status_against(contract, &latest_writer.id, &findings) {
             Ok(status) => {
                 validated_matrix = Some(matrix);
@@ -7222,6 +7285,11 @@ fn pause_writer_completion_before_reviews(
         attempt_id,
         reason,
         &artifact.path,
+        crate::host_evidence::pending_plan_host_evidence_action(
+            project_root,
+            &item.attempts[attempt_index],
+        )
+        .as_ref(),
     )?;
     mutate_attempt_work_item(store, &item.id, |fresh| {
         let attempt = fresh
@@ -7350,6 +7418,7 @@ fn write_writer_completion_handoff(
     attempt_id: &str,
     reason: &str,
     progress_path: &str,
+    host_action: Option<&crate::host_evidence::PlanHostEvidenceAction>,
 ) -> Result<String> {
     let matrix = progress_path.ends_with(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
     let file_name = if matrix {
@@ -7381,6 +7450,25 @@ fn write_writer_completion_handoff(
             "# {title}\n\nFluent stopped before Tester and review planning because the {contract} cannot be repaired safely.\n\nReason: {reason}\n\nInspect `{progress_path}` and {repair}.\n"
         ),
     )?;
+    if let Some(action) = host_action {
+        let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+        writeln!(
+            file,
+            "\n\nThis pending Plan row is an authorized-host check and does not require a Writer commit.\n\nPlan row: {}\nExact command to run on an authorized host against candidate {}: {}\nCompletion matrix: {}\n\nWrite a schema-version-1 host evidence JSON document whose check exactly matches that command, then attach it with:\n\nfluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}\n\nFluent will bind the evidence to this unchanged candidate and create a targeted Tests Review. After that Review settles, resume the Attempt with fluent queue resume {} --attempt {} (or fluent attempt run {} {}).",
+            action.plan_row,
+            action.candidate_commit,
+            action.command,
+            action.matrix_artifact,
+            work_item_id,
+            attempt_id,
+            action.candidate_commit,
+            action.plan_row,
+            work_item_id,
+            attempt_id,
+            work_item_id,
+            attempt_id,
+        )?;
+    }
     Ok(relative_path)
 }
 

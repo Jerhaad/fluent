@@ -627,6 +627,34 @@ THE SYSTEM SHALL retain that exact candidate-bound gate, Tester result, and
 failed-command logs as an eligible round-cap extension frontier.
 Test: src/work_attempt_loop.rs (rejected_final_tester_gate_remains_round_cap_frontier_after_no_change_writer)
 
+### B23
+
+IF Writer completion is paused only because a required Plan row names an
+authorized-host command, THEN THE SYSTEM SHALL identify that row, exact command,
+candidate, and completion matrix in the handoff and provide a candidate-bound
+`--plan-row` evidence attachment transition instead of requiring a Writer
+commit.
+Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
+
+### B24
+
+WHEN an operator attaches a schema-version-1 host evidence document for the
+exact pending Plan row and unchanged candidate, THE SYSTEM SHALL record an
+audited binding to the Work Item, Attempt, Writer, source matrix, evidence
+digest, row, and command, then create exactly one targeted Tests Review.
+Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
+
+### B25
+
+WHEN the authorized-host Plan-row evidence and targeted Tests Review pass, THE
+SYSTEM SHALL credit the host-owned row without rewriting the Writer matrix or
+creating a source commit, and SHALL continue through the ordinary Tester and
+Learner gates. A failing result SHALL remain uncredited for a corrective
+review. Repeating the exact attachment SHALL return the existing recovery;
+stale candidates, commands, or rows SHALL be rejected without mutation.
+Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
+Test: src/host_evidence.rs (plan_row_host_evidence_rejects_wrong_command_without_mutation)
+
 ## Test harnesses
 
 | Harness | Runs | Usage |

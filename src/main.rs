@@ -668,8 +668,36 @@ fn cmd_attempt(
                     evidence_file,
                     review_artifact,
                     recheck_artifact,
+                    plan_row,
                 },
         } => {
+            if let Some(plan_row) = plan_row {
+                anyhow::ensure!(
+                    review_artifact.is_empty() && recheck_artifact.is_none(),
+                    "--plan-row cannot be combined with review or recheck artifacts"
+                );
+                let recovery = fluent::host_evidence::attach_plan_row(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &plan_row,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached Plan-row host evidence {} for Attempt {}; targeted reviews: {}",
+                    recovery.attachment.digest,
+                    attempt_id,
+                    recovery
+                        .targets
+                        .iter()
+                        .map(|target| target.role.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Ok(());
+            }
             let recovery = fluent::host_evidence::attach(
                 project_root,
                 &store,
