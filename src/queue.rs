@@ -685,6 +685,17 @@ pub fn resume_with_tester_no_sandbox(
     }
     let _ = reconcile_interrupted_evidence_queue_admissions(project_root, id, attempt_id)?;
     let store = WorkModelStore::new(project_root);
+    // Older Fluent versions could persist a direct Codex authentication failure
+    // as a generic round-cap pause. Reclassify that exact, transcript-proven
+    // frontier before queue admission so the public scheduler recovery remains
+    // usable after the operator re-authenticates. The migration is idempotent;
+    // non-matching failures remain hard and are still rejected below.
+    let _ = crate::work_attempt_loop::reclassify_codex_auth_pause(
+        &store,
+        project_root,
+        id,
+        attempt_id,
+    )?;
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
     let failed_candidate_gate_correction = item
@@ -1918,6 +1929,67 @@ mod tests {
         let replayed = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
         assert_eq!(replayed.dispatches.len(), 2);
         assert_eq!(replayed.active().unwrap().priority, 11);
+    }
+
+    #[test]
+    fn resume_reclassifies_legacy_codex_auth_pause_before_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-auth", "attempt-1");
+        add(dir.path(), "wi-auth", Some(3)).unwrap();
+        claim(dir.path(), "wi-auth", "attempt-1").unwrap().unwrap();
+
+        let store = WorkModelStore::new(dir.path());
+        store
+            .mutate_work_item("wi-auth", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                let task = &mut attempt.tasks[0];
+                task.status = TaskStatus::Failed;
+                task.artifact_area = Some(crate::work_model::TaskArtifactArea {
+                    path: crate::work_model::work_artifact_path(
+                        "wi-auth",
+                        "attempt-1",
+                        "attempt-1-write-1",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        reconcile_active(dir.path(), "wi-auth", DispatchStatus::NeedsUser).unwrap();
+
+        let transcript = dir.path().join(crate::work_model::work_artifact_path(
+            "wi-auth",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resume(dir.path(), "wi-auth", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+        let migrated = store.read_work_item("wi-auth").unwrap();
+        assert_eq!(migrated.attempts[0].pause_kind, Some(PauseKind::Auth));
+        assert_eq!(migrated.attempts[0].tasks[0].status, TaskStatus::NeedsUser);
+        assert_eq!(
+            resume(dir.path(), "wi-auth", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::ExistingMatching
+        );
+        assert_eq!(store.read_work_item("wi-auth").unwrap(), migrated);
     }
 
     fn initialize_queue_resume_git_project(project: &Path) {

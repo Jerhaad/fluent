@@ -100,6 +100,71 @@ pub(crate) fn classify_codex_transport_unavailable(
     })
 }
 
+/// Recognize a Codex launch that failed authentication before the model made
+/// any progress. Older Fluent builds could flatten this failure to a generic
+/// `RoundCap` task when the CLI emitted the auth error directly in its
+/// structured transcript.  Recovery uses this narrow grammar to migrate only
+/// that historical shape back to the normal resumable Auth pause.
+pub(crate) fn classify_codex_auth_failure(transcript: &Path) -> bool {
+    let Some(events) = read_json_lines(transcript) else {
+        return false;
+    };
+    let mut saw_turn = false;
+    let mut saw_auth_failure = false;
+    let mut saw_terminal_failure = false;
+
+    for (index, event) in events.iter().enumerate() {
+        let Some(event_type) = event["type"].as_str() else {
+            return false;
+        };
+        match event_type {
+            "thread.started" if !saw_turn && !saw_terminal_failure => {}
+            "turn.started" if !saw_turn && !saw_terminal_failure => saw_turn = true,
+            "error" if saw_turn && !saw_terminal_failure => {
+                if !is_codex_auth_failure_message(event["message"].as_str().unwrap_or_default()) {
+                    return false;
+                }
+                saw_auth_failure = true;
+            }
+            "item.completed" if saw_turn && !saw_terminal_failure => {
+                if event["item"]["type"].as_str() != Some("error")
+                    || !is_codex_auth_failure_message(
+                        event["item"]["message"].as_str().unwrap_or_default(),
+                    )
+                {
+                    return false;
+                }
+                saw_auth_failure = true;
+            }
+            "turn.failed" if saw_turn && index + 1 == events.len() => {
+                if !is_codex_auth_failure_message(
+                    event["error"]["message"].as_str().unwrap_or_default(),
+                ) {
+                    return false;
+                }
+                saw_auth_failure = true;
+                saw_terminal_failure = true;
+            }
+            _ => return false,
+        }
+    }
+
+    saw_turn && saw_auth_failure && saw_terminal_failure
+}
+
+fn is_codex_auth_failure_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    (message.contains("access token")
+        && (message.contains("refresh")
+            || message.contains("expired")
+            || message.contains("authentication")))
+        || message.contains("refresh_token_reused")
+        || (message.contains("authentication token")
+            && (message.contains("expired") || message.contains("invalid")))
+        || ((message.contains("sign in") || message.contains("log out"))
+            && (message.contains("token") || message.contains("authentication")))
+}
+
 fn is_codex_transport_failure_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("stream disconnected before completion")
@@ -481,6 +546,42 @@ mod tests {
                 provider: CoderKind::Codex,
             })
         );
+    }
+
+    #[test]
+    fn classifies_codex_auth_failure_before_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(classify_codex_auth_failure(&path));
+    }
+
+    #[test]
+    fn rejects_codex_auth_failure_after_model_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"working\"}}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Your access token could not be refreshed. Please sign in again.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(!classify_codex_auth_failure(&path));
     }
 
     #[test]

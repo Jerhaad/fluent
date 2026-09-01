@@ -382,6 +382,14 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             && attempt.pause_kind == Some(PauseKind::RoundCap)
             && attempt.round_cap_extensions.is_empty()
         {
+            if reclassify_codex_auth_pause(
+                config.store,
+                config.project_root,
+                config.work_item_id,
+                config.attempt_id,
+            )? {
+                continue;
+            }
             if reclassify_codex_transport_pause(
                 config.store,
                 config.project_root,
@@ -2083,6 +2091,63 @@ enum LegacyProviderPauseRecovery {
     Reclassified,
     Ineligible(String),
     NotLegacy,
+}
+
+/// Recover an older generic pause only when one failed Codex Task has an exact
+/// pre-progress authentication-failure transcript. This migration preserves
+/// real hard failures and retries the same Task without charging another
+/// Writer round.
+pub(crate) fn reclassify_codex_auth_pause(
+    store: &WorkModelStore,
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    Ok(mutate_attempt_work_item(store, work_item_id, |item| {
+        let Some(attempt) = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+        else {
+            return Ok(false);
+        };
+        if attempt.status != AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(PauseKind::RoundCap)
+            || !attempt.round_cap_extensions.is_empty()
+        {
+            return Ok(false);
+        }
+
+        let failed = attempt
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.status == TaskStatus::Failed)
+            .collect::<Vec<_>>();
+        if failed.len() != 1 {
+            return Ok(false);
+        }
+        let (task_index, task) = failed[0];
+        if !matches!(task.kind, TaskKind::Write | TaskKind::Review)
+            || task.output.is_some()
+            || attempt.coder_mapping.for_task_kind(task.kind).coder
+                != crate::coder::CoderKind::Codex
+        {
+            return Ok(false);
+        }
+        let Some(area) = task.artifact_area.as_ref() else {
+            return Ok(false);
+        };
+        let transcript = project_root.join(&area.path).join("transcript.jsonl");
+        if !crate::provider_evidence::classify_codex_auth_failure(&transcript) {
+            return Ok(false);
+        }
+
+        crate::work_model::set_task_terminal(&mut attempt.tasks[task_index], TaskStatus::NeedsUser);
+        attempt.pause_kind = Some(PauseKind::Auth);
+        attempt.pause_recovery = None;
+        Ok(true)
+    })?)
 }
 
 /// Recover an older generic pause only when one failed Codex Task has an exact
@@ -20043,6 +20108,52 @@ mod tests {
         assert_eq!(attempt.pause_kind, Some(PauseKind::ProviderUnavailable));
         assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
         assert!(attempt.tasks[0].output.is_none());
+    }
+
+    #[test]
+    fn reclassifies_failed_codex_auth_task_for_same_task_resume_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Recover Codex authentication outage");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.coder_mapping.write.coder = crate::coder::CoderKind::Codex;
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::RoundCap);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        let task = &mut attempt.tasks[0];
+        task.status = TaskStatus::Failed;
+        task.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-1"),
+        });
+        store.create_work_item(&item).unwrap();
+
+        let transcript = tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1/transcript.jsonl",
+        ));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"thread.started\"}\n",
+                "{\"type\":\"turn.started\"}\n",
+                "{\"type\":\"error\",\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}\n",
+                "{\"type\":\"turn.failed\",\"error\":{\"message\":\"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(reclassify_codex_auth_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap());
+        let migrated = store.read_work_item("work-1").unwrap();
+        let attempt = &migrated.attempts[0];
+        assert_eq!(attempt.pause_kind, Some(PauseKind::Auth));
+        assert_eq!(attempt.tasks[0].status, TaskStatus::NeedsUser);
+        assert!(attempt.tasks[0].output.is_none());
+
+        assert!(!reclassify_codex_auth_pause(&store, tmp.path(), "work-1", "attempt-1").unwrap());
+        assert_eq!(store.read_work_item("work-1").unwrap(), migrated);
     }
 
     #[test]
