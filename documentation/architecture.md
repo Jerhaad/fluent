@@ -1005,6 +1005,14 @@ still requires all exact-commit evidence and Learning before landing. The
 ordinary `code-change` disposition closes evidence recovery and follows the
 normal Writer, Tester, and reviewer path.
 
+Classification admission and Writer-completion checks live in
+`src/recovery_contracts.rs`, a neutral boundary consumed by the queue, executor,
+and host-evidence modules. Keeping these checks shared prevents a reciprocal
+executor/host-evidence dependency while ensuring direct and queued continuations
+enforce the same candidate-bound contract.
+The queue and executor therefore depend on this boundary without importing the
+host-evidence implementation.
+
 If that code-change disposition plans a corrective Writer and the operator
 interrupts it before it produces output, replacement evidence remains eligible
 only against that exact evidence Review and unchanged clean candidate. Accepting

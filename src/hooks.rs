@@ -219,6 +219,26 @@ mod tests {
     }
 
     #[test]
+    fn passes_base_commit_to_hook() {
+        let tmp = TempDir::new().unwrap();
+        write_hook(
+            tmp.path(),
+            "check-pre-merge",
+            "#!/bin/sh\nprintf '%s' \"$FLUENT_BASE_COMMIT\"\n",
+        );
+        let log_dir = tmp.path().join("logs");
+        let context = HookContext {
+            base_commit: Some("base-123".to_string()),
+            log_dir: log_dir.clone(),
+            ..Default::default()
+        };
+        let outcome = run_hook(tmp.path(), "check-pre-merge", tmp.path(), &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read_to_string(outcome.log_path).unwrap(), "base-123");
+    }
+
+    #[test]
     fn reports_non_zero_exit() {
         let tmp = TempDir::new().unwrap();
         write_hook(

@@ -3352,7 +3352,7 @@ mod tests {
         fs::write(
             &hook,
             format!(
-                "#!/bin/sh\n[ \"$FLUENT_BASE_COMMIT\" = \"{}\" ]\n",
+                "#!/bin/sh\n[ \"$FLUENT_BASE_COMMIT\" = \"{}\" ] || exit 9\n",
                 fixture.base
             ),
         )
@@ -3363,6 +3363,7 @@ mod tests {
         let evidence =
             run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
 
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
         assert_eq!(
             check(&evidence, "project-check").status,
             CandidateCheckStatus::Passed
