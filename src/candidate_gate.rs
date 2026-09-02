@@ -2,7 +2,7 @@
 //! Recheck corrective candidates from their original base and admit a history
 //! rewrite only when it repairs metadata without changing the candidate tree.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -12,6 +12,7 @@ use crate::work_model::{WriterCompletionContract, WriterCompletionRequirementKin
 pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
+const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -529,6 +530,249 @@ pub(crate) fn candidate_ancestry_repair_authorization(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataFinding {
+    commit: String,
+    reason: String,
+}
+
+/// Validate a project check that derives from the preceding gate's commit
+/// metadata finding.  The gate owns this classifier so both the recovery
+/// command and the candidate gate apply the same evidence contract.
+pub(crate) fn validate_derived_project_check(
+    project_root: &Path,
+    gate_path: &Path,
+    metadata_check: &CandidateCheckEvidence,
+    project_check: &CandidateCheckEvidence,
+) -> Result<String> {
+    let gate_findings =
+        metadata_findings(&metadata_check.diagnostics, &[], false).ok_or_else(|| {
+            anyhow::anyhow!(
+                "project-check failure is not explained by structured commit-metadata diagnostics"
+            )
+        })?;
+    if gate_findings.is_empty() {
+        bail!("project-check failure is not explained by structured commit-metadata diagnostics");
+    }
+    let known_commits = gate_findings
+        .iter()
+        .map(|finding| finding.commit.clone())
+        .fold(Vec::new(), |mut commits, commit| {
+            if !commits.contains(&commit) {
+                commits.push(commit);
+            }
+            commits
+        });
+
+    let expected_log_path = gate_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("candidate gate artifact path has no parent"))?
+        .join("hooks/check-pre-merge.log");
+    let expected_log_rel = expected_log_path
+        .strip_prefix(project_root)
+        .map_err(|_| anyhow::anyhow!("candidate gate artifact path is outside the project"))?
+        .to_string_lossy()
+        .to_string();
+    if project_check.log_path.as_deref() != Some(expected_log_rel.as_str()) {
+        bail!("derived project-check hook log must be the canonical {expected_log_rel} artifact");
+    }
+
+    let metadata = fs::metadata(&expected_log_path).with_context(|| {
+        format!(
+            "inspect derived project-check hook log {}",
+            expected_log_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "derived project-check hook log is not a regular file: {}",
+            expected_log_path.display()
+        );
+    }
+    if metadata.len() > MAX_PROJECT_CHECK_LOG_BYTES {
+        bail!(
+            "derived project-check hook log is {} bytes; maximum is {MAX_PROJECT_CHECK_LOG_BYTES} bytes",
+            metadata.len()
+        );
+    }
+    let log = String::from_utf8(fs::read(&expected_log_path).with_context(|| {
+        format!(
+            "read derived project-check hook log {}",
+            expected_log_path.display()
+        )
+    })?)
+    .map_err(|_| anyhow::anyhow!("derived project-check hook log is not valid UTF-8"))?;
+    let log_diagnostics = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if log_diagnostics.is_empty() {
+        bail!("derived project-check hook log has no structured hook diagnostics");
+    }
+    let log_findings =
+        metadata_findings(&log_diagnostics, &known_commits, true).ok_or_else(|| {
+            anyhow::anyhow!(
+                "project-check hook log contains a diagnostic unrelated to commit-metadata findings"
+            )
+        })?;
+    if log_findings.is_empty() {
+        bail!("derived project-check hook log has no structured hook diagnostics");
+    }
+    if !log_diagnostics.iter().any(|diagnostic| {
+        parse_metadata_finding(diagnostic, &known_commits, true).is_some_and(
+            |(finding, raw_reason)| {
+                is_body_line_length_reason(&raw_reason)
+                    && gate_findings.iter().any(|gate| {
+                        gate.commit == finding.commit && gate.reason == "literal-line-breaks"
+                    })
+            },
+        )
+    }) {
+        bail!(
+            "derived project-check hook log does not contain the required body-line-length finding"
+        );
+    }
+
+    let diagnostic_findings = project_check
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| !is_project_check_exit_diagnostic(diagnostic))
+        .cloned()
+        .collect::<Vec<_>>();
+    let diagnostic_findings = metadata_findings(&diagnostic_findings, &known_commits, true)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project-check diagnostics contain a diagnostic unrelated to commit-metadata findings"
+            )
+        })?;
+    if diagnostic_findings
+        .iter()
+        .any(|finding| !log_findings.contains(finding))
+    {
+        bail!("project-check diagnostics are not represented in the stored hook log");
+    }
+
+    let mut remaining = gate_findings;
+    for finding in log_findings {
+        let Some(index) = remaining.iter().position(|candidate| candidate == &finding) else {
+            bail!(
+                "project-check hook log contains a diagnostic unrelated to commit-metadata findings"
+            );
+        };
+        remaining.remove(index);
+    }
+    Ok(expected_log_rel)
+}
+
+fn metadata_findings(
+    diagnostics: &[String],
+    known_commits: &[String],
+    allow_project_policy_wording: bool,
+) -> Option<Vec<MetadataFinding>> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            parse_metadata_finding(diagnostic, known_commits, allow_project_policy_wording)
+                .map(|(finding, _)| finding)
+        })
+        .collect()
+}
+
+fn parse_metadata_finding(
+    diagnostic: &str,
+    known_commits: &[String],
+    allow_project_policy_wording: bool,
+) -> Option<(MetadataFinding, String)> {
+    let normalized = normalize_diagnostic_text(diagnostic);
+    let rest = normalized.strip_prefix("commit ")?;
+    let (raw_commit, reason) = rest.split_once(' ')?;
+    let raw_commit = raw_commit.trim_end_matches(':');
+    let commit = resolve_commit_id(raw_commit, known_commits)?;
+    let raw_reason = reason.to_ascii_lowercase();
+    let normalized_reason = normalize_metadata_reason(&raw_reason, allow_project_policy_wording)?;
+    Some((
+        MetadataFinding {
+            commit,
+            reason: normalized_reason,
+        },
+        raw_reason,
+    ))
+}
+
+fn normalize_diagnostic_text(diagnostic: &str) -> String {
+    diagnostic.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn resolve_commit_id(raw_commit: &str, known_commits: &[String]) -> Option<String> {
+    if !(4..=64).contains(&raw_commit.len())
+        || !raw_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let raw_commit = raw_commit.to_ascii_lowercase();
+    if known_commits.is_empty() {
+        return Some(raw_commit);
+    }
+    let mut matches = known_commits
+        .iter()
+        .filter(|commit| commit.as_str() == raw_commit || commit.starts_with(&raw_commit))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    matches.sort_unstable();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches[0].to_string())
+}
+
+fn normalize_metadata_reason(reason: &str, allow_project_policy_wording: bool) -> Option<String> {
+    if allow_project_policy_wording && is_body_line_length_reason(reason) {
+        return Some("literal-line-breaks".to_string());
+    }
+    match reason {
+        "is a merge commit" => Some("merge-commit".to_string()),
+        "has an empty subject" => Some("empty-subject".to_string()),
+        "contains literal \\n text instead of line breaks" => {
+            Some("literal-line-breaks".to_string())
+        }
+        _ => reason.strip_prefix("has invalid ").and_then(|label| {
+            let label = label.split(':').next()?.trim();
+            matches!(
+                label,
+                "author name" | "author email" | "committer name" | "committer email"
+            )
+            .then(|| format!("invalid-{}", label.replace(' ', "-")))
+        }),
+    }
+}
+
+fn is_body_line_length_reason(reason: &str) -> bool {
+    let mut fields = reason.split_whitespace();
+    if fields.next() != Some("body") || fields.next() != Some("line") {
+        return false;
+    }
+    let Some(line) = fields.next() else {
+        return false;
+    };
+    let Ok(line_number) = line.parse::<u64>() else {
+        return false;
+    };
+    if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) || line_number == 0 {
+        return false;
+    }
+    matches!(
+        (fields.next(), fields.next(), fields.next(), fields.next()),
+        (Some("exceeds"), Some("72"), Some("characters"), None)
+    )
+}
+
+fn is_project_check_exit_diagnostic(diagnostic: &str) -> bool {
+    let normalized = normalize_diagnostic_text(diagnostic);
+    normalized
+        .strip_prefix("check-pre-merge exited ")
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some()
+}
+
 fn validate_metadata_only_rewrite(
     request: &CandidateGateRequest<'_>,
     prior_gate_path: &Path,
@@ -551,7 +795,7 @@ fn validate_metadata_only_rewrite(
             .iter()
             .find(|check| check.name == "project-check")
             .ok_or_else(|| anyhow::anyhow!("prior gate has no project-check check"))?;
-        if let Err(error) = crate::candidate_metadata_recovery::validate_derived_project_check(
+        if let Err(error) = validate_derived_project_check(
             request.project_root,
             prior_gate_path,
             metadata_check,

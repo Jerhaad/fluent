@@ -30,7 +30,6 @@ use crate::work_model::{
 pub const PRODUCER: &str = "candidate-metadata-recovery";
 const SCHEMA_VERSION: u32 = 1;
 const MAX_RESOLUTION_BYTES: usize = 4_096;
-const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
 
 /// Result of requesting the one audited metadata-rewrite Writer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,12 +74,6 @@ struct EligibleMetadataRepair {
     gate_ref: ArtifactRef,
     gate_path: String,
     project_check_ref: Option<ArtifactRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MetadataFinding {
-    commit: String,
-    reason: String,
 }
 
 /// Return the exact public command when the current Attempt has this recovery
@@ -571,98 +564,6 @@ fn inspect_candidate_frontier(
     })
 }
 
-pub(crate) fn validate_derived_project_check(
-    project_root: &Path,
-    gate_path: &Path,
-    metadata_check: &crate::candidate_gate::CandidateCheckEvidence,
-    project_check: &crate::candidate_gate::CandidateCheckEvidence,
-) -> Result<()> {
-    let gate_findings =
-        metadata_findings(&metadata_check.diagnostics, &[], false).ok_or_else(|| {
-            anyhow::anyhow!(
-                "project-check failure is not explained by structured commit-metadata diagnostics"
-            )
-        })?;
-    if gate_findings.is_empty() {
-        bail!("project-check failure is not explained by structured commit-metadata diagnostics");
-    }
-    let known_commits = gate_findings
-        .iter()
-        .map(|finding| finding.commit.clone())
-        .collect::<Vec<_>>();
-
-    let log_rel = project_check
-        .log_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("derived project-check failure has no stored hook log"))?;
-    let log_path =
-        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, log_rel)?;
-    let expected_log_dir = gate_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("candidate gate artifact path has no parent"))?
-        .join("hooks");
-    if log_path.parent() != Some(expected_log_dir.as_path()) {
-        bail!(
-            "derived project-check hook log is not beside the candidate gate: {}",
-            log_path.display()
-        );
-    }
-    let metadata = fs::metadata(&log_path).with_context(|| {
-        format!(
-            "inspect derived project-check hook log {}",
-            log_path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        bail!(
-            "derived project-check hook log is not a regular file: {}",
-            log_path.display()
-        );
-    }
-    if metadata.len() > MAX_PROJECT_CHECK_LOG_BYTES {
-        bail!(
-            "derived project-check hook log is {} bytes; maximum is {MAX_PROJECT_CHECK_LOG_BYTES} bytes",
-            metadata.len()
-        );
-    }
-    let log =
-        String::from_utf8(fs::read(&log_path).with_context(|| {
-            format!("read derived project-check hook log {}", log_path.display())
-        })?)
-        .map_err(|_| anyhow::anyhow!("derived project-check hook log is not valid UTF-8"))?;
-    let mut project_findings = log
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    project_findings.extend(
-        project_check
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| !is_project_check_exit_diagnostic(diagnostic))
-            .cloned(),
-    );
-    if project_findings.is_empty() {
-        bail!("derived project-check failure has no structured hook diagnostics");
-    }
-    let project_findings =
-        metadata_findings(&project_findings, &known_commits, true).ok_or_else(|| {
-            anyhow::anyhow!(
-                "project-check failure contains a diagnostic unrelated to commit-metadata findings"
-            )
-        })?;
-    let mut remaining = gate_findings;
-    for finding in project_findings {
-        let Some(index) = remaining.iter().position(|candidate| candidate == &finding) else {
-            bail!(
-                "project-check failure contains a diagnostic unrelated to commit-metadata findings"
-            );
-        };
-        remaining.remove(index);
-    }
-    Ok(())
-}
-
 fn classify_derived_project_check(
     project_root: &Path,
     source_writer_id: &str,
@@ -670,15 +571,16 @@ fn classify_derived_project_check(
     metadata_check: &crate::candidate_gate::CandidateCheckEvidence,
     project_check: &crate::candidate_gate::CandidateCheckEvidence,
 ) -> Result<ArtifactRef> {
-    let log_rel = project_check
-        .log_path
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("derived project-check failure has no stored hook log"))?;
-    validate_derived_project_check(project_root, gate_path, metadata_check, project_check)?;
+    let log_rel = crate::candidate_gate::validate_derived_project_check(
+        project_root,
+        gate_path,
+        metadata_check,
+        project_check,
+    )?;
 
     Ok(ArtifactRef {
         producer_id: source_writer_id.to_string(),
-        path: log_rel.to_string(),
+        path: log_rel,
     })
 }
 
@@ -706,103 +608,14 @@ pub(crate) fn authorized_derived_project_check_metadata_rewrite_base(
         .checks
         .iter()
         .find(|check| check.name == "project-check")?;
-    validate_derived_project_check(project_root, gate_path, metadata_check, project_check).ok()?;
-    Some(evidence.base_commit)
-}
-
-fn metadata_findings(
-    diagnostics: &[String],
-    known_commits: &[String],
-    allow_project_policy_wording: bool,
-) -> Option<Vec<MetadataFinding>> {
-    diagnostics
-        .iter()
-        .map(|diagnostic| {
-            let normalized = normalize_diagnostic_text(diagnostic);
-            let rest = normalized.strip_prefix("commit ")?;
-            let (raw_commit, reason) = rest.split_once(' ')?;
-            let raw_commit = raw_commit.trim_end_matches(':');
-            let commit = resolve_commit_id(raw_commit, known_commits)?;
-            let reason = normalize_metadata_reason(reason, allow_project_policy_wording)?;
-            Some(MetadataFinding { commit, reason })
-        })
-        .collect()
-}
-
-fn normalize_diagnostic_text(diagnostic: &str) -> String {
-    diagnostic.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn resolve_commit_id(raw_commit: &str, known_commits: &[String]) -> Option<String> {
-    if !(4..=64).contains(&raw_commit.len())
-        || !raw_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let raw_commit = raw_commit.to_ascii_lowercase();
-    if known_commits.is_empty() {
-        return Some(raw_commit);
-    }
-    let matches = known_commits
-        .iter()
-        .filter(|commit| commit.as_str() == raw_commit || commit.starts_with(&raw_commit))
-        .collect::<Vec<_>>();
-    (matches.len() == 1).then(|| matches[0].clone())
-}
-
-fn normalize_metadata_reason(reason: &str, allow_project_policy_wording: bool) -> Option<String> {
-    let reason = reason.to_ascii_lowercase();
-    if allow_project_policy_wording && is_body_line_length_reason(&reason) {
-        return Some("literal-line-breaks".to_string());
-    }
-    match reason.as_str() {
-        "is a merge commit" => Some("merge-commit".to_string()),
-        "has an empty subject" => Some("empty-subject".to_string()),
-        "contains literal \\n text instead of line breaks" => {
-            Some("literal-line-breaks".to_string())
-        }
-        "has no body separated from its subject by a blank line"
-            if allow_project_policy_wording =>
-        {
-            Some("literal-line-breaks".to_string())
-        }
-        _ => reason.strip_prefix("has invalid ").and_then(|label| {
-            let label = label.split(':').next()?.trim();
-            matches!(
-                label,
-                "author name" | "author email" | "committer name" | "committer email"
-            )
-            .then(|| format!("invalid-{}", label.replace(' ', "-")))
-        }),
-    }
-}
-
-fn is_body_line_length_reason(reason: &str) -> bool {
-    let mut fields = reason.split_whitespace();
-    if fields.next() != Some("body") || fields.next() != Some("line") {
-        return false;
-    }
-    let Some(line) = fields.next() else {
-        return false;
-    };
-    let Ok(line_number) = line.parse::<u64>() else {
-        return false;
-    };
-    if line.is_empty() || !line.bytes().all(|byte| byte.is_ascii_digit()) || line_number == 0 {
-        return false;
-    }
-    matches!(
-        (fields.next(), fields.next(), fields.next(), fields.next()),
-        (Some("exceeds"), Some("72"), Some("characters"), None)
+    crate::candidate_gate::validate_derived_project_check(
+        project_root,
+        gate_path,
+        metadata_check,
+        project_check,
     )
-}
-
-fn is_project_check_exit_diagnostic(diagnostic: &str) -> bool {
-    let normalized = normalize_diagnostic_text(diagnostic);
-    normalized
-        .strip_prefix("check-pre-merge exited ")
-        .and_then(|code| code.parse::<i32>().ok())
-        .is_some()
+    .ok()?;
+    Some(evidence.base_commit)
 }
 
 fn read_authority(
@@ -869,7 +682,7 @@ fn validate_planned_repair(
         || authority.protected_base_commit != eligible.protected_base_commit
         || authority.candidate_tree != eligible.candidate_tree
         || authority.source_gate_artifact != eligible.gate_path
-        || !task.input_artifacts.contains(&eligible.gate_ref)
+        || !task_binds_frontier_evidence(task, &eligible)
     {
         bail!(
             "metadata recovery Writer {:?} no longer matches its authorized candidate-gate frontier",
@@ -908,6 +721,14 @@ fn validate_planned_repair(
         );
     }
     Ok(())
+}
+
+fn task_binds_frontier_evidence(task: &Task, eligible: &EligibleMetadataRepair) -> bool {
+    task.input_artifacts.contains(&eligible.gate_ref)
+        && eligible
+            .project_check_ref
+            .as_ref()
+            .is_none_or(|project_check_ref| task.input_artifacts.contains(project_check_ref))
 }
 
 fn digest_path(project_root: &Path, relative: &str) -> Result<String> {
@@ -1140,61 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_recovery_accepts_derived_project_check() {
-        let fixture = fixture();
-        let metadata = metadata_diagnostic(&fixture.candidate);
-        let hook = format!(
-            "commit {} has no body separated from its subject by a blank line\n",
-            fixture.candidate
-        );
-        fixture.configure_project_check(&[&metadata], &hook, &[]);
-
-        let repair = repair(
-            &fixture.project,
-            &fixture.store,
-            "work-1",
-            "attempt-1",
-            "Rewrite only malformed commit messages after the protected base.",
-        )
-        .unwrap();
-
-        assert!(!repair.already_authorized);
-        let item = fixture.store.read_work_item("work-1").unwrap();
-        let writer = item.attempts[0].tasks.last().unwrap();
-        assert!(writer.input_artifacts.contains(&ArtifactRef {
-            producer_id: "attempt-1-write-1".to_string(),
-            path: fixture.gate.clone(),
-        }));
-        assert!(writer.input_artifacts.iter().any(|artifact| {
-            artifact.producer_id == "attempt-1-write-1"
-                && artifact.path.ends_with("/hooks/check-pre-merge.log")
-        }));
-        let authority: MetadataRepairAuthority = serde_json::from_slice(
-            &fs::read(fixture.project.join(&repair.audit_artifact)).unwrap(),
-        )
-        .unwrap();
-        let project_check_path = Path::new(&fixture.gate)
-            .parent()
-            .unwrap()
-            .join("hooks/check-pre-merge.log")
-            .to_string_lossy()
-            .to_string();
-        assert!(writer.input_artifacts.contains(&ArtifactRef {
-            producer_id: "attempt-1-write-1".to_string(),
-            path: project_check_path.clone(),
-        }));
-        assert_eq!(
-            authority.source_project_check_artifact.as_deref(),
-            Some(project_check_path.as_str())
-        );
-        let project_check_sha256 = digest_path(&fixture.project, &project_check_path).unwrap();
-        assert_eq!(
-            authority.source_project_check_sha256.as_deref(),
-            Some(project_check_sha256.as_str())
-        );
-    }
-
-    #[test]
     fn metadata_recovery_accepts_hook_line_length_wording() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
@@ -1252,11 +1018,154 @@ mod tests {
     }
 
     #[test]
-    fn derived_project_check_authorizes_followup_candidate_gate() {
+    fn metadata_recovery_accepts_hook_line_length_with_duplicate_gate_finding() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let invalid_author = format!(
+            "commit {} has invalid author name: missing",
+            fixture.candidate
+        );
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata, &invalid_author], &hook, &[]);
+
+        let repair = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap();
+
+        assert!(!repair.already_authorized);
+        assert_eq!(repair.candidate_commit, fixture.candidate);
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_hook_wording_only_in_project_check_diagnostic() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], "", &[&hook]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_noncanonical_project_check_log_path() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let gate_path = fixture.project.join(&fixture.gate);
+        let mut evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&gate_path).unwrap()).unwrap();
+        let project = evidence
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "project-check")
+            .unwrap();
+        let canonical_log = gate_path
+            .parent()
+            .unwrap()
+            .join("hooks/check-pre-merge.log");
+        let alternate_log = canonical_log.parent().unwrap().join("other.log");
+        fs::write(&alternate_log, hook).unwrap();
+        project.log_path = Some(
+            alternate_log
+                .strip_prefix(&fixture.project)
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+        );
+        fs::write(&gate_path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_legacy_project_policy_wording() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
             "commit {} has no body separated from its subject by a blank line\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn derived_project_check_authorizes_followup_candidate_gate() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1318,7 +1227,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} has no body separated from its subject by a blank line\n",
+            "commit {} body line 1 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(
@@ -1593,6 +1502,35 @@ mod tests {
     }
 
     #[test]
+    fn authorized_recovery_rejects_missing_project_check_task_input() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+        repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Authorize the metadata rewrite.",
+        )
+        .unwrap();
+
+        let mut item = fixture.store.read_work_item("work-1").unwrap();
+        let writer = item.attempts[0].tasks.last_mut().unwrap();
+        writer
+            .input_artifacts
+            .retain(|artifact| !artifact.path.ends_with("/hooks/check-pre-merge.log"));
+        fixture.store.write_work_item(&item).unwrap();
+
+        let error = is_resume_ready(&fixture.project, &item, "attempt-1").unwrap_err();
+        assert!(error.to_string().contains("candidate-gate frontier"));
+    }
+
+    #[test]
     fn ordinary_candidate_drift_is_rejected() {
         let fixture = fixture();
         fs::write(fixture.workspace.join("drift.txt"), "untracked\n").unwrap();
@@ -1629,7 +1567,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} has no body separated from its subject by a blank line\n",
+            "commit {} body line 1 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);

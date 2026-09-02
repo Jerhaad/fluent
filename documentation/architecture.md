@@ -300,9 +300,12 @@ writes recovery authority.
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a
 new trusted base. Corrective history remains append-only except for one bounded
-case: when commit metadata was the preceding gate's only failure, or a failed
-project check contains only the approved derived wording, the Writer may
-rewrite those commits. The host revalidates the prior gate, proves that both
+case: when the preceding gate's failed checks are exactly `commit-metadata`, or
+exactly `commit-metadata` plus `project-check` whose canonical stored
+`check-pre-merge.log` contains `commit <id> body line <positive integer> exceeds
+72 characters` for the gate's literal-line-breaks finding, the Writer may
+rewrite those commits. A project-check-only failure is never eligible. The host
+revalidates the prior gate, proves that both
 candidates descend from its original base, requires identical Git trees, runs
 every gate check again over the replacement, and records both commit identities,
 the shared tree, and the prior artifact path. A changed tree, another prior
@@ -317,10 +320,11 @@ both into the correction prompt. The default mode is `append-only`: removing
 unwanted content still requires a new correction commit, and the preceding
 candidate must remain an ancestor. Fluent renders
 `tree-identical-metadata-rewrite` when the latest validated rejected gate that
-names the current candidate has only the commit-metadata failure or its approved
-derived project-check failure; older gate artifacts remain readable history but
-cannot override that current frontier. An operator can make this authorization
-explicit with
+names the current candidate has exactly the commit-metadata failure, or exactly
+that failure plus the approved derived project-check failure; the latter must
+come from the canonical stored hook log and the same gate-covered commit.
+Older gate artifacts remain readable history but cannot override that current
+frontier. An operator can make this authorization explicit with
 `fluent attempt repair-candidate-metadata`. That transition records the exact
 gate, candidate tree, protected base, and human decision before scheduling the
 Writer. The mode tells the Writer to change metadata without changing the tree
