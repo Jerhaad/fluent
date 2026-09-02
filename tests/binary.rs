@@ -26452,6 +26452,11 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, prior_review_path, evidence) =
         setup_failed_evidence_recovery_fixture(&tmp, "evidence-classify-legacy");
+    fs::write(
+        &evidence,
+        br#"{"schema_version":1,"producer":"host","check":"check","working_directory":"/repo","result":"fail","run_at":"2026-08-03T17:59:47Z","output":"failed"}"#,
+    )
+    .unwrap();
     let resolution = "The legacy failed candidate-bound check needs a source correction.";
     fluent_cmd()
         .current_dir(&project)

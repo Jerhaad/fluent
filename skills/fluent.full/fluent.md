@@ -268,8 +268,9 @@ host-only evidence attachment when the candidate needs no source change and a co
 external condition needs another host run; use candidate-bound source correction
 classification for a paused actionable `evidence-needed` recovery when the
 operator authorizes a source correction (or for a legacy paused recovery with an
-unqualified marker). A new malformed or unqualified review follows the ordinary
-Writer path.
+unqualified marker). A single malformed `Disposition: evidence-needed` marker
+follows the ordinary Writer path; missing, duplicate, or unknown disposition
+markers remain an uncertain pause.
 
 ### Codex authentication pauses
 
