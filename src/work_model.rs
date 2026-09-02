@@ -6240,6 +6240,23 @@ pub struct EvidenceRecovery {
     pub targets: Vec<EvidenceReviewTarget>,
     pub state: EvidenceRecoveryState,
     pub created_at: String,
+    /// One operator-authorized source correction for a failed evidence review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_change_classification: Option<HostEvidenceClassification>,
+}
+
+/// Durable result of classifying candidate-bound host evidence as a source
+/// correction. The audit artifact binds the operator decision to its frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostEvidenceClassification {
+    pub operation_id: String,
+    pub review_artifact: String,
+    pub review_digest: String,
+    pub authorization: String,
+    pub authorization_digest: String,
+    pub audit_artifact: ArtifactRef,
+    pub writer_task_id: String,
+    pub classified_at: String,
 }
 
 impl EvidenceRecovery {
@@ -10749,6 +10766,7 @@ random banner prose that must be ignored
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-03T17:59:47Z".to_string(),
+            code_change_classification: None,
         };
 
         assert_eq!(
@@ -10784,6 +10802,7 @@ random banner prose that must be ignored
             }],
             state: EvidenceRecoveryState::Complete,
             created_at: "2026-08-23T10:00:00Z".to_string(),
+            code_change_classification: None,
         };
         attempt.attach_evidence_recovery(prior).unwrap();
         let later = EvidenceRecovery {
@@ -10797,6 +10816,7 @@ random banner prose that must be ignored
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-23T11:00:00Z".to_string(),
+            code_change_classification: None,
         };
 
         assert_eq!(
@@ -10825,6 +10845,7 @@ random banner prose that must be ignored
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-22T20:00:00Z".to_string(),
+            code_change_classification: None,
         };
         let mut review = task(TaskKind::Review, Vec::new());
         review.id = "attempt-1-evidence-proof-tests".to_string();
@@ -10914,6 +10935,7 @@ random banner prose that must be ignored
             targets: Vec::new(),
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-03T17:59:47Z".to_string(),
+            code_change_classification: None,
         };
         attempt.attach_evidence_recovery(prior.clone()).unwrap();
         prior.state = EvidenceRecoveryState::NeedsEvidence;
@@ -10930,6 +10952,7 @@ random banner prose that must be ignored
             targets: Vec::new(),
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-03T18:00:47Z".to_string(),
+            code_change_classification: None,
         };
 
         assert_eq!(
@@ -17123,6 +17146,7 @@ random banner prose that must be ignored
             }],
             state,
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            code_change_classification: None,
         };
         let mut attempt = Attempt {
             evidence_recoveries: vec![

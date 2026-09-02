@@ -624,6 +624,34 @@ fn cmd_attempt(
     match command {
         AttemptCommands::Evidence {
             command:
+                AttemptEvidenceCommands::Classify {
+                    work_item_id,
+                    attempt_id,
+                    candidate,
+                    review_artifact,
+                    evidence_digest,
+                    resolution,
+                },
+        } => {
+            let classification = fluent::host_evidence::classify_for_code_change(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &candidate,
+                &review_artifact,
+                &evidence_digest,
+                &resolution,
+            )?;
+            println!(
+                "Authorized host-evidence source correction Writer {} for Attempt {}",
+                classification.writer_task_id, attempt_id
+            );
+            println!("Audit: {}", classification.audit_artifact);
+            println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::Evidence {
+            command:
                 AttemptEvidenceCommands::Run {
                     work_item_id,
                     attempt_id,

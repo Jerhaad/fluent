@@ -1764,6 +1764,7 @@ mod tests {
                 }],
                 state: crate::work_model::EvidenceRecoveryState::NeedsEvidence,
                 created_at: "2026-08-03T00:00:00Z".to_string(),
+                code_change_classification: None,
             }],
             ..Attempt::default()
         };
@@ -1798,6 +1799,7 @@ mod tests {
                 }],
                 state: crate::work_model::EvidenceRecoveryState::NeedsEvidence,
                 created_at: "2026-08-03T00:00:00Z".to_string(),
+                code_change_classification: None,
             }],
             ..Attempt::default()
         };

@@ -644,6 +644,25 @@ pub enum AttemptCommands {
 
 #[derive(Subcommand)]
 pub enum AttemptEvidenceCommands {
+    /// Classify paused failed host evidence as an authorized source correction
+    Classify {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Exact candidate commit
+        #[arg(long)]
+        candidate: String,
+        /// Completed evidence-targeted review artifact
+        #[arg(long, value_name = "PATH")]
+        review_artifact: String,
+        /// Digest of the attached immutable host evidence
+        #[arg(long)]
+        evidence_digest: String,
+        /// Operator authorization for the source correction
+        #[arg(long)]
+        resolution: String,
+    },
     /// Run one failed Tests Review's focused check and attach its result
     Run {
         /// Work Item ID

@@ -24954,6 +24954,103 @@ fn work_show_explains_evidence_only_recovery_history_and_next_action() {
 }
 
 #[test]
+fn failed_host_evidence_can_be_classified_for_code_change() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path, evidence) =
+        setup_failed_evidence_recovery_fixture(&tmp, "evidence-classify");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-classify",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    let targeted_path = store
+        .mutate_work_item("evidence-classify", |item| {
+            let targeted = item.attempts[0].tasks.last_mut().unwrap();
+            targeted.status = fluent::work_model::TaskStatus::Complete;
+            targeted.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(format!(
+                "{}/review.md",
+                targeted.artifact_area.as_ref().unwrap().path
+            ))
+        })
+        .unwrap();
+    fs::create_dir_all(project.join(&targeted_path).parent().unwrap()).unwrap();
+    fs::write(
+        project.join(&targeted_path),
+        "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n",
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "run",
+            "evidence-classify",
+            "attempt-1",
+            "--no-sandbox",
+        ])
+        .assert()
+        .success();
+    let before = work_item_value(&project, "evidence-classify");
+    let digest = before["attempts"][0]["evidence_recoveries"][0]["attachment"]["digest"]
+        .as_str()
+        .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            digest,
+            "--resolution",
+            "The failed candidate-bound check needs a source correction.",
+        ])
+        .assert()
+        .success();
+    let shown = work_item_value(&project, "evidence-classify");
+    let attempt = &shown["attempts"][0];
+    assert_eq!(attempt["status"], "planned");
+    assert_eq!(attempt["evidence_recoveries"][0]["state"], "code-change");
+    let classification = &attempt["evidence_recoveries"][0]["code_change_classification"];
+    assert_eq!(classification["review_artifact"], targeted_path);
+    assert!(
+        project
+            .join(classification["audit_artifact"]["path"].as_str().unwrap())
+            .exists()
+    );
+    let writer = attempt["tasks"].as_array().unwrap().last().unwrap();
+    assert_eq!(writer["kind"], "write");
+    assert!(
+        writer["input_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| { input["path"] == targeted_path })
+    );
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
 fn merge_candidate_list_prints_candidates() {
     let tmp = TempDir::new().unwrap();
     write_rich_work_item(tmp.path());
@@ -29960,6 +30057,7 @@ fn attempt_extend_counts_repeated_evidence_corrections() {
             }],
             state: EvidenceRecoveryState::CodeChange,
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            code_change_classification: None,
         });
         let writer_id = item
             .add_next_write_round(

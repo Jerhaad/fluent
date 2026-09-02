@@ -1545,6 +1545,7 @@ mod tests {
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-25T10:00:00Z".to_string(),
+            code_change_classification: None,
         });
         store.create_work_item(&item).unwrap();
     }

@@ -14,9 +14,10 @@ use crate::content::ContentResolver;
 use crate::review::{self, Verdict};
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
-    EvidenceReviewContext, EvidenceReviewTarget, Task, TaskKind, TaskStatus, WorkModelError,
-    WorkModelStore, WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionRow,
-    WriterCompletionState, WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
+    EvidenceReviewContext, EvidenceReviewTarget, HostEvidenceClassification, Task, TaskKind,
+    TaskStatus, WorkModelError, WorkModelStore, WriterCompletionMatrix,
+    WriterCompletionRequirementKind, WriterCompletionRow, WriterCompletionState,
+    WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
 };
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
@@ -179,6 +180,149 @@ pub struct FocusedEvidenceRun {
     pub result: EvidenceResult,
     pub command: String,
     pub working_directory: String,
+}
+
+/// Returned by the public classification boundary after it schedules (or
+/// replays) one corrective Writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeChangeClassification {
+    pub writer_task_id: String,
+    pub audit_artifact: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodeChangeClassificationAudit<'a> {
+    schema_version: u32,
+    operation_id: &'a str,
+    work_item_id: &'a str,
+    attempt_id: &'a str,
+    candidate_commit: &'a str,
+    recovery_id: &'a str,
+    evidence: &'a EvidenceAttachment,
+    review_artifact: &'a str,
+    review_digest: &'a str,
+    authorization: &'a str,
+    authorization_digest: &'a str,
+    writer_task_id: &'a str,
+}
+
+pub fn classify_for_code_change(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    candidate_commit: &str,
+    review_artifact: &str,
+    evidence_digest: &str,
+    authorization: &str,
+) -> Result<CodeChangeClassification> {
+    let authorization = authorization.trim();
+    anyhow::ensure!(
+        !authorization.is_empty() && authorization.len() <= MAX_FOCUSED_COMMAND_BYTES,
+        "provide a non-empty --resolution up to {MAX_FOCUSED_COMMAND_BYTES} bytes"
+    );
+    let authorization_digest = format!("sha256:{:x}", Sha256::digest(authorization.as_bytes()));
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
+        .context("acquire land lock before classifying host evidence")?;
+    store.mutate_work_item_from_external(
+        work_item_id,
+        "classify candidate-bound host evidence for source correction",
+        Some(review_artifact.to_string()),
+        |item| {
+        let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: "the supplied classification does not match a paused candidate-bound host-evidence recovery".to_string(),
+        };
+        let attempt = item.attempts.iter().find(|attempt| attempt.id == attempt_id).ok_or_else(rejected)?;
+        let recovery = attempt.evidence_recoveries.iter().rev().find(|recovery| {
+            recovery.candidate_commit == candidate_commit
+                && recovery.attachment.digest == evidence_digest
+        }).ok_or_else(rejected)?;
+        let review_path = project_root.join(review_artifact);
+        let review_bytes = fs::read(&review_path).map_err(|_| rejected())?;
+        let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
+        if let Some(prior) = recovery.code_change_classification.as_ref() {
+            if prior.review_artifact == review_artifact
+                && prior.review_digest == review_digest
+                && prior.authorization == authorization
+                && prior.authorization_digest == authorization_digest
+            {
+                return Ok(CodeChangeClassification {
+                    writer_task_id: prior.writer_task_id.clone(),
+                    audit_artifact: prior.audit_artifact.path.clone(),
+                });
+            }
+            return Err(rejected());
+        }
+        if recovery.state != EvidenceRecoveryState::NeedsEvidence {
+            return Err(rejected());
+        }
+        let review_task = attempt.tasks.iter().find(|task| {
+            task.kind == TaskKind::Review
+                && task.status == TaskStatus::Complete
+                && review_artifact_path(task).as_deref() == Some(review_artifact)
+                && task.evidence_review_context.as_ref().is_some_and(|context| {
+                    context.recovery_id == recovery.id
+                        && context.candidate_commit == candidate_commit
+                        && context.attachment == recovery.attachment
+                })
+        }).ok_or_else(rejected)?;
+        let review_task_id = review_task.id.clone();
+        let attachment = recovery.attachment.clone();
+        let recovery_id = recovery.id.clone();
+        if review::extract_verdict(std::str::from_utf8(&review_bytes).map_err(|_| rejected())?) != Verdict::Fail
+            || attempt.status != work_model::AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(work_model::PauseKind::Uncertain)
+            || attempt.tasks.iter().any(|task| task.status == TaskStatus::Executing)
+        {
+            return Err(rejected());
+        }
+        let writer = attempt.tasks.iter().rev().find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref()).ok_or_else(rejected)?;
+        if writer.commit != candidate_commit || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit) {
+            return Err(rejected());
+        }
+        let evidence_path = project_root.join(&recovery.attachment.snapshot_path);
+        let evidence_bytes = fs::read(&evidence_path).map_err(|_| rejected())?;
+        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
+            return Err(rejected());
+        }
+        let operation_material = format!(
+            "{attempt_id}\0{candidate_commit}\0{}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{authorization_digest}",
+            recovery.id
+        );
+        let operation_id = format!("host-evidence-classification-{:x}", Sha256::digest(operation_material.as_bytes()));
+        let audit_path = work_model::work_artifact_path(work_item_id, attempt_id, &operation_id);
+        let audit_artifact = ArtifactRef { producer_id: operation_id.clone(), path: format!("{audit_path}/classification.json") };
+        let writer_task_id = format!("{attempt_id}-write-{}", attempt.tasks.iter().filter(|task| task.kind == TaskKind::Write).count() + 1);
+        let audit = CodeChangeClassificationAudit {
+            schema_version: 1, operation_id: &operation_id, work_item_id, attempt_id, candidate_commit,
+            recovery_id: &recovery_id, evidence: &attachment, review_artifact, review_digest: &review_digest,
+            authorization, authorization_digest: &authorization_digest, writer_task_id: &writer_task_id,
+        };
+        let audit_bytes = serde_json::to_vec_pretty(&audit).map_err(|_| rejected())?;
+        publish_snapshot(project_root, &audit_artifact.path, &audit_bytes).map_err(|_| rejected())?;
+        {
+            let attempt = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id).expect("validated Attempt remains present");
+            let recovery = attempt.evidence_recoveries.iter_mut().find(|recovery| recovery.id == recovery_id).expect("validated recovery remains present");
+            recovery.state = EvidenceRecoveryState::CodeChange;
+            recovery.code_change_classification = Some(HostEvidenceClassification {
+                operation_id, review_artifact: review_artifact.to_string(), review_digest, authorization: authorization.to_string(), authorization_digest,
+                audit_artifact: audit_artifact.clone(), writer_task_id: writer_task_id.clone(), classified_at: work_model::now_iso8601(),
+            });
+            if !attempt.artifacts.contains(&audit_artifact) { attempt.artifacts.push(audit_artifact.clone()); }
+            attempt.status = work_model::AttemptStatus::Planned;
+            attempt.pause_kind = None;
+        }
+        let task_id = item.add_next_write_round(attempt_id, vec![
+            ArtifactRef { producer_id: review_task_id, path: review_artifact.to_string() },
+            ArtifactRef { producer_id: "host-evidence".to_string(), path: attachment.snapshot_path },
+            audit_artifact.clone(),
+        ]).map_err(|_| rejected())?;
+        if task_id != writer_task_id { return Err(rejected()); }
+        Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path })
+        },
+    ).map_err(Into::into)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1450,6 +1594,7 @@ pub fn attach(
                 .collect(),
             state: EvidenceRecoveryState::Reviewing,
             created_at: work_model::now_iso8601(),
+            code_change_classification: None,
         })?;
         if let Some(task_id) = interrupted_correction_id
             && let Some(task) = attempt.tasks.iter_mut().find(|task| task.id == task_id)
@@ -1821,6 +1966,7 @@ pub fn attach_plan_row(
                 }],
                 state: EvidenceRecoveryState::Reviewing,
                 created_at: work_model::now_iso8601(),
+                code_change_classification: None,
             };
             let recovery = item
                 .attempts

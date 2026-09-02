@@ -12240,6 +12240,7 @@ mod tests {
                         }],
                         state: EvidenceRecoveryState::Complete,
                         created_at: "2026-08-23T11:00:00Z".to_string(),
+                        code_change_classification: None,
                     });
                 attempt.status = AttemptStatus::Complete;
                 attempt.pause_kind = None;
@@ -14175,6 +14176,7 @@ mod tests {
                         }],
                         state: EvidenceRecoveryState::Reviewing,
                         created_at: "2026-08-03T00:00:00Z".to_string(),
+                        code_change_classification: None,
                     });
                 let mut targeted = review_task_with_artifact(task_id, "behaviors", &artifact_path);
                 targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
@@ -14412,6 +14414,7 @@ mod tests {
                         }],
                         state: EvidenceRecoveryState::Complete,
                         created_at: "2026-08-24T01:00:00Z".to_string(),
+                        code_change_classification: None,
                     });
                 let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_area);
                 targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
@@ -15243,6 +15246,7 @@ mod tests {
                         }],
                         state: EvidenceRecoveryState::Reviewing,
                         created_at: "2026-08-03T00:00:00Z".to_string(),
+                        code_change_classification: None,
                     });
                 let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_path);
                 targeted.review_context.as_mut().unwrap().candidate_commit = candidate.clone();
