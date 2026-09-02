@@ -1330,7 +1330,7 @@ struct TestReference {
 }
 
 fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, String> {
-    let reference = reference.trim();
+    let reference = reference.trim().trim_matches('`').trim();
     if reference.is_empty() {
         return Err("reference is empty".to_string());
     }
@@ -1351,10 +1351,7 @@ fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, S
     // Planning documents commonly format repository paths as inline Markdown.
     // The backticks are presentation, not part of the committed path that Git
     // should validate.
-    let path = match path.strip_prefix('`') {
-        Some(inner) => inner.strip_suffix('`').map(str::trim).unwrap_or(path),
-        None => path,
-    };
+    let path = path.trim_matches('`').trim();
     validate_test_path(path)?;
     if selector
         .as_ref()
@@ -2006,6 +2003,28 @@ mod tests {
         );
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
         let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn markdown_wrapped_test_reference_validates_committed_path_and_selector() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "src/review.rs",
+            "fn evidence_needed_requires_actionable_host_reason() {}\n",
+            "Add review regression\n\n- Cover actionable host evidence",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract =
+            behavior_contract("`src/review.rs` (evidence_needed_requires_actionable_host_reason)");
 
         let evidence =
             run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
