@@ -290,12 +290,18 @@ a time. It also narrowly repairs an older binary's terminal failed-correction
 shape by replanning only the same output-free Writer whose attached gate was
 produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
-immediately.
+immediately. A metadata recovery may also admit a failed project check only
+when its stored `check-pre-merge` log contains the exact structured body-line
+length finding for a commit whose gate metadata finding is literal-line-breaks;
+the log is bound alongside the gate so the corrective Writer receives the
+immutable evidence. Any unrelated hook output remains rejected before Fluent
+writes recovery authority.
 
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a
 new trusted base. Corrective history remains append-only except for one bounded
-case: when commit metadata was the preceding gate's only failure, the Writer may
+case: when commit metadata was the preceding gate's only failure, or a failed
+project check contains only the approved derived wording, the Writer may
 rewrite those commits. The host revalidates the prior gate, proves that both
 candidates descend from its original base, requires identical Git trees, runs
 every gate check again over the replacement, and records both commit identities,
@@ -311,9 +317,10 @@ both into the correction prompt. The default mode is `append-only`: removing
 unwanted content still requires a new correction commit, and the preceding
 candidate must remain an ancestor. Fluent renders
 `tree-identical-metadata-rewrite` when the latest validated rejected gate that
-names the current candidate has commit metadata as its sole failed check; older
-gate artifacts remain readable history but cannot override that current
-frontier. An operator can make this authorization explicit with
+names the current candidate has only the commit-metadata failure or its approved
+derived project-check failure; older gate artifacts remain readable history but
+cannot override that current frontier. An operator can make this authorization
+explicit with
 `fluent attempt repair-candidate-metadata`. That transition records the exact
 gate, candidate tree, protected base, and human decision before scheduling the
 Writer. The mode tells the Writer to change metadata without changing the tree

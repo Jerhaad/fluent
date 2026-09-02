@@ -1235,7 +1235,11 @@ mod tests {
         );
         assert_eq!(
             authority.source_project_check_sha256.as_deref(),
-            Some(digest_path(&fixture.project, &project_check_path).unwrap().as_str())
+            Some(
+                digest_path(&fixture.project, &project_check_path)
+                    .unwrap()
+                    .as_str()
+            )
         );
         assert!(writer.input_artifacts.contains(&ArtifactRef {
             producer_id: "attempt-1-write-1".to_string(),

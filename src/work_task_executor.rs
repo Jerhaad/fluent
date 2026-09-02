@@ -4653,7 +4653,8 @@ fn build_reviewed_correction_prompt(
     let artifact_dir = resolve_managed_artifact_area_path(project_root, &artifact_area.path)?;
     let candidate_commit = head_commit(workspace_path)?;
     let base_commit = writer_context_base_commit(item, attempt_id, workspace_path);
-    let correction_lineage = correction_lineage(&candidate_commit, correction_artifacts);
+    let correction_lineage =
+        correction_lineage(project_root, &candidate_commit, correction_artifacts);
     let recovered_protected_base =
         latest_candidate_ancestry_protected_base(item, attempt_id).unwrap_or_default();
     let context_path = write_execution_context_with_finding_policy(
@@ -4869,6 +4870,7 @@ fn build_reviewed_correction_prompt(
 }
 
 fn correction_lineage(
+    project_root: &Path,
     prior_candidate_commit: &str,
     correction_artifacts: &[PathBuf],
 ) -> ExecutionContextCorrectionLineage {
@@ -4889,6 +4891,13 @@ fn correction_lineage(
             path,
             prior_candidate_commit,
         )
+        .or_else(|| {
+            crate::candidate_metadata_recovery::authorized_derived_project_check_metadata_rewrite_base(
+                project_root,
+                path,
+                prior_candidate_commit,
+            )
+        })
     });
     let mode = if protected_base_commit.is_some() {
         ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
@@ -18071,7 +18080,7 @@ mod tests {
         write_gate(&older, "older-candidate", "protected-base");
         write_gate(&current, "current-candidate", "protected-base");
 
-        let lineage = correction_lineage("current-candidate", &[older, current]);
+        let lineage = correction_lineage(project.path(), "current-candidate", &[older, current]);
         assert_eq!(
             lineage.mode,
             ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
@@ -18080,6 +18089,98 @@ mod tests {
         assert_eq!(
             lineage.protected_base_commit.as_deref(),
             Some("protected-base")
+        );
+    }
+
+    #[test]
+    fn derived_line_length_metadata_gate_preserves_tree_identical_correction_lineage() {
+        let project = tempfile::tempdir().unwrap();
+        let candidate = "a".repeat(40);
+        let protected_base = "b".repeat(40);
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let hook_path = gate_path
+            .parent()
+            .unwrap()
+            .join("hooks/check-pre-merge.log");
+        fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
+        fs::write(
+            &hook_path,
+            format!("commit {candidate} body line 1 exceeds 72 characters\n"),
+        )
+        .unwrap();
+        let metadata_diagnostic =
+            format!("commit {candidate} contains literal \\n text instead of line breaks");
+        let checks = vec![
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "candidate-identity".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "whitespace".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "commit-metadata".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec![metadata_diagnostic],
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "behavior-references".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Passed,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "tester-reference-evidence".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Skipped,
+                diagnostics: Vec::new(),
+                log_path: None,
+            },
+            crate::candidate_gate::CandidateCheckEvidence {
+                name: "project-check".to_string(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec!["check-pre-merge exited 1".to_string()],
+                log_path: Some(
+                    hook_path
+                        .strip_prefix(project.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            },
+        ];
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&crate::candidate_gate::CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                base_commit: protected_base.clone(),
+                candidate_commit: candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let lineage = correction_lineage(project.path(), &candidate, &[gate_path]);
+
+        assert_eq!(
+            lineage.mode,
+            ExecutionContextCorrectionLineageMode::TreeIdenticalMetadataRewrite
+        );
+        assert_eq!(
+            lineage.protected_base_commit.as_deref(),
+            Some(protected_base.as_str())
         );
     }
 

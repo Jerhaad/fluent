@@ -25,6 +25,7 @@ pub(crate) fn is_correction_artifact(path: &Path) -> bool {
         name == "review.md"
             || name == "tester-results.json"
             || name == crate::candidate_gate::CANDIDATE_GATE_FILE
+            || name == "check-pre-merge.log"
     }) || crate::tester::is_command_log_path(path)
         || (path.file_name().is_some_and(|name| name == "repair.json")
             && path
@@ -228,5 +229,12 @@ mod tests {
                 .any(|warning| warning.as_str().unwrap().contains("transcript"))
         );
         assert!(tmp.path().join("commands").is_dir());
+    }
+
+    #[test]
+    fn candidate_project_check_log_is_a_correction_artifact() {
+        assert!(is_correction_artifact(Path::new(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/hooks/check-pre-merge.log",
+        )));
     }
 }
