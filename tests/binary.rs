@@ -25235,6 +25235,53 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
 }
 
 #[test]
+fn host_evidence_classification_rejects_executing_task_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-executing");
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item("evidence-classify-executing", |item| {
+            item.attempts[0].tasks[2].status = fluent::work_model::TaskStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+    let before = persisted_work_snapshot(&project, "evidence-classify-executing");
+    let head_before = git_head(&project);
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-executing",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            "Correct the source.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "classification accepted an executing Task: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-executing"),
+        before,
+        "executing Task classification changed persisted state"
+    );
+    assert_eq!(git_head(&project), head_before);
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree() {
     for stale in ["candidate", "worktree"] {
         let tmp = TempDir::new().unwrap();
@@ -25633,6 +25680,85 @@ fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
             "stale {stale} queue resume appended a dispatch"
         );
     }
+}
+
+#[test]
+fn classified_host_evidence_queue_resume_rejects_executing_task_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-executing-queue");
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-executing-queue",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            resolution,
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item("evidence-classify-executing-queue", |item| {
+            item.attempts[0].tasks[2].status = fluent::work_model::TaskStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+    let before = persisted_work_snapshot(&project, "evidence-classify-executing-queue");
+    let head_before = git_head(&project);
+    let queue_path = project.join(".fluent/work/queue/evidence-classify-executing-queue.json");
+    let queue_before = fs::read(&queue_path).ok();
+    let invoked = tmp.path().join("classified-writer-executing-invoked");
+    let bin_dir = tmp.path().join("classified-writer-executing-bin");
+    write_mock_claude(
+        &bin_dir,
+        r##"#!/bin/bash
+for arg in "$@"; do
+  if [ "$arg" = "-p" ]; then
+    printf 'invoked\n' > "$MOCK_WRITER_INVOKED"
+    break
+  fi
+done
+exit 0
+"##,
+    );
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "queue",
+            "resume",
+            "evidence-classify-executing-queue",
+            "--attempt",
+            "attempt-1",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .env("MOCK_WRITER_INVOKED", &invoked)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "queue resumed with an executing Task: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!invoked.exists(), "classified Writer was invoked");
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-executing-queue"),
+        before,
+        "executing Task continuation changed persisted state"
+    );
+    assert_eq!(git_head(&project), head_before);
+    assert_eq!(fs::read(&queue_path).ok(), queue_before);
 }
 
 #[test]

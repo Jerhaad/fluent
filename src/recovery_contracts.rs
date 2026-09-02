@@ -1,0 +1,950 @@
+//! Shared admission and completion contracts for recovery-bound Writers.
+//!
+//! This boundary is intentionally independent from the host-evidence producer
+//! and task executor. Queue admission, direct execution, and host recovery all
+//! consume the same immutable checks without introducing a module cycle.
+
+use anyhow::{Context, Result, bail};
+use chrono::DateTime;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+use crate::candidate_gate;
+use crate::git;
+use crate::review;
+use crate::work_model::{
+    self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
+    HostEvidenceClassification, Task, TaskKind, TaskStatus, WorkModelError,
+    WriterCompletionFinding,
+};
+
+pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
+const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+const CODE_CHANGE_DISPOSITION: &str = "code-change";
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceSnapshot {
+    schema_version: u32,
+    producer: String,
+    check: String,
+    working_directory: String,
+    result: EvidenceSnapshotResult,
+    run_at: String,
+    output: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum EvidenceSnapshotResult {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct CodeChangeClassificationAudit<'a> {
+    pub(crate) schema_version: u32,
+    pub(crate) operation_id: &'a str,
+    pub(crate) work_item_id: &'a str,
+    pub(crate) attempt_id: &'a str,
+    pub(crate) candidate_commit: &'a str,
+    pub(crate) recovery_id: &'a str,
+    pub(crate) evidence: &'a EvidenceAttachment,
+    pub(crate) review_artifact: &'a str,
+    pub(crate) review_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) disposition: Option<&'a str>,
+    pub(crate) authorization: &'a str,
+    pub(crate) authorization_digest: &'a str,
+    pub(crate) writer_task_id: &'a str,
+}
+
+/// Return the task-owned completion matrix path without opening it.
+pub(crate) fn writer_completion_matrix_path(project_root: &Path, task: &Task) -> Option<PathBuf> {
+    task.artifact_area.as_ref().map(|area| {
+        project_root
+            .join(&area.path)
+            .join(WRITER_COMPLETION_MATRIX_FILE)
+    })
+}
+
+/// Resolve the task-owned completion matrix path under the managed artifact
+/// root before it is read or written.
+pub(crate) fn managed_writer_completion_matrix_path(
+    project_root: &Path,
+    task: &Task,
+) -> Result<Option<PathBuf>> {
+    task.artifact_area
+        .as_ref()
+        .map(|area| {
+            resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|dir| dir.join(WRITER_COMPLETION_MATRIX_FILE))
+        })
+        .transpose()
+}
+
+/// Resolve an input artifact from one of Fluent's managed roots.
+pub(crate) fn resolve_input_artifact_path(project_root: &Path, path: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(path);
+    if relative_path.is_absolute() {
+        bail!("Input artifact path must be relative: {path}");
+    }
+    let mut components = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(part) => components.push(part.to_owned()),
+            _ => bail!(
+                "Input artifact path must stay under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
+            ),
+        }
+    }
+    let valid = components.len() >= 3
+        && components[0] == std::ffi::OsStr::new(".fluent")
+        && components[1] == std::ffi::OsStr::new("work")
+        && (components[2] == std::ffi::OsStr::new("artifacts")
+            || components[2] == std::ffi::OsStr::new("progress"));
+    if !valid {
+        bail!(
+            "Input artifact path must be under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
+        );
+    }
+    Ok(resolve_workspace_path(project_root, path))
+}
+
+/// Resolve a task artifact area below `.fluent/work/artifacts`.
+pub(crate) fn resolve_managed_artifact_area_path(
+    project_root: &Path,
+    path: &str,
+) -> Result<PathBuf> {
+    let relative_path = Path::new(path);
+    if relative_path.is_absolute() {
+        bail!("Task artifact area path must be relative: {path}");
+    }
+
+    let mut components = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            Component::Normal(part) => components.push(part.to_owned()),
+            _ => bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}"),
+        }
+    }
+
+    let managed_prefix = [
+        std::ffi::OsStr::new(".fluent"),
+        std::ffi::OsStr::new("work"),
+        std::ffi::OsStr::new("artifacts"),
+    ];
+    if components.len() <= managed_prefix.len()
+        || !components
+            .iter()
+            .zip(managed_prefix.iter())
+            .all(|(actual, expected)| actual == expected)
+    {
+        bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}");
+    }
+
+    Ok(resolve_workspace_path(project_root, path))
+}
+
+fn resolve_workspace_path(project_root: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    }
+}
+
+/// Collect immutable findings that a Writer completion matrix must address.
+pub(crate) fn writer_completion_findings(
+    project_root: &Path,
+    task: &Task,
+) -> Result<Vec<WriterCompletionFinding>> {
+    let mut findings = BTreeMap::new();
+    // A Tester-harness repair is authorized by its explicit operator decision.
+    // Its ordinary command failures are not product obligations for the scoped
+    // repair and therefore do not enter this matrix.
+    if task.role == work_model::TESTER_HARNESS_REPAIR_ROLE {
+        return Ok(findings.into_values().collect());
+    }
+    for artifact in &task.input_artifacts {
+        let relative = Path::new(&artifact.path);
+        let is_review = relative.file_name().is_some_and(|name| {
+            name == "review.md" || name.to_string_lossy().starts_with("review-")
+        });
+        if !is_review {
+            continue;
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let source = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "read review findings for Writer completion matrix: {}",
+                path.display()
+            )
+        })?;
+        let role = review::REVIEWERS
+            .iter()
+            .find(|role| {
+                artifact.producer_id.contains(**role)
+                    || artifact.path.contains(&format!("review-{role}"))
+            })
+            .copied()
+            .unwrap_or("unknown");
+        for title in review::open_finding_titles(&source) {
+            let identity = review::finding_identity(role, &title);
+            findings
+                .entry((role.to_string(), identity.clone()))
+                .or_insert(WriterCompletionFinding {
+                    id: format!("finding:{role}:{identity}"),
+                    role: role.to_string(),
+                    source: artifact.path.clone(),
+                    requirement: title,
+                });
+        }
+    }
+    for artifact in &task.input_artifacts {
+        let relative = Path::new(&artifact.path);
+        let is_candidate_gate = relative
+            .file_name()
+            .is_some_and(|name| name == candidate_gate::CANDIDATE_GATE_FILE);
+        if !is_candidate_gate {
+            continue;
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let source = fs::read(&path).with_context(|| {
+            format!(
+                "read candidate gate findings for Writer completion matrix: {}",
+                path.display()
+            )
+        })?;
+        let evidence = serde_json::from_slice::<candidate_gate::CandidateGateEvidence>(&source)
+            .with_context(|| {
+                format!(
+                    "parse candidate gate findings for Writer completion matrix: {}",
+                    path.display()
+                )
+            })?;
+        if evidence.disposition != candidate_gate::CandidateGateDisposition::Rejected {
+            continue;
+        }
+        for check in evidence
+            .checks
+            .iter()
+            .filter(|check| check.status == candidate_gate::CandidateCheckStatus::Failed)
+        {
+            let diagnostics = if check.diagnostics.is_empty() {
+                vec![format!("{} check failed", check.name)]
+            } else {
+                check.diagnostics.clone()
+            };
+            for diagnostic in diagnostics {
+                let role = "candidate-gate";
+                let identity = review::finding_identity(role, &diagnostic);
+                findings
+                    .entry((role.to_string(), identity.clone()))
+                    .or_insert(WriterCompletionFinding {
+                        id: format!("finding:{role}:{identity}"),
+                        role: role.to_string(),
+                        source: artifact.path.clone(),
+                        requirement: diagnostic,
+                    });
+            }
+        }
+    }
+    for artifact in &task.input_artifacts {
+        let relative = Path::new(&artifact.path);
+        let is_tester_results = relative.file_name().is_some_and(|name| {
+            name == "tester-results.json"
+                && relative
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|parent| parent.to_string_lossy().contains("-tester"))
+        });
+        if !is_tester_results {
+            continue;
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let source = fs::read(&path).with_context(|| {
+            format!(
+                "read Tester findings for Writer completion matrix: {}",
+                path.display()
+            )
+        })?;
+        let results = serde_json::from_slice::<crate::tester::TesterResults>(&source)
+            .with_context(|| {
+                format!(
+                    "parse Tester findings for Writer completion matrix: {}",
+                    path.display()
+                )
+            })?;
+        for (index, command) in results
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(_, command)| command.exit_code != 0)
+        {
+            let role = "tester";
+            let stable_title = format!("configured command {index}: {}", command.command);
+            let identity = review::finding_identity(role, &stable_title);
+            findings
+                .entry((role.to_string(), identity.clone()))
+                .or_insert(WriterCompletionFinding {
+                    id: format!("finding:{role}:{identity}"),
+                    role: role.to_string(),
+                    source: artifact.path.clone(),
+                    requirement: format!(
+                        "Configured Tester command {index} failed with exit code {}",
+                        command.exit_code
+                    ),
+                });
+        }
+    }
+    Ok(findings.into_values().collect())
+}
+
+/// Revalidate a classified source-correction Writer immediately before it is
+/// reserved for execution. Ordinary Writers do not carry a matching
+/// classification and pass through unchanged.
+pub(crate) fn validate_code_change_writer_start(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+) -> std::result::Result<(), WorkModelError> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| code_change_writer_rejection(attempt_id, "Attempt is not present"))?;
+    let (writer_index, writer) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| task.id == task_id && task.kind == TaskKind::Write)
+        .ok_or_else(|| code_change_writer_rejection(attempt_id, "classified Writer is missing"))?;
+
+    let classified = attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find_map(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .filter(|classification| classification.writer_task_id == task_id)
+                .map(|classification| (recovery, classification))
+        });
+    let pending_classification_for_other_writer = attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find_map(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .filter(|classification| {
+                    classification.writer_task_id != task_id
+                        && attempt.tasks.iter().any(|task| {
+                            task.id == classification.writer_task_id
+                                && task.kind == TaskKind::Write
+                                && task.status == TaskStatus::Planned
+                                && task.output.is_none()
+                        })
+                })
+        });
+    let Some((recovery, classification)) = classified else {
+        if pending_classification_for_other_writer.is_some() {
+            return Err(code_change_writer_rejection(
+                attempt_id,
+                "another classified Writer owns the planned continuation",
+            ));
+        }
+        return Ok(());
+    };
+
+    let rejected = |reason: &str| code_change_writer_rejection(attempt_id, reason);
+    validate_classification_recovery_scope(attempt, &recovery.id)
+        .map_err(|reason| rejected(&reason))?;
+    if item.attempts.last().map(|current| current.id.as_str()) != Some(attempt_id)
+        || attempt.status != work_model::AttemptStatus::Planned
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+        || attempt.pause_kind.is_some()
+        || attempt.pause_recovery.is_some()
+        || attempt.completed_at.is_some()
+    {
+        return Err(rejected(
+            "classified source-correction Attempt is not the current planned frontier",
+        ));
+    }
+    if recovery.state != EvidenceRecoveryState::CodeChange
+        || writer.status != TaskStatus::Planned
+        || writer.output.is_some()
+        || writer.role != "author"
+        || writer.work_item_id != item.id
+        || writer.attempt_id.as_deref() != Some(attempt_id)
+        || writer_index + 1 != attempt.tasks.len()
+    {
+        return Err(rejected(
+            "classified Writer is not the final planned continuation",
+        ));
+    }
+    if attempt.tasks.iter().enumerate().any(|(index, task)| {
+        index != writer_index
+            && (task.status == TaskStatus::Executing
+                || task.status == TaskStatus::NeedsUser
+                || (task.status == TaskStatus::Failed
+                    && (task.kind != TaskKind::Write || task.output.is_some()))
+                || task.status == TaskStatus::Planned)
+    }) {
+        return Err(rejected("Attempt contains another live or unresolved Task"));
+    }
+    if item.merge_candidates.iter().any(|candidate| {
+        candidate.attempt_id == attempt_id
+            && candidate.candidate_commit == recovery.candidate_commit
+    }) {
+        return Err(rejected("a Merge Candidate already owns this candidate"));
+    }
+
+    let source_output = attempt
+        .tasks
+        .iter()
+        .take(writer_index)
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| rejected("the source candidate Writer is missing"))?;
+    if source_output.commit != recovery.candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, source_output, &recovery.candidate_commit)
+    {
+        return Err(rejected(
+            "the candidate workspace no longer matches the classified commit",
+        ));
+    }
+    if writer.workspace_access.writes.len() != 1
+        || writer.workspace_access.writes[0].id != source_output.workspace_id
+        || writer.workspace_access.writes[0].path != source_output.workspace_path
+    {
+        return Err(rejected(
+            "the corrective Writer workspace is not candidate-bound",
+        ));
+    }
+
+    let matching_targets = recovery
+        .targets
+        .iter()
+        .filter(|target| {
+            target.role == "tests"
+                && target
+                    .review_task_id
+                    .as_ref()
+                    .is_some_and(|review_task_id| {
+                        attempt.tasks.iter().any(|task| {
+                            task.id == *review_task_id
+                                && task.kind == TaskKind::Review
+                                && task.role == "tests"
+                                && review_artifact_path(task).as_deref()
+                                    == Some(classification.review_artifact.as_str())
+                        })
+                    })
+        })
+        .collect::<Vec<_>>();
+    if matching_targets.len() != 1 {
+        return Err(rejected(
+            "classified recovery has an ambiguous Tests Review target",
+        ));
+    }
+    let target = matching_targets[0];
+    let review_task_id = target
+        .review_task_id
+        .as_deref()
+        .ok_or_else(|| rejected("classified recovery target has no review Task identity"))?;
+    if target.review_digest.as_deref() != Some(classification.review_digest.as_str()) {
+        return Err(rejected("saved review digest changed"));
+    }
+    let review_task = attempt
+        .tasks
+        .iter()
+        .find(|task| {
+            task.id == review_task_id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && task.work_item_id == item.id
+                && task.attempt_id.as_deref() == Some(attempt_id)
+                && review_artifact_path(task).as_deref()
+                    == Some(classification.review_artifact.as_str())
+                && task.review_context.as_ref().is_some_and(|context| {
+                    context.candidate_commit == recovery.candidate_commit
+                        && context.candidate_workspace_id == source_output.workspace_id
+                        && context.candidate_workspace_path == source_output.workspace_path
+                })
+                && task
+                    .evidence_review_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.recovery_id == recovery.id
+                            && context.candidate_commit == recovery.candidate_commit
+                            && context.attachment == recovery.attachment
+                            && context.prior_review_artifact == target.prior_review_artifact
+                    })
+        })
+        .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
+    validate_classification_task_frontier(attempt, review_task_id, Some(task_id))
+        .map_err(|reason| rejected(&reason))?;
+    let evidence_ref = ArtifactRef {
+        producer_id: "host-evidence".to_string(),
+        path: recovery.attachment.snapshot_path.clone(),
+    };
+    if review_task
+        .input_artifacts
+        .iter()
+        .filter(|input| *input == &evidence_ref)
+        .count()
+        != 1
+        || review_task
+            .input_artifacts
+            .iter()
+            .any(|input| input.path == evidence_ref.path && input != &evidence_ref)
+    {
+        return Err(rejected("bound Tests Review Task lost its evidence input"));
+    }
+
+    let review_path = validate_managed_file_path(project_root, &classification.review_artifact)
+        .map_err(|error| {
+            code_change_writer_rejection(
+                attempt_id,
+                format!("review artifact is not a managed regular file: {error}"),
+            )
+        })?;
+    let review_bytes = fs::read(&review_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read bound review artifact: {error}"),
+        )
+    })?;
+    let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
+    if review_digest != classification.review_digest {
+        return Err(rejected("bound review bytes changed"));
+    }
+    let review_text = std::str::from_utf8(&review_bytes)
+        .map_err(|_| rejected("bound review artifact is not valid UTF-8"))?;
+    let disposition = review::extract_evidence_disposition(review_text);
+    let legacy_disposition = review::has_unqualified_evidence_needed_disposition(review_text);
+    if review::extract_verdict(review_text) != review::Verdict::Fail
+        || (disposition != Some(review::EvidenceDisposition::EvidenceNeeded) && !legacy_disposition)
+    {
+        return Err(rejected("bound review no longer requests evidence-needed"));
+    }
+
+    let expected_snapshot = snapshot_path(&item.id, attempt_id, &recovery.attachment.digest)
+        .map_err(|error| code_change_writer_rejection(attempt_id, error.to_string()))?;
+    if recovery.attachment.snapshot_path != expected_snapshot
+        || !recovery.attachment.digest.starts_with("sha256:")
+    {
+        return Err(rejected("evidence snapshot binding changed"));
+    }
+    let evidence_path =
+        validate_managed_file_path(project_root, &recovery.attachment.snapshot_path).map_err(
+            |error| {
+                code_change_writer_rejection(
+                    attempt_id,
+                    format!("evidence snapshot is not a managed regular file: {error}"),
+                )
+            },
+        )?;
+    let evidence_bytes = fs::read(&evidence_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read bound evidence snapshot: {error}"),
+        )
+    })?;
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
+        || parse_evidence_snapshot(&evidence_bytes).is_err()
+    {
+        return Err(rejected("evidence snapshot bytes changed"));
+    }
+
+    let authorization_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(classification.authorization.as_bytes())
+    );
+    if authorization_digest != classification.authorization_digest {
+        return Err(rejected("classification authorization digest changed"));
+    }
+    if classification.disposition != CODE_CHANGE_DISPOSITION {
+        return Err(rejected("classification uses an unsupported disposition"));
+    }
+    let expected_operation_id = code_change_operation_id(
+        attempt_id,
+        &recovery.candidate_commit,
+        &recovery.id,
+        &classification.review_artifact,
+        &classification.review_digest,
+        &recovery.attachment.digest,
+        &classification.disposition,
+        &classification.authorization_digest,
+    );
+    let legacy_identity = classification_uses_legacy_identity(classification, attempt_id, recovery);
+    if classification.operation_id != expected_operation_id && !legacy_identity {
+        return Err(rejected("classification operation identity changed"));
+    }
+    let expected_writer_task_id = format!(
+        "{attempt_id}-write-{}",
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count()
+    );
+    if classification.writer_task_id != expected_writer_task_id {
+        return Err(rejected("classification Writer identity changed"));
+    }
+    let expected_audit_artifact = ArtifactRef {
+        producer_id: classification.operation_id.clone(),
+        path: work_model::work_artifact_path(
+            &item.id,
+            attempt_id,
+            &format!("{}/classification.json", classification.operation_id),
+        ),
+    };
+    if classification.audit_artifact != expected_audit_artifact
+        || attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| *artifact == &classification.audit_artifact)
+            .count()
+            != 1
+    {
+        return Err(rejected("classification audit binding changed"));
+    }
+    let audit_path = validate_managed_file_path(project_root, &classification.audit_artifact.path)
+        .map_err(|error| {
+            code_change_writer_rejection(
+                attempt_id,
+                format!("classification audit is not a managed regular file: {error}"),
+            )
+        })?;
+    let audit_bytes = fs::read(&audit_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read classification audit: {error}"),
+        )
+    })?;
+    let expected_audit = CodeChangeClassificationAudit {
+        schema_version: 1,
+        operation_id: &classification.operation_id,
+        work_item_id: &item.id,
+        attempt_id,
+        candidate_commit: &recovery.candidate_commit,
+        recovery_id: &recovery.id,
+        evidence: &recovery.attachment,
+        review_artifact: &classification.review_artifact,
+        review_digest: &classification.review_digest,
+        disposition: (!legacy_identity).then_some(classification.disposition.as_str()),
+        authorization: &classification.authorization,
+        authorization_digest: &classification.authorization_digest,
+        writer_task_id: &classification.writer_task_id,
+    };
+    let expected_audit_bytes = serde_json::to_vec_pretty(&expected_audit)
+        .map_err(|error| code_change_writer_rejection(attempt_id, error.to_string()))?;
+    if audit_bytes != expected_audit_bytes {
+        return Err(rejected("classification audit bytes changed"));
+    }
+
+    let expected_review_input = ArtifactRef {
+        producer_id: review_task.id.clone(),
+        path: classification.review_artifact.clone(),
+    };
+    let expected_refs = [
+        expected_review_input,
+        evidence_ref,
+        classification.audit_artifact.clone(),
+    ];
+    for expected in expected_refs {
+        if writer
+            .input_artifacts
+            .iter()
+            .filter(|input| *input == &expected)
+            .count()
+            != 1
+            || writer
+                .input_artifacts
+                .iter()
+                .any(|input| input.path == expected.path && input != &expected)
+        {
+            return Err(rejected("corrective Writer input binding changed"));
+        }
+    }
+    Ok(())
+}
+
+fn code_change_writer_rejection(attempt_id: &str, reason: impl Into<String>) -> WorkModelError {
+    WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt_id.to_string(),
+        reason: reason.into(),
+    }
+}
+
+/// Validate the task frontier that a host-evidence classification may mutate.
+pub(crate) fn validate_classification_task_frontier(
+    attempt: &work_model::Attempt,
+    review_task_id: &str,
+    allowed_planned_writer_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    let (review_index, review_task) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| task.id == review_task_id)
+        .ok_or_else(|| "the classified Tests Review Task is missing".to_string())?;
+    if review_task.kind != TaskKind::Review
+        || review_task.role != "tests"
+        || review_task.status != TaskStatus::Complete
+    {
+        return Err("the classified Tests Review Task is not complete".to_string());
+    }
+
+    let mut failed_writer_count = 0usize;
+    let mut planned_writer_count = 0usize;
+    for (index, task) in attempt.tasks.iter().enumerate() {
+        let allowed_planned_writer = allowed_planned_writer_id.is_some_and(|id| id == task.id);
+        match task.status {
+            TaskStatus::Complete | TaskStatus::Superseded => {}
+            TaskStatus::Failed
+                if task.kind == TaskKind::Write
+                    && task.output.is_none()
+                    && index < review_index =>
+            {
+                failed_writer_count += 1;
+            }
+            TaskStatus::Planned
+                if allowed_planned_writer
+                    && task.kind == TaskKind::Write
+                    && task.output.is_none() =>
+            {
+                planned_writer_count += 1;
+            }
+            _ => {
+                return Err(format!(
+                    "Task {} is an unrelated live or unresolved frontier entry",
+                    task.id
+                ));
+            }
+        }
+    }
+    if failed_writer_count > 1 {
+        return Err("the frontier contains multiple failed output-free Writers".to_string());
+    }
+    if allowed_planned_writer_id.is_some() && planned_writer_count != 1 {
+        return Err(
+            "the classified corrective Writer is not the only planned continuation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Ensure a classification targets the current unresolved host-evidence
+/// frontier. A later active or evidence-waiting recovery supersedes an older
+/// paused recovery for new classifications and Writer continuation.
+pub(crate) fn validate_classification_recovery_scope(
+    attempt: &work_model::Attempt,
+    recovery_id: &str,
+) -> std::result::Result<(), String> {
+    let recovery_index = attempt
+        .evidence_recoveries
+        .iter()
+        .position(|recovery| recovery.id == recovery_id)
+        .ok_or_else(|| "the classified recovery is missing".to_string())?;
+    if attempt
+        .evidence_recoveries
+        .iter()
+        .skip(recovery_index + 1)
+        .any(|recovery| {
+            matches!(
+                recovery.state,
+                EvidenceRecoveryState::Reviewing | EvidenceRecoveryState::NeedsEvidence
+            )
+        })
+    {
+        return Err(
+            "a later active or NeedsEvidence recovery owns the current frontier".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn code_change_operation_id(
+    attempt_id: &str,
+    candidate_commit: &str,
+    recovery_id: &str,
+    review_artifact: &str,
+    review_digest: &str,
+    evidence_digest: &str,
+    disposition: &str,
+    authorization_digest: &str,
+) -> String {
+    let operation_material = format!(
+        "{attempt_id}\0{candidate_commit}\0{recovery_id}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{disposition}\0{authorization_digest}"
+    );
+    format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(operation_material.as_bytes())
+    )
+}
+
+fn legacy_code_change_operation_id(
+    attempt_id: &str,
+    candidate_commit: &str,
+    recovery_id: &str,
+    review_artifact: &str,
+    review_digest: &str,
+    evidence_digest: &str,
+    authorization_digest: &str,
+) -> String {
+    let operation_material = format!(
+        "{attempt_id}\0{candidate_commit}\0{recovery_id}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{authorization_digest}"
+    );
+    format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(operation_material.as_bytes())
+    )
+}
+
+pub(crate) fn classification_uses_legacy_identity(
+    classification: &HostEvidenceClassification,
+    attempt_id: &str,
+    recovery: &EvidenceRecovery,
+) -> bool {
+    classification.operation_id
+        == legacy_code_change_operation_id(
+            attempt_id,
+            &recovery.candidate_commit,
+            &recovery.id,
+            &classification.review_artifact,
+            &classification.review_digest,
+            &recovery.attachment.digest,
+            &classification.authorization_digest,
+        )
+}
+
+pub(crate) fn classification_audit_bytes(
+    work_item_id: &str,
+    attempt_id: &str,
+    recovery: &EvidenceRecovery,
+    classification: &HostEvidenceClassification,
+    include_disposition: bool,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&CodeChangeClassificationAudit {
+        schema_version: 1,
+        operation_id: &classification.operation_id,
+        work_item_id,
+        attempt_id,
+        candidate_commit: &recovery.candidate_commit,
+        recovery_id: &recovery.id,
+        evidence: &recovery.attachment,
+        review_artifact: &classification.review_artifact,
+        review_digest: &classification.review_digest,
+        disposition: include_disposition.then_some(classification.disposition.as_str()),
+        authorization: &classification.authorization,
+        authorization_digest: &classification.authorization_digest,
+        writer_task_id: &classification.writer_task_id,
+    })
+    .context("serialize host-evidence classification audit")
+}
+
+pub(crate) fn candidate_workspace_is_clean_at(
+    project_root: &Path,
+    output: &work_model::TaskOutput,
+    candidate: &str,
+) -> bool {
+    let workspace = Path::new(&output.workspace_path);
+    let workspace = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        project_root.join(workspace)
+    };
+    git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "inspect evidence candidate",
+    )
+    .is_ok_and(|head| head == candidate)
+        && git::run_stdout(
+            &workspace,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect evidence candidate cleanliness",
+        )
+        .is_ok_and(|status| status.is_empty())
+}
+
+pub(crate) fn validate_managed_file_path(project_root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    let managed_root = Path::new(".fluent/work/artifacts");
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || !relative_path.starts_with(managed_root)
+    {
+        bail!("artifact path must stay under the managed artifact root");
+    }
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.len() <= managed_root.components().count()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("artifact path must use normal managed components");
+    }
+    let full_path = project_root.join(relative_path);
+    let mut current = project_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            unreachable!("validated artifact component");
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            bail!("artifact path must not traverse a symlink");
+        }
+        let is_last = index + 1 == components.len();
+        if (is_last && !metadata.is_file()) || (!is_last && !metadata.is_dir()) {
+            bail!("artifact path has an invalid file type");
+        }
+    }
+    Ok(full_path)
+}
+
+fn parse_evidence_snapshot(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() || bytes.len() > MAX_EVIDENCE_BYTES {
+        bail!("evidence document must be between 1 and {MAX_EVIDENCE_BYTES} bytes");
+    }
+    let document: EvidenceSnapshot = serde_json::from_slice(bytes)
+        .context("evidence document must be valid schema-version-1 JSON")?;
+    if document.schema_version != 1
+        || document.producer.trim().is_empty()
+        || document.check.trim().is_empty()
+        || document.working_directory.trim().is_empty()
+    {
+        bail!("evidence document has an unsupported version or empty required field");
+    }
+    DateTime::parse_from_rfc3339(&document.run_at).context("evidence run_at must be RFC3339")?;
+    let _ = (&document.result, &document.output);
+    Ok(())
+}
+
+pub(crate) fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .context("invalid evidence digest")?;
+    Ok(format!(
+        ".fluent/work/artifacts/{work}/{attempt}/host-evidence/{hex}.json"
+    ))
+}
+
+pub(crate) fn review_artifact_path(task: &Task) -> Option<String> {
+    task.artifact_area
+        .as_ref()
+        .map(|area| format!("{}/review.md", area.path))
+}

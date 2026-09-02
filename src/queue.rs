@@ -1183,7 +1183,7 @@ fn ensure_code_change_classification_resume_ready(
                 && recovery.code_change_classification.is_some()
         })
         .ok_or_else(|| ineligible("no classified recovery remains"))?;
-    crate::host_evidence::validate_classification_recovery_scope(attempt, &recovery.id)
+    crate::recovery_contracts::validate_classification_recovery_scope(attempt, &recovery.id)
         .map_err(|reason| ineligible(&reason))?;
     let classification = recovery
         .code_change_classification
@@ -1258,7 +1258,7 @@ fn ensure_code_change_classification_resume_ready(
             "the planned Writer no longer names its audit artifact",
         ));
     }
-    crate::host_evidence::validate_code_change_writer_start(
+    crate::recovery_contracts::validate_code_change_writer_start(
         project_root,
         item,
         &attempt.id,

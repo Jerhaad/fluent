@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::coder::{CoderKind, CoderSandbox};
 use crate::content::ContentResolver;
@@ -40,7 +40,8 @@ pub struct WorkTaskRunResult {
 }
 
 const NO_CHANGE_DECLARATION_FILE: &str = "no-change.json";
-pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
+pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str =
+    crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE;
 const REVIEW_ARTIFACT_WARN_BYTES: u64 = 16 * 1024 * 1024;
 const EXECUTION_CONTEXT_MAX_BYTES: usize = 128 * 1024;
 const EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES: usize = 300;
@@ -360,7 +361,7 @@ fn reserve_task_start(
                 id: task_id.to_string(),
             })?;
         if expected_kind == TaskKind::Write {
-            crate::host_evidence::validate_code_change_writer_start(
+            crate::recovery_contracts::validate_code_change_writer_start(
                 project_root,
                 item,
                 attempt_id,
@@ -3581,61 +3582,11 @@ pub(crate) fn resolve_managed_artifact_area_path(
     project_root: &Path,
     path: &str,
 ) -> Result<PathBuf> {
-    let relative_path = Path::new(path);
-    if relative_path.is_absolute() {
-        bail!("Task artifact area path must be relative: {path}");
-    }
-
-    let mut components = Vec::new();
-    for component in relative_path.components() {
-        match component {
-            Component::Normal(part) => components.push(part.to_owned()),
-            _ => bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}"),
-        }
-    }
-
-    let managed_prefix = [
-        std::ffi::OsStr::new(".fluent"),
-        std::ffi::OsStr::new("work"),
-        std::ffi::OsStr::new("artifacts"),
-    ];
-    if components.len() <= managed_prefix.len()
-        || !components
-            .iter()
-            .zip(managed_prefix.iter())
-            .all(|(actual, expected)| actual == expected)
-    {
-        bail!("Task artifact area path must stay under .fluent/work/artifacts: {path}");
-    }
-
-    Ok(resolve_workspace_path(project_root, path))
+    crate::recovery_contracts::resolve_managed_artifact_area_path(project_root, path)
 }
 
 fn resolve_input_artifact_path(project_root: &Path, path: &str) -> Result<PathBuf> {
-    let relative_path = Path::new(path);
-    if relative_path.is_absolute() {
-        bail!("Input artifact path must be relative: {path}");
-    }
-    let mut components = Vec::new();
-    for component in relative_path.components() {
-        match component {
-            Component::Normal(part) => components.push(part.to_owned()),
-            _ => bail!(
-                "Input artifact path must stay under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
-            ),
-        }
-    }
-    let valid = components.len() >= 3
-        && components[0] == std::ffi::OsStr::new(".fluent")
-        && components[1] == std::ffi::OsStr::new("work")
-        && (components[2] == std::ffi::OsStr::new("artifacts")
-            || components[2] == std::ffi::OsStr::new("progress"));
-    if !valid {
-        bail!(
-            "Input artifact path must be under .fluent/work/artifacts/ or .fluent/work/progress/: {path}"
-        );
-    }
-    Ok(resolve_workspace_path(project_root, path))
+    crate::recovery_contracts::resolve_input_artifact_path(project_root, path)
 }
 
 fn resolve_input_artifact_paths(
@@ -6367,173 +6318,21 @@ fn writer_completion_matrix_path(
     project_root: &Path,
     task: &crate::work_model::Task,
 ) -> Option<PathBuf> {
-    task.artifact_area.as_ref().map(|area| {
-        project_root
-            .join(&area.path)
-            .join(WRITER_COMPLETION_MATRIX_FILE)
-    })
+    crate::recovery_contracts::writer_completion_matrix_path(project_root, task)
 }
 
 fn managed_writer_completion_matrix_path(
     project_root: &Path,
     task: &crate::work_model::Task,
 ) -> Result<Option<PathBuf>> {
-    task.artifact_area
-        .as_ref()
-        .map(|area| {
-            resolve_managed_artifact_area_path(project_root, &area.path)
-                .map(|dir| dir.join(WRITER_COMPLETION_MATRIX_FILE))
-        })
-        .transpose()
+    crate::recovery_contracts::managed_writer_completion_matrix_path(project_root, task)
 }
 
 pub(crate) fn writer_completion_findings(
     project_root: &Path,
     task: &crate::work_model::Task,
 ) -> Result<Vec<crate::work_model::WriterCompletionFinding>> {
-    let mut findings = BTreeMap::new();
-    // A Tester-harness repair is authorized by its explicit operator decision.
-    // The failed Tester result remains immutable prompt evidence for diagnosing
-    // that repair, but its ordinary command failures are not product obligations:
-    // importing them here would invite the narrowly scoped Writer to edit product
-    // code outside `.fluent/tester.yaml` and the extractor.
-    if task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE {
-        return Ok(findings.into_values().collect());
-    }
-    for artifact in &task.input_artifacts {
-        let relative = Path::new(&artifact.path);
-        let is_review = relative.file_name().is_some_and(|name| {
-            name == "review.md" || name.to_string_lossy().starts_with("review-")
-        });
-        if !is_review {
-            continue;
-        }
-        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
-        let source = fs::read_to_string(&path).with_context(|| {
-            format!(
-                "read review findings for Writer completion matrix: {}",
-                path.display()
-            )
-        })?;
-        let role = crate::review::REVIEWERS
-            .iter()
-            .find(|role| {
-                artifact.producer_id.contains(**role)
-                    || artifact.path.contains(&format!("review-{role}"))
-            })
-            .copied()
-            .unwrap_or("unknown");
-        for title in crate::review::open_finding_titles(&source) {
-            let identity = crate::review::finding_identity(role, &title);
-            findings
-                .entry((role.to_string(), identity.clone()))
-                .or_insert(crate::work_model::WriterCompletionFinding {
-                    id: format!("finding:{role}:{identity}"),
-                    role: role.to_string(),
-                    source: artifact.path.clone(),
-                    requirement: title,
-                });
-        }
-    }
-    for artifact in &task.input_artifacts {
-        let relative = Path::new(&artifact.path);
-        let is_candidate_gate = relative
-            .file_name()
-            .is_some_and(|name| name == crate::candidate_gate::CANDIDATE_GATE_FILE);
-        if !is_candidate_gate {
-            continue;
-        }
-        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
-        let source = fs::read(&path).with_context(|| {
-            format!(
-                "read candidate gate findings for Writer completion matrix: {}",
-                path.display()
-            )
-        })?;
-        let evidence =
-            serde_json::from_slice::<crate::candidate_gate::CandidateGateEvidence>(&source)
-                .with_context(|| {
-                    format!(
-                        "parse candidate gate findings for Writer completion matrix: {}",
-                        path.display()
-                    )
-                })?;
-        if evidence.disposition != crate::candidate_gate::CandidateGateDisposition::Rejected {
-            continue;
-        }
-        for check in evidence
-            .checks
-            .iter()
-            .filter(|check| check.status == crate::candidate_gate::CandidateCheckStatus::Failed)
-        {
-            let diagnostics = if check.diagnostics.is_empty() {
-                vec![format!("{} check failed", check.name)]
-            } else {
-                check.diagnostics.clone()
-            };
-            for diagnostic in diagnostics {
-                let role = "candidate-gate";
-                let identity = crate::review::finding_identity(role, &diagnostic);
-                findings
-                    .entry((role.to_string(), identity.clone()))
-                    .or_insert(crate::work_model::WriterCompletionFinding {
-                        id: format!("finding:{role}:{identity}"),
-                        role: role.to_string(),
-                        source: artifact.path.clone(),
-                        requirement: diagnostic,
-                    });
-            }
-        }
-    }
-    for artifact in &task.input_artifacts {
-        let relative = Path::new(&artifact.path);
-        let is_tester_results = relative.file_name().is_some_and(|name| {
-            name == "tester-results.json"
-                && relative
-                    .parent()
-                    .and_then(Path::file_name)
-                    .is_some_and(|parent| parent.to_string_lossy().contains("-tester"))
-        });
-        if !is_tester_results {
-            continue;
-        }
-        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
-        let source = fs::read(&path).with_context(|| {
-            format!(
-                "read Tester findings for Writer completion matrix: {}",
-                path.display()
-            )
-        })?;
-        let results = serde_json::from_slice::<crate::tester::TesterResults>(&source)
-            .with_context(|| {
-                format!(
-                    "parse Tester findings for Writer completion matrix: {}",
-                    path.display()
-                )
-            })?;
-        for (index, command) in results
-            .commands
-            .iter()
-            .enumerate()
-            .filter(|(_, command)| command.exit_code != 0)
-        {
-            let role = "tester";
-            let stable_title = format!("configured command {index}: {}", command.command);
-            let identity = crate::review::finding_identity(role, &stable_title);
-            findings
-                .entry((role.to_string(), identity.clone()))
-                .or_insert(crate::work_model::WriterCompletionFinding {
-                    id: format!("finding:{role}:{identity}"),
-                    role: role.to_string(),
-                    source: artifact.path.clone(),
-                    requirement: format!(
-                        "Configured Tester command {index} failed with exit code {}",
-                        command.exit_code
-                    ),
-                });
-        }
-    }
-    Ok(findings.into_values().collect())
+    crate::recovery_contracts::writer_completion_findings(project_root, task)
 }
 
 /// Materialize one task-specific structured completion matrix before launching a
