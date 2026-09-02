@@ -1335,3 +1335,26 @@ pub(crate) fn review_artifact_path(task: &Task) -> Option<String> {
         .as_ref()
         .map(|area| format!("{}/review.md", area.path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EvidenceSnapshotResult, parse_evidence_snapshot, validate_failed_evidence_snapshot,
+    };
+
+    #[test]
+    fn failed_evidence_snapshot_rejects_pass_result() {
+        let passing = br#"{"schema_version":1,"producer":"host","check":"cargo test","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
+
+        assert_eq!(
+            parse_evidence_snapshot(passing).unwrap(),
+            EvidenceSnapshotResult::Pass
+        );
+        let error = validate_failed_evidence_snapshot(passing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("evidence snapshot result must be fail")
+        );
+    }
+}
