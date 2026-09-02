@@ -24540,11 +24540,27 @@ fn setup_paused_code_change_classification_fixture(
     )
 }
 
+struct ManagedWorktreeCleanup {
+    project: PathBuf,
+    workspace: PathBuf,
+}
+
+impl Drop for ManagedWorktreeCleanup {
+    fn drop(&mut self) {
+        let workspace = self.workspace.to_string_lossy().into_owned();
+        let _ = git::run(
+            &self.project,
+            &["worktree", "remove", "--force", &workspace],
+            "remove classified Writer fixture worktree",
+        );
+    }
+}
+
 fn bind_candidate_to_managed_sibling(
     project: &Path,
     work_item_id: &str,
     candidate: &str,
-) -> PathBuf {
+) -> ManagedWorktreeCleanup {
     let workspace_relative =
         fluent::work_model::initial_candidate_workspace_path(work_item_id, "attempt-1");
     let workspace_name = Path::new(&workspace_relative)
@@ -24566,6 +24582,10 @@ fn bind_candidate_to_managed_sibling(
         "create managed candidate fixture worktree",
     )
     .unwrap();
+    let cleanup = ManagedWorktreeCleanup {
+        project: project.to_path_buf(),
+        workspace: workspace_path,
+    };
 
     let store = WorkModelStore::new(project);
     let workspace_relative_for_model = workspace_relative.clone();
@@ -24597,7 +24617,7 @@ fn bind_candidate_to_managed_sibling(
             Ok(())
         })
         .unwrap();
-    workspace_path
+    cleanup
 }
 
 #[test]
@@ -25161,6 +25181,21 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
         String::from_utf8_lossy(&first_output.stderr)
     );
     let first_stdout = first_output.stdout.clone();
+    let first_stdout_text = String::from_utf8(first_stdout.clone()).unwrap();
+    let next_command = first_stdout_text
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .expect("classification must emit a queue-resume next command");
+    assert_eq!(
+        next_command,
+        "fluent queue resume evidence-classify --attempt attempt-1"
+    );
+    let next_args = next_command.split_whitespace().skip(1).collect::<Vec<_>>();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(next_args)
+        .assert()
+        .success();
     let shown = work_item_value(&project, "evidence-classify");
     let attempt = &shown["attempts"][0];
     assert_eq!(attempt["status"], "planned");
@@ -25315,18 +25350,6 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     let first_model = shown.clone();
     let first_snapshot = persisted_work_snapshot(&project, "evidence-classify");
     let first_audit_bytes = audit_bytes.clone();
-
-    fluent_cmd()
-        .current_dir(&project)
-        .args([
-            "queue",
-            "resume",
-            "evidence-classify",
-            "--attempt",
-            "attempt-1",
-        ])
-        .assert()
-        .success();
 
     let second_output = fluent_cmd()
         .current_dir(&project)
@@ -25513,6 +25536,84 @@ fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_rejects_later_recovery() {
+    for later_state in [
+        fluent::work_model::EvidenceRecoveryState::Reviewing,
+        fluent::work_model::EvidenceRecoveryState::NeedsEvidence,
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-replay-later");
+        let resolution = "The failed candidate-bound check needs a source correction.";
+        let classify_args = [
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-replay-later",
+            "attempt-1",
+            "--candidate",
+            candidate.as_str(),
+            "--review-artifact",
+            targeted_path.as_str(),
+            "--evidence-digest",
+            digest.as_str(),
+            "--resolution",
+            resolution,
+        ];
+        fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .assert()
+            .success();
+
+        let classified = work_item_value(&project, "evidence-classify-replay-later");
+        let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+            ["code_change_classification"]["audit_artifact"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let store = WorkModelStore::new(&project);
+        store
+            .mutate_work_item("evidence-classify-replay-later", |item| {
+                let attempt = &mut item.attempts[0];
+                let mut later = attempt.evidence_recoveries[0].clone();
+                later.id = "host-evidence-replay-later".to_string();
+                later.state = later_state.clone();
+                later.targets[0].role = "architecture".to_string();
+                later.targets[0].review_task_id = None;
+                later.targets[0].review_digest = None;
+                attempt.evidence_recoveries.push(later);
+                Ok(())
+            })
+            .unwrap();
+        let before = persisted_work_snapshot(&project, "evidence-classify-replay-later");
+        let audit_before = fs::read(project.join(&audit_path)).unwrap();
+
+        let replay = fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .output()
+            .unwrap();
+        assert!(
+            !replay.status.success(),
+            "replay accepted a later {later_state:?} recovery: stdout={} stderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&replay.stderr)
+                .contains("later active or NeedsEvidence recovery")
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-replay-later"),
+            before
+        );
+        assert_eq!(fs::read(project.join(&audit_path)).unwrap(), audit_before);
+        assert_eq!(git_head(&project), candidate);
+    }
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_accepts_claimed_writer() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
@@ -25592,16 +25693,21 @@ fn exact_host_evidence_classification_replay_accepts_claimed_writer() {
 #[test]
 fn classified_writer_continuation_runs_with_candidate_bound_inputs() {
     let tmp = TempDir::new().unwrap();
-    let work_item_id = "evidence-classify-writer";
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-writer-{run_suffix}");
     let (project, candidate, _prior_review_path, targeted_path, digest, snapshot_path) =
-        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
-    let workspace_path = bind_candidate_to_managed_sibling(&project, work_item_id, &candidate);
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let _workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
     let resolution = "The failed candidate-bound check needs a source correction.";
     let classify_args = [
         "attempt",
         "evidence",
         "classify",
-        work_item_id,
+        &work_item_id,
         "attempt-1",
         "--candidate",
         candidate.as_str(),
@@ -25612,12 +25718,33 @@ fn classified_writer_continuation_runs_with_candidate_bound_inputs() {
         "--resolution",
         resolution,
     ];
-    fluent_cmd()
+    let classify_output = fluent_cmd()
         .current_dir(&project)
         .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        classify_output.status.success(),
+        "classification failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&classify_output.stdout),
+        String::from_utf8_lossy(&classify_output.stderr)
+    );
+    let classify_stdout = String::from_utf8_lossy(&classify_output.stdout).into_owned();
+    let next_command = classify_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Next: "))
+        .expect("classification must emit a queue-resume next command");
+    assert_eq!(
+        next_command,
+        format!("fluent queue resume {work_item_id} --attempt attempt-1")
+    );
+    let next_args = next_command.split_whitespace().skip(1).collect::<Vec<_>>();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(next_args)
         .assert()
         .success();
-    let classified = work_item_value(&project, work_item_id);
+    let classified = work_item_value(&project, &work_item_id);
     let attempt = &classified["attempts"][0];
     let writer_id =
         attempt["evidence_recoveries"][0]["code_change_classification"]["writer_task_id"]
@@ -25663,7 +25790,7 @@ exit 0
         .args([
             "task",
             "run",
-            work_item_id,
+            &work_item_id,
             "attempt-1",
             &writer_id,
             "--no-sandbox",
@@ -25683,7 +25810,7 @@ exit 0
         prompt.contains(&targeted_path),
         "prompt lost review binding"
     );
-    let after = work_item_value(&project, work_item_id);
+    let after = work_item_value(&project, &work_item_id);
     let after_attempt = &after["attempts"][0];
     let writer = after_attempt["tasks"]
         .as_array()
@@ -25694,7 +25821,7 @@ exit 0
     assert_eq!(writer["status"], "complete");
     assert_eq!(
         writer["output"]["workspace_path"],
-        fluent::work_model::initial_candidate_workspace_path(work_item_id, "attempt-1")
+        fluent::work_model::initial_candidate_workspace_path(&work_item_id, "attempt-1")
     );
     assert!(
         writer["input_artifacts"]
@@ -25714,18 +25841,6 @@ exit 0
     );
     assert_ne!(writer["output"]["commit"], candidate);
     assert_eq!(after_attempt["status"], "executing");
-
-    git::run(
-        &project,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            workspace_path.to_str().unwrap(),
-        ],
-        "remove classified Writer fixture worktree",
-    )
-    .unwrap();
 }
 
 #[test]

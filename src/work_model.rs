@@ -11115,9 +11115,9 @@ random banner prose that must be ignored
             2
         );
 
-        // A later review frontier may reuse the same immutable attachment.
-        // Replaying the first request must still resolve its own persisted
-        // classification instead of selecting the newer recovery.
+        // A later recovery owns the current frontier, so replaying the first
+        // request must be rejected rather than directing work to stale
+        // correction state.
         let mut later_target = after_second.attempts[0]
             .tasks
             .iter()
@@ -11183,7 +11183,7 @@ random banner prose that must be ignored
                 Ok(())
             })
             .unwrap();
-        let replay_first = crate::host_evidence::classify_for_code_change(
+        let replay_error = crate::host_evidence::classify_for_code_change(
             root,
             &store,
             "work-1",
@@ -11193,12 +11193,20 @@ random banner prose that must be ignored
             &evidence_digest,
             "Correct the source.",
         )
-        .unwrap();
-        assert_eq!(replay_first, first);
+        .unwrap_err();
+        assert!(
+            replay_error
+                .to_string()
+                .contains("later active or NeedsEvidence recovery")
+        );
         let after_distinct_replay = store.read_work_item("work-1").unwrap();
         assert_eq!(
             after_distinct_replay.attempts[0].evidence_recoveries.len(),
             2
+        );
+        assert_eq!(
+            after_distinct_replay.attempts[0].evidence_recoveries[0].code_change_classification,
+            after_second.attempts[0].evidence_recoveries[0].code_change_classification
         );
         assert!(
             after_distinct_replay.attempts[0].evidence_recoveries[1]

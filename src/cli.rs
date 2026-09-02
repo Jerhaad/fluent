@@ -393,7 +393,7 @@ pub enum WorkItemCommands {
 
 #[derive(Subcommand)]
 pub enum AttemptCommands {
-    /// Attach immutable host-run evidence and plan targeted review
+    /// Run, attach, or classify host-evidence recovery
     Evidence {
         #[command(subcommand)]
         command: AttemptEvidenceCommands,

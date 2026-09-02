@@ -70,10 +70,10 @@ non-empty `Additional-Proof` that would resolve it. A single
 `Disposition: evidence-needed` marker with missing, empty, or otherwise
 malformed qualification follows the ordinary `code-change` Writer path. Missing,
 duplicate, or unknown `Disposition` markers remain an uncertain pause. A legacy
-paused recovery containing an unqualified marker may use this classification
-path. If exact evidence already ran against the exact candidate and the failed
-review did not name an actionable condition, classify the source correction on
-the existing paused Attempt instead of attaching the same proof:
+paused recovery with an unqualified marker is the only documented exception.
+When the saved targeted review names the actionable condition above and the
+operator authorizes a source correction, classify that correction on the
+existing paused Attempt instead of attaching the same proof:
 
 ```sh
 fluent attempt evidence classify <work-item-id> <attempt-id> \

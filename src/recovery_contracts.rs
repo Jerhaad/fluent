@@ -700,6 +700,7 @@ pub(crate) fn validate_code_change_classification_replay(
     if item.attempts.last().map(|current| current.id.as_str()) != Some(attempt.id.as_str()) {
         return Err(rejected("the classified Attempt is no longer current"));
     }
+    validate_classification_recovery_scope(attempt, &recovery.id)?;
     if recovery.state != EvidenceRecoveryState::CodeChange {
         return Err(rejected(
             "stored classification recovery is not code-change",
