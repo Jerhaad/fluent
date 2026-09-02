@@ -16133,6 +16133,23 @@ mod tests {
                 .review_prompt
                 .contains("Disposition: evidence-needed")
         );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("On failure, emit exactly one")
+        );
+        assert!(prompts.review_prompt.contains("`Disposition:` line"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("exactly one\n`External-Condition:")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("line plus exactly one\n`Additional-Proof:")
+        );
+        assert!(prompts.review_prompt.contains("Disposition: code-change"));
     }
 
     #[test]

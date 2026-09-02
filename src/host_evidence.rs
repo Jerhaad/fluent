@@ -206,6 +206,15 @@ struct CodeChangeClassificationAudit<'a> {
     writer_task_id: &'a str,
 }
 
+/// Classify one paused, evidence-needed Tests Review as an authorized source
+/// correction for the unchanged candidate.
+///
+/// The boundary validates the persisted review task, its saved review digest,
+/// the candidate-bound evidence snapshot, and the complete failed-review
+/// frontier before it publishes an audit or reopens the Attempt. Repeating the
+/// exact review/evidence/authorization request returns the stored Writer and
+/// audit identifiers without creating another Task; a different request is
+/// rejected.
 pub fn classify_for_code_change(
     project_root: &Path,
     store: &WorkModelStore,
@@ -229,18 +238,111 @@ pub fn classify_for_code_change(
         "classify candidate-bound host evidence for source correction",
         Some(review_artifact.to_string()),
         |item| {
+        let rejected_for = |reason: &str| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: reason.to_string(),
+        };
         let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
             attempt_id: attempt_id.to_string(),
             reason: "the supplied classification does not match a paused candidate-bound host-evidence recovery".to_string(),
         };
-        let attempt = item.attempts.iter().find(|attempt| attempt.id == attempt_id).ok_or_else(rejected)?;
+        let attempt = item.attempts.iter().find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| rejected_for("Attempt is not present"))?;
+        // Resolve the recovery by its complete persisted frontier before reading
+        // any caller-supplied path. The same attachment may legitimately back
+        // multiple later Reviews, so candidate/evidence alone is insufficient.
         let recovery = attempt.evidence_recoveries.iter().rev().find(|recovery| {
             recovery.candidate_commit == candidate_commit
                 && recovery.attachment.digest == evidence_digest
-        }).ok_or_else(rejected)?;
-        let review_path = project_root.join(review_artifact);
-        let review_bytes = fs::read(&review_path).map_err(|_| rejected())?;
+                && recovery.targets.iter().any(|target| {
+                    target.role == "tests"
+                        && target.review_task_id.as_ref().is_some_and(|task_id| {
+                            attempt.tasks.iter().any(|task| {
+                                task.id == *task_id
+                                    && review_artifact_path(task).as_deref()
+                                        == Some(review_artifact)
+                            })
+                        })
+                })
+        }).ok_or_else(|| rejected_for("no recovery matches candidate, evidence, and review frontier"))?;
+        let target = recovery.targets.iter().find(|target| {
+            target.role == "tests"
+                && target.review_task_id.as_ref().is_some_and(|task_id| {
+                    attempt.tasks.iter().any(|task| {
+                        task.id == *task_id
+                            && review_artifact_path(task).as_deref() == Some(review_artifact)
+                    })
+                })
+        }).ok_or_else(|| rejected_for("recovery has no Tests target for this review"))?;
+        let review_task_id = target.review_task_id.as_deref()
+            .ok_or_else(|| rejected_for("recovery target has no review Task identity"))?;
+        let review_task = attempt.tasks.iter().find(|task| {
+            task.id == review_task_id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && review_artifact_path(task).as_deref() == Some(review_artifact)
+                && task.evidence_review_context.as_ref().is_some_and(|context| {
+                    context.recovery_id == recovery.id
+                        && context.candidate_commit == candidate_commit
+                        && context.attachment == recovery.attachment
+                        && context.prior_review_artifact == target.prior_review_artifact
+                })
+        }).ok_or_else(|| rejected_for("bound Tests review Task is missing or mismatched"))?;
+        // The path has now been proven to be the exact persisted Review task.
+        // Reject absolute, parent-relative, symlinked, or non-regular paths
+        // before opening external bytes while the land/model locks are held.
+        let review_path = validate_managed_file_path(project_root, review_artifact)
+            .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!("review artifact is not a managed regular file: {error}"),
+            })?;
+        let review_bytes = fs::read(&review_path).map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("cannot read bound review artifact: {error}"),
+        })?;
         let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
+        if target.review_digest.as_deref() != Some(review_digest.as_str()) {
+            return Err(rejected_for("saved review digest or evidence-needed disposition changed"));
+        }
+        let review_text = std::str::from_utf8(&review_bytes).map_err(|_| rejected())?;
+        if review::extract_verdict(review_text) != Verdict::Fail
+            || review::extract_evidence_disposition(review_text)
+                != Some(review::EvidenceDisposition::EvidenceNeeded)
+        {
+            return Err(rejected_for("bound review no longer requests evidence-needed"));
+        }
+
+        let expected_snapshot = snapshot_path(
+            work_item_id,
+            attempt_id,
+            &recovery.attachment.digest,
+        )
+        .map_err(|_| rejected())?;
+        if recovery.attachment.digest != evidence_digest
+            || recovery.attachment.snapshot_path != expected_snapshot
+        {
+            return Err(rejected_for("evidence snapshot binding changed"));
+        }
+        let evidence_path = validate_managed_file_path(
+            project_root,
+            &recovery.attachment.snapshot_path,
+        )
+        .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("evidence snapshot is not a managed regular file: {error}"),
+        })?;
+        let evidence_bytes = fs::read(&evidence_path).map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("cannot read bound evidence snapshot: {error}"),
+        })?;
+        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes))
+            != recovery.attachment.digest
+            || parse_document(&evidence_bytes).is_err()
+        {
+            return Err(rejected_for("evidence snapshot bytes changed"));
+        }
+
         if let Some(prior) = recovery.code_change_classification.as_ref() {
             if prior.matches_request(
                 review_artifact,
@@ -248,44 +350,55 @@ pub fn classify_for_code_change(
                 authorization,
                 &authorization_digest,
             ) {
+                let writer_exists = attempt.tasks.iter().any(|task| {
+                    task.id == prior.writer_task_id
+                        && task.kind == TaskKind::Write
+                        && task.input_artifacts.contains(&prior.audit_artifact)
+                });
+                if !writer_exists || !attempt.artifacts.contains(&prior.audit_artifact) {
+                    return Err(rejected());
+                }
                 return Ok(CodeChangeClassification {
                     writer_task_id: prior.writer_task_id.clone(),
                     audit_artifact: prior.audit_artifact.path.clone(),
                 });
             }
-            return Err(rejected());
+            return Err(rejected_for("authorization differs from the stored classification"));
         }
         if recovery.state != EvidenceRecoveryState::NeedsEvidence {
             return Err(rejected());
         }
-        let review_task = attempt.tasks.iter().find(|task| {
-            task.kind == TaskKind::Review
-                && task.status == TaskStatus::Complete
-                && review_artifact_path(task).as_deref() == Some(review_artifact)
-                && task.evidence_review_context.as_ref().is_some_and(|context| {
-                    context.recovery_id == recovery.id
-                        && context.candidate_commit == candidate_commit
-                        && context.attachment == recovery.attachment
-                })
-        }).ok_or_else(rejected)?;
+        if item.attempts.last().map(|attempt| attempt.id.as_str()) != Some(attempt_id)
+            || attempt.status != work_model::AttemptStatus::NeedsUser
+            || attempt.pause_kind != Some(work_model::PauseKind::Uncertain)
+            || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+            || attempt.tasks.iter().any(|task| task.status == TaskStatus::Executing)
+        {
+            return Err(rejected_for("Attempt is not the current paused failed-review frontier"));
+        }
+        let selected = validate_evidence_frontier(
+            project_root,
+            item,
+            attempt_id,
+            candidate_commit,
+            &[review_artifact.to_string()],
+        )
+        .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("failed-review frontier is not eligible: {error}"),
+        })?;
+        if selected.len() != 1
+            || selected[0].id != review_task.id
+            || selected[0].role != "tests"
+        {
+            return Err(rejected_for("shared failed-review frontier selected a different Task"));
+        }
         let review_task_id = review_task.id.clone();
         let attachment = recovery.attachment.clone();
         let recovery_id = recovery.id.clone();
-        if review::extract_verdict(std::str::from_utf8(&review_bytes).map_err(|_| rejected())?) != Verdict::Fail
-            || attempt.status != work_model::AttemptStatus::NeedsUser
-            || attempt.pause_kind != Some(work_model::PauseKind::Uncertain)
-            || attempt.tasks.iter().any(|task| task.status == TaskStatus::Executing)
-        {
-            return Err(rejected());
-        }
         let writer = attempt.tasks.iter().rev().find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
             .and_then(|task| task.output.as_ref()).ok_or_else(rejected)?;
         if writer.commit != candidate_commit || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit) {
-            return Err(rejected());
-        }
-        let evidence_path = project_root.join(&recovery.attachment.snapshot_path);
-        let evidence_bytes = fs::read(&evidence_path).map_err(|_| rejected())?;
-        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
             return Err(rejected());
         }
         let operation_material = format!(
@@ -302,7 +415,6 @@ pub fn classify_for_code_change(
             authorization, authorization_digest: &authorization_digest, writer_task_id: &writer_task_id,
         };
         let audit_bytes = serde_json::to_vec_pretty(&audit).map_err(|_| rejected())?;
-        publish_snapshot(project_root, &audit_artifact.path, &audit_bytes).map_err(|_| rejected())?;
         {
             let attempt = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id).expect("validated Attempt remains present");
             let recovery = attempt.evidence_recoveries.iter_mut().find(|recovery| recovery.id == recovery_id).expect("validated recovery remains present");
@@ -312,8 +424,7 @@ pub fn classify_for_code_change(
                 audit_artifact: audit_artifact.clone(), writer_task_id: writer_task_id.clone(), classified_at: work_model::now_iso8601(),
             });
             if !attempt.artifacts.contains(&audit_artifact) { attempt.artifacts.push(audit_artifact.clone()); }
-            attempt.status = work_model::AttemptStatus::Planned;
-            attempt.pause_kind = None;
+            work_model::reopen_attempt(attempt);
         }
         let task_id = item.add_next_write_round(attempt_id, vec![
             ArtifactRef { producer_id: review_task_id, path: review_artifact.to_string() },
@@ -321,9 +432,52 @@ pub fn classify_for_code_change(
             audit_artifact.clone(),
         ]).map_err(|_| rejected())?;
         if task_id != writer_task_id { return Err(rejected()); }
+        // Publish only after the in-memory transition and Task shape have
+        // validated. A rejected request therefore cannot leave an audit file
+        // behind without its corresponding recovery and Writer records.
+        publish_snapshot(project_root, &audit_artifact.path, &audit_bytes).map_err(|_| rejected())?;
         Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path })
         },
     ).map_err(Into::into)
+}
+
+/// Validate a caller-supplied managed artifact path without opening it.
+/// Every component must remain under `.fluent/work/artifacts`, no component may
+/// be a symlink, and the final entry must be a regular file.
+fn validate_managed_file_path(project_root: &Path, relative: &str) -> Result<PathBuf> {
+    let relative_path = Path::new(relative);
+    let managed_root = Path::new(".fluent/work/artifacts");
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || !relative_path.starts_with(managed_root)
+    {
+        bail!("artifact path must stay under the managed artifact root");
+    }
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.len() <= managed_root.components().count()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("artifact path must use normal managed components");
+    }
+    let full_path = project_root.join(relative_path);
+    let mut current = project_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            unreachable!("validated artifact component");
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current)?;
+        if metadata.file_type().is_symlink() {
+            bail!("artifact path must not traverse a symlink");
+        }
+        let is_last = index + 1 == components.len();
+        if (is_last && !metadata.is_file()) || (!is_last && !metadata.is_dir()) {
+            bail!("artifact path has an invalid file type");
+        }
+    }
+    Ok(full_path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1591,6 +1745,7 @@ pub fn attach(
                             .unwrap_or_default()
                     },
                     review_task_id: None,
+                    review_digest: None,
                 })
                 .collect(),
             state: EvidenceRecoveryState::Reviewing,
@@ -1964,6 +2119,7 @@ pub fn attach_plan_row(
                     role: "tests".to_string(),
                     prior_review_artifact: binding_path.clone(),
                     review_task_id: None,
+                    review_digest: None,
                 }],
                 state: EvidenceRecoveryState::Reviewing,
                 created_at: work_model::now_iso8601(),

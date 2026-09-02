@@ -322,9 +322,30 @@ host-only work.
 
 Fluent snapshots the exact document, binds it to that candidate, and reruns
 only the named reviewers. Do not edit the candidate or invent a commit. Inspect
-the Work Item again for the next action: `evidence-needed` means attach new
-host proof; `code-change` means run the ordinary Writer path. A passing targeted
-review still requires all exact-commit evidence and Learning before landing.
+the Work Item again for the next action. `evidence-needed` means attach new host
+proof when the review names an external condition and the additional proof that
+would resolve it. If the exact command already ran against the exact candidate
+and the failed review did not name such a condition, authorize the source
+correction on the existing paused Attempt instead of attaching the same proof:
+
+```sh
+fluent attempt evidence classify <work-item-id> <attempt-id> \
+  --candidate <candidate-sha> \
+  --review-artifact .fluent/work/artifacts/.../review.md \
+  --evidence-digest <attached-evidence-sha256> \
+  --resolution 'The candidate-bound failure requires a source correction.'
+```
+
+Use the failed targeted Tests Review path and evidence digest shown by
+`fluent work-item show`. Fluent accepts this command only for the saved,
+complete `evidence-needed` review, unchanged candidate, clean worktree, and
+matching Attempt frontier. It records the authorization and audit artifact,
+then schedules one corrective Writer with the failed review, immutable evidence
+snapshot, and audit input; resume it with `fluent queue resume <work-item-id>
+--attempt <attempt-id>`. Repeating the exact command returns the same Writer
+and audit identifiers without creating another record, while stale or different
+inputs are rejected without mutation. A passing targeted review still requires
+all exact-commit evidence and Learning before landing.
 
 ### Codex authentication pauses
 

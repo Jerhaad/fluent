@@ -1761,6 +1761,7 @@ mod tests {
                     prior_review_artifact:
                         ".fluent/work/artifacts/work-1/attempt-1/review/review.md".to_string(),
                     review_task_id: Some(review_task_id.to_string()),
+                    review_digest: None,
                 }],
                 state: crate::work_model::EvidenceRecoveryState::NeedsEvidence,
                 created_at: "2026-08-03T00:00:00Z".to_string(),
@@ -1796,6 +1797,7 @@ mod tests {
                     prior_review_artifact:
                         ".fluent/work/artifacts/work-1/attempt-1/review/review.md".to_string(),
                     review_task_id: None,
+                    review_digest: None,
                 }],
                 state: crate::work_model::EvidenceRecoveryState::NeedsEvidence,
                 created_at: "2026-08-03T00:00:00Z".to_string(),

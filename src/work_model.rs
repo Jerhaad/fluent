@@ -4766,10 +4766,12 @@ impl Attempt {
         };
         let failed_candidate_gate_correction = self.is_failed_candidate_gate_correction();
         let pending_evidence_reviews = self.has_pending_evidence_review_tasks();
+        let pending_code_change_classification = self.has_pending_code_change_classification();
 
         if self.status != AttemptStatus::NeedsUser
             && !failed_candidate_gate_correction
             && !pending_evidence_reviews
+            && !pending_code_change_classification
         {
             return Err(ineligible(format!(
                 "Attempt is {} and is not paused at needs-user",
@@ -4780,6 +4782,9 @@ impl Attempt {
             task.status == TaskStatus::Executing
                 || (task.status == TaskStatus::Failed
                     && !failed_candidate_gate_correction
+                    && !(pending_code_change_classification
+                        && task.kind == TaskKind::Write
+                        && task.output.is_none())
                     && !self.is_superseded_tester_harness_followup(&task.id)
                     && !self.has_tester_harness_repair_for(&task.id)
                     && !self.is_approach_revision_superseded_task(&task.id))
@@ -4793,6 +4798,9 @@ impl Attempt {
             return Ok(());
         }
         if pending_evidence_reviews {
+            return Ok(());
+        }
+        if pending_code_change_classification {
             return Ok(());
         }
 
@@ -5153,6 +5161,59 @@ impl Attempt {
             && self.tasks.iter().all(|task| {
                 task.status != TaskStatus::Planned || target_task_ids.contains(task.id.as_str())
             })
+    }
+
+    /// Return whether this Attempt owns the planned corrective Writer created
+    /// by an accepted host-evidence source classification.
+    ///
+    /// This narrow model shape lets queue admission resume the Writer after the
+    /// classifier intentionally reopens the Attempt from `NeedsUser` to
+    /// `Planned`. Live candidate and artifact checks remain in the queue layer.
+    pub fn has_pending_code_change_classification(&self) -> bool {
+        if self.status != AttemptStatus::Planned
+            || self.pause_kind.is_some()
+            || self.pause_recovery.is_some()
+            || self.completed_at.is_some()
+        {
+            return false;
+        }
+        let Some(recovery) = self.evidence_recoveries.iter().rev().find(|recovery| {
+            recovery.state == EvidenceRecoveryState::CodeChange
+                && recovery.code_change_classification.is_some()
+        }) else {
+            return false;
+        };
+        let Some(classification) = recovery.code_change_classification.as_ref() else {
+            return false;
+        };
+        let Some(writer) = self.tasks.iter().find(|task| {
+            task.id == classification.writer_task_id
+                && task.kind == TaskKind::Write
+                && task.status == TaskStatus::Planned
+                && task.output.is_none()
+        }) else {
+            return false;
+        };
+        let Some(target) = recovery.targets.iter().find(|target| {
+            target.role == "tests"
+                && target.review_task_id.is_some()
+                && target.review_digest.is_some()
+                && self.tasks.iter().any(|task| {
+                    target.review_task_id.as_deref() == Some(task.id.as_str())
+                        && task.artifact_area.as_ref().is_some_and(|area| {
+                            format!("{}/review.md", area.path) == classification.review_artifact
+                        })
+                })
+        }) else {
+            return false;
+        };
+        writer.input_artifacts.iter().any(|input| {
+            input == &classification.audit_artifact
+                || (input.producer_id == target.review_task_id.as_deref().unwrap_or_default()
+                    && input.path == classification.review_artifact)
+        }) && writer.input_artifacts.iter().any(|input| {
+            input.producer_id == "host-evidence" && input.path == recovery.attachment.snapshot_path
+        })
     }
 
     /// Materialize the authoritative `## Required completion` section into the
@@ -6229,6 +6290,12 @@ pub struct EvidenceReviewTarget {
     pub prior_review_artifact: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_task_id: Option<String>,
+    /// Digest of the exact failed Review that paused this recovery.
+    ///
+    /// Older records omit this field; new evidence-needed pauses always save
+    /// it before accepting a later source-correction classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_digest: Option<String>,
 }
 
 /// Append-only, host-owned recovery record for an unchanged candidate.
@@ -10778,6 +10845,7 @@ random banner prose that must be ignored
                 prior_review_artifact: ".fluent/work/artifacts/work/attempt-1/tests/review.md"
                     .to_string(),
                 review_task_id: None,
+                review_digest: None,
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-03T17:59:47Z".to_string(),
@@ -10796,7 +10864,7 @@ random banner prose that must be ignored
     }
 
     #[test]
-    fn host_evidence_classification_is_idempotent() {
+    fn host_evidence_classification_matches_request() {
         let classification = HostEvidenceClassification {
             operation_id: "host-evidence-classification-abc".to_string(),
             review_artifact: "review.md".to_string(),
@@ -10825,6 +10893,259 @@ random banner prose that must be ignored
     }
 
     #[test]
+    fn host_evidence_classification_is_idempotent() {
+        use sha2::Digest;
+        use std::fs;
+        use std::process::Command;
+
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test User"]);
+        fs::write(root.join("seed.txt"), "seed\n").unwrap();
+        fs::write(root.join(".gitignore"), ".fluent/\n").unwrap();
+        run_git(&["add", "seed.txt", ".gitignore"]);
+        run_git(&["commit", "-qm", "seed"]);
+        let candidate = run_git(&["rev-parse", "HEAD"]);
+
+        let store = WorkModelStore::new(root);
+        let mut item = WorkItem::planned("work-1", "Recover host evidence");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: root.display().to_string(),
+            source_branch: "main".to_string(),
+            base_commit: None,
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+        let prior = item.attempts[0].tasks.last_mut().unwrap();
+        prior.status = TaskStatus::Complete;
+        let prior_path = format!("{}/review.md", prior.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(root.join(&prior_path).parent().unwrap()).unwrap();
+        fs::write(root.join(&prior_path), "Verdict: fail\n").unwrap();
+
+        let evidence_bytes = br#"{"schema_version":1,"producer":"trusted host","check":"cargo test exact","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
+        let evidence_digest = format!("sha256:{:x}", sha2::Sha256::digest(evidence_bytes));
+        let evidence_path = format!(
+            ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
+            &evidence_digest[7..]
+        );
+        fs::create_dir_all(root.join(&evidence_path).parent().unwrap()).unwrap();
+        fs::write(root.join(&evidence_path), evidence_bytes).unwrap();
+        let attachment = EvidenceAttachment {
+            snapshot_path: evidence_path.clone(),
+            digest: evidence_digest.clone(),
+        };
+
+        let recovery_id = "host-evidence-proof".to_string();
+        let mut targeted = prior.clone();
+        targeted.id = "attempt-1-evidence-proof-tests".to_string();
+        targeted.status = TaskStatus::Complete;
+        targeted.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", &targeted.id),
+        });
+        targeted.evidence_review_context = Some(EvidenceReviewContext {
+            recovery_id: recovery_id.clone(),
+            candidate_commit: candidate.clone(),
+            attachment: attachment.clone(),
+            prior_review_artifact: prior_path.clone(),
+        });
+        targeted.input_artifacts = vec![
+            ArtifactRef {
+                producer_id: "host-evidence".to_string(),
+                path: evidence_path.clone(),
+            },
+            ArtifactRef {
+                producer_id: prior.id.clone(),
+                path: prior_path.clone(),
+            },
+        ];
+        let targeted_path = format!(
+            "{}/review.md",
+            targeted.artifact_area.as_ref().unwrap().path
+        );
+        let targeted_content = "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host.\nAdditional-Proof: Attach proof.\n";
+        fs::create_dir_all(root.join(&targeted_path).parent().unwrap()).unwrap();
+        fs::write(root.join(&targeted_path), targeted_content).unwrap();
+        let review_digest = format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(targeted_content.as_bytes())
+        );
+        let recovery = EvidenceRecovery {
+            id: recovery_id,
+            candidate_commit: candidate.clone(),
+            attachment,
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: prior_path,
+                review_task_id: Some(targeted.id.clone()),
+                review_digest: Some(review_digest),
+            }],
+            state: EvidenceRecoveryState::NeedsEvidence,
+            created_at: now_iso8601(),
+            code_change_classification: None,
+        };
+        let attempt = &mut item.attempts[0];
+        attempt.tasks.push(targeted);
+        attempt.evidence_recoveries.push(recovery);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::Uncertain);
+        attempt.review_state = Some(AttemptReviewState::Failed);
+        attempt.completed_at = Some(now_iso8601());
+        store.create_work_item(&item).unwrap();
+
+        let first = crate::host_evidence::classify_for_code_change(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &targeted_path,
+            &evidence_digest,
+            "Correct the source.",
+        )
+        .unwrap();
+        let after_first = store.read_work_item("work-1").unwrap();
+        let second = crate::host_evidence::classify_for_code_change(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &targeted_path,
+            &evidence_digest,
+            "Correct the source.",
+        )
+        .unwrap();
+        let after_second = store.read_work_item("work-1").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(after_first, after_second);
+        assert_eq!(after_second.attempts[0].evidence_recoveries.len(), 1);
+        assert!(after_second.attempts[0].pause_kind.is_none());
+        assert!(after_second.attempts[0].pause_recovery.is_none());
+        assert!(after_second.attempts[0].completed_at.is_none());
+        assert_eq!(
+            after_second.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+
+        // A later review frontier may reuse the same immutable attachment.
+        // Replaying the first request must still resolve its own persisted
+        // classification instead of selecting the newer recovery.
+        let mut later_target = after_second.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == "attempt-1-evidence-proof-tests")
+            .cloned()
+            .unwrap();
+        let later_recovery_id = "host-evidence-proof-later".to_string();
+        later_target.id = "attempt-1-evidence-proof-later-tests".to_string();
+        later_target.status = TaskStatus::Complete;
+        later_target.completed_at = Some(now_iso8601());
+        later_target.artifact_area = Some(TaskArtifactArea {
+            path: work_artifact_path("work-1", "attempt-1", &later_target.id),
+        });
+        later_target.evidence_review_context = Some(EvidenceReviewContext {
+            recovery_id: later_recovery_id.clone(),
+            candidate_commit: candidate.clone(),
+            attachment: EvidenceAttachment {
+                snapshot_path: evidence_path.clone(),
+                digest: evidence_digest.clone(),
+            },
+            prior_review_artifact: after_second.attempts[0].evidence_recoveries[0].targets[0]
+                .prior_review_artifact
+                .clone(),
+        });
+        let later_path = format!(
+            "{}/review.md",
+            later_target.artifact_area.as_ref().unwrap().path
+        );
+        let later_content = "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host again.\nAdditional-Proof: Attach the second proof.\n";
+        fs::create_dir_all(root.join(&later_path).parent().unwrap()).unwrap();
+        fs::write(root.join(&later_path), later_content).unwrap();
+        let later_recovery = EvidenceRecovery {
+            id: later_recovery_id.clone(),
+            candidate_commit: candidate.clone(),
+            attachment: EvidenceAttachment {
+                snapshot_path: evidence_path.clone(),
+                digest: evidence_digest.clone(),
+            },
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: after_second.attempts[0].evidence_recoveries[0].targets[0]
+                    .prior_review_artifact
+                    .clone(),
+                review_task_id: Some(later_target.id.clone()),
+                review_digest: Some(format!(
+                    "sha256:{:x}",
+                    sha2::Sha256::digest(later_content.as_bytes())
+                )),
+            }],
+            state: EvidenceRecoveryState::NeedsEvidence,
+            created_at: now_iso8601(),
+            code_change_classification: None,
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.tasks.push(later_target);
+                attempt.evidence_recoveries.push(later_recovery);
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::Uncertain);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                attempt.completed_at = Some(now_iso8601());
+                Ok(())
+            })
+            .unwrap();
+        let replay_first = crate::host_evidence::classify_for_code_change(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &targeted_path,
+            &evidence_digest,
+            "Correct the source.",
+        )
+        .unwrap();
+        assert_eq!(replay_first, first);
+        let after_distinct_replay = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            after_distinct_replay.attempts[0].evidence_recoveries.len(),
+            2
+        );
+        assert!(
+            after_distinct_replay.attempts[0].evidence_recoveries[1]
+                .code_change_classification
+                .is_none()
+        );
+    }
+
+    #[test]
     fn completed_host_evidence_attachment_can_support_a_distinct_frontier() {
         let attachment = EvidenceAttachment {
             snapshot_path: ".fluent/work/artifacts/work/attempt-1/host-evidence/123.json"
@@ -10843,6 +11164,7 @@ random banner prose that must be ignored
                 role: "tests".to_string(),
                 prior_review_artifact: "first-review.md".to_string(),
                 review_task_id: Some("first-review".to_string()),
+                review_digest: None,
             }],
             state: EvidenceRecoveryState::Complete,
             created_at: "2026-08-23T10:00:00Z".to_string(),
@@ -10857,6 +11179,7 @@ random banner prose that must be ignored
                 role: "tests".to_string(),
                 prior_review_artifact: "failed-recheck-binding.json".to_string(),
                 review_task_id: None,
+                review_digest: None,
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-23T11:00:00Z".to_string(),
@@ -10886,6 +11209,7 @@ random banner prose that must be ignored
                 prior_review_artifact:
                     ".fluent/work/artifacts/work-1/attempt-1/host-evidence/binding.json".to_string(),
                 review_task_id: Some("attempt-1-evidence-proof-tests".to_string()),
+                review_digest: None,
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-22T20:00:00Z".to_string(),
@@ -17187,6 +17511,7 @@ random banner prose that must be ignored
                     ".fluent/work/artifacts/work-1/attempt-1/{id}/review.md"
                 ),
                 review_task_id: Some(format!("attempt-1-{id}-tests")),
+                review_digest: None,
             }],
             state,
             created_at: "2026-08-11T00:00:00Z".to_string(),

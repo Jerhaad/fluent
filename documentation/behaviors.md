@@ -450,6 +450,19 @@ THE SYSTEM SHALL pause the same Attempt for further host evidence without
 planning a Writer.
 Test: src/work_attempt_loop.rs (evidence_needed_review_pauses_without_writer_round)
 
+### B9a
+
+WHEN a complete candidate-bound host check failed but its evidence-targeted
+review did not name an actionable external condition, THE SYSTEM SHALL accept
+an explicit candidate, review, evidence-digest, and resolution authorization
+through `fluent attempt evidence classify`, record the decision, and schedule
+one corrective Writer on the same Attempt with the failed review and immutable
+host-evidence snapshot as inputs. A repeated exact request SHALL return the
+stored Writer and audit result; stale or different frontier inputs SHALL be
+rejected without mutation.
+Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
+Test: tests/binary.rs (host_evidence_classification_rejects_stale_inputs)
+
 ### B10
 
 WHEN an evidence-targeted reviewer fails with `Disposition: code-change`, THE

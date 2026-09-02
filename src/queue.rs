@@ -718,6 +718,11 @@ pub fn resume_with_tester_no_sandbox(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .is_some_and(crate::work_model::Attempt::has_pending_evidence_review_tasks);
+    let pending_code_change_classification = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .is_some_and(crate::work_model::Attempt::has_pending_code_change_classification);
     let reconciled_evidence_queue_admission =
         has_reconciled_interrupted_evidence_queue_admission(project_root, &item, attempt_id);
     let legacy_learner_tester_evidence =
@@ -762,6 +767,7 @@ pub fn resume_with_tester_no_sandbox(
         legacy_learner_tester_evidence,
         reconciled_candidate_ancestry_repair,
         reconciled_candidate_metadata_repair,
+        pending_code_change_classification,
     )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
@@ -784,6 +790,11 @@ pub fn resume_with_tester_no_sandbox(
                 && !(previous.status == DispatchStatus::Blocked && learner_retry)
                 && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
                 && !(previous.status == DispatchStatus::Blocked && pending_evidence_review)
+                && !(pending_code_change_classification
+                    && matches!(
+                        previous.status,
+                        DispatchStatus::Failed | DispatchStatus::Blocked
+                    ))
                 && !(legacy_learner_tester_evidence
                     && matches!(
                         previous.status,
@@ -1067,6 +1078,7 @@ fn ensure_resume_eligible(
     known_legacy_learner_tester_evidence: bool,
     known_candidate_ancestry_repair: bool,
     known_candidate_metadata_repair: bool,
+    known_code_change_classification: bool,
 ) -> Result<()> {
     item.ensure_not_abandoned()?;
     item.ensure_execution_ready()?;
@@ -1079,6 +1091,8 @@ fn ensure_resume_eligible(
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let candidate_metadata_repair = known_candidate_metadata_repair
         || crate::candidate_metadata_recovery::is_resume_ready(project_root, item, attempt_id)?;
+    let code_change_classification =
+        known_code_change_classification || attempt.has_pending_code_change_classification();
     let evidence_queue_reconciliation =
         has_reconciled_interrupted_evidence_queue_admission(project_root, item, attempt_id);
     if item
@@ -1087,6 +1101,7 @@ fn ensure_resume_eligible(
         .is_some_and(|current| current.id != attempt_id)
         && !candidate_ancestry_repair
         && !candidate_metadata_repair
+        && !code_change_classification
         && !evidence_queue_reconciliation
     {
         bail!(
@@ -1101,6 +1116,10 @@ fn ensure_resume_eligible(
         return Ok(());
     }
     if candidate_metadata_repair {
+        return Ok(());
+    }
+    if code_change_classification {
+        ensure_code_change_classification_resume_ready(project_root, item, attempt)?;
         return Ok(());
     }
     let legacy_learner_tester_evidence = known_legacy_learner_tester_evidence
@@ -1137,6 +1156,105 @@ fn ensure_resume_eligible(
                 attempt_id,
             )?;
         }
+    }
+    Ok(())
+}
+
+fn ensure_code_change_classification_resume_ready(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt: &crate::work_model::Attempt,
+) -> Result<()> {
+    let ineligible = |reason: &str| {
+        anyhow::anyhow!(
+            "Attempt {:?} host-evidence source correction is not resumable: {reason}",
+            attempt.id
+        )
+    };
+    if item.attempts.last().map(|current| current.id.as_str()) != Some(attempt.id.as_str()) {
+        return Err(ineligible("the classified Attempt is no longer current"));
+    }
+    let recovery = attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find(|recovery| {
+            recovery.state == crate::work_model::EvidenceRecoveryState::CodeChange
+                && recovery.code_change_classification.is_some()
+        })
+        .ok_or_else(|| ineligible("no classified recovery remains"))?;
+    let classification = recovery
+        .code_change_classification
+        .as_ref()
+        .expect("classified recovery checked above");
+    let (writer_index, writer) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| {
+            task.id == classification.writer_task_id
+                && task.kind == TaskKind::Write
+                && task.status == TaskStatus::Planned
+                && task.output.is_none()
+        })
+        .ok_or_else(|| ineligible("the classified Writer is not the planned continuation"))?;
+    if attempt.tasks.iter().enumerate().any(|(index, task)| {
+        task.status == TaskStatus::Executing
+            || (task.status == TaskStatus::NeedsUser)
+            || (task.status == TaskStatus::Failed
+                && (task.kind != TaskKind::Write || task.output.is_some()))
+            || (task.status == TaskStatus::Planned && index != writer_index)
+    }) {
+        return Err(ineligible(
+            "the Attempt contains another live or unresolved Task",
+        ));
+    }
+    if item.merge_candidates.iter().any(|candidate| {
+        candidate.attempt_id == attempt.id
+            && candidate.candidate_commit == recovery.candidate_commit
+    }) {
+        return Err(ineligible("a Merge Candidate already owns this candidate"));
+    }
+    let completed = attempt
+        .tasks
+        .iter()
+        .take(writer_index)
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| ineligible("the source candidate Writer is missing"))?;
+    if completed.commit != recovery.candidate_commit {
+        return Err(ineligible("the source candidate commit changed"));
+    }
+    let workspace = Path::new(&completed.workspace_path);
+    let workspace = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        project_root.join(workspace)
+    };
+    let head = crate::git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "inspect classified candidate",
+    )?;
+    if head != recovery.candidate_commit {
+        return Err(ineligible("the candidate workspace HEAD changed"));
+    }
+    let status = crate::git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect classified candidate cleanliness",
+    )?;
+    if !status.is_empty() {
+        return Err(ineligible("the candidate workspace is not clean"));
+    }
+    if !writer
+        .input_artifacts
+        .contains(&classification.audit_artifact)
+    {
+        return Err(ineligible(
+            "the planned Writer no longer names its audit artifact",
+        ));
     }
     Ok(())
 }
@@ -1250,6 +1368,7 @@ pub fn claim(
                 &item,
                 work_item_id,
                 persisted_attempt_id,
+                false,
                 false,
                 false,
                 false,
@@ -1542,6 +1661,7 @@ mod tests {
                 role: "tests".to_string(),
                 prior_review_artifact: prior_path,
                 review_task_id: Some(targeted.id),
+                review_digest: None,
             }],
             state: EvidenceRecoveryState::Reviewing,
             created_at: "2026-08-25T10:00:00Z".to_string(),

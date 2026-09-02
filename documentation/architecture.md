@@ -963,11 +963,31 @@ Fluent snapshots the rejected gate inside a content-addressed binding so a
 later gate run cannot erase the decision that authorized the host evidence.
 A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
-`Disposition: code-change`. The former waits for another attachment without a
-Writer round. The latter closes evidence recovery and follows the normal
-Writer, Tester, and reviewer path. Once every targeted role passes and the
-unchanged candidate's remaining exact-commit evidence passes, the Attempt
-continues to Learning without rerunning the Writer or Tester.
+`Disposition: code-change`. An `evidence-needed` result must also name exactly
+one `External-Condition` and one `Additional-Proof`; otherwise the review is a
+source-correction case. For a complete candidate-bound failure with no
+actionable host condition, an operator may authorize that correction on the
+paused Attempt with:
+
+```sh
+fluent attempt evidence classify <work-item> <attempt> \
+  --candidate <sha> \
+  --review-artifact .fluent/work/artifacts/.../review.md \
+  --evidence-digest <snapshot-digest> \
+  --resolution '<source-correction decision>'
+```
+
+The command requires the saved review digest and disposition, exact candidate
+and evidence snapshot, current clean worktree, and complete targeted Tests
+Review frontier. It appends an authorization audit and schedules one corrective
+Writer with the failed review, evidence snapshot, and audit artifact; the
+candidate and prior records remain unchanged. The next action is
+`fluent queue resume <work-item> --attempt <attempt>`. Repeating the exact
+review, evidence, and authorization request returns the persisted Writer and
+audit result without duplicates, while stale or different requests fail before
+mutation. A passing targeted review still requires all exact-commit evidence
+and Learning before landing. The ordinary `code-change` disposition closes
+evidence recovery and follows the normal Writer, Tester, and reviewer path.
 
 If that code-change disposition plans a corrective Writer and the operator
 interrupts it before it produces output, replacement evidence remains eligible

@@ -32,13 +32,13 @@ sibling directories may remain intentionally unreadable.
 This unchanged candidate is under host-evidence recovery. Assess only whether
 the immutable host evidence at {{evidence_snapshot_path}} resolves the decision
 recorded at {{evidence_prior_review_path}} for commit
-{{evidence_candidate_commit}}. If you fail, include exactly one line:
-`Disposition: evidence-needed` only when a concrete external host remediation
-could resolve it. That choice must also include exactly one
-`External-Condition: <host condition to correct>` line and one
+{{evidence_candidate_commit}}. On failure, emit exactly one
+`Disposition:` line. Use `Disposition: evidence-needed` only when a concrete
+external host remediation could resolve the failure, and emit exactly one
+`External-Condition: <host condition to correct>` line plus exactly one
 `Additional-Proof: <evidence to attach after correction>` line. When the exact
 command has already run against this exact candidate and no external
-remediation is named, use `Disposition: code-change`.
+remediation is named, emit exactly one `Disposition: code-change` line.
 {{/if}}
 
 ## Phase 1 — Understand the Work Item

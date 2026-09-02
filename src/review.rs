@@ -524,6 +524,21 @@ mod tests {
             extract_evidence_disposition("Verdict: fail\nDisposition: later\n"),
             None
         );
+
+        for malformed in [
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: \n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nExternal-Condition: Repair it again.\nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\nAdditional-Proof: Attach more proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nAdditional-Proof: Attach proof.\n",
+        ] {
+            assert_eq!(
+                extract_evidence_disposition(malformed),
+                Some(EvidenceDisposition::CodeChange),
+                "malformed actionable reason must not authorize evidence-needed"
+            );
+        }
     }
 
     #[test]

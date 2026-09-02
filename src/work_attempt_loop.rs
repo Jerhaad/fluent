@@ -8032,22 +8032,37 @@ fn interpret_reviews(
                     .as_ref()
                     .map(|area| project_root.join(&area.path).join("review.md"))
                     .unwrap();
-                let content = fs::read_to_string(path).unwrap_or_default();
+                let content = fs::read_to_string(&path).unwrap_or_default();
+                let review_digest = format!("sha256:{:x}", Sha256::digest(content.as_bytes()));
                 let disposition = review::extract_evidence_disposition(&content);
                 match disposition {
                     Some(review::EvidenceDisposition::EvidenceNeeded) => {
-                        item.attempts[attempt_index]
-                            .evidence_recoveries
-                            .iter_mut()
-                            .find(|entry| entry.id == recovery.id)
-                            .unwrap()
-                            .state = EvidenceRecoveryState::NeedsEvidence;
+                        let review_path = path
+                            .strip_prefix(project_root)
+                            .ok()
+                            .and_then(|path| path.to_str())
+                            .unwrap_or_default();
+                        let handoff_path = {
+                            let recovery = item.attempts[attempt_index]
+                                .evidence_recoveries
+                                .iter_mut()
+                                .find(|entry| entry.id == recovery.id)
+                                .unwrap();
+                            recovery.state = EvidenceRecoveryState::NeedsEvidence;
+                            if let Some(target) = recovery.targets.iter_mut().find(|target| {
+                                target.review_task_id.as_deref() == Some(task.id.as_str())
+                                    || target.prior_review_artifact == review_path
+                            }) {
+                                target.review_digest = Some(review_digest);
+                            }
+                            recovery.attachment.snapshot_path.clone()
+                        };
                         item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
                         item.attempts[attempt_index].pause_kind = Some(PauseKind::Uncertain);
+                        item.attempts[attempt_index].review_state =
+                            Some(AttemptReviewState::Failed);
                         write_attempt_work_item(store, &item)?;
-                        return Ok(WorkAttemptRunOutcome::NeedsUser {
-                            handoff_path: recovery.attachment.snapshot_path,
-                        });
+                        return Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path });
                     }
                     Some(review::EvidenceDisposition::CodeChange) => {
                         item.attempts[attempt_index]
@@ -12237,6 +12252,7 @@ mod tests {
                                 ".fluent/work/artifacts/work-1/attempt-1/prior-tests/review.md"
                                     .to_string(),
                             review_task_id: Some("attempt-1-prior-evidence-tests".to_string()),
+                            review_digest: None,
                         }],
                         state: EvidenceRecoveryState::Complete,
                         created_at: "2026-08-23T11:00:00Z".to_string(),
@@ -14173,6 +14189,7 @@ mod tests {
                             role: "behaviors".to_string(),
                             prior_review_artifact: prior_review_artifact.clone(),
                             review_task_id: Some(task_id.to_string()),
+                            review_digest: None,
                         }],
                         state: EvidenceRecoveryState::Reviewing,
                         created_at: "2026-08-03T00:00:00Z".to_string(),
@@ -14411,6 +14428,7 @@ mod tests {
                             role: "tests".to_string(),
                             prior_review_artifact: prior_path.clone(),
                             review_task_id: Some(targeted_id.to_string()),
+                            review_digest: None,
                         }],
                         state: EvidenceRecoveryState::Complete,
                         created_at: "2026-08-24T01:00:00Z".to_string(),
@@ -15243,6 +15261,7 @@ mod tests {
                             role: "tests".to_string(),
                             prior_review_artifact: prior_review_artifact.clone(),
                             review_task_id: Some(targeted_id.to_string()),
+                            review_digest: None,
                         }],
                         state: EvidenceRecoveryState::Reviewing,
                         created_at: "2026-08-03T00:00:00Z".to_string(),
