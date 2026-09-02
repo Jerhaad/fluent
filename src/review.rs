@@ -306,27 +306,52 @@ pub struct EvidenceNeededReason {
     pub additional_proof: String,
 }
 
+fn labeled_values(content: &str, label: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            let (actual, value) = line.split_once(':')?;
+            actual
+                .trim()
+                .eq_ignore_ascii_case(label)
+                .then(|| value.trim().to_string())
+        })
+        .collect()
+}
+
 fn extract_evidence_needed_reason(content: &str) -> Option<EvidenceNeededReason> {
-    let value = |label: &str| {
-        let values = content
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                let line = line.strip_prefix("- ").unwrap_or(line);
-                let (actual, value) = line.split_once(':')?;
-                actual
-                    .trim()
-                    .eq_ignore_ascii_case(label)
-                    .then(|| value.trim())
-            })
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>();
-        (values.len() == 1).then(|| values[0].to_string())
+    let external_conditions = labeled_values(content, "External-Condition");
+    let additional_proof = labeled_values(content, "Additional-Proof");
+    let [external_condition] = external_conditions.as_slice() else {
+        return None;
     };
+    let [additional_proof] = additional_proof.as_slice() else {
+        return None;
+    };
+    if external_condition.is_empty() || additional_proof.is_empty() {
+        return None;
+    }
     Some(EvidenceNeededReason {
-        external_condition: value("External-Condition")?,
-        additional_proof: value("Additional-Proof")?,
+        external_condition: external_condition.clone(),
+        additional_proof: additional_proof.clone(),
     })
+}
+
+/// Return whether a failed review contains the legacy, unqualified
+/// `Disposition: evidence-needed` marker. New reviews must include actionable
+/// reason fields; this narrow marker exists only to migrate an already-paused
+/// pre-contract recovery without treating malformed new output as authority.
+pub fn has_unqualified_evidence_needed_disposition(content: &str) -> bool {
+    if extract_verdict(content) != Verdict::Fail {
+        return false;
+    }
+    let dispositions = labeled_values(content, "Disposition");
+    dispositions.len() == 1
+        && dispositions[0].eq_ignore_ascii_case("evidence-needed")
+        && labeled_values(content, "External-Condition").is_empty()
+        && labeled_values(content, "Additional-Proof").is_empty()
 }
 
 /// Read the fail-only disposition from an evidence-targeted review. A pass must
@@ -337,20 +362,18 @@ pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition
     if extract_verdict(content) != Verdict::Fail {
         return None;
     }
-    content.lines().find_map(|line| {
-        let (label, value) = line.split_once(':')?;
-        if !label.trim().eq_ignore_ascii_case("disposition") {
-            return None;
+    let dispositions = labeled_values(content, "Disposition");
+    let [value] = dispositions.as_slice() else {
+        return None;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "evidence-needed" if extract_evidence_needed_reason(content).is_some() => {
+            Some(EvidenceDisposition::EvidenceNeeded)
         }
-        match value.trim().to_ascii_lowercase().as_str() {
-            "evidence-needed" if extract_evidence_needed_reason(content).is_some() => {
-                Some(EvidenceDisposition::EvidenceNeeded)
-            }
-            "evidence-needed" => Some(EvidenceDisposition::CodeChange),
-            "code-change" => Some(EvidenceDisposition::CodeChange),
-            _ => None,
-        }
-    })
+        "evidence-needed" => Some(EvidenceDisposition::CodeChange),
+        "code-change" => Some(EvidenceDisposition::CodeChange),
+        _ => None,
+    }
 }
 
 /// One focused command requested by a failed Tests Reviewer.
@@ -539,6 +562,27 @@ mod tests {
                 "malformed actionable reason must not authorize evidence-needed"
             );
         }
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\nExternal-Condition: Restore the host.\nAdditional-Proof: Attach proof.\n"
+            ),
+            None,
+            "contradictory disposition lines must be rejected"
+        );
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: code-change\nDisposition: code-change\n"
+            ),
+            None,
+            "duplicate disposition lines must be rejected"
+        );
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host.\nExternal-Condition: \nAdditional-Proof: Attach proof.\n"
+            ),
+            Some(EvidenceDisposition::CodeChange),
+            "an empty duplicate reason must not authorize evidence-needed"
+        );
     }
 
     #[test]

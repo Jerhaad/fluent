@@ -302,13 +302,33 @@ pub fn classify_for_code_change(
             reason: format!("cannot read bound review artifact: {error}"),
         })?;
         let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
-        if target.review_digest.as_deref() != Some(review_digest.as_str()) {
-            return Err(rejected_for("saved review digest or evidence-needed disposition changed"));
-        }
         let review_text = std::str::from_utf8(&review_bytes).map_err(|_| rejected())?;
-        if review::extract_verdict(review_text) != Verdict::Fail
-            || review::extract_evidence_disposition(review_text)
-                != Some(review::EvidenceDisposition::EvidenceNeeded)
+        let disposition = review::extract_evidence_disposition(review_text);
+        let legacy_review = target.review_digest.is_none();
+        let review_matches_saved_digest = target
+            .review_digest
+            .as_deref()
+            .is_some_and(|saved| saved == review_digest);
+        let repeats_stored_classification = recovery
+            .code_change_classification
+            .as_ref()
+            .is_some_and(|classification| {
+                classification.matches_request(
+                    review_artifact,
+                    &review_digest,
+                    authorization,
+                    &authorization_digest,
+                )
+            });
+        let legacy_review_is_evidence_needed = legacy_review
+            && (disposition == Some(review::EvidenceDisposition::EvidenceNeeded)
+                || review::has_unqualified_evidence_needed_disposition(review_text));
+        if (!legacy_review && !review_matches_saved_digest)
+            || (legacy_review && !legacy_review_is_evidence_needed)
+            || review::extract_verdict(review_text) != Verdict::Fail
+            || (!legacy_review
+                && disposition != Some(review::EvidenceDisposition::EvidenceNeeded)
+                && !repeats_stored_classification)
         {
             return Err(rejected_for("bound review no longer requests evidence-needed"));
         }
@@ -419,6 +439,11 @@ pub fn classify_for_code_change(
             let attempt = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id).expect("validated Attempt remains present");
             let recovery = attempt.evidence_recoveries.iter_mut().find(|recovery| recovery.id == recovery_id).expect("validated recovery remains present");
             recovery.state = EvidenceRecoveryState::CodeChange;
+            if let Some(target) = recovery.targets.iter_mut().find(|target| {
+                target.review_task_id.as_deref() == Some(review_task_id.as_str())
+            }) {
+                target.review_digest = Some(review_digest.clone());
+            }
             recovery.code_change_classification = Some(HostEvidenceClassification {
                 operation_id, review_artifact: review_artifact.to_string(), review_digest, authorization: authorization.to_string(), authorization_digest,
                 audit_artifact: audit_artifact.clone(), writer_task_id: writer_task_id.clone(), classified_at: work_model::now_iso8601(),
@@ -439,6 +464,390 @@ pub fn classify_for_code_change(
         Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path })
         },
     ).map_err(Into::into)
+}
+
+fn code_change_writer_rejection(attempt_id: &str, reason: impl Into<String>) -> WorkModelError {
+    WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt_id.to_string(),
+        reason: reason.into(),
+    }
+}
+
+/// Revalidate a classified source-correction Writer immediately before it is
+/// reserved for execution.
+///
+/// Queue admission and direct Task execution both call this boundary. It
+/// rechecks the candidate worktree and every immutable input named by the
+/// classification, so a host-side replacement or a changed candidate cannot
+/// reach a coder after the classification was accepted. Ordinary Writers do
+/// not carry a matching classification and pass through unchanged.
+pub(crate) fn validate_code_change_writer_start(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+) -> std::result::Result<(), WorkModelError> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| code_change_writer_rejection(attempt_id, "Attempt is not present"))?;
+    let (writer_index, writer) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| task.id == task_id && task.kind == TaskKind::Write)
+        .ok_or_else(|| code_change_writer_rejection(attempt_id, "classified Writer is missing"))?;
+
+    let classified = attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find_map(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .filter(|classification| classification.writer_task_id == task_id)
+                .map(|classification| (recovery, classification))
+        });
+    let pending_classification_for_other_writer = attempt
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find_map(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .filter(|classification| {
+                    classification.writer_task_id != task_id
+                        && attempt.tasks.iter().any(|task| {
+                            task.id == classification.writer_task_id
+                                && task.kind == TaskKind::Write
+                                && task.status == TaskStatus::Planned
+                                && task.output.is_none()
+                        })
+                })
+        });
+    let Some((recovery, classification)) = classified else {
+        if pending_classification_for_other_writer.is_some() {
+            return Err(code_change_writer_rejection(
+                attempt_id,
+                "another classified Writer owns the planned continuation",
+            ));
+        }
+        // The shared reservation boundary also serves ordinary Writers. Only
+        // the Writer explicitly owned by a classification needs these checks.
+        return Ok(());
+    };
+
+    let rejected = |reason: &str| code_change_writer_rejection(attempt_id, reason);
+    if item.attempts.last().map(|current| current.id.as_str()) != Some(attempt_id)
+        || attempt.status != work_model::AttemptStatus::Planned
+        || attempt.review_state != Some(work_model::AttemptReviewState::Failed)
+        || attempt.pause_kind.is_some()
+        || attempt.pause_recovery.is_some()
+        || attempt.completed_at.is_some()
+    {
+        return Err(rejected(
+            "classified source-correction Attempt is not the current planned frontier",
+        ));
+    }
+    if recovery.state != EvidenceRecoveryState::CodeChange
+        || writer.status != TaskStatus::Planned
+        || writer.output.is_some()
+        || writer.role != "author"
+        || writer.work_item_id != item.id
+        || writer.attempt_id.as_deref() != Some(attempt_id)
+        || writer_index + 1 != attempt.tasks.len()
+    {
+        return Err(rejected(
+            "classified Writer is not the final planned continuation",
+        ));
+    }
+    if attempt.tasks.iter().enumerate().any(|(index, task)| {
+        index != writer_index
+            && (task.status == TaskStatus::Executing
+                || task.status == TaskStatus::NeedsUser
+                || (task.status == TaskStatus::Failed
+                    && (task.kind != TaskKind::Write || task.output.is_some()))
+                || task.status == TaskStatus::Planned)
+    }) {
+        return Err(rejected("Attempt contains another live or unresolved Task"));
+    }
+    if item.merge_candidates.iter().any(|candidate| {
+        candidate.attempt_id == attempt_id
+            && candidate.candidate_commit == recovery.candidate_commit
+    }) {
+        return Err(rejected("a Merge Candidate already owns this candidate"));
+    }
+
+    let source_output = attempt
+        .tasks
+        .iter()
+        .take(writer_index)
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .ok_or_else(|| rejected("the source candidate Writer is missing"))?;
+    if source_output.commit != recovery.candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, source_output, &recovery.candidate_commit)
+    {
+        return Err(rejected(
+            "the candidate workspace no longer matches the classified commit",
+        ));
+    }
+    if writer.workspace_access.writes.len() != 1
+        || writer.workspace_access.writes[0].id != source_output.workspace_id
+        || writer.workspace_access.writes[0].path != source_output.workspace_path
+    {
+        return Err(rejected(
+            "the corrective Writer workspace is not candidate-bound",
+        ));
+    }
+
+    let matching_targets = recovery
+        .targets
+        .iter()
+        .filter(|target| {
+            target.role == "tests"
+                && target
+                    .review_task_id
+                    .as_ref()
+                    .is_some_and(|review_task_id| {
+                        attempt.tasks.iter().any(|task| {
+                            task.id == *review_task_id
+                                && task.kind == TaskKind::Review
+                                && task.role == "tests"
+                                && review_artifact_path(task).as_deref()
+                                    == Some(classification.review_artifact.as_str())
+                        })
+                    })
+        })
+        .collect::<Vec<_>>();
+    if matching_targets.len() != 1 {
+        return Err(rejected(
+            "classified recovery has an ambiguous Tests Review target",
+        ));
+    }
+    let target = matching_targets[0];
+    let review_task_id = target
+        .review_task_id
+        .as_deref()
+        .ok_or_else(|| rejected("classified recovery target has no review Task identity"))?;
+    if target.review_digest.as_deref() != Some(classification.review_digest.as_str()) {
+        return Err(rejected("saved review digest changed"));
+    }
+    let review_task = attempt
+        .tasks
+        .iter()
+        .find(|task| {
+            task.id == review_task_id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && task.work_item_id == item.id
+                && task.attempt_id.as_deref() == Some(attempt_id)
+                && review_artifact_path(task).as_deref()
+                    == Some(classification.review_artifact.as_str())
+                && task.review_context.as_ref().is_some_and(|context| {
+                    context.candidate_commit == recovery.candidate_commit
+                        && context.candidate_workspace_id == source_output.workspace_id
+                        && context.candidate_workspace_path == source_output.workspace_path
+                })
+                && task
+                    .evidence_review_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.recovery_id == recovery.id
+                            && context.candidate_commit == recovery.candidate_commit
+                            && context.attachment == recovery.attachment
+                            && context.prior_review_artifact == target.prior_review_artifact
+                    })
+        })
+        .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
+    let evidence_ref = ArtifactRef {
+        producer_id: "host-evidence".to_string(),
+        path: recovery.attachment.snapshot_path.clone(),
+    };
+    if review_task
+        .input_artifacts
+        .iter()
+        .filter(|input| *input == &evidence_ref)
+        .count()
+        != 1
+        || review_task
+            .input_artifacts
+            .iter()
+            .any(|input| input.path == evidence_ref.path && input != &evidence_ref)
+    {
+        return Err(rejected("bound Tests Review Task lost its evidence input"));
+    }
+
+    let review_path = validate_managed_file_path(project_root, &classification.review_artifact)
+        .map_err(|error| {
+            code_change_writer_rejection(
+                attempt_id,
+                format!("review artifact is not a managed regular file: {error}"),
+            )
+        })?;
+    let review_bytes = fs::read(&review_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read bound review artifact: {error}"),
+        )
+    })?;
+    let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
+    if review_digest != classification.review_digest {
+        return Err(rejected("bound review bytes changed"));
+    }
+    let review_text = std::str::from_utf8(&review_bytes)
+        .map_err(|_| rejected("bound review artifact is not valid UTF-8"))?;
+    let disposition = review::extract_evidence_disposition(review_text);
+    let legacy_disposition = review::has_unqualified_evidence_needed_disposition(review_text);
+    if review::extract_verdict(review_text) != Verdict::Fail
+        || (disposition != Some(review::EvidenceDisposition::EvidenceNeeded) && !legacy_disposition)
+    {
+        return Err(rejected("bound review no longer requests evidence-needed"));
+    }
+
+    let expected_snapshot = snapshot_path(&item.id, attempt_id, &recovery.attachment.digest)
+        .map_err(|error| code_change_writer_rejection(attempt_id, error.to_string()))?;
+    if recovery.attachment.snapshot_path != expected_snapshot
+        || !recovery.attachment.digest.starts_with("sha256:")
+    {
+        return Err(rejected("evidence snapshot binding changed"));
+    }
+    let evidence_path =
+        validate_managed_file_path(project_root, &recovery.attachment.snapshot_path).map_err(
+            |error| {
+                code_change_writer_rejection(
+                    attempt_id,
+                    format!("evidence snapshot is not a managed regular file: {error}"),
+                )
+            },
+        )?;
+    let evidence_bytes = fs::read(&evidence_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read bound evidence snapshot: {error}"),
+        )
+    })?;
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
+        || parse_document(&evidence_bytes).is_err()
+    {
+        return Err(rejected("evidence snapshot bytes changed"));
+    }
+
+    let authorization_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(classification.authorization.as_bytes())
+    );
+    if authorization_digest != classification.authorization_digest {
+        return Err(rejected("classification authorization digest changed"));
+    }
+    let operation_material = format!(
+        "{attempt_id}\0{}\0{}\0{}\0{}\0{}\0{}",
+        recovery.candidate_commit,
+        recovery.id,
+        classification.review_artifact,
+        classification.review_digest,
+        recovery.attachment.digest,
+        classification.authorization_digest,
+    );
+    let expected_operation_id = format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(operation_material.as_bytes())
+    );
+    if classification.operation_id != expected_operation_id {
+        return Err(rejected("classification operation identity changed"));
+    }
+    let expected_writer_task_id = format!(
+        "{attempt_id}-write-{}",
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count()
+    );
+    if classification.writer_task_id != expected_writer_task_id {
+        return Err(rejected("classification Writer identity changed"));
+    }
+    let expected_audit_artifact = ArtifactRef {
+        producer_id: classification.operation_id.clone(),
+        path: work_artifact_path(
+            &item.id,
+            attempt_id,
+            &format!("{}/classification.json", classification.operation_id),
+        ),
+    };
+    if classification.audit_artifact != expected_audit_artifact
+        || attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| *artifact == &classification.audit_artifact)
+            .count()
+            != 1
+    {
+        return Err(rejected("classification audit binding changed"));
+    }
+    let audit_path = validate_managed_file_path(project_root, &classification.audit_artifact.path)
+        .map_err(|error| {
+            code_change_writer_rejection(
+                attempt_id,
+                format!("classification audit is not a managed regular file: {error}"),
+            )
+        })?;
+    let audit_bytes = fs::read(&audit_path).map_err(|error| {
+        code_change_writer_rejection(
+            attempt_id,
+            format!("cannot read classification audit: {error}"),
+        )
+    })?;
+    let expected_audit = CodeChangeClassificationAudit {
+        schema_version: 1,
+        operation_id: &classification.operation_id,
+        work_item_id: &item.id,
+        attempt_id,
+        candidate_commit: &recovery.candidate_commit,
+        recovery_id: &recovery.id,
+        evidence: &recovery.attachment,
+        review_artifact: &classification.review_artifact,
+        review_digest: &classification.review_digest,
+        authorization: &classification.authorization,
+        authorization_digest: &classification.authorization_digest,
+        writer_task_id: &classification.writer_task_id,
+    };
+    let expected_audit_bytes = serde_json::to_vec_pretty(&expected_audit)
+        .map_err(|error| code_change_writer_rejection(attempt_id, error.to_string()))?;
+    if audit_bytes != expected_audit_bytes {
+        return Err(rejected("classification audit bytes changed"));
+    }
+
+    let expected_review_input = ArtifactRef {
+        producer_id: review_task.id.clone(),
+        path: classification.review_artifact.clone(),
+    };
+    let expected_refs = [
+        expected_review_input,
+        evidence_ref,
+        classification.audit_artifact.clone(),
+    ];
+    for expected in expected_refs {
+        if writer
+            .input_artifacts
+            .iter()
+            .filter(|input| *input == &expected)
+            .count()
+            != 1
+            || writer
+                .input_artifacts
+                .iter()
+                .any(|input| input.path == expected.path && input != &expected)
+        {
+            return Err(rejected("corrective Writer input binding changed"));
+        }
+    }
+    Ok(())
 }
 
 /// Validate a caller-supplied managed artifact path without opening it.

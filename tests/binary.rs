@@ -25058,6 +25058,7 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, prior_review_path, targeted_path, digest, snapshot_path) =
         setup_paused_code_change_classification_fixture(&tmp, "evidence-classify");
+    let resolution = "The failed candidate-bound check needs a source correction.";
     let before = work_item_value(&project, "evidence-classify");
     let target_task_id = before["attempts"][0]["tasks"]
         .as_array()
@@ -25086,7 +25087,7 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
             "--evidence-digest",
             &digest,
             "--resolution",
-            "The failed candidate-bound check needs a source correction.",
+            resolution,
         ])
         .output()
         .unwrap();
@@ -25103,6 +25104,11 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     assert_eq!(attempt["evidence_recoveries"][0]["state"], "code-change");
     let classification = &attempt["evidence_recoveries"][0]["code_change_classification"];
     assert_eq!(classification["review_artifact"], targeted_path);
+    assert_eq!(classification["authorization"], resolution);
+    assert_eq!(
+        classification["authorization_digest"],
+        format!("sha256:{:x}", sha2::Sha256::digest(resolution.as_bytes()))
+    );
     assert_eq!(
         classification["review_digest"].as_str().unwrap(),
         format!(
@@ -25122,6 +25128,11 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     assert_eq!(audit["evidence"]["digest"], digest);
     assert_eq!(audit["review_artifact"], targeted_path);
     assert_eq!(audit["review_digest"], classification["review_digest"]);
+    assert_eq!(audit["authorization"], resolution);
+    assert_eq!(
+        audit["authorization_digest"],
+        classification["authorization_digest"]
+    );
     let writer = attempt["tasks"].as_array().unwrap().last().unwrap();
     assert_eq!(writer["kind"], "write");
     let inputs = writer["input_artifacts"].as_array().unwrap();
@@ -25219,6 +25230,238 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     );
     assert_eq!(git_head(&project), candidate);
     assert!(prior_review_path.starts_with(".fluent/work/artifacts/"));
+}
+
+#[test]
+fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
+    for stale in ["candidate", "evidence", "review", "audit"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-queue");
+        let resolution = "The failed candidate-bound check needs a source correction.";
+        let classified = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "classify",
+                "evidence-classify-queue",
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--review-artifact",
+                &targeted_path,
+                "--evidence-digest",
+                &digest,
+                "--resolution",
+                resolution,
+            ])
+            .output()
+            .unwrap();
+        assert!(classified.status.success());
+        let classified_value = work_item_value(&project, "evidence-classify-queue");
+        let audit_path =
+            classified_value["attempts"][0]["evidence_recoveries"][0]["code_change_classification"]
+                ["audit_artifact"]["path"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        let queue_path = project.join(".fluent/work/queue/evidence-classify-queue.json");
+        let queue_before = fs::read(&queue_path).ok();
+        match stale {
+            "candidate" => git::run(
+                &project,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "Advance candidate frontier",
+                ],
+                "advance candidate frontier",
+            )
+            .unwrap(),
+            "evidence" => fs::remove_file(project.join(&snapshot_path)).unwrap(),
+            "review" => fs::write(
+                project.join(&targeted_path),
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Changed after classification.\nAdditional-Proof: Re-run the check.\n",
+            )
+            .unwrap(),
+            "audit" => {
+                let mut bytes = fs::read(project.join(&audit_path)).unwrap();
+                bytes.extend_from_slice(b"tampered\n");
+                fs::write(project.join(&audit_path), bytes).unwrap();
+            }
+            _ => unreachable!("stale cases are exhaustive"),
+        }
+        let before = persisted_work_snapshot(&project, "evidence-classify-queue");
+        let output = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "queue",
+                "resume",
+                "evidence-classify-queue",
+                "--attempt",
+                "attempt-1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "stale {stale} continuation unexpectedly queued: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-queue"),
+            before,
+            "stale {stale} queue resume changed persisted state"
+        );
+        assert_eq!(
+            fs::read(&queue_path).ok(),
+            queue_before,
+            "stale {stale} queue resume appended a dispatch"
+        );
+    }
+}
+
+#[test]
+fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, prior_review_path, evidence) =
+        setup_failed_evidence_recovery_fixture(&tmp, "evidence-classify-legacy");
+    let resolution = "The legacy failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-classify-legacy",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &prior_review_path,
+        ])
+        .assert()
+        .success();
+
+    let store = fluent::work_model::WorkModelStore::new(&project);
+    let targeted_path = store
+        .mutate_work_item("evidence-classify-legacy", |item| {
+            let targeted = item.attempts[0].tasks.last_mut().unwrap();
+            targeted.status = fluent::work_model::TaskStatus::Complete;
+            targeted.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(format!(
+                "{}/review.md",
+                targeted.artifact_area.as_ref().unwrap().path
+            ))
+        })
+        .unwrap();
+    fs::create_dir_all(project.join(&targeted_path).parent().unwrap()).unwrap();
+    fs::write(
+        project.join(&targeted_path),
+        "Verdict: fail\nDisposition: evidence-needed\n",
+    )
+    .unwrap();
+    let evidence_digest =
+        work_item_value(&project, "evidence-classify-legacy")["attempts"][0]["evidence_recoveries"]
+            [0]["attachment"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    store
+        .mutate_work_item("evidence-classify-legacy", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.evidence_recoveries[0].state =
+                fluent::work_model::EvidenceRecoveryState::NeedsEvidence;
+            attempt.evidence_recoveries[0].targets[0].review_digest = None;
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::Uncertain);
+            attempt.review_state = Some(fluent::work_model::AttemptReviewState::Failed);
+            attempt.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
+        .unwrap();
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-legacy",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &evidence_digest,
+            "--resolution",
+            resolution,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "legacy classification failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = work_item_value(&project, "evidence-classify-legacy");
+    assert_eq!(shown["attempts"][0]["status"], "planned");
+    assert_eq!(
+        shown["attempts"][0]["evidence_recoveries"][0]["state"],
+        "code-change"
+    );
+    assert_eq!(
+        shown["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_digest"],
+        format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(fs::read(project.join(&targeted_path)).unwrap())
+        )
+    );
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-legacy",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &evidence_digest,
+            "--resolution",
+            resolution,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "legacy classification replay failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "queue",
+            "resume",
+            "evidence-classify-legacy",
+            "--attempt",
+            "attempt-1",
+        ])
+        .assert()
+        .success();
 }
 
 #[test]

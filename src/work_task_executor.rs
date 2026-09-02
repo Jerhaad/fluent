@@ -336,6 +336,7 @@ fn plan_task_start(
 /// [`with_reservation_rollback`] guard, which reverts this reservation via an
 /// exact expected-state CAS.
 fn reserve_task_start(
+    project_root: &Path,
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
@@ -358,6 +359,14 @@ fn reserve_task_start(
             .ok_or_else(|| crate::work_model::WorkModelError::TaskNotFound {
                 id: task_id.to_string(),
             })?;
+        if expected_kind == TaskKind::Write {
+            crate::host_evidence::validate_code_change_writer_start(
+                project_root,
+                item,
+                attempt_id,
+                task_id,
+            )?;
+        }
         let attempt = &item.attempts[attempt_index];
         if attempt.tasks[task_index].kind != expected_kind {
             return Err(crate::work_model::WorkModelError::TaskNotFound {
@@ -814,6 +823,7 @@ fn run_write_task_with_coder(
     // StartRejected error and nothing mutated. The fresh coder mapping and the
     // rollback receipt come from the reservation.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -1402,6 +1412,7 @@ fn run_review_task_with_coder(
     // that took the Attempt terminal rejects the reservation here, leaving prior
     // review.md evidence untouched.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -2016,6 +2027,7 @@ fn run_tester_task_with_settlement_preparer(
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here.
     let reservation = reserve_task_start(
+        config.project_root,
         config.store,
         config.work_item_id,
         config.attempt_id,
@@ -15708,6 +15720,7 @@ mod tests {
             let starter = scope.spawn(move || {
                 starter_barrier.wait();
                 reserve_task_start(
+                    project_root,
                     store_ref,
                     "work-1",
                     "attempt-1",
@@ -15751,6 +15764,7 @@ mod tests {
         store.create_work_item(&item).unwrap();
 
         let reservation = reserve_task_start(
+            tmp.path(),
             &store,
             "work-1",
             "attempt-1",

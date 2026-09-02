@@ -273,10 +273,10 @@ settled review artifacts for the current candidate.
 
 ### Recover a host-evidence finding
 
-Use this only when the candidate does not need a source change and either a
-failed review asks for proof that a trusted host can run or the final candidate
-gate asks for one command-shaped `Test:` reference that canonical Tester did
-not run. Create one JSON file on that host, for example:
+For host-only attachment, use this when the candidate does not need a source
+change and either a failed review asks for proof that a trusted host can run or
+the final candidate gate asks for one command-shaped `Test:` reference that
+canonical Tester did not run. Create one JSON file on that host, for example:
 
 ```json
 {"schema_version":1,"producer":"release-host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"...captured output..."}
@@ -338,8 +338,9 @@ fluent attempt evidence classify <work-item-id> <attempt-id> \
 
 Use the failed targeted Tests Review path and evidence digest shown by
 `fluent work-item show`. Fluent accepts this command only for the saved,
-complete `evidence-needed` review, unchanged candidate, clean worktree, and
-matching Attempt frontier. It records the authorization and audit artifact,
+complete `evidence-needed` review (or a legacy paused review containing the
+unqualified marker), unchanged candidate, clean worktree, and matching Attempt
+frontier. It records the authorization and audit artifact,
 then schedules one corrective Writer with the failed review, immutable evidence
 snapshot, and audit input; resume it with `fluent queue resume <work-item-id>
 --attempt <attempt-id>`. Repeating the exact command returns the same Writer

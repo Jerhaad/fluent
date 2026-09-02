@@ -5186,7 +5186,7 @@ impl Attempt {
         let Some(classification) = recovery.code_change_classification.as_ref() else {
             return false;
         };
-        let Some(writer) = self.tasks.iter().find(|task| {
+        let Some((writer_index, writer)) = self.tasks.iter().enumerate().find(|(_, task)| {
             task.id == classification.writer_task_id
                 && task.kind == TaskKind::Write
                 && task.status == TaskStatus::Planned
@@ -5194,26 +5194,58 @@ impl Attempt {
         }) else {
             return false;
         };
+        if writer_index + 1 != self.tasks.len() {
+            return false;
+        }
         let Some(target) = recovery.targets.iter().find(|target| {
             target.role == "tests"
                 && target.review_task_id.is_some()
-                && target.review_digest.is_some()
+                && target.review_digest.as_deref() == Some(classification.review_digest.as_str())
                 && self.tasks.iter().any(|task| {
                     target.review_task_id.as_deref() == Some(task.id.as_str())
+                        && task.kind == TaskKind::Review
+                        && task.role == "tests"
+                        && task.status == TaskStatus::Complete
                         && task.artifact_area.as_ref().is_some_and(|area| {
                             format!("{}/review.md", area.path) == classification.review_artifact
                         })
+                        && task
+                            .evidence_review_context
+                            .as_ref()
+                            .is_some_and(|context| {
+                                context.recovery_id == recovery.id
+                                    && context.candidate_commit == recovery.candidate_commit
+                                    && context.attachment == recovery.attachment
+                                    && context.prior_review_artifact == target.prior_review_artifact
+                            })
                 })
         }) else {
             return false;
         };
-        writer.input_artifacts.iter().any(|input| {
-            input == &classification.audit_artifact
-                || (input.producer_id == target.review_task_id.as_deref().unwrap_or_default()
-                    && input.path == classification.review_artifact)
-        }) && writer.input_artifacts.iter().any(|input| {
-            input.producer_id == "host-evidence" && input.path == recovery.attachment.snapshot_path
-        })
+        let expected_review = ArtifactRef {
+            producer_id: target.review_task_id.clone().unwrap_or_default(),
+            path: classification.review_artifact.clone(),
+        };
+        let expected_evidence = ArtifactRef {
+            producer_id: "host-evidence".to_string(),
+            path: recovery.attachment.snapshot_path.clone(),
+        };
+        let exact_input = |expected: &ArtifactRef| {
+            writer
+                .input_artifacts
+                .iter()
+                .filter(|input| *input == expected)
+                .count()
+                == 1
+                && !writer
+                    .input_artifacts
+                    .iter()
+                    .any(|input| input.path == expected.path && input != expected)
+        };
+        self.artifacts.contains(&classification.audit_artifact)
+            && exact_input(&expected_review)
+            && exact_input(&expected_evidence)
+            && exact_input(&classification.audit_artifact)
     }
 
     /// Materialize the authoritative `## Required completion` section into the

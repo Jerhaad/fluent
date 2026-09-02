@@ -977,11 +977,14 @@ fluent attempt evidence classify <work-item> <attempt> \
   --resolution '<source-correction decision>'
 ```
 
-The command requires the saved review digest and disposition, exact candidate
-and evidence snapshot, current clean worktree, and complete targeted Tests
-Review frontier. It appends an authorization audit and schedules one corrective
-Writer with the failed review, evidence snapshot, and audit artifact; the
-candidate and prior records remain unchanged. The next action is
+For a current recovery, the command requires the saved review digest and
+disposition. A legacy paused recovery may omit that digest and contain only the
+unqualified `Disposition: evidence-needed` line; Fluent derives and persists
+the digest during this one-time migration. Both forms require the exact
+candidate and evidence snapshot, current clean worktree, and complete targeted
+Tests Review frontier. It appends an authorization audit and schedules one
+corrective Writer with the failed review, evidence snapshot, and audit artifact;
+the candidate and prior records remain unchanged. The next action is
 `fluent queue resume <work-item> --attempt <attempt>`. Repeating the exact
 review, evidence, and authorization request returns the persisted Writer and
 audit result without duplicates, while stale or different requests fail before

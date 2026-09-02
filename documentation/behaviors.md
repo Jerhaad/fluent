@@ -452,16 +452,31 @@ Test: src/work_attempt_loop.rs (evidence_needed_review_pauses_without_writer_rou
 
 ### B9a
 
-WHEN a complete candidate-bound host check failed but its evidence-targeted
-review did not name an actionable external condition, THE SYSTEM SHALL accept
-an explicit candidate, review, evidence-digest, and resolution authorization
-through `fluent attempt evidence classify`, record the decision, and schedule
-one corrective Writer on the same Attempt with the failed review and immutable
-host-evidence snapshot as inputs. A repeated exact request SHALL return the
-stored Writer and audit result; stale or different frontier inputs SHALL be
-rejected without mutation.
+WHEN a complete candidate-bound host check failed and its evidence-targeted
+review is paused as `evidence-needed` without an actionable external
+condition—including a legacy paused review that contains only the unqualified
+marker—THE SYSTEM SHALL accept an explicit candidate, review, evidence-digest,
+and resolution authorization through `fluent attempt evidence classify`, record
+the decision, and schedule one corrective Writer on the same Attempt with the
+failed review and immutable host-evidence snapshot as inputs.
 Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
+Test: tests/binary.rs (legacy_unqualified_host_evidence_can_be_classified_for_code_change)
+
+### B9b
+
+WHEN an operator repeats the exact candidate-bound classification request, THE
+SYSTEM SHALL return the stored Writer and audit result without creating another
+Task, audit, or evidence record.
+Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
+Test: src/work_model.rs (host_evidence_classification_is_idempotent)
+
+### B9c
+
+IF a candidate-bound classification's review, evidence, candidate, Attempt,
+worktree, or authorization no longer matches its persisted frontier, THEN THE
+SYSTEM SHALL reject the request without mutation.
 Test: tests/binary.rs (host_evidence_classification_rejects_stale_inputs)
+Test: tests/binary.rs (classified_host_evidence_queue_resume_rejects_stale_continuation)
 
 ### B10
 

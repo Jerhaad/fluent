@@ -1256,6 +1256,13 @@ fn ensure_code_change_classification_resume_ready(
             "the planned Writer no longer names its audit artifact",
         ));
     }
+    crate::host_evidence::validate_code_change_writer_start(
+        project_root,
+        item,
+        &attempt.id,
+        &classification.writer_task_id,
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(())
 }
 
