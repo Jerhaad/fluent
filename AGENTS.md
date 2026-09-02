@@ -91,6 +91,22 @@ this environment resolves `/Users/mrinal/.local/bin/fluent` first.
 
 - Don't create too many summary documents and markdown files.
 
+## Use clear, self-contained language
+
+Start with plain language. Use established programming terms when they make the
+explanation more precise, and define them when the reader may not know them.
+
+Avoid inventing names or metaphors for concepts that already have a clear
+description. Use existing project terminology consistently. When a
+Fluent-specific term is necessary, explain it in one short sentence before
+using it. Prefer “the current blocker and next safe action” over undefined
+shorthand such as “frontier.”
+
+Before asking the user for a decision or explaining a recommendation, make the
+message self-contained. State the goal, relevant earlier decisions, current
+state, important evidence, the blocker or tradeoff, and the exact question or
+next step. Do not assume the user remembers earlier messages.
+
 ### Use active verb forms
 
 When writing comments, docstrings, commit messages, or documentation, prefer **active verb phrases** over
