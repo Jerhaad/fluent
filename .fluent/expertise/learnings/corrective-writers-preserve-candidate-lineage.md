@@ -27,8 +27,13 @@ Prevent that avoidable loop by making correction lineage explicit before launch:
   corrections produce a new commit, and the named prior candidate remains an
   ancestor.
 - Expose the tree-identical metadata-rewrite mode only when one validated
-  rejected gate names the current candidate, established candidate identity,
-  and failed solely on commit metadata.
+  rejected gate names the current candidate, establishes candidate identity,
+  and fails either solely on commit metadata or on exactly that failure plus
+  the approved derived project check. The derived case requires the canonical
+  stored `check-pre-merge.log` to contain `commit <id> body line <positive
+  integer> exceeds 72 characters` for a commit whose gate finding is
+  `literal-line-breaks`; a project-check-only, mixed, or unrelated failure
+  remains outside the exception.
 - Keep the deterministic candidate gate authoritative. Prompt guidance prevents
   a predictable mistake; it does not replace ancestry, original-base, or tree
   identity checks.

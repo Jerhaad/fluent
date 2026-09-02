@@ -14,6 +14,8 @@
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
 - [bound-conversation-state-follows-project-authority](bound-conversation-state-follows-project-authority.md) — Keep bound conversation payloads and active state in the project runtime; the runner-owner root retains only routing, deduplication, and unbound ingress
 - [candidate-commits-require-separated-body](candidate-commits-require-separated-body.md) — Candidate commits need a non-whitespace body separated from the subject by a blank line before review or testing
+- [candidate-gate-owns-derived-recovery-policy](candidate-gate-owns-derived-recovery-policy.md) — Keep recovery eligibility classifiers at the host-owned candidate gate and keep recovery modules responsible for orchestration
+- [canonical-recovery-hook-evidence](canonical-recovery-hook-evidence.md) — Bind recovery eligibility to the canonical stored hook log and its digest, not to a serialized diagnostic summary
 - [canonical-reviewer-cache-cleanup](canonical-reviewer-cache-cleanup.md) — Shared reviewer caches retire only when no nonterminal Work references their candidate commit; legacy artifact-cache cleanup removes only recognized canonical directories
 - [canonicalize-confinement-paths](canonicalize-confinement-paths.md) — Canonicalize existing paths before passing them between the environment and Seatbelt policy, while retaining the lifetime guard that owns temporary-directory cleanup
 - [capture-pump-terminate-descendants-before-eof](capture-pump-terminate-descendants-before-eof.md) — When a thread drains a child's piped stdout to EOF, terminate the whole process group before waiting for EOF; a backgrounded descendant can hold the pipe open forever
@@ -26,6 +28,7 @@
 - [dashboard-layout-contract-is-acyclic](dashboard-layout-contract-is-acyclic.md) — Keep dashboard interaction state and rendering acyclic by placing shared geometry and line projection in the layout contract
 - [dashboard-rendered-overflow-tests](dashboard-rendered-overflow-tests.md) — Dashboard overflow and responsive-layout tests must render constrained TestBackend frames and assert visible content and pane bounds
 - [declared-behavior-tests-must-exist-before-land](declared-behavior-tests-must-exist-before-land.md) — Every Test: reference in behaviors.md must resolve to a real passing test before landing; a green suite does not substitute for a missing production-boundary regression
+- [deduplicate-commit-diagnostic-identities](deduplicate-commit-diagnostic-identities.md) — Resolve abbreviated Git IDs against unique full commits when several gate findings describe one commit
 - [deduplicated-command-replays-durable-result](deduplicated-command-replays-durable-result.md) — A duplicate consequential command suppresses the external effect but replays its persisted result through a deterministic outbox identity
 - [doc-comment-attachment-in-rust](doc-comment-attachment-in-rust.md) — Inserting a function between a doc comment and its target silently re-attaches the comment to the wrong item
 - [durable-external-effects-use-reconcilable-identities](durable-external-effects-use-reconcilable-identities.md) — Persist a stable action identity before an external effect and reconcile that identity before retrying after an interruption
@@ -45,6 +48,7 @@
 - [git-publication-validates-push-destination](git-publication-validates-push-destination.md) — Validate the effective Git push URL independently from the fetch URL and publish only through that validated destination
 - [git-subprocesses-use-central-wrapper](git-subprocesses-use-central-wrapper.md) — Production Git subprocesses must use src/git.rs rather than constructing git commands directly
 - [hermetic-release-provider-boundary](hermetic-release-provider-boundary.md) — Declared release suites isolate nested provider routes with fail-closed doubles and an explicit fixture credential allowlist
+- [hook-base-commit-is-context-specific](hook-base-commit-is-context-specific.md) — Treat FLUENT_BASE_COMMIT as optional hook context supplied by candidate-gate checks, not as a universal hook variable
 - [host-evidence-writes-use-exclusive-create](host-evidence-writes-use-exclusive-create.md) — Host-owned run/handoff evidence is written with exclusive create-new and propagates every write error — never a best-effort copy
 - [host-owned-git-transaction-over-untrusted-coder](host-owned-git-transaction-over-untrusted-coder.md) — A host driving an untrusted coder over one workspace owns a Git transaction: cumulative per-return ledger, host-authored canonical squash, pointers only after clean verify
 - [http-test-server-reads-complete-body](http-test-server-reads-complete-body.md) — Local HTTP test servers must read headers and the complete Content-Length body before asserting a production request
