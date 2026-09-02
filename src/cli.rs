@@ -1229,6 +1229,35 @@ mod tests {
     }
 
     #[test]
+    fn evidence_classify_parses_candidate_bound_inputs() {
+        let cli = Cli::try_parse_from([
+            "fluent",
+            "attempt",
+            "evidence",
+            "classify",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            "abc123",
+            "--review-artifact",
+            "review.md",
+            "--evidence-digest",
+            "sha256:evidence",
+            "--resolution",
+            "Correct the source.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Attempt {
+                command: AttemptCommands::Evidence {
+                    command: AttemptEvidenceCommands::Classify { evidence_digest, .. }
+                }
+            }) if evidence_digest == "sha256:evidence"
+        ));
+    }
+
+    #[test]
     fn candidate_ancestry_repair_parses_operator_resolution() {
         let cli = Cli::try_parse_from([
             "fluent",
