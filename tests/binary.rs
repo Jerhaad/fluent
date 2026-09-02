@@ -24484,8 +24484,24 @@ fn setup_paused_code_change_classification_fixture(
     tmp: &TempDir,
     work_item_id: &str,
 ) -> (PathBuf, String, String, String, String, String) {
+    setup_paused_code_change_classification_fixture_with_result(tmp, work_item_id, "fail")
+}
+
+fn setup_paused_code_change_classification_fixture_with_result(
+    tmp: &TempDir,
+    work_item_id: &str,
+    evidence_result: &str,
+) -> (PathBuf, String, String, String, String, String) {
     let (project, candidate, prior_review_path, evidence) =
         setup_failed_evidence_recovery_fixture(tmp, work_item_id);
+    let mut evidence_document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&evidence).unwrap()).unwrap();
+    evidence_document["result"] = serde_json::Value::String(evidence_result.to_string());
+    fs::write(
+        &evidence,
+        serde_json::to_vec_pretty(&evidence_document).unwrap(),
+    )
+    .unwrap();
     fluent_cmd()
         .current_dir(&project)
         .args([
@@ -25414,6 +25430,65 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     );
     assert_eq!(git_head(&project), candidate);
     assert!(prior_review_path.starts_with(".fluent/work/artifacts/"));
+}
+
+#[test]
+fn host_evidence_classification_rejects_passing_snapshot_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture_with_result(
+            &tmp,
+            "evidence-classify-passing",
+            "pass",
+        );
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let before = work_item_value(&project, "evidence-classify-passing");
+    let before_persisted = persisted_work_snapshot(&project, "evidence-classify-passing");
+    let head_before = git_head(&project);
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-passing",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            resolution,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "classification accepted passing evidence: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("evidence snapshot result must be fail")
+    );
+    assert_eq!(
+        work_item_value(&project, "evidence-classify-passing"),
+        before,
+        "passing evidence classification changed the Work Item"
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-passing"),
+        before_persisted,
+        "passing evidence classification changed persisted artifacts"
+    );
+    assert_eq!(
+        git_head(&project),
+        head_before,
+        "passing evidence classification changed the candidate"
+    );
 }
 
 #[test]

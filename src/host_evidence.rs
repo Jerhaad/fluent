@@ -344,10 +344,11 @@ pub fn classify_for_code_change(
         })?;
         if format!("sha256:{:x}", Sha256::digest(&evidence_bytes))
             != recovery.attachment.digest
-            || parse_document(&evidence_bytes).is_err()
         {
             return Err(rejected_for("evidence snapshot bytes changed"));
         }
+        crate::recovery_contracts::validate_failed_evidence_snapshot(&evidence_bytes)
+            .map_err(|error| rejected_for(&format!("invalid evidence snapshot: {error}")))?;
 
         let source_writer_index = recovery
             .code_change_classification

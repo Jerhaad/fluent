@@ -16396,10 +16396,22 @@ mod tests {
         );
         let shared_cache = candidate_reviewer_cache_dir(project_root, "abc123");
         assert!(prompts.review_prompt.contains("CARGO_TARGET_DIR"));
+        assert!(prompts.review_prompt.contains("CARGO_HOME"));
         assert!(
             prompts
                 .review_prompt
                 .contains(&shared_cache.display().to_string())
+        );
+        assert!(prompts.review_prompt.contains("/cargo-home"));
+        assert!(
+            prompts
+                .review_prompt
+                .contains("CARGO_HOME=\"$FLUENT_EVIDENCE_SCRATCH/cargo-home\"")
+        );
+        assert!(
+            prompts
+                .review_prompt
+                .contains("CARGO_TARGET_DIR=\"$FLUENT_EVIDENCE_SCRATCH/target\"")
         );
         assert!(
             !prompts

@@ -37,7 +37,7 @@ struct EvidenceSnapshot {
     output: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum EvidenceSnapshotResult {
     Pass,
@@ -561,11 +561,11 @@ pub(crate) fn validate_code_change_writer_start(
             format!("cannot read bound evidence snapshot: {error}"),
         )
     })?;
-    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
-        || parse_evidence_snapshot(&evidence_bytes).is_err()
-    {
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
         return Err(rejected("evidence snapshot bytes changed"));
     }
+    validate_failed_evidence_snapshot(&evidence_bytes)
+        .map_err(|error| rejected(&error.to_string()))?;
 
     let authorization_digest = format!(
         "sha256:{:x}",
@@ -879,11 +879,11 @@ pub(crate) fn validate_code_change_classification_replay(
         )?;
     let evidence_bytes = fs::read(&evidence_path)
         .map_err(|error| rejected(&format!("cannot read bound evidence snapshot: {error}")))?;
-    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
-        || parse_evidence_snapshot(&evidence_bytes).is_err()
-    {
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
         return Err(rejected("evidence snapshot bytes changed"));
     }
+    validate_failed_evidence_snapshot(&evidence_bytes)
+        .map_err(|error| rejected(&error.to_string()))?;
 
     let authorization_digest = format!(
         "sha256:{:x}",
@@ -1292,7 +1292,7 @@ pub(crate) fn validate_managed_file_path(project_root: &Path, relative: &str) ->
     Ok(full_path)
 }
 
-fn parse_evidence_snapshot(bytes: &[u8]) -> Result<()> {
+fn parse_evidence_snapshot(bytes: &[u8]) -> Result<EvidenceSnapshotResult> {
     if bytes.is_empty() || bytes.len() > MAX_EVIDENCE_BYTES {
         bail!("evidence document must be between 1 and {MAX_EVIDENCE_BYTES} bytes");
     }
@@ -1306,8 +1306,19 @@ fn parse_evidence_snapshot(bytes: &[u8]) -> Result<()> {
         bail!("evidence document has an unsupported version or empty required field");
     }
     DateTime::parse_from_rfc3339(&document.run_at).context("evidence run_at must be RFC3339")?;
-    let _ = (&document.result, &document.output);
-    Ok(())
+    let _ = &document.output;
+    Ok(document.result)
+}
+
+/// Require host evidence to record a failed check before allowing a source
+/// correction classification or replay.
+pub(crate) fn validate_failed_evidence_snapshot(bytes: &[u8]) -> Result<()> {
+    match parse_evidence_snapshot(bytes)? {
+        EvidenceSnapshotResult::Fail => Ok(()),
+        EvidenceSnapshotResult::Pass => {
+            bail!("evidence snapshot result must be fail for source correction")
+        }
+    }
 }
 
 pub(crate) fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
