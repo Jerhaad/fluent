@@ -6259,6 +6259,21 @@ pub struct HostEvidenceClassification {
     pub classified_at: String,
 }
 
+impl HostEvidenceClassification {
+    pub fn matches_request(
+        &self,
+        review_artifact: &str,
+        review_digest: &str,
+        authorization: &str,
+        authorization_digest: &str,
+    ) -> bool {
+        self.review_artifact == review_artifact
+            && self.review_digest == review_digest
+            && self.authorization == authorization
+            && self.authorization_digest == authorization_digest
+    }
+}
+
 impl EvidenceRecovery {
     pub fn is_active(&self) -> bool {
         self.state == EvidenceRecoveryState::Reviewing
@@ -10778,6 +10793,35 @@ random banner prose that must be ignored
             recovery
         );
         assert_eq!(attempt.evidence_recoveries, vec![recovery]);
+    }
+
+    #[test]
+    fn host_evidence_classification_is_idempotent() {
+        let classification = HostEvidenceClassification {
+            operation_id: "host-evidence-classification-abc".to_string(),
+            review_artifact: "review.md".to_string(),
+            review_digest: "sha256:review".to_string(),
+            authorization: "Correct the source.".to_string(),
+            authorization_digest: "sha256:authorization".to_string(),
+            audit_artifact: ArtifactRef {
+                producer_id: "host-evidence-classification-abc".to_string(),
+                path: "audit.json".to_string(),
+            },
+            writer_task_id: "attempt-1-write-2".to_string(),
+            classified_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        assert!(classification.matches_request(
+            "review.md",
+            "sha256:review",
+            "Correct the source.",
+            "sha256:authorization",
+        ));
+        assert!(!classification.matches_request(
+            "review.md",
+            "sha256:review",
+            "Authorize a different correction.",
+            "sha256:authorization",
+        ));
     }
 
     #[test]

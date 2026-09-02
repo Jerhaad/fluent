@@ -314,7 +314,10 @@ fn extract_evidence_needed_reason(content: &str) -> Option<EvidenceNeededReason>
                 let line = line.trim();
                 let line = line.strip_prefix("- ").unwrap_or(line);
                 let (actual, value) = line.split_once(':')?;
-                actual.trim().eq_ignore_ascii_case(label).then(|| value.trim())
+                actual
+                    .trim()
+                    .eq_ignore_ascii_case(label)
+                    .then(|| value.trim())
             })
             .filter(|value| !value.is_empty())
             .collect::<Vec<_>>();

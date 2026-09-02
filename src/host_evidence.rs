@@ -242,11 +242,12 @@ pub fn classify_for_code_change(
         let review_bytes = fs::read(&review_path).map_err(|_| rejected())?;
         let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
         if let Some(prior) = recovery.code_change_classification.as_ref() {
-            if prior.review_artifact == review_artifact
-                && prior.review_digest == review_digest
-                && prior.authorization == authorization
-                && prior.authorization_digest == authorization_digest
-            {
+            if prior.matches_request(
+                review_artifact,
+                &review_digest,
+                authorization,
+                &authorization_digest,
+            ) {
                 return Ok(CodeChangeClassification {
                     writer_task_id: prior.writer_task_id.clone(),
                     audit_artifact: prior.audit_artifact.path.clone(),

@@ -25048,6 +25048,111 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
             .any(|input| { input["path"] == targeted_path })
     );
     assert_eq!(git_head(&project), candidate);
+
+    let task_count = attempt["tasks"].as_array().unwrap().len();
+    let audit_count = attempt["artifacts"].as_array().unwrap().len();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            digest,
+            "--resolution",
+            "The failed candidate-bound check needs a source correction.",
+        ])
+        .assert()
+        .success();
+    let repeated = work_item_value(&project, "evidence-classify");
+    assert_eq!(
+        repeated["attempts"][0]["tasks"].as_array().unwrap().len(),
+        task_count
+    );
+    assert_eq!(
+        repeated["attempts"][0]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        audit_count
+    );
+}
+
+#[test]
+fn host_evidence_classification_rejects_stale_inputs() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path, evidence) =
+        setup_failed_evidence_recovery_fixture(&tmp, "evidence-classify-stale");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "evidence-classify-stale",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &review_path,
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    let targeted_path = store
+        .mutate_work_item("evidence-classify-stale", |item| {
+            let targeted = item.attempts[0].tasks.last_mut().unwrap();
+            targeted.status = fluent::work_model::TaskStatus::Complete;
+            Ok(format!(
+                "{}/review.md",
+                targeted.artifact_area.as_ref().unwrap().path
+            ))
+        })
+        .unwrap();
+    fs::create_dir_all(project.join(&targeted_path).parent().unwrap()).unwrap();
+    fs::write(project.join(&targeted_path), "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n").unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "run",
+            "evidence-classify-stale",
+            "attempt-1",
+            "--no-sandbox",
+        ])
+        .assert()
+        .success();
+    let item_path = project.join(".fluent/work/items/evidence-classify-stale.json");
+    let before = fs::read_to_string(&item_path).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-stale",
+            "attempt-1",
+            "--candidate",
+            "stale-candidate",
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            "sha256:stale",
+            "--resolution",
+            "Correct the source.",
+        ])
+        .assert()
+        .failure();
+    assert_json_unchanged(&item_path, &before);
+    assert_eq!(git_head(&project), candidate);
 }
 
 #[test]
