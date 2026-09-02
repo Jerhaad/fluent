@@ -540,7 +540,28 @@ fn validate_metadata_only_rewrite(
         .filter(|check| check.status == CandidateCheckStatus::Failed)
         .map(|check| check.name.as_str())
         .collect::<Vec<_>>();
-    if failed != ["commit-metadata"] {
+    if failed == ["commit-metadata", "project-check"] {
+        let metadata_check = prior
+            .checks
+            .iter()
+            .find(|check| check.name == "commit-metadata")
+            .ok_or_else(|| anyhow::anyhow!("prior gate has no commit-metadata check"))?;
+        let project_check = prior
+            .checks
+            .iter()
+            .find(|check| check.name == "project-check")
+            .ok_or_else(|| anyhow::anyhow!("prior gate has no project-check check"))?;
+        if let Err(error) = crate::candidate_metadata_recovery::validate_derived_project_check(
+            request.project_root,
+            prior_gate_path,
+            metadata_check,
+            project_check,
+        ) {
+            return Ok(Err(format!(
+                "candidate history changed after prior gate failures: {error:#}"
+            )));
+        }
+    } else if failed != ["commit-metadata"] {
         return Ok(Err(format!(
             "candidate history changed after prior gate failures: {}",
             if failed.is_empty() {
