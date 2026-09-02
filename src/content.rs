@@ -843,6 +843,8 @@ Check item {{ITEM_ID}}.
             .expect("the bundled skill must point to host-evidence recovery guidance");
         assert!(pointer.contains("host-only evidence attachment"));
         assert!(pointer.contains("candidate-bound source correction"));
+        assert!(pointer.contains("single malformed `Disposition: evidence-needed` marker"));
+        assert!(pointer.contains("missing, duplicate, or unknown disposition"));
         assert!(bundled_skill_content("fluent/references/coder-environment.md").is_some());
 
         let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md")
