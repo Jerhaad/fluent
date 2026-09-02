@@ -10999,7 +10999,7 @@ random banner prose that must be ignored
         fs::create_dir_all(root.join(&prior_path).parent().unwrap()).unwrap();
         fs::write(root.join(&prior_path), "Verdict: fail\n").unwrap();
 
-        let evidence_bytes = br#"{"schema_version":1,"producer":"trusted host","check":"cargo test exact","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
+        let evidence_bytes = br#"{"schema_version":1,"producer":"trusted host","check":"cargo test exact","working_directory":".","result":"fail","run_at":"2026-09-02T00:00:00Z","output":"failed"}"#;
         let evidence_digest = format!("sha256:{:x}", sha2::Sha256::digest(evidence_bytes));
         let evidence_path = format!(
             ".fluent/work/artifacts/work-1/attempt-1/host-evidence/{}.json",
