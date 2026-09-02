@@ -965,8 +965,10 @@ A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
 `Disposition: code-change`. A new `evidence-needed` result is actionable only
 when it names exactly one non-empty `External-Condition` and exactly one
-non-empty `Additional-Proof`; otherwise the Attempt follows the ordinary
-source-correction (`code-change`) path and plans a Writer. For a complete
+non-empty `Additional-Proof`; a single marker with malformed qualification
+follows the ordinary source-correction (`code-change`) path and plans a Writer.
+Missing, duplicate, or unknown `Disposition` markers remain an uncertain pause.
+For a complete
 candidate-bound failure, an operator may authorize that correction on a paused
 Attempt with:
 
@@ -985,7 +987,10 @@ persists the digest during this one-time migration. The legacy form is the only
 place an unqualified marker is classified: an unqualified new review never
 pauses for this command and already follows the ordinary Writer path. Both
 classification forms require the exact candidate and evidence snapshot,
-current clean worktree, and complete targeted Tests Review frontier. Fluent
+current clean worktree, and complete targeted Tests Review frontier. A new
+classification must target the current paused recovery; a later `Reviewing` or
+`NeedsEvidence` recovery rejects the older classification and its continuation.
+Exact replay still reconciles the stored result. Fluent
 persists the authorization and operation identity with an explicit
 `code-change` disposition, then schedules one corrective Writer with the failed
 review, evidence snapshot, and audit artifact; the candidate and prior records

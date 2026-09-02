@@ -14269,11 +14269,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, _) =
             make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
-        add_evidence_targeted_review(
-            tmp.path(),
-            &store,
-            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n",
-        );
+        let review_content = "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n";
+        add_evidence_targeted_review(tmp.path(), &store, review_content);
         let before = store.read_work_item("work-1").unwrap();
         let writer_count = before.attempts[0]
             .tasks
@@ -14291,6 +14288,14 @@ mod tests {
         assert_eq!(
             stored.attempts[0].evidence_recoveries[0].state,
             EvidenceRecoveryState::NeedsEvidence
+        );
+        let expected_review_digest =
+            format!("sha256:{:x}", Sha256::digest(review_content.as_bytes()));
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].targets[0]
+                .review_digest
+                .as_deref(),
+            Some(expected_review_digest.as_str())
         );
         assert_eq!(
             stored.attempts[0]
@@ -14340,6 +14345,82 @@ mod tests {
                 .count(),
             writer_count + 1
         );
+    }
+
+    #[test]
+    fn malformed_single_evidence_needed_review_plans_writer() {
+        for content in [
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\nAdditional-Proof: Attach more proof.\n",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (store, _) =
+                make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+            add_evidence_targeted_review(tmp.path(), &store, content);
+            let before = store.read_work_item("work-1").unwrap();
+            let writer_count = before.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+
+            let outcome =
+                interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+            assert!(matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedWriteRound { .. }
+            ));
+            let stored = store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+            assert_eq!(
+                stored.attempts[0].evidence_recoveries[0].state,
+                EvidenceRecoveryState::CodeChange
+            );
+            assert_eq!(
+                stored.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writer_count + 1
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_evidence_disposition_pauses_without_writer() {
+        for content in [
+            "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\nExternal-Condition: Repair the host.\nAdditional-Proof: Attach proof.\n",
+            "Verdict: fail\nDisposition: unknown\n",
+            "Verdict: fail\n",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (store, _) =
+                make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+            add_evidence_targeted_review(tmp.path(), &store, content);
+            let before = store.read_work_item("work-1").unwrap();
+            let writer_count = before.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+
+            let outcome =
+                interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+            assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+            let stored = store.read_work_item("work-1").unwrap();
+            assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+            assert_eq!(
+                stored.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writer_count
+            );
+        }
     }
 
     #[test]

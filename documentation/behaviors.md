@@ -454,18 +454,23 @@ Test: src/work_attempt_loop.rs (evidence_needed_review_pauses_without_writer_rou
 ### B9a
 
 WHEN a complete candidate-bound host check failed and a new evidence-targeted
-review returns an unqualified or malformed `evidence-needed` marker, THE SYSTEM
-SHALL follow the ordinary `code-change` Writer path; WHEN a legacy paused
-recovery contains only that unqualified marker, THE SYSTEM SHALL accept an
-explicit candidate, review, evidence-digest, and resolution authorization
-through `fluent attempt evidence classify`, record the decision, and schedule
-one corrective Writer on the same Attempt with the failed review and immutable
-host-evidence snapshot as inputs.
-Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
-Test: tests/binary.rs (legacy_unqualified_host_evidence_can_be_classified_for_code_change)
+review contains exactly one `Disposition: evidence-needed` marker with missing,
+empty, or otherwise malformed qualification fields, THE SYSTEM SHALL follow the
+ordinary `code-change` Writer path.
 Test: src/work_attempt_loop.rs (unqualified_evidence_needed_review_plans_ordinary_writer)
+Test: src/work_attempt_loop.rs (malformed_single_evidence_needed_review_plans_writer)
 
 ### B9b
+
+WHEN a legacy paused recovery contains exactly one unqualified
+`Disposition: evidence-needed` marker, AND an operator supplies the explicit
+candidate, review, evidence-digest, and resolution authorization through
+`fluent attempt evidence classify`, THE SYSTEM SHALL record the decision and
+schedule one corrective Writer on the same Attempt with the failed review and
+immutable host-evidence snapshot as inputs.
+Test: tests/binary.rs (legacy_unqualified_host_evidence_can_be_classified_for_code_change)
+
+### B9c
 
 WHEN an operator repeats the exact candidate-bound classification request, THE
 SYSTEM SHALL return the stored Writer and audit result without creating another
@@ -473,7 +478,7 @@ Task, audit, or evidence record.
 Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
 Test: src/work_model.rs (host_evidence_classification_is_idempotent)
 
-### B9c
+### B9d
 
 IF a candidate-bound classification's review, evidence, candidate, Attempt,
 worktree, or authorization no longer matches its persisted frontier, THEN THE

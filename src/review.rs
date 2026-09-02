@@ -339,18 +339,27 @@ fn extract_evidence_needed_reason(content: &str) -> Option<EvidenceNeededReason>
     })
 }
 
+/// Return whether a failed review contains exactly one evidence-needed marker.
+/// Qualification fields are intentionally ignored: a single marker with
+/// missing or malformed qualification follows the ordinary code-change path,
+/// while duplicate, unknown, or missing disposition markers remain uncertain.
+pub fn has_single_evidence_needed_disposition(content: &str) -> bool {
+    if extract_verdict(content) != Verdict::Fail {
+        return false;
+    }
+    let dispositions = labeled_values(content, "Disposition");
+    dispositions.len() == 1 && dispositions[0].eq_ignore_ascii_case("evidence-needed")
+}
+
 /// Return whether a failed review contains the legacy, unqualified
 /// `Disposition: evidence-needed` marker. New reviews must include actionable
 /// reason fields; this narrow marker exists only to migrate an already-paused
 /// pre-contract recovery without treating malformed new output as authority.
 pub fn has_unqualified_evidence_needed_disposition(content: &str) -> bool {
-    if extract_verdict(content) != Verdict::Fail {
+    if !has_single_evidence_needed_disposition(content) {
         return false;
     }
-    let dispositions = labeled_values(content, "Disposition");
-    dispositions.len() == 1
-        && dispositions[0].eq_ignore_ascii_case("evidence-needed")
-        && labeled_values(content, "External-Condition").is_empty()
+    labeled_values(content, "External-Condition").is_empty()
         && labeled_values(content, "Additional-Proof").is_empty()
 }
 
@@ -583,6 +592,16 @@ mod tests {
             Some(EvidenceDisposition::CodeChange),
             "an empty duplicate reason must not authorize evidence-needed"
         );
+        assert!(has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: \nAdditional-Proof: Attach proof.\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: evidence-needed\nDisposition: code-change\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition(
+            "Verdict: fail\nDisposition: unknown\n"
+        ));
+        assert!(!has_single_evidence_needed_disposition("Verdict: fail\n"));
     }
 
     #[test]

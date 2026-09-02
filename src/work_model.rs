@@ -5177,12 +5177,31 @@ impl Attempt {
         {
             return false;
         }
-        let Some(recovery) = self.evidence_recoveries.iter().rev().find(|recovery| {
-            recovery.state == EvidenceRecoveryState::CodeChange
-                && recovery.code_change_classification.is_some()
-        }) else {
+        let Some((recovery_index, recovery)) = self
+            .evidence_recoveries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, recovery)| {
+                recovery.state == EvidenceRecoveryState::CodeChange
+                    && recovery.code_change_classification.is_some()
+            })
+        else {
             return false;
         };
+        if self
+            .evidence_recoveries
+            .iter()
+            .skip(recovery_index + 1)
+            .any(|recovery| {
+                matches!(
+                    recovery.state,
+                    EvidenceRecoveryState::Reviewing | EvidenceRecoveryState::NeedsEvidence
+                )
+            })
+        {
+            return false;
+        }
         let Some(classification) = recovery.code_change_classification.as_ref() else {
             return false;
         };

@@ -422,6 +422,8 @@ pub fn classify_for_code_change(
         if recovery.state != EvidenceRecoveryState::NeedsEvidence {
             return Err(rejected());
         }
+        validate_classification_recovery_scope(attempt, &recovery.id)
+            .map_err(|reason| rejected_for(&reason))?;
         if item.attempts.last().map(|attempt| attempt.id.as_str()) != Some(attempt_id)
             || attempt.status != work_model::AttemptStatus::NeedsUser
             || attempt.pause_kind != Some(work_model::PauseKind::Uncertain)
@@ -607,6 +609,38 @@ fn validate_classification_task_frontier(
     Ok(())
 }
 
+/// Ensure a classification targets the current unresolved host-evidence
+/// frontier. A later active or evidence-waiting recovery supersedes an older
+/// paused recovery for new classifications and for their Writer continuation.
+/// Exact replay is checked before this guard so an already-recorded operation
+/// remains idempotent even when a later recovery is subsequently opened.
+pub(crate) fn validate_classification_recovery_scope(
+    attempt: &work_model::Attempt,
+    recovery_id: &str,
+) -> std::result::Result<(), String> {
+    let recovery_index = attempt
+        .evidence_recoveries
+        .iter()
+        .position(|recovery| recovery.id == recovery_id)
+        .ok_or_else(|| "the classified recovery is missing".to_string())?;
+    if attempt
+        .evidence_recoveries
+        .iter()
+        .skip(recovery_index + 1)
+        .any(|recovery| {
+            matches!(
+                recovery.state,
+                EvidenceRecoveryState::Reviewing | EvidenceRecoveryState::NeedsEvidence
+            )
+        })
+    {
+        return Err(
+            "a later active or NeedsEvidence recovery owns the current frontier".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn code_change_operation_id(
     attempt_id: &str,
     candidate_commit: &str,
@@ -763,15 +797,25 @@ fn reconcile_code_change_classification_audit(
         classification,
         !legacy_identity,
     )?;
-    let audit_path = project_root.join(&classification.audit_artifact.path);
+    let audit_file = project_root.join(&classification.audit_artifact.path);
+    let audit_path = match fs::symlink_metadata(&audit_file) {
+        Ok(_) => validate_managed_file_path(project_root, &classification.audit_artifact.path)
+            .with_context(|| format!("validate classification audit {}", audit_file.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return publish_snapshot(
+                project_root,
+                &classification.audit_artifact.path,
+                &audit_bytes,
+            );
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect classification audit {}", audit_file.display()));
+        }
+    };
     match fs::read(&audit_path) {
         Ok(existing) if existing == audit_bytes => Ok(()),
         Ok(_) => bail!("classification audit bytes changed"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publish_snapshot(
-            project_root,
-            &classification.audit_artifact.path,
-            &audit_bytes,
-        ),
         Err(error) => Err(error)
             .with_context(|| format!("read classification audit {}", audit_path.display())),
     }
@@ -845,6 +889,8 @@ pub(crate) fn validate_code_change_writer_start(
     };
 
     let rejected = |reason: &str| code_change_writer_rejection(attempt_id, reason);
+    validate_classification_recovery_scope(attempt, &recovery.id)
+        .map_err(|reason| rejected(&reason))?;
     if item.attempts.last().map(|current| current.id.as_str()) != Some(attempt_id)
         || attempt.status != work_model::AttemptStatus::Planned
         || attempt.review_state != Some(work_model::AttemptReviewState::Failed)

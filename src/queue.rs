@@ -1183,6 +1183,8 @@ fn ensure_code_change_classification_resume_ready(
                 && recovery.code_change_classification.is_some()
         })
         .ok_or_else(|| ineligible("no classified recovery remains"))?;
+    crate::host_evidence::validate_classification_recovery_scope(attempt, &recovery.id)
+        .map_err(|reason| ineligible(&reason))?;
     let classification = recovery
         .code_change_classification
         .as_ref()

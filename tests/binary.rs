@@ -25355,6 +25355,194 @@ fn host_evidence_classification_replay_republishes_missing_audit() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn host_evidence_classification_replay_rejects_symlinked_audit() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-audit-link");
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        "evidence-classify-audit-link",
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+    let classified = work_item_value(&project, "evidence-classify-audit-link");
+    let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_file = project.join(&audit_path);
+    let outside = tmp.path().join("outside-classification-audit.json");
+    fs::write(&outside, b"outside audit bytes\n").unwrap();
+    fs::remove_file(&audit_file).unwrap();
+    symlink(&outside, &audit_file).unwrap();
+    let before = persisted_work_snapshot(&project, "evidence-classify-audit-link");
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        !replay.status.success(),
+        "symlinked classification audit unexpectedly replayed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-audit-link"),
+        before
+    );
+    assert!(
+        fs::symlink_metadata(&audit_file)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&outside).unwrap(), b"outside audit bytes\n");
+}
+
+#[test]
+fn host_evidence_classification_rejects_older_recovery_with_later_wait() {
+    for later_state in [
+        fluent::work_model::EvidenceRecoveryState::Reviewing,
+        fluent::work_model::EvidenceRecoveryState::NeedsEvidence,
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-scope");
+        let store = WorkModelStore::new(&project);
+        store
+            .mutate_work_item("evidence-classify-scope", |item| {
+                let attempt = &mut item.attempts[0];
+                let mut later = attempt.evidence_recoveries[0].clone();
+                later.id = "host-evidence-later-architecture".to_string();
+                later.state = later_state.clone();
+                later.targets[0].role = "architecture".to_string();
+                later.targets[0].review_task_id = None;
+                later.targets[0].review_digest = None;
+                attempt.evidence_recoveries.push(later);
+                Ok(())
+            })
+            .unwrap();
+        let before = persisted_work_snapshot(&project, "evidence-classify-scope");
+        let output = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "classify",
+                "evidence-classify-scope",
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--review-artifact",
+                &targeted_path,
+                "--evidence-digest",
+                &digest,
+                "--resolution",
+                "Correct the source.",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "older recovery classified while later {later_state:?} recovery waited: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-scope"),
+            before
+        );
+    }
+}
+
+#[test]
+fn classified_host_evidence_queue_resume_rejects_later_recovery() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-later");
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-later",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            resolution,
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item("evidence-classify-later", |item| {
+            let attempt = &mut item.attempts[0];
+            let mut later = attempt.evidence_recoveries[0].clone();
+            later.id = "host-evidence-later-architecture".to_string();
+            later.state = fluent::work_model::EvidenceRecoveryState::NeedsEvidence;
+            later.targets[0].role = "architecture".to_string();
+            later.targets[0].review_task_id = None;
+            later.targets[0].review_digest = None;
+            attempt.evidence_recoveries.push(later);
+            Ok(())
+        })
+        .unwrap();
+    let before = persisted_work_snapshot(&project, "evidence-classify-later");
+    let queue_path = project.join(".fluent/work/queue/evidence-classify-later.json");
+    let queue_before = fs::read(&queue_path).ok();
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "queue",
+            "resume",
+            "evidence-classify-later",
+            "--attempt",
+            "attempt-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "queue resume accepted a later unresolved recovery: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-later"),
+        before
+    );
+    assert_eq!(fs::read(&queue_path).ok(), queue_before);
+}
+
 #[test]
 fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
     for stale in ["candidate", "evidence", "review", "audit"] {
@@ -25733,7 +25921,7 @@ fn host_evidence_classification_rejects_stale_inputs() {
             "wrong-review" => review_arg = prior_review_path.clone(),
             "changed-review" => fs::write(
                 project.join(&targeted_path),
-                "Verdict: fail\nDisposition: code-change\n",
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Changed after classification.\nAdditional-Proof: Re-run the check.\n",
             )
             .unwrap(),
             "changed-evidence" => fs::write(
