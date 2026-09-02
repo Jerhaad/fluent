@@ -3006,10 +3006,12 @@ aligns with existing Fluent state vocabulary (`land`,
 Each hook receives Fluent context as environment variables
 (`FLUENT_HOOK`, `FLUENT_WORK_ITEM_ID`, `FLUENT_ATTEMPT_ID`,
 `FLUENT_TASK_ID`, `FLUENT_MERGE_CANDIDATE_ID`,
-`FLUENT_CANDIDATE_COMMIT`, `FLUENT_ARTIFACT_DIR`) and runs with
-the candidate workspace as its working directory. Stdout and
-stderr are captured to `<log_dir>/<hook-name>.log` so failures stay
-inspectable after the fact. Hooks that are missing or not
+`FLUENT_CANDIDATE_COMMIT`, `FLUENT_BASE_COMMIT`,
+`FLUENT_ARTIFACT_DIR`) and runs with the candidate workspace as its
+working directory. `FLUENT_BASE_COMMIT` identifies the lower bound of
+the candidate range that the gate is checking. Stdout and stderr are
+captured to `<log_dir>/<hook-name>.log` so failures stay inspectable
+after the fact. Hooks that are missing or not
 executable are silently skipped — no central registry, no
 configuration file, the filesystem is the manifest.
 
