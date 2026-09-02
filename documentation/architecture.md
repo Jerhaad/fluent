@@ -963,11 +963,12 @@ Fluent snapshots the rejected gate inside a content-addressed binding so a
 later gate run cannot erase the decision that authorized the host evidence.
 A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
-`Disposition: code-change`. An `evidence-needed` result must also name exactly
-one `External-Condition` and one `Additional-Proof`; otherwise the review is a
-source-correction case. For a complete candidate-bound failure with no
-actionable host condition, an operator may authorize that correction on the
-paused Attempt with:
+`Disposition: code-change`. A new `evidence-needed` result is actionable only
+when it names exactly one non-empty `External-Condition` and exactly one
+non-empty `Additional-Proof`; otherwise the Attempt follows the ordinary
+source-correction (`code-change`) path and plans a Writer. For a complete
+candidate-bound failure, an operator may authorize that correction on a paused
+Attempt with:
 
 ```sh
 fluent attempt evidence classify <work-item> <attempt> \
@@ -977,20 +978,27 @@ fluent attempt evidence classify <work-item> <attempt> \
   --resolution '<source-correction decision>'
 ```
 
-For a current recovery, the command requires the saved review digest and
-disposition. A legacy paused recovery may omit that digest and contain only the
-unqualified `Disposition: evidence-needed` line; Fluent derives and persists
-the digest during this one-time migration. Both forms require the exact
-candidate and evidence snapshot, current clean worktree, and complete targeted
-Tests Review frontier. It appends an authorization audit and schedules one
-corrective Writer with the failed review, evidence snapshot, and audit artifact;
-the candidate and prior records remain unchanged. The next action is
+For a current actionable recovery, the command requires the saved review digest
+and disposition. A legacy paused recovery may omit that digest and contain only
+the unqualified `Disposition: evidence-needed` line; Fluent derives and
+persists the digest during this one-time migration. The legacy form is the only
+place an unqualified marker is classified: an unqualified new review never
+pauses for this command and already follows the ordinary Writer path. Both
+classification forms require the exact candidate and evidence snapshot,
+current clean worktree, and complete targeted Tests Review frontier. Fluent
+persists the authorization and operation identity with an explicit
+`code-change` disposition, then schedules one corrective Writer with the failed
+review, evidence snapshot, and audit artifact; the candidate and prior records
+remain unchanged. The Work Item mutation commits the classification and its
+audit reference before the audit bytes are published; a retry deterministically
+reconciles a missing audit and rejects conflicting bytes. The next action is
 `fluent queue resume <work-item> --attempt <attempt>`. Repeating the exact
 review, evidence, and authorization request returns the persisted Writer and
 audit result without duplicates, while stale or different requests fail before
-mutation. A passing targeted review still requires all exact-commit evidence
-and Learning before landing. The ordinary `code-change` disposition closes
-evidence recovery and follows the normal Writer, Tester, and reviewer path.
+mutation. A passing targeted review
+still requires all exact-commit evidence and Learning before landing. The
+ordinary `code-change` disposition closes evidence recovery and follows the
+normal Writer, Tester, and reviewer path.
 
 If that code-change disposition plans a corrective Writer and the operator
 interrupts it before it produces output, replacement evidence remains eligible

@@ -14303,6 +14303,46 @@ mod tests {
     }
 
     #[test]
+    fn unqualified_evidence_needed_review_plans_ordinary_writer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, _) =
+            make_interpret_reviews_fixture(tmp.path(), "FAIL", Some(passing_tester_json()));
+        add_evidence_targeted_review(
+            tmp.path(),
+            &store,
+            "Verdict: fail\nDisposition: evidence-needed\n",
+        );
+        let before = store.read_work_item("work-1").unwrap();
+        let writer_count = before.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+
+        let outcome =
+            interpret_reviews(tmp.path(), &store, before, "attempt-1", true, None).unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);
+        assert_eq!(
+            stored.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::CodeChange
+        );
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writer_count + 1
+        );
+    }
+
+    #[test]
     fn ordinary_tests_review_focused_request_pauses_without_writer_round() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, _) =

@@ -6349,6 +6349,12 @@ pub struct EvidenceRecovery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostEvidenceClassification {
     pub operation_id: String,
+    /// The fixed disposition namespace for this recovery operation.
+    ///
+    /// Older persisted classifications predate this field and deserialize as
+    /// the only disposition this endpoint supports: `code-change`.
+    #[serde(default = "default_host_evidence_classification_disposition")]
+    pub disposition: String,
     pub review_artifact: String,
     pub review_digest: String,
     pub authorization: String,
@@ -6356,6 +6362,10 @@ pub struct HostEvidenceClassification {
     pub audit_artifact: ArtifactRef,
     pub writer_task_id: String,
     pub classified_at: String,
+}
+
+fn default_host_evidence_classification_disposition() -> String {
+    "code-change".to_string()
 }
 
 impl HostEvidenceClassification {
@@ -10899,6 +10909,7 @@ random banner prose that must be ignored
     fn host_evidence_classification_matches_request() {
         let classification = HostEvidenceClassification {
             operation_id: "host-evidence-classification-abc".to_string(),
+            disposition: "code-change".to_string(),
             review_artifact: "review.md".to_string(),
             review_digest: "sha256:review".to_string(),
             authorization: "Correct the source.".to_string(),

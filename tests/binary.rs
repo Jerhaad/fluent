@@ -25105,6 +25105,7 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     let classification = &attempt["evidence_recoveries"][0]["code_change_classification"];
     assert_eq!(classification["review_artifact"], targeted_path);
     assert_eq!(classification["authorization"], resolution);
+    assert_eq!(classification["disposition"], "code-change");
     assert_eq!(
         classification["authorization_digest"],
         format!("sha256:{:x}", sha2::Sha256::digest(resolution.as_bytes()))
@@ -25128,6 +25129,7 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     assert_eq!(audit["evidence"]["digest"], digest);
     assert_eq!(audit["review_artifact"], targeted_path);
     assert_eq!(audit["review_digest"], classification["review_digest"]);
+    assert_eq!(audit["disposition"], "code-change");
     assert_eq!(audit["authorization"], resolution);
     assert_eq!(
         audit["authorization_digest"],
@@ -25305,6 +25307,55 @@ fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree
 }
 
 #[test]
+fn host_evidence_classification_replay_republishes_missing_audit() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-audit");
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        "evidence-classify-audit",
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+    let classified = work_item_value(&project, "evidence-classify-audit");
+    let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_bytes = fs::read(project.join(&audit_path)).unwrap();
+    fs::remove_file(project.join(&audit_path)).unwrap();
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(project.join(&audit_path)).unwrap(), audit_bytes);
+    assert_eq!(
+        work_item_value(&project, "evidence-classify-audit")["attempts"][0]["evidence_recoveries"]
+            [0]["code_change_classification"]["disposition"],
+        "code-change"
+    );
+}
+
+#[test]
 fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
     for stale in ["candidate", "evidence", "review", "audit"] {
         let tmp = TempDir::new().unwrap();
@@ -25392,6 +25443,127 @@ fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
             fs::read(&queue_path).ok(),
             queue_before,
             "stale {stale} queue resume appended a dispatch"
+        );
+    }
+}
+
+#[test]
+fn classified_host_evidence_writer_reservation_rejects_stale_inputs() {
+    for stale in ["candidate", "evidence", "review", "audit", "worktree"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-reserve");
+        let resolution = "The failed candidate-bound check needs a source correction.";
+        let classify_args = [
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-reserve",
+            "attempt-1",
+            "--candidate",
+            candidate.as_str(),
+            "--review-artifact",
+            targeted_path.as_str(),
+            "--evidence-digest",
+            digest.as_str(),
+            "--resolution",
+            resolution,
+        ];
+        fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .assert()
+            .success();
+        let classified = work_item_value(&project, "evidence-classify-reserve");
+        let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+            ["code_change_classification"]["audit_artifact"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        match stale {
+            "candidate" => git::run(
+                &project,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "Advance reservation frontier",
+                ],
+                "advance reservation frontier",
+            )
+            .unwrap(),
+            "evidence" => fs::remove_file(project.join(&snapshot_path)).unwrap(),
+            "review" => fs::write(
+                project.join(&targeted_path),
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Changed after classification.\nAdditional-Proof: Re-run the check.\n",
+            )
+            .unwrap(),
+            "audit" => {
+                let mut bytes = fs::read(project.join(&audit_path)).unwrap();
+                bytes.extend_from_slice(b"tampered\n");
+                fs::write(project.join(&audit_path), bytes).unwrap();
+            }
+            "worktree" => fs::write(project.join("stale-reservation-marker"), b"dirty\n").unwrap(),
+            _ => unreachable!("stale reservation cases are exhaustive"),
+        }
+        let before = persisted_work_snapshot(&project, "evidence-classify-reserve");
+        let status_before = git::run_stdout(
+            &project,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "snapshot reservation candidate status",
+        )
+        .unwrap();
+        let invoked = tmp.path().join("classified-writer-invoked");
+        let bin_dir = tmp.path().join("classified-writer-bin");
+        write_mock_claude(
+            &bin_dir,
+            r##"#!/bin/bash
+for arg in "$@"; do
+  if [ "$arg" = "-p" ]; then
+    printf 'invoked\n' > "$MOCK_WRITER_INVOKED"
+    break
+  fi
+done
+exit 0
+"##,
+        );
+        let output = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "run",
+                "evidence-classify-reserve",
+                "attempt-1",
+                "--no-sandbox",
+            ])
+            .env("PATH", mock_path(&bin_dir))
+            .env("MOCK_WRITER_INVOKED", &invoked)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "stale {stale} reservation unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !invoked.exists(),
+            "stale {stale} reservation invoked the classified Writer"
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-reserve"),
+            before,
+            "stale {stale} reservation changed persisted state"
+        );
+        assert_eq!(
+            git::run_stdout(
+                &project,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "verify reservation candidate status",
+            )
+            .unwrap(),
+            status_before,
+            "stale {stale} reservation changed candidate worktree"
         );
     }
 }
@@ -25641,6 +25813,88 @@ fn host_evidence_classification_rejects_stale_inputs() {
             .unwrap(),
             status_before,
             "stale case {case} changed candidate worktree"
+        );
+    }
+}
+
+#[test]
+fn host_evidence_classification_rejects_stale_attempt_state_without_mutation() {
+    for case in [
+        "attempt-status",
+        "pause-kind",
+        "review-state",
+        "recovery-state",
+        "unrelated-task",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-attempt");
+        let store = WorkModelStore::new(&project);
+        store
+            .mutate_work_item("evidence-classify-attempt", |item| {
+                let attempt = &mut item.attempts[0];
+                match case {
+                    "attempt-status" => {
+                        attempt.status = fluent::work_model::AttemptStatus::Reviewing;
+                    }
+                    "pause-kind" => {
+                        attempt.pause_kind = Some(fluent::work_model::PauseKind::Auth);
+                    }
+                    "review-state" => {
+                        attempt.review_state = Some(fluent::work_model::AttemptReviewState::Passed);
+                    }
+                    "recovery-state" => {
+                        attempt.evidence_recoveries[0].state =
+                            fluent::work_model::EvidenceRecoveryState::Reviewing;
+                    }
+                    "unrelated-task" => {
+                        let mut extra = attempt.tasks[0].clone();
+                        extra.id = "attempt-1-write-unrelated".to_string();
+                        extra.status = fluent::work_model::TaskStatus::Planned;
+                        extra.output = None;
+                        extra.artifact_area = Some(fluent::work_model::TaskArtifactArea {
+                            path: ".fluent/work/artifacts/evidence-classify-attempt/attempt-1/attempt-1-write-unrelated".to_string(),
+                        });
+                        extra.created_at = Some(fluent::work_model::now_iso8601());
+                        extra.started_at = None;
+                        extra.completed_at = None;
+                        attempt.tasks.push(extra);
+                    }
+                    _ => unreachable!("stale Attempt cases are exhaustive"),
+                }
+                Ok(())
+            })
+            .unwrap();
+        let before = persisted_work_snapshot(&project, "evidence-classify-attempt");
+        let output = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "classify",
+                "evidence-classify-attempt",
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--review-artifact",
+                &targeted_path,
+                "--evidence-digest",
+                &digest,
+                "--resolution",
+                "Correct the source.",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "stale Attempt case {case} unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-attempt"),
+            before,
+            "stale Attempt case {case} changed persisted state"
         );
     }
 }

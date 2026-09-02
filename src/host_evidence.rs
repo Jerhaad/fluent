@@ -26,6 +26,7 @@ const MAX_FOCUSED_OUTPUT_BYTES: u64 = 384 * 1024;
 const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
 const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
 const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
 const PLAN_COMMAND_LAUNCHERS: &[&str] = &[
     "bash",
@@ -188,6 +189,7 @@ pub struct FocusedEvidenceRun {
 pub struct CodeChangeClassification {
     pub writer_task_id: String,
     pub audit_artifact: String,
+    pub disposition: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +203,8 @@ struct CodeChangeClassificationAudit<'a> {
     evidence: &'a EvidenceAttachment,
     review_artifact: &'a str,
     review_digest: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disposition: Option<&'a str>,
     authorization: &'a str,
     authorization_digest: &'a str,
     writer_task_id: &'a str,
@@ -378,7 +382,21 @@ pub fn classify_for_code_change(
             ));
         }
 
+        let review_task_id = review_task.id.clone();
+        validate_classification_task_frontier(
+            attempt,
+            &review_task_id,
+            recovery
+                .code_change_classification
+                .as_ref()
+                .map(|classification| classification.writer_task_id.as_str()),
+        )
+        .map_err(|reason| rejected_for(&reason))?;
+
         if let Some(prior) = recovery.code_change_classification.as_ref() {
+            if prior.disposition != CODE_CHANGE_DISPOSITION {
+                return Err(rejected_for("stored classification uses an unsupported disposition"));
+            }
             if prior.matches_request(
                 review_artifact,
                 &review_digest,
@@ -396,6 +414,7 @@ pub fn classify_for_code_change(
                 return Ok(CodeChangeClassification {
                     writer_task_id: prior.writer_task_id.clone(),
                     audit_artifact: prior.audit_artifact.path.clone(),
+                    disposition: prior.disposition.clone(),
                 });
             }
             return Err(rejected_for("authorization differs from the stored classification"));
@@ -428,23 +447,58 @@ pub fn classify_for_code_change(
         {
             return Err(rejected_for("shared failed-review frontier selected a different Task"));
         }
-        let review_task_id = review_task.id.clone();
         let attachment = recovery.attachment.clone();
         let recovery_id = recovery.id.clone();
-        let operation_material = format!(
-            "{attempt_id}\0{candidate_commit}\0{}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{authorization_digest}",
-            recovery.id
+        let disposition = CODE_CHANGE_DISPOSITION;
+        let operation_id = code_change_operation_id(
+            attempt_id,
+            candidate_commit,
+            &recovery.id,
+            review_artifact,
+            &review_digest,
+            evidence_digest,
+            disposition,
+            &authorization_digest,
         );
-        let operation_id = format!("host-evidence-classification-{:x}", Sha256::digest(operation_material.as_bytes()));
         let audit_path = work_model::work_artifact_path(work_item_id, attempt_id, &operation_id);
         let audit_artifact = ArtifactRef { producer_id: operation_id.clone(), path: format!("{audit_path}/classification.json") };
         let writer_task_id = format!("{attempt_id}-write-{}", attempt.tasks.iter().filter(|task| task.kind == TaskKind::Write).count() + 1);
-        let audit = CodeChangeClassificationAudit {
-            schema_version: 1, operation_id: &operation_id, work_item_id, attempt_id, candidate_commit,
-            recovery_id: &recovery_id, evidence: &attachment, review_artifact, review_digest: &review_digest,
-            authorization, authorization_digest: &authorization_digest, writer_task_id: &writer_task_id,
+        // A staged audit from an interrupted earlier attempt may be reused only
+        // when its deterministic bytes match this operation. Reject a collision
+        // before mutating the Work Item; the normal path publishes after the
+        // model transaction commits and reconciles a missing file on retry.
+        let pending_audit = CodeChangeClassificationAudit {
+            schema_version: 1,
+            operation_id: &operation_id,
+            work_item_id,
+            attempt_id,
+            candidate_commit,
+            recovery_id: &recovery_id,
+            evidence: &attachment,
+            review_artifact,
+            review_digest: &review_digest,
+            disposition: Some(disposition),
+            authorization,
+            authorization_digest: &authorization_digest,
+            writer_task_id: &writer_task_id,
         };
-        let audit_bytes = serde_json::to_vec_pretty(&audit).map_err(|_| rejected())?;
+        let pending_audit_bytes = serde_json::to_vec_pretty(&pending_audit).map_err(|_| rejected())?;
+        let audit_file = project_root.join(&audit_artifact.path);
+        match fs::symlink_metadata(&audit_file) {
+            Ok(_) => {
+                let audit_file = validate_managed_file_path(project_root, &audit_artifact.path)
+                    .map_err(|error| rejected_for(&format!("classification audit is invalid: {error}")))?;
+                let existing = fs::read(&audit_file)
+                    .map_err(|error| rejected_for(&format!("cannot read classification audit: {error}")))?;
+                if existing != pending_audit_bytes {
+                    return Err(rejected_for("classification audit already contains conflicting bytes"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(rejected_for(&format!("cannot inspect classification audit: {error}")));
+            }
+        }
         {
             let attempt = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id).expect("validated Attempt remains present");
             let recovery = attempt.evidence_recoveries.iter_mut().find(|recovery| recovery.id == recovery_id).expect("validated recovery remains present");
@@ -455,7 +509,7 @@ pub fn classify_for_code_change(
                 target.review_digest = Some(review_digest.clone());
             }
             recovery.code_change_classification = Some(HostEvidenceClassification {
-                operation_id, review_artifact: review_artifact.to_string(), review_digest, authorization: authorization.to_string(), authorization_digest,
+                operation_id, disposition: disposition.to_string(), review_artifact: review_artifact.to_string(), review_digest, authorization: authorization.to_string(), authorization_digest,
                 audit_artifact: audit_artifact.clone(), writer_task_id: writer_task_id.clone(), classified_at: work_model::now_iso8601(),
             });
             if !attempt.artifacts.contains(&audit_artifact) { attempt.artifacts.push(audit_artifact.clone()); }
@@ -467,19 +521,259 @@ pub fn classify_for_code_change(
             audit_artifact.clone(),
         ]).map_err(|_| rejected())?;
         if task_id != writer_task_id { return Err(rejected()); }
-        // Publish only after the in-memory transition and Task shape have
-        // validated. A rejected request therefore cannot leave an audit file
-        // behind without its corresponding recovery and Writer records.
-        publish_snapshot(project_root, &audit_artifact.path, &audit_bytes).map_err(|_| rejected())?;
-        Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path })
+        Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path, disposition: disposition.to_string() })
         },
-    ).map_err(Into::into)
+    )
+    .map_err(Into::into)
+    .and_then(|classification| {
+        reconcile_code_change_classification_audit(
+            project_root,
+            store,
+            work_item_id,
+            attempt_id,
+            &classification.writer_task_id,
+        )?;
+        Ok(classification)
+    })
 }
 
 fn code_change_writer_rejection(attempt_id: &str, reason: impl Into<String>) -> WorkModelError {
     WorkModelError::HostEvidenceRecoveryIneligible {
         attempt_id: attempt_id.to_string(),
         reason: reason.into(),
+    }
+}
+
+/// Validate the task frontier that a host-evidence classification is allowed to
+/// transition. A paused recovery may contain complete (or superseded) history,
+/// and at most one historical output-free failed Writer. During an exact replay
+/// the already-created corrective Writer is the only additional planned Task.
+/// Every other live, planned, or failed Task makes the frontier ambiguous and
+/// must be rejected before the recovery is reopened.
+fn validate_classification_task_frontier(
+    attempt: &work_model::Attempt,
+    review_task_id: &str,
+    allowed_planned_writer_id: Option<&str>,
+) -> std::result::Result<(), String> {
+    let (review_index, review_task) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .find(|(_, task)| task.id == review_task_id)
+        .ok_or_else(|| "the classified Tests Review Task is missing".to_string())?;
+    if review_task.kind != TaskKind::Review
+        || review_task.role != "tests"
+        || review_task.status != TaskStatus::Complete
+    {
+        return Err("the classified Tests Review Task is not complete".to_string());
+    }
+
+    let mut failed_writer_count = 0usize;
+    let mut planned_writer_count = 0usize;
+    for (index, task) in attempt.tasks.iter().enumerate() {
+        let allowed_planned_writer = allowed_planned_writer_id.is_some_and(|id| id == task.id);
+        match task.status {
+            TaskStatus::Complete | TaskStatus::Superseded => {}
+            TaskStatus::Failed
+                if task.kind == TaskKind::Write
+                    && task.output.is_none()
+                    && index < review_index =>
+            {
+                failed_writer_count += 1;
+            }
+            TaskStatus::Planned
+                if allowed_planned_writer
+                    && task.kind == TaskKind::Write
+                    && task.output.is_none() =>
+            {
+                planned_writer_count += 1;
+            }
+            _ => {
+                return Err(format!(
+                    "Task {} is an unrelated live or unresolved frontier entry",
+                    task.id
+                ));
+            }
+        }
+    }
+    if failed_writer_count > 1 {
+        return Err("the frontier contains multiple failed output-free Writers".to_string());
+    }
+    if allowed_planned_writer_id.is_some() && planned_writer_count != 1 {
+        return Err(
+            "the classified corrective Writer is not the only planned continuation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn code_change_operation_id(
+    attempt_id: &str,
+    candidate_commit: &str,
+    recovery_id: &str,
+    review_artifact: &str,
+    review_digest: &str,
+    evidence_digest: &str,
+    disposition: &str,
+    authorization_digest: &str,
+) -> String {
+    let operation_material = format!(
+        "{attempt_id}\0{candidate_commit}\0{recovery_id}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{disposition}\0{authorization_digest}"
+    );
+    format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(operation_material.as_bytes())
+    )
+}
+
+/// Reproduce the pre-disposition identity used by the first implementation.
+/// Old persisted classifications may still carry it; new operations always use
+/// [`code_change_operation_id`] so their disposition remains part of identity.
+fn legacy_code_change_operation_id(
+    attempt_id: &str,
+    candidate_commit: &str,
+    recovery_id: &str,
+    review_artifact: &str,
+    review_digest: &str,
+    evidence_digest: &str,
+    authorization_digest: &str,
+) -> String {
+    let operation_material = format!(
+        "{attempt_id}\0{candidate_commit}\0{recovery_id}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{authorization_digest}"
+    );
+    format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(operation_material.as_bytes())
+    )
+}
+
+fn classification_uses_legacy_identity(
+    classification: &HostEvidenceClassification,
+    attempt_id: &str,
+    recovery: &EvidenceRecovery,
+) -> bool {
+    classification.operation_id
+        == legacy_code_change_operation_id(
+            attempt_id,
+            &recovery.candidate_commit,
+            &recovery.id,
+            &classification.review_artifact,
+            &classification.review_digest,
+            &recovery.attachment.digest,
+            &classification.authorization_digest,
+        )
+}
+
+fn classification_audit_bytes(
+    work_item_id: &str,
+    attempt_id: &str,
+    recovery: &EvidenceRecovery,
+    classification: &HostEvidenceClassification,
+    include_disposition: bool,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&CodeChangeClassificationAudit {
+        schema_version: 1,
+        operation_id: &classification.operation_id,
+        work_item_id,
+        attempt_id,
+        candidate_commit: &recovery.candidate_commit,
+        recovery_id: &recovery.id,
+        evidence: &recovery.attachment,
+        review_artifact: &classification.review_artifact,
+        review_digest: &classification.review_digest,
+        disposition: include_disposition.then_some(classification.disposition.as_str()),
+        authorization: &classification.authorization,
+        authorization_digest: &classification.authorization_digest,
+        writer_task_id: &classification.writer_task_id,
+    })
+    .context("serialize host-evidence classification audit")
+}
+
+/// Reconcile the durable audit after the Work Item mutation commits.
+///
+/// The model is the source of truth: classification state and the corrective
+/// Writer are persisted first, then this deterministic artifact is published.
+/// A retry of the same operation recreates a missing audit byte-for-byte and
+/// rejects any conflicting bytes, so a crash cannot produce an audit that is
+/// reported as successful without a corresponding model record.
+fn reconcile_code_change_classification_audit(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    writer_task_id: &str,
+) -> Result<()> {
+    let item = store
+        .read_work_item(work_item_id)
+        .with_context(|| format!("read classified Work Item {work_item_id}"))?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .with_context(|| format!("classified Attempt {attempt_id} is missing"))?;
+    let recovery = attempt
+        .evidence_recoveries
+        .iter()
+        .find(|recovery| {
+            recovery
+                .code_change_classification
+                .as_ref()
+                .is_some_and(|classification| classification.writer_task_id == writer_task_id)
+        })
+        .context("classified recovery is missing")?;
+    let classification = recovery
+        .code_change_classification
+        .as_ref()
+        .expect("classification selected above");
+    anyhow::ensure!(
+        classification.disposition == CODE_CHANGE_DISPOSITION,
+        "classified recovery uses an unsupported disposition"
+    );
+    let expected_operation_id = code_change_operation_id(
+        attempt_id,
+        &recovery.candidate_commit,
+        &recovery.id,
+        &classification.review_artifact,
+        &classification.review_digest,
+        &recovery.attachment.digest,
+        &classification.disposition,
+        &classification.authorization_digest,
+    );
+    let legacy_identity = classification_uses_legacy_identity(classification, attempt_id, recovery);
+    anyhow::ensure!(
+        classification.operation_id == expected_operation_id || legacy_identity,
+        "classified recovery operation identity changed"
+    );
+    let expected_audit_artifact = ArtifactRef {
+        producer_id: classification.operation_id.clone(),
+        path: work_artifact_path(
+            work_item_id,
+            attempt_id,
+            &format!("{}/classification.json", classification.operation_id),
+        ),
+    };
+    anyhow::ensure!(
+        classification.audit_artifact == expected_audit_artifact,
+        "classified recovery audit binding changed"
+    );
+    let audit_bytes = classification_audit_bytes(
+        work_item_id,
+        attempt_id,
+        recovery,
+        classification,
+        !legacy_identity,
+    )?;
+    let audit_path = project_root.join(&classification.audit_artifact.path);
+    match fs::read(&audit_path) {
+        Ok(existing) if existing == audit_bytes => Ok(()),
+        Ok(_) => bail!("classification audit bytes changed"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publish_snapshot(
+            project_root,
+            &classification.audit_artifact.path,
+            &audit_bytes,
+        ),
+        Err(error) => Err(error)
+            .with_context(|| format!("read classification audit {}", audit_path.display())),
     }
 }
 
@@ -675,6 +969,8 @@ pub(crate) fn validate_code_change_writer_start(
                     })
         })
         .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
+    validate_classification_task_frontier(attempt, review_task_id, Some(task_id))
+        .map_err(|reason| rejected(&reason))?;
     let evidence_ref = ArtifactRef {
         producer_id: "host-evidence".to_string(),
         path: recovery.attachment.snapshot_path.clone(),
@@ -755,20 +1051,21 @@ pub(crate) fn validate_code_change_writer_start(
     if authorization_digest != classification.authorization_digest {
         return Err(rejected("classification authorization digest changed"));
     }
-    let operation_material = format!(
-        "{attempt_id}\0{}\0{}\0{}\0{}\0{}\0{}",
-        recovery.candidate_commit,
-        recovery.id,
-        classification.review_artifact,
-        classification.review_digest,
-        recovery.attachment.digest,
-        classification.authorization_digest,
+    if classification.disposition != CODE_CHANGE_DISPOSITION {
+        return Err(rejected("classification uses an unsupported disposition"));
+    }
+    let expected_operation_id = code_change_operation_id(
+        attempt_id,
+        &recovery.candidate_commit,
+        &recovery.id,
+        &classification.review_artifact,
+        &classification.review_digest,
+        &recovery.attachment.digest,
+        &classification.disposition,
+        &classification.authorization_digest,
     );
-    let expected_operation_id = format!(
-        "host-evidence-classification-{:x}",
-        Sha256::digest(operation_material.as_bytes())
-    );
-    if classification.operation_id != expected_operation_id {
+    let legacy_identity = classification_uses_legacy_identity(classification, attempt_id, recovery);
+    if classification.operation_id != expected_operation_id && !legacy_identity {
         return Err(rejected("classification operation identity changed"));
     }
     let expected_writer_task_id = format!(
@@ -823,6 +1120,7 @@ pub(crate) fn validate_code_change_writer_start(
         evidence: &recovery.attachment,
         review_artifact: &classification.review_artifact,
         review_digest: &classification.review_digest,
+        disposition: (!legacy_identity).then_some(classification.disposition.as_str()),
         authorization: &classification.authorization,
         authorization_digest: &classification.authorization_digest,
         writer_task_id: &classification.writer_task_id,

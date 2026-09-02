@@ -445,22 +445,25 @@ Test: tests/binary.rs (attempt_evidence_attach_revalidates_after_landing_owner_r
 
 ### B9
 
-WHEN an evidence-targeted reviewer fails with `Disposition: evidence-needed`,
-THE SYSTEM SHALL pause the same Attempt for further host evidence without
-planning a Writer.
+WHEN an evidence-targeted reviewer fails with `Disposition: evidence-needed`
+and names exactly one non-empty `External-Condition` and exactly one non-empty
+`Additional-Proof`, THE SYSTEM SHALL pause the same Attempt for that further
+host evidence without planning a Writer.
 Test: src/work_attempt_loop.rs (evidence_needed_review_pauses_without_writer_round)
 
 ### B9a
 
-WHEN a complete candidate-bound host check failed and its evidence-targeted
-review is paused as `evidence-needed` without an actionable external
-condition—including a legacy paused review that contains only the unqualified
-marker—THE SYSTEM SHALL accept an explicit candidate, review, evidence-digest,
-and resolution authorization through `fluent attempt evidence classify`, record
-the decision, and schedule one corrective Writer on the same Attempt with the
-failed review and immutable host-evidence snapshot as inputs.
+WHEN a complete candidate-bound host check failed and a new evidence-targeted
+review returns an unqualified or malformed `evidence-needed` marker, THE SYSTEM
+SHALL follow the ordinary `code-change` Writer path; WHEN a legacy paused
+recovery contains only that unqualified marker, THE SYSTEM SHALL accept an
+explicit candidate, review, evidence-digest, and resolution authorization
+through `fluent attempt evidence classify`, record the decision, and schedule
+one corrective Writer on the same Attempt with the failed review and immutable
+host-evidence snapshot as inputs.
 Test: tests/binary.rs (failed_host_evidence_can_be_classified_for_code_change)
 Test: tests/binary.rs (legacy_unqualified_host_evidence_can_be_classified_for_code_change)
+Test: src/work_attempt_loop.rs (unqualified_evidence_needed_review_plans_ordinary_writer)
 
 ### B9b
 
