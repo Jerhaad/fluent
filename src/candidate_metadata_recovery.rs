@@ -1303,6 +1303,101 @@ mod tests {
     }
 
     #[test]
+    fn metadata_recovery_rejects_hook_line_length_for_non_literal_gate_finding() {
+        let fixture = fixture();
+        let metadata = format!(
+            "commit {} has invalid author name: missing",
+            fixture.candidate
+        );
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD"],
+            "resolve fixture candidate HEAD before non-literal rejection",
+        )
+        .unwrap();
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(
+            git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "resolve fixture candidate HEAD after non-literal rejection",
+            )
+            .unwrap(),
+            before_head
+        );
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_hook_line_length_with_wrong_threshold() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 73 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD"],
+            "resolve fixture candidate HEAD before threshold rejection",
+        )
+        .unwrap();
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(
+            git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "resolve fixture candidate HEAD after threshold rejection",
+            )
+            .unwrap(),
+            before_head
+        );
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
     fn metadata_recovery_rejects_unrelated_hook_diagnostic() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
