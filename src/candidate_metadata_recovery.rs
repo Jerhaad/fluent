@@ -1390,6 +1390,68 @@ mod tests {
     }
 
     #[test]
+    fn metadata_recovery_rejects_unrelated_hook_diagnostic() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 1 exceeds 72 characters\ndependency cycle: app -> render -> app\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_non_positive_hook_line() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 0 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
     fn metadata_recovery_hook_wording_is_idempotent() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
