@@ -129,7 +129,10 @@ pub(crate) fn run_candidate_gate_with_prior(
         check_commit_metadata(&request, &identity.effective_base_commit)?,
     ];
     checks.extend(check_behavior_references(&request)?);
-    checks.push(run_project_check(&request)?);
+    checks.push(run_project_check(
+        &request,
+        &identity.effective_base_commit,
+    )?);
 
     let disposition = if checks
         .iter()
@@ -1463,7 +1466,10 @@ fn learner_only_delta(workspace: &Path, from: &str, to: &str) -> Result<bool> {
             .all(|path| path.starts_with(".fluent/expertise/")))
 }
 
-fn run_project_check(request: &CandidateGateRequest<'_>) -> Result<CandidateCheckEvidence> {
+fn run_project_check(
+    request: &CandidateGateRequest<'_>,
+    base_commit: &str,
+) -> Result<CandidateCheckEvidence> {
     if crate::hooks::find_hook(request.project_root, "check-pre-merge").is_none() {
         return Ok(check(
             "project-check",
@@ -1491,6 +1497,7 @@ fn run_project_check(request: &CandidateGateRequest<'_>) -> Result<CandidateChec
         attempt_id: Some(request.attempt_id.to_string()),
         task_id: request.task_id.map(str::to_string),
         candidate_commit: Some(request.candidate_commit.to_string()),
+        base_commit: Some(base_commit.to_string()),
         artifact_dir: request.artifact_path.parent().map(Path::to_path_buf),
         log_dir,
         ..Default::default()
@@ -3070,6 +3077,33 @@ mod tests {
                 .unwrap()
                 .contains("dependency cycle")
         }));
+    }
+
+    #[test]
+    fn project_check_receives_the_effective_candidate_base() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit("src/lib.rs", "pub fn value() {}\n", "Add value");
+        let hooks = fixture.project.path().join(".fluent/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("check-pre-merge");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\n[ \"$FLUENT_BASE_COMMIT\" = \"{}\" ]\n",
+                fixture.base
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
+
+        assert_eq!(
+            check(&evidence, "project-check").status,
+            CandidateCheckStatus::Passed
+        );
     }
 
     #[test]
