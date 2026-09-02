@@ -24874,7 +24874,7 @@ fn work_show_explains_evidence_only_recovery_history_and_next_action() {
     fs::create_dir_all(project.join(&targeted_path)).unwrap();
     fs::write(
         project.join(&targeted_path).join("review.md"),
-        "Verdict: fail\nDisposition: evidence-needed\n",
+        "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n",
     )
     .unwrap();
     let targeted_review_path = format!("{targeted_path}/review.md");

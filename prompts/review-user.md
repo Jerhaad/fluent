@@ -33,8 +33,12 @@ This unchanged candidate is under host-evidence recovery. Assess only whether
 the immutable host evidence at {{evidence_snapshot_path}} resolves the decision
 recorded at {{evidence_prior_review_path}} for commit
 {{evidence_candidate_commit}}. If you fail, include exactly one line:
-`Disposition: evidence-needed` when more proof could resolve it, or
-`Disposition: code-change` when source work is required.
+`Disposition: evidence-needed` only when a concrete external host remediation
+could resolve it. That choice must also include exactly one
+`External-Condition: <host condition to correct>` line and one
+`Additional-Proof: <evidence to attach after correction>` line. When the exact
+command has already run against this exact candidate and no external
+remediation is named, use `Disposition: code-change`.
 {{/if}}
 
 ## Phase 1 — Understand the Work Item

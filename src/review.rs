@@ -298,8 +298,38 @@ pub enum EvidenceDisposition {
     CodeChange,
 }
 
+/// The actionable host condition and proof a reviewer requests before waiting
+/// for another evidence attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceNeededReason {
+    pub external_condition: String,
+    pub additional_proof: String,
+}
+
+fn extract_evidence_needed_reason(content: &str) -> Option<EvidenceNeededReason> {
+    let value = |label: &str| {
+        let values = content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let line = line.strip_prefix("- ").unwrap_or(line);
+                let (actual, value) = line.split_once(':')?;
+                actual.trim().eq_ignore_ascii_case(label).then(|| value.trim())
+            })
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        (values.len() == 1).then(|| values[0].to_string())
+    };
+    Some(EvidenceNeededReason {
+        external_condition: value("External-Condition")?,
+        additional_proof: value("Additional-Proof")?,
+    })
+}
+
 /// Read the fail-only disposition from an evidence-targeted review. A pass must
-/// not carry a disposition, and malformed or missing values stay uncertain.
+/// not carry a disposition. `evidence-needed` is valid only when the reviewer
+/// names both an external remediation and the proof that would resolve it;
+/// otherwise a complete candidate-bound failure requires a source correction.
 pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition> {
     if extract_verdict(content) != Verdict::Fail {
         return None;
@@ -310,7 +340,10 @@ pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition
             return None;
         }
         match value.trim().to_ascii_lowercase().as_str() {
-            "evidence-needed" => Some(EvidenceDisposition::EvidenceNeeded),
+            "evidence-needed" if extract_evidence_needed_reason(content).is_some() => {
+                Some(EvidenceDisposition::EvidenceNeeded)
+            }
+            "evidence-needed" => Some(EvidenceDisposition::CodeChange),
             "code-change" => Some(EvidenceDisposition::CodeChange),
             _ => None,
         }
@@ -465,10 +498,16 @@ mod tests {
     }
 
     #[test]
-    fn evidence_targeted_disposition_is_fail_only_and_typed() {
+    fn evidence_needed_requires_actionable_host_reason() {
+        assert_eq!(
+            extract_evidence_disposition(
+                "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n"
+            ),
+            Some(EvidenceDisposition::EvidenceNeeded)
+        );
         assert_eq!(
             extract_evidence_disposition("Verdict: fail\nDisposition: evidence-needed\n"),
-            Some(EvidenceDisposition::EvidenceNeeded)
+            Some(EvidenceDisposition::CodeChange)
         );
         assert_eq!(
             extract_evidence_disposition("Verdict: fail\nDisposition: code-change\n"),

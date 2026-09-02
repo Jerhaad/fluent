@@ -14253,7 +14253,7 @@ mod tests {
         add_evidence_targeted_review(
             tmp.path(),
             &store,
-            "Verdict: fail\nDisposition: evidence-needed\n",
+            "Verdict: fail\nDisposition: evidence-needed\nExternal-Condition: Restore the host launch network.\nAdditional-Proof: Attach a rerun after restoring it.\n",
         );
         let before = store.read_work_item("work-1").unwrap();
         let writer_count = before.attempts[0]
