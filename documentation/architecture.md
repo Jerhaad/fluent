@@ -980,7 +980,12 @@ frontier for an explicit Writer extension.
 If the Writer-completion gate pauses because a required Plan row is an
 authorized-host check, the row is a different evidence frontier: completing it
 produces host proof, not a source commit. The handoff names the exact
-`plan:<step>` row, command, unchanged candidate, and Writer completion matrix.
+`plan:<step>` row, resolved command, unchanged candidate, and Writer completion
+matrix. The resolver preserves the approved Plan text and accepts either a
+direct command reference, an inline code command, or one unambiguous command
+embedded in the row's Deliverable or Verification prose. If those fields name
+zero or multiple executable commands, Fluent remains paused for an explicit
+human decision rather than guessing.
 After running that command on the authorized host, create the same schema-
 version-1 evidence document and attach it with:
 

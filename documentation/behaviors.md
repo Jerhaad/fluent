@@ -655,6 +655,17 @@ stale candidates, commands, or rows SHALL be rejected without mutation.
 Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
 Test: src/host_evidence.rs (plan_row_host_evidence_rejects_wrong_command_without_mutation)
 
+### B26
+
+WHEN a required Plan row places one executable host command in its direct
+reference, inline code, Deliverable, or Verification prose, THE SYSTEM SHALL
+resolve that command without changing the approved planning text and use it for
+the candidate-bound evidence check. IF the row contains no command or more than
+one command-shaped reference, THE SYSTEM SHALL keep the Attempt paused for an
+explicit human decision rather than selecting one implicitly.
+Test: src/host_evidence.rs (plan_row_host_evidence_resolves_command_from_deliverable_prose)
+Test: src/host_evidence.rs (plan_row_host_evidence_resolves_inline_command_and_rejects_ambiguity)
+
 ## Test harnesses
 
 | Harness | Runs | Usage |

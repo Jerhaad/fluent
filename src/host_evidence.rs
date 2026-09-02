@@ -15,8 +15,8 @@ use crate::review::{self, Verdict};
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
     EvidenceReviewContext, EvidenceReviewTarget, Task, TaskKind, TaskStatus, WorkModelError,
-    WorkModelStore, WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionState,
-    WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
+    WorkModelStore, WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionRow,
+    WriterCompletionState, WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
 };
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
@@ -25,6 +25,51 @@ const MAX_FOCUSED_OUTPUT_BYTES: u64 = 384 * 1024;
 const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
 const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
 const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+const PLAN_COMMAND_LAUNCHERS: &[&str] = &[
+    "bash",
+    "bazel",
+    "bun",
+    "bundle",
+    "cargo",
+    "cmake",
+    "curl",
+    "deno",
+    "docker",
+    "dotnet",
+    "env",
+    "git",
+    "go",
+    "gradle",
+    "java",
+    "just",
+    "make",
+    "mvn",
+    "node",
+    "ninja",
+    "npm",
+    "npx",
+    "perl",
+    "pip",
+    "pip3",
+    "pnpm",
+    "podman",
+    "pytest",
+    "python",
+    "python3",
+    "rake",
+    "rsync",
+    "ruby",
+    "sh",
+    "shellcheck",
+    "ssh",
+    "swift",
+    "timeout",
+    "uv",
+    "wget",
+    "yarn",
+    "zsh",
+];
 
 /// Version-one operator evidence document. Its serialized bytes, not a
 /// re-rendering, are the audited artifact.
@@ -98,10 +143,10 @@ struct ValidatedCandidateGateFrontier {
     binding_bytes: Vec<u8>,
 }
 
-/// A pending Plan row whose verification is an exact command that must run on
-/// an authorized host. The Writer cannot complete this row because it does not
-/// have that host's credentials or runtime; the operator binds its result to
-/// the unchanged candidate instead.
+/// A pending Plan row whose resolved command must run on an authorized host.
+/// The Writer cannot complete this row because it does not have that host's
+/// credentials or runtime; the operator binds its result to the unchanged
+/// candidate instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanHostEvidenceAction {
     pub plan_row: String,
@@ -340,12 +385,10 @@ pub(crate) fn pending_plan_host_evidence_action(
     matrix.rows.into_iter().find_map(|row| {
         if row.kind != WriterCompletionRequirementKind::Plan
             || row.state != WriterCompletionState::Pending
-            || row.verification_refs.len() != 1
         {
             return None;
         }
-        let command = row.verification_refs[0].trim().to_string();
-        validate_focused_command(&command).ok()?;
+        let command = resolve_plan_row_command(&row)?;
         Some(PlanHostEvidenceAction {
             plan_row: row.id,
             command,
@@ -353,6 +396,212 @@ pub(crate) fn pending_plan_host_evidence_action(
             matrix_artifact: matrix_ref.path.clone(),
         })
     })
+}
+
+/// Resolve one exact executable command from a Plan row without changing the
+/// approved planning text. Older plans often put a sentence in `Verification`
+/// and the runnable command in `Deliverable`/`State reached`; newer plans may
+/// put the command in an inline code span. We accept only one unambiguous
+/// command-shaped candidate across both fields. Multiple candidates remain an
+/// explicit human-recovery condition rather than an educated guess.
+fn resolve_plan_row_command(row: &WriterCompletionRow) -> Option<String> {
+    let mut candidates = row
+        .verification_refs
+        .iter()
+        .chain(std::iter::once(&row.requirement))
+        .flat_map(|text| extract_plan_command_candidates(text))
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    let [command] = candidates.as_slice() else {
+        return None;
+    };
+    Some(command.clone())
+}
+
+fn extract_plan_command_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // Inline code is the least ambiguous representation and is common in
+    // Verification prose. Ignore spans that contain ordinary path labels.
+    let mut code_start = None;
+    for (index, character) in text.char_indices() {
+        if character != '`' {
+            continue;
+        }
+        if let Some(start) = code_start.take() {
+            if let Some(command) = normalize_plan_command_candidate(&text[start..index]) {
+                candidates.push(command);
+            }
+        } else {
+            code_start = Some(index + character.len_utf8());
+        }
+    }
+
+    // Deliverables and narrative verification commonly use "Run <command>",
+    // while some plans say "execute <command>" or "command: <command>".
+    for marker in ["run ", "execute ", "command:"] {
+        let lower = text.to_ascii_lowercase();
+        let marker_lower = marker.to_ascii_lowercase();
+        let mut offset = 0;
+        while let Some(relative) = lower[offset..].find(&marker_lower) {
+            let marker_start = offset + relative;
+            let before = text[..marker_start].chars().next_back();
+            if before.is_none_or(|character| !character.is_ascii_alphanumeric()) {
+                let tail_start = marker_start + marker.len();
+                if let Some(command) = command_from_plan_tail(&text[tail_start..]) {
+                    candidates.push(command);
+                }
+            }
+            offset = marker_start + marker.len();
+        }
+    }
+
+    // Finally handle a command embedded in prose without an explicit marker,
+    // such as "the exact DGX_BRING_UP_LIVE=1 ./tests/... check". Environment
+    // assignments and known launchers are strong enough starts to avoid
+    // treating arbitrary nouns or paths as commands.
+    let tokens = text.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        let token = trim_plan_token(token);
+        if !is_plan_command_start(token) {
+            continue;
+        }
+        // The executable operand of an environment-prefixed command is not a
+        // second command. The complete `NAME=value <command>` candidate was
+        // already collected from the assignment token.
+        if index > 0 && is_plan_command_start(trim_plan_token(tokens[index - 1])) {
+            continue;
+        }
+        if let Some(command) = command_from_plan_tokens(&tokens[index..]) {
+            candidates.push(command);
+        }
+    }
+
+    candidates
+}
+
+fn command_from_plan_tail(tail: &str) -> Option<String> {
+    let tokens = tail.split_whitespace().collect::<Vec<_>>();
+    command_from_plan_tokens(&tokens)
+}
+
+fn command_from_plan_tokens(tokens: &[&str]) -> Option<String> {
+    let mut selected: Vec<String> = Vec::new();
+    for raw in tokens {
+        let token = trim_plan_token(raw);
+        if token.is_empty() {
+            break;
+        }
+        if !selected.is_empty()
+            && selected
+                .iter()
+                .any(|selected| is_plan_script_operand(selected))
+            && !token.starts_with('-')
+        {
+            break;
+        }
+        let lower = token.to_ascii_lowercase();
+        if !selected.is_empty()
+            && matches!(
+                lower.as_str(),
+                "unchanged" | "on" | "at" | "against" | "then" | "and" | "while" | "with"
+            )
+        {
+            break;
+        }
+        if selected.is_empty() && !is_plan_command_start(token) {
+            return None;
+        }
+        selected.push(token.to_string());
+        if raw.chars().next_back().is_some_and(|character| {
+            matches!(
+                character,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
+            )
+        }) {
+            break;
+        }
+    }
+    let candidate = selected.join(" ");
+    normalize_plan_command_candidate(&candidate)
+}
+
+fn normalize_plan_command_candidate(raw: &str) -> Option<String> {
+    let mut candidate = raw.trim();
+    while candidate.chars().next_back().is_some_and(|character| {
+        matches!(
+            character,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
+        )
+    }) {
+        candidate = candidate[..candidate.len() - 1].trim_end();
+    }
+    if !is_plan_command(candidate) {
+        return None;
+    }
+    validate_focused_command(candidate).ok()?;
+    Some(candidate.to_string())
+}
+
+fn trim_plan_token(token: &str) -> &str {
+    token.trim_matches(|character: char| matches!(character, '`' | '(' | '[' | '{' | '"' | '\''))
+}
+
+fn is_plan_script_operand(token: &str) -> bool {
+    let token = trim_plan_token(token).trim_end_matches(['.', ',', ';', ':', '!', '?']);
+    (token.starts_with("./") || token.contains('/'))
+        && [".sh", ".bash", ".py", ".rb", ".js", ".ts"]
+            .iter()
+            .any(|suffix| token.ends_with(suffix))
+}
+
+fn is_plan_command_start(token: &str) -> bool {
+    let token = trim_plan_token(token);
+    is_plan_environment_assignment(token)
+        || token.starts_with("./")
+        || token.starts_with('/')
+        || is_plan_script_operand(token)
+        || PLAN_COMMAND_LAUNCHERS.iter().any(|launcher| {
+            token == *launcher
+                || token
+                    .strip_prefix(launcher)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+}
+
+fn is_plan_command(token: &str) -> bool {
+    let mut words = token.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if is_plan_environment_assignment(first) {
+        let Some(second) = words.next() else {
+            return false;
+        };
+        return is_plan_command_start(second) || second.starts_with('-');
+    }
+    if PLAN_COMMAND_LAUNCHERS.iter().any(|launcher| {
+        first == *launcher
+            || first
+                .strip_prefix(launcher)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }) {
+        return words.next().is_some();
+    }
+    is_plan_command_start(first)
+}
+
+fn is_plan_environment_assignment(token: &str) -> bool {
+    let Some((name, value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && !value.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            (index == 0 && (character == '_' || character.is_ascii_alphabetic()))
+                || (index > 0 && (character == '_' || character.is_ascii_alphanumeric()))
+        })
 }
 
 /// Return a host-materialized completion matrix only after the evidence review
@@ -402,8 +651,7 @@ pub(crate) fn completed_plan_host_matrix_ref(
             || source_row.kind != WriterCompletionRequirementKind::Plan
             || source_row.state != WriterCompletionState::Pending
             || source_row.requirement != binding.requirement
-            || source_row.verification_refs.len() != 1
-            || source_row.verification_refs[0].trim() != binding.command
+            || resolve_plan_row_command(source_row).as_deref() != Some(binding.command.as_str())
         {
             return None;
         }
@@ -516,8 +764,7 @@ pub(crate) fn apply_completed_plan_host_evidence(
         if source_row.kind != WriterCompletionRequirementKind::Plan
             || source_row.state != WriterCompletionState::Pending
             || source_row.requirement != binding.requirement
-            || source_row.verification_refs.len() != 1
-            || source_row.verification_refs[0].trim() != binding.command
+            || resolve_plan_row_command(source_row).as_deref() != Some(binding.command.as_str())
         {
             continue;
         }
@@ -564,10 +811,7 @@ pub(crate) fn apply_completed_plan_host_evidence(
         }) else {
             continue;
         };
-        if !row
-            .verification_refs
-            .iter()
-            .any(|command| command == &binding.command)
+        if resolve_plan_row_command(row).as_deref() != Some(binding.command.as_str())
             || row.requirement != binding.requirement
         {
             continue;
@@ -1444,14 +1688,11 @@ pub fn attach_plan_row(
                     "Plan row {plan_row:?} is already complete"
                 )));
             }
-            if row.verification_refs.len() != 1 {
-                return Err(ineligible(&format!(
-                    "Plan row {plan_row:?} must contain exactly one host verification command"
-                )));
-            }
-            let command = row.verification_refs[0].trim().to_string();
-            validate_focused_command(&command)
-                .map_err(|error| ineligible(&format!("Plan row command is invalid: {error}")))?;
+            let command = resolve_plan_row_command(row).ok_or_else(|| {
+                ineligible(&format!(
+                    "Plan row {plan_row:?} must contain exactly one unambiguous host verification command"
+                ))
+            })?;
             if document.check != command {
                 return Err(ineligible(&format!(
                     "evidence check {:?} does not match Plan row command {:?}",
@@ -3221,6 +3462,20 @@ mod tests {
         String,
         PathBuf,
     ) {
+        plan_host_evidence_fixture_with_row(command, "Host check passed", command)
+    }
+
+    fn plan_host_evidence_fixture_with_row(
+        command: &str,
+        deliverable: &str,
+        verification: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        WorkModelStore,
+        String,
+        PathBuf,
+    ) {
         let project = tempfile::TempDir::new().unwrap();
         let workspace = tempfile::TempDir::new().unwrap();
         crate::git::run(
@@ -3267,7 +3522,7 @@ mod tests {
             plan: Some(format!(
                 "| # | State reached | Behaviors | Verification | Req? |\n\
                  |---|---------------|-----------|--------------|------|\n\
-                 | 6 | Host check passed | | {command} | Yes |\n"
+                 | 6 | {deliverable} | | {verification} | Yes |\n"
             )),
             ..Default::default()
         });
@@ -3483,6 +3738,107 @@ mod tests {
             fs::read(project.path().join(&source.path)).unwrap(),
             source_bytes,
             "the immutable Writer matrix is not rewritten by host recovery"
+        );
+    }
+
+    #[test]
+    fn plan_row_host_evidence_resolves_command_from_deliverable_prose() {
+        let command = "DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh";
+        let deliverable = format!("Run {command} unchanged on spark1.");
+        let verification = "The live smoke preserves isolation and reports content-free evidence.";
+        let (project, _workspace, store, candidate, evidence_path) =
+            plan_host_evidence_fixture_with_row(command, &deliverable, verification);
+
+        let before = store.read_work_item("work-1").unwrap();
+        let action = pending_plan_host_evidence_action(project.path(), &before.attempts[0])
+            .expect("the command in the approved Deliverable is recoverable");
+        assert_eq!(action.command, command);
+        assert_eq!(action.plan_row, "plan:step-6");
+
+        let recovery = attach_plan_row(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            &action.plan_row,
+            &evidence_path,
+        )
+        .expect("the extracted command should bind unchanged-candidate evidence");
+        assert_eq!(recovery.candidate_commit, candidate);
+        assert_eq!(recovery.targets.len(), 1);
+
+        let review_id = recovery.targets[0].review_task_id.clone().unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let review = attempt
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == review_id)
+                    .unwrap();
+                let review_path = review.artifact_area.as_ref().unwrap().path.clone();
+                fs::create_dir_all(project.path().join(&review_path)).unwrap();
+                fs::write(
+                    project.path().join(&review_path).join("review.md"),
+                    "Verdict: pass\n",
+                )
+                .unwrap();
+                work_model::set_task_terminal(review, TaskStatus::Complete);
+                attempt.evidence_recoveries[0].state = EvidenceRecoveryState::Complete;
+                Ok(())
+            })
+            .unwrap();
+
+        let completed = store.read_work_item("work-1").unwrap();
+        let attempt = &completed.attempts[0];
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        let source = writer_completion_matrix_ref(project.path(), attempt, writer).unwrap();
+        let source_bytes = fs::read(project.path().join(&source.path)).unwrap();
+        let mut projected: WriterCompletionMatrix = serde_json::from_slice(&source_bytes).unwrap();
+        assert!(apply_completed_plan_host_evidence(
+            project.path(),
+            attempt,
+            writer,
+            &source,
+            &mut projected,
+        ));
+        assert_eq!(
+            projected
+                .rows
+                .iter()
+                .find(|row| row.id == action.plan_row)
+                .unwrap()
+                .state,
+            WriterCompletionState::Complete
+        );
+    }
+
+    #[test]
+    fn plan_row_host_evidence_resolves_inline_command_and_rejects_ambiguity() {
+        let command = "DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh";
+        let inline_verification = format!("The exact `{command}` runs on spark1.");
+        let (project, _workspace, store, _candidate, _evidence_path) =
+            plan_host_evidence_fixture_with_row(command, "Host smoke", &inline_verification);
+        let before = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            pending_plan_host_evidence_action(project.path(), &before.attempts[0])
+                .unwrap()
+                .command,
+            command
+        );
+
+        let ambiguous = format!("Run {command}; then run python3 tests/other.py.");
+        let (project, _workspace, store, _candidate, _evidence_path) =
+            plan_host_evidence_fixture_with_row(command, "Host smoke", &ambiguous);
+        let before = store.read_work_item("work-1").unwrap();
+        assert!(
+            pending_plan_host_evidence_action(project.path(), &before.attempts[0]).is_none(),
+            "multiple executable references must remain an explicit ambiguity"
         );
     }
 

@@ -307,13 +307,18 @@ fluent attempt evidence attach <work-item-id> <attempt-id> \
   --plan-row plan:step-N
 ```
 
-The evidence `check` must exactly equal the Plan row's direct command. Fluent
-binds the result to the unchanged Writer candidate and source completion matrix,
-records an audited binding, and schedules one targeted Tests Review. Passing
-evidence can complete that host-owned row after the targeted Review and continue
-to the canonical gates; failing evidence remains a reviewed correction and does
-not make the row complete. Retrying the same command is idempotent. This route
-does not ask the Writer to create a source commit for host-only work.
+The evidence `check` must exactly equal the one command Fluent resolves from the
+Plan row. The row may contain a direct command reference, an inline code command,
+or one command embedded in its Deliverable or Verification prose. Fluent keeps
+the approved planning text unchanged; if the row contains no command or more
+than one command-shaped reference, it remains a human-recovery pause instead of
+guessing. Fluent binds the result to the unchanged Writer candidate and source
+completion matrix, records an audited binding, and schedules one targeted Tests
+Review. Passing evidence can complete that host-owned row after the targeted
+Review and continue to the canonical gates; failing evidence remains a reviewed
+correction and does not make the row complete. Retrying the same command is
+idempotent. This route does not ask the Writer to create a source commit for
+host-only work.
 
 Fluent snapshots the exact document, binds it to that candidate, and reruns
 only the named reviewers. Do not edit the candidate or invent a commit. Inspect
