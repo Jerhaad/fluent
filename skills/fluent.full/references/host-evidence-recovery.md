@@ -1,10 +1,18 @@
 # Recover a host-evidence finding
 
-Use this uncommon host-only recovery path when the candidate does not need a
-source change and either a failed review asks for proof that a trusted host can
-run or the final candidate gate asks for one command-shaped `Test:` reference
-that canonical Tester did not run. Create one JSON file on that host, for
-example:
+Use exactly one recovery path. Attach host-only evidence when the candidate is
+correct and a concrete external condition needs another host run. Classify a
+candidate-bound source correction when exact evidence already ran for the exact
+candidate and the review lacks actionable host remediation. These paths are not
+interchangeable: attachment keeps the candidate waiting, while classification
+schedules a Writer on the existing Attempt.
+
+## Attach host-only evidence
+
+Use this path when the candidate does not need a source change and either a
+failed review asks for proof that a trusted host can run or the final candidate
+gate asks for one command-shaped `Test:` reference that canonical Tester did not
+run. Create one JSON file on that host, for example:
 
 ```json
 {"schema_version":1,"producer":"release-host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"...captured output..."}
@@ -48,18 +56,22 @@ failing evidence remains a reviewed correction and does not make the row
 complete. Retrying the same command is idempotent. This route does not ask the
 Writer to create a source commit for host-only work.
 
-Fluent snapshots the exact document, binds it to that candidate, and reruns
-only the named reviewers. Do not edit the candidate or invent a commit. Inspect
-the Work Item again for the next action. `evidence-needed` means attach new host
-proof only when the review names exactly one non-empty `External-Condition` and
-exactly one non-empty `Additional-Proof` that would resolve it. A single
+Fluent snapshots the exact document, binds it to that candidate, and reruns only
+the named reviewers. Do not edit the candidate or invent a commit. Inspect the
+Work Item again for the next action.
+
+## Classify a candidate-bound source correction
+
+For a new evidence-targeted review, `evidence-needed` is valid only when the
+review names exactly one non-empty `External-Condition` and exactly one
+non-empty `Additional-Proof` that would resolve it. A single
 `Disposition: evidence-needed` marker with missing, empty, or otherwise
-malformed qualification follows the ordinary `code-change` Writer path.
-Missing, duplicate, or unknown `Disposition` markers remain an uncertain pause;
-they do not authorize either recovery route. If the exact command already ran
-against the exact candidate and the failed review did not name such a
-condition, authorize the source correction on the existing paused Attempt
-instead of attaching the same proof:
+malformed qualification follows the ordinary `code-change` Writer path. Missing,
+duplicate, or unknown `Disposition` markers remain an uncertain pause. A legacy
+paused recovery containing an unqualified marker may use this classification
+path. If exact evidence already ran against the exact candidate and the failed
+review did not name an actionable condition, classify the source correction on
+the existing paused Attempt instead of attaching the same proof:
 
 ```sh
 fluent attempt evidence classify <work-item-id> <attempt-id> \
@@ -71,18 +83,17 @@ fluent attempt evidence classify <work-item-id> <attempt-id> \
 
 Use the failed targeted Tests Review path and evidence digest shown by
 `fluent work-item show`. Fluent accepts this command only for the saved,
-complete actionable `evidence-needed` review or a legacy paused recovery
-containing the unqualified marker; a new unqualified review is already on the
-ordinary Writer path. The candidate, clean worktree, and matching Attempt
-frontier must remain unchanged. A new classification must target the current
-paused recovery; a later `Reviewing` or `NeedsEvidence` recovery rejects an
-older classification and its Writer continuation. Exact replay still returns
-the stored result and safely reconciles its audit. Fluent records the
-authorization, explicit `code-change` disposition, and audit artifact, then
-schedules one corrective Writer with the failed review, immutable evidence
-snapshot, and audit input;
-resume it with `fluent queue resume <work-item-id> --attempt <attempt-id>`.
-Repeating the exact command returns the same Writer and audit identifiers
-without creating another record, while stale or different inputs are rejected
-without mutation. A passing targeted review still requires all exact-commit
-evidence and Learning before landing.
+complete actionable `evidence-needed` review or a legacy paused recovery with
+the unqualified marker; a new unqualified review is already on the ordinary
+Writer path. The candidate, clean worktree, and matching Attempt frontier must
+remain unchanged. A new classification must target the current paused
+recovery; a later `Reviewing` or `NeedsEvidence` recovery rejects an older
+classification and its Writer continuation. Exact replay returns the stored
+result and safely reconciles its audit. Fluent records the authorization,
+explicit `code-change` disposition, and audit artifact, then schedules one
+corrective Writer with the failed review, immutable evidence snapshot, and
+audit input; resume it with `fluent queue resume <work-item-id> --attempt
+<attempt-id>`. Repeating the exact command returns the same Writer and audit
+identifiers without creating another record, while stale or different inputs
+are rejected without mutation. A passing targeted review still requires all
+exact-commit evidence and Learning before landing.

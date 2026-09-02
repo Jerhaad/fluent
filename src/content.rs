@@ -829,6 +829,45 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn bundled_fluent_skill_separates_host_evidence_recovery_paths() {
+        let skill = bundled_skill_content("fluent/SKILL.md")
+            .expect("bundled fluent skill must have SKILL.md");
+        assert!(
+            skill.lines().count() <= 500,
+            "bundled fluent SKILL.md must stay under 500 lines"
+        );
+        let pointer = skill
+            .split_once("### Recover a host-evidence finding")
+            .and_then(|(_, section)| section.split_once("### Codex authentication pauses"))
+            .map(|(section, _)| section)
+            .expect("the bundled skill must point to host-evidence recovery guidance");
+        assert!(pointer.contains("host-only evidence attachment"));
+        assert!(pointer.contains("candidate-bound source correction"));
+        assert!(bundled_skill_content("fluent/references/coder-environment.md").is_some());
+
+        let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md")
+            .expect("bundled host-evidence recovery guide must be present");
+        let attachment = guide
+            .split_once("## Attach host-only evidence")
+            .and_then(|(_, rest)| {
+                rest.split_once("## Classify a candidate-bound source correction")
+            })
+            .map(|(section, _)| section)
+            .expect("the guide must separate host-only attachment from classification");
+        assert!(attachment.contains("candidate does not need a source change"));
+        assert!(
+            !attachment.contains("malformed") && !attachment.contains("evidence-needed"),
+            "malformed-marker rules belong only to classification guidance"
+        );
+        let classification = guide
+            .split_once("## Classify a candidate-bound source correction")
+            .map(|(_, section)| section)
+            .expect("the guide must document candidate-bound classification");
+        assert!(classification.contains("source correction"));
+        assert!(classification.contains("malformed qualification"));
+    }
+
+    #[test]
     fn bundled_fluent_skill_uses_public_description() {
         const DESCRIPTION: &str = "description: Operate Fluent, a self-improving software factory. Use when a user wants to review, build, fix, or improve software with Fluent. Invoke when they ask to install or initialize Fluent; capture an Observation; define a slice; create or refine a Brief, Behavior Specification, Technical Approach, Implementation Plan, or Work Item; run, queue, inspect, resume, or recover an Attempt; review a codebase through Fluent; manage or land a Merge Candidate; capture project Expertise; or configure Fluent's agents, scheduler, sandboxes, or remote execution.";
         let skill = bundled_skill_content("fluent/SKILL.md")

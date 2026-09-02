@@ -127,25 +127,14 @@ For a codebase, module, or area review (not building something new), capture eno
 
 ## Recover an enclosing agent sandbox
 
-Configured initialization and local execution may report
-`FLUENT_HOST_SANDBOX_BLOCKED` when this skill is running inside Codex or Claude
-Code and the enclosing agent sandbox prevents Fluent from applying its own
-macOS worker sandbox.
-
-When that code appears, rerun the exact same Fluent command through the host
-agent's scoped unsandboxed-command approval:
-
-- In Codex, request escalated execution for that command and explain that Fluent
-  needs to establish its own worker sandbox, access the selected provider's
-  credentials, and manage Git worktrees.
-- In Claude Code, retry that Bash command with its unsandboxed-command escape
-  hatch so the normal Claude Code permission flow asks for approval.
-
-Tell the user that the approval applies to the Fluent command, while Fluent will
-still sandbox every worker it launches. Do not add Fluent's `--no-sandbox`, do
-not switch the whole host-agent session to full access, and do not mistake this
-boundary error for a provider login failure. After approval, continue with the
-same command and the same Work Item or Attempt.
+Configured initialization and local execution may report `FLUENT_HOST_SANDBOX_BLOCKED`
+when an enclosing Codex or Claude Code sandbox prevents Fluent from applying its
+worker sandbox. Rerun the same command through the host agent's scoped
+unsandboxed approval. In Codex, request escalated execution for that command.
+In Claude Code, retry that Bash command with its unsandboxed-command escape hatch.
+Tell the user the approval applies only to Fluent; Fluent will still sandbox every
+worker. Do not add Fluent's `--no-sandbox`; do not switch the whole host-agent
+session to full access. Continue with the same command and Work Item or Attempt.
 
 ## Delegated execution
 
@@ -273,37 +262,20 @@ settled review artifacts for the current candidate.
 
 ### Recover a host-evidence finding
 
-This is an uncommon host-only recovery path. Read
-[`references/host-evidence-recovery.md`](references/host-evidence-recovery.md)
-before attaching evidence or classifying a paused recovery. The guide covers
-the attachment, candidate-gate, Plan-row, and legacy-classification procedures.
+This recovery has two paths. Read the applicable section in
+[`references/host-evidence-recovery.md`](references/host-evidence-recovery.md):
+host-only evidence attachment when the candidate needs no source change and a concrete
+external condition needs another host run; candidate-bound source correction when
+exact evidence already ran but the review lacks actionable host remediation.
 
 ### Codex authentication pauses
 
-Autonomous Codex workers use a private authentication home and do not load the
-interactive Codex configuration or hooks. If Fluent pauses an Attempt for Codex
-authentication, run `codex login`, then resume the same work with `fluent attempt
-run <work-item-id> [attempt-id]`. Interactive Codex sessions continue to use the
-user's normal configuration and hooks.
-
-To make additional skills available to autonomous Codex roles, configure
-explicit skill roots. Project roots must stay inside the project and may be
-relative to its root. External roots belong in user configuration and must be
-absolute:
-
-```yaml
-codex:
-  skill-roots:
-    - /absolute/path/to/skills
-```
-
-Fluent validates and snapshots each root into the private worker home before
-the role is reserved. Symlinks and duplicate top-level skill names fail closed;
-the worker never receives access to the rest of the operator's home.
-
-Autonomous Claude Writers use an Attempt-scoped managed home. Their sandbox
-blocks the operator's persistent Claude project and memory tree; do not copy
-memory or session state from `~/.claude/projects` into a Work Item manually.
+Autonomous Codex workers use a private authentication home, not the interactive
+Codex configuration or hooks. If Fluent pauses an Attempt for Codex
+authentication, run `codex login`, then resume it with `fluent attempt run
+<work-item-id> [attempt-id]`. Interactive sessions use the user's normal
+configuration. For explicit skill roots or the autonomous Claude home, read
+[`references/coder-environment.md`](references/coder-environment.md).
 
 ### Recover Claude readiness failures
 
