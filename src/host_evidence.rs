@@ -363,6 +363,21 @@ pub fn classify_for_code_change(
             return Err(rejected_for("evidence snapshot bytes changed"));
         }
 
+        let writer = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .ok_or_else(rejected)?;
+        if writer.commit != candidate_commit
+            || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit)
+        {
+            return Err(rejected_for(
+                "the candidate workspace no longer matches the classified commit",
+            ));
+        }
+
         if let Some(prior) = recovery.code_change_classification.as_ref() {
             if prior.matches_request(
                 review_artifact,
@@ -416,11 +431,6 @@ pub fn classify_for_code_change(
         let review_task_id = review_task.id.clone();
         let attachment = recovery.attachment.clone();
         let recovery_id = recovery.id.clone();
-        let writer = attempt.tasks.iter().rev().find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-            .and_then(|task| task.output.as_ref()).ok_or_else(rejected)?;
-        if writer.commit != candidate_commit || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit) {
-            return Err(rejected());
-        }
         let operation_material = format!(
             "{attempt_id}\0{candidate_commit}\0{}\0{review_artifact}\0{review_digest}\0{evidence_digest}\0{authorization_digest}",
             recovery.id

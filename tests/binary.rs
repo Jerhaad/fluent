@@ -25233,6 +25233,78 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree() {
+    for stale in ["candidate", "worktree"] {
+        let tmp = TempDir::new().unwrap();
+        let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-replay");
+        let resolution = "The failed candidate-bound check needs a source correction.";
+        let classify_args = [
+            "attempt",
+            "evidence",
+            "classify",
+            "evidence-classify-replay",
+            "attempt-1",
+            "--candidate",
+            candidate.as_str(),
+            "--review-artifact",
+            targeted_path.as_str(),
+            "--evidence-digest",
+            digest.as_str(),
+            "--resolution",
+            resolution,
+        ];
+        fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .assert()
+            .success();
+
+        let classified = work_item_value(&project, "evidence-classify-replay");
+        let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+            ["code_change_classification"]["audit_artifact"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let model_before = persisted_work_snapshot(&project, "evidence-classify-replay");
+        let audit_before = fs::read(project.join(&audit_path)).unwrap();
+
+        match stale {
+            "candidate" => git::run(
+                &project,
+                &["commit", "--allow-empty", "-m", "Advance replay frontier"],
+                "advance replay frontier",
+            )
+            .unwrap(),
+            "worktree" => fs::write(project.join("stale-replay-marker"), b"dirty\n").unwrap(),
+            _ => unreachable!("stale replay cases are exhaustive"),
+        }
+
+        let replay = fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .output()
+            .unwrap();
+        assert!(
+            !replay.status.success(),
+            "stale {stale} classification replay unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, "evidence-classify-replay"),
+            model_before,
+            "stale {stale} replay changed persisted state"
+        );
+        assert_eq!(
+            fs::read(project.join(&audit_path)).unwrap(),
+            audit_before,
+            "stale {stale} replay changed the recovery audit"
+        );
+    }
+}
+
+#[test]
 fn classified_host_evidence_queue_resume_rejects_stale_continuation() {
     for stale in ["candidate", "evidence", "review", "audit"] {
         let tmp = TempDir::new().unwrap();
