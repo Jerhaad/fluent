@@ -1539,6 +1539,9 @@ mod tests {
         .unwrap();
         assert!(second.already_authorized);
         assert_eq!(second.task_id, first.task_id);
+        assert_eq!(second.audit_artifact, first.audit_artifact);
+        assert_eq!(second.candidate_commit, first.candidate_commit);
+        assert_eq!(second.protected_base_commit, first.protected_base_commit);
         assert_eq!(
             fixture.store.read_work_item("work-1").unwrap().attempts[0]
                 .tasks
@@ -1551,6 +1554,19 @@ mod tests {
             fixture.store.read_work_item("work-1").unwrap(),
             before_second_item
         );
+        let replayed_writer = fixture.store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .last()
+            .unwrap()
+            .clone();
+        assert!(replayed_writer.input_artifacts.contains(&ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: fixture.gate.clone(),
+        }));
+        assert!(replayed_writer.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id == "attempt-1-write-1"
+                && artifact.path.ends_with("/hooks/check-pre-merge.log")
+        }));
         assert_eq!(snapshot_artifacts(&artifact_root), before_second_artifacts);
         assert_eq!(
             git::run_stdout(
