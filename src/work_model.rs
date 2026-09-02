@@ -10958,23 +10958,16 @@ random banner prose that must be ignored
     fn host_evidence_classification_is_idempotent() {
         use sha2::Digest;
         use std::fs;
-        use std::process::Command;
 
         let project = tempfile::TempDir::new().unwrap();
         let root = project.path();
         let run_git = |args: &[&str]| {
-            let output = Command::new("git")
-                .current_dir(root)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
+            crate::git::run_stdout(
+                root,
                 args,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
+                "run host-evidence classification fixture Git command",
+            )
+            .unwrap()
         };
         run_git(&["init", "-q"]);
         run_git(&["config", "user.email", "test@example.com"]);
