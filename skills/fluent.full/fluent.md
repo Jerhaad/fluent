@@ -265,8 +265,11 @@ settled review artifacts for the current candidate.
 This recovery has two paths. Read the applicable section in
 [`references/host-evidence-recovery.md`](references/host-evidence-recovery.md):
 host-only evidence attachment when the candidate needs no source change and a concrete
-external condition needs another host run; candidate-bound source correction when
-exact evidence already ran but the review lacks actionable host remediation.
+external condition needs another host run; use candidate-bound source correction
+classification for a paused actionable `evidence-needed` recovery when the
+operator authorizes a source correction (or for a legacy paused recovery with an
+unqualified marker). A new malformed or unqualified review follows the ordinary
+Writer path.
 
 ### Codex authentication pauses
 

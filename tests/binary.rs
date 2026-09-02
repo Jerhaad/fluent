@@ -24540,6 +24540,66 @@ fn setup_paused_code_change_classification_fixture(
     )
 }
 
+fn bind_candidate_to_managed_sibling(
+    project: &Path,
+    work_item_id: &str,
+    candidate: &str,
+) -> PathBuf {
+    let workspace_relative =
+        fluent::work_model::initial_candidate_workspace_path(work_item_id, "attempt-1");
+    let workspace_name = Path::new(&workspace_relative)
+        .file_name()
+        .expect("managed candidate workspace has a name");
+    let workspace_path = project
+        .parent()
+        .expect("fixture project has a parent")
+        .join(workspace_name);
+    git::run(
+        project,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            workspace_path.to_str().unwrap(),
+            candidate,
+        ],
+        "create managed candidate fixture worktree",
+    )
+    .unwrap();
+
+    let store = WorkModelStore::new(project);
+    let workspace_relative_for_model = workspace_relative.clone();
+    store
+        .mutate_work_item(work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            for task in &mut attempt.tasks {
+                for workspace in task
+                    .workspace_access
+                    .reads
+                    .iter_mut()
+                    .chain(task.workspace_access.writes.iter_mut())
+                {
+                    if workspace.id == "candidate" {
+                        workspace.path = workspace_relative_for_model.clone();
+                    }
+                }
+                if let Some(context) = task.review_context.as_mut()
+                    && context.candidate_workspace_id == "candidate"
+                {
+                    context.candidate_workspace_path = workspace_relative_for_model.clone();
+                }
+                if let Some(output) = task.output.as_mut()
+                    && output.workspace_id == "candidate"
+                {
+                    output.workspace_path = workspace_relative_for_model.clone();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    workspace_path
+}
+
 #[test]
 fn attempt_evidence_attach_recovers_failed_no_change_writer_in_same_attempt() {
     let tmp = TempDir::new().unwrap();
@@ -25060,6 +25120,9 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
         setup_paused_code_change_classification_fixture(&tmp, "evidence-classify");
     let resolution = "The failed candidate-bound check needs a source correction.";
     let before = work_item_value(&project, "evidence-classify");
+    let before_persisted = persisted_work_snapshot(&project, "evidence-classify");
+    let before_targeted_review = fs::read(project.join(&targeted_path)).unwrap();
+    let before_evidence = fs::read(project.join(&snapshot_path)).unwrap();
     let target_task_id = before["attempts"][0]["tasks"]
         .as_array()
         .unwrap()
@@ -25124,6 +25187,7 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     );
     let audit_path = classification["audit_artifact"]["path"].as_str().unwrap();
     let audit_bytes = fs::read(project.join(audit_path)).unwrap();
+    let audit_directory = Path::new(audit_path).parent().unwrap().to_path_buf();
     let audit: serde_json::Value = serde_json::from_slice(&audit_bytes).unwrap();
     assert_eq!(audit["evidence"]["snapshot_path"], snapshot_path);
     assert_eq!(audit["evidence"]["digest"], digest);
@@ -25153,6 +25217,101 @@ fn failed_host_evidence_can_be_classified_for_code_change() {
     );
     assert_eq!(attempt["evidence_recoveries"].as_array().unwrap().len(), 1);
     assert_eq!(git_head(&project), candidate);
+    let after_first_persisted = persisted_work_snapshot(&project, "evidence-classify");
+    for before_entry in &before_persisted {
+        let is_mutable_aggregate = before_entry.path
+            == PathBuf::from(".fluent/work/items/evidence-classify.json")
+            || before_entry
+                .path
+                .starts_with(".fluent/work/attempts/evidence-classify/");
+        if is_mutable_aggregate {
+            continue;
+        }
+        let after_entry = after_first_persisted
+            .iter()
+            .find(|entry| entry.path == before_entry.path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "historical entry disappeared: {}",
+                    before_entry.path.display()
+                )
+            });
+        assert_eq!(
+            after_entry.kind,
+            before_entry.kind,
+            "kind changed for {}",
+            before_entry.path.display()
+        );
+        assert_eq!(
+            after_entry.bytes,
+            before_entry.bytes,
+            "bytes changed for {}",
+            before_entry.path.display()
+        );
+    }
+    assert_eq!(
+        fs::read(project.join(&targeted_path)).unwrap(),
+        before_targeted_review
+    );
+    assert_eq!(
+        fs::read(project.join(&snapshot_path)).unwrap(),
+        before_evidence
+    );
+    let before_attempt = &before["attempts"][0];
+    let after_attempt = attempt;
+    for before_task in before_attempt["tasks"].as_array().unwrap() {
+        let task_id = before_task["id"].as_str().unwrap();
+        let after_task = after_attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == task_id)
+            .unwrap_or_else(|| panic!("historical Task disappeared: {task_id}"));
+        assert_eq!(
+            after_task, before_task,
+            "Task history changed for {task_id}"
+        );
+    }
+    let before_recovery = &before_attempt["evidence_recoveries"][0];
+    let after_recovery = &after_attempt["evidence_recoveries"][0];
+    assert_eq!(after_recovery["id"], before_recovery["id"]);
+    assert_eq!(
+        after_recovery["candidate_commit"],
+        before_recovery["candidate_commit"]
+    );
+    assert_eq!(after_recovery["attachment"], before_recovery["attachment"]);
+    assert_eq!(
+        after_recovery["targets"][0]["prior_review_artifact"],
+        before_recovery["targets"][0]["prior_review_artifact"]
+    );
+    assert_eq!(
+        after_recovery["targets"][0]["role"],
+        before_recovery["targets"][0]["role"]
+    );
+    assert_eq!(
+        after_recovery["targets"][0]["review_task_id"],
+        before_recovery["targets"][0]["review_task_id"]
+    );
+    let writer_task_id = classification["writer_task_id"].as_str().unwrap();
+    let mut added_paths = after_first_persisted
+        .iter()
+        .filter(|entry| {
+            !before_persisted
+                .iter()
+                .any(|before| before.path == entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect::<Vec<_>>();
+    added_paths.sort();
+    let mut expected_added_paths = vec![
+        audit_directory,
+        PathBuf::from(audit_path),
+        PathBuf::from(format!(
+            ".fluent/work/tasks/evidence-classify/attempt-1/{writer_task_id}.json"
+        )),
+    ];
+    expected_added_paths.sort();
+    assert_eq!(added_paths, expected_added_paths);
     let first_model = shown.clone();
     let first_snapshot = persisted_work_snapshot(&project, "evidence-classify");
     let first_audit_bytes = audit_bytes.clone();
@@ -25351,6 +25510,222 @@ fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree
             "stale {stale} replay changed the recovery audit"
         );
     }
+}
+
+#[test]
+fn exact_host_evidence_classification_replay_accepts_claimed_writer() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-claimed");
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        "evidence-classify-claimed",
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    let first = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "initial classification failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let classified = work_item_value(&project, "evidence-classify-claimed");
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item("evidence-classify-claimed", |item| {
+            let attempt = &mut item.attempts[0];
+            let writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            writer.status = fluent::work_model::TaskStatus::Executing;
+            writer.started_at = Some(fluent::work_model::now_iso8601());
+            attempt.status = fluent::work_model::AttemptStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "claimed Writer replay failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(replay.stdout, first.stdout);
+    let shown = work_item_value(&project, "evidence-classify-claimed");
+    let writer = shown["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == writer_id)
+        .unwrap();
+    assert_eq!(writer["status"], "executing");
+    assert_eq!(shown["attempts"][0]["status"], "executing");
+}
+
+#[test]
+fn classified_writer_continuation_runs_with_candidate_bound_inputs() {
+    let tmp = TempDir::new().unwrap();
+    let work_item_id = "evidence-classify-writer";
+    let (project, candidate, _prior_review_path, targeted_path, digest, snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
+    let workspace_path = bind_candidate_to_managed_sibling(&project, work_item_id, &candidate);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        work_item_id,
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+    let classified = work_item_value(&project, work_item_id);
+    let attempt = &classified["attempts"][0];
+    let writer_id =
+        attempt["evidence_recoveries"][0]["code_change_classification"]["writer_task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let audit_path =
+        attempt["evidence_recoveries"][0]["code_change_classification"]["audit_artifact"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let bin_dir = tmp.path().join("bin-classified-writer");
+    let prompt_path = tmp.path().join("classified-writer-prompt");
+    write_mock_claude(
+        &bin_dir,
+        &format!(
+            r##"#!/bin/bash
+set -euo pipefail
+prompt=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    shift
+    prompt="${{1:-}}"
+    break
+  fi
+  shift
+done
+if [ -z "$prompt" ]; then
+  exit 0
+fi
+printf '%s' "$prompt" > "{}"
+printf 'classified source correction\n' >> README.md
+git add README.md
+git commit -m "Apply classified source correction" >/dev/null
+exit 0
+"##,
+            prompt_path.display()
+        ),
+    );
+    let run = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "run",
+            work_item_id,
+            "attempt-1",
+            &writer_id,
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "classified Writer failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let prompt = fs::read_to_string(&prompt_path).unwrap();
+    assert!(prompt.contains(&candidate), "prompt lost candidate binding");
+    assert!(
+        prompt.contains(&targeted_path),
+        "prompt lost review binding"
+    );
+    let after = work_item_value(&project, work_item_id);
+    let after_attempt = &after["attempts"][0];
+    let writer = after_attempt["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == writer_id)
+        .unwrap();
+    assert_eq!(writer["status"], "complete");
+    assert_eq!(
+        writer["output"]["workspace_path"],
+        fluent::work_model::initial_candidate_workspace_path(work_item_id, "attempt-1")
+    );
+    assert!(
+        writer["input_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| {
+                input["producer_id"] == "host-evidence" && input["path"] == snapshot_path
+            })
+    );
+    assert!(
+        writer["input_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| { input["producer_id"] == audit_path || input["path"] == audit_path })
+    );
+    assert_ne!(writer["output"]["commit"], candidate);
+    assert_eq!(after_attempt["status"], "executing");
+
+    git::run(
+        &project,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            workspace_path.to_str().unwrap(),
+        ],
+        "remove classified Writer fixture worktree",
+    )
+    .unwrap();
 }
 
 #[test]

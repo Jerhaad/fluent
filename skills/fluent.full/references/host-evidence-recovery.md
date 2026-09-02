@@ -1,11 +1,13 @@
 # Recover a host-evidence finding
 
 Use exactly one recovery path. Attach host-only evidence when the candidate is
-correct and a concrete external condition needs another host run. Classify a
-candidate-bound source correction when exact evidence already ran for the exact
-candidate and the review lacks actionable host remediation. These paths are not
-interchangeable: attachment keeps the candidate waiting, while classification
-schedules a Writer on the existing Attempt.
+correct and a concrete external condition needs another host run. Classify only
+a paused candidate-bound recovery when the operator authorizes a source
+correction: a new recovery must have an actionable `evidence-needed` review,
+while a legacy paused recovery may contain an unqualified marker. A new
+malformed or unqualified review follows the ordinary `code-change` Writer path.
+These paths are not interchangeable: attachment keeps the candidate waiting,
+while classification schedules a Writer on the existing Attempt.
 
 ## Attach host-only evidence
 

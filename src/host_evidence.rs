@@ -349,8 +349,18 @@ pub fn classify_for_code_change(
             return Err(rejected_for("evidence snapshot bytes changed"));
         }
 
-        let writer = attempt
-            .tasks
+        let source_writer_index = recovery
+            .code_change_classification
+            .as_ref()
+            .and_then(|classification| {
+                attempt
+                    .tasks
+                    .iter()
+                    .position(|task| task.id == classification.writer_task_id)
+            });
+        let writer = source_writer_index
+            .map(|index| &attempt.tasks[..index])
+            .unwrap_or(attempt.tasks.as_slice())
             .iter()
             .rev()
             .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
@@ -364,17 +374,6 @@ pub fn classify_for_code_change(
             ));
         }
 
-        let review_task_id = review_task.id.clone();
-        crate::recovery_contracts::validate_classification_task_frontier(
-            attempt,
-            &review_task_id,
-            recovery
-                .code_change_classification
-                .as_ref()
-                .map(|classification| classification.writer_task_id.as_str()),
-        )
-        .map_err(|reason| rejected_for(&reason))?;
-
         if let Some(prior) = recovery.code_change_classification.as_ref() {
             if prior.disposition != CODE_CHANGE_DISPOSITION {
                 return Err(rejected_for("stored classification uses an unsupported disposition"));
@@ -385,14 +384,15 @@ pub fn classify_for_code_change(
                 authorization,
                 &authorization_digest,
             ) {
-                let writer_exists = attempt.tasks.iter().any(|task| {
-                    task.id == prior.writer_task_id
-                        && task.kind == TaskKind::Write
-                        && task.input_artifacts.contains(&prior.audit_artifact)
-                });
-                if !writer_exists || !attempt.artifacts.contains(&prior.audit_artifact) {
-                    return Err(rejected());
-                }
+                crate::recovery_contracts::validate_code_change_classification_replay(
+                    project_root,
+                    item,
+                    attempt,
+                    recovery,
+                    prior,
+                    &review_task.id,
+                )
+                .map_err(|reason| rejected_for(&reason))?;
                 return Ok(CodeChangeClassification {
                     writer_task_id: prior.writer_task_id.clone(),
                     audit_artifact: prior.audit_artifact.path.clone(),
@@ -400,6 +400,19 @@ pub fn classify_for_code_change(
                 });
             }
             return Err(rejected_for("authorization differs from the stored classification"));
+        }
+        let review_task_id = review_task.id.clone();
+        crate::recovery_contracts::validate_classification_task_frontier(
+            attempt,
+            &review_task_id,
+            None,
+        )
+        .map_err(|reason| rejected_for(&reason))?;
+        if item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.candidate_commit == recovery.candidate_commit
+        }) {
+            return Err(rejected_for("a Merge Candidate already owns this candidate"));
         }
         if recovery.state != EvidenceRecoveryState::NeedsEvidence {
             return Err(rejected());

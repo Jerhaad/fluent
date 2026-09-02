@@ -5,8 +5,10 @@ need to inspect the managed home used by a Claude Writer.
 
 ## Configure Codex skill roots
 
-Configure explicit skill roots for autonomous Codex roles. Project roots may be
-relative but must stay inside the project; external roots must be absolute:
+Configure explicit skill roots for autonomous Codex roles. Put absolute external
+roots in user configuration (for example, `~/.config/fluent/config.yaml`).
+Project configuration may use only relative roots that stay inside the project;
+it must not name external roots. The external-root form is:
 
 ```yaml
 codex:

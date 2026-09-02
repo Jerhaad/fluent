@@ -607,7 +607,7 @@ Test: tests/binary.rs (work_show_explains_evidence_only_recovery_history_and_nex
 
 WHEN an evidence-targeted reviewer fails, THE SYSTEM SHALL accept only the typed
 dispositions `evidence-needed` and `code-change`.
-Test: src/review.rs (evidence_targeted_disposition_is_fail_only_and_typed)
+Test: src/review.rs (evidence_needed_requires_actionable_host_reason)
 
 ### B18
 
