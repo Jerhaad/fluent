@@ -951,7 +951,9 @@ schema-version-1 JSON document containing `producer`, `check`,
 `output`. Fluent validates and snapshots its exact bytes under the Attempt's
 managed artifacts, binds its digest to the named candidate commit, and plans
 only the named failed reviewer roles. Attachment never changes the candidate or
-approved planning inputs, and it cannot make a candidate landable.
+approved planning inputs, and it cannot make a candidate landable. Passing
+evidence follows the ordinary host-only attachment path and cannot authorize a
+source correction.
 
 Evidence-targeted reviewers receive the immutable snapshot and the prior
 decision artifact. This is normally their failed review; after an unexplained
@@ -980,27 +982,36 @@ fluent attempt evidence classify <work-item> <attempt> \
   --resolution '<source-correction decision>'
 ```
 
-For a current actionable recovery, the command requires the saved review digest
-and disposition. A legacy paused recovery may omit that digest and contain only
-the unqualified `Disposition: evidence-needed` line; Fluent derives and
-persists the digest during this one-time migration. The legacy form is the only
-place an unqualified marker is classified: an unqualified new review never
-pauses for this command and already follows the ordinary Writer path. Both
-classification forms require the exact candidate and evidence snapshot,
-current clean worktree, and complete targeted Tests Review frontier. A new
-classification must target the current paused recovery; a later `Reviewing` or
-`NeedsEvidence` recovery rejects the older classification and its continuation.
-Exact replay still reconciles the stored result. Fluent
+Source-correction classification requires an immutable candidate-bound evidence
+snapshot whose `result` is `fail`. For a current actionable recovery, the
+command requires the saved review digest and disposition. A legacy paused
+recovery may omit that digest and contain only the unqualified `Disposition:
+evidence-needed` line; Fluent derives and persists the digest during this
+one-time migration. The legacy form is the only place an unqualified marker is
+classified: an unqualified new review never pauses for this command and already
+follows the ordinary Writer path. Both classification forms require the exact
+candidate and evidence snapshot, current clean worktree, and complete targeted
+Tests Review frontier. A new classification must target the current paused
+recovery; a later `Reviewing` or `NeedsEvidence` recovery rejects the older
+classification and its continuation.
+Exact classification replay is idempotent only while the saved classified
+Writer remains resumable. The supported resumable states are `Planned`,
+`Executing`, or `NeedsUser` with no output, and `Complete` with output. A
+`Failed` or `Superseded` classified Writer is not replayable. In either state,
+repeating `classify` is rejected without mutation. For a `Failed` Writer, use
+an explicit validated retry or replan transition before queue resume; for a
+`Superseded` Writer, continue with its replacement and do not repeat the
+classification. Fluent
 persists the authorization and operation identity with an explicit
 `code-change` disposition, then schedules one corrective Writer with the failed
 review, evidence snapshot, and audit artifact; the candidate and prior records
 remain unchanged. The Work Item mutation commits the classification and its
 audit reference before the audit bytes are published; a retry deterministically
 reconciles a missing audit and rejects conflicting bytes. The next action is
-`fluent queue resume <work-item> --attempt <attempt>`. Repeating the exact
-review, evidence, and authorization request returns the persisted Writer and
-audit result without duplicates, while stale or different requests fail before
-mutation. A passing targeted review
+`fluent queue resume <work-item> --attempt <attempt>`. While the classified
+Writer remains resumable, repeating the exact review, evidence, and
+authorization request returns the persisted Writer and audit result without
+duplicates; stale or different requests fail before mutation. A passing targeted review
 still requires all exact-commit evidence and Learning before landing. The
 ordinary `code-change` disposition closes evidence recovery and follows the
 normal Writer, Tester, and reviewer path.

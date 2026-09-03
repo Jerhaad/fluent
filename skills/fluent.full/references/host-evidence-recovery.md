@@ -22,6 +22,10 @@ run. Create one JSON file on that host, for example:
 {"schema_version":1,"producer":"release-host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"...captured output..."}
 ```
 
+This passing snapshot belongs to host-only attachment. Passing evidence
+follows the ordinary host-only attachment path and cannot authorize a source
+correction.
+
 Inspect `fluent work-item show <work-item-id>` for the current Attempt,
 candidate SHA, and failed `review.md` artifact paths. Then attach the exact
 proof and each finding it addresses:
@@ -85,6 +89,10 @@ fluent attempt evidence classify <work-item-id> <attempt-id> \
   --resolution 'The candidate-bound failure requires a source correction.'
 ```
 
+Source-correction classification requires an immutable candidate-bound evidence
+snapshot whose `result` is `fail`. A passing snapshot belongs to the host-only
+attachment path above and cannot authorize code change.
+
 Use the failed targeted Tests Review path and evidence digest shown by
 `fluent work-item show`. Fluent accepts this command only for the saved,
 complete actionable `evidence-needed` review or a legacy paused recovery with
@@ -93,11 +101,19 @@ Writer path. The candidate, clean worktree, and matching Attempt frontier must
 remain unchanged. A new classification must target the current paused
 recovery; a later `Reviewing` or `NeedsEvidence` recovery rejects an older
 classification and its Writer continuation. Exact replay returns the stored
-result and safely reconciles its audit. Fluent records the authorization,
+result and safely reconciles its audit. Exact classification replay is
+idempotent only while the saved classified Writer remains resumable. The
+supported resumable states are `Planned`, `Executing`, or `NeedsUser` with no
+output, and `Complete` with output. A `Failed` or `Superseded` classified Writer
+is not replayable. In either state, repeating `classify` is rejected without
+mutation. For a `Failed` Writer, use an explicit validated retry or replan
+transition before queue resume; for a `Superseded` Writer, continue with its
+replacement and do not repeat the classification. Fluent records the authorization,
 explicit `code-change` disposition, and audit artifact, then schedules one
 corrective Writer with the failed review, immutable evidence snapshot, and
 audit input; resume it with `fluent queue resume <work-item-id> --attempt
-<attempt-id>`. Repeating the exact command returns the same Writer and audit
-identifiers without creating another record, while stale or different inputs
-are rejected without mutation. A passing targeted review still requires all
-exact-commit evidence and Learning before landing.
+<attempt-id>`. While the classified Writer remains resumable, repeating the
+exact command returns the same Writer and audit identifiers without creating
+another record; stale or different inputs are rejected without mutation. A
+passing targeted review still requires all exact-commit evidence and Learning
+before landing.

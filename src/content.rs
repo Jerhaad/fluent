@@ -870,6 +870,61 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn living_host_evidence_recovery_docs_require_fail_closed_replay() {
+        let architecture = read_living_doc("documentation/architecture.md");
+        let guide = read_living_doc("skills/fluent.full/references/host-evidence-recovery.md");
+        let decisions = read_living_doc(".fluent/expertise/decisions.md");
+
+        for (name, document) in [
+            ("architecture", architecture.as_str()),
+            ("host-evidence guide", guide.as_str()),
+            ("expertise decisions", decisions.as_str()),
+        ] {
+            assert!(
+                document.contains(
+                    "Source-correction classification requires an immutable candidate-bound \
+                     evidence snapshot whose `result` is `fail`."
+                ),
+                "{name} must require failed candidate-bound evidence for source correction"
+            );
+            assert!(
+                document.contains(
+                    "Passing evidence follows the ordinary host-only attachment path and cannot \
+                     authorize a source correction."
+                ),
+                "{name} must keep passing evidence on the attachment path"
+            );
+            assert!(
+                document.contains(
+                    "Exact classification replay is idempotent only while the saved classified \
+                     Writer remains resumable."
+                ),
+                "{name} must qualify classification replay by Writer lifecycle"
+            );
+            assert!(
+                document
+                    .contains("A `Failed` or `Superseded` classified Writer is not replayable."),
+                "{name} must reject hard-failed and superseded replay"
+            );
+            assert!(
+                document.contains("repeating `classify` is rejected without mutation"),
+                "{name} must state the no-mutation rejection for unsupported replay"
+            );
+        }
+
+        for (name, document) in [
+            ("architecture", architecture.as_str()),
+            ("host-evidence guide", guide.as_str()),
+        ] {
+            assert!(
+                document
+                    .contains("While the classified Writer remains resumable, repeating the exact"),
+                "{name} must qualify duplicate-request replay by Writer lifecycle"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_fluent_skill_uses_public_description() {
         const DESCRIPTION: &str = "description: Operate Fluent, a self-improving software factory. Use when a user wants to review, build, fix, or improve software with Fluent. Invoke when they ask to install or initialize Fluent; capture an Observation; define a slice; create or refine a Brief, Behavior Specification, Technical Approach, Implementation Plan, or Work Item; run, queue, inspect, resume, or recover an Attempt; review a codebase through Fluent; manage or land a Merge Candidate; capture project Expertise; or configure Fluent's agents, scheduler, sandboxes, or remote execution.";
         let skill = bundled_skill_content("fluent/SKILL.md")

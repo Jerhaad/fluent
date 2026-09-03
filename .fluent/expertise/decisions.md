@@ -172,3 +172,21 @@ admission, and Writer reservation may depend on that boundary, while the
 boundary does not depend on any of those callers. This keeps the immutable
 candidate, workspace, review, and host-evidence binding contract shared without
 introducing a reciprocal executor-to-host-evidence dependency.
+
+## Source-correction recovery fails closed on Writer lifecycle
+
+Source-correction classification requires an immutable candidate-bound evidence
+snapshot whose `result` is `fail`. Passing evidence follows the ordinary
+host-only attachment path and cannot authorize a source correction. Exact
+classification replay is idempotent only while the saved classified Writer
+remains resumable. The supported resumable states are `Planned`, `Executing`,
+or `NeedsUser` with no output, and `Complete` with output. A `Failed` or
+`Superseded` classified Writer is not replayable. In either state, repeating
+`classify` is rejected without mutation. For a `Failed` Writer, use an explicit
+validated retry or replan transition before queue resume; for a `Superseded`
+Writer, continue with its replacement and do not repeat the classification.
+
+This fail-closed policy keeps replay and queue admission aligned: a hard-failed
+Writer has no implicit retry and cannot create a second corrective Writer.
+Only an explicit validated retry or replan transition can make that recovery
+eligible again.
