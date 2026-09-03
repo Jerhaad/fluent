@@ -291,32 +291,35 @@ shape by replanning only the same output-free Writer whose attached gate was
 produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
 immediately. A metadata recovery may also admit a failed project check only
-when its canonical `hooks/check-pre-merge.log` contains only structured commit
-diagnostics that match the gate's metadata findings, including the exact body-
-line length finding for a commit whose gate metadata finding is literal-line-
-breaks, and the gate records exactly one nonzero hook exit. The log is bound
-alongside the gate so the corrective Writer receives the exact evidence. Any
-diagnostic present only in the gate structure, unrelated hook output,
-noncanonical path, or symlinked log remains rejected before Fluent writes
+when its gate entry records exactly one nonzero `check-pre-merge exited N`
+diagnostic and its canonical `hooks/check-pre-merge.log` contains only nonblank
+hook-finding lines that normalize to the gate's commit-metadata findings,
+including the exact body-line length finding for a commit whose gate metadata
+finding is literal-line-breaks. The exit diagnostic belongs to the gate entry;
+the hook log supplies the findings. Any additional non-exit project-check
+diagnostic, diagnostic present only in the gate structure, unrelated or
+unparseable hook line, noncanonical path, or symlinked log remains rejected
+before Fluent writes
 recovery authority.
 
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a
 new trusted base. Corrective history remains append-only except for one bounded
-case: when the preceding gate's failed checks are exactly `commit-metadata`, or
-exactly `commit-metadata` plus `project-check` whose canonical stored
-`check-pre-merge.log` contains only matching metadata findings, including
+case: when commit metadata was the preceding gate's only failure, or when
+`project-check` was the one additional failure and its canonical stored hook
+log contains only matching metadata findings, including
 `commit <id> body line <positive integer> exceeds 72 characters` for the gate's
-literal-line-breaks finding, and exactly one nonzero hook exit, the Writer may
-rewrite those commits. A project-check-only failure is never eligible. The host
+literal-line-breaks finding, while its gate entry records exactly one nonzero
+hook exit. The Writer may rewrite those commits only after the host
 revalidates the prior gate, proves that both candidates descend from its
-original base, requires identical Git trees, runs every gate check again over
-the replacement, and records both commit identities, the shared tree, and the
-prior artifact path. A changed tree, another prior failure, changed author
-identity, changed linear suffix shape, malformed or unproven hook evidence, or
-an ordinary non-ancestor candidate blocks before review. Committer timestamps
-may change during the authorized rewrite, but the protected suffix's
-per-commit trees and authors remain fixed.
+original base, and requires identical Git trees, runs every gate check again
+over the replacement, and records both commit identities, the shared tree, and
+the prior artifact path. A project-check-only failure is never eligible. A
+changed tree, another prior failure, changed author identity, changed linear
+suffix shape, malformed or unproven hook evidence, or an ordinary non-ancestor
+candidate blocks before review. Committer timestamps may change during the
+authorized rewrite, but the protected suffix's per-commit trees and authors
+remain fixed.
 
 Before that Writer launches, Fluent writes the immediately preceding candidate
 and a host-owned lineage mode into the generated execution context and renders

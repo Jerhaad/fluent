@@ -1495,6 +1495,15 @@ mod tests {
         format!("commit {candidate} contains literal \\n text instead of line breaks")
     }
 
+    fn candidate_head(fixture: &Fixture) -> String {
+        git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD"],
+            "snapshot candidate HEAD",
+        )
+        .unwrap()
+    }
+
     fn snapshot_artifacts(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
         fn visit(root: &Path, current: &Path, entries: &mut Vec<(String, Option<Vec<u8>>)>) {
             let mut children = fs::read_dir(current)
@@ -1784,6 +1793,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         assert!(
             repair(
@@ -1797,6 +1807,7 @@ mod tests {
         );
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
     }
 
     #[test]
@@ -1813,6 +1824,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         assert!(
             repair(
@@ -1826,6 +1838,7 @@ mod tests {
         );
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
     }
 
     #[test]
@@ -1842,6 +1855,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         assert!(
             repair(
@@ -1855,6 +1869,7 @@ mod tests {
         );
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
     }
 
     #[test]
@@ -1885,6 +1900,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         assert!(
             repair(
@@ -1898,6 +1914,7 @@ mod tests {
         );
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
     }
 
     #[cfg(unix)]
@@ -1925,6 +1942,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         assert!(
             repair(
@@ -1938,6 +1956,7 @@ mod tests {
         );
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
     }
 
     #[test]
@@ -1959,6 +1978,7 @@ mod tests {
                     .map(|value| (*value).to_string())
                     .collect();
             });
+            let before_head = candidate_head(&fixture);
 
             assert!(
                 repair(
@@ -1970,6 +1990,7 @@ mod tests {
                 )
                 .is_err()
             );
+            assert_eq!(candidate_head(&fixture), before_head);
         }
     }
 
@@ -2083,6 +2104,7 @@ mod tests {
             .join(".fluent/work/artifacts/work-1/attempt-1");
         let before_item = fixture.store.read_work_item("work-1").unwrap();
         let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
 
         let error = repair(
             &fixture.project,
@@ -2096,6 +2118,7 @@ mod tests {
         assert!(error.to_string().contains("project-check"));
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
         assert!(!artifact_root.join("candidate-metadata-repairs").exists());
     }
 
