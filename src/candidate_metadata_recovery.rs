@@ -1801,6 +1801,41 @@ mod tests {
     }
 
     #[test]
+    fn metadata_recovery_rejects_same_commit_diagnostic_with_different_reason() {
+        let fixture = fixture();
+        let invalid_author = format!(
+            "commit {} has invalid author email: malformed@example",
+            fixture.candidate
+        );
+        let hook = format!(
+            "commit {} body line 3 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&invalid_author], &hook, &[]);
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
     fn metadata_recovery_rejects_policy_only_hook_diagnostics() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
@@ -2408,6 +2443,98 @@ mod tests {
         assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
         assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
         assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn request_records_authority_and_is_idempotent() {
+        let fixture = fixture();
+        let first = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap();
+        assert!(!first.already_authorized);
+        assert_eq!(first.candidate_commit, fixture.candidate);
+        assert_eq!(first.protected_base_commit, fixture.base);
+        let authority: MetadataRepairAuthority =
+            serde_json::from_slice(&fs::read(fixture.project.join(&first.audit_artifact)).unwrap())
+                .unwrap();
+        assert_eq!(authority.source_gate_artifact, fixture.gate);
+        assert_eq!(authority.source_candidate_commit, fixture.candidate);
+        assert_eq!(authority.protected_base_commit, fixture.base);
+        assert_eq!(
+            authority.resolution_sha256,
+            content_digest(authority.resolution.as_bytes())
+        );
+
+        let item = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert!(attempt.pause_kind.is_none());
+        assert!(is_resume_ready(&fixture.project, &item, "attempt-1").unwrap());
+        let writer = attempt.tasks.last().unwrap();
+        assert_eq!(writer.role, CANDIDATE_METADATA_REPAIR_ROLE);
+        assert!(writer.input_artifacts.contains(&ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: fixture.gate.clone(),
+        }));
+        assert!(writer.input_artifacts.contains(&ArtifactRef {
+            producer_id: PRODUCER.to_string(),
+            path: first.audit_artifact.clone(),
+        }));
+        assert!(attempt.artifacts.contains(&ArtifactRef {
+            producer_id: PRODUCER.to_string(),
+            path: first.audit_artifact.clone(),
+        }));
+
+        let before_second_item = fixture.store.read_work_item("work-1").unwrap();
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_second_artifacts = snapshot_artifacts(&artifact_root);
+        let before_second_head = candidate_head(&fixture);
+        let second = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap();
+        assert!(second.already_authorized);
+        assert_eq!(second.task_id, first.task_id);
+        assert_eq!(second.audit_artifact, first.audit_artifact);
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.role == CANDIDATE_METADATA_REPAIR_ROLE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap(),
+            before_second_item
+        );
+        assert_eq!(snapshot_artifacts(&artifact_root), before_second_artifacts);
+        assert_eq!(candidate_head(&fixture), before_second_head);
+
+        let queued = crate::queue::resume(&fixture.project, "work-1", "attempt-1", None).unwrap();
+        assert_eq!(queued, crate::queue::ResumeDispatchOutcome::Created);
+        let queued_again =
+            crate::queue::resume(&fixture.project, "work-1", "attempt-1", None).unwrap();
+        assert_eq!(
+            queued_again,
+            crate::queue::ResumeDispatchOutcome::ExistingMatching
+        );
+    }
+
+    #[test]
+    fn metadata_recovery_derived_check_is_idempotent() {
+        metadata_recovery_hook_wording_is_idempotent();
     }
 
     #[test]

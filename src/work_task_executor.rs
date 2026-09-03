@@ -18073,8 +18073,40 @@ mod tests {
     #[test]
     fn derived_line_length_metadata_gate_preserves_tree_identical_correction_lineage() {
         let project = tempfile::tempdir().unwrap();
-        let candidate = "a".repeat(40);
-        let protected_base = "b".repeat(40);
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Fluent Test"][..],
+            &["config", "user.email", "fluent@example.test"][..],
+        ] {
+            crate::git::run(project.path(), args, "prepare lineage fixture").unwrap();
+        }
+        fs::write(project.path().join("base.txt"), "base\n").unwrap();
+        crate::git::run(project.path(), &["add", "base.txt"], "stage lineage base").unwrap();
+        crate::git::run(
+            project.path(),
+            &["commit", "-q", "-m", "Create protected base"],
+            "commit lineage base",
+        )
+        .unwrap();
+        let protected_base = head_commit(project.path()).unwrap();
+        fs::write(project.path().join("candidate.txt"), "candidate\n").unwrap();
+        crate::git::run(
+            project.path(),
+            &["add", "candidate.txt"],
+            "stage lineage candidate",
+        )
+        .unwrap();
+        let malformed_message = "Candidate\nThis malformed body contains literal \\n text and is deliberately longer than seventy-two characters.";
+        crate::git::run(
+            project.path(),
+            &["commit", "-q", "-m", malformed_message],
+            "commit lineage candidate",
+        )
+        .unwrap();
+        let candidate = head_commit(project.path()).unwrap();
+        assert_ne!(candidate, protected_base);
+        assert_eq!(candidate.len(), 40);
+        assert_eq!(protected_base.len(), 40);
         let gate_path = project.path().join(
             ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
         );
