@@ -25660,6 +25660,59 @@ fn host_evidence_classification_rejects_executing_task_without_mutation() {
 }
 
 #[test]
+fn host_evidence_classification_rejects_ambiguous_tests_target_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let work_item_id = "evidence-classify-ambiguous-target";
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(work_item_id, |item| {
+            let target = item.attempts[0].evidence_recoveries[0].targets[0].clone();
+            item.attempts[0].evidence_recoveries[0].targets.push(target);
+            Ok(())
+        })
+        .unwrap();
+    let before = work_item_value(&project, work_item_id);
+    let before_persisted = persisted_work_snapshot(&project, work_item_id);
+    let head_before = git_head(&project);
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            "Reject duplicate Tests target bindings.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "ambiguous Tests target classification unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ambiguous Tests Review target"));
+    assert_eq!(work_item_value(&project, work_item_id), before);
+    assert_eq!(
+        persisted_work_snapshot(&project, work_item_id),
+        before_persisted,
+        "ambiguous Tests target classification changed persisted state"
+    );
+    assert_eq!(git_head(&project), head_before);
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree() {
     for stale in ["candidate", "worktree"] {
         let tmp = TempDir::new().unwrap();

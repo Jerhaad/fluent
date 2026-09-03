@@ -1223,35 +1223,23 @@ fn ensure_code_change_classification_resume_ready(
             TaskStatus::Planned | TaskStatus::NeedsUser | TaskStatus::Failed
         )
     {
-        let review_task_ids = recovery
-            .targets
-            .iter()
-            .filter_map(|target| {
-                let review_task_id = target.review_task_id.as_deref()?;
-                (target.role == "tests"
-                    && attempt.tasks.iter().any(|task| {
-                        task.id == review_task_id
-                            && task.kind == TaskKind::Review
-                            && task.role == "tests"
-                            && task.artifact_area.as_ref().is_some_and(|area| {
-                                format!("{}/review.md", area.path) == classification.review_artifact
-                            })
-                    }))
-                .then_some(review_task_id)
-            })
-            .collect::<Vec<_>>();
-        if review_task_ids.len() != 1 {
-            return Err(ineligible(
-                "classified recovery has an ambiguous Tests Review target",
-            ));
-        }
+        let target = crate::recovery_contracts::unique_tests_review_target(
+            attempt,
+            recovery,
+            &classification.review_artifact,
+        )
+        .map_err(|reason| ineligible(&reason))?;
+        let review_task_id =
+            target.target.review_task_id.as_deref().ok_or_else(|| {
+                ineligible("classified recovery target has no review Task identity")
+            })?;
         crate::recovery_contracts::validate_code_change_classification_replay(
             project_root,
             item,
             attempt,
             recovery,
             classification,
-            review_task_ids[0],
+            review_task_id,
         )
         .map_err(|reason| ineligible(&reason))?;
         attempt

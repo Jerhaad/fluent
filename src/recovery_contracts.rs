@@ -425,31 +425,9 @@ pub(crate) fn validate_code_change_writer_start(
         ));
     }
 
-    let matching_targets = recovery
-        .targets
-        .iter()
-        .filter(|target| {
-            target.role == "tests"
-                && target
-                    .review_task_id
-                    .as_ref()
-                    .is_some_and(|review_task_id| {
-                        attempt.tasks.iter().any(|task| {
-                            task.id == *review_task_id
-                                && task.kind == TaskKind::Review
-                                && task.role == "tests"
-                                && review_artifact_path(task).as_deref()
-                                    == Some(classification.review_artifact.as_str())
-                        })
-                    })
-        })
-        .collect::<Vec<_>>();
-    if matching_targets.len() != 1 {
-        return Err(rejected(
-            "classified recovery has an ambiguous Tests Review target",
-        ));
-    }
-    let target = matching_targets[0];
+    let target = unique_tests_review_target(attempt, recovery, &classification.review_artifact)
+        .map_err(|reason| rejected(&reason))?
+        .target;
     let review_task_id = target
         .review_task_id
         .as_deref()
@@ -707,32 +685,9 @@ pub(crate) fn migrate_legacy_code_change_review_digest(
     let review_artifact = classification.review_artifact.clone();
     let review_digest = classification.review_digest.clone();
     let recovery = &attempt.evidence_recoveries[recovery_index];
-    let matching_targets = recovery
-        .targets
-        .iter()
-        .enumerate()
-        .filter(|(_, target)| {
-            target.role == "tests"
-                && target
-                    .review_task_id
-                    .as_ref()
-                    .is_some_and(|review_task_id| {
-                        attempt.tasks.iter().any(|task| {
-                            task.id == *review_task_id
-                                && task.kind == TaskKind::Review
-                                && task.role == "tests"
-                                && review_artifact_path(task).as_deref()
-                                    == Some(review_artifact.as_str())
-                        })
-                    })
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if matching_targets.len() != 1 {
-        return Err("classified recovery has an ambiguous Tests Review target".to_string());
-    }
-    let target_index = matching_targets[0];
-    let target = &recovery.targets[target_index];
+    let selected_target = unique_tests_review_target(attempt, recovery, &review_artifact)?;
+    let target_index = selected_target.index;
+    let target = selected_target.target;
     if target.review_digest.is_some() {
         return Ok(false);
     }
@@ -852,29 +807,13 @@ pub(crate) fn validate_code_change_classification_replay(
 
     validate_classification_replay_task_frontier(attempt, review_task_id, writer_index)?;
 
-    let matching_targets = recovery
-        .targets
-        .iter()
-        .filter(|target| {
-            target.role == "tests"
-                && target.review_task_id.as_deref() == Some(review_task_id)
-                && target.review_task_id.as_ref().is_some_and(|id| {
-                    attempt.tasks.iter().any(|task| {
-                        task.id == *id
-                            && task.kind == TaskKind::Review
-                            && task.role == "tests"
-                            && review_artifact_path(task).as_deref()
-                                == Some(classification.review_artifact.as_str())
-                    })
-                })
-        })
-        .collect::<Vec<_>>();
-    if matching_targets.len() != 1 {
+    let target =
+        unique_tests_review_target(attempt, recovery, &classification.review_artifact)?.target;
+    if target.review_task_id.as_deref() != Some(review_task_id) {
         return Err(rejected(
-            "classified recovery has an ambiguous Tests Review target",
+            "classified recovery target does not match the stored Review",
         ));
     }
-    let target = matching_targets[0];
     if target
         .review_digest
         .as_deref()
@@ -1397,6 +1336,48 @@ pub(crate) fn validate_failed_evidence_snapshot(bytes: &[u8]) -> Result<()> {
     }
 }
 
+/// Select the one persisted Tests Review target bound to a review artifact.
+///
+/// Every source-correction boundary must establish this cardinality before it
+/// reads or mutates the recovery. The candidate workspace and host-evidence
+/// bindings are checked by `validate_code_change_candidate_binding` after this
+/// target has been selected.
+pub(crate) struct UniqueTestsReviewTarget<'a> {
+    pub(crate) index: usize,
+    pub(crate) target: &'a EvidenceReviewTarget,
+}
+
+pub(crate) fn unique_tests_review_target<'a>(
+    attempt: &work_model::Attempt,
+    recovery: &'a EvidenceRecovery,
+    review_artifact: &str,
+) -> std::result::Result<UniqueTestsReviewTarget<'a>, String> {
+    let matching_targets = recovery
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| {
+            target.role == "tests"
+                && target
+                    .review_task_id
+                    .as_ref()
+                    .is_some_and(|review_task_id| {
+                        attempt.tasks.iter().any(|task| {
+                            task.id == *review_task_id
+                                && task.kind == TaskKind::Review
+                                && task.role == "tests"
+                                && review_artifact_path(task).as_deref() == Some(review_artifact)
+                        })
+                    })
+        })
+        .collect::<Vec<_>>();
+    if matching_targets.len() != 1 {
+        return Err("classified recovery has an ambiguous Tests Review target".to_string());
+    }
+    let (index, target) = matching_targets[0];
+    Ok(UniqueTestsReviewTarget { index, target })
+}
+
 /// Validate the immutable candidate and host-evidence bindings shared by every
 /// source-correction classification boundary.
 ///
@@ -1419,6 +1400,12 @@ pub(crate) fn validate_code_change_candidate_binding(
     evidence_digest: &str,
 ) -> std::result::Result<(), String> {
     let rejected = |reason: &str| reason.to_string();
+    let unique_target = unique_tests_review_target(attempt, recovery, review_artifact)?;
+    if unique_target.target != target {
+        return Err(rejected(
+            "bound Tests review target is not uniquely selected",
+        ));
+    }
     if source_output.commit != candidate_commit
         || recovery.candidate_commit != candidate_commit
         || !candidate_workspace_is_clean_at(project_root, source_output, candidate_commit)

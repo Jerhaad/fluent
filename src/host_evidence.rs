@@ -251,15 +251,13 @@ pub fn classify_for_code_change(
                         })
                 })
         }).ok_or_else(|| rejected_for("no recovery matches candidate, evidence, and review frontier"))?;
-        let target = recovery.targets.iter().find(|target| {
-            target.role == "tests"
-                && target.review_task_id.as_ref().is_some_and(|task_id| {
-                    attempt.tasks.iter().any(|task| {
-                        task.id == *task_id
-                            && review_artifact_path(task).as_deref() == Some(review_artifact)
-                    })
-                })
-        }).ok_or_else(|| rejected_for("recovery has no Tests target for this review"))?;
+        let target = crate::recovery_contracts::unique_tests_review_target(
+            attempt,
+            recovery,
+            review_artifact,
+        )
+        .map_err(|reason| rejected_for(&reason))?
+        .target;
         let review_task_id = target.review_task_id.as_deref()
             .ok_or_else(|| rejected_for("recovery target has no review Task identity"))?;
         let review_task = attempt.tasks.iter().find(|task| {
