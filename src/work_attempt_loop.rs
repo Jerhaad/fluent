@@ -8100,48 +8100,6 @@ fn interpret_reviews(
                 .find(|entry| entry.id == recovery.id)
                 .unwrap()
                 .state = EvidenceRecoveryState::Complete;
-
-            // A classified source correction supersedes the output-free
-            // Writer that originally failed before the recovery was admitted.
-            // Keep that Task as immutable history, but release its unresolved
-            // frontier ownership before the Attempt can become terminal.
-            let classified_writer_indices = item.attempts[attempt_index]
-                .evidence_recoveries
-                .iter()
-                .filter_map(|entry| {
-                    (entry.state == EvidenceRecoveryState::CodeChange)
-                        .then(|| entry.code_change_classification.as_ref())
-                        .flatten()
-                })
-                .filter_map(|classification| {
-                    item.attempts[attempt_index]
-                        .tasks
-                        .iter()
-                        .position(|task| task.id == classification.writer_task_id)
-                })
-                .collect::<Vec<_>>();
-            let mut failed_source_writer_indices = classified_writer_indices
-                .iter()
-                .flat_map(|writer_index| {
-                    item.attempts[attempt_index]
-                        .tasks
-                        .iter()
-                        .enumerate()
-                        .take(*writer_index)
-                        .filter_map(|(index, task)| {
-                            (task.kind == TaskKind::Write
-                                && task.status == TaskStatus::Failed
-                                && task.output.is_none())
-                            .then_some(index)
-                        })
-                })
-                .collect::<Vec<_>>();
-            failed_source_writer_indices.sort_unstable();
-            failed_source_writer_indices.dedup();
-            if failed_source_writer_indices.len() == 1 {
-                let task = &mut item.attempts[attempt_index].tasks[failed_source_writer_indices[0]];
-                crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
-            }
         }
     }
     if !item.attempts[attempt_index].kind.is_review_only_like() {
@@ -8429,6 +8387,7 @@ fn interpret_reviews(
     }
 
     item.attempts[attempt_index].review_state = Some(AttemptReviewState::Passed);
+    supersede_classified_source_writer(&mut item.attempts[attempt_index]);
     crate::work_model::set_attempt_terminal(
         &mut item.attempts[attempt_index],
         AttemptStatus::Complete,
@@ -8487,6 +8446,50 @@ fn interpret_reviews(
     }
     write_attempt_work_item(store, &item)?;
     Ok(WorkAttemptRunOutcome::MergeCandidateReady { candidate_id })
+}
+
+/// Release the unresolved frontier held by the failed Writer that a classified
+/// recovery replaced, while retaining that Writer as immutable Attempt history.
+/// Run this only at the terminal completion boundary after the corrective Writer,
+/// reviews, and final Tester have all succeeded.
+fn supersede_classified_source_writer(attempt: &mut Attempt) {
+    let classified_writer_indices = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|entry| {
+            (entry.state == EvidenceRecoveryState::CodeChange)
+                .then(|| entry.code_change_classification.as_ref())
+                .flatten()
+        })
+        .filter_map(|classification| {
+            attempt
+                .tasks
+                .iter()
+                .position(|task| task.id == classification.writer_task_id)
+        })
+        .collect::<Vec<_>>();
+    let mut failed_source_writer_indices = classified_writer_indices
+        .iter()
+        .flat_map(|writer_index| {
+            attempt
+                .tasks
+                .iter()
+                .enumerate()
+                .take(*writer_index)
+                .filter_map(|(index, task)| {
+                    (task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Failed
+                        && task.output.is_none())
+                    .then_some(index)
+                })
+        })
+        .collect::<Vec<_>>();
+    failed_source_writer_indices.sort_unstable();
+    failed_source_writer_indices.dedup();
+    if failed_source_writer_indices.len() == 1 {
+        let task = &mut attempt.tasks[failed_source_writer_indices[0]];
+        crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+    }
 }
 
 #[derive(Debug)]

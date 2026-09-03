@@ -161,3 +161,14 @@ The aggregate invariant `MergeCandidate.candidate_commit == latest completed Wri
 `MergeCandidate::validate` normally requires a pending candidate's Attempt to be `Complete` with reviews `Passed` (a `Failed` merge status is separately exempt so a failed land keeps its record). It carries exactly one cross-object recovery exception: a pending candidate also validates when its Attempt is `NeedsUser` with `pause_kind: HostSandbox`. This is deliberate, not an oversight. The Learner's host-sandbox preflight runs *after* reviews have passed and the candidate already identifies the reviewed Writer commit; when Fluent cannot apply its Seatbelt boundary, the Attempt suspends to that typed pause before the Learner reserves a run. Admitting this one state lets the same Attempt persist and reload the reviewed candidate and resume once the host recovers, without discarding review evidence or consuming another Writer round. The exception is narrow by construction — every other pause kind, including `CandidateGate`, and every non-`Passed` review state keeps a pending candidate structurally invalid.
 
 Structural validity is not landing readiness, and the two gates are kept apart on purpose. `MergeCandidate::validate` decides only whether the persisted aggregate is well-formed; `MergeCandidate::validate_advancement` remains the landing gate and still fails closed on a non-succeeded Learner through the shared `Attempt::learning_advancement_readiness()` reason. A host-sandbox pause precedes the Learner, so a preserved candidate is structurally valid yet cannot land until the recovered Learner succeeds. Do not widen the structural exception to other pauses, and do not move the host-sandbox check into the advancement gate — a paused candidate must be storable without becoming landable. See [[advancement-requires-a-succeeded-learner]].
+
+---
+
+## Recovery contracts form a neutral dependency boundary
+
+Candidate-bound recovery admission and Writer completion checks live in the
+neutral `recovery_contracts` module. Host-evidence classification, queue
+admission, and Writer reservation may depend on that boundary, while the
+boundary does not depend on any of those callers. This keeps the immutable
+candidate, workspace, review, and host-evidence binding contract shared without
+introducing a reciprocal executor-to-host-evidence dependency.

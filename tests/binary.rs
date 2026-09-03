@@ -25766,7 +25766,7 @@ fn exact_host_evidence_classification_replay_accepts_claimed_writer() {
 }
 
 #[test]
-fn classified_writer_continuation_runs_with_candidate_bound_inputs() {
+fn classified_recovery_completes_without_later_host_evidence() {
     let tmp = TempDir::new().unwrap();
     let run_suffix = tmp
         .path()
@@ -25916,6 +25916,87 @@ exit 0
     );
     assert_ne!(writer["output"]["commit"], candidate);
     assert_eq!(after_attempt["status"], "executing");
+
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            item.add_next_review_tasks(
+                "attempt-1",
+                &[
+                    "documentation",
+                    "behaviors",
+                    "architecture",
+                    "skills",
+                    "tests",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let review_bin = tmp.path().join("bin-classified-writer-review");
+    write_mock_claude(
+        &review_bin,
+        &learner_mock_script(r#"{"learning_summary":"classified","follow_ups":[]}"#),
+    );
+    let review_ids = work_item_value(&project, &work_item_id)["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "review" && task["status"].is_null())
+        .filter_map(|task| task["id"].as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(review_ids.len(), 5);
+    for review_id in &review_ids {
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "task",
+                "run",
+                &work_item_id,
+                "attempt-1",
+                review_id,
+                "--no-sandbox",
+            ])
+            .env("PATH", mock_path(&review_bin))
+            .assert()
+            .success();
+    }
+
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", &work_item_id, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&review_bin))
+        .assert()
+        .success();
+    let completed = work_item_value(&project, &work_item_id);
+    let completed_attempt = &completed["attempts"][0];
+    assert_eq!(completed_attempt["status"], "complete");
+    assert_eq!(
+        completed_attempt["evidence_recoveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        completed_attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["id"] == "attempt-1-write-2" && task["status"] == "superseded" })
+    );
+    assert!(
+        completed_attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|task| {
+                task["kind"] != "write"
+                    || task["status"] == "complete"
+                    || task["status"] == "superseded"
+            })
+    );
 }
 
 #[test]
