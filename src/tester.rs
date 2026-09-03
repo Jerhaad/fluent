@@ -1372,6 +1372,43 @@ mod tests {
         assert!(results.error.is_none());
     }
 
+    #[test]
+    fn attempt_scoped_tester_commands_receive_private_cargo_home() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            workspace.path(),
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        crate::writer_cache::prepare_writer_dependency_cache(&cache, None).unwrap();
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/command-marker\"'\n    test_harness: shell-harness\n",
+        );
+        write_extractor(workspace.path(), "#!/bin/sh\necho '[]'\n");
+        let plan = plan(workspace.path()).unwrap();
+        let settlement = prepare_settlement_directories(artifact_dir.path(), &plan).unwrap();
+        let sandbox = render_sandbox_profile_with_cache(
+            workspace.path(),
+            artifact_dir.path(),
+            true,
+            &resolver(),
+            settlement,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(sandbox.launch_env, cache.launch_env());
+        assert_eq!(
+            run_with_sandbox_profile(workspace.path(), artifact_dir.path(), &sandbox).unwrap(),
+            TesterOutcome::Passed
+        );
+        assert!(cache.cargo_home().join("command-marker").is_file());
+    }
+
     enum ScriptedInventory {
         Empty,
         Leak { pid: u32, kind: &'static str },

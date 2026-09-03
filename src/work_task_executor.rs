@@ -14261,6 +14261,70 @@ mod tests {
         assert_eq!(chained_results.commands.len(), 1);
     }
 
+    #[test]
+    fn tester_task_uses_attempt_scoped_dependency_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        let store = WorkModelStore::new(&project_root);
+        let mut item = review_item_with_final_tester();
+        let tester = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let tester_id = tester.id.clone();
+        let workspace = project_root.join(
+            &tester
+                .review_context
+                .as_ref()
+                .unwrap()
+                .candidate_workspace_path,
+        );
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/task-marker\"'\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        commit_tester_candidate_fixture(&project_root, &mut item);
+        store.create_work_item(&item).unwrap();
+
+        let resolver = ContentResolver::new(Some(&project_root));
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &tester_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+
+        let cache_home =
+            project_root.join(".fluent/work/cache/writers/work-1/attempt-1/cargo-home");
+        assert!(
+            cache_home.join("task-marker").is_file(),
+            "Tester commands must write through the Attempt-scoped Cargo home"
+        );
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.id == tester_id)
+                .unwrap()
+                .status,
+            TaskStatus::Complete
+        );
+    }
+
     fn review_item_with_role(role: &str) -> WorkItem {
         let mut item = WorkItem {
             id: "work-1".to_string(),
