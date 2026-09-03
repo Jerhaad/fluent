@@ -290,15 +290,38 @@ a time. It also narrowly repairs an older binary's terminal failed-correction
 shape by replanning only the same output-free Writer whose attached gate was
 produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
-immediately. A metadata recovery may also admit a failed project check only
-when its gate entry records exactly one nonzero `check-pre-merge exited N`
-diagnostic and its canonical `hooks/check-pre-merge.log` is non-empty and
-contains only nonblank hook-finding lines that normalize to the gate's
-commit-metadata findings, including the exact body-line length finding for a
-commit whose gate metadata finding is literal-line-breaks. The exit diagnostic
-belongs to the gate entry; the non-empty hook log supplies the findings. A
-generic `body line N exceeds 72 characters` finding must resolve to a gate
-commit and the exact overlong commit message line must contain literal `\\n`
+immediately.
+
+A metadata recovery is eligible when `commit-metadata` is the only failed
+check, or when `project-check` is the one additional failure and is derived
+from those findings. In the derived form, the gate entry must record exactly
+one nonzero `check-pre-merge exited N` diagnostic. Its canonical
+`hooks/check-pre-merge.log` must be non-empty and contain only nonblank
+hook-finding lines that normalize to the gate's commit-metadata findings,
+including the exact body-line length finding for a commit whose gate metadata
+finding is literal-line-breaks. The exit diagnostic belongs to the gate entry;
+the non-empty hook log supplies the findings. The protected base must remain an
+ancestor.
+
+An operator authorizes this recovery with:
+
+```text
+fluent attempt repair-candidate-metadata <work-item-id> <attempt-id> --resolution "<approved rewrite>"
+```
+
+The transition records the exact gate, rejected candidate, derived hook
+evidence, protected base, candidate tree, and human decision before scheduling
+one corrective Writer. After authorization, run this exact command:
+
+```text
+fluent queue resume <work-item-id> --attempt <attempt-id>
+```
+
+This resumes the same Attempt and continues through the ordinary candidate
+gate, Tester, review, and Learner lifecycle.
+
+A generic `body line N exceeds 72 characters` finding must resolve to a gate
+commit, and the exact overlong commit message line must contain literal `\\n`
 text. A finding for an uncovered commit, an ordinary overlong line, any
 additional non-exit project-check diagnostic, diagnostic present only in the
 gate structure, unrelated or unparseable hook line, noncanonical path, or
@@ -335,10 +358,7 @@ names the current candidate has exactly the commit-metadata failure, or exactly
 that failure plus a project check proven by its canonical stored hook log,
 matching the same gate-covered commit and its required body-line finding;
 older gate artifacts remain readable history but cannot override that current
-frontier. An operator can make this authorization explicit with
-`fluent attempt repair-candidate-metadata`. That transition records the exact
-gate, candidate tree, protected base, and human decision before scheduling the
-Writer. The mode tells the Writer to change metadata without changing the tree
+frontier. The mode tells the Writer to change metadata without changing the tree
 and supplies the exact protected base that must remain an ancestor. These
 instructions reduce avoidable correction failures; the deterministic candidate
 gate remains the enforcement boundary and independently verifies the resulting

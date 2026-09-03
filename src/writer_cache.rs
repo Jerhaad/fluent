@@ -61,9 +61,9 @@ pub(crate) fn preflight_writer_dependency_cache(
     })
 }
 
-/// Materialize an exact-Attempt cache and seed only Cargo dependency stores.
-/// Credentials, configuration, binaries, and every other user Cargo-home entry
-/// remain outside the Writer boundary.
+/// Materialize an exact-Attempt cache and seed only Cargo dependency stores for
+/// Writer and final Tester tasks. Credentials, configuration, binaries, and
+/// every other user Cargo-home entry remain outside both task boundaries.
 pub(crate) fn prepare_writer_dependency_cache(
     cache: &WriterDependencyCache,
     canonical_cargo_home: Option<&Path>,
@@ -74,8 +74,9 @@ pub(crate) fn prepare_writer_dependency_cache(
     Ok(())
 }
 
-/// Seed only dependency stores into a private Cargo home. Callers retain an
-/// isolated writable cache without admitting host credentials or config.
+/// Seed only dependency stores into a private Cargo home. Writer and final
+/// Tester callers retain an isolated writable cache without admitting host
+/// credentials or config.
 pub(crate) fn prepare_private_cargo_dependency_cache(
     private_home: &Path,
     canonical_cargo_home: Option<&Path>,
@@ -90,8 +91,9 @@ pub(crate) fn prepare_private_cargo_dependency_cache(
     validate_private_cache_symlinks(private_home, private_home)
 }
 
-/// Reclaim stale caches and prepare one launch while holding the project cache
-/// lock. Concurrent Writer Tasks cannot race a seed copy against reclamation.
+/// Reclaim stale caches and prepare one Writer or final Tester launch while
+/// holding the project cache lock. Concurrent Writer and final Tester Tasks
+/// cannot race a seed copy against reclamation.
 pub(crate) fn prepare_writer_dependency_cache_for_launch(
     cache: &WriterDependencyCache,
     store: &WorkModelStore,
@@ -104,8 +106,8 @@ pub(crate) fn prepare_writer_dependency_cache_for_launch(
     prepare_writer_dependency_cache(cache, canonical_cargo_home)
 }
 
-/// Resolve the host Cargo home used only as an admitted seed source. Writers are
-/// never granted this path.
+/// Resolve the host Cargo home used only as an admitted seed source. Writer and
+/// final Tester tasks are never granted this path.
 pub(crate) fn canonical_cargo_home_from_env() -> Option<PathBuf> {
     #[cfg(any(test, feature = "test-support"))]
     {
