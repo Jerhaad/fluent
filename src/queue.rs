@@ -1216,12 +1216,14 @@ fn ensure_code_change_classification_resume_ready(
         .enumerate()
         .find(|(_, task)| task.id == classification.writer_task_id && task.kind == TaskKind::Write)
         .ok_or_else(|| ineligible("the classified Writer is missing"))?;
+    if writer.status == TaskStatus::Failed {
+        return Err(ineligible(
+            "the classified Writer is hard-failed without a validated retry transition",
+        ));
+    }
     if attempt.status == AttemptStatus::NeedsUser
         && writer.output.is_none()
-        && matches!(
-            writer.status,
-            TaskStatus::Planned | TaskStatus::NeedsUser | TaskStatus::Failed
-        )
+        && matches!(writer.status, TaskStatus::Planned | TaskStatus::NeedsUser)
     {
         let target = crate::recovery_contracts::unique_tests_review_target(
             attempt,

@@ -25713,6 +25713,200 @@ fn host_evidence_classification_rejects_ambiguous_tests_target_without_mutation(
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_rejects_failed_writer_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let work_item_id = "evidence-classify-replay-failed";
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        work_item_id,
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+
+    let classified = work_item_value(&project, work_item_id);
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(work_item_id, |item| {
+            let writer = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            fluent::work_model::set_task_terminal(writer, fluent::work_model::TaskStatus::Failed);
+            writer.output = None;
+            Ok(())
+        })
+        .unwrap();
+
+    let before = persisted_work_snapshot(&project, work_item_id);
+    let before_audit = fs::read(project.join(&audit_path)).unwrap();
+    let before_writer_count = work_item_value(&project, work_item_id)["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+    let before_head = git_head(&project);
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        !replay.status.success(),
+        "failed classified Writer replay unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stderr)
+            .contains("classified Writer lifecycle is not replayable")
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, work_item_id),
+        before,
+        "failed classified Writer replay changed persisted state"
+    );
+    let after = work_item_value(&project, work_item_id);
+    assert_eq!(
+        after["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        before_writer_count,
+        "failed classified Writer replay created another Writer"
+    );
+    assert_eq!(fs::read(project.join(&audit_path)).unwrap(), before_audit);
+    assert_eq!(git_head(&project), before_head);
+}
+
+#[test]
+fn classified_host_evidence_queue_rejects_failed_writer_without_retry_transition() {
+    let tmp = TempDir::new().unwrap();
+    let work_item_id = "evidence-classify-queue-failed";
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            resolution,
+        ])
+        .assert()
+        .success();
+
+    let classified = work_item_value(&project, work_item_id);
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::Interrupted);
+            attempt.pause_recovery = None;
+            attempt.completed_at = Some(fluent::work_model::now_iso8601());
+            attempt.evidence_recoveries[0].targets[0].review_digest = None;
+            let writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            fluent::work_model::set_task_terminal(writer, fluent::work_model::TaskStatus::Failed);
+            writer.output = None;
+            Ok(())
+        })
+        .unwrap();
+
+    let before = persisted_work_snapshot(&project, work_item_id);
+    let before_writer_count = work_item_value(&project, work_item_id)["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+    let queue_path = queue_ledger_path(&project, work_item_id);
+    let before_queue = fs::read(&queue_path).ok();
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", work_item_id, "--attempt", "attempt-1"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "failed classified Writer queue resume unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("classified Writer lifecycle is not replayable")
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, work_item_id),
+        before,
+        "failed classified Writer queue resume changed persisted state"
+    );
+    assert_eq!(fs::read(&queue_path).ok(), before_queue);
+    assert_eq!(
+        work_item_value(&project, work_item_id)["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        before_writer_count,
+        "failed classified Writer queue resume created another Writer"
+    );
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_rejects_stale_candidate_or_worktree() {
     for stale in ["candidate", "worktree"] {
         let tmp = TempDir::new().unwrap();
@@ -27210,16 +27404,21 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
 #[test]
 fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
     let tmp = TempDir::new().unwrap();
-    let work_item_id = "evidence-classify-legacy-persisted";
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-legacy-persisted-{run_suffix}");
     let (project, candidate, _prior_review_path, targeted_path, evidence_digest, _snapshot_path) =
-        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
-    let _workspace_cleanup = bind_candidate_to_managed_sibling(&project, work_item_id, &candidate);
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let _workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
     let resolution = "The failed candidate-bound check needs a source correction.";
     let classify_args = [
         "attempt",
         "evidence",
         "classify",
-        work_item_id,
+        work_item_id.as_str(),
         "attempt-1",
         "--candidate",
         candidate.as_str(),
@@ -27238,7 +27437,7 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
 
     let legacy = persist_legacy_classified_recovery(
         &project,
-        work_item_id,
+        &work_item_id,
         &candidate,
         &targeted_path,
         &evidence_digest,
@@ -27273,7 +27472,7 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
         String::from_utf8_lossy(&replay.stdout),
         String::from_utf8_lossy(&replay.stderr)
     );
-    let replayed = work_item_value(&project, work_item_id);
+    let replayed = work_item_value(&project, &work_item_id);
     assert_eq!(
         replayed["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_digest"],
         expected_review_digest
@@ -27290,7 +27489,7 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
     clear_target_digest();
     let store = WorkModelStore::new(&project);
     store
-        .mutate_work_item(work_item_id, |item| {
+        .mutate_work_item(&work_item_id, |item| {
             let attempt = &mut item.attempts[0];
             attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
             attempt.pause_kind = Some(fluent::work_model::PauseKind::Interrupted);
@@ -27306,7 +27505,7 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
             Ok(())
         })
         .unwrap();
-    let legacy_model = store.read_work_item(work_item_id).unwrap();
+    let legacy_model = store.read_work_item(&work_item_id).unwrap();
     assert_eq!(
         legacy_model.attempts[0].status,
         fluent::work_model::AttemptStatus::NeedsUser
@@ -27317,10 +27516,16 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
     );
     fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", work_item_id, "--attempt", "attempt-1"])
+        .args([
+            "queue",
+            "resume",
+            work_item_id.as_str(),
+            "--attempt",
+            "attempt-1",
+        ])
         .assert()
         .success();
-    let queued = work_item_value(&project, work_item_id);
+    let queued = work_item_value(&project, &work_item_id);
     assert_eq!(
         queued["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_digest"],
         expected_review_digest
@@ -27331,7 +27536,7 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
     );
 
     store
-        .mutate_work_item(work_item_id, |item| {
+        .mutate_work_item(&work_item_id, |item| {
             fluent::work_model::reopen_attempt(&mut item.attempts[0]);
             Ok(())
         })
@@ -27358,7 +27563,7 @@ exit 0
         .args([
             "task",
             "run",
-            work_item_id,
+            work_item_id.as_str(),
             "attempt-1",
             &writer_id,
             "--no-sandbox",
@@ -27366,7 +27571,18 @@ exit 0
         .env("PATH", mock_path(&bin_dir))
         .assert()
         .success();
-    let started = work_item_value(&project, work_item_id);
+    let started = work_item_value(&project, &work_item_id);
+    let started_writer = started["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == writer_id)
+        .unwrap();
+    assert_eq!(started_writer["status"], "complete");
+    assert!(
+        started_writer["output"].is_object(),
+        "legacy queue resume did not start the classified Writer"
+    );
     assert_eq!(
         started["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_digest"],
         expected_review_digest
@@ -27380,10 +27596,15 @@ exit 0
 #[test]
 fn legacy_classified_host_evidence_queue_rejects_stale_candidate_without_mutation() {
     let tmp = TempDir::new().unwrap();
-    let work_item_id = "evidence-classify-legacy-stale";
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-legacy-stale-{run_suffix}");
     let (project, candidate, _prior_review_path, targeted_path, evidence_digest, _snapshot_path) =
-        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
-    let workspace_cleanup = bind_candidate_to_managed_sibling(&project, work_item_id, &candidate);
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
     let resolution = "The failed candidate-bound check needs a source correction.";
     fluent_cmd()
         .current_dir(&project)
@@ -27391,7 +27612,7 @@ fn legacy_classified_host_evidence_queue_rejects_stale_candidate_without_mutatio
             "attempt",
             "evidence",
             "classify",
-            work_item_id,
+            work_item_id.as_str(),
             "attempt-1",
             "--candidate",
             &candidate,
@@ -27406,7 +27627,7 @@ fn legacy_classified_host_evidence_queue_rejects_stale_candidate_without_mutatio
         .success();
     let _legacy = persist_legacy_classified_recovery(
         &project,
-        work_item_id,
+        &work_item_id,
         &candidate,
         &targeted_path,
         &evidence_digest,
@@ -27418,8 +27639,8 @@ fn legacy_classified_host_evidence_queue_rejects_stale_candidate_without_mutatio
         "stale candidate\n",
         "Make candidate stale",
     );
-    let before_model = persisted_work_snapshot(&project, work_item_id);
-    let queue_path = queue_ledger_path(&project, work_item_id);
+    let before_model = persisted_work_snapshot(&project, &work_item_id);
+    let queue_path = queue_ledger_path(&project, &work_item_id);
     let before_queue = fs::read(&queue_path).ok();
     let before_candidate_head = git_head(&workspace_cleanup.workspace);
     let before_candidate_status = git::run_stdout(
@@ -27446,7 +27667,13 @@ exit 42
 
     let output = fluent_cmd()
         .current_dir(&project)
-        .args(["queue", "resume", work_item_id, "--attempt", "attempt-1"])
+        .args([
+            "queue",
+            "resume",
+            work_item_id.as_str(),
+            "--attempt",
+            "attempt-1",
+        ])
         .env("PATH", mock_path(&bin_dir))
         .env("WRITER_MARKER", &writer_marker)
         .output()
@@ -27459,7 +27686,7 @@ exit 42
     );
 
     assert_eq!(
-        persisted_work_snapshot(&project, work_item_id),
+        persisted_work_snapshot(&project, &work_item_id),
         before_model,
         "stale legacy migration changed model or artifacts"
     );
@@ -27483,7 +27710,7 @@ exit 42
         "stale legacy migration invoked the Writer"
     );
     assert!(
-        work_item_value(&project, work_item_id)["attempts"][0]["evidence_recoveries"][0]["targets"]
+        work_item_value(&project, &work_item_id)["attempts"][0]["evidence_recoveries"][0]["targets"]
             [0]["review_digest"]
             .is_null(),
         "stale legacy migration persisted a target digest"

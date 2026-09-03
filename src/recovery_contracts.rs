@@ -729,10 +729,11 @@ pub(crate) fn migrate_legacy_code_change_review_digest(
 /// Validate an exact replay of an already-persisted source classification.
 ///
 /// Classification mutates the model before a corrective Writer can be claimed,
-/// so a retry may observe that Writer in any recoverable lifecycle state. Keep
-/// this contract separate from the first-mutation frontier: replay checks the
-/// stored operation and every immutable binding, while the frontier validator
-/// below remains strict for a new classification.
+/// so a retry may observe that Writer in a resumable lifecycle state. A hard
+/// failure is not resumable without an explicit validated retry transition.
+/// Keep this contract separate from the first-mutation frontier: replay checks
+/// the stored operation and every immutable binding, while the frontier
+/// validator below remains strict for a new classification.
 pub(crate) fn validate_code_change_classification_replay(
     project_root: &Path,
     item: &work_model::WorkItem,
@@ -777,11 +778,11 @@ pub(crate) fn validate_code_change_classification_replay(
         return Err(rejected("classified Writer identity changed"));
     }
     let lifecycle_is_replayable = match writer.status {
-        TaskStatus::Planned
-        | TaskStatus::Executing
-        | TaskStatus::NeedsUser
-        | TaskStatus::Failed => writer.output.is_none(),
+        TaskStatus::Planned | TaskStatus::Executing | TaskStatus::NeedsUser => {
+            writer.output.is_none()
+        }
         TaskStatus::Complete => writer.output.is_some(),
+        TaskStatus::Failed => false,
         TaskStatus::Superseded => false,
     };
     if !lifecycle_is_replayable {

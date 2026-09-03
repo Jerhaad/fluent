@@ -5166,12 +5166,14 @@ impl Attempt {
             })
     }
 
-    /// Return whether this Attempt owns a replayable corrective Writer created
+    /// Return whether this Attempt owns a resumable corrective Writer created
     /// by an accepted host-evidence source classification.
     ///
     /// Queue admission uses this broader shape while recovering an older
-    /// paused or interrupted Writer. The replay contract still validates every
-    /// candidate and artifact binding before queue admission mutates anything.
+    /// paused or interrupted Writer. A hard-failed Writer is not admitted
+    /// without an explicit validated retry transition. The replay contract
+    /// still validates every candidate and artifact binding before queue
+    /// admission mutates anything.
     pub fn has_replayable_code_change_classification(&self) -> bool {
         let Some((recovery_index, recovery)) = self
             .evidence_recoveries
@@ -5210,10 +5212,7 @@ impl Attempt {
         };
         matches!(
             writer.status,
-            TaskStatus::Planned
-                | TaskStatus::Executing
-                | TaskStatus::NeedsUser
-                | TaskStatus::Failed
+            TaskStatus::Planned | TaskStatus::Executing | TaskStatus::NeedsUser
         ) && writer.output.is_none()
     }
 
