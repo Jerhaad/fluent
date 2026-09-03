@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -25,21 +25,24 @@ pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
-#[derive(Debug, Deserialize)]
+/// Version-one operator evidence document. The parser below is the single
+/// validation boundary for host-evidence attachment and source correction.
+/// Callers retain the exact serialized bytes separately as the audit artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EvidenceSnapshot {
-    schema_version: u32,
-    producer: String,
-    check: String,
-    working_directory: String,
-    result: EvidenceSnapshotResult,
-    run_at: String,
-    output: String,
+pub struct EvidenceDocument {
+    pub schema_version: u32,
+    pub producer: String,
+    pub check: String,
+    pub working_directory: String,
+    pub result: EvidenceResult,
+    pub run_at: String,
+    pub output: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum EvidenceSnapshotResult {
+pub enum EvidenceResult {
     Pass,
     Fail,
 }
@@ -1308,11 +1311,11 @@ pub(crate) fn validate_managed_file_path(project_root: &Path, relative: &str) ->
     Ok(full_path)
 }
 
-fn parse_evidence_snapshot(bytes: &[u8]) -> Result<EvidenceSnapshotResult> {
+pub(crate) fn parse_evidence_document(bytes: &[u8]) -> Result<EvidenceDocument> {
     if bytes.is_empty() || bytes.len() > MAX_EVIDENCE_BYTES {
         bail!("evidence document must be between 1 and {MAX_EVIDENCE_BYTES} bytes");
     }
-    let document: EvidenceSnapshot = serde_json::from_slice(bytes)
+    let document: EvidenceDocument = serde_json::from_slice(bytes)
         .context("evidence document must be valid schema-version-1 JSON")?;
     if document.schema_version != 1
         || document.producer.trim().is_empty()
@@ -1322,16 +1325,15 @@ fn parse_evidence_snapshot(bytes: &[u8]) -> Result<EvidenceSnapshotResult> {
         bail!("evidence document has an unsupported version or empty required field");
     }
     DateTime::parse_from_rfc3339(&document.run_at).context("evidence run_at must be RFC3339")?;
-    let _ = &document.output;
-    Ok(document.result)
+    Ok(document)
 }
 
 /// Require host evidence to record a failed check before allowing a source
 /// correction classification or replay.
 pub(crate) fn validate_failed_evidence_snapshot(bytes: &[u8]) -> Result<()> {
-    match parse_evidence_snapshot(bytes)? {
-        EvidenceSnapshotResult::Fail => Ok(()),
-        EvidenceSnapshotResult::Pass => {
+    match parse_evidence_document(bytes)?.result {
+        EvidenceResult::Fail => Ok(()),
+        EvidenceResult::Pass => {
             bail!("evidence snapshot result must be fail for source correction")
         }
     }
@@ -1523,17 +1525,15 @@ pub(crate) fn review_artifact_path(task: &Task) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EvidenceSnapshotResult, parse_evidence_snapshot, validate_failed_evidence_snapshot,
-    };
+    use super::{EvidenceResult, parse_evidence_document, validate_failed_evidence_snapshot};
 
     #[test]
     fn failed_evidence_snapshot_rejects_pass_result() {
         let passing = br#"{"schema_version":1,"producer":"host","check":"cargo test","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
 
         assert_eq!(
-            parse_evidence_snapshot(passing).unwrap(),
-            EvidenceSnapshotResult::Pass
+            parse_evidence_document(passing).unwrap().result,
+            EvidenceResult::Pass
         );
         let error = validate_failed_evidence_snapshot(passing).unwrap_err();
         assert!(

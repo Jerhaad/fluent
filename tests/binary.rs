@@ -26134,6 +26134,394 @@ fn exact_host_evidence_classification_replay_accepts_claimed_writer() {
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_returns_original_for_supported_writer_lifecycles() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-lifecycle-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        work_item_id.as_str(),
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    let first = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "initial classification failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_model = work_item_value(&project, &work_item_id);
+    let classification =
+        &first_model["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
+    let writer_id = classification["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_path = classification["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_audit = fs::read(project.join(&audit_path)).unwrap();
+    let writer_count = first_model["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+
+    let replay_and_assert_unchanged = |label: &str| {
+        let before_model = work_item_value(&project, &work_item_id);
+        let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+        let before_head = git_head(&project);
+        let replay = fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .output()
+            .unwrap();
+        assert!(
+            replay.status.success(),
+            "{label} replay failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_eq!(replay.stdout, first.stdout, "{label} replay changed result");
+        assert_eq!(
+            work_item_value(&project, &work_item_id),
+            before_model,
+            "{label} replay changed the Work Item"
+        );
+        assert_eq!(
+            persisted_work_snapshot(&project, &work_item_id),
+            before_persisted,
+            "{label} replay changed persisted model or artifacts"
+        );
+        assert_eq!(
+            fs::read(project.join(&audit_path)).unwrap(),
+            first_audit,
+            "{label} replay changed the classification audit"
+        );
+        assert_eq!(
+            git_head(&project),
+            before_head,
+            "{label} replay changed candidate"
+        );
+        assert_eq!(
+            work_item_value(&project, &work_item_id)["attempts"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|task| task["kind"] == "write")
+                .count(),
+            writer_count,
+            "{label} replay created another Writer"
+        );
+    };
+
+    // The initial classification leaves the corrective Writer Planned with no output.
+    replay_and_assert_unchanged("Planned");
+
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            let writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            writer.status = fluent::work_model::TaskStatus::Executing;
+            writer.started_at = Some(fluent::work_model::now_iso8601());
+            attempt.status = fluent::work_model::AttemptStatus::Executing;
+            Ok(())
+        })
+        .unwrap();
+    replay_and_assert_unchanged("Executing");
+
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            let writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            fluent::work_model::set_task_terminal(
+                writer,
+                fluent::work_model::TaskStatus::NeedsUser,
+            );
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::Interrupted);
+            attempt.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
+        .unwrap();
+    replay_and_assert_unchanged("NeedsUser");
+
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            let source_output = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Write
+                        && task.id != writer_id
+                        && task.status == fluent::work_model::TaskStatus::Complete
+                })
+                .and_then(|task| task.output.clone())
+                .expect("fixture has a completed source Writer");
+            let writer = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            writer.status = fluent::work_model::TaskStatus::Complete;
+            writer.output = Some(source_output);
+            writer.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
+        .unwrap();
+    replay_and_assert_unchanged("Complete");
+}
+
+#[test]
+fn exact_host_evidence_classification_replay_rejects_superseded_writer_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-superseded-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        work_item_id.as_str(),
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+
+    let classified = work_item_value(&project, &work_item_id);
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            let writer = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            writer.status = fluent::work_model::TaskStatus::Superseded;
+            writer.output = None;
+            Ok(())
+        })
+        .unwrap();
+
+    let before_model = work_item_value(&project, &work_item_id);
+    let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+    let before_audit = fs::read(project.join(&audit_path)).unwrap();
+    let before_head = git_head(&project);
+    let before_writer_count = before_model["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        !replay.status.success(),
+        "Superseded replay unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&replay.stderr)
+            .contains("classified Writer lifecycle is not replayable")
+    );
+    assert_eq!(work_item_value(&project, &work_item_id), before_model);
+    assert_eq!(
+        persisted_work_snapshot(&project, &work_item_id),
+        before_persisted,
+        "Superseded replay changed persisted model or artifacts"
+    );
+    assert_eq!(fs::read(project.join(&audit_path)).unwrap(), before_audit);
+    assert_eq!(git_head(&project), before_head);
+    assert_eq!(
+        work_item_value(&project, &work_item_id)["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        before_writer_count,
+        "Superseded replay created another Writer"
+    );
+}
+
+#[test]
+fn host_evidence_classification_rejects_existing_merge_candidate_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-merge-candidate-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            let failed_writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Write
+                        && task.status == fluent::work_model::TaskStatus::Failed
+                })
+                .expect("fixture has a failed source-correction Writer");
+            failed_writer.status = fluent::work_model::TaskStatus::Superseded;
+            attempt.status = fluent::work_model::AttemptStatus::Complete;
+            attempt.pause_kind = None;
+            attempt.completed_at = None;
+            attempt.review_state = Some(fluent::work_model::AttemptReviewState::Passed);
+            let candidate_id = item
+                .create_or_get_merge_candidate("attempt-1")
+                .expect("fixture should create a valid Merge Candidate");
+            assert_eq!(candidate_id, "attempt-1-merge-candidate");
+            let candidate = item
+                .merge_candidates
+                .last()
+                .expect("Merge Candidate was appended");
+            assert_eq!(candidate.attempt_id, "attempt-1");
+            assert_eq!(
+                candidate.candidate_commit,
+                item.attempts[0].tasks[0].output.as_ref().unwrap().commit
+            );
+            assert_eq!(candidate.candidate_commit, git_head(&project));
+
+            let attempt = &mut item.attempts[0];
+            let failed_writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Write && task.output.is_none()
+                })
+                .expect("fixture retains its corrective Writer");
+            failed_writer.status = fluent::work_model::TaskStatus::Failed;
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::HostSandbox);
+            attempt.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
+        .unwrap();
+
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let before_model = work_item_value(&project, &work_item_id);
+    assert_eq!(
+        before_model["merge_candidates"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        before_model["merge_candidates"][0]["attempt_id"],
+        "attempt-1"
+    );
+    assert_eq!(
+        before_model["merge_candidates"][0]["candidate_commit"],
+        candidate
+    );
+    let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+    let before_head = git_head(&project);
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id.as_str(),
+            "attempt-1",
+            "--candidate",
+            candidate.as_str(),
+            "--review-artifact",
+            targeted_path.as_str(),
+            "--evidence-digest",
+            digest.as_str(),
+            "--resolution",
+            resolution,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "classification with existing Merge Candidate unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("a Merge Candidate already owns this candidate")
+    );
+    assert_eq!(work_item_value(&project, &work_item_id), before_model);
+    assert_eq!(
+        persisted_work_snapshot(&project, &work_item_id),
+        before_persisted,
+        "classification changed persisted model or artifacts"
+    );
+    assert_eq!(git_head(&project), before_head);
+}
+
+#[test]
 fn classified_recovery_completes_without_later_host_evidence() {
     let tmp = TempDir::new().unwrap();
     let run_suffix = tmp

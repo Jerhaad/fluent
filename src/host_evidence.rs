@@ -1,7 +1,6 @@
 //! Immutable, host-produced evidence attached to a reviewed Attempt.
 
 use anyhow::{Context, Result, bail};
-use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -11,6 +10,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::content::ContentResolver;
+use crate::recovery_contracts::parse_evidence_document;
+pub use crate::recovery_contracts::{EvidenceDocument, EvidenceResult};
 use crate::review::{self, Verdict};
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
@@ -72,27 +73,6 @@ const PLAN_COMMAND_LAUNCHERS: &[&str] = &[
     "yarn",
     "zsh",
 ];
-
-/// Version-one operator evidence document. Its serialized bytes, not a
-/// re-rendering, are the audited artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvidenceDocument {
-    pub schema_version: u32,
-    pub producer: String,
-    pub check: String,
-    pub working_directory: String,
-    pub result: EvidenceResult,
-    pub run_at: String,
-    pub output: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvidenceResult {
-    Pass,
-    Fail,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1126,7 +1106,7 @@ pub(crate) fn completed_plan_host_matrix_ref(
         {
             return None;
         }
-        let evidence: EvidenceDocument = serde_json::from_slice(&evidence_bytes).ok()?;
+        let evidence = parse_evidence_document(&evidence_bytes).ok()?;
         if evidence.result != EvidenceResult::Pass
             || evidence.check != binding.command
             || evidence.working_directory != binding.working_directory
@@ -1237,7 +1217,7 @@ pub(crate) fn apply_completed_plan_host_evidence(
         if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != binding.evidence.digest {
             continue;
         }
-        let Ok(evidence) = serde_json::from_slice::<EvidenceDocument>(&evidence_bytes) else {
+        let Ok(evidence) = parse_evidence_document(&evidence_bytes) else {
             continue;
         };
         if evidence.result != EvidenceResult::Pass
@@ -1721,7 +1701,7 @@ pub fn attach(
     }
     let bytes = fs::read(evidence_file)
         .with_context(|| format!("read evidence file {}", evidence_file.display()))?;
-    let document = parse_document(&bytes)?;
+    let document = parse_evidence_document(&bytes)?;
     let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     let snapshot_path = snapshot_path(work_item_id, attempt_id, &digest)?;
 
@@ -2035,7 +2015,7 @@ pub fn attach_plan_row(
     }
     let bytes = fs::read(evidence_file)
         .with_context(|| format!("read evidence file {}", evidence_file.display()))?;
-    let document = parse_document(&bytes)?;
+    let document = parse_evidence_document(&bytes)?;
     let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     let snapshot_path = snapshot_path(work_item_id, attempt_id, &digest)?;
     let plan_row = plan_row.trim().to_string();
@@ -3231,7 +3211,7 @@ fn completed_recheck_evidence_source_for_recovery(
     if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
         return None;
     }
-    let evidence = parse_document(&evidence_bytes).ok()?;
+    let evidence = parse_evidence_document(&evidence_bytes).ok()?;
     let evidence_check = binding
         .evidence_check
         .as_deref()
@@ -3379,7 +3359,7 @@ pub(crate) fn completed_candidate_gate_evidence_commands(
             {
                 return None;
             }
-            let evidence = parse_document(&evidence_bytes).ok()?;
+            let evidence = parse_evidence_document(&evidence_bytes).ok()?;
             if evidence.result != EvidenceResult::Pass
                 || evidence.check != binding.command
                 || evidence.working_directory != binding.working_directory
@@ -3443,7 +3423,7 @@ pub(crate) fn completed_review_evidence_commands(
             {
                 return None;
             }
-            let evidence = parse_document(&evidence_bytes).ok()?;
+            let evidence = parse_evidence_document(&evidence_bytes).ok()?;
             if evidence.result != EvidenceResult::Pass {
                 return None;
             }
@@ -3622,23 +3602,6 @@ fn candidate_workspace_is_clean_at(
     candidate: &str,
 ) -> bool {
     crate::recovery_contracts::candidate_workspace_is_clean_at(project_root, output, candidate)
-}
-
-fn parse_document(bytes: &[u8]) -> Result<EvidenceDocument> {
-    if bytes.is_empty() || bytes.len() > MAX_EVIDENCE_BYTES {
-        bail!("evidence document must be between 1 and {MAX_EVIDENCE_BYTES} bytes");
-    }
-    let document: EvidenceDocument = serde_json::from_slice(bytes)
-        .context("evidence document must be valid schema-version-1 JSON")?;
-    if document.schema_version != 1
-        || document.producer.trim().is_empty()
-        || document.check.trim().is_empty()
-        || document.working_directory.trim().is_empty()
-    {
-        bail!("evidence document has an unsupported version or empty required field");
-    }
-    DateTime::parse_from_rfc3339(&document.run_at).context("evidence run_at must be RFC3339")?;
-    Ok(document)
 }
 
 fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
@@ -4029,12 +3992,12 @@ mod tests {
     fn evidence_document_requires_versioned_complete_host_claim() {
         let accepted = br#"{"schema_version":1,"producer":"host","check":"fluent tester check","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
         assert_eq!(
-            parse_document(accepted).unwrap().result,
+            parse_evidence_document(accepted).unwrap().result,
             EvidenceResult::Pass
         );
 
         let missing_check = br#"{"schema_version":1,"producer":"host","check":"","working_directory":"/repo","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"ok"}"#;
-        assert!(parse_document(missing_check).is_err());
+        assert!(parse_evidence_document(missing_check).is_err());
     }
 
     #[test]
@@ -4291,8 +4254,7 @@ mod tests {
         let command = "python3 tests/readiness.py";
         let (project, _workspace, store, candidate, evidence_path) =
             plan_host_evidence_fixture(command);
-        let mut document: EvidenceDocument =
-            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        let mut document = parse_evidence_document(&fs::read(&evidence_path).unwrap()).unwrap();
         document.check = "python3 tests/another-check.py".to_string();
         fs::write(
             &evidence_path,
@@ -4604,8 +4566,7 @@ mod tests {
         let command = "python3 tests/readiness.py";
         let (project, _workspace, store, candidate, gate_path, evidence_path) =
             candidate_gate_evidence_fixture(command);
-        let mut document: EvidenceDocument =
-            serde_json::from_slice(&fs::read(&evidence_path).unwrap()).unwrap();
+        let mut document = parse_evidence_document(&fs::read(&evidence_path).unwrap()).unwrap();
         document.result = EvidenceResult::Fail;
         document.output = "public readiness workflow failed".to_string();
         fs::write(
