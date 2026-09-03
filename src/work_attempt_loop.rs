@@ -8100,6 +8100,48 @@ fn interpret_reviews(
                 .find(|entry| entry.id == recovery.id)
                 .unwrap()
                 .state = EvidenceRecoveryState::Complete;
+
+            // A classified source correction supersedes the output-free
+            // Writer that originally failed before the recovery was admitted.
+            // Keep that Task as immutable history, but release its unresolved
+            // frontier ownership before the Attempt can become terminal.
+            let classified_writer_indices = item.attempts[attempt_index]
+                .evidence_recoveries
+                .iter()
+                .filter_map(|entry| {
+                    (entry.state == EvidenceRecoveryState::CodeChange)
+                        .then(|| entry.code_change_classification.as_ref())
+                        .flatten()
+                })
+                .filter_map(|classification| {
+                    item.attempts[attempt_index]
+                        .tasks
+                        .iter()
+                        .position(|task| task.id == classification.writer_task_id)
+                })
+                .collect::<Vec<_>>();
+            let mut failed_source_writer_indices = classified_writer_indices
+                .iter()
+                .flat_map(|writer_index| {
+                    item.attempts[attempt_index]
+                        .tasks
+                        .iter()
+                        .enumerate()
+                        .take(*writer_index)
+                        .filter_map(|(index, task)| {
+                            (task.kind == TaskKind::Write
+                                && task.status == TaskStatus::Failed
+                                && task.output.is_none())
+                            .then_some(index)
+                        })
+                })
+                .collect::<Vec<_>>();
+            failed_source_writer_indices.sort_unstable();
+            failed_source_writer_indices.dedup();
+            if failed_source_writer_indices.len() == 1 {
+                let task = &mut item.attempts[attempt_index].tasks[failed_source_writer_indices[0]];
+                crate::work_model::set_task_terminal(task, TaskStatus::Superseded);
+            }
         }
     }
     if !item.attempts[attempt_index].kind.is_review_only_like() {

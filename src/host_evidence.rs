@@ -319,37 +319,6 @@ pub fn classify_for_code_change(
             return Err(rejected_for("bound review no longer requests evidence-needed"));
         }
 
-        let expected_snapshot = snapshot_path(
-            work_item_id,
-            attempt_id,
-            &recovery.attachment.digest,
-        )
-        .map_err(|_| rejected())?;
-        if recovery.attachment.digest != evidence_digest
-            || recovery.attachment.snapshot_path != expected_snapshot
-        {
-            return Err(rejected_for("evidence snapshot binding changed"));
-        }
-        let evidence_path = validate_managed_file_path(
-            project_root,
-            &recovery.attachment.snapshot_path,
-        )
-        .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
-            attempt_id: attempt_id.to_string(),
-            reason: format!("evidence snapshot is not a managed regular file: {error}"),
-        })?;
-        let evidence_bytes = fs::read(&evidence_path).map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
-            attempt_id: attempt_id.to_string(),
-            reason: format!("cannot read bound evidence snapshot: {error}"),
-        })?;
-        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes))
-            != recovery.attachment.digest
-        {
-            return Err(rejected_for("evidence snapshot bytes changed"));
-        }
-        crate::recovery_contracts::validate_failed_evidence_snapshot(&evidence_bytes)
-            .map_err(|error| rejected_for(&format!("invalid evidence snapshot: {error}")))?;
-
         let source_writer_index = recovery
             .code_change_classification
             .as_ref()
@@ -367,13 +336,19 @@ pub fn classify_for_code_change(
             .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
             .and_then(|task| task.output.as_ref())
             .ok_or_else(rejected)?;
-        if writer.commit != candidate_commit
-            || !candidate_workspace_is_clean_at(project_root, writer, candidate_commit)
-        {
-            return Err(rejected_for(
-                "the candidate workspace no longer matches the classified commit",
-            ));
-        }
+        crate::recovery_contracts::validate_code_change_candidate_binding(
+            project_root,
+            item,
+            attempt,
+            recovery,
+            target,
+            review_task,
+            writer,
+            candidate_commit,
+            review_artifact,
+            evidence_digest,
+        )
+        .map_err(|reason| rejected_for(&reason))?;
 
         if let Some(prior) = recovery.code_change_classification.as_ref() {
             if prior.disposition != CODE_CHANGE_DISPOSITION {

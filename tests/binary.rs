@@ -25919,6 +25919,325 @@ exit 0
 }
 
 #[test]
+fn classified_recovery_continues_through_tester_and_later_host_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-e2e-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let _workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        &work_item_id,
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .assert()
+        .success();
+    let classified = work_item_value(&project, &work_item_id);
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", &work_item_id, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+
+    let writer_bin = tmp.path().join("bin-classified-e2e-writer");
+    write_mock_claude(
+        &writer_bin,
+        r##"#!/bin/bash
+HAS_PROMPT=0
+for arg in "$@"; do
+  if [ "$arg" = "-p" ]; then HAS_PROMPT=1; break; fi
+done
+if [ "$HAS_PROMPT" = 0 ]; then exit 0; fi
+mkdir -p tests
+printf 'classified source correction\n' >> README.md
+printf 'print("readiness")\n' > tests/readiness.py
+git add README.md tests/readiness.py
+git commit -m "Apply classified source correction" >/dev/null
+exit 0
+"##,
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "run",
+            &work_item_id,
+            "attempt-1",
+            &writer_id,
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&writer_bin))
+        .assert()
+        .success();
+
+    let matrix_path = project.join(format!(
+        ".fluent/work/artifacts/{work_item_id}/attempt-1/{writer_id}/writer-completion.json"
+    ));
+    fs::create_dir_all(matrix_path.parent().unwrap()).unwrap();
+    fs::write(
+        &matrix_path,
+        serde_json::to_vec_pretty(&fluent::work_model::WriterCompletionMatrix {
+            schema_version: 1,
+            task_id: writer_id.clone(),
+            rows: vec![fluent::work_model::WriterCompletionRow {
+                id: "behavior:e2e:b1".to_string(),
+                kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#b1".to_string(),
+                requirement: "The readiness check remains runnable.".to_string(),
+                verification_refs: vec!["python3 tests/readiness.py".to_string()],
+                state: fluent::work_model::WriterCompletionState::Complete,
+                implementation_evidence: vec!["tests/readiness.py".to_string()],
+                verification: vec![fluent::work_model::WriterVerificationClaim {
+                    command: "python3 tests/readiness.py".to_string(),
+                    result: fluent::work_model::WriterVerificationResult::Pass,
+                }],
+                applicable_constraints: Vec::new(),
+            }],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&work_item_id, |item| {
+            item.attempts[0].writer_completion_contract =
+                Some(fluent::work_model::WriterCompletionContract {
+                    version: fluent::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                    requirements: vec![fluent::work_model::WriterCompletionRequirement {
+                        id: "behavior:e2e:b1".to_string(),
+                        kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
+                        source: "behaviors.md#b1".to_string(),
+                        requirement: "The readiness check remains runnable.".to_string(),
+                        verification_refs: vec!["python3 tests/readiness.py".to_string()],
+                    }],
+                });
+            item.add_next_review_tasks(
+                "attempt-1",
+                &[
+                    "documentation",
+                    "behaviors",
+                    "architecture",
+                    "skills",
+                    "tests",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let review_bin = tmp.path().join("bin-classified-e2e-review");
+    write_mock_claude(
+        &review_bin,
+        &learner_mock_script(r#"{"learning_summary":"e2e","follow_ups":[]}"#),
+    );
+    let review_ids = work_item_value(&project, &work_item_id)["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "review" && task["status"].is_null())
+        .filter_map(|task| task["id"].as_str())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(review_ids.len(), 5);
+    for review_id in &review_ids {
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "task",
+                "run",
+                &work_item_id,
+                "attempt-1",
+                review_id,
+                "--no-sandbox",
+            ])
+            .env("PATH", mock_path(&review_bin))
+            .assert()
+            .success();
+    }
+
+    let tester = fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", &work_item_id, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&review_bin))
+        .output()
+        .unwrap();
+    assert!(
+        tester.status.success(),
+        "final Tester did not reach host-evidence pause: stdout={} stderr={}",
+        String::from_utf8_lossy(&tester.stdout),
+        String::from_utf8_lossy(&tester.stderr)
+    );
+    let paused = work_item_value(&project, &work_item_id);
+    assert_eq!(paused["attempts"][0]["status"], "needs-user");
+    assert_eq!(paused["attempts"][0]["pause_kind"], "host-evidence");
+    assert!(
+        paused["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["kind"] == "tester" && task["status"] == "complete")
+    );
+    let gate_path = paused["attempts"][0]["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|artifact| {
+            artifact["path"]
+                .as_str()
+                .filter(|path| path.ends_with("/candidate-gate.json"))
+        })
+        .expect("final Tester must publish a rejected candidate gate")
+        .to_string();
+    let latest_candidate = paused["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|task| task["kind"] == "write" && task["status"] == "complete")
+        .and_then(|task| task["output"]["commit"].as_str())
+        .unwrap()
+        .to_string();
+    assert_ne!(latest_candidate, candidate);
+
+    let evidence = tmp.path().join("e2e-gate-evidence.json");
+    fs::write(
+        &evidence,
+        br#"{"schema_version":1,"producer":"host","check":"python3 tests/readiness.py","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ready"}"#,
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            &work_item_id,
+            "attempt-1",
+            "--candidate",
+            &latest_candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &gate_path,
+        ])
+        .assert()
+        .success();
+    let targeted_review_id =
+        work_item_value(&project, &work_item_id)["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .unwrap()
+            .last()
+            .and_then(|recovery| recovery["targets"][0]["review_task_id"].as_str())
+            .unwrap()
+            .to_string();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "run",
+            &work_item_id,
+            "attempt-1",
+            &targeted_review_id,
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&review_bin))
+        .assert()
+        .success();
+
+    let resumed = fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", &work_item_id, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&review_bin))
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "host-evidence continuation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let completed = work_item_value(&project, &work_item_id);
+    let attempt = &completed["attempts"][0];
+    assert_eq!(attempt["status"], "complete");
+    assert_eq!(attempt["evidence_recoveries"][0]["state"], "code-change");
+    assert_eq!(attempt["evidence_recoveries"][1]["state"], "complete");
+    assert_eq!(attempt["evidence_recoveries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        3,
+        "the classified recovery adds one Writer without duplicating it"
+    );
+    assert!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["id"] == targeted_review_id && task["status"] == "complete" })
+    );
+    assert!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| { task["kind"] == "tester" && task["status"] == "complete" })
+    );
+    assert!(
+        completed["merge_candidates"]
+            .as_array()
+            .is_some_and(|candidates| {
+                candidates.iter().any(|candidate| {
+                    candidate["attempt_id"] == "attempt-1"
+                        && candidate["candidate_commit"] == latest_candidate
+                })
+            })
+    );
+    assert_eq!(
+        attempt["evidence_recoveries"][0]["attachment"]["snapshot_path"],
+        snapshot_path
+    );
+    assert_eq!(
+        attempt["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"] == "attempt-1-write-2")
+            .and_then(|task| task["status"].as_str()),
+        Some("superseded"),
+        "the failed source Writer remains as superseded history after recovery"
+    );
+}
+
+#[test]
 fn host_evidence_classification_replay_republishes_missing_audit() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
@@ -26514,7 +26833,7 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
         })
         .unwrap();
 
-    let output = fluent_cmd()
+    let first = fluent_cmd()
         .current_dir(&project)
         .args([
             "attempt",
@@ -26534,10 +26853,10 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        first.status.success(),
         "legacy classification failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
     );
     let shown = work_item_value(&project, "evidence-classify-legacy");
     assert_eq!(shown["attempts"][0]["status"], "planned");
@@ -26552,6 +26871,21 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
             sha2::Sha256::digest(fs::read(project.join(&targeted_path)).unwrap())
         )
     );
+    let classification =
+        &shown["attempts"][0]["evidence_recoveries"][0]["code_change_classification"];
+    let audit_path = classification["audit_artifact"]["path"].as_str().unwrap();
+    let first_model = shown.clone();
+    let first_persisted = persisted_work_snapshot(&project, "evidence-classify-legacy");
+    let first_audit = fs::read(project.join(audit_path)).unwrap();
+    let snapshot_path =
+        first_model["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let first_snapshot = fs::read(project.join(&snapshot_path)).unwrap();
+    let first_review = fs::read(project.join(&targeted_path)).unwrap();
+    let first_tasks = first_model["attempts"][0]["tasks"].clone();
+    let first_recoveries = first_model["attempts"][0]["evidence_recoveries"].clone();
 
     let replay = fluent_cmd()
         .current_dir(&project)
@@ -26578,6 +26912,32 @@ fn legacy_unqualified_host_evidence_can_be_classified_for_code_change() {
         String::from_utf8_lossy(&replay.stdout),
         String::from_utf8_lossy(&replay.stderr)
     );
+    assert_eq!(replay.stdout, first.stdout);
+    let replayed = work_item_value(&project, "evidence-classify-legacy");
+    assert_eq!(replayed, first_model);
+    assert_eq!(
+        replayed["attempts"][0]["tasks"], first_tasks,
+        "legacy replay changed Task history"
+    );
+    assert_eq!(
+        replayed["attempts"][0]["evidence_recoveries"], first_recoveries,
+        "legacy replay changed recovery history"
+    );
+    assert_eq!(
+        persisted_work_snapshot(&project, "evidence-classify-legacy"),
+        first_persisted,
+        "legacy replay changed persisted artifacts"
+    );
+    assert_eq!(fs::read(project.join(audit_path)).unwrap(), first_audit);
+    assert_eq!(
+        fs::read(project.join(&snapshot_path)).unwrap(),
+        first_snapshot
+    );
+    assert_eq!(
+        fs::read(project.join(&targeted_path)).unwrap(),
+        first_review
+    );
+    assert_eq!(git_head(&project), candidate);
 
     fluent_cmd()
         .current_dir(&project)
@@ -26604,10 +26964,13 @@ fn host_evidence_classification_rejects_stale_inputs() {
         "wrong-candidate-digest",
         "wrong-evidence-digest",
         "absolute-review-path",
+        "changed-review-workspace",
+        "missing-review-evidence-input",
     ] {
         let tmp = TempDir::new().unwrap();
         let (project, candidate, prior_review_path, targeted_path, digest, snapshot_path) =
             setup_paused_code_change_classification_fixture(&tmp, "evidence-classify-stale");
+        let store = WorkModelStore::new(&project);
         let mut attempt_arg = "attempt-1".to_string();
         let mut candidate_arg = candidate.clone();
         let mut review_arg = targeted_path.clone();
@@ -26643,6 +27006,53 @@ fn host_evidence_classification_rejects_stale_inputs() {
                 .unwrap();
                 review_arg = outside.display().to_string();
             }
+            "changed-review-workspace" => store
+                .mutate_work_item("evidence-classify-stale", |item| {
+                    let review = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| {
+                            task.kind == fluent::work_model::TaskKind::Review
+                                && task.role == "tests"
+                                && task.artifact_area.as_ref().is_some_and(|area| {
+                                    format!("{}/review.md", area.path) == targeted_path
+                                })
+                        })
+                        .unwrap();
+                    review
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_workspace_path = "../work-stale-candidate".to_string();
+                    review
+                        .workspace_access
+                        .reads
+                        .iter_mut()
+                        .find(|workspace| workspace.id == "candidate")
+                        .unwrap()
+                        .path = "../work-stale-candidate".to_string();
+                    Ok(())
+                })
+                .unwrap(),
+            "missing-review-evidence-input" => store
+                .mutate_work_item("evidence-classify-stale", |item| {
+                    let review = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| {
+                            task.kind == fluent::work_model::TaskKind::Review
+                                && task.role == "tests"
+                                && task.artifact_area.as_ref().is_some_and(|area| {
+                                    format!("{}/review.md", area.path) == targeted_path
+                                })
+                        })
+                        .unwrap();
+                    review
+                        .input_artifacts
+                        .retain(|input| input.producer_id != "host-evidence");
+                    Ok(())
+                })
+                .unwrap(),
             _ => unreachable!("case list is exhaustive"),
         }
         let before = persisted_work_snapshot(&project, "evidence-classify-stale");

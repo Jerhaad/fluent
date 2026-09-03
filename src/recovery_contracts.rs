@@ -17,7 +17,7 @@ use crate::git;
 use crate::review;
 use crate::work_model::{
     self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
-    HostEvidenceClassification, Task, TaskKind, TaskStatus, WorkModelError,
+    EvidenceReviewTarget, HostEvidenceClassification, Task, TaskKind, TaskStatus, WorkModelError,
     WriterCompletionFinding,
 };
 
@@ -416,13 +416,6 @@ pub(crate) fn validate_code_change_writer_start(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref())
         .ok_or_else(|| rejected("the source candidate Writer is missing"))?;
-    if source_output.commit != recovery.candidate_commit
-        || !candidate_workspace_is_clean_at(project_root, source_output, &recovery.candidate_commit)
-    {
-        return Err(rejected(
-            "the candidate workspace no longer matches the classified commit",
-        ));
-    }
     if writer.workspace_access.writes.len() != 1
         || writer.workspace_access.writes[0].id != source_output.workspace_id
         || writer.workspace_access.writes[0].path != source_output.workspace_path
@@ -492,6 +485,19 @@ pub(crate) fn validate_code_change_writer_start(
                     })
         })
         .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
+    validate_code_change_candidate_binding(
+        project_root,
+        item,
+        attempt,
+        recovery,
+        target,
+        review_task,
+        source_output,
+        &recovery.candidate_commit,
+        &classification.review_artifact,
+        &recovery.attachment.digest,
+    )
+    .map_err(|reason| rejected(&reason))?;
     validate_classification_task_frontier(attempt, review_task_id, Some(task_id))
         .map_err(|reason| rejected(&reason))?;
     let evidence_ref = ArtifactRef {
@@ -538,34 +544,6 @@ pub(crate) fn validate_code_change_writer_start(
     {
         return Err(rejected("bound review no longer requests evidence-needed"));
     }
-
-    let expected_snapshot = snapshot_path(&item.id, attempt_id, &recovery.attachment.digest)
-        .map_err(|error| code_change_writer_rejection(attempt_id, error.to_string()))?;
-    if recovery.attachment.snapshot_path != expected_snapshot
-        || !recovery.attachment.digest.starts_with("sha256:")
-    {
-        return Err(rejected("evidence snapshot binding changed"));
-    }
-    let evidence_path =
-        validate_managed_file_path(project_root, &recovery.attachment.snapshot_path).map_err(
-            |error| {
-                code_change_writer_rejection(
-                    attempt_id,
-                    format!("evidence snapshot is not a managed regular file: {error}"),
-                )
-            },
-        )?;
-    let evidence_bytes = fs::read(&evidence_path).map_err(|error| {
-        code_change_writer_rejection(
-            attempt_id,
-            format!("cannot read bound evidence snapshot: {error}"),
-        )
-    })?;
-    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
-        return Err(rejected("evidence snapshot bytes changed"));
-    }
-    validate_failed_evidence_snapshot(&evidence_bytes)
-        .map_err(|error| rejected(&error.to_string()))?;
 
     let authorization_digest = format!(
         "sha256:{:x}",
@@ -751,13 +729,6 @@ pub(crate) fn validate_code_change_classification_replay(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref())
         .ok_or_else(|| rejected("the source candidate Writer is missing"))?;
-    if source_output.commit != recovery.candidate_commit
-        || !candidate_workspace_is_clean_at(project_root, source_output, &recovery.candidate_commit)
-    {
-        return Err(rejected(
-            "the candidate workspace no longer matches the classified commit",
-        ));
-    }
     if writer.workspace_access.writes.len() != 1
         || writer.workspace_access.writes[0].id != source_output.workspace_id
         || writer.workspace_access.writes[0].path != source_output.workspace_path
@@ -823,6 +794,18 @@ pub(crate) fn validate_code_change_classification_replay(
                     })
         })
         .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
+    validate_code_change_candidate_binding(
+        project_root,
+        item,
+        attempt,
+        recovery,
+        target,
+        review_task,
+        source_output,
+        &recovery.candidate_commit,
+        &classification.review_artifact,
+        &recovery.attachment.digest,
+    )?;
     let evidence_ref = ArtifactRef {
         producer_id: "host-evidence".to_string(),
         path: recovery.attachment.snapshot_path.clone(),
@@ -861,29 +844,6 @@ pub(crate) fn validate_code_change_classification_replay(
     {
         return Err(rejected("bound review no longer requests evidence-needed"));
     }
-
-    let expected_snapshot = snapshot_path(&item.id, &attempt.id, &recovery.attachment.digest)
-        .map_err(|error| rejected(&error.to_string()))?;
-    if recovery.attachment.snapshot_path != expected_snapshot
-        || !recovery.attachment.digest.starts_with("sha256:")
-    {
-        return Err(rejected("evidence snapshot binding changed"));
-    }
-    let evidence_path =
-        validate_managed_file_path(project_root, &recovery.attachment.snapshot_path).map_err(
-            |error| {
-                rejected(&format!(
-                    "evidence snapshot is not a managed regular file: {error}"
-                ))
-            },
-        )?;
-    let evidence_bytes = fs::read(&evidence_path)
-        .map_err(|error| rejected(&format!("cannot read bound evidence snapshot: {error}")))?;
-    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
-        return Err(rejected("evidence snapshot bytes changed"));
-    }
-    validate_failed_evidence_snapshot(&evidence_bytes)
-        .map_err(|error| rejected(&error.to_string()))?;
 
     let authorization_digest = format!(
         "sha256:{:x}",
@@ -1319,6 +1279,127 @@ pub(crate) fn validate_failed_evidence_snapshot(bytes: &[u8]) -> Result<()> {
             bail!("evidence snapshot result must be fail for source correction")
         }
     }
+}
+
+/// Validate the immutable candidate and host-evidence bindings shared by every
+/// source-correction classification boundary.
+///
+/// Callers must run this contract before changing the Work Item. It proves that
+/// the failed Review still reads the exact candidate workspace, names the
+/// persisted recovery, and carries the exact failed host-evidence snapshot.
+/// Queue admission, Writer reservation, and classification replay reuse this
+/// check so no boundary can accept a stale binding that another boundary later
+/// rejects.
+pub(crate) fn validate_code_change_candidate_binding(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+    target: &EvidenceReviewTarget,
+    review_task: &Task,
+    source_output: &work_model::TaskOutput,
+    candidate_commit: &str,
+    review_artifact: &str,
+    evidence_digest: &str,
+) -> std::result::Result<(), String> {
+    let rejected = |reason: &str| reason.to_string();
+    if source_output.commit != candidate_commit
+        || recovery.candidate_commit != candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, source_output, candidate_commit)
+    {
+        return Err(rejected(
+            "the candidate workspace no longer matches the classified commit",
+        ));
+    }
+    if review_task.kind != TaskKind::Review
+        || review_task.role != "tests"
+        || review_task.status != TaskStatus::Complete
+        || review_task.work_item_id != item.id
+        || review_task.attempt_id.as_deref() != Some(attempt.id.as_str())
+        || review_artifact_path(review_task).as_deref() != Some(review_artifact)
+        || target.role != review_task.role
+        || target.review_task_id.as_deref() != Some(review_task.id.as_str())
+    {
+        return Err(rejected("bound Tests review Task identity changed"));
+    }
+    let review_context = review_task
+        .review_context
+        .as_ref()
+        .ok_or_else(|| rejected("bound Tests review has no candidate workspace context"))?;
+    let matching_candidate_reads = review_task
+        .workspace_access
+        .reads
+        .iter()
+        .filter(|workspace| {
+            workspace.id == source_output.workspace_id
+                && workspace.path == source_output.workspace_path
+        })
+        .count();
+    let conflicting_candidate_reads = review_task.workspace_access.reads.iter().any(|workspace| {
+        workspace.id == source_output.workspace_id && workspace.path != source_output.workspace_path
+    });
+    if review_context.candidate_commit != candidate_commit
+        || review_context.candidate_workspace_id != source_output.workspace_id
+        || review_context.candidate_workspace_path != source_output.workspace_path
+        || matching_candidate_reads != 1
+        || conflicting_candidate_reads
+    {
+        return Err(rejected(
+            "bound Tests review is not attached to the candidate workspace",
+        ));
+    }
+    let evidence_context = review_task
+        .evidence_review_context
+        .as_ref()
+        .ok_or_else(|| rejected("bound Tests review has no host-evidence context"))?;
+    if evidence_context.recovery_id != recovery.id
+        || evidence_context.candidate_commit != candidate_commit
+        || evidence_context.attachment != recovery.attachment
+        || evidence_context.prior_review_artifact != target.prior_review_artifact
+    {
+        return Err(rejected("bound Tests review host-evidence context changed"));
+    }
+    if recovery.attachment.digest != evidence_digest {
+        return Err(rejected("evidence snapshot binding changed"));
+    }
+    let evidence_ref = ArtifactRef {
+        producer_id: "host-evidence".to_string(),
+        path: recovery.attachment.snapshot_path.clone(),
+    };
+    if review_task
+        .input_artifacts
+        .iter()
+        .filter(|input| *input == &evidence_ref)
+        .count()
+        != 1
+        || review_task
+            .input_artifacts
+            .iter()
+            .any(|input| input.path == evidence_ref.path && input != &evidence_ref)
+    {
+        return Err(rejected("bound Tests review lost its evidence input"));
+    }
+    let expected_snapshot = snapshot_path(&item.id, &attempt.id, &recovery.attachment.digest)
+        .map_err(|error| rejected(&error.to_string()))?;
+    if recovery.attachment.snapshot_path != expected_snapshot {
+        return Err(rejected("evidence snapshot binding changed"));
+    }
+    let evidence_path =
+        validate_managed_file_path(project_root, &recovery.attachment.snapshot_path).map_err(
+            |error| {
+                rejected(&format!(
+                    "evidence snapshot is not a managed regular file: {error}"
+                ))
+            },
+        )?;
+    let evidence_bytes = fs::read(&evidence_path)
+        .map_err(|error| rejected(&format!("cannot read bound evidence snapshot: {error}")))?;
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
+        return Err(rejected("evidence snapshot bytes changed"));
+    }
+    validate_failed_evidence_snapshot(&evidence_bytes)
+        .map_err(|error| rejected(&format!("invalid evidence snapshot: {error}")))?;
+    Ok(())
 }
 
 pub(crate) fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
