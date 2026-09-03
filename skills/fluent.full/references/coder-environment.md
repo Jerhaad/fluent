@@ -16,6 +16,11 @@ codex:
     - /absolute/path/to/skills
 ```
 
+Project-relative roots resolve from the project root before Fluent checks their
+containment (for example, `project-skills` means `<project>/project-skills`, not
+a path relative to the caller's current directory). A project root cannot use
+`..` to escape the project.
+
 Fluent validates and snapshots each root into the private worker home before
 reserving the role. Symlinks and duplicate top-level names fail closed, and the
 worker cannot access the rest of the operator's home.

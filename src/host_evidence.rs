@@ -297,37 +297,6 @@ pub fn classify_for_code_change(
             return Err(rejected_for("bound review no longer requests evidence-needed"));
         }
 
-        let source_writer_index = recovery
-            .code_change_classification
-            .as_ref()
-            .and_then(|classification| {
-                attempt
-                    .tasks
-                    .iter()
-                    .position(|task| task.id == classification.writer_task_id)
-            });
-        let writer = source_writer_index
-            .map(|index| &attempt.tasks[..index])
-            .unwrap_or(attempt.tasks.as_slice())
-            .iter()
-            .rev()
-            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-            .and_then(|task| task.output.as_ref())
-            .ok_or_else(rejected)?;
-        crate::recovery_contracts::validate_code_change_candidate_binding(
-            project_root,
-            item,
-            attempt,
-            recovery,
-            target,
-            review_task,
-            writer,
-            candidate_commit,
-            review_artifact,
-            evidence_digest,
-        )
-        .map_err(|reason| rejected_for(&reason))?;
-
         if let Some(prior) = recovery.code_change_classification.as_ref() {
             if prior.disposition != CODE_CHANGE_DISPOSITION {
                 return Err(rejected_for("stored classification uses an unsupported disposition"));
@@ -381,6 +350,26 @@ pub fn classify_for_code_change(
             }
             return Err(rejected_for("authorization differs from the stored classification"));
         }
+        let writer = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .ok_or_else(rejected)?;
+        crate::recovery_contracts::validate_code_change_candidate_binding(
+            project_root,
+            item,
+            attempt,
+            recovery,
+            target,
+            review_task,
+            writer,
+            candidate_commit,
+            review_artifact,
+            evidence_digest,
+        )
+        .map_err(|reason| rejected_for(&reason))?;
         let review_task_id = review_task.id.clone();
         crate::recovery_contracts::validate_classification_task_frontier(
             attempt,

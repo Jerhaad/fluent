@@ -853,18 +853,43 @@ pub(crate) fn validate_code_change_classification_replay(
                     })
         })
         .ok_or_else(|| rejected("bound Tests Review Task is missing or mismatched"))?;
-    validate_code_change_candidate_binding(
-        project_root,
-        item,
-        attempt,
-        recovery,
-        target,
-        review_task,
-        source_output,
-        &recovery.candidate_commit,
-        &classification.review_artifact,
-        &recovery.attachment.digest,
-    )?;
+    match writer.status {
+        TaskStatus::Complete => {
+            let corrective_output = writer
+                .output
+                .as_ref()
+                .ok_or_else(|| rejected("completed classified Writer has no output"))?;
+            validate_code_change_post_correction_binding(
+                project_root,
+                item,
+                attempt,
+                recovery,
+                target,
+                review_task,
+                source_output,
+                corrective_output,
+                &classification.review_artifact,
+                &recovery.attachment.digest,
+            )?;
+        }
+        TaskStatus::Planned | TaskStatus::Executing | TaskStatus::NeedsUser => {
+            validate_code_change_candidate_binding(
+                project_root,
+                item,
+                attempt,
+                recovery,
+                target,
+                review_task,
+                source_output,
+                &recovery.candidate_commit,
+                &classification.review_artifact,
+                &recovery.attachment.digest,
+            )?;
+        }
+        TaskStatus::Failed | TaskStatus::Superseded => {
+            return Err(rejected("classified Writer lifecycle is not replayable"));
+        }
+    }
     let evidence_ref = ArtifactRef {
         producer_id: "host-evidence".to_string(),
         path: recovery.attachment.snapshot_path.clone(),
@@ -1387,10 +1412,93 @@ pub(crate) fn unique_tests_review_target<'a>(
 /// Callers must run this contract before changing the Work Item. It proves that
 /// the failed Review still reads the exact candidate workspace, names the
 /// persisted recovery, and carries the exact failed host-evidence snapshot.
-/// Queue admission, Writer reservation, and classification replay reuse this
-/// check so no boundary can accept a stale binding that another boundary later
-/// rejects.
+/// Queue admission and Writer reservation use this strict source binding, while
+/// classification replay uses it for no-output resumable Writers and the
+/// post-correction binding below for completed Writers. Keeping both replay
+/// contracts here prevents a boundary from accepting an immutable binding that
+/// another boundary later rejects.
 pub(crate) fn validate_code_change_candidate_binding(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+    target: &EvidenceReviewTarget,
+    review_task: &Task,
+    source_output: &work_model::TaskOutput,
+    candidate_commit: &str,
+    review_artifact: &str,
+    evidence_digest: &str,
+) -> std::result::Result<(), String> {
+    let rejected = |reason: &str| reason.to_string();
+    if source_output.commit != candidate_commit
+        || recovery.candidate_commit != candidate_commit
+        || !candidate_workspace_is_clean_at(project_root, source_output, candidate_commit)
+    {
+        return Err(rejected(
+            "the candidate workspace no longer matches the classified commit",
+        ));
+    }
+    validate_code_change_review_and_evidence_binding(
+        project_root,
+        item,
+        attempt,
+        recovery,
+        target,
+        review_task,
+        source_output,
+        candidate_commit,
+        review_artifact,
+        evidence_digest,
+    )
+}
+
+/// Validate a completed classified Writer against the candidate it recorded.
+///
+/// Classification binds its source Review and failed evidence to the original
+/// candidate commit. Once the corrective Writer has completed, that Writer's
+/// output is the new candidate boundary, so replay must validate its saved
+/// workspace and commit rather than require the source commit to remain HEAD.
+pub(crate) fn validate_code_change_post_correction_binding(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+    target: &EvidenceReviewTarget,
+    review_task: &Task,
+    source_output: &work_model::TaskOutput,
+    corrective_output: &work_model::TaskOutput,
+    review_artifact: &str,
+    evidence_digest: &str,
+) -> std::result::Result<(), String> {
+    let rejected = |reason: &str| reason.to_string();
+    if source_output.commit != recovery.candidate_commit
+        || corrective_output.workspace_id != source_output.workspace_id
+        || corrective_output.workspace_path != source_output.workspace_path
+        || !candidate_workspace_is_clean_at(
+            project_root,
+            corrective_output,
+            &corrective_output.commit,
+        )
+    {
+        return Err(rejected(
+            "the completed corrective Writer output is not the current clean candidate",
+        ));
+    }
+    validate_code_change_review_and_evidence_binding(
+        project_root,
+        item,
+        attempt,
+        recovery,
+        target,
+        review_task,
+        source_output,
+        &recovery.candidate_commit,
+        review_artifact,
+        evidence_digest,
+    )
+}
+
+fn validate_code_change_review_and_evidence_binding(
     project_root: &Path,
     item: &work_model::WorkItem,
     attempt: &work_model::Attempt,
@@ -1407,14 +1515,6 @@ pub(crate) fn validate_code_change_candidate_binding(
     if unique_target.target != target {
         return Err(rejected(
             "bound Tests review target is not uniquely selected",
-        ));
-    }
-    if source_output.commit != candidate_commit
-        || recovery.candidate_commit != candidate_commit
-        || !candidate_workspace_is_clean_at(project_root, source_output, candidate_commit)
-    {
-        return Err(rejected(
-            "the candidate workspace no longer matches the classified commit",
         ));
     }
     if review_task.kind != TaskKind::Review

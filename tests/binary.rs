@@ -26305,6 +26305,153 @@ fn exact_host_evidence_classification_replay_returns_original_for_supported_writ
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_accepts_completed_correction_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-correction-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    let classify_args = [
+        "attempt",
+        "evidence",
+        "classify",
+        work_item_id.as_str(),
+        "attempt-1",
+        "--candidate",
+        candidate.as_str(),
+        "--review-artifact",
+        targeted_path.as_str(),
+        "--evidence-digest",
+        digest.as_str(),
+        "--resolution",
+        resolution,
+    ];
+    let first = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "initial classification failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let first_model = work_item_value(&project, &work_item_id);
+    let writer_id = first_model["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let audit_path = first_model["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_audit = fs::read(project.join(&audit_path)).unwrap();
+
+    commit_file(
+        &project,
+        "recovery-correction.txt",
+        "candidate correction\n",
+        "Apply candidate correction",
+    );
+    let corrected_candidate = git_head(&project);
+    assert_ne!(corrected_candidate, candidate);
+    WorkModelStore::new(&project)
+        .mutate_work_item(&work_item_id, |item| {
+            let source_output = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Write
+                        && task.id != writer_id
+                        && task.status == fluent::work_model::TaskStatus::Complete
+                })
+                .and_then(|task| task.output.clone())
+                .expect("fixture has a completed source Writer");
+            let writer = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .expect("classification has a corrective Writer");
+            writer.status = fluent::work_model::TaskStatus::Complete;
+            writer.output = Some(fluent::work_model::TaskOutput {
+                workspace_id: source_output.workspace_id,
+                workspace_path: source_output.workspace_path,
+                source_branch: source_output.source_branch,
+                base_commit: Some(candidate.clone()),
+                commit: corrected_candidate.clone(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            writer.completed_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
+        .unwrap();
+
+    let before_model = work_item_value(&project, &work_item_id);
+    let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+    let before_head = git_head(&project);
+    let before_writer_count = before_model["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["kind"] == "write")
+        .count();
+    let before_artifact_count = before_model["attempts"][0]["artifacts"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    let replay = fluent_cmd()
+        .current_dir(&project)
+        .args(classify_args)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "completed correction replay failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(replay.stdout, first.stdout);
+    assert_eq!(replay.stderr, first.stderr);
+    assert_eq!(work_item_value(&project, &work_item_id), before_model);
+    assert_eq!(
+        persisted_work_snapshot(&project, &work_item_id),
+        before_persisted,
+        "completed correction replay changed persisted model or artifacts"
+    );
+    assert_eq!(fs::read(project.join(&audit_path)).unwrap(), first_audit);
+    assert_eq!(git_head(&project), before_head);
+    assert_eq!(
+        work_item_value(&project, &work_item_id)["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        before_writer_count,
+        "completed correction replay created another Writer"
+    );
+    assert_eq!(
+        work_item_value(&project, &work_item_id)["attempts"][0]["artifacts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before_artifact_count,
+        "completed correction replay created another artifact"
+    );
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_rejects_superseded_writer_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let run_suffix = tmp

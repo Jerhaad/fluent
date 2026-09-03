@@ -68,6 +68,25 @@ Fluent snapshots the exact document, binds it to that candidate, and reruns only
 the named reviewers. Do not edit the candidate or invent a commit. Inspect the
 Work Item again for the next action.
 
+## Run one focused Tests check
+
+Use this public path when a failed Tests Review asks for one exact
+`Evidence-Command` and no host evidence document exists yet:
+
+```sh
+fluent attempt evidence run <work-item-id> <attempt-id> \
+  --review-artifact .fluent/work/artifacts/.../review.md
+```
+
+Fluent runs that single review-requested command in its host-only scratch
+environment, records its schema-version-1 result, and routes the result through
+the ordinary attachment path. For a legacy review without structured request
+lines, also provide its exact `--command` and `--working-directory`. Use `run`
+when Fluent must perform the focused check; use `attach` when an authorized host
+has already produced the JSON evidence document. Use `classify` only after a
+failed snapshot and targeted review establish that the operator authorizes a
+source correction.
+
 ## Classify a candidate-bound source correction
 
 For a new evidence-targeted review, `evidence-needed` is valid only when the
@@ -106,9 +125,14 @@ idempotent only while the saved classified Writer remains resumable. The
 supported resumable states are `Planned`, `Executing`, or `NeedsUser` with no
 output, and `Complete` with output. A `Failed` or `Superseded` classified Writer
 is not replayable. In either state, repeating `classify` is rejected without
-mutation. For a `Failed` Writer, use an explicit validated retry or replan
-transition before queue resume; for a `Superseded` Writer, continue with its
-replacement and do not repeat the classification. Fluent records the authorization,
+mutation. For a `Complete` Writer with output, replay retains the original
+source, review, and evidence bindings but validates that saved output's
+workspace is the current clean candidate before returning the stored result. For
+a `Failed` Writer, no public resume transition retries it: `fluent queue resume`,
+`fluent attempt run`, and repeated `classify` are rejected, so inspect the
+failed Task and escalate for a separately validated recovery. For a `Superseded`
+Writer, continue with its replacement and do not repeat the classification.
+Fluent records the authorization,
 explicit `code-change` disposition, and audit artifact, then schedules one
 corrective Writer with the failed review, immutable evidence snapshot, and
 audit input; resume it with `fluent queue resume <work-item-id> --attempt

@@ -867,6 +867,13 @@ Check item {{ITEM_ID}}.
             .expect("the guide must document candidate-bound classification");
         assert!(classification.contains("source correction"));
         assert!(classification.contains("malformed qualification"));
+        assert!(guide.contains("## Run one focused Tests check"));
+        assert!(guide.contains("fluent attempt evidence run <work-item-id> <attempt-id>"));
+        let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_guide.contains("use `attach` when an authorized host"));
+        let environment = bundled_skill_content("fluent/references/coder-environment.md")
+            .expect("bundled coder environment guide must be present");
+        assert!(environment.contains("Project-relative roots resolve from the project root"));
     }
 
     #[test]
@@ -909,6 +916,15 @@ Check item {{ITEM_ID}}.
             assert!(
                 document.contains("repeating `classify` is rejected without mutation"),
                 "{name} must state the no-mutation rejection for unsupported replay"
+            );
+            assert!(
+                document
+                    .contains("For a `Complete` Writer with output, replay retains the original"),
+                "{name} must validate the saved completed Writer output during replay"
+            );
+            assert!(
+                document.contains("no public resume transition retries it"),
+                "{name} must require escalation after a hard-failed classified Writer"
             );
         }
 
@@ -1112,6 +1128,7 @@ Check item {{ITEM_ID}}.
         let recovery = recovery.split_whitespace().collect::<Vec<_>>().join(" ");
 
         assert!(recovery.contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+        assert!(recovery.contains("enclosing host-agent boundary, not a provider login failure"));
         assert!(recovery.contains("In Codex, request escalated execution for that command"));
         assert!(recovery.contains("In Claude Code, retry that Bash command"));
         assert!(recovery.contains("Fluent will still sandbox every worker"));

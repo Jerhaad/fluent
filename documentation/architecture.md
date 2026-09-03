@@ -963,6 +963,10 @@ candidate. A command-shaped Test reference rejected by the final candidate gate
 uses the same attachment command with `--review-artifact <candidate-gate.json>`.
 Fluent snapshots the rejected gate inside a content-addressed binding so a
 later gate run cannot erase the decision that authorized the host evidence.
+A focused `Evidence-Command` uses `fluent attempt evidence run`; use `attach`
+when the host already has the schema-version-1 JSON document, and use
+`classify` only when a failed result and targeted review authorize a source
+correction.
 A passing result replaces only that role's result for the same
 candidate; `Verdict: fail` must include `Disposition: evidence-needed` or
 `Disposition: code-change`. A new `evidence-needed` result is actionable only
@@ -998,10 +1002,14 @@ Exact classification replay is idempotent only while the saved classified
 Writer remains resumable. The supported resumable states are `Planned`,
 `Executing`, or `NeedsUser` with no output, and `Complete` with output. A
 `Failed` or `Superseded` classified Writer is not replayable. In either state,
-repeating `classify` is rejected without mutation. For a `Failed` Writer, use
-an explicit validated retry or replan transition before queue resume; for a
-`Superseded` Writer, continue with its replacement and do not repeat the
-classification. Fluent
+repeating `classify` is rejected without mutation. For a `Complete` Writer with
+output, replay retains the original source, review, and evidence bindings but
+validates that saved output's workspace as the current clean candidate before
+returning the stored result. For a `Failed` Writer, no public resume transition
+retries it: `fluent queue resume`, `fluent attempt run`, and repeated `classify`
+are rejected, so the operator must inspect the failed Task and escalate for a
+separately validated recovery. For a `Superseded` Writer, continue with its
+replacement and do not repeat the classification. Fluent
 persists the authorization and operation identity with an explicit
 `code-change` disposition, then schedules one corrective Writer with the failed
 review, evidence snapshot, and audit artifact; the candidate and prior records

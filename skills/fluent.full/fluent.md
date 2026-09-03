@@ -134,7 +134,9 @@ unsandboxed approval. In Codex, request escalated execution for that command.
 In Claude Code, retry that Bash command with its unsandboxed-command escape hatch.
 Tell the user the approval applies only to Fluent; Fluent will still sandbox every
 worker. Do not add Fluent's `--no-sandbox`; do not switch the whole host-agent
-session to full access. Continue with the same command and Work Item or Attempt.
+session to full access. This is an enclosing host-agent boundary, not a provider
+login failure; do not treat it as a reason to run `codex login` or `claude /login`.
+Continue with the same command and Work Item or Attempt.
 
 ## Delegated execution
 
@@ -270,7 +272,10 @@ classification for a paused actionable `evidence-needed` recovery when the
 operator authorizes a source correction (or for a legacy paused recovery with an
 unqualified marker). A single malformed `Disposition: evidence-needed` marker
 follows the ordinary Writer path; missing, duplicate, or unknown disposition
-markers remain an uncertain pause.
+markers remain an uncertain pause. Use the public `fluent attempt evidence run`
+path when Fluent must execute one focused Tests Review command, `attach` when
+the host already has the schema-version-1 JSON result, and `classify` only when
+a failed result authorizes a source correction.
 
 ### Codex authentication pauses
 
@@ -407,7 +412,8 @@ When `.fluent/` does not exist:
    Fluent's generated `.fluent/.gitignore` excludes runtime state such as `.fluent/work/`
    while retaining Expertise, hooks, and Tester configuration. Recover
    `FLUENT_HOST_SANDBOX_BLOCKED` through the scoped host-agent flow above. For
-   provider failures, offer the user a retry or a different profile.
+   provider failures, offer the user a retry or a different profile; do not
+   confuse those login failures with the enclosing sandbox boundary above.
    These readiness checks do not promise future provider capacity.
 
 7. After success, show the saved coder, model, and effort for both roles. Explain
