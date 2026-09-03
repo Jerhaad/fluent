@@ -361,6 +361,18 @@ fn reserve_task_start(
                 id: task_id.to_string(),
             })?;
         if expected_kind == TaskKind::Write {
+            crate::recovery_contracts::migrate_legacy_code_change_review_digest(
+                project_root,
+                item,
+                attempt_id,
+                Some(task_id),
+            )
+            .map_err(|reason| {
+                crate::work_model::WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason,
+                }
+            })?;
             crate::recovery_contracts::validate_code_change_writer_start(
                 project_root,
                 item,

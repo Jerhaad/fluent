@@ -5168,7 +5168,9 @@ impl Attempt {
     ///
     /// This narrow model shape lets queue admission resume the Writer after the
     /// classifier intentionally reopens the Attempt from `NeedsUser` to
-    /// `Planned`. Live candidate and artifact checks remain in the queue layer.
+    /// `Planned`. Legacy classified recoveries may omit the target digest here;
+    /// queue admission migrates that field after live candidate and artifact
+    /// checks.
     pub fn has_pending_code_change_classification(&self) -> bool {
         if self.status != AttemptStatus::Planned
             || self.pause_kind.is_some()
@@ -5219,7 +5221,8 @@ impl Attempt {
         let Some(target) = recovery.targets.iter().find(|target| {
             target.role == "tests"
                 && target.review_task_id.is_some()
-                && target.review_digest.as_deref() == Some(classification.review_digest.as_str())
+                && (target.review_digest.as_deref() == Some(classification.review_digest.as_str())
+                    || target.review_digest.is_none())
                 && self.tasks.iter().any(|task| {
                     target.review_task_id.as_deref() == Some(task.id.as_str())
                         && task.kind == TaskKind::Review

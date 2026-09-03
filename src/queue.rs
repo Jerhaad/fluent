@@ -696,6 +696,21 @@ pub fn resume_with_tester_no_sandbox(
         id,
         attempt_id,
     )?;
+    // Older classified recoveries omitted the target Review digest. Reconcile
+    // that field from the exact candidate-bound Review before queue admission;
+    // the migration validates the complete replay contract and is idempotent.
+    let _ = store.mutate_work_item(id, |item| {
+        crate::recovery_contracts::migrate_legacy_code_change_review_digest(
+            project_root,
+            item,
+            attempt_id,
+            None,
+        )
+        .map_err(|reason| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason,
+        })
+    })?;
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
     let failed_candidate_gate_correction = item

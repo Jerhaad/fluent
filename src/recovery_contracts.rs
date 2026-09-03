@@ -454,7 +454,11 @@ pub(crate) fn validate_code_change_writer_start(
         .review_task_id
         .as_deref()
         .ok_or_else(|| rejected("classified recovery target has no review Task identity"))?;
-    if target.review_digest.as_deref() != Some(classification.review_digest.as_str()) {
+    if target
+        .review_digest
+        .as_deref()
+        .is_some_and(|digest| digest != classification.review_digest)
+    {
         return Err(rejected("saved review digest changed"));
     }
     let review_task = attempt
@@ -659,6 +663,122 @@ pub(crate) fn validate_code_change_writer_start(
     Ok(())
 }
 
+/// Fill the target digest on a legacy classified recovery after validating the
+/// exact persisted Review and every replay binding against a cloned aggregate.
+///
+/// Older classified recoveries may omit `EvidenceReviewTarget.review_digest`,
+/// even though the classification already stores the digest used to create the
+/// operation and its audit. Derive the missing field from the managed Review
+/// bytes, validate the candidate-bound replay with that field present, and only
+/// then update the caller's aggregate. This keeps a rejected migration a
+/// durable no-op and never changes the classification identity or audit.
+pub(crate) fn migrate_legacy_code_change_review_digest(
+    project_root: &Path,
+    item: &mut work_model::WorkItem,
+    attempt_id: &str,
+    writer_task_id: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let Some(attempt_index) = item
+        .attempts
+        .iter()
+        .position(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(false);
+    };
+    let attempt = &item.attempts[attempt_index];
+    let Some((recovery_index, classification)) = attempt
+        .evidence_recoveries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, recovery)| {
+            let classification = recovery.code_change_classification.as_ref()?;
+            (recovery.state == EvidenceRecoveryState::CodeChange
+                && writer_task_id
+                    .is_none_or(|writer_task_id| classification.writer_task_id == writer_task_id))
+            .then_some((index, classification))
+        })
+    else {
+        return Ok(false);
+    };
+    let review_artifact = classification.review_artifact.clone();
+    let review_digest = classification.review_digest.clone();
+    let classification_writer_task_id = classification.writer_task_id.clone();
+    let recovery = &attempt.evidence_recoveries[recovery_index];
+    let matching_targets = recovery
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| {
+            target.role == "tests"
+                && target
+                    .review_task_id
+                    .as_ref()
+                    .is_some_and(|review_task_id| {
+                        attempt.tasks.iter().any(|task| {
+                            task.id == *review_task_id
+                                && task.kind == TaskKind::Review
+                                && task.role == "tests"
+                                && review_artifact_path(task).as_deref()
+                                    == Some(review_artifact.as_str())
+                        })
+                    })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matching_targets.len() != 1 {
+        return Err("classified recovery has an ambiguous Tests Review target".to_string());
+    }
+    let target_index = matching_targets[0];
+    let target = &recovery.targets[target_index];
+    if target.review_digest.is_some() {
+        return Ok(false);
+    }
+    let review_task_id = target
+        .review_task_id
+        .clone()
+        .ok_or_else(|| "classified recovery target has no review Task identity".to_string())?;
+    let review_path = validate_managed_file_path(project_root, &review_artifact)
+        .map_err(|error| format!("review artifact is not a managed regular file: {error}"))?;
+    let review_bytes = fs::read(&review_path)
+        .map_err(|error| format!("cannot read bound review artifact: {error}"))?;
+    let derived_review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
+    if derived_review_digest != review_digest {
+        return Err("bound review bytes changed".to_string());
+    }
+
+    let mut migrated = item.clone();
+    migrated.attempts[attempt_index].evidence_recoveries[recovery_index].targets[target_index]
+        .review_digest = Some(derived_review_digest.clone());
+    let migrated_attempt = &migrated.attempts[attempt_index];
+    let migrated_recovery = &migrated_attempt.evidence_recoveries[recovery_index];
+    let migrated_classification = migrated_recovery
+        .code_change_classification
+        .as_ref()
+        .expect("legacy classification remains present in cloned aggregate");
+    validate_code_change_classification_replay(
+        project_root,
+        &migrated,
+        migrated_attempt,
+        migrated_recovery,
+        migrated_classification,
+        &review_task_id,
+    )?;
+    if writer_task_id.is_none() {
+        validate_code_change_writer_start(
+            project_root,
+            &migrated,
+            attempt_id,
+            &classification_writer_task_id,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+
+    item.attempts[attempt_index].evidence_recoveries[recovery_index].targets[target_index]
+        .review_digest = Some(derived_review_digest);
+    Ok(true)
+}
+
 /// Validate an exact replay of an already-persisted source classification.
 ///
 /// Classification mutates the model before a corrective Writer can be claimed,
@@ -763,7 +883,11 @@ pub(crate) fn validate_code_change_classification_replay(
         ));
     }
     let target = matching_targets[0];
-    if target.review_digest.as_deref() != Some(classification.review_digest.as_str()) {
+    if target
+        .review_digest
+        .as_deref()
+        .is_some_and(|digest| digest != classification.review_digest)
+    {
         return Err(rejected("saved review digest changed"));
     }
     let review_task = attempt

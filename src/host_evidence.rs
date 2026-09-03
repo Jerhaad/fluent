@@ -360,19 +360,45 @@ pub fn classify_for_code_change(
                 authorization,
                 &authorization_digest,
             ) {
+                let needs_target_digest_migration = target.review_digest.is_none();
+                let recovery_id = recovery.id.clone();
+                let review_task_id = review_task.id.clone();
+                let writer_task_id = prior.writer_task_id.clone();
+                let audit_artifact = prior.audit_artifact.path.clone();
+                let disposition = prior.disposition.clone();
                 crate::recovery_contracts::validate_code_change_classification_replay(
                     project_root,
                     item,
                     attempt,
                     recovery,
                     prior,
-                    &review_task.id,
+                    &review_task_id,
                 )
                 .map_err(|reason| rejected_for(&reason))?;
+                if needs_target_digest_migration {
+                    let attempt = item
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                        .ok_or_else(|| rejected_for("Attempt is not present"))?;
+                    let recovery = attempt
+                        .evidence_recoveries
+                        .iter_mut()
+                        .find(|recovery| recovery.id == recovery_id)
+                        .ok_or_else(|| rejected_for("classified recovery is missing"))?;
+                    let target = recovery
+                        .targets
+                        .iter_mut()
+                        .find(|target| {
+                            target.review_task_id.as_deref() == Some(review_task_id.as_str())
+                        })
+                        .ok_or_else(|| rejected_for("classified recovery target is missing"))?;
+                    target.review_digest = Some(review_digest.clone());
+                }
                 return Ok(CodeChangeClassification {
-                    writer_task_id: prior.writer_task_id.clone(),
-                    audit_artifact: prior.audit_artifact.path.clone(),
-                    disposition: prior.disposition.clone(),
+                    writer_task_id,
+                    audit_artifact,
+                    disposition,
                 });
             }
             return Err(rejected_for("authorization differs from the stored classification"));
