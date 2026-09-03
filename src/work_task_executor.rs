@@ -2028,9 +2028,10 @@ fn run_tester_task_with_settlement_preparer(
         Some(recheck) => recheck.plan.clone(),
         None => crate::tester::plan(&candidate_workspace)?,
     };
-    // Share one rebuildable dependency cache with every Writer round and the
-    // final Tester for this exact Attempt. Resolve the path before reservation;
-    // materialization happens below only after the Task start is durable.
+    // Use the rebuildable dependency boundary shared by Writer rounds and the
+    // final Tester. Resolve the exact Attempt path before reservation;
+    // preparation happens below only after the Task has durably reserved
+    // permission to launch.
     let tester_cache = crate::writer_cache::preflight_writer_dependency_cache(
         config.project_root,
         config.work_item_id,

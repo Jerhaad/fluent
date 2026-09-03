@@ -534,7 +534,7 @@ pub fn render_sandbox_profile(
 }
 
 /// Render the Tester boundary with the Attempt-scoped dependency cache shared
-/// by Writer rounds and the final Tester for the same Attempt.
+/// by the Writer rounds and final Tester for this Attempt.
 pub(crate) fn render_sandbox_profile_with_cache(
     candidate_workspace: &Path,
     artifact_dir: &Path,
@@ -1407,6 +1407,103 @@ mod tests {
             TesterOutcome::Passed
         );
         assert!(cache.cargo_home().join("command-marker").is_file());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn attempt_scoped_tester_cache_runs_through_rendered_sandbox() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize rendered Tester sandbox fixture",
+        )
+        .unwrap();
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            workspace.path(),
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        crate::writer_cache::prepare_writer_dependency_cache(&cache, None).unwrap();
+        write_tester_yaml(
+            workspace.path(),
+            "commands:\n  - command: 'test -d \"$CARGO_HOME\" && touch \"$CARGO_HOME/rendered-sandbox-marker\"'\n    test_harness: shell-harness\n",
+        );
+        write_extractor(workspace.path(), "#!/bin/sh\necho '[]'\n");
+        let plan = plan(workspace.path()).unwrap();
+        let settlement = prepare_settlement_directories(artifact_dir.path(), &plan).unwrap();
+        let invocation_log = artifact_dir.path().join("sandbox-invocations.log");
+        let sandbox_launcher = workspace.path().join("test-sandbox-exec");
+        fs::write(
+            &sandbox_launcher,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"{}\"\nshift 2\nexec \"$@\"\n",
+                invocation_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&sandbox_launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&sandbox_launcher, permissions).unwrap();
+
+        unsafe {
+            std::env::set_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "render-pass");
+            std::env::set_var(
+                "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+                &sandbox_launcher,
+            );
+        }
+        let result = (|| -> Result<(TesterOutcome, String)> {
+            let sandbox = render_sandbox_profile_with_cache(
+                workspace.path(),
+                artifact_dir.path(),
+                false,
+                &resolver(),
+                settlement,
+                Some(&cache),
+            )?;
+            let profile = sandbox
+                .profile()
+                .expect("the rendered Tester sandbox must retain its profile");
+            let profile_path = profile.path.display().to_string();
+            let profile_content = fs::read_to_string(&profile.path)?;
+            let outcome =
+                run_with_sandbox_profile(workspace.path(), artifact_dir.path(), &sandbox)?;
+            Ok((outcome, format!("{profile_path}\n{profile_content}")))
+        })();
+        unsafe {
+            std::env::remove_var("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT");
+            std::env::remove_var("FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC");
+        }
+        let (outcome, profile) = result.unwrap();
+        let (profile_path, profile_content) = profile.split_once('\n').unwrap();
+
+        assert_eq!(outcome, TesterOutcome::Passed);
+        assert!(cache.cargo_home().join("rendered-sandbox-marker").is_file());
+        let cache_write = format!(
+            "(allow file-write* (subpath \"{}\"))",
+            cache.root().display()
+        );
+        assert!(
+            profile_content.contains(&cache_write),
+            "the rendered Tester sandbox must grant the exact Attempt cache: {profile_content}"
+        );
+        if let Some(home) = std::env::var_os("HOME") {
+            let user_cargo = PathBuf::from(home).join(".cargo");
+            let user_cargo_write =
+                format!("(allow file-write* (subpath \"{}\"))", user_cargo.display());
+            assert!(
+                !profile_content.contains(&user_cargo_write),
+                "the rendered Tester sandbox must not grant the user's Cargo store: {profile_content}"
+            );
+        }
+        let invocations = fs::read_to_string(invocation_log).unwrap();
+        let invocation_paths = invocations.lines().collect::<Vec<_>>();
+        assert_eq!(invocation_paths.len(), 2);
+        assert!(invocation_paths.iter().all(|path| *path == profile_path));
     }
 
     enum ScriptedInventory {

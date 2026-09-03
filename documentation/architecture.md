@@ -292,22 +292,24 @@ produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
 immediately. A metadata recovery may also admit a failed project check only
 when its gate entry records exactly one nonzero `check-pre-merge exited N`
-diagnostic and its canonical `hooks/check-pre-merge.log` contains only nonblank
-hook-finding lines that normalize to the gate's commit-metadata findings,
-including the exact body-line length finding for a commit whose gate metadata
-finding is literal-line-breaks. The exit diagnostic belongs to the gate entry;
-the hook log supplies the findings. Any additional non-exit project-check
-diagnostic, diagnostic present only in the gate structure, unrelated or
-unparseable hook line, noncanonical path, or symlinked log remains rejected
-before Fluent writes
-recovery authority.
+diagnostic and its canonical `hooks/check-pre-merge.log` is non-empty and
+contains only nonblank hook-finding lines that normalize to the gate's
+commit-metadata findings, including the exact body-line length finding for a
+commit whose gate metadata finding is literal-line-breaks. The exit diagnostic
+belongs to the gate entry; the non-empty hook log supplies the findings. A
+generic `body line N exceeds 72 characters` finding must resolve to a gate
+commit and the exact overlong commit message line must contain literal `\\n`
+text. A finding for an uncovered commit, an ordinary overlong line, any
+additional non-exit project-check diagnostic, diagnostic present only in the
+gate structure, unrelated or unparseable hook line, noncanonical path, or
+symlinked log remains rejected before Fluent writes recovery authority.
 
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a
 new trusted base. Corrective history remains append-only except for one bounded
 case: when commit metadata was the preceding gate's only failure, or when
 `project-check` was the one additional failure and its canonical stored hook
-log contains only matching metadata findings, including
+log is non-empty and contains only matching metadata findings, including
 `commit <id> body line <positive integer> exceeds 72 characters` for the gate's
 literal-line-breaks finding, while its gate entry records exactly one nonzero
 hook exit. The Writer may rewrite those commits only after the host
@@ -315,7 +317,9 @@ revalidates the prior gate, proves that both candidates descend from its
 original base, and requires identical Git trees, runs every gate check again
 over the replacement, and records both commit identities, the shared tree, and
 the prior artifact path. A project-check-only failure is never eligible. A
-changed tree, another prior failure, changed author identity, changed linear
+generic overlong line must prove the corresponding literal `\\n` text in the
+commit message; a changed tree, another prior failure, changed author identity,
+changed linear
 suffix shape, malformed or unproven hook evidence, or an ordinary non-ancestor
 candidate blocks before review. Committer timestamps may change during the
 authorized rewrite, but the protected suffix's per-commit trees and authors
@@ -439,18 +443,20 @@ into the next launch's temporary worker home. Authentication, configuration,
 hooks, and cache are not included. Older Attempts without that snapshot fall
 back to a fresh persistent session rather than attempting an unusable resume.
 
-Every autonomous Writer also receives one Fluent-owned Cargo dependency cache
-under `.fluent/work/cache/writers/<work-item-id>/<attempt-id>/`. Its private
+Every autonomous Writer and final Tester receives one Fluent-owned Cargo
+dependency cache under
+`.fluent/work/cache/writers/<work-item-id>/<attempt-id>/`. Its private
 `cargo-home/` is shared by initial, continuation, and corrective Writer Tasks
-in that exact Attempt, but never by another Attempt. Cargo build output remains
-in the candidate workspace so later Writer rounds, the final Tester, and the
-candidate-keyed reviewer cache retain the existing warm-output path.
+and the final Tester in that exact Attempt, but never by another Attempt. Cargo
+build output remains in the candidate workspace so later Writer rounds, the
+final Tester, and the candidate-keyed reviewer cache retain the existing
+warm-output path.
 Before the first launch, the host admits only `registry/` and `git/` from its
 canonical Cargo home, using copy-on-write or a deep copy so private writes can
 never mutate the source. Fluent does not copy Cargo credentials, configuration,
-or binaries, and the Writer sandbox grants the private cache without granting
-the operator's Cargo home. The cache is rebuildable execution state rather than
-a durable artifact. Existing managed-path components and copied dependency
+or binaries, and Writer and Tester sandboxes grant the private cache without
+granting the operator's Cargo home. The cache is rebuildable execution state
+rather than a durable artifact. Existing managed-path components and copied dependency
 symlinks are checked for escapes, and cache reclamation preserves only
 Work Item/Attempt pairs still referenced by nonterminal Work.
 

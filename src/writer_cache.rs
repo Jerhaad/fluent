@@ -1,4 +1,4 @@
-//! Attempt-scoped Cargo caches for autonomous Writer tasks.
+//! Attempt-scoped Cargo caches for Writer and final Tester tasks.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -13,8 +13,9 @@ const WRITER_CACHE_RELATIVE_ROOT: &str = ".fluent/work/cache/writers";
 const WRITER_CACHE_LOCK_RELATIVE_PATH: &str = ".fluent/work/locks/writer-cache.lock";
 const ADMITTED_CARGO_DIRS: &[&str] = &["registry", "git"];
 
-/// One private dependency cache shared by every Writer round in an exact
-/// Work Item Attempt. It is rebuildable execution state, never durable evidence.
+/// One private dependency cache shared by every Writer round and the final
+/// Tester in an exact Work Item Attempt. It is rebuildable execution state,
+/// never durable evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriterDependencyCache {
     project_root: PathBuf,

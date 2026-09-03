@@ -750,7 +750,7 @@ pub(crate) fn validate_derived_project_check(
         bail!("derived project-check evidence must contain two failed checks");
     }
     let gate_findings =
-        metadata_findings(&metadata_check.diagnostics, &[], false).ok_or_else(|| {
+        metadata_findings(project_root, &metadata_check.diagnostics, &[], false).ok_or_else(|| {
             anyhow::anyhow!(
                 "project-check failure is not explained by structured commit-metadata diagnostics"
             )
@@ -834,7 +834,7 @@ pub(crate) fn validate_derived_project_check(
         bail!("derived project-check hook log has no structured hook diagnostics");
     }
     let log_findings =
-        metadata_findings(&log_diagnostics, &known_commits, true).ok_or_else(|| {
+        metadata_findings(project_root, &log_diagnostics, &known_commits, true).ok_or_else(|| {
             anyhow::anyhow!(
                 "project-check hook log contains a diagnostic unrelated to commit-metadata findings"
             )
@@ -863,8 +863,8 @@ pub(crate) fn validate_derived_project_check(
         .filter(|diagnostic| !is_project_check_exit_diagnostic(diagnostic))
         .cloned()
         .collect::<Vec<_>>();
-    let diagnostic_findings = metadata_findings(&diagnostic_findings, &known_commits, true)
-        .ok_or_else(|| {
+    let diagnostic_findings =
+        metadata_findings(project_root, &diagnostic_findings, &known_commits, true).ok_or_else(|| {
             anyhow::anyhow!(
                 "project-check diagnostics contain a diagnostic unrelated to commit-metadata findings"
             )
@@ -889,6 +889,7 @@ pub(crate) fn validate_derived_project_check(
 }
 
 fn metadata_findings(
+    project_root: &Path,
     diagnostics: &[String],
     known_commits: &[String],
     allow_project_policy_wording: bool,
@@ -896,8 +897,18 @@ fn metadata_findings(
     diagnostics
         .iter()
         .map(|diagnostic| {
-            parse_metadata_finding(diagnostic, known_commits, allow_project_policy_wording)
-                .map(|(finding, _)| finding)
+            let (finding, raw_reason) =
+                parse_metadata_finding(diagnostic, known_commits, allow_project_policy_wording)?;
+            if let Some(line_number) = project_policy_line_number(&raw_reason)
+                && !commit_message_line_proves_literal_breaks(
+                    project_root,
+                    &finding.commit,
+                    line_number,
+                )?
+            {
+                return None;
+            }
+            Some(finding)
         })
         .collect()
 }
@@ -986,6 +997,31 @@ fn is_body_line_length_reason(reason: &str) -> bool {
         (fields.next(), fields.next(), fields.next(), fields.next()),
         (Some("exceeds"), Some("72"), Some("characters"), None)
     )
+}
+
+fn project_policy_line_number(reason: &str) -> Option<usize> {
+    let reason = reason.to_ascii_lowercase();
+    let line_number = reason
+        .strip_prefix("body line ")
+        .and_then(|line| line.strip_suffix(" exceeds 72 characters"))?;
+    (!line_number.is_empty() && line_number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| line_number.parse::<usize>().ok())
+        .flatten()
+        .filter(|line| *line > 0)
+}
+
+fn commit_message_line_proves_literal_breaks(
+    project_root: &Path,
+    commit: &str,
+    line_number: usize,
+) -> Option<bool> {
+    let output = crate::git::run_raw(project_root, &["show", "-s", "--format=%B", commit]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let message = String::from_utf8(output.stdout).ok()?;
+    let line = message.split('\n').nth(line_number.checked_sub(1)?)?;
+    Some(line.chars().count() > 72 && line.contains("\\n"))
 }
 
 fn is_project_check_exit_diagnostic(diagnostic: &str) -> bool {
@@ -1964,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_hook_classifier_accepts_only_real_body_line_wording() {
+fn derived_hook_classifier_normalizes_project_body_line_wording() {
         assert_eq!(
             normalize_metadata_reason("body line 2 exceeds 72 characters", true),
             Some("literal-line-breaks".to_string())

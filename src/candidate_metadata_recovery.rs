@@ -1319,6 +1319,14 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_first_candidate_body(false)
+    }
+
+    fn fixture_with_malformed_first_candidate() -> Fixture {
+        fixture_with_first_candidate_body(true)
+    }
+
+    fn fixture_with_first_candidate_body(malformed_first_candidate: bool) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("main");
         let workspace = tmp.path().join("work-candidate-metadata");
@@ -1342,12 +1350,25 @@ mod tests {
         );
         fs::write(workspace.join("candidate.txt"), "candidate\n").unwrap();
         git_ok(&workspace, &["add", "."]);
-        git_ok(&workspace, &["commit", "-q", "-m", "Candidate"]);
+        let first_message = if malformed_first_candidate {
+            "Candidate\n\nThis malformed body contains literal \\n text and is deliberately longer than seventy-two characters."
+        } else {
+            "Candidate"
+        };
+        git_ok(&workspace, &["commit", "-q", "-m", first_message]);
         let candidate =
             git::run_stdout(&workspace, &["rev-parse", "HEAD"], "fixture candidate").unwrap();
         fs::write(workspace.join("follow-up.txt"), "follow-up\n").unwrap();
         git_ok(&workspace, &["add", "."]);
-        git_ok(&workspace, &["commit", "-q", "-m", "Candidate follow-up"]);
+        git_ok(
+            &workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Candidate follow-up\n\nThis malformed body contains literal \\n text and is deliberately longer than seventy-two characters.\nThis ordinary overlong body line has no metadata marker and exceeds the project limit.",
+            ],
+        );
         let latest_candidate = git::run_stdout(
             &workspace,
             &["rev-parse", "HEAD"],
@@ -1537,7 +1558,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1734,11 +1755,11 @@ mod tests {
 
     #[test]
     fn metadata_recovery_accepts_real_hook_diagnostics_for_multiple_commits() {
-        let fixture = fixture();
+        let fixture = fixture_with_malformed_first_candidate();
         let first_metadata = metadata_diagnostic(&fixture.first_candidate);
         let latest_metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\ncommit {} body line 3 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\ncommit {} body line 3 exceeds 72 characters\n",
             fixture.first_candidate, fixture.candidate
         );
         fixture.configure_project_check(&[&first_metadata, &latest_metadata], &hook, &[]);
@@ -1764,7 +1785,7 @@ mod tests {
             fixture.candidate
         );
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata, &invalid_author], &hook, &[]);
@@ -1815,7 +1836,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let project_diagnostic = format!(
-            "commit {} body line 2 exceeds 72 characters",
+            "commit {} body line 3 exceeds 72 characters",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], "", &[&project_diagnostic]);
@@ -1846,7 +1867,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\nunrelated hook output\n",
+            "commit {} body line 3 exceeds 72 characters\nunrelated hook output\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1873,11 +1894,75 @@ mod tests {
     }
 
     #[test]
+    fn metadata_recovery_rejects_parseable_hook_diagnostic_for_uncovered_commit() {
+        let fixture = fixture_with_malformed_first_candidate();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 3 exceeds 72 characters\ncommit {} body line 3 exceeds 72 characters\n",
+            fixture.candidate, fixture.first_candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_generic_overlong_line_without_literal_breaks() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 4 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+        let artifact_root = fixture
+            .project
+            .join(".fluent/work/artifacts/work-1/attempt-1");
+        let before_item = fixture.store.read_work_item("work-1").unwrap();
+        let before_artifacts = snapshot_artifacts(&artifact_root);
+        let before_head = candidate_head(&fixture);
+
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("project-check"));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before_item);
+        assert_eq!(snapshot_artifacts(&artifact_root), before_artifacts);
+        assert_eq!(candidate_head(&fixture), before_head);
+        assert!(!artifact_root.join("candidate-metadata-repairs").exists());
+    }
+
+    #[test]
     fn metadata_recovery_rejects_noncanonical_hook_log_path() {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1923,7 +2008,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1968,7 +2053,7 @@ mod tests {
             let fixture = fixture();
             let metadata = metadata_diagnostic(&fixture.candidate);
             let hook = format!(
-                "commit {} body line 2 exceeds 72 characters\n",
+                "commit {} body line 3 exceeds 72 characters\n",
                 fixture.candidate
             );
             fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -1999,7 +2084,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -2028,7 +2113,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -2091,7 +2176,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(
@@ -2330,7 +2415,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -2528,7 +2613,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 2 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
