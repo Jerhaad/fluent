@@ -291,27 +291,31 @@ shape by replanning only the same output-free Writer whose attached gate was
 produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
 immediately. A metadata recovery may also admit a failed project check only
-when its stored `check-pre-merge` log contains the exact structured body-line
-length finding for a commit whose gate metadata finding is literal-line-breaks;
-the log is bound alongside the gate so the corrective Writer receives the
-immutable evidence. Any unrelated hook output remains rejected before Fluent
-writes recovery authority.
+when its canonical `hooks/check-pre-merge.log` contains only structured commit
+diagnostics that match the gate's metadata findings, including the exact body-
+line length finding for a commit whose gate metadata finding is literal-line-
+breaks, and the gate records exactly one nonzero hook exit. The log is bound
+alongside the gate so the corrective Writer receives the exact evidence. Any
+diagnostic present only in the gate structure, unrelated hook output,
+noncanonical path, or symlinked log remains rejected before Fluent writes
+recovery authority.
 
 A corrective gate reads the preceding host-owned gate and checks the complete
 replacement from the original base; it never treats the rejected candidate as a
 new trusted base. Corrective history remains append-only except for one bounded
 case: when the preceding gate's failed checks are exactly `commit-metadata`, or
 exactly `commit-metadata` plus `project-check` whose canonical stored
-`check-pre-merge.log` contains `commit <id> body line <positive integer> exceeds
-72 characters` for the gate's literal-line-breaks finding, the Writer may
+`check-pre-merge.log` contains only matching metadata findings, including
+`commit <id> body line <positive integer> exceeds 72 characters` for the gate's
+literal-line-breaks finding, and exactly one nonzero hook exit, the Writer may
 rewrite those commits. A project-check-only failure is never eligible. The host
-revalidates the prior gate, proves that both
-candidates descend from its original base, requires identical Git trees, runs
-every gate check again over the replacement, and records both commit identities,
-the shared tree, and the prior artifact path. A changed tree, another prior
-failure, changed author identity, changed linear suffix shape, malformed
-evidence, or an ordinary non-ancestor candidate blocks before review. Committer
-timestamps may change during the authorized rewrite, but the protected suffix's
+revalidates the prior gate, proves that both candidates descend from its
+original base, requires identical Git trees, runs every gate check again over
+the replacement, and records both commit identities, the shared tree, and the
+prior artifact path. A changed tree, another prior failure, changed author
+identity, changed linear suffix shape, malformed or unproven hook evidence, or
+an ordinary non-ancestor candidate blocks before review. Committer timestamps
+may change during the authorized rewrite, but the protected suffix's
 per-commit trees and authors remain fixed.
 
 Before that Writer launches, Fluent writes the immediately preceding candidate
@@ -321,9 +325,9 @@ unwanted content still requires a new correction commit, and the preceding
 candidate must remain an ancestor. Fluent renders
 `tree-identical-metadata-rewrite` when the latest validated rejected gate that
 names the current candidate has exactly the commit-metadata failure, or exactly
-that failure plus the approved derived project-check failure; the latter must
-come from the canonical stored hook log and the same gate-covered commit.
-Older gate artifacts remain readable history but cannot override that current
+that failure plus a project check proven by its canonical stored hook log,
+matching the same gate-covered commit and its required body-line finding;
+older gate artifacts remain readable history but cannot override that current
 frontier. An operator can make this authorization explicit with
 `fluent attempt repair-candidate-metadata`. That transition records the exact
 gate, candidate tree, protected base, and human decision before scheduling the

@@ -36,6 +36,10 @@ pub const CANDIDATE_ANCESTRY_REPAIR_ROLE: &str = "candidate-ancestry-repair";
 /// The role remains an ordinary Writer so its replacement candidate passes the
 /// normal candidate gate, Tester, reviewers, and Learner safeguards.
 pub const CANDIDATE_METADATA_REPAIR_ROLE: &str = "candidate-metadata-repair";
+/// Instruction suffix that binds a derived project-check artifact to a
+/// metadata recovery Writer's readable inputs.
+pub(crate) const CANDIDATE_METADATA_DERIVED_PROJECT_CHECK_MARKER: &str =
+    "\nDerived project-check artifact: ";
 
 fn is_canonical_work_artifact_file(path: &str, filename: &str) -> bool {
     let source = Path::new(path);
@@ -5896,6 +5900,13 @@ pub struct EvidenceReviewContext {
     pub prior_review_artifact: String,
 }
 
+pub(crate) fn candidate_metadata_derived_project_check_path(task: &Task) -> Option<&str> {
+    task.instructions
+        .as_deref()?
+        .rsplit_once(CANDIDATE_METADATA_DERIVED_PROJECT_CHECK_MARKER)
+        .map(|(_, path)| path.trim())
+}
+
 impl Task {
     pub fn is_failed_command_recheck(&self) -> bool {
         self.kind == TaskKind::Tester && self.role == FAILED_COMMAND_RECHECK_ROLE
@@ -6117,11 +6128,26 @@ impl Task {
                     crate::candidate_gate::CANDIDATE_GATE_FILE,
                 )
             });
+            let has_project_check_input = self.input_artifacts.iter().any(|artifact| {
+                is_canonical_work_artifact_file(&artifact.path, "check-pre-merge.log")
+            });
+            let has_derived_project_check =
+                match candidate_metadata_derived_project_check_path(self) {
+                    Some(path) => {
+                        is_canonical_work_artifact_file(path, "check-pre-merge.log")
+                            && self
+                                .input_artifacts
+                                .iter()
+                                .any(|artifact| artifact.path == path)
+                    }
+                    None => !has_project_check_input,
+                };
             if self.kind != TaskKind::Write
                 || self.artifact_area.is_none()
                 || self.workspace_access.writes.len() != 1
                 || !has_authority
                 || !has_source_gate
+                || !has_derived_project_check
                 || self.review_context.is_some()
                 || self.depends_on.is_some()
             {

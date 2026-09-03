@@ -18020,7 +18020,7 @@ mod tests {
         fs::create_dir_all(hook_path.parent().unwrap()).unwrap();
         fs::write(
             &hook_path,
-            format!("commit {candidate} body line 1 exceeds 72 characters\n"),
+            format!("commit {candidate} body line 2 exceeds 72 characters\n"),
         )
         .unwrap();
         let metadata_diagnostic =

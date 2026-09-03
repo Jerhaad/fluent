@@ -744,6 +744,11 @@ pub(crate) fn validate_derived_project_check(
     metadata_check: &CandidateCheckEvidence,
     project_check: &CandidateCheckEvidence,
 ) -> Result<String> {
+    if metadata_check.status != CandidateCheckStatus::Failed
+        || project_check.status != CandidateCheckStatus::Failed
+    {
+        bail!("derived project-check evidence must contain two failed checks");
+    }
     let gate_findings =
         metadata_findings(&metadata_check.diagnostics, &[], false).ok_or_else(|| {
             anyhow::anyhow!(
@@ -776,13 +781,13 @@ pub(crate) fn validate_derived_project_check(
         bail!("derived project-check hook log must be the canonical {expected_log_rel} artifact");
     }
 
-    let metadata = fs::metadata(&expected_log_path).with_context(|| {
+    let metadata = fs::symlink_metadata(&expected_log_path).with_context(|| {
         format!(
             "inspect derived project-check hook log {}",
             expected_log_path.display()
         )
     })?;
-    if !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!(
             "derived project-check hook log is not a regular file: {}",
             expected_log_path.display()
@@ -794,6 +799,25 @@ pub(crate) fn validate_derived_project_check(
             metadata.len()
         );
     }
+
+    let exit_codes = project_check
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| project_check_exit_code(diagnostic))
+        .collect::<Vec<_>>();
+    if exit_codes.len() != 1 || exit_codes[0] == 0 {
+        bail!(
+            "derived project-check evidence must contain exactly one nonzero check-pre-merge exit"
+        );
+    }
+    if project_check
+        .diagnostics
+        .iter()
+        .any(|diagnostic| project_check_exit_code(diagnostic).is_none())
+    {
+        bail!("derived project-check diagnostics must be represented in the stored hook log");
+    }
+
     let log = String::from_utf8(fs::read(&expected_log_path).with_context(|| {
         format!(
             "read derived project-check hook log {}",
@@ -965,11 +989,14 @@ fn is_body_line_length_reason(reason: &str) -> bool {
 }
 
 fn is_project_check_exit_diagnostic(diagnostic: &str) -> bool {
+    project_check_exit_code(diagnostic).is_some()
+}
+
+fn project_check_exit_code(diagnostic: &str) -> Option<i32> {
     let normalized = normalize_diagnostic_text(diagnostic);
     normalized
         .strip_prefix("check-pre-merge exited ")
         .and_then(|code| code.parse::<i32>().ok())
-        .is_some()
 }
 
 fn validate_metadata_only_rewrite(
@@ -1934,6 +1961,29 @@ mod tests {
         assert!(path.selector.is_none());
         assert!(path.command.is_none());
         assert!(parse_test_reference("tests/example.rs::").is_err());
+    }
+
+    #[test]
+    fn derived_hook_classifier_accepts_only_real_body_line_wording() {
+        assert_eq!(
+            normalize_metadata_reason("body line 2 exceeds 72 characters", true),
+            Some("literal-line-breaks".to_string())
+        );
+        assert_eq!(
+            normalize_metadata_reason("body line 0 exceeds 72 characters", true),
+            None
+        );
+        assert_eq!(
+            normalize_metadata_reason("body line 2 exceeds 73 characters", true),
+            None
+        );
+        assert_eq!(
+            normalize_metadata_reason(
+                "has no body separated from its subject by a blank line",
+                true,
+            ),
+            None
+        );
     }
 
     #[test]
