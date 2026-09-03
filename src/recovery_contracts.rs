@@ -672,6 +672,9 @@ pub(crate) fn validate_code_change_writer_start(
 /// bytes, validate the candidate-bound replay with that field present, and only
 /// then update the caller's aggregate. This keeps a rejected migration a
 /// durable no-op and never changes the classification identity or audit.
+/// Queue admission uses this replay-only contract so an interrupted corrective
+/// Writer can be migrated before the Attempt loop reopens it. The strict
+/// planned-frontier contract remains at the actual Writer launch.
 pub(crate) fn migrate_legacy_code_change_review_digest(
     project_root: &Path,
     item: &mut work_model::WorkItem,
@@ -703,7 +706,6 @@ pub(crate) fn migrate_legacy_code_change_review_digest(
     };
     let review_artifact = classification.review_artifact.clone();
     let review_digest = classification.review_digest.clone();
-    let classification_writer_task_id = classification.writer_task_id.clone();
     let recovery = &attempt.evidence_recoveries[recovery_index];
     let matching_targets = recovery
         .targets
@@ -764,16 +766,6 @@ pub(crate) fn migrate_legacy_code_change_review_digest(
         migrated_classification,
         &review_task_id,
     )?;
-    if writer_task_id.is_none() {
-        validate_code_change_writer_start(
-            project_root,
-            &migrated,
-            attempt_id,
-            &classification_writer_task_id,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-
     item.attempts[attempt_index].evidence_recoveries[recovery_index].targets[target_index]
         .review_digest = Some(derived_review_digest);
     Ok(true)

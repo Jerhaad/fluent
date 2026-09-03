@@ -1108,6 +1108,7 @@ fn ensure_resume_eligible(
         || crate::candidate_metadata_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let code_change_classification =
         known_code_change_classification || attempt.has_pending_code_change_classification();
+    let replayable_code_change_classification = attempt.has_replayable_code_change_classification();
     let evidence_queue_reconciliation =
         has_reconciled_interrupted_evidence_queue_admission(project_root, item, attempt_id);
     if item
@@ -1117,6 +1118,7 @@ fn ensure_resume_eligible(
         && !candidate_ancestry_repair
         && !candidate_metadata_repair
         && !code_change_classification
+        && !replayable_code_change_classification
         && !evidence_queue_reconciliation
     {
         bail!(
@@ -1134,6 +1136,10 @@ fn ensure_resume_eligible(
         return Ok(());
     }
     if code_change_classification {
+        ensure_code_change_classification_resume_ready(project_root, item, attempt)?;
+        return Ok(());
+    }
+    if replayable_code_change_classification {
         ensure_code_change_classification_resume_ready(project_root, item, attempt)?;
         return Ok(());
     }
@@ -1208,13 +1214,51 @@ fn ensure_code_change_classification_resume_ready(
         .tasks
         .iter()
         .enumerate()
-        .find(|(_, task)| {
-            task.id == classification.writer_task_id
-                && task.kind == TaskKind::Write
-                && task.status == TaskStatus::Planned
-                && task.output.is_none()
-        })
-        .ok_or_else(|| ineligible("the classified Writer is not the planned continuation"))?;
+        .find(|(_, task)| task.id == classification.writer_task_id && task.kind == TaskKind::Write)
+        .ok_or_else(|| ineligible("the classified Writer is missing"))?;
+    if attempt.status == AttemptStatus::NeedsUser
+        && writer.output.is_none()
+        && matches!(
+            writer.status,
+            TaskStatus::Planned | TaskStatus::NeedsUser | TaskStatus::Failed
+        )
+    {
+        let review_task_ids = recovery
+            .targets
+            .iter()
+            .filter_map(|target| {
+                let review_task_id = target.review_task_id.as_deref()?;
+                (target.role == "tests"
+                    && attempt.tasks.iter().any(|task| {
+                        task.id == review_task_id
+                            && task.kind == TaskKind::Review
+                            && task.role == "tests"
+                            && task.artifact_area.as_ref().is_some_and(|area| {
+                                format!("{}/review.md", area.path) == classification.review_artifact
+                            })
+                    }))
+                .then_some(review_task_id)
+            })
+            .collect::<Vec<_>>();
+        if review_task_ids.len() != 1 {
+            return Err(ineligible(
+                "classified recovery has an ambiguous Tests Review target",
+            ));
+        }
+        crate::recovery_contracts::validate_code_change_classification_replay(
+            project_root,
+            item,
+            attempt,
+            recovery,
+            classification,
+            review_task_ids[0],
+        )
+        .map_err(|reason| ineligible(&reason))?;
+        attempt
+            .ensure_resume_ready()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        return Ok(());
+    }
     if attempt.tasks.iter().enumerate().any(|(index, task)| {
         task.status == TaskStatus::Executing
             || (task.status == TaskStatus::NeedsUser)

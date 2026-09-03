@@ -4767,6 +4767,8 @@ impl Attempt {
         let failed_candidate_gate_correction = self.is_failed_candidate_gate_correction();
         let pending_evidence_reviews = self.has_pending_evidence_review_tasks();
         let pending_code_change_classification = self.has_pending_code_change_classification();
+        let replayable_code_change_classification =
+            self.has_replayable_code_change_classification();
 
         if self.status != AttemptStatus::NeedsUser
             && !failed_candidate_gate_correction
@@ -4782,7 +4784,8 @@ impl Attempt {
             task.status == TaskStatus::Executing
                 || (task.status == TaskStatus::Failed
                     && !failed_candidate_gate_correction
-                    && !(pending_code_change_classification
+                    && !((pending_code_change_classification
+                        || replayable_code_change_classification)
                         && task.kind == TaskKind::Write
                         && task.output.is_none())
                     && !self.is_superseded_tester_harness_followup(&task.id)
@@ -5161,6 +5164,57 @@ impl Attempt {
             && self.tasks.iter().all(|task| {
                 task.status != TaskStatus::Planned || target_task_ids.contains(task.id.as_str())
             })
+    }
+
+    /// Return whether this Attempt owns a replayable corrective Writer created
+    /// by an accepted host-evidence source classification.
+    ///
+    /// Queue admission uses this broader shape while recovering an older
+    /// paused or interrupted Writer. The replay contract still validates every
+    /// candidate and artifact binding before queue admission mutates anything.
+    pub fn has_replayable_code_change_classification(&self) -> bool {
+        let Some((recovery_index, recovery)) = self
+            .evidence_recoveries
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, recovery)| {
+                recovery.state == EvidenceRecoveryState::CodeChange
+                    && recovery.code_change_classification.is_some()
+            })
+        else {
+            return false;
+        };
+        if self
+            .evidence_recoveries
+            .iter()
+            .skip(recovery_index + 1)
+            .any(|recovery| {
+                matches!(
+                    recovery.state,
+                    EvidenceRecoveryState::Reviewing | EvidenceRecoveryState::NeedsEvidence
+                )
+            })
+        {
+            return false;
+        }
+        let Some(classification) = recovery.code_change_classification.as_ref() else {
+            return false;
+        };
+        let Some(writer) = self
+            .tasks
+            .iter()
+            .find(|task| task.id == classification.writer_task_id)
+        else {
+            return false;
+        };
+        matches!(
+            writer.status,
+            TaskStatus::Planned
+                | TaskStatus::Executing
+                | TaskStatus::NeedsUser
+                | TaskStatus::Failed
+        ) && writer.output.is_none()
     }
 
     /// Return whether this Attempt owns the planned corrective Writer created

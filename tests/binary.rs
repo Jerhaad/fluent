@@ -24556,6 +24556,127 @@ fn setup_paused_code_change_classification_fixture_with_result(
     )
 }
 
+struct LegacyClassifiedRecovery {
+    attempt_path: PathBuf,
+    operation_id: String,
+    writer_id: String,
+    audit_path: String,
+    audit: Vec<u8>,
+}
+
+fn persist_legacy_classified_recovery(
+    project: &Path,
+    work_item_id: &str,
+    candidate: &str,
+    targeted_path: &str,
+    evidence_digest: &str,
+) -> LegacyClassifiedRecovery {
+    let store = WorkModelStore::new(project);
+    let attempt_path = store.work_attempt_path(work_item_id, "attempt-1").unwrap();
+    let mut legacy_attempt = read_json_path(&attempt_path);
+    let recovery_id = legacy_attempt["evidence_recoveries"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let review_digest =
+        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["review_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let authorization_digest = legacy_attempt["evidence_recoveries"][0]
+        ["code_change_classification"]["authorization_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let writer_id =
+        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["writer_task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let current_operation_id =
+        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    let current_audit_path = legacy_attempt["evidence_recoveries"][0]["code_change_classification"]
+        ["audit_artifact"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let legacy_operation_material = format!(
+        "attempt-1\0{candidate}\0{recovery_id}\0{targeted_path}\0{review_digest}\0{evidence_digest}\0{authorization_digest}"
+    );
+    let legacy_operation_id = format!(
+        "host-evidence-classification-{:x}",
+        Sha256::digest(legacy_operation_material.as_bytes())
+    );
+    let legacy_audit_path = format!(
+        ".fluent/work/artifacts/{work_item_id}/attempt-1/{legacy_operation_id}/classification.json"
+    );
+    let mut legacy_audit = fs::read(project.join(&current_audit_path)).unwrap();
+    let disposition_line = b"  \"disposition\": \"code-change\",\n";
+    let disposition_start = legacy_audit
+        .windows(disposition_line.len())
+        .position(|window| window == disposition_line)
+        .expect("new audit includes the disposition field");
+    legacy_audit.drain(disposition_start..disposition_start + disposition_line.len());
+    legacy_audit = String::from_utf8(legacy_audit)
+        .unwrap()
+        .replace(&current_operation_id, &legacy_operation_id)
+        .into_bytes();
+    fs::create_dir_all(project.join(&legacy_audit_path).parent().unwrap()).unwrap();
+    fs::write(project.join(&legacy_audit_path), legacy_audit.clone()).unwrap();
+    fs::remove_file(project.join(&current_audit_path)).unwrap();
+
+    {
+        let recovery = &mut legacy_attempt["evidence_recoveries"][0];
+        let classification = &mut recovery["code_change_classification"];
+        classification["operation_id"] = serde_json::Value::String(legacy_operation_id.clone());
+        classification["audit_artifact"] = serde_json::json!({
+            "producer_id": legacy_operation_id.clone(),
+            "path": legacy_audit_path.clone(),
+        });
+        classification
+            .as_object_mut()
+            .unwrap()
+            .remove("disposition");
+        recovery["targets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("review_digest");
+    }
+    for artifact in legacy_attempt["artifacts"].as_array_mut().unwrap() {
+        if artifact["path"] == current_audit_path {
+            *artifact = serde_json::json!({
+                "producer_id": legacy_operation_id.clone(),
+                "path": legacy_audit_path.clone(),
+            });
+        }
+    }
+    let writer_path = store
+        .work_task_path(work_item_id, "attempt-1", &writer_id)
+        .unwrap();
+    let mut legacy_writer = read_json_path(&writer_path);
+    for input in legacy_writer["input_artifacts"].as_array_mut().unwrap() {
+        if input["path"] == current_audit_path {
+            *input = serde_json::json!({
+                "producer_id": legacy_operation_id.clone(),
+                "path": legacy_audit_path.clone(),
+            });
+        }
+    }
+    write_json_path(&attempt_path, &legacy_attempt);
+    write_json_path(&writer_path, &legacy_writer);
+
+    LegacyClassifiedRecovery {
+        attempt_path,
+        operation_id: legacy_operation_id,
+        writer_id,
+        audit_path: legacy_audit_path,
+        audit: legacy_audit,
+    }
+}
+
 struct ManagedWorktreeCleanup {
     project: PathBuf,
     workspace: PathBuf,
@@ -27062,102 +27183,18 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
         .assert()
         .success();
 
-    let store = WorkModelStore::new(&project);
-    let attempt_path = store.work_attempt_path(work_item_id, "attempt-1").unwrap();
-    let mut legacy_attempt = read_json_path(&attempt_path);
-    let recovery_id = legacy_attempt["evidence_recoveries"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let review_digest =
-        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["review_digest"]
-            .as_str()
-            .unwrap()
-            .to_string();
-    let authorization_digest = legacy_attempt["evidence_recoveries"][0]
-        ["code_change_classification"]["authorization_digest"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let writer_id =
-        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["writer_task_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-    let current_operation_id =
-        legacy_attempt["evidence_recoveries"][0]["code_change_classification"]["operation_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-    let current_audit_path = legacy_attempt["evidence_recoveries"][0]["code_change_classification"]
-        ["audit_artifact"]["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let legacy_operation_material = format!(
-        "attempt-1\0{candidate}\0{recovery_id}\0{targeted_path}\0{review_digest}\0{evidence_digest}\0{authorization_digest}"
+    let legacy = persist_legacy_classified_recovery(
+        &project,
+        work_item_id,
+        &candidate,
+        &targeted_path,
+        &evidence_digest,
     );
-    let legacy_operation_id = format!(
-        "host-evidence-classification-{:x}",
-        Sha256::digest(legacy_operation_material.as_bytes())
-    );
-    let legacy_audit_path = format!(
-        ".fluent/work/artifacts/{work_item_id}/attempt-1/{legacy_operation_id}/classification.json"
-    );
-    let mut legacy_audit = fs::read(project.join(&current_audit_path)).unwrap();
-    let disposition_line = b"  \"disposition\": \"code-change\",\n";
-    let disposition_start = legacy_audit
-        .windows(disposition_line.len())
-        .position(|window| window == disposition_line)
-        .expect("new audit includes the disposition field");
-    legacy_audit.drain(disposition_start..disposition_start + disposition_line.len());
-    legacy_audit = String::from_utf8(legacy_audit)
-        .unwrap()
-        .replace(&current_operation_id, &legacy_operation_id)
-        .into_bytes();
-    fs::create_dir_all(project.join(&legacy_audit_path).parent().unwrap()).unwrap();
-    fs::write(project.join(&legacy_audit_path), legacy_audit.clone()).unwrap();
-    fs::remove_file(project.join(&current_audit_path)).unwrap();
-
-    {
-        let recovery = &mut legacy_attempt["evidence_recoveries"][0];
-        let classification = &mut recovery["code_change_classification"];
-        classification["operation_id"] = serde_json::Value::String(legacy_operation_id.clone());
-        classification["audit_artifact"] = serde_json::json!({
-            "producer_id": legacy_operation_id.clone(),
-            "path": legacy_audit_path.clone(),
-        });
-        classification
-            .as_object_mut()
-            .unwrap()
-            .remove("disposition");
-        recovery["targets"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("review_digest");
-    }
-    for artifact in legacy_attempt["artifacts"].as_array_mut().unwrap() {
-        if artifact["path"] == current_audit_path {
-            *artifact = serde_json::json!({
-                "producer_id": legacy_operation_id.clone(),
-                "path": legacy_audit_path.clone(),
-            });
-        }
-    }
-    let writer_path = store
-        .work_task_path(work_item_id, "attempt-1", &writer_id)
-        .unwrap();
-    let mut legacy_writer = read_json_path(&writer_path);
-    for input in legacy_writer["input_artifacts"].as_array_mut().unwrap() {
-        if input["path"] == current_audit_path {
-            *input = serde_json::json!({
-                "producer_id": legacy_operation_id.clone(),
-                "path": legacy_audit_path.clone(),
-            });
-        }
-    }
-    write_json_path(&attempt_path, &legacy_attempt);
-    write_json_path(&writer_path, &legacy_writer);
+    let attempt_path = legacy.attempt_path;
+    let legacy_operation_id = legacy.operation_id;
+    let writer_id = legacy.writer_id;
+    let legacy_audit_path = legacy.audit_path;
+    let legacy_audit = legacy.audit;
 
     let expected_review_digest = format!(
         "sha256:{:x}",
@@ -27198,12 +27235,32 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
     );
 
     clear_target_digest();
-    let legacy_model = WorkModelStore::new(&project)
-        .read_work_item(work_item_id)
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(work_item_id, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = fluent::work_model::AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(fluent::work_model::PauseKind::Interrupted);
+            attempt.pause_recovery = None;
+            attempt.completed_at = Some(fluent::work_model::now_iso8601());
+            let writer = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == writer_id)
+                .unwrap();
+            writer.status = fluent::work_model::TaskStatus::NeedsUser;
+            writer.started_at = Some(fluent::work_model::now_iso8601());
+            Ok(())
+        })
         .unwrap();
-    assert!(
-        legacy_model.attempts[0].has_pending_code_change_classification(),
-        "legacy classified recovery must remain a pending Writer frontier"
+    let legacy_model = store.read_work_item(work_item_id).unwrap();
+    assert_eq!(
+        legacy_model.attempts[0].status,
+        fluent::work_model::AttemptStatus::NeedsUser
+    );
+    assert_eq!(
+        legacy_model.attempts[0].tasks.last().unwrap().status,
+        fluent::work_model::TaskStatus::NeedsUser
     );
     fluent_cmd()
         .current_dir(&project)
@@ -27220,6 +27277,12 @@ fn legacy_classified_host_evidence_replays_queues_and_starts_writer() {
         legacy_audit
     );
 
+    store
+        .mutate_work_item(work_item_id, |item| {
+            fluent::work_model::reopen_attempt(&mut item.attempts[0]);
+            Ok(())
+        })
+        .unwrap();
     clear_target_digest();
     let bin_dir = tmp.path().join("legacy-classified-writer-bin");
     write_mock_claude(
@@ -27258,6 +27321,119 @@ exit 0
     assert_eq!(
         fs::read(project.join(&legacy_audit_path)).unwrap(),
         legacy_audit
+    );
+}
+
+#[test]
+fn legacy_classified_host_evidence_queue_rejects_stale_candidate_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let work_item_id = "evidence-classify-legacy-stale";
+    let (project, candidate, _prior_review_path, targeted_path, evidence_digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, work_item_id);
+    let workspace_cleanup = bind_candidate_to_managed_sibling(&project, work_item_id, &candidate);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &evidence_digest,
+            "--resolution",
+            resolution,
+        ])
+        .assert()
+        .success();
+    let _legacy = persist_legacy_classified_recovery(
+        &project,
+        work_item_id,
+        &candidate,
+        &targeted_path,
+        &evidence_digest,
+    );
+
+    commit_file(
+        &workspace_cleanup.workspace,
+        "stale-candidate.txt",
+        "stale candidate\n",
+        "Make candidate stale",
+    );
+    let before_model = persisted_work_snapshot(&project, work_item_id);
+    let queue_path = queue_ledger_path(&project, work_item_id);
+    let before_queue = fs::read(&queue_path).ok();
+    let before_candidate_head = git_head(&workspace_cleanup.workspace);
+    let before_candidate_status = git::run_stdout(
+        &workspace_cleanup.workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect stale candidate cleanliness",
+    )
+    .unwrap();
+    let writer_marker = tmp.path().join("legacy-stale-writer-invoked");
+    let bin_dir = tmp.path().join("legacy-stale-writer-bin");
+    write_mock_claude(
+        &bin_dir,
+        r##"#!/bin/bash
+set -euo pipefail
+for arg in "$@"; do
+  if [ "$arg" = "-p" ]; then
+    printf invoked > "$WRITER_MARKER"
+    break
+  fi
+done
+exit 42
+"##,
+    );
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", work_item_id, "--attempt", "attempt-1"])
+        .env("PATH", mock_path(&bin_dir))
+        .env("WRITER_MARKER", &writer_marker)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "stale legacy migration unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        persisted_work_snapshot(&project, work_item_id),
+        before_model,
+        "stale legacy migration changed model or artifacts"
+    );
+    assert_eq!(fs::read(&queue_path).ok(), before_queue);
+    assert_eq!(
+        git_head(&workspace_cleanup.workspace),
+        before_candidate_head,
+        "stale legacy migration changed the candidate"
+    );
+    assert_eq!(
+        git::run_stdout(
+            &workspace_cleanup.workspace,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect stale candidate after rejection",
+        )
+        .unwrap(),
+        before_candidate_status
+    );
+    assert!(
+        !writer_marker.exists(),
+        "stale legacy migration invoked the Writer"
+    );
+    assert!(
+        work_item_value(&project, work_item_id)["attempts"][0]["evidence_recoveries"][0]["targets"]
+            [0]["review_digest"]
+            .is_null(),
+        "stale legacy migration persisted a target digest"
     );
 }
 
