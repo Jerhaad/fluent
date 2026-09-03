@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-use crate::work_model::{WriterCompletionContract, WriterCompletionRequirementKind};
+use crate::work_model::{
+    CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract,
+    WriterCompletionRequirementKind,
+};
 
 pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
@@ -137,7 +140,19 @@ pub(crate) fn run_candidate_gate_with_prior(
     request: CandidateGateRequest<'_>,
     prior_candidate_gate_path: Option<&Path>,
 ) -> Result<CandidateGateEvidence> {
-    let identity = check_candidate_identity(&request, prior_candidate_gate_path)?;
+    run_candidate_gate_with_prior_and_role(request, prior_candidate_gate_path, None)
+}
+
+/// Run the post-Writer candidate gate with the Writer role that produced the
+/// candidate.  Metadata-recovery Writers must stay inside the audited,
+/// tree-identical rewrite scope even when their replacement is a descendant of
+/// the rejected candidate; ordinary Writers retain the append-only path.
+pub(crate) fn run_candidate_gate_with_prior_and_role(
+    request: CandidateGateRequest<'_>,
+    prior_candidate_gate_path: Option<&Path>,
+    writer_role: Option<&str>,
+) -> Result<CandidateGateEvidence> {
+    let identity = check_candidate_identity(&request, prior_candidate_gate_path, writer_role)?;
     let mut checks = vec![
         identity.check,
         check_whitespace(&request, &identity.effective_base_commit)?,
@@ -203,6 +218,7 @@ struct CandidateIdentityResolution {
 fn check_candidate_identity(
     request: &CandidateGateRequest<'_>,
     prior_candidate_gate_path: Option<&Path>,
+    writer_role: Option<&str>,
 ) -> Result<CandidateIdentityResolution> {
     let head = crate::git::run_stdout(
         request.workspace,
@@ -236,6 +252,7 @@ fn check_candidate_identity(
     }
 
     if diagnostics.is_empty() {
+        let metadata_recovery = writer_role == Some(CANDIDATE_METADATA_REPAIR_ROLE);
         match prior_candidate_gate_path {
             Some(path) => match read_prior_writer_gate(path) {
                 Ok(prior) => {
@@ -287,7 +304,7 @@ fn check_candidate_identity(
                             request.base_commit,
                             request.candidate_commit,
                         )?;
-                        if !current_descends_from_rejected {
+                        if metadata_recovery || !current_descends_from_rejected {
                             match validate_metadata_only_rewrite(request, path, &prior)? {
                                 Ok(evidence) => metadata_rewrite = Some(evidence),
                                 Err(reason) => diagnostics.push(reason),
@@ -298,7 +315,10 @@ fn check_candidate_identity(
                 Err(reason) => diagnostics.push(reason),
             },
             None => {
-                if is_ancestor(
+                if metadata_recovery {
+                    diagnostics
+                        .push("metadata-recovery Writer has no prior candidate gate".to_string());
+                } else if is_ancestor(
                     request.workspace,
                     request.base_commit,
                     request.candidate_commit,

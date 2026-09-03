@@ -6635,7 +6635,7 @@ fn gate_candidate_after_writer(
             &item.attempts[attempt_index],
             task,
         )?;
-    let evidence = crate::candidate_gate::run_candidate_gate_with_prior(
+    let evidence = crate::candidate_gate::run_candidate_gate_with_prior_and_role(
         crate::candidate_gate::CandidateGateRequest {
             project_root,
             workspace: &workspace,
@@ -6658,6 +6658,7 @@ fn gate_candidate_after_writer(
             artifact_path: &project_root.join(&artifact.path),
         },
         prior_candidate_gate_path.as_deref(),
+        Some(task.role.as_str()),
     )?;
     match evidence.disposition {
         crate::candidate_gate::CandidateGateDisposition::Passed => {
@@ -9015,6 +9016,10 @@ fn read_work_item_or_not_found(store: &WorkModelStore, id: &str) -> Result<WorkI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::candidate_gate::{
+        CandidateCheckEvidence, CandidateCheckStatus, CandidateGateDisposition,
+        CandidateGateEvidence, CandidateGatePhase,
+    };
     use crate::content::ContentResolver;
     use crate::follow_up::{ArtifactRef as LearnerArtifactRef, FollowUpDraftV1, LearnerDraftV1};
     use crate::work_model::AttemptKind;
@@ -17968,6 +17973,172 @@ mod tests {
         assert_eq!(
             evidence.disposition,
             crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn metadata_recovery_rejects_descendant_product_change_after_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let source_output = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .clone()
+            .unwrap();
+        let source_candidate = source_output.commit.clone();
+        let protected_base = source_output.base_commit.clone().unwrap();
+        let gate = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate_path = project.path().join(&gate);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Failed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Skipped),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: if name == "commit-metadata" {
+                vec!["commit message is missing a body".to_string()]
+            } else {
+                Vec::new()
+            },
+            log_path: None,
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: protected_base,
+                candidate_commit: source_candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let source_gate = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: gate,
+        };
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::CandidateGate);
+                attempt.review_state = Some(AttemptReviewState::NotReviewed);
+                attempt.artifacts.push(source_gate.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let recovery = crate::candidate_metadata_recovery::repair(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            "Rewrite only malformed commit messages after the protected base.",
+        )
+        .unwrap();
+        assert!(!recovery.already_authorized);
+
+        fs::write(
+            workspace.path().join("src/product.rs"),
+            "pub fn product_change() {}\n",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", "src/product.rs"],
+            "stage descendant product change",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-q", "-m", "Extend product"],
+            "commit descendant product change",
+        )
+        .unwrap();
+        let descendant = crate::git::run_stdout(
+            workspace.path(),
+            &["rev-parse", "HEAD"],
+            "read descendant product change",
+        )
+        .unwrap();
+
+        store
+            .mutate_work_item("work-1", |item| {
+                let task = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == recovery.task_id)
+                    .unwrap();
+                crate::work_model::set_task_terminal(task, TaskStatus::Complete);
+                task.output = Some(TaskOutput {
+                    base_commit: Some(source_candidate.clone()),
+                    commit: descendant.clone(),
+                    ..source_output.clone()
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        assert_eq!(
+            stored.attempts[0].pause_kind,
+            Some(PauseKind::CandidateGate)
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.kind != TaskKind::Review && task.kind != TaskKind::Tester)
+        );
+        let gate_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == recovery.task_id
+                    && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        let identity = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "candidate-identity")
+            .unwrap();
+        assert_eq!(identity.status, CandidateCheckStatus::Error);
+        assert!(
+            identity
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("rewritten candidate tree"))
         );
     }
 
