@@ -1820,6 +1820,46 @@ fn run_merge_checks(
     .expect("check-pre-merge presence already confirmed");
     artifacts.push(hook_artifact(config.project_root, &recheck_outcome));
     if !recheck_outcome.passed {
+        // Fluent 0.2.0 could create its maintenance commit with only a subject.
+        // If a later project policy rejects exactly that generated commit, repair
+        // only the known Fluent commit message and retry the hook. This does not
+        // rewrite an arbitrary project commit: it requires that fix-pre-merge made
+        // no tree change, the current subject is Fluent's exact maintenance subject,
+        // and the hook reports the corresponding missing-body diagnostic.
+        if after_commit == baseline_commit
+            && generated_autofix_message_failure(source_workspace, &recheck_outcome)?
+        {
+            let preserved_log = recheck_outcome
+                .log_path
+                .with_file_name("check-pre-merge-before-autofix-message-repair.log");
+            fs::copy(&recheck_outcome.log_path, &preserved_log).with_context(|| {
+                format!(
+                    "preserve failed check-pre-merge log before repairing generated commit message: {}",
+                    recheck_outcome.log_path.display()
+                )
+            })?;
+            artifacts.push(ArtifactRef {
+                producer_id: "merge-hook-check-pre-merge-before-autofix-message-repair".to_string(),
+                path: path_for_model(config.project_root, &preserved_log),
+            });
+            amend_autofix_commit_message(source_workspace)?;
+            let repaired_outcome = hooks::run_hook(
+                config.project_root,
+                "check-pre-merge",
+                source_workspace,
+                &context,
+            )?
+            .expect("check-pre-merge presence already confirmed");
+            artifacts.push(hook_artifact(config.project_root, &repaired_outcome));
+            if !repaired_outcome.passed {
+                bail!(
+                    "check-pre-merge failed after generated commit-message repair (exit {}). Log: {}",
+                    repaired_outcome.exit_code,
+                    repaired_outcome.log_path.display()
+                );
+            }
+            return Ok(artifacts);
+        }
         bail!(
             "check-pre-merge failed after fix-pre-merge (exit {}). Log: {}",
             recheck_outcome.exit_code,
@@ -1855,6 +1895,47 @@ fn autofix_commit_message() -> &'static str {
     "Conform code to project standards"
 }
 
+fn autofix_commit_body() -> &'static str {
+    "Apply project formatting fixes."
+}
+
+fn generated_autofix_message_failure(worktree_dir: &Path, outcome: &HookOutcome) -> Result<bool> {
+    if outcome.passed {
+        return Ok(false);
+    }
+    let subject = git::run_stdout(
+        worktree_dir,
+        &["log", "-1", "--format=%s"],
+        "read HEAD subject",
+    )?;
+    if subject != autofix_commit_message() {
+        return Ok(false);
+    }
+    let head = head_commit(worktree_dir)?;
+    let expected = format!("commit {head} has no body separated from its subject by a blank line");
+    let log = match fs::read_to_string(&outcome.log_path) {
+        Ok(log) => log,
+        Err(_) => return Ok(false),
+    };
+    Ok(log.lines().any(|line| line.trim() == expected))
+}
+
+fn amend_autofix_commit_message(worktree_dir: &Path) -> Result<()> {
+    git::run(
+        worktree_dir,
+        &[
+            "commit",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            autofix_commit_message(),
+            "-m",
+            autofix_commit_body(),
+        ],
+        "repair generated fix-pre-merge commit message",
+    )
+}
+
 fn commit_autofix(worktree_dir: &Path) -> Result<()> {
     git::run(
         worktree_dir,
@@ -1862,9 +1943,10 @@ fn commit_autofix(worktree_dir: &Path) -> Result<()> {
         "stage fix-pre-merge changes",
     )?;
     let subject = autofix_commit_message();
+    let body = autofix_commit_body();
     git::run(
         worktree_dir,
-        &["commit", "-m", subject],
+        &["commit", "-m", subject, "-m", body],
         "commit fix-pre-merge changes",
     )
 }
@@ -1886,7 +1968,80 @@ fn set_candidate_executing(
     work_item_id: &str,
     candidate_id: &str,
 ) -> Result<()> {
-    update_candidate(store, work_item_id, candidate_id, |candidate| {
+    mutate_landing_work_item(store, work_item_id, |item| {
+        let candidate_index = item
+            .merge_candidates
+            .iter()
+            .position(|candidate| candidate.id == candidate_id)
+            .ok_or_else(|| WorkModelError::MergeCandidateNotFound {
+                candidate_id: candidate_id.to_string(),
+            })?;
+        let attempt_id = item.merge_candidates[candidate_index].attempt_id.clone();
+        let retrying_terminal_land = matches!(
+            item.merge_candidates[candidate_index].merge_state.status,
+            MergeCandidateMergeStatus::Failed | MergeCandidateMergeStatus::NeedsUser
+        );
+
+        // A failed landing leaves a complete, reviewed candidate behind, but its
+        // Attempt may still carry the landing pause (or an older `attempt run`
+        // may have reopened it). Normalize that one audited retry boundary before
+        // marking the candidate Executing. This keeps the existing Rebase Tasks as
+        // history while making the aggregate valid for the new landing transition.
+        if retrying_terminal_land {
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: attempt_id.clone(),
+                })?;
+            if attempt.review_state != Some(crate::work_model::AttemptReviewState::Passed) {
+                return Err(WorkModelError::MergeCandidateAttemptReviewsNotPassed {
+                    candidate_id: candidate_id.to_string(),
+                    attempt_id,
+                });
+            }
+            if let Some(task) = attempt.tasks.iter().find(|task| {
+                task.kind != TaskKind::Rebase
+                    && matches!(
+                        task.status,
+                        TaskStatus::Failed | TaskStatus::Executing | TaskStatus::NeedsUser
+                    )
+            }) {
+                return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                    candidate_id: candidate_id.to_string(),
+                    reason: format!(
+                        "Attempt has unresolved non-landing Task {} in {} state",
+                        task.id, task.status
+                    ),
+                });
+            }
+            if let Some(task) = attempt
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Rebase && task.status == TaskStatus::Executing)
+            {
+                return Err(WorkModelError::MergeCandidateCorrectionIneligible {
+                    candidate_id: candidate_id.to_string(),
+                    reason: format!(
+                        "landing Rebase Task {} is still executing; wait for it to settle",
+                        task.id
+                    ),
+                });
+            }
+            attempt.status = crate::work_model::AttemptStatus::Complete;
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            if let Some(ready_at) = item.merge_candidates[candidate_index].ready_at.as_ref() {
+                attempt.completed_at = Some(ready_at.clone());
+            } else {
+                attempt
+                    .completed_at
+                    .get_or_insert_with(crate::work_model::now_iso8601);
+            }
+        }
+
+        let candidate = &mut item.merge_candidates[candidate_index];
         candidate.merge_review_state = MergeReviewState::Pending;
         candidate.merge_state = MergeCandidateMergeState {
             status: MergeCandidateMergeStatus::Executing,
@@ -1898,7 +2053,9 @@ fn set_candidate_executing(
             follow_up_failure: None,
         };
         crate::work_model::mark_merge_candidate_started(candidate);
+        Ok(())
     })
+    .map_err(Into::into)
 }
 
 fn record_candidate_failure(
@@ -3382,6 +3539,79 @@ mod tests {
     }
 
     #[test]
+    fn failed_landing_retry_restores_reviewed_attempt_atomically() {
+        // A failed landing is retryable when all product work and reviews are
+        // already complete. The public landing retry must restore the Attempt's
+        // terminal review state in the same model write that marks the candidate
+        // Executing; otherwise candidate validation rejects the retry between the
+        // two states. Existing tasks and their history remain untouched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source_workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&source_workspace).unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let (mut item, _) = executing_candidate_item("work-1", &source_workspace);
+        let ready_at = "2026-09-03T12:54:00.009455+00:00".to_string();
+        let attempt = &mut item.attempts[0];
+        attempt.status = crate::work_model::AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(crate::work_model::PauseKind::HostSandbox);
+        attempt.completed_at = Some("landing-paused-later".to_string());
+        attempt.learning = Some(crate::work_model::AttemptLearning::succeeded(
+            1,
+            crate::follow_up::ArtifactRef {
+                path: ".fluent/work/artifacts/work-1/attempt-1/learner/handoff.json".to_string(),
+                digest: "sha256:test".to_string(),
+            },
+        ));
+        let prior_task_ids = attempt
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let candidate = &mut item.merge_candidates[0];
+        candidate.ready_at = Some(ready_at.clone());
+        candidate.merge_state = MergeCandidateMergeState {
+            status: MergeCandidateMergeStatus::Failed,
+            merged_commit: None,
+            failure_reason: Some("pre-merge hook failed".to_string()),
+            check_artifacts: Vec::new(),
+            review_artifacts: Vec::new(),
+            auto_merge_skipped: None,
+            follow_up_failure: None,
+        };
+        crate::work_model::set_merge_candidate_terminal(
+            candidate,
+            MergeCandidateMergeStatus::Failed,
+        );
+        store.create_work_item(&item).unwrap();
+
+        set_candidate_executing(&store, "work-1", "attempt-1-merge-candidate").unwrap();
+
+        let after = store.read_work_item("work-1").unwrap();
+        let attempt = &after.attempts[0];
+        assert_eq!(attempt.status, crate::work_model::AttemptStatus::Complete);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.completed_at.as_deref(), Some(ready_at.as_str()));
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>(),
+            prior_task_ids,
+            "retry normalization preserves every prior Task"
+        );
+        assert_eq!(
+            after.merge_candidates[0].merge_state.status,
+            MergeCandidateMergeStatus::Executing
+        );
+        assert_eq!(
+            after.merge_candidates[0].merge_review_state,
+            MergeReviewState::Pending
+        );
+        after.validate().expect("the combined retry state is valid");
+    }
+
+    #[test]
     fn rebase_launch_threads_resolved_capture() {
         // B8: the rebase launch route threads the project's resolved, immutable
         // TranscriptCapture into run_captured — not a dropped or default config. A
@@ -3400,7 +3630,7 @@ mod tests {
 
         let source_workspace = project_root.join("workspace");
         std::fs::create_dir_all(&source_workspace).unwrap();
-        let artifact_dir = project_root.join("artifacts");
+        let artifact_dir = tmp.path().join("artifacts");
 
         let store = WorkModelStore::new(project_root);
         let mut item = WorkItem {
@@ -5277,22 +5507,110 @@ mod tests {
         // any persisted divergence fails.
         assert_eq!(
             persisted,
-            autofix_commit_message(),
+            format!("{}\n\n{}", autofix_commit_message(), autofix_commit_body()),
             "persisted message must equal the production message source"
         );
 
         // Policy (B2): the complete persisted message equals the approved
-        // maintenance wording.
+        // maintenance wording, including its required explanatory body.
         assert_eq!(
-            persisted, "Conform code to project standards",
+            persisted, "Conform code to project standards\n\nApply project formatting fixes.",
             "persisted message must equal the approved wording"
         );
 
-        // Shape (B1): nonempty, exactly one subject and no body.
+        // Shape (B1): nonempty subject, blank separator, and explanatory body.
         assert!(!persisted.is_empty(), "message must not be empty");
         assert!(
-            !persisted.contains('\n'),
-            "message must be a single subject line with no body: {persisted:?}"
+            persisted.contains("\n\n"),
+            "message must separate its subject and body: {persisted:?}"
+        );
+        assert!(persisted.ends_with(autofix_commit_body()));
+    }
+
+    #[test]
+    fn old_generated_autofix_message_is_repaired_during_merge_checks() {
+        // A candidate produced by an older Fluent build can contain the exact
+        // maintenance subject without a body. A failing policy hook may repair
+        // that narrow, generated commit in place and continue, while preserving
+        // the original failed hook log as an audit artifact.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        fs::create_dir_all(&project_root).unwrap();
+        init_test_repo(&project_root);
+        git::run(
+            &project_root,
+            &["commit", "--allow-empty", "-m", autofix_commit_message()],
+            "create legacy generated commit",
+        )
+        .unwrap();
+        let candidate_commit = head_commit(&project_root).unwrap();
+        write_hook(
+            &project_root,
+            "check-pre-merge",
+            "#!/bin/sh
+subject=$(git log -1 --format=%s)
+body=$(git log -1 --format=%b)
+if [ \"$subject\" = \"Conform code to project standards\" ] && [ -z \"$body\" ]; then
+  head=$(git rev-parse HEAD)
+  echo \"commit $head has no body separated from its subject by a blank line\"
+  exit 1
+fi
+exit 0
+",
+        );
+        write_hook(
+            &project_root,
+            "fix-pre-merge",
+            "#!/bin/sh
+exit 0
+",
+        );
+
+        let store = WorkModelStore::new(&project_root);
+        let resolver = ContentResolver::new(None);
+        let config = WorkMergeConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            merge_candidate_id: "attempt-1-merge-candidate",
+            resolver: &resolver,
+            extra_args: &[],
+            coder_kind: CoderKind::Codex,
+            coder_override: None,
+            model: None,
+            effort: None,
+            use_attempt_mapping: false,
+            no_sandbox: true,
+            run_post_merge_review: false,
+        };
+        let mut candidate = merge_candidate_fixture(&project_root);
+        candidate.candidate_commit = candidate_commit;
+        let artifact_dir = tmp.path().join("artifacts");
+        fs::create_dir_all(&artifact_dir).unwrap();
+
+        let artifacts = run_merge_checks(&config, &candidate, &project_root, &artifact_dir)
+            .expect("the exact legacy Fluent message is repaired");
+        let persisted = git::run_stdout(
+            &project_root,
+            &["log", "-1", "--format=%B"],
+            "read repaired message",
+        )
+        .unwrap();
+        assert_eq!(
+            persisted,
+            format!("{}\n\n{}", autofix_commit_message(), autofix_commit_body())
+        );
+        assert!(
+            artifact_dir
+                .join("hooks/check-pre-merge-before-autofix-message-repair.log")
+                .is_file(),
+            "the rejected legacy hook result remains available"
+        );
+        assert!(
+            artifacts.iter().any(|artifact| artifact
+                .path
+                .ends_with("check-pre-merge-before-autofix-message-repair.log")),
+            "the preserved failed hook result is included in merge artifacts"
         );
     }
 

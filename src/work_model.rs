@@ -6602,7 +6602,15 @@ impl MergeCandidate {
                 attempt_id: self.attempt_id.clone(),
             });
         }
-        if let Some(ready_at) = self.ready_at.as_ref() {
+        // A failed landing is terminal history, not a candidate that can advance
+        // toward landing. Its ready timestamp may legitimately predate a later
+        // recovery pause or failed landing attempt, so do not make the failed
+        // record unreadable when those timestamps no longer match. Pending,
+        // needs-user, executing, and merged candidates still enforce the shared
+        // readiness timestamp and Learner gate.
+        if self.merge_state.status != MergeCandidateMergeStatus::Failed
+            && let Some(ready_at) = self.ready_at.as_ref()
+        {
             attempt.learning_advancement_readiness()?;
             if attempt.completed_at.as_ref() != Some(ready_at) {
                 return Err(WorkModelError::MergeCandidateReadinessTimestampMismatch {
@@ -13803,6 +13811,25 @@ random banner prose that must be ignored
                 field: "candidate_commit",
             }
         );
+    }
+
+    #[test]
+    fn failed_merge_candidate_allows_stale_readiness_timestamp() {
+        // A landing failure is durable terminal history. Recovery may happen
+        // after a later pause has changed the Attempt timestamp, so reading the
+        // failed Candidate must not require its old readiness time to match.
+        let mut work_item = work_item_with_completed_write("work-1");
+        work_item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+        work_item.attempts[0].completed_at = Some("attempt-completed".to_string());
+        let mut candidate = candidate_for_completed_write();
+        candidate.ready_at = Some("candidate-ready".to_string());
+        candidate.merge_state.status = MergeCandidateMergeStatus::Failed;
+        candidate.merge_state.failure_reason = Some("landing hook failed".to_string());
+        work_item.merge_candidates.push(candidate);
+
+        work_item
+            .validate()
+            .expect("failed landing history remains readable for recovery");
     }
 
     #[test]

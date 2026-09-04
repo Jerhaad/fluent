@@ -9534,13 +9534,13 @@ Test: src/writer_cache.rs (reclamation_retires_a_cache_after_work_becomes_termin
 WHEN `fix-pre-merge` changes candidate files and Fluent creates the
 corresponding commit,
 THE SYSTEM SHALL persist a nonempty commit message containing exactly one
-subject and no body.
+subject, a blank separator, and an explanatory body.
 Test: src/work_merge_executor.rs (commit_autofix_writes_approved_message)
 
 ### B2
 
 WHEN `fix-pre-merge` changes candidate files and Fluent creates the
 corresponding commit,
-THE SYSTEM SHALL persist `Conform code to project standards` as the complete
-commit message.
+THE SYSTEM SHALL persist `Conform code to project standards` as the subject
+and `Apply project formatting fixes.` as its body.
 Test: src/work_merge_executor.rs (commit_autofix_writes_approved_message)
