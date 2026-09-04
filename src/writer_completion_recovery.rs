@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -75,6 +76,7 @@ struct EligibleRecovery {
     task_id: String,
     source_writer_task_id: String,
     candidate_commit: String,
+    workspace_path: String,
     protected_base_commit: Option<String>,
     superseded_task_ids: Vec<String>,
     existing_no_change: bool,
@@ -158,6 +160,20 @@ pub fn repair(
         resolution_sha256: content_digest(resolution.as_bytes()),
         created_at,
     };
+    let authority_bytes =
+        serde_json::to_vec(&authority).context("serialize Writer-completion recovery identity")?;
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "writer-completion-recovery",
+        work_item_id,
+        attempt_id,
+        Some(eligible.candidate_commit.clone()),
+        Some(eligible.task_id.clone()),
+        None,
+        Some(eligible.workspace_path.clone()),
+        Some(resolution.clone()),
+        Some(format!("sha256:{:x}", Sha256::digest(&authority_bytes))),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
     let audit_path = project_root.join(&audit_artifact);
     write_authority_once(&audit_path, &authority)?;
     let audit_ref = ArtifactRef {
@@ -325,6 +341,11 @@ pub fn repair(
             // A stale terminal timestamp made queue and direct status disagree
             // in older records. A resumable recovery has no completion time.
             attempt.completed_at = None;
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next_action)?;
             Ok(())
         },
     )?;
@@ -1158,6 +1179,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
         task_id,
         source_writer_task_id: source_writer.id.clone(),
         candidate_commit: source_output.commit.clone(),
+        workspace_path: source_output.workspace_path.clone(),
         protected_base_commit: source_output.base_commit.clone(),
         superseded_task_ids,
         existing_no_change,
@@ -1452,6 +1474,11 @@ mod tests {
                 .iter()
                 .any(|a| a.producer_id == PRODUCER)
         );
+        assert_eq!(attempt.recovery_operations.len(), 1);
+        assert_eq!(
+            attempt.recovery_operations[0].operation_kind,
+            "writer-completion-recovery"
+        );
         let second = repair(
             &fixture.project,
             &fixture.store,
@@ -1467,6 +1494,12 @@ mod tests {
                 .tasks
                 .len(),
             3
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .recovery_operations
+                .len(),
+            1
         );
     }
 

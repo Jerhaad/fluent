@@ -211,13 +211,28 @@ pub fn request(
             .parent()
             .expect("Tester-harness authority path has a parent"),
     )?;
-    crate::atomic_write::atomic_write(&authority_path, &serde_json::to_vec_pretty(&authority)?)
-        .with_context(|| {
-            format!(
-                "write Tester-harness repair authority {}",
-                authority_path.display()
-            )
-        })?;
+    let authority_bytes = serde_json::to_vec_pretty(&authority)?;
+    crate::atomic_write::atomic_write(&authority_path, &authority_bytes).with_context(|| {
+        format!(
+            "write Tester-harness repair authority {}",
+            authority_path.display()
+        )
+    })?;
+
+    let failed_tester_id = tester.id.clone();
+    let candidate_commit = context.candidate_commit.clone();
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "tester-harness-repair",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.clone()),
+        Some(failed_tester_id.clone()),
+        None,
+        Some(context.candidate_workspace_path.clone()),
+        Some(resolution.clone()),
+        Some(crate::follow_up::content_digest(&authority_bytes)),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
 
     let mut inputs = vec![ArtifactRef {
         producer_id: "tester-harness-repair-authority".to_string(),
@@ -242,8 +257,6 @@ pub fn request(
 
     let expected = item.clone();
     let instructions = repair_instructions(&resolution);
-    let failed_tester_id = tester.id.clone();
-    let candidate_commit = context.candidate_commit.clone();
     let stored_task_id = store.mutate_work_item_from_external(
         work_item_id,
         format!("approve Tester-harness repair for {attempt_id}"),
@@ -285,6 +298,11 @@ pub fn request(
             attempt.pause_kind = Some(PauseKind::TesterHarness);
             attempt.pause_recovery = None;
             attempt.completed_at = Some(requested_at.clone());
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next_action)?;
             Ok(task_id)
         },
     )?;
@@ -872,6 +890,11 @@ mod tests {
             fixture.candidate_commit
         );
         assert!(attempt.has_tester_harness_repair_for("attempt-1-tester"));
+        assert_eq!(attempt.recovery_operations.len(), 1);
+        assert_eq!(
+            attempt.recovery_operations[0].operation_kind,
+            "tester-harness-repair"
+        );
         attempt.ensure_resume_ready().unwrap();
 
         let mut malformed = item.clone();
@@ -913,6 +936,12 @@ mod tests {
                 .tasks
                 .len(),
             4
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .recovery_operations
+                .len(),
+            1
         );
     }
 

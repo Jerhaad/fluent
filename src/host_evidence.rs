@@ -233,6 +233,23 @@ pub fn classify_for_code_change(
         })?;
         let review_digest = format!("sha256:{:x}", Sha256::digest(&review_bytes));
         let review_text = std::str::from_utf8(&review_bytes).map_err(|_| rejected())?;
+        let operation = crate::work_model::RecoveryOperationRequest::new(
+            "host-evidence-code-change",
+            work_item_id,
+            attempt_id,
+            Some(candidate_commit.to_string()),
+            Some(review_task.id.clone()),
+            Some(evidence_digest.to_string()),
+            None,
+            Some(authorization.to_string()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!("{review_artifact}\0{review_digest}\0{evidence_digest}").as_bytes()
+                )
+            )),
+        );
+        let _ = item.validate_recovery_operation(project_root, &operation)?;
         let disposition = review::extract_evidence_disposition(review_text);
         let legacy_review = target.review_digest.is_none();
         let review_matches_saved_digest = target
@@ -453,6 +470,16 @@ pub fn classify_for_code_change(
             audit_artifact.clone(),
         ]).map_err(|_| rejected())?;
         if task_id != writer_task_id { return Err(rejected()); }
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| rejected_for("Attempt is not present after recovery"))?;
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(attempt),
+            Some(project_root),
+        );
+        attempt.record_recovery_operation(&operation, next_action)?;
         Ok(CodeChangeClassification { writer_task_id: task_id, audit_artifact: audit_artifact.path, disposition: disposition.to_string() })
         },
     )
@@ -1524,6 +1551,29 @@ pub fn attach(
     let document = parse_evidence_document(&bytes)?;
     let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
     let snapshot_path = snapshot_path(work_item_id, attempt_id, &digest)?;
+    let input_identity = format!(
+        "{}\0{}",
+        recheck_artifact.unwrap_or("review"),
+        review_artifacts.join("\0")
+    );
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        if recheck_artifact.is_some() {
+            "host-evidence-recheck-attachment"
+        } else {
+            "host-evidence-review-attachment"
+        },
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.to_string()),
+        None,
+        Some(digest.clone()),
+        None,
+        None,
+        Some(format!(
+            "sha256:{:x}",
+            Sha256::digest(input_identity.as_bytes())
+        )),
+    );
 
     // Share the land boundary with Attempt execution and landing.  Acquire it
     // before the model lock so the frontier is revalidated only after no
@@ -1532,6 +1582,7 @@ pub fn attach(
         .context("acquire land lock before attaching host evidence")?;
 
     let recovery = store.mutate_work_item(work_item_id, |item| {
+        let _ = item.validate_recovery_operation(project_root, &operation)?;
         let existing = item
             .attempts
             .iter()
@@ -1799,6 +1850,11 @@ pub fn attach(
         attempt.review_state = Some(work_model::AttemptReviewState::NotReviewed);
         attempt.pause_kind = None;
         attempt.pause_recovery = None;
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(attempt),
+            Some(project_root),
+        );
+        attempt.record_recovery_operation(&operation, next_action)?;
         Ok(attempt
             .evidence_recoveries
             .iter()
@@ -1843,6 +1899,20 @@ pub fn attach_plan_row(
         !plan_row.is_empty() && plan_row.len() <= MAX_FOCUSED_COMMAND_BYTES,
         "plan row must name one completion-matrix row"
     );
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "host-evidence-plan-row-attachment",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.to_string()),
+        None,
+        Some(digest.clone()),
+        None,
+        None,
+        Some(format!(
+            "sha256:{:x}",
+            Sha256::digest(format!("{plan_row}\0{digest}").as_bytes())
+        )),
+    );
 
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
         .context("acquire land lock before attaching Plan-row host evidence")?;
@@ -1858,6 +1928,7 @@ pub fn attach_plan_row(
                 .ok_or_else(|| WorkModelError::AttemptNotFound {
                     id: attempt_id.to_string(),
                 })?;
+            let _ = item.validate_recovery_operation(project_root, &operation)?;
             let ineligible = |reason: &str| WorkModelError::HostEvidenceRecoveryIneligible {
                 attempt_id: attempt_id.to_string(),
                 reason: reason.to_string(),
@@ -2159,6 +2230,11 @@ pub fn attach_plan_row(
                 })
                 .ok_or_else(|| ineligible("Plan-row evidence recovery target disappeared"))?;
             target.review_task_id = Some(task_id);
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next_action)?;
             Ok(attempt
                 .evidence_recoveries
                 .iter()
@@ -3882,6 +3958,11 @@ mod tests {
             1
         );
         assert_eq!(after.attempts[0].evidence_recoveries.len(), 1);
+        assert_eq!(after.attempts[0].recovery_operations.len(), 1);
+        assert_eq!(
+            after.attempts[0].recovery_operations[0].operation_kind,
+            "host-evidence-plan-row-attachment"
+        );
         assert_eq!(recovery.targets.len(), 1);
         let review_id = recovery.targets[0].review_task_id.clone().unwrap();
         assert!(after.attempts[0].tasks.iter().any(|task| {
@@ -3904,6 +3985,7 @@ mod tests {
         assert_eq!(repeated, recovery);
         let repeated_item = store.read_work_item("work-1").unwrap();
         assert_eq!(repeated_item.attempts[0].evidence_recoveries.len(), 1);
+        assert_eq!(repeated_item.attempts[0].recovery_operations.len(), 1);
         assert_eq!(
             repeated_item.attempts[0]
                 .tasks
@@ -4390,6 +4472,11 @@ mod tests {
         let attempt = &attached.attempts[0];
         assert_eq!(attempt.status, work_model::AttemptStatus::Reviewing);
         assert_eq!(attempt.evidence_recoveries.len(), 1);
+        assert_eq!(attempt.recovery_operations.len(), 1);
+        assert_eq!(
+            attempt.recovery_operations[0].operation_kind,
+            "host-evidence-review-attachment"
+        );
         let review_id = recovery.targets[0].review_task_id.as_ref().unwrap();
         let review = attempt
             .tasks

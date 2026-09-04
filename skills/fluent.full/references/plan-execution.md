@@ -93,6 +93,14 @@ showing the command; a changed Attempt gets freshly derived guidance instead of
 stale instructions. Older Attempts can be read without this record and are
 upgraded on their next managed write.
 
+Public recovery commands also append one operation record to the Attempt. It
+binds the operation to the exact candidate, Task or evidence, workspace,
+authorization, and input digest that were checked. The operation is recorded
+after the recovery changes the Attempt and includes the resulting status and
+next action. Repeating the identical command reuses that result without
+creating duplicate Tasks or evidence; a changed identity is rejected before
+the Work Item is modified.
+
 Without planning-wide delegation, after discussing each step or group of steps,
 ask:
 

@@ -29,6 +29,7 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
 pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
+pub const RECOVERY_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
 pub const TESTER_HARNESS_REPAIR_ROLE: &str = "tester-harness-repair";
 pub const CANDIDATE_ANCESTRY_REPAIR_ROLE: &str = "candidate-ancestry-repair";
@@ -542,6 +543,118 @@ impl WorkItem {
             });
         }
         Ok(())
+    }
+
+    /// Validate the identity fields shared by all public recovery operations.
+    /// Domain-specific recovery modules still validate their own artifacts and
+    /// lifecycle shape. An exact prior operation is returned so those modules
+    /// can replay it without creating another Task or evidence record.
+    pub fn validate_recovery_operation(
+        &self,
+        project_root: &Path,
+        request: &RecoveryOperationRequest,
+    ) -> Result<Option<RecoveryOperationRecord>, WorkModelError> {
+        let attempt = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == request.attempt_id)
+            .ok_or_else(|| WorkModelError::RecoveryOperationIneligible {
+                attempt_id: request.attempt_id.clone(),
+                reason: "Attempt is not present".to_string(),
+            })?;
+        request.validate_shape(&attempt.id)?;
+        if request.work_item_id != self.id {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt.id.clone(),
+                reason: "recovery request names a different Work Item".to_string(),
+            });
+        }
+        let operation_id = request.operation_id();
+        if let Some(existing) = attempt.recovery_operation(&operation_id) {
+            if existing.matches_request(request) {
+                return Ok(Some(existing.clone()));
+            }
+            return Err(WorkModelError::RecoveryOperationConflict {
+                attempt_id: attempt.id.clone(),
+                operation_id,
+            });
+        }
+        if let Some(candidate) = request.candidate_commit.as_deref()
+            && attempt.current_candidate_commit() != Some(candidate)
+        {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt.id.clone(),
+                reason: format!(
+                    "candidate changed: expected {candidate}, found {}",
+                    attempt.current_candidate_commit().unwrap_or("none")
+                ),
+            });
+        }
+        if let Some(task_id) = request.task_id.as_deref()
+            && attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .is_none_or(|task| task.status == TaskStatus::Superseded)
+        {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt.id.clone(),
+                reason: format!("Task {task_id:?} is missing or superseded"),
+            });
+        }
+        if let Some(evidence_digest) = request.evidence_digest.as_deref()
+            && !attempt
+                .evidence_recoveries
+                .iter()
+                .any(|recovery| recovery.attachment.digest == evidence_digest)
+        {
+            // Attachment operations are the one shared boundary that creates
+            // the evidence record it names. Their specialized validation still
+            // checks the immutable document before publication; every later
+            // operation must find the digest already attached.
+            let is_new_host_attachment = request.operation_kind.starts_with("host-evidence-")
+                && request.operation_kind.ends_with("-attachment");
+            if !is_new_host_attachment {
+                return Err(WorkModelError::RecoveryOperationIneligible {
+                    attempt_id: attempt.id.clone(),
+                    reason: format!(
+                        "evidence digest {evidence_digest:?} is not attached to the Attempt"
+                    ),
+                });
+            }
+        }
+        if let Some(workspace_path) = request.workspace_path.as_deref() {
+            let expected = attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| {
+                    task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Complete
+                        && task.output.is_some()
+                })
+                .and_then(|task| task.output.as_ref())
+                .map(|output| output.workspace_path.as_str());
+            if expected != Some(workspace_path) {
+                return Err(WorkModelError::RecoveryOperationIneligible {
+                    attempt_id: attempt.id.clone(),
+                    reason: format!(
+                        "workspace changed: expected {workspace_path:?}, found {}",
+                        expected.unwrap_or("none")
+                    ),
+                });
+            }
+            resolve_managed_sibling_workspace_path(
+                project_root,
+                workspace_path,
+                "recovery operation workspace",
+            )
+            .map_err(|error| WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt.id.clone(),
+                reason: error.to_string(),
+            })?;
+        }
+        Ok(None)
     }
 
     fn preserved_input_refs(&self) -> Vec<ArtifactRef> {
@@ -4598,6 +4711,12 @@ pub struct Attempt {
     /// exceptional evidence-only route that supersedes them operationally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_recoveries: Vec<EvidenceRecovery>,
+    /// Append-only records for public recovery operations. The record binds
+    /// one authorization and its immutable inputs to the resulting Attempt
+    /// state, so a repeated request can be recognized without guessing from
+    /// task names or artifact files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_operations: Vec<RecoveryOperationRecord>,
     /// Failed Reviewer launches retained as history but explicitly superseded
     /// by an audited Approach-revision corrective Writer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4654,6 +4773,7 @@ impl Default for Attempt {
             pause_record: None,
             artifacts: Vec::new(),
             evidence_recoveries: Vec::new(),
+            recovery_operations: Vec::new(),
             approach_revision_superseded_tasks: Vec::new(),
             writer_runs: Vec::new(),
             created_at: None,
@@ -4667,6 +4787,51 @@ impl Default for Attempt {
 }
 
 impl Attempt {
+    /// Return the latest completed Writer commit that this Attempt currently
+    /// treats as its candidate.
+    pub fn current_candidate_commit(&self) -> Option<&str> {
+        self.tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::Complete
+                    && task.output.is_some()
+            })
+            .and_then(|task| task.output.as_ref().map(|output| output.commit.as_str()))
+    }
+
+    /// Return a previously recorded recovery operation by its stable identity.
+    pub fn recovery_operation(&self, operation_id: &str) -> Option<&RecoveryOperationRecord> {
+        self.recovery_operations
+            .iter()
+            .find(|record| record.operation_id == operation_id)
+    }
+
+    /// Append one recovery result, or return the identical prior result when a
+    /// caller repeats the same request. A reused operation identity with
+    /// different inputs is rejected rather than silently merged.
+    pub fn record_recovery_operation(
+        &mut self,
+        request: &RecoveryOperationRequest,
+        next_action: Option<String>,
+    ) -> Result<RecoveryOperationRecord, WorkModelError> {
+        request.validate_shape(&self.id)?;
+        let operation_id = request.operation_id();
+        if let Some(existing) = self.recovery_operation(&operation_id) {
+            if existing.matches_request(request) {
+                return Ok(existing.clone());
+            }
+            return Err(WorkModelError::RecoveryOperationConflict {
+                attempt_id: self.id.clone(),
+                operation_id,
+            });
+        }
+        let record = RecoveryOperationRecord::from_request(request, self, next_action);
+        self.recovery_operations.push(record.clone());
+        Ok(record)
+    }
+
     /// Return whether an audited Approach revision explicitly superseded this
     /// failed Reviewer launch while preserving its terminal Task outcome.
     pub fn is_approach_revision_superseded_task(&self, task_id: &str) -> bool {
@@ -5620,6 +5785,14 @@ impl Attempt {
                     reason,
                 })?;
         }
+        for record in &self.recovery_operations {
+            record.validate(work_item_id, &self.id).map_err(|reason| {
+                WorkModelError::InvalidRecoveryOperation {
+                    attempt_id: self.id.clone(),
+                    reason,
+                }
+            })?;
+        }
         for task in &self.tasks {
             if task.work_item_id != work_item_id {
                 return Err(WorkModelError::TaskWorkItemMismatch {
@@ -6153,6 +6326,237 @@ impl PauseRecord {
             && self.required_evidence_or_decision == other.required_evidence_or_decision
             && self.next_operation == other.next_operation
             && self.no_safe_operation_reason == other.no_safe_operation_reason
+    }
+}
+
+/// The immutable inputs that identify one public recovery request. Recovery
+/// modules use this shared shape before they apply their domain-specific
+/// checks, so a stale candidate or Task is rejected consistently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOperationRequest {
+    pub operation_kind: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub candidate_commit: Option<String>,
+    pub task_id: Option<String>,
+    pub evidence_digest: Option<String>,
+    pub workspace_path: Option<String>,
+    pub authorization: Option<String>,
+    pub input_digest: Option<String>,
+}
+
+impl RecoveryOperationRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        operation_kind: impl Into<String>,
+        work_item_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+        candidate_commit: Option<String>,
+        task_id: Option<String>,
+        evidence_digest: Option<String>,
+        workspace_path: Option<String>,
+        authorization: Option<String>,
+        input_digest: Option<String>,
+    ) -> Self {
+        Self {
+            operation_kind: operation_kind.into().trim().to_string(),
+            work_item_id: work_item_id.into().trim().to_string(),
+            attempt_id: attempt_id.into().trim().to_string(),
+            candidate_commit: candidate_commit.map(|value| value.trim().to_string()),
+            task_id: task_id.map(|value| value.trim().to_string()),
+            evidence_digest: evidence_digest.map(|value| value.trim().to_string()),
+            workspace_path: workspace_path.map(|value| value.trim().to_string()),
+            authorization: authorization.map(|value| value.trim().to_string()),
+            input_digest: input_digest.map(|value| value.trim().to_string()),
+        }
+    }
+
+    /// Stable identity for the exact operation inputs. Length-prefixing keeps
+    /// adjacent fields unambiguous without depending on JSON formatting.
+    pub fn operation_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        for value in [
+            self.operation_kind.as_str(),
+            self.work_item_id.as_str(),
+            self.attempt_id.as_str(),
+            self.candidate_commit.as_deref().unwrap_or("<none>"),
+            self.task_id.as_deref().unwrap_or("<none>"),
+            self.evidence_digest.as_deref().unwrap_or("<none>"),
+            self.workspace_path.as_deref().unwrap_or("<none>"),
+            self.authorization.as_deref().unwrap_or("<none>"),
+            self.input_digest.as_deref().unwrap_or("<none>"),
+        ] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        format!("recovery-{:x}", hasher.finalize())
+    }
+
+    pub fn authorization_digest(&self) -> Option<String> {
+        self.authorization
+            .as_deref()
+            .map(|value| format!("sha256:{:x}", Sha256::digest(value.as_bytes())))
+    }
+
+    fn validate_shape(&self, attempt_id: &str) -> Result<(), WorkModelError> {
+        if self.operation_kind.is_empty() || self.operation_kind.len() > 128 {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "recovery operation kind is empty or too long".to_string(),
+            });
+        }
+        if self.work_item_id.is_empty() || self.attempt_id.is_empty() {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "recovery operation must identify a Work Item and Attempt".to_string(),
+            });
+        }
+        for (label, value, limit) in [
+            ("candidate", self.candidate_commit.as_deref(), 128),
+            ("Task", self.task_id.as_deref(), 256),
+            ("evidence digest", self.evidence_digest.as_deref(), 256),
+            ("workspace", self.workspace_path.as_deref(), 4_096),
+            ("input digest", self.input_digest.as_deref(), 256),
+        ] {
+            if value.is_some_and(|value| value.is_empty() || value.len() > limit) {
+                return Err(WorkModelError::RecoveryOperationIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("recovery operation {label} is empty or too long"),
+                });
+            }
+        }
+        if self
+            .authorization
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_ROUND_CAP_RESOLUTION_BYTES)
+        {
+            return Err(WorkModelError::RecoveryOperationIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "recovery operation authorization is empty or too long".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The result recorded for a recovery operation. Replays return the original
+/// record; they do not append another result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryOperationResult {
+    Applied,
+}
+
+/// One append-only audit record for a public recovery operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RecoveryOperationRecord {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_digest: Option<String>,
+    pub result: RecoveryOperationResult,
+    pub next_status: AttemptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_pause_kind: Option<PauseKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    pub created_at: String,
+    pub completed_at: String,
+}
+
+impl RecoveryOperationRecord {
+    pub fn from_request(
+        request: &RecoveryOperationRequest,
+        attempt: &Attempt,
+        next_action: Option<String>,
+    ) -> Self {
+        let now = now_iso8601();
+        Self {
+            schema_version: RECOVERY_OPERATION_SCHEMA_VERSION,
+            operation_id: request.operation_id(),
+            operation_kind: request.operation_kind.clone(),
+            work_item_id: request.work_item_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            candidate_commit: request.candidate_commit.clone(),
+            task_id: request.task_id.clone(),
+            evidence_digest: request.evidence_digest.clone(),
+            workspace_path: request.workspace_path.clone(),
+            authorization: request.authorization.clone(),
+            authorization_digest: request.authorization_digest(),
+            input_digest: request.input_digest.clone(),
+            result: RecoveryOperationResult::Applied,
+            next_status: attempt.status.clone(),
+            next_pause_kind: attempt.pause_kind.clone(),
+            next_action,
+            created_at: now.clone(),
+            completed_at: now,
+        }
+    }
+
+    fn matches_request(&self, request: &RecoveryOperationRequest) -> bool {
+        self.schema_version == RECOVERY_OPERATION_SCHEMA_VERSION
+            && self.operation_id == request.operation_id()
+            && self.operation_kind == request.operation_kind
+            && self.work_item_id == request.work_item_id
+            && self.attempt_id == request.attempt_id
+            && self.candidate_commit == request.candidate_commit
+            && self.task_id == request.task_id
+            && self.evidence_digest == request.evidence_digest
+            && self.workspace_path == request.workspace_path
+            && self.authorization == request.authorization
+            && self.authorization_digest == request.authorization_digest()
+            && self.input_digest == request.input_digest
+    }
+
+    fn validate(&self, work_item_id: &str, attempt_id: &str) -> Result<(), String> {
+        if self.schema_version != RECOVERY_OPERATION_SCHEMA_VERSION {
+            return Err(format!(
+                "recovery operation schema version {} is not supported",
+                self.schema_version
+            ));
+        }
+        if self.operation_id.trim().is_empty()
+            || self.operation_kind.trim().is_empty()
+            || self.work_item_id != work_item_id
+            || self.attempt_id != attempt_id
+        {
+            return Err("recovery operation identity is invalid".to_string());
+        }
+        if self.authorization_digest
+            != self
+                .authorization
+                .as_deref()
+                .map(|value| format!("sha256:{:x}", Sha256::digest(value.as_bytes())))
+        {
+            return Err("recovery operation authorization digest is invalid".to_string());
+        }
+        if self
+            .next_action
+            .as_deref()
+            .is_some_and(|value| value.len() > 4_096)
+        {
+            return Err("recovery operation next action is too long".to_string());
+        }
+        if self.created_at.trim().is_empty() || self.completed_at.trim().is_empty() {
+            return Err("recovery operation timestamps must not be empty".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -7305,6 +7709,18 @@ pub enum WorkModelError {
         attempt_id: String,
         reason: String,
     },
+    InvalidRecoveryOperation {
+        attempt_id: String,
+        reason: String,
+    },
+    RecoveryOperationIneligible {
+        attempt_id: String,
+        reason: String,
+    },
+    RecoveryOperationConflict {
+        attempt_id: String,
+        operation_id: String,
+    },
     MergeCandidateReadinessTimestampMismatch {
         candidate_id: String,
         attempt_id: String,
@@ -7515,6 +7931,25 @@ impl fmt::Display for WorkModelError {
                     "Attempt {attempt_id:?} has an invalid pause record: {reason}"
                 )
             }
+            Self::InvalidRecoveryOperation { attempt_id, reason } => {
+                write!(
+                    f,
+                    "Attempt {attempt_id:?} has an invalid recovery operation: {reason}"
+                )
+            }
+            Self::RecoveryOperationIneligible { attempt_id, reason } => {
+                write!(
+                    f,
+                    "Recovery operation is not eligible for Attempt {attempt_id:?}: {reason}"
+                )
+            }
+            Self::RecoveryOperationConflict {
+                attempt_id,
+                operation_id,
+            } => write!(
+                f,
+                "Recovery operation {operation_id:?} conflicts with the existing record for Attempt {attempt_id:?}"
+            ),
             Self::RoundCapExtensionIncrementOutOfRange { requested } => write!(
                 f,
                 "round-cap extensions must add {MIN_ADDITIONAL_WRITE_ROUNDS} to {MAX_ADDITIONAL_WRITE_ROUNDS} Writer rounds, not {requested}"
@@ -8158,6 +8593,8 @@ struct AttemptRecord {
     pause_recovery: Option<PauseRecovery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause_record: Option<PauseRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recovery_operations: Vec<RecoveryOperationRecord>,
     #[serde(default)]
     artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -8255,6 +8692,7 @@ impl AttemptRecord {
             pause_kind: attempt.pause_kind.clone(),
             pause_recovery: attempt.pause_recovery,
             pause_record: attempt.pause_record.clone(),
+            recovery_operations: attempt.recovery_operations.clone(),
             artifacts: attempt.artifacts.clone(),
             evidence_recoveries: attempt.evidence_recoveries.clone(),
             approach_revision_superseded_tasks: attempt.approach_revision_superseded_tasks.clone(),
@@ -8282,6 +8720,7 @@ impl From<AttemptRecord> for Attempt {
             pause_kind: record.pause_kind,
             pause_recovery: record.pause_recovery,
             pause_record: record.pause_record,
+            recovery_operations: record.recovery_operations,
             artifacts: record.artifacts,
             evidence_recoveries: record.evidence_recoveries,
             approach_revision_superseded_tasks: record.approach_revision_superseded_tasks,
@@ -16702,6 +17141,87 @@ random banner prose that must be ignored
         reopen_attempt(attempt);
 
         assert!(attempt.pause_record.is_none());
+    }
+
+    #[test]
+    fn recovery_operation_is_audited_idempotent_and_candidate_bound() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut item = work_item_with_completed_write("work-1");
+        let request = RecoveryOperationRequest::new(
+            "candidate-repair",
+            "work-1",
+            "attempt-1",
+            Some("commit-initial".to_string()),
+            Some("attempt-1-write-1".to_string()),
+            None,
+            None,
+            Some("Approved repair after reviewing the saved gate.".to_string()),
+            Some("sha256:input".to_string()),
+        );
+
+        assert!(
+            item.validate_recovery_operation(tmp.path(), &request)
+                .unwrap()
+                .is_none()
+        );
+        let first = item.attempts[0]
+            .record_recovery_operation(
+                &request,
+                Some("fluent queue resume work-1 --attempt attempt-1".to_string()),
+            )
+            .unwrap();
+        let duplicate = item.attempts[0]
+            .record_recovery_operation(&request, None)
+            .unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(item.attempts[0].recovery_operations.len(), 1);
+
+        let replay = item
+            .validate_recovery_operation(tmp.path(), &request)
+            .unwrap()
+            .expect("an exact repeat returns its saved result");
+        assert_eq!(replay.operation_id, request.operation_id());
+        assert_eq!(replay.authorization_digest, request.authorization_digest());
+
+        let stale_candidate = RecoveryOperationRequest::new(
+            "candidate-repair",
+            "work-1",
+            "attempt-1",
+            Some("commit-no-longer-current".to_string()),
+            Some("attempt-1-write-1".to_string()),
+            None,
+            None,
+            Some("Approved repair after reviewing the saved gate.".to_string()),
+            Some("sha256:input".to_string()),
+        );
+        let error = item
+            .validate_recovery_operation(tmp.path(), &stale_candidate)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkModelError::RecoveryOperationIneligible { .. }
+        ));
+
+        let round_trip: WorkItem =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(
+            round_trip.attempts[0].recovery_operations,
+            item.attempts[0].recovery_operations
+        );
+    }
+
+    #[test]
+    fn legacy_attempt_without_recovery_operations_remains_readable() {
+        let attempt: Attempt = serde_json::from_str(
+            r#"{"id":"attempt-1","work_item_id":"work-1","status":"planned"}"#,
+        )
+        .unwrap();
+        assert!(attempt.recovery_operations.is_empty());
+        assert!(
+            !serde_json::to_string(&attempt)
+                .unwrap()
+                .contains("recovery_operations")
+        );
     }
 
     #[test]

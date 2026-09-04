@@ -177,21 +177,31 @@ pub fn revise(
         resolution_sha256: digest(resolution.as_bytes()),
         legacy_reconciliation: audited_frontier.legacy_reconciliation.clone(),
     };
-    write_once(
-        &project_root.join(&audit_artifact),
-        &serde_json::to_vec_pretty(&audit)?,
-    )?;
+    let audit_bytes = serde_json::to_vec_pretty(&audit)?;
+    write_once(&project_root.join(&audit_artifact), &audit_bytes)?;
+    let source_id = audited_frontier.source_review.id.clone();
+    let candidate_commit = audited_frontier.candidate_commit.clone();
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "planning-approach-revision",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.clone()),
+        Some(source_id.clone()),
+        None,
+        None,
+        Some(resolution.to_string()),
+        Some(digest(&audit_bytes)),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
     let expected_context = context.clone();
     let audit_ref = ArtifactRef {
         producer_id: PRODUCER.to_string(),
         path: audit_artifact.clone(),
     };
-    let source_id = audited_frontier.source_review.id.clone();
     let failed_id = audited_frontier
         .failed_launch
         .as_ref()
         .map(|task| task.id.clone());
-    let candidate_commit = audited_frontier.candidate_commit.clone();
     let metadata = DurableTransitionMetadata {
         origin: DurableTransitionOrigin::External,
         reason: Some("revise approved Approach".to_string()),
@@ -265,6 +275,11 @@ pub fn revise(
         attempt.pause_kind = None;
         attempt.pause_recovery = None;
         attempt.completed_at = None;
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(attempt),
+            Some(project_root),
+        );
+        attempt.record_recovery_operation(&operation, next_action)?;
         Ok(task_id)
     })?;
     Ok(ApproachRevision {
@@ -869,6 +884,11 @@ mod tests {
         assert_eq!(
             stored.attempts[0].tasks.last().unwrap().role,
             CORRECTIVE_WRITER_ROLE
+        );
+        assert_eq!(stored.attempts[0].recovery_operations.len(), 1);
+        assert_eq!(
+            stored.attempts[0].recovery_operations[0].operation_kind,
+            "planning-approach-revision"
         );
     }
 

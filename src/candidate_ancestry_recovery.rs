@@ -260,6 +260,20 @@ pub fn repair(
             evidence
         }
     };
+    let evidence_bytes = serde_json::to_vec(&evidence)
+        .context("serialize candidate ancestry recovery evidence identity")?;
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "candidate-ancestry-repair",
+        work_item_id,
+        attempt_id,
+        Some(eligible.source_candidate_commit.clone()),
+        Some(eligible.source_task_id.clone()),
+        None,
+        Some(eligible.workspace_path.clone()),
+        Some(resolution.clone()),
+        Some(format!("sha256:{:x}", Sha256::digest(&evidence_bytes))),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
     preserve_source_ref(
         &workspace,
         &evidence.preserved_ref,
@@ -355,6 +369,11 @@ pub fn repair(
         if !repaired.artifacts.contains(&recovery_artifact) {
             repaired.artifacts.push(recovery_artifact.clone());
         }
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(repaired),
+            Some(project_root),
+        );
+        repaired.record_recovery_operation(&operation, next_action)?;
         Ok(())
     })?;
 
@@ -1919,6 +1938,11 @@ mod tests {
         assert!(stored.attempts[0].artifacts.iter().any(|artifact| {
             artifact.producer_id == RECOVERY_PRODUCER && artifact.path.ends_with("/recovery.json")
         }));
+        assert_eq!(stored.attempts[0].recovery_operations.len(), 1);
+        assert_eq!(
+            stored.attempts[0].recovery_operations[0].operation_kind,
+            "candidate-ancestry-repair"
+        );
         let preserved = format!(
             "refs/fluent/recovery/work-1/attempt-1/candidate-ancestry-{}",
             fixture.replacement
@@ -2005,6 +2029,12 @@ mod tests {
                 .iter()
                 .filter(|task| task.role == CANDIDATE_ANCESTRY_REPAIR_ROLE)
                 .count(),
+            1
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .recovery_operations
+                .len(),
             1
         );
     }

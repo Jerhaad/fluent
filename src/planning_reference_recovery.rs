@@ -164,7 +164,7 @@ pub fn revise(
         revision_id: revision_id.clone(),
         work_item_id: work_item_id.to_string(),
         attempt_id: attempt_id.to_string(),
-        candidate_commit,
+        candidate_commit: candidate_commit.clone(),
         resolution: resolution.to_string(),
         resolution_sha256: digest(resolution.as_bytes()),
         changes: changes.clone(),
@@ -200,6 +200,19 @@ pub fn revise(
         Err(error) => return Err(error.into()),
     };
     debug_assert_eq!(audit.revision_id, revision_id);
+
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "planning-test-reference-revision",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.clone()),
+        None,
+        None,
+        None,
+        Some(resolution.to_string()),
+        Some(digest(&serde_json::to_vec(&audit)?)),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
 
     let audit_ref = ArtifactRef {
         producer_id: PRODUCER.to_string(),
@@ -263,6 +276,11 @@ pub fn revise(
             attempt.pause_kind = None;
             attempt.pause_recovery = None;
             attempt.completed_at = None;
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next_action)?;
             Ok(task_ids)
         })?;
 
@@ -710,6 +728,11 @@ mod tests {
         let attempt = &stored.attempts[0];
         assert_eq!(attempt.status, AttemptStatus::Reviewing);
         assert!(attempt.pause_kind.is_none());
+        assert_eq!(attempt.recovery_operations.len(), 1);
+        assert_eq!(
+            attempt.recovery_operations[0].operation_kind,
+            "planning-test-reference-revision"
+        );
         assert_eq!(
             attempt.tasks.len(),
             5,

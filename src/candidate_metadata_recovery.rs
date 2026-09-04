@@ -208,21 +208,38 @@ pub fn repair(
             .parent()
             .expect("candidate metadata authority path has a parent"),
     )?;
-    crate::atomic_write::atomic_write(&authority_path, &serde_json::to_vec_pretty(&authority)?)
-        .with_context(|| {
-            format!(
-                "write candidate metadata recovery authority {}",
-                authority_path.display()
-            )
-        })?;
+    let authority_bytes = serde_json::to_vec_pretty(&authority)?;
+    crate::atomic_write::atomic_write(&authority_path, &authority_bytes).with_context(|| {
+        format!(
+            "write candidate metadata recovery authority {}",
+            authority_path.display()
+        )
+    })?;
+
+    let source_writer_id = eligible.source_writer.id.clone();
+    let source_candidate_commit = eligible.source_candidate_commit.clone();
+    let operation = crate::work_model::RecoveryOperationRequest::new(
+        "candidate-metadata-recovery",
+        work_item_id,
+        attempt_id,
+        Some(source_candidate_commit.clone()),
+        Some(source_writer_id.clone()),
+        None,
+        eligible
+            .source_writer
+            .output
+            .as_ref()
+            .map(|output| output.workspace_path.clone()),
+        Some(resolution.clone()),
+        Some(content_digest(&authority_bytes)),
+    );
+    let _ = item.validate_recovery_operation(project_root, &operation)?;
 
     let authority_ref = ArtifactRef {
         producer_id: PRODUCER.to_string(),
         path: authority_rel.clone(),
     };
     let expected = item.clone();
-    let source_writer_id = eligible.source_writer.id.clone();
-    let source_candidate_commit = eligible.source_candidate_commit.clone();
     let protected_base_commit = eligible.protected_base_commit.clone();
     let gate_ref = eligible.gate_ref.clone();
     let project_check_ref = eligible.project_check_ref.clone();
@@ -311,6 +328,11 @@ pub fn repair(
             attempt.pause_kind = None;
             attempt.completed_at = None;
             attempt.review_state = Some(AttemptReviewState::Failed);
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next_action)?;
             Ok(task_id)
         },
     )?;
@@ -2489,6 +2511,11 @@ mod tests {
             producer_id: PRODUCER.to_string(),
             path: first.audit_artifact.clone(),
         }));
+        assert_eq!(attempt.recovery_operations.len(), 1);
+        assert_eq!(
+            attempt.recovery_operations[0].operation_kind,
+            "candidate-metadata-recovery"
+        );
 
         let before_second_item = fixture.store.read_work_item("work-1").unwrap();
         let artifact_root = fixture
@@ -2518,6 +2545,12 @@ mod tests {
         assert_eq!(
             fixture.store.read_work_item("work-1").unwrap(),
             before_second_item
+        );
+        assert_eq!(
+            fixture.store.read_work_item("work-1").unwrap().attempts[0]
+                .recovery_operations
+                .len(),
+            1
         );
         assert_eq!(snapshot_artifacts(&artifact_root), before_second_artifacts);
         assert_eq!(candidate_head(&fixture), before_second_head);

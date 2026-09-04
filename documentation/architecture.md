@@ -2063,6 +2063,25 @@ the old command is suppressed and a current operation is derived instead. This
 keeps a handoff from directing an operator to a transition that the current
 Attempt would reject.
 
+### Public recovery operation records
+
+Every public recovery that changes a paused Attempt also records one append-only
+recovery operation on that Attempt. The record names the operation, Work Item,
+Attempt, candidate, relevant Task or evidence, authorization text, and a digest
+of the immutable inputs. The recovery checks those identities before it mutates
+the Work Item, then performs its specialized artifact and Git checks inside the
+same model transaction. It records the resulting Attempt status and the next
+action after the change.
+
+The operation identity is stable for the complete request. Repeating the exact
+request returns the saved result and does not add another Task, evidence
+attachment, candidate, or audit record. A changed candidate, Task, evidence
+digest, workspace, or authorization gets a clear rejection before mutation.
+Existing recovery artifacts remain the detailed evidence; this shared record
+connects them to the public operation and gives status and later recovery code a
+single history to inspect. The field is optional when reading older Attempts so
+old model records remain readable.
+
 ### progress.md
 
 Each Attempt with a plan.md records a `progress.md` file at

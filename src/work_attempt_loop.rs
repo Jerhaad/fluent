@@ -109,7 +109,7 @@ pub fn extend_round_cap(
         }) {
             return Err(round_cap_ineligible("a landing owns this Attempt"));
         }
-        let attempt = &mut item.attempts[attempt_index];
+        let attempt = &item.attempts[attempt_index];
         if attempt.has_round_cap_task_blocker() {
             return Err(round_cap_ineligible(
                 "a live or failed Task owns this Attempt",
@@ -171,15 +171,54 @@ pub fn extend_round_cap(
             ));
         }
         let effective_cap = attempt.effective_write_round_cap(base_cap);
-        if let Some(extension) = attempt.round_cap_extensions.iter().find(|extension| {
-            extension.additional_write_rounds == additional_write_rounds
-                && extension.candidate_commit == head
-                && extension.failed_reviews == failed_reviews
-                && extension.new_cap == effective_cap
-                && extension.human_resolution == human_resolution
-                && extension.human_resolution_digest == human_resolution_digest
-        }) {
-            return Ok(extension.clone());
+        let workspace_path = write_output.workspace_path.clone();
+        let failed_review_identity = failed_reviews
+            .iter()
+            .map(|review| format!("{}\0{}", review.artifact.path, review.digest))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let operation = crate::work_model::RecoveryOperationRequest::new(
+            "round-cap-extension",
+            work_item_id,
+            attempt_id,
+            Some(head.clone()),
+            None,
+            None,
+            Some(workspace_path),
+            Some(human_resolution.clone()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!("{effective_cap}\0{additional_write_rounds}\0{failed_review_identity}")
+                        .as_bytes()
+                )
+            )),
+        );
+        let _ = item
+            .validate_recovery_operation(project_root, &operation)
+            .map_err(|error| round_cap_ineligible(error.to_string()))?;
+        let existing_extension = attempt
+            .round_cap_extensions
+            .iter()
+            .find(|extension| {
+                extension.additional_write_rounds == additional_write_rounds
+                    && extension.candidate_commit == head
+                    && extension.failed_reviews == failed_reviews
+                    && extension.new_cap == effective_cap
+                    && extension.human_resolution == human_resolution
+                    && extension.human_resolution_digest == human_resolution_digest
+            })
+            .cloned();
+        if let Some(extension) = existing_extension {
+            let attempt = &mut item.attempts[attempt_index];
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt
+                .record_recovery_operation(&operation, next_action)
+                .map_err(|error| round_cap_ineligible(error.to_string()))?;
+            return Ok(extension);
         }
         let write_rounds = attempt.materialized_write_rounds();
         if write_rounds != effective_cap {
@@ -187,7 +226,8 @@ pub fn extend_round_cap(
                 "the paused frontier has {write_rounds} Writer rounds, not its current cap {effective_cap}"
             )));
         }
-        attempt
+        let attempt = &mut item.attempts[attempt_index];
+        let extension = attempt
             .record_round_cap_extension(
                 base_cap,
                 RoundCapExtensionRequest {
@@ -198,7 +238,15 @@ pub fn extend_round_cap(
                     human_resolution,
                 },
             )
-            .cloned()
+            .cloned()?;
+        let next_action = crate::work_status::derive_attempt_recovery_next_action(
+            Some(attempt),
+            Some(project_root),
+        );
+        attempt
+            .record_recovery_operation(&operation, next_action)
+            .map_err(|error| round_cap_ineligible(error.to_string()))?;
+        Ok(extension)
     })?)
 }
 
