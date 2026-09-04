@@ -10,6 +10,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::content::ContentResolver;
+use crate::plan_command::extract_plan_command_candidates;
 use crate::recovery_contracts::parse_evidence_document;
 pub use crate::recovery_contracts::{EvidenceDocument, EvidenceResult};
 use crate::review::{self, Verdict};
@@ -28,51 +29,6 @@ const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
 const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
 const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
-
-const PLAN_COMMAND_LAUNCHERS: &[&str] = &[
-    "bash",
-    "bazel",
-    "bun",
-    "bundle",
-    "cargo",
-    "cmake",
-    "curl",
-    "deno",
-    "docker",
-    "dotnet",
-    "env",
-    "git",
-    "go",
-    "gradle",
-    "java",
-    "just",
-    "make",
-    "mvn",
-    "node",
-    "ninja",
-    "npm",
-    "npx",
-    "perl",
-    "pip",
-    "pip3",
-    "pnpm",
-    "podman",
-    "pytest",
-    "python",
-    "python3",
-    "rake",
-    "rsync",
-    "ruby",
-    "sh",
-    "shellcheck",
-    "ssh",
-    "swift",
-    "timeout",
-    "uv",
-    "wget",
-    "yarn",
-    "zsh",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,6 +93,12 @@ pub(crate) struct PlanHostEvidenceAction {
     pub matrix_artifact: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPlanCommand {
+    command: String,
+    source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct PlanHostEvidenceBinding {
@@ -148,6 +110,10 @@ struct PlanHostEvidenceBinding {
     plan_row: String,
     requirement: String,
     command: String,
+    /// `structured:<row>` for current matrices; old matrices record the text
+    /// fields used by the one compatibility parser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command_source: Option<String>,
     working_directory: String,
     source_matrix: BoundRecheckArtifact,
     evidence: BoundRecheckArtifact,
@@ -830,209 +796,66 @@ pub(crate) fn pending_plan_host_evidence_action(
 }
 
 /// Resolve one exact executable command from a Plan row without changing the
-/// approved planning text. Older plans often put a sentence in `Verification`
-/// and the runnable command in `Deliverable`/`State reached`; newer plans may
-/// put the command in an inline code span. We accept only one unambiguous
-/// command-shaped candidate across both fields. Multiple candidates remain an
-/// explicit human-recovery condition rather than an educated guess.
+/// approved planning text. New Attempts carry a structured command captured at
+/// planning time. Older matrices have no such field, so the compatibility path
+/// accepts one unambiguous command-shaped candidate across their text fields.
 fn resolve_plan_row_command(row: &WriterCompletionRow) -> Option<String> {
+    resolve_plan_row_command_with_source(row).map(|resolved| resolved.command)
+}
+
+fn resolve_plan_row_command_with_source(row: &WriterCompletionRow) -> Option<ResolvedPlanCommand> {
+    if let Some(command) = row.command.as_ref() {
+        if command.source_row != row.id {
+            return None;
+        }
+        validate_focused_command(&command.command).ok()?;
+        return Some(ResolvedPlanCommand {
+            command: command.command.clone(),
+            source: format!("structured:{}", command.source_row),
+        });
+    }
     let mut candidates = row
         .verification_refs
         .iter()
-        .chain(std::iter::once(&row.requirement))
-        .flat_map(|text| extract_plan_command_candidates(text))
+        .flat_map(|text| {
+            extract_plan_command_candidates(text)
+                .into_iter()
+                .map(|command| (command, "legacy:verification".to_string()))
+                .collect::<Vec<_>>()
+        })
+        .chain(
+            extract_plan_command_candidates(&row.requirement)
+                .into_iter()
+                .map(|command| (command, "legacy:requirement".to_string())),
+        )
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.dedup();
-    let [command] = candidates.as_slice() else {
-        return None;
-    };
-    Some(command.clone())
-}
-
-fn extract_plan_command_candidates(text: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    // Inline code is the least ambiguous representation and is common in
-    // Verification prose. Ignore spans that contain ordinary path labels.
-    let mut code_start = None;
-    for (index, character) in text.char_indices() {
-        if character != '`' {
-            continue;
-        }
-        if let Some(start) = code_start.take() {
-            if let Some(command) = normalize_plan_command_candidate(&text[start..index]) {
-                candidates.push(command);
-            }
-        } else {
-            code_start = Some(index + character.len_utf8());
-        }
-    }
-
-    // Deliverables and narrative verification commonly use "Run <command>",
-    // while some plans say "execute <command>" or "command: <command>".
-    for marker in ["run ", "execute ", "command:"] {
-        let lower = text.to_ascii_lowercase();
-        let marker_lower = marker.to_ascii_lowercase();
-        let mut offset = 0;
-        while let Some(relative) = lower[offset..].find(&marker_lower) {
-            let marker_start = offset + relative;
-            let before = text[..marker_start].chars().next_back();
-            if before.is_none_or(|character| !character.is_ascii_alphanumeric()) {
-                let tail_start = marker_start + marker.len();
-                if let Some(command) = command_from_plan_tail(&text[tail_start..]) {
-                    candidates.push(command);
-                }
-            }
-            offset = marker_start + marker.len();
-        }
-    }
-
-    // Finally handle a command embedded in prose without an explicit marker,
-    // such as "the exact DGX_BRING_UP_LIVE=1 ./tests/... check". Environment
-    // assignments and known launchers are strong enough starts to avoid
-    // treating arbitrary nouns or paths as commands.
-    let tokens = text.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        let token = trim_plan_token(token);
-        if !is_plan_command_start(token) {
-            continue;
-        }
-        // The executable operand of an environment-prefixed command is not a
-        // second command. The complete `NAME=value <command>` candidate was
-        // already collected from the assignment token.
-        if index > 0 && is_plan_command_start(trim_plan_token(tokens[index - 1])) {
-            continue;
-        }
-        if let Some(command) = command_from_plan_tokens(&tokens[index..]) {
-            candidates.push(command);
-        }
-    }
-
-    candidates
-}
-
-fn command_from_plan_tail(tail: &str) -> Option<String> {
-    let tokens = tail.split_whitespace().collect::<Vec<_>>();
-    command_from_plan_tokens(&tokens)
-}
-
-fn command_from_plan_tokens(tokens: &[&str]) -> Option<String> {
-    let mut selected: Vec<String> = Vec::new();
-    for raw in tokens {
-        let token = trim_plan_token(raw);
-        if token.is_empty() {
-            break;
-        }
-        if !selected.is_empty()
-            && selected
-                .iter()
-                .any(|selected| is_plan_script_operand(selected))
-            && !token.starts_with('-')
-        {
-            break;
-        }
-        let lower = token.to_ascii_lowercase();
-        if !selected.is_empty()
-            && matches!(
-                lower.as_str(),
-                "unchanged" | "on" | "at" | "against" | "then" | "and" | "while" | "with"
-            )
-        {
-            break;
-        }
-        if selected.is_empty() && !is_plan_command_start(token) {
-            return None;
-        }
-        selected.push(token.to_string());
-        if raw.chars().next_back().is_some_and(|character| {
-            matches!(
-                character,
-                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
-            )
-        }) {
-            break;
-        }
-    }
-    let candidate = selected.join(" ");
-    normalize_plan_command_candidate(&candidate)
-}
-
-fn normalize_plan_command_candidate(raw: &str) -> Option<String> {
-    let mut candidate = raw.trim();
-    while candidate.chars().next_back().is_some_and(|character| {
-        matches!(
-            character,
-            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}'
-        )
-    }) {
-        candidate = candidate[..candidate.len() - 1].trim_end();
-    }
-    if !is_plan_command(candidate) {
+    let command = candidates.first().map(|(command, _)| command.clone())?;
+    if candidates.iter().any(|candidate| candidate.0 != command) {
         return None;
     }
-    validate_focused_command(candidate).ok()?;
-    Some(candidate.to_string())
+    let mut sources = candidates
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    Some(ResolvedPlanCommand {
+        command,
+        source: sources.join("+"),
+    })
 }
 
-fn trim_plan_token(token: &str) -> &str {
-    token.trim_matches(|character: char| matches!(character, '`' | '(' | '[' | '{' | '"' | '\''))
-}
-
-fn is_plan_script_operand(token: &str) -> bool {
-    let token = trim_plan_token(token).trim_end_matches(['.', ',', ';', ':', '!', '?']);
-    (token.starts_with("./") || token.contains('/'))
-        && [".sh", ".bash", ".py", ".rb", ".js", ".ts"]
-            .iter()
-            .any(|suffix| token.ends_with(suffix))
-}
-
-fn is_plan_command_start(token: &str) -> bool {
-    let token = trim_plan_token(token);
-    is_plan_environment_assignment(token)
-        || token.starts_with("./")
-        || token.starts_with('/')
-        || is_plan_script_operand(token)
-        || PLAN_COMMAND_LAUNCHERS.iter().any(|launcher| {
-            token == *launcher
-                || token
-                    .strip_prefix(launcher)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
-}
-
-fn is_plan_command(token: &str) -> bool {
-    let mut words = token.split_whitespace();
-    let Some(first) = words.next() else {
+fn plan_command_binding_matches(
+    row: &WriterCompletionRow,
+    command: &str,
+    source: Option<&str>,
+) -> bool {
+    let Some(resolved) = resolve_plan_row_command_with_source(row) else {
         return false;
     };
-    if is_plan_environment_assignment(first) {
-        let Some(second) = words.next() else {
-            return false;
-        };
-        return is_plan_command_start(second) || second.starts_with('-');
-    }
-    if PLAN_COMMAND_LAUNCHERS.iter().any(|launcher| {
-        first == *launcher
-            || first
-                .strip_prefix(launcher)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    }) {
-        return words.next().is_some();
-    }
-    is_plan_command_start(first)
-}
-
-fn is_plan_environment_assignment(token: &str) -> bool {
-    let Some((name, value)) = token.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && !value.is_empty()
-        && name.chars().enumerate().all(|(index, character)| {
-            (index == 0 && (character == '_' || character.is_ascii_alphabetic()))
-                || (index > 0 && (character == '_' || character.is_ascii_alphanumeric()))
-        })
+    resolved.command == command && source.is_none_or(|source| source == resolved.source)
 }
 
 /// Return a host-materialized completion matrix only after the evidence review
@@ -1082,7 +905,11 @@ pub(crate) fn completed_plan_host_matrix_ref(
             || source_row.kind != WriterCompletionRequirementKind::Plan
             || source_row.state != WriterCompletionState::Pending
             || source_row.requirement != binding.requirement
-            || resolve_plan_row_command(source_row).as_deref() != Some(binding.command.as_str())
+            || !plan_command_binding_matches(
+                source_row,
+                &binding.command,
+                binding.command_source.as_deref(),
+            )
         {
             return None;
         }
@@ -1195,7 +1022,11 @@ pub(crate) fn apply_completed_plan_host_evidence(
         if source_row.kind != WriterCompletionRequirementKind::Plan
             || source_row.state != WriterCompletionState::Pending
             || source_row.requirement != binding.requirement
-            || resolve_plan_row_command(source_row).as_deref() != Some(binding.command.as_str())
+            || !plan_command_binding_matches(
+                source_row,
+                &binding.command,
+                binding.command_source.as_deref(),
+            )
         {
             continue;
         }
@@ -2121,11 +1952,12 @@ pub fn attach_plan_row(
                     "Plan row {plan_row:?} is already complete"
                 )));
             }
-            let command = resolve_plan_row_command(row).ok_or_else(|| {
+            let resolved_command = resolve_plan_row_command_with_source(row).ok_or_else(|| {
                 ineligible(&format!(
                     "Plan row {plan_row:?} must contain exactly one unambiguous host verification command"
                 ))
             })?;
+            let command = resolved_command.command.clone();
             if document.check != command {
                 return Err(ineligible(&format!(
                     "evidence check {:?} does not match Plan row command {:?}",
@@ -2142,6 +1974,7 @@ pub fn attach_plan_row(
                 plan_row: plan_row.clone(),
                 requirement: row.requirement.clone(),
                 command: command.clone(),
+                command_source: Some(resolved_command.source),
                 working_directory: document.working_directory.clone(),
                 source_matrix: BoundRecheckArtifact {
                     path: matrix_ref.path.clone(),
@@ -4164,6 +3997,20 @@ mod tests {
         assert_eq!(recovery.candidate_commit, candidate);
         assert_eq!(recovery.targets.len(), 1);
 
+        let binding: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                project
+                    .path()
+                    .join(&recovery.targets[0].prior_review_artifact),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding["command-source"], "structured:plan:step-6",
+            "the evidence record identifies the structured command source"
+        );
+
         let review_id = recovery.targets[0].review_task_id.clone().unwrap();
         store
             .mutate_work_item("work-1", |item| {
@@ -4211,6 +4058,70 @@ mod tests {
                 .unwrap()
                 .state,
             WriterCompletionState::Complete
+        );
+    }
+
+    #[test]
+    fn structured_plan_command_wins_over_explanatory_text() {
+        let row = WriterCompletionRow {
+            id: "plan:step-6".to_string(),
+            kind: WriterCompletionRequirementKind::Plan,
+            source: "plan.md#step-6".to_string(),
+            requirement: "Run python3 tests/old-check.py unchanged on spark1.".to_string(),
+            verification_refs: vec![
+                "The check preserves isolation and reports content-free evidence.".to_string(),
+            ],
+            command: Some(work_model::PlanCommand {
+                command: "python3 tests/fluent_merge_readiness.py".to_string(),
+                working_directory: ".".to_string(),
+                environment: std::collections::BTreeMap::new(),
+                source_row: "plan:step-6".to_string(),
+            }),
+            state: WriterCompletionState::Pending,
+            implementation_evidence: Vec::new(),
+            verification: Vec::new(),
+            applicable_constraints: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_plan_row_command(&row).as_deref(),
+            Some("python3 tests/fluent_merge_readiness.py"),
+            "host evidence must use the command captured at planning time"
+        );
+        assert_eq!(
+            resolve_plan_row_command_with_source(&row),
+            Some(ResolvedPlanCommand {
+                command: "python3 tests/fluent_merge_readiness.py".to_string(),
+                source: "structured:plan:step-6".to_string(),
+            })
+        );
+
+        let mut mismatched = row;
+        mismatched.command.as_mut().unwrap().source_row = "plan:step-5".to_string();
+        assert!(resolve_plan_row_command_with_source(&mismatched).is_none());
+    }
+
+    #[test]
+    fn legacy_plan_command_resolution_records_which_text_field_supplied_it() {
+        let row = WriterCompletionRow {
+            id: "plan:step-6".to_string(),
+            kind: WriterCompletionRequirementKind::Plan,
+            source: "plan.md#step-6".to_string(),
+            requirement: "Run python3 tests/readiness.py unchanged on spark1.".to_string(),
+            verification_refs: vec!["The smoke reports content-free evidence.".to_string()],
+            command: None,
+            state: WriterCompletionState::Pending,
+            implementation_evidence: Vec::new(),
+            verification: Vec::new(),
+            applicable_constraints: Vec::new(),
+        };
+
+        assert_eq!(
+            resolve_plan_row_command_with_source(&row),
+            Some(ResolvedPlanCommand {
+                command: "python3 tests/readiness.py".to_string(),
+                source: "legacy:requirement".to_string(),
+            })
         );
     }
 

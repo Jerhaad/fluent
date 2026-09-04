@@ -5233,6 +5233,59 @@ fn attempt_create_accepts_execution_ready_work() {
 }
 
 #[test]
+fn attempt_create_persists_plan_command_separately_from_explanation() {
+    let tmp = TempDir::new().unwrap();
+    let plan_path = tmp.path().join("plan.md");
+    fs::write(
+        &plan_path,
+        "# Plan\n\n| # | State reached | Behaviors | Verification | Req? |\n\
+         |---|---------------|-----------|--------------|------|\n\
+         | 1 | Run DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh unchanged on spark1. | | The smoke preserves isolation and reports content-free evidence. | Yes |\n",
+    )
+    .unwrap();
+
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args([
+            "work-item",
+            "create",
+            "command-records",
+            "--title",
+            "Command records",
+            "--plan-file",
+            plan_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(tmp.path())
+        .args(["attempt", "create", "command-records", "attempt-1"])
+        .assert()
+        .success();
+
+    let shown = work_item_value(tmp.path(), "command-records");
+    let requirement = &shown["attempts"][0]["writer_completion_contract"]["requirements"][0];
+    assert_eq!(
+        requirement["requirement"],
+        "Run DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh unchanged on spark1."
+    );
+    assert_eq!(
+        requirement["verification_refs"],
+        serde_json::json!(["The smoke preserves isolation and reports content-free evidence."])
+    );
+    assert_eq!(
+        requirement["command"]["command"],
+        "DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh"
+    );
+    assert_eq!(requirement["command"]["source-row"], "plan:step-1");
+    assert_eq!(requirement["command"]["working-directory"], ".");
+    assert_eq!(
+        requirement["command"]["environment"],
+        serde_json::json!({"DGX_BRING_UP_LIVE": "1"})
+    );
+}
+
+#[test]
 fn work_attempt_adds_planned_attempt_with_initial_write_task() {
     // Nest the project under its own parent so the managed workspace sibling
     // (`../work-6-work-1-attempt-1`) resolves inside this test's TempDir. A bare
@@ -22405,6 +22458,7 @@ fn queue_resume_requires_exact_legacy_learner_evidence() {
             source: "behaviors.md#b1".to_string(),
             requirement: "Preserve behavior".to_string(),
             verification_refs: vec!["tests/behavior.rs::required_behavior".to_string()],
+            command: None,
         }],
     });
     item.add_final_tester_task("attempt-1").unwrap();
@@ -27264,6 +27318,7 @@ exit 0
                 source: "behaviors.md#b1".to_string(),
                 requirement: "The readiness check remains runnable.".to_string(),
                 verification_refs: vec!["python3 tests/readiness.py".to_string()],
+                command: None,
                 state: fluent::work_model::WriterCompletionState::Complete,
                 implementation_evidence: vec!["tests/readiness.py".to_string()],
                 verification: vec![fluent::work_model::WriterVerificationClaim {
@@ -27289,6 +27344,7 @@ exit 0
                         source: "behaviors.md#b1".to_string(),
                         requirement: "The readiness check remains runnable.".to_string(),
                         verification_refs: vec!["python3 tests/readiness.py".to_string()],
+                        command: None,
                     }],
                 });
             item.add_next_review_tasks(

@@ -223,6 +223,13 @@ unchecked `## Required completion` projection from the Plan. Wrapped
 execution-guidance bullets retain every continuation line until the next bullet
 or section. Physical line breaks therefore cannot remove an approved constraint
 from the matrix.
+For each required Plan row, the matrix also carries a bounded structured command
+record when one can be identified: the exact invocation, candidate-relative
+working directory, leading environment assignments, and the `plan:<step>` source
+identity. The row's state and verification prose stay separate. Host evidence
+and later Plan checks use this record instead of searching the prose again.
+Matrices from older Attempts omit the record and go through one explicit
+compatibility parser; an ambiguous legacy row remains paused for correction.
 Planning claims from the prior Writer carry forward; open findings from the
 current review artifacts
 become pending rows identified by stable role-scoped finding identities. The

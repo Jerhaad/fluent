@@ -1992,6 +1992,7 @@ mod tests {
                 source: "behaviors.md#area:b1".to_string(),
                 requirement: "THE SYSTEM SHALL work.".to_string(),
                 verification_refs: vec![reference.to_string()],
+                command: None,
             }],
         }
     }

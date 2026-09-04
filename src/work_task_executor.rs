@@ -17634,6 +17634,7 @@ mod tests {
                     source: "plan.md#step-2".to_string(),
                     requirement: "Keep the controls session-owned.".to_string(),
                     verification_refs: Vec::new(),
+                    command: None,
                 }],
             });
         let matrix_prompt = build_writer_continuation_prompt(
@@ -17774,6 +17775,7 @@ mod tests {
                     source: "plan.md#step-2".to_string(),
                     requirement: "Keep the controls session-owned.".to_string(),
                     verification_refs: Vec::new(),
+                    command: None,
                 }],
             });
         let progress = progress_md_path_for(project.path(), "work-1", "attempt-1");
@@ -19171,6 +19173,7 @@ mod tests {
             source: tester_rel.to_string(),
             requirement: "Address tester review finding: failed command".to_string(),
             verification_refs: Vec::new(),
+            command: None,
             state: crate::work_model::WriterCompletionState::Complete,
             implementation_evidence: vec!["product.txt".to_string()],
             verification: Vec::new(),

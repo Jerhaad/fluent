@@ -75,6 +75,14 @@ and record the same four things without intermediate questions:
 - The verification — a test path, a curl command, a screen to check. Without this the writer doesn't know when to stop.
 - Required or optional. Optional steps are the ones you'd trade away if execution runs into trouble.
 
+For an executable verification, include one exact command in the row (inline
+code is clearest) and keep the surrounding explanation about what the check
+proves. When Fluent creates an Attempt, it stores that command separately with
+its Plan-row identity, working directory, and leading environment assignments;
+the explanation remains the row's normal state and verification text. Older
+Attempts without this stored field use one compatibility parser and pause when
+the old text names zero or multiple commands.
+
 Without planning-wide delegation, after discussing each step or group of steps,
 ask:
 

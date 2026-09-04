@@ -2813,6 +2813,43 @@ pub enum WriterCompletionRequirementKind {
 /// matrix. `verification_refs` preserves the approved `Test:` marker or Plan
 /// verification cell; it does not create a new test-selector vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PlanCommand {
+    /// The exact shell invocation approved for this Plan row.
+    pub command: String,
+    /// The directory in which the command must run. `.` means the candidate
+    /// worktree root.
+    #[serde(default = "default_plan_working_directory")]
+    pub working_directory: String,
+    /// Environment values recorded separately from the command text. The exact
+    /// command remains authoritative for compatibility with existing evidence.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    /// Stable completion-matrix identity that supplied this command.
+    pub source_row: String,
+}
+
+fn default_plan_working_directory() -> String {
+    ".".to_string()
+}
+
+impl PlanCommand {
+    fn from_legacy_texts<'a>(
+        source_row: &str,
+        texts: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
+        let command = crate::plan_command::resolve_legacy_plan_command(texts)?;
+        let environment = crate::plan_command::extract_command_environment(&command);
+        Some(Self {
+            command,
+            working_directory: default_plan_working_directory(),
+            environment,
+            source_row: source_row.to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterCompletionRequirement {
     pub id: String,
     pub kind: WriterCompletionRequirementKind,
@@ -2820,6 +2857,10 @@ pub struct WriterCompletionRequirement {
     pub requirement: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_refs: Vec<String>,
+    /// Structured command captured from a Plan row when the Attempt is created.
+    /// Older Attempts omit this field and use the host compatibility adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<PlanCommand>,
 }
 
 /// Immutable planning requirements stamped on a new code-producing Attempt.
@@ -2957,6 +2998,7 @@ fn parse_behavior_completion_requirements(source: &str) -> Vec<WriterCompletionR
             source: source_ref,
             requirement: statement.join(" "),
             verification_refs,
+            command: None,
         });
     }
     requirements
@@ -2996,6 +3038,7 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
                         source: "approach.md#structure".to_string(),
                         requirement: structure.join(" "),
                         verification_refs: Vec::new(),
+                        command: None,
                     });
                 }
                 section = Section::Other;
@@ -3043,6 +3086,7 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
                         source: format!("approach.md#{}", completion_slug(heading)),
                         requirement: choice_lines.join(" "),
                         verification_refs: Vec::new(),
+                        command: None,
                     });
                 }
             }
@@ -3067,6 +3111,7 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
                     source: format!("approach.md#execution-guidance-{guidance_index}"),
                     requirement: guidance_lines.join(" "),
                     verification_refs: Vec::new(),
+                    command: None,
                 });
                 index = cursor;
                 continue;
@@ -3103,12 +3148,18 @@ fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequi
             .filter(|verification| !verification.is_empty())
             .map(|verification| vec![(*verification).to_string()])
             .unwrap_or_default();
+        let mut command_texts = vec![cells[1]];
+        if let Some(verification) = cells.get(3).filter(|verification| !verification.is_empty()) {
+            command_texts.push(*verification);
+        }
+        let row_id = format!("plan:step-{}", cells[0]);
         requirements.push(WriterCompletionRequirement {
-            id: format!("plan:step-{}", cells[0]),
+            id: row_id.clone(),
             kind: WriterCompletionRequirementKind::Plan,
             source: format!("plan.md#step-{}", cells[0]),
             requirement: cells[1].to_string(),
             verification_refs,
+            command: PlanCommand::from_legacy_texts(&row_id, command_texts),
         });
     }
     requirements
@@ -3174,6 +3225,9 @@ pub struct WriterCompletionRow {
     pub requirement: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verification_refs: Vec<String>,
+    /// Host-owned structured command copied from the approved Plan row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<PlanCommand>,
     #[serde(default)]
     pub state: WriterCompletionState,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -3192,6 +3246,7 @@ impl From<&WriterCompletionRequirement> for WriterCompletionRow {
             source: requirement.source.clone(),
             requirement: requirement.requirement.clone(),
             verification_refs: requirement.verification_refs.clone(),
+            command: requirement.command.clone(),
             state: WriterCompletionState::Pending,
             implementation_evidence: Vec::new(),
             verification: Vec::new(),
@@ -3271,6 +3326,7 @@ impl WriterCompletionMatrix {
                     && previous.source == row.source
                     && previous.requirement == row.requirement
                     && previous.verification_refs == row.verification_refs
+                    && previous.command == row.command
                     && previous.state == WriterCompletionState::Complete
             }) else {
                 continue;
@@ -3324,6 +3380,7 @@ impl WriterCompletionMatrix {
                 || row.source != expected_row.source
                 || row.requirement != expected_row.requirement
                 || row.verification_refs != expected_row.verification_refs
+                || row.command != expected_row.command
             {
                 return Err(format!(
                     "Writer completion matrix immutable row {:?} was omitted, reordered, or rewritten",
@@ -3382,10 +3439,12 @@ impl WriterCompletionMatrix {
             if row.source != expected_row.source
                 || row.requirement != expected_row.requirement
                 || row.verification_refs != expected_row.verification_refs
+                || row.command != expected_row.command
             {
                 row.source = expected_row.source.clone();
                 row.requirement = expected_row.requirement.clone();
                 row.verification_refs = expected_row.verification_refs.clone();
+                row.command = expected_row.command.clone();
                 repairs.push(WriterCompletionRepair {
                     row_id: row.id.clone(),
                     kind: WriterCompletionRepairKind::RestoredHostOwnedFields,
@@ -3478,6 +3537,7 @@ impl WriterCompletionMatrix {
                         && previous.source == row.source
                         && previous.requirement == row.requirement
                         && previous.verification_refs == row.verification_refs
+                        && previous.command == row.command
                         && previous.state == WriterCompletionState::Complete
                 }) else {
                     continue;
@@ -3496,6 +3556,7 @@ impl WriterCompletionMatrix {
                 finding.role, finding.requirement
             ),
             verification_refs: Vec::new(),
+            command: None,
             state: WriterCompletionState::Pending,
             implementation_evidence: Vec::new(),
             verification: Vec::new(),
@@ -9941,6 +10002,7 @@ mod tests {
                 source: "plan.md#step-1".to_string(),
                 requirement: "Preserve the approved punctuation.".to_string(),
                 verification_refs: vec!["cargo test projection".to_string()],
+                command: None,
                 state: WriterCompletionState::Complete,
                 implementation_evidence: vec!["src/work_model.rs".to_string()],
                 verification: vec![WriterVerificationClaim {
@@ -10014,6 +10076,7 @@ mod tests {
                 source: "plan.md#step-1".to_string(),
                 requirement: "Different requirement.".to_string(),
                 verification_refs: Vec::new(),
+                command: None,
                 state: WriterCompletionState::Complete,
                 implementation_evidence: vec!["src/lib.rs".to_string()],
                 verification: vec![WriterVerificationClaim {
@@ -10120,6 +10183,27 @@ mod tests {
             contract.requirements[5].verification_refs,
             vec!["`cargo test down_moves_selection`"]
         );
+        assert_eq!(
+            contract.requirements[5]
+                .command
+                .as_ref()
+                .map(|command| command.command.as_str()),
+            Some("cargo test down_moves_selection")
+        );
+        assert_eq!(
+            contract.requirements[5]
+                .command
+                .as_ref()
+                .map(|command| command.source_row.as_str()),
+            Some("plan:step-1")
+        );
+        assert_eq!(
+            contract.requirements[5]
+                .command
+                .as_ref()
+                .map(|command| command.working_directory.as_str()),
+            Some(".")
+        );
 
         let mut item = WorkItem::planned("matrix-work", "Matrix work");
         item.planning_context = Some(context);
@@ -10128,6 +10212,45 @@ mod tests {
             item.attempts[0].writer_completion_contract.as_ref(),
             Some(&contract),
             "the approved manifest is stamped before the Attempt is persisted"
+        );
+    }
+
+    #[test]
+    fn writer_completion_contract_separates_plan_command_from_explanation() {
+        let context = PlanningContext {
+            plan: Some(
+                "| # | State reached | Behaviors | Verification | Req? |\n\
+                 |---|---------------|-----------|--------------|------|\n\
+                 | 6 | Run DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh unchanged on spark1. | | The live smoke preserves isolation and reports content-free evidence. | Yes |\n"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let contract = WriterCompletionContract::from_planning_context(&context).unwrap();
+        let requirement = contract
+            .requirements
+            .iter()
+            .find(|requirement| requirement.id == "plan:step-6")
+            .unwrap();
+        assert_eq!(
+            requirement.requirement,
+            "Run DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh unchanged on spark1."
+        );
+        assert_eq!(
+            requirement.verification_refs,
+            vec!["The live smoke preserves isolation and reports content-free evidence."]
+        );
+        let command = requirement.command.as_ref().unwrap();
+        assert_eq!(
+            command.command,
+            "DGX_BRING_UP_LIVE=1 ./tests/dgx-bring-up-smoke.sh"
+        );
+        assert_eq!(command.source_row, "plan:step-6");
+        assert_eq!(command.working_directory, ".");
+        assert_eq!(
+            command.environment,
+            BTreeMap::from([("DGX_BRING_UP_LIVE".to_string(), "1".to_string())])
         );
     }
 
@@ -10142,6 +10265,7 @@ mod tests {
                     source: "behaviors.md#dashboard:b1".to_string(),
                     requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
                     verification_refs: vec!["tests/dashboard.rs (preserves_selection)".to_string()],
+                    command: None,
                 },
                 WriterCompletionRequirement {
                     id: "plan:step-2".to_string(),
@@ -10149,6 +10273,7 @@ mod tests {
                     source: "plan.md#step-2".to_string(),
                     requirement: "Keep Retry and Dismiss session-owned.".to_string(),
                     verification_refs: vec!["cargo test hud_actions".to_string()],
+                    command: None,
                 },
             ],
         };
@@ -10246,6 +10371,7 @@ mod tests {
                 source: "behaviors.md#dashboard:b1".to_string(),
                 requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
                 verification_refs: vec!["tests/dashboard.rs (preserves_selection)".to_string()],
+                command: None,
             }],
         };
         let findings = vec![WriterCompletionFinding {
@@ -10325,6 +10451,7 @@ mod tests {
                 source: "behaviors.md#dashboard:b1".to_string(),
                 requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
                 verification_refs: Vec::new(),
+                command: None,
             }],
         };
         let mut prior =
@@ -10355,6 +10482,7 @@ mod tests {
                 source: "behaviors.md#dashboard:b1".to_string(),
                 requirement: "WHEN refreshed, THE SYSTEM SHALL preserve selection.".to_string(),
                 verification_refs: Vec::new(),
+                command: None,
             }],
         };
         let mut matrix =
@@ -10396,6 +10524,7 @@ mod tests {
                 source: "behaviors.md#dashboard:b1".to_string(),
                 requirement: "Preserve selection".to_string(),
                 verification_refs: Vec::new(),
+                command: None,
             }],
         };
         let matrix = WriterCompletionMatrix::skeleton(&contract, "write-1", &[], None).unwrap();
@@ -10484,6 +10613,7 @@ mod tests {
                 source: "plan.md#step-1".to_string(),
                 requirement: "Dashboard is navigable".to_string(),
                 verification_refs: vec!["dashboard journey".to_string()],
+                command: None,
             }],
         };
         let finding = WriterCompletionFinding {
@@ -10530,6 +10660,7 @@ mod tests {
                 source: "behaviors.md#large:b1".to_string(),
                 requirement: "x".repeat(WRITER_COMPLETION_MATRIX_MAX_BYTES),
                 verification_refs: Vec::new(),
+                command: None,
             }],
         };
         let error = WriterCompletionMatrix::skeleton(&oversized_contract, "write-1", &[], None)
@@ -10544,6 +10675,7 @@ mod tests {
                 source: "behaviors.md#bounded:b1".to_string(),
                 requirement: "Keep evidence bounded".to_string(),
                 verification_refs: Vec::new(),
+                command: None,
             }],
         };
         let mut matrix = WriterCompletionMatrix::skeleton(&contract, "write-1", &[], None).unwrap();
