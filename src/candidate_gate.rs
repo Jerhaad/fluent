@@ -94,6 +94,20 @@ pub enum CandidateMetadataRewriteAuthorization {
     #[default]
     RejectedMetadataGate,
     WriterCompletionRepair,
+    ReviewFinding,
+}
+
+/// Host-validated authority for a tree-identical metadata rewrite authorized by
+/// a completed review finding rather than a rejected candidate gate.
+///
+/// The Writer still supplies the replacement commit. The candidate gate uses
+/// this context to verify that the replacement rewrites only commit metadata
+/// after the protected base and keeps the source candidate's exact tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedMetadataRewriteContext {
+    pub source_candidate_commit: String,
+    pub protected_base_commit: String,
+    pub candidate_tree: String,
 }
 
 pub struct CandidateGateRequest<'a> {
@@ -107,6 +121,7 @@ pub struct CandidateGateRequest<'a> {
     pub candidate_commit: &'a str,
     pub completion_contract: Option<&'a WriterCompletionContract>,
     pub allow_tree_identical_metadata_rewrite: bool,
+    pub metadata_rewrite_authorization: Option<&'a AuthorizedMetadataRewriteContext>,
     pub tester_results_path: Option<&'a Path>,
     /// Exact candidate-bound commands whose failed canonical Tester result was
     /// superseded by accepted host evidence and a passing targeted Tests review.
@@ -224,7 +239,37 @@ fn check_candidate_identity(
         match prior_candidate_gate_path {
             Some(path) => match read_prior_writer_gate(path) {
                 Ok(prior) => {
-                    if let Err(reason) = validate_prior_writer_gate(&prior, request.base_commit) {
+                    if let Some(authorization) = request.metadata_rewrite_authorization {
+                        // A review-derived rewrite starts from a passing gate.
+                        // The older rejected-gate validator is intentionally
+                        // strict for ordinary corrections, so use a separate
+                        // passing-gate check for this explicitly audited path.
+                        if let Err(reason) = validate_passing_writer_gate_for_metadata_rewrite(
+                            &prior,
+                            request.base_commit,
+                        ) {
+                            diagnostics.push(reason);
+                        } else if !is_ancestor(
+                            request.workspace,
+                            &prior.base_commit,
+                            &prior.candidate_commit,
+                        )? {
+                            diagnostics.push(format!(
+                                "prior candidate {} does not descend from original base {}",
+                                prior.candidate_commit, prior.base_commit
+                            ));
+                        } else {
+                            match validate_authorized_metadata_rewrite(request, authorization)? {
+                                Ok((base, evidence)) => {
+                                    effective_base_commit = base;
+                                    metadata_rewrite = Some(evidence);
+                                }
+                                Err(reason) => diagnostics.push(reason),
+                            }
+                        }
+                    } else if let Err(reason) =
+                        validate_prior_writer_gate(&prior, request.base_commit)
+                    {
                         diagnostics.push(reason);
                     } else if !is_ancestor(
                         request.workspace,
@@ -259,6 +304,14 @@ fn check_candidate_identity(
                     request.candidate_commit,
                 )? {
                     // The normal append-only Writer path needs no recovery.
+                } else if let Some(authorization) = request.metadata_rewrite_authorization {
+                    match validate_authorized_metadata_rewrite(request, authorization)? {
+                        Ok((base, evidence)) => {
+                            effective_base_commit = base;
+                            metadata_rewrite = Some(evidence);
+                        }
+                        Err(reason) => diagnostics.push(reason),
+                    }
                 } else if request.allow_tree_identical_metadata_rewrite {
                     match validate_completion_repair_metadata_rewrite(request)? {
                         Ok((base, evidence)) => {
@@ -300,6 +353,85 @@ fn check_candidate_identity(
         effective_base_commit,
         metadata_rewrite,
     })
+}
+
+fn validate_authorized_metadata_rewrite(
+    request: &CandidateGateRequest<'_>,
+    authorization: &AuthorizedMetadataRewriteContext,
+) -> Result<std::result::Result<(String, CandidateMetadataRewriteEvidence), String>> {
+    if request.base_commit != authorization.source_candidate_commit {
+        return Ok(Err(format!(
+            "metadata recovery expected source candidate {}, Writer reported base {}",
+            authorization.source_candidate_commit, request.base_commit
+        )));
+    }
+    if !is_ancestor(
+        request.workspace,
+        &authorization.protected_base_commit,
+        request.base_commit,
+    )? {
+        return Ok(Err(format!(
+            "protected base {} is not an ancestor of source candidate {}",
+            authorization.protected_base_commit, request.base_commit
+        )));
+    }
+    if !is_ancestor(
+        request.workspace,
+        &authorization.protected_base_commit,
+        request.candidate_commit,
+    )? {
+        return Ok(Err(format!(
+            "protected base {} is not an ancestor of replacement candidate {}",
+            authorization.protected_base_commit, request.candidate_commit
+        )));
+    }
+    let source_tree = crate::git::run_stdout(
+        request.workspace,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", authorization.source_candidate_commit),
+        ],
+        "resolve metadata recovery source tree",
+    )?;
+    let replacement_tree = crate::git::run_stdout(
+        request.workspace,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", request.candidate_commit),
+        ],
+        "resolve metadata recovery replacement tree",
+    )?;
+    if source_tree != authorization.candidate_tree {
+        return Ok(Err(format!(
+            "metadata recovery source tree {} does not match its authorized tree {}",
+            source_tree, authorization.candidate_tree
+        )));
+    }
+    if replacement_tree != authorization.candidate_tree {
+        return Ok(Err(format!(
+            "metadata recovery replacement tree {} does not match authorized tree {}",
+            replacement_tree, authorization.candidate_tree
+        )));
+    }
+    if let Some(reason) = equivalent_message_only_suffix_mismatch(
+        request.workspace,
+        &authorization.protected_base_commit,
+        &authorization.source_candidate_commit,
+        request.candidate_commit,
+    )? {
+        return Ok(Err(reason));
+    }
+    Ok(Ok((
+        authorization.protected_base_commit.clone(),
+        CandidateMetadataRewriteEvidence {
+            prior_gate_path: None,
+            authorization: CandidateMetadataRewriteAuthorization::ReviewFinding,
+            original_base_commit: authorization.protected_base_commit.clone(),
+            rejected_candidate_commit: authorization.source_candidate_commit.clone(),
+            replacement_candidate_commit: request.candidate_commit.to_string(),
+            candidate_tree: replacement_tree,
+        },
+    )))
 }
 
 fn validate_completion_repair_metadata_rewrite(
@@ -445,6 +577,70 @@ pub(crate) fn validate_prior_writer_gate(
         .is_none_or(|check| check.status != CandidateCheckStatus::Passed)
     {
         return Err("prior candidate gate did not establish candidate identity".to_string());
+    }
+    Ok(())
+}
+
+/// Validate the passing source gate used by an explicitly authorized review
+/// finding. This is deliberately separate from `validate_prior_writer_gate`,
+/// which admits only rejected correction gates for the ordinary append-only
+/// recovery path.
+fn validate_passing_writer_gate_for_metadata_rewrite(
+    prior: &CandidateGateEvidence,
+    expected_candidate: &str,
+) -> std::result::Result<(), String> {
+    if prior.schema_version == 0 || prior.schema_version > CANDIDATE_GATE_SCHEMA_VERSION {
+        return Err(format!(
+            "source candidate gate uses unsupported schema version {}",
+            prior.schema_version
+        ));
+    }
+    if prior.phase != CandidateGatePhase::Writer
+        || prior.disposition != CandidateGateDisposition::Passed
+    {
+        return Err("source candidate gate is not a passing Writer gate".to_string());
+    }
+    if prior.candidate_commit != expected_candidate {
+        return Err(format!(
+            "source candidate gate names candidate {}, expected {expected_candidate}",
+            prior.candidate_commit
+        ));
+    }
+    let expected_checks = [
+        "candidate-identity",
+        "whitespace",
+        "commit-metadata",
+        "behavior-references",
+        "tester-reference-evidence",
+        "project-check",
+    ];
+    if prior.checks.len() != expected_checks.len()
+        || expected_checks.iter().any(|name| {
+            prior
+                .checks
+                .iter()
+                .filter(|check| check.name == *name)
+                .count()
+                != 1
+        })
+    {
+        return Err("source candidate gate has an incomplete or duplicate check set".to_string());
+    }
+    if prior.checks.iter().any(|check| {
+        matches!(
+            check.status,
+            CandidateCheckStatus::Failed | CandidateCheckStatus::Error
+        )
+    }) {
+        return Err("source candidate gate contains a failed or untrustworthy check".to_string());
+    }
+    if prior
+        .checks
+        .iter()
+        .find(|check| check.name == "candidate-identity")
+        .is_none_or(|check| check.status != CandidateCheckStatus::Passed)
+    {
+        return Err("source candidate gate did not establish candidate identity".to_string());
     }
     Ok(())
 }
@@ -1152,6 +1348,13 @@ fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, S
     } else {
         (reference, None)
     };
+    // Planning documents commonly format repository paths as inline Markdown.
+    // The backticks are presentation, not part of the committed path that Git
+    // should validate.
+    let path = match path.strip_prefix('`') {
+        Some(inner) => inner.strip_suffix('`').map(str::trim).unwrap_or(path),
+        None => path,
+    };
     validate_test_path(path)?;
     if selector
         .as_ref()
@@ -1688,6 +1891,7 @@ mod tests {
                 candidate_commit: candidate,
                 completion_contract: contract,
                 allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
                 tester_results_path,
                 accepted_tester_commands: &[],
                 artifact_path,
@@ -1733,6 +1937,46 @@ mod tests {
         assert!(path.selector.is_none());
         assert!(path.command.is_none());
         assert!(parse_test_reference("tests/example.rs::").is_err());
+    }
+
+    #[test]
+    fn parses_markdown_wrapped_source_path_test_reference() {
+        let reference = parse_test_reference(
+            "`src/candidate_metadata_recovery.rs` (metadata_recovery_accepts_derived_project_check)",
+        )
+        .unwrap();
+
+        assert_eq!(reference.path, "src/candidate_metadata_recovery.rs");
+        assert_eq!(
+            reference.selector.as_deref(),
+            Some("metadata_recovery_accepts_derived_project_check")
+        );
+        assert!(reference.command.is_none());
+    }
+
+    #[test]
+    fn validates_markdown_wrapped_source_path_test_reference() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "src/candidate_metadata_recovery.rs",
+            "#[test]\nfn metadata_recovery_accepts_derived_project_check() {}\n",
+            "Add recovery test\n\n- Cover derived metadata checks",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract(
+            "`src/candidate_metadata_recovery.rs` (metadata_recovery_accepts_derived_project_check)",
+        );
+
+        let evidence =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Passed,
+            "{:?}",
+            check(&evidence, "behavior-references").diagnostics
+        );
     }
 
     #[test]

@@ -911,6 +911,50 @@ fn cmd_attempt(
             println!("Audit: {}", repair.audit_artifact);
             println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
         }
+        AttemptCommands::RepairWriterCompletion {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let repair = fluent::writer_completion_recovery::repair(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            if repair.already_applied {
+                println!(
+                    "Writer-completion recovery {} is already recorded for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            } else {
+                println!(
+                    "Authorized Writer-completion recovery {} for candidate {}",
+                    repair.task_id, repair.candidate_commit
+                );
+            }
+            if repair.superseded_task_ids.is_empty() {
+                println!("No duplicate Writer tasks were superseded");
+            } else {
+                println!(
+                    "Superseded duplicate Writer task(s): {}",
+                    repair.superseded_task_ids.join(", ")
+                );
+            }
+            if !repair.reconciled_task_ids.is_empty() {
+                println!(
+                    "Reconciled stale Writer task(s): {}",
+                    repair.reconciled_task_ids.join(", ")
+                );
+            }
+            println!("Audit: {}", repair.audit_artifact);
+            if repair.reconciled_task_ids.is_empty() {
+                println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+            } else {
+                println!("Next: fluent attempt run {work_item_id} {attempt_id}");
+            }
+        }
         AttemptCommands::ReviseTestReferences {
             work_item_id,
             attempt_id,

@@ -58,6 +58,12 @@ struct MetadataRepairAuthority {
     source_project_check_artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_project_check_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_review_artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_review_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_finding_id: Option<String>,
     source_candidate_commit: String,
     protected_base_commit: String,
     candidate_tree: String,
@@ -74,6 +80,8 @@ struct EligibleMetadataRepair {
     gate_ref: ArtifactRef,
     gate_path: String,
     project_check_ref: Option<ArtifactRef>,
+    source_review_ref: Option<ArtifactRef>,
+    source_finding_id: Option<String>,
 }
 
 /// Return the exact public command when the current Attempt has this recovery
@@ -130,8 +138,14 @@ pub fn repair(
     }
     let eligible = inspect_eligible(project_root, attempt)?;
     let write_rounds = attempt.materialized_write_rounds();
+    // A Documentation review-derived metadata repair is an explicitly
+    // authorized history operation, not another open-ended content attempt.
+    // It may therefore consume one recovery Writer even when the ordinary
+    // correction budget is exhausted. Candidate-gate-derived repairs retain
+    // the normal cap and still require a separate round-cap approval.
     if write_rounds
         >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
+        && eligible.source_review_ref.is_none()
     {
         bail!(
             "candidate metadata recovery has no remaining authorized Writer round; approve a round-cap extension first"
@@ -167,6 +181,16 @@ pub fn repair(
             .as_ref()
             .map(|artifact| digest_path(project_root, &artifact.path))
             .transpose()?,
+        source_review_artifact: eligible
+            .source_review_ref
+            .as_ref()
+            .map(|artifact| artifact.path.clone()),
+        source_review_sha256: eligible
+            .source_review_ref
+            .as_ref()
+            .map(|artifact| digest_path(project_root, &artifact.path))
+            .transpose()?,
+        source_finding_id: eligible.source_finding_id.clone(),
         source_candidate_commit: eligible.source_candidate_commit.clone(),
         protected_base_commit: eligible.protected_base_commit.clone(),
         candidate_tree: eligible.candidate_tree.clone(),
@@ -235,7 +259,15 @@ pub fn repair(
                 });
             }
 
+            // The source Writer gate is always carried into the recovery
+            // Writer. A Documentation-derived repair also carries the review
+            // that authorized it; keeping both bindings lets the Work Model
+            // validate the special Writer shape and lets the later candidate
+            // gate re-check the exact source evidence.
             let mut source_evidence = vec![gate_ref.clone()];
+            if let Some(review_ref) = eligible.source_review_ref.clone() {
+                source_evidence.push(review_ref);
+            }
             if let Some(project_check_ref) = project_check_ref.clone() {
                 source_evidence.push(project_check_ref);
             }
@@ -350,11 +382,33 @@ fn existing_repair(
     attempt: &Attempt,
     resolution: &str,
 ) -> Result<Option<CandidateMetadataRepair>> {
-    let Some(task) = attempt
-        .tasks
-        .iter()
-        .find(|task| task.kind == TaskKind::Write && task.role == CANDIDATE_METADATA_REPAIR_ROLE)
-    else {
+    let Some(task) = attempt.tasks.iter().rev().find(|task| {
+        if task.kind != TaskKind::Write || task.role != CANDIDATE_METADATA_REPAIR_ROLE {
+            return false;
+        }
+        let Some(authority_ref) = task
+            .input_artifacts
+            .iter()
+            .find(|artifact| artifact.producer_id == PRODUCER)
+        else {
+            return false;
+        };
+        let Ok(authority) = read_authority(project_root, attempt, task, authority_ref) else {
+            return false;
+        };
+        let Ok(current) = inspect_candidate_frontier(project_root, attempt, Some(task.id.as_str()))
+            .or_else(|_| {
+                inspect_documentation_review_frontier(project_root, attempt, Some(task.id.as_str()))
+            })
+        else {
+            return false;
+        };
+        authority.source_writer_task_id == current.source_writer.id
+            && authority.source_candidate_commit == current.source_candidate_commit
+    }) else {
+        // A previous metadata rewrite belongs to an older candidate frontier.
+        // It remains immutable history, but must not prevent a later audited
+        // repair for a newly rejected tree-identical candidate.
         return Ok(None);
     };
     let authority_ref = task
@@ -395,13 +449,335 @@ fn existing_repair(
 }
 
 fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleMetadataRepair> {
-    if attempt.status != AttemptStatus::NeedsUser || !attempt.is_candidate_gate_pause() {
-        bail!("Attempt is not paused at a candidate-gate metadata frontier");
+    if attempt.status != AttemptStatus::NeedsUser {
+        bail!("Attempt is not paused at a recoverable metadata frontier");
     }
     // This also rejects a concurrent Writer, failed Task, or unsupported pause
     // shape before we create an audited recovery task.
     attempt.ensure_resume_ready()?;
-    inspect_candidate_frontier(project_root, attempt, None)
+    if attempt.is_candidate_gate_pause() {
+        inspect_candidate_frontier(project_root, attempt, None)
+    } else if attempt.pause_kind == Some(crate::work_model::PauseKind::WriterCompletion) {
+        inspect_documentation_review_frontier(project_root, attempt, None)
+    } else {
+        bail!("Attempt is not paused at a candidate-gate or Documentation metadata frontier");
+    }
+}
+
+/// Recognize a completed Documentation review that found one historical
+/// commit-body line-length defect after a Writer deliberately made no content
+/// change. The review is the authority for why a metadata rewrite is needed;
+/// Git supplies the protected parent of the named commit and verifies that the
+/// candidate is otherwise unchanged.
+fn inspect_documentation_review_frontier(
+    project_root: &Path,
+    attempt: &Attempt,
+    ignored_task_id: Option<&str>,
+) -> Result<EligibleMetadataRepair> {
+    let (writer_index, source_writer) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, task)| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Documentation metadata frontier has no completed Writer")
+        })?;
+    let source_writer = source_writer.clone();
+    let output = source_writer
+        .output
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Documentation metadata Writer has no candidate output"))?;
+    let no_change = output.no_change.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Documentation metadata recovery requires the latest Writer to declare no change"
+        )
+    })?;
+    if no_change.declaration_path.trim().is_empty() {
+        bail!("Documentation metadata Writer has an empty no-change declaration path");
+    }
+
+    let gate_ref = attempt
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| {
+            artifact.producer_id == source_writer.id
+                && artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Documentation metadata frontier has no Writer gate"))?;
+    let gate_path = crate::work_task_executor::resolve_managed_artifact_area_path(
+        project_root,
+        &gate_ref.path,
+    )?;
+    let gate = read_prior_writer_gate(&gate_path).map_err(anyhow::Error::msg)?;
+    if gate.schema_version == 0
+        || gate.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || gate.phase != CandidateGatePhase::Writer
+        || gate.disposition != CandidateGateDisposition::Passed
+        || gate.candidate_commit != output.commit
+        || gate.checks.iter().any(|check| {
+            matches!(
+                check.status,
+                CandidateCheckStatus::Failed | CandidateCheckStatus::Error
+            )
+        })
+    {
+        bail!("Documentation metadata frontier does not have a passing current Writer gate");
+    }
+
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "Documentation metadata recovery workspace",
+    )?;
+    let head = git::run_stdout(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        "resolve Documentation metadata recovery HEAD",
+    )?;
+    if head != output.commit {
+        bail!(
+            "candidate HEAD changed from {} to {head}; ordinary candidate drift remains rejected",
+            output.commit
+        );
+    }
+    let status = git::run_stdout(
+        &workspace,
+        &["status", "--porcelain", "--untracked-files=all", "--", "."],
+        "check Documentation metadata recovery cleanliness",
+    )?;
+    if !status.is_empty() {
+        bail!("Documentation metadata recovery requires a clean candidate worktree:\n{status}");
+    }
+    let candidate_tree = git::run_stdout(
+        &workspace,
+        &["rev-parse", &format!("{}^{{tree}}", output.commit)],
+        "resolve Documentation metadata candidate tree",
+    )?;
+
+    let matrix_path = source_writer
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|path| path.join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE))
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("Documentation metadata Writer has no completion matrix"))?;
+    let matrix: crate::work_model::WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&matrix_path).with_context(|| {
+            format!(
+                "read Documentation metadata Writer completion matrix {}",
+                matrix_path.display()
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "parse Documentation metadata Writer completion matrix {}",
+                matrix_path.display()
+            )
+        })?;
+    if matrix.task_id != source_writer.id {
+        bail!(
+            "Documentation metadata completion matrix belongs to {}, expected {}",
+            matrix.task_id,
+            source_writer.id
+        );
+    }
+    let pending = matrix
+        .rows
+        .iter()
+        .filter(|row| {
+            row.kind == crate::work_model::WriterCompletionRequirementKind::Finding
+                && row.state == crate::work_model::WriterCompletionState::Pending
+        })
+        .collect::<Vec<_>>();
+    if pending.len() != 1 {
+        bail!(
+            "Documentation metadata recovery requires exactly one pending review finding; found {}",
+            pending.len()
+        );
+    }
+    let finding = pending[0];
+    let finding_id = finding.id.clone();
+    let Some(role) = finding
+        .id
+        .strip_prefix("finding:")
+        .and_then(|value| value.split(':').next())
+    else {
+        bail!("Documentation metadata finding has an invalid identity");
+    };
+    if role != "documentation" {
+        bail!(
+            "metadata recovery from this pause only supports a Documentation finding, not {role}"
+        );
+    }
+    let review_task = attempt
+        .tasks
+        .iter()
+        .find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == role
+                && task.status == TaskStatus::Complete
+                && task
+                    .artifact_area
+                    .as_ref()
+                    .is_some_and(|area| format!("{}/review.md", area.path) == finding.source)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Documentation metadata finding has no matching review Task")
+        })?;
+    let review_ref = ArtifactRef {
+        producer_id: review_task.id.clone(),
+        path: finding.source.clone(),
+    };
+    let review_path = crate::work_task_executor::resolve_managed_artifact_area_path(
+        project_root,
+        &review_ref.path,
+    )?;
+    let review_source = fs::read_to_string(&review_path).with_context(|| {
+        format!(
+            "read Documentation metadata finding review {}",
+            review_path.display()
+        )
+    })?;
+    let finding_title = finding
+        .requirement
+        .strip_prefix("Address documentation review finding: ")
+        .unwrap_or(&finding.requirement);
+    if crate::review::extract_verdict(&review_source) != crate::review::Verdict::Fail
+        || !crate::review::open_finding_titles(&review_source)
+            .iter()
+            .any(|title| title == finding_title)
+    {
+        bail!("Documentation metadata finding review is no longer an unchanged failing report");
+    }
+    if review_task
+        .review_context
+        .as_ref()
+        .is_none_or(|context| context.candidate_commit != output.commit)
+    {
+        bail!("Documentation metadata finding is not bound to the current candidate");
+    }
+    let protected_base_commit = parse_commit_body_length_finding(
+        &workspace,
+        &review_source,
+        &finding.requirement,
+        &output.commit,
+    )?;
+    if writer_index + 1 < attempt.tasks.len()
+        && attempt.tasks[writer_index + 1..].iter().any(|task| {
+            task.status != TaskStatus::Complete
+                && task.status != TaskStatus::Superseded
+                && Some(task.id.as_str()) != ignored_task_id
+        })
+    {
+        bail!("Documentation metadata frontier has unsettled Tasks after the current Writer");
+    }
+    Ok(EligibleMetadataRepair {
+        source_writer,
+        source_candidate_commit: output.commit,
+        protected_base_commit,
+        candidate_tree,
+        gate_ref: gate_ref.clone(),
+        gate_path: gate_ref.path.clone(),
+        project_check_ref: None,
+        source_review_ref: Some(review_ref),
+        source_finding_id: Some(finding_id),
+    })
+}
+
+fn parse_commit_body_length_finding(
+    workspace: &Path,
+    review_source: &str,
+    requirement: &str,
+    candidate: &str,
+) -> Result<String> {
+    let requirement_lower = requirement.to_ascii_lowercase();
+    if !requirement_lower.contains("commit body")
+        || !requirement_lower.contains("line-length")
+        || !requirement_lower.contains("blocking")
+    {
+        bail!("Documentation finding is not the supported commit-body line-length finding");
+    }
+    let commits = review_source
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().contains("commit"))
+        .flat_map(extract_full_commit_ids)
+        .collect::<Vec<_>>();
+    let mut commits = commits;
+    commits.sort();
+    commits.dedup();
+    let [target] = commits.as_slice() else {
+        bail!(
+            "Documentation metadata finding must name exactly one commit; found {}",
+            commits.len()
+        );
+    };
+    if target == candidate {
+        bail!("Documentation metadata finding names the candidate tip, not a historical commit");
+    }
+    let parent_line = git::run_stdout(
+        workspace,
+        &["rev-list", "--parents", "-n", "1", target],
+        "resolve Documentation metadata finding commit parent",
+    )?;
+    let parents = parent_line.split_whitespace().collect::<Vec<_>>();
+    if parents.len() != 2 || parents[0] != target {
+        bail!("Documentation metadata finding names a merge or malformed commit");
+    }
+    if !git::run_raw(
+        workspace,
+        &["merge-base", "--is-ancestor", target, candidate],
+    )?
+    .status
+    .success()
+    {
+        bail!("Documentation metadata finding names a commit outside the current candidate");
+    }
+    let message = git::run_stdout(
+        workspace,
+        &["show", "-s", "--format=%B", target],
+        "read Documentation metadata finding commit message",
+    )?;
+    if message
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        <= 72
+    {
+        bail!("Documentation metadata finding no longer matches the named commit");
+    }
+    Ok(parents[1].to_string())
+}
+
+fn extract_full_commit_ids(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut ids = Vec::new();
+    for start in 0..bytes.len().saturating_sub(39) {
+        let end = start + 40;
+        if end > bytes.len()
+            || !bytes[start..end]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || (start > 0 && bytes[start - 1].is_ascii_hexdigit())
+            || (end < bytes.len() && bytes[end].is_ascii_hexdigit())
+        {
+            continue;
+        }
+        // The review is normally ASCII, but do not slice a UTF-8 string at a
+        // byte offset that falls inside a non-ASCII character.
+        if !line.is_char_boundary(start) || !line.is_char_boundary(end) {
+            continue;
+        }
+        ids.push(line[start..end].to_ascii_lowercase());
+    }
+    ids
 }
 
 fn inspect_candidate_frontier(
@@ -547,7 +923,9 @@ fn inspect_candidate_frontier(
     )?;
     if writer_index + 1 < attempt.tasks.len()
         && attempt.tasks[writer_index + 1..].iter().any(|task| {
-            task.status != TaskStatus::Complete && Some(task.id.as_str()) != ignored_task_id
+            task.status != TaskStatus::Complete
+                && task.status != TaskStatus::Superseded
+                && Some(task.id.as_str()) != ignored_task_id
         })
     {
         bail!("candidate-gate metadata frontier has unsettled Tasks after the current Writer");
@@ -558,9 +936,11 @@ fn inspect_candidate_frontier(
         source_candidate_commit: output.commit.clone(),
         protected_base_commit,
         candidate_tree,
-        gate_ref,
+        gate_ref: gate_ref.clone(),
         gate_path,
         project_check_ref,
+        source_review_ref: None,
+        source_finding_id: None,
     })
 }
 
@@ -652,6 +1032,8 @@ fn read_authority(
         || authority.source_gate_sha256.is_empty()
         || authority.source_project_check_artifact.is_some()
             != authority.source_project_check_sha256.is_some()
+        || authority.source_review_artifact.is_some() != authority.source_review_sha256.is_some()
+        || authority.source_review_artifact.is_some() != authority.source_finding_id.is_some()
         || authority.resolution.trim().is_empty()
         || authority.resolution_sha256 != content_digest(authority.resolution.as_bytes())
         || authority.requested_at.trim().is_empty()
@@ -676,12 +1058,22 @@ fn validate_planned_repair(
     task: &Task,
     authority: &MetadataRepairAuthority,
 ) -> Result<()> {
-    let eligible = inspect_candidate_frontier(project_root, attempt, Some(task.id.as_str()))?;
+    let eligible = if authority.source_review_artifact.is_some() {
+        inspect_documentation_review_frontier(project_root, attempt, Some(task.id.as_str()))?
+    } else {
+        inspect_candidate_frontier(project_root, attempt, Some(task.id.as_str()))?
+    };
     if authority.source_writer_task_id != eligible.source_writer.id
         || authority.source_candidate_commit != eligible.source_candidate_commit
         || authority.protected_base_commit != eligible.protected_base_commit
         || authority.candidate_tree != eligible.candidate_tree
         || authority.source_gate_artifact != eligible.gate_path
+        || authority.source_review_artifact.as_deref()
+            != eligible
+                .source_review_ref
+                .as_ref()
+                .map(|artifact| artifact.path.as_str())
+        || authority.source_finding_id.as_deref() != eligible.source_finding_id.as_deref()
         || !task_binds_frontier_evidence(task, &eligible)
     {
         bail!(
@@ -714,6 +1106,23 @@ fn validate_planned_repair(
             task.id
         );
     }
+    let current_review_digest = eligible
+        .source_review_ref
+        .as_ref()
+        .map(|artifact| digest_path(project_root, &artifact.path))
+        .transpose()?;
+    let review_matches = authority.source_review_artifact.as_deref()
+        == eligible
+            .source_review_ref
+            .as_ref()
+            .map(|artifact| artifact.path.as_str())
+        && authority.source_review_sha256.as_deref() == current_review_digest.as_deref();
+    if !review_matches {
+        bail!(
+            "metadata recovery Writer {:?} no longer matches its Documentation review evidence",
+            task.id
+        );
+    }
     if authority.resolution_sha256 != content_digest(authority.resolution.as_bytes()) {
         bail!(
             "metadata recovery Writer {:?} has a mismatched authorization digest",
@@ -726,9 +1135,117 @@ fn validate_planned_repair(
 fn task_binds_frontier_evidence(task: &Task, eligible: &EligibleMetadataRepair) -> bool {
     task.input_artifacts.contains(&eligible.gate_ref)
         && eligible
+            .source_review_ref
+            .as_ref()
+            .is_none_or(|review_ref| task.input_artifacts.contains(review_ref))
+        && eligible
             .project_check_ref
             .as_ref()
             .is_none_or(|project_check_ref| task.input_artifacts.contains(project_check_ref))
+}
+
+/// Return the host-validated context needed by the candidate gate for a
+/// review-derived metadata rewrite. Candidate-gate recovery already carries a
+/// rejected gate artifact and follows its older path; review-derived recovery
+/// carries the review and this authority instead, so the gate must verify the
+/// authority's source evidence before accepting a rewritten candidate.
+pub(crate) fn candidate_gate_authorization_context(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &Task,
+) -> Result<Option<crate::candidate_gate::AuthorizedMetadataRewriteContext>> {
+    let Some(authority_ref) = task.input_artifacts.iter().find(|artifact| {
+        artifact.producer_id == PRODUCER && artifact.path.ends_with("/repair.json")
+    }) else {
+        return Ok(None);
+    };
+    let authority = read_authority(project_root, attempt, task, authority_ref)?;
+    let Some(review_path) = authority.source_review_artifact.as_deref() else {
+        return Ok(None);
+    };
+    let review_digest = digest_path(project_root, review_path)?;
+    if authority.source_review_sha256.as_deref() != Some(review_digest.as_str())
+        || !task
+            .input_artifacts
+            .iter()
+            .any(|artifact| artifact.producer_id != PRODUCER && artifact.path == review_path)
+    {
+        bail!(
+            "metadata recovery Writer {:?} no longer carries its authorized Documentation review",
+            task.id
+        );
+    }
+    let gate_path = crate::work_task_executor::resolve_managed_artifact_area_path(
+        project_root,
+        &authority.source_gate_artifact,
+    )?;
+    if !task.input_artifacts.iter().any(|artifact| {
+        artifact.producer_id == authority.source_writer_task_id
+            && artifact.path == authority.source_gate_artifact
+    }) {
+        bail!(
+            "metadata recovery Writer {:?} no longer carries its authorized source Writer gate",
+            task.id
+        );
+    }
+    let gate_digest = digest_path(project_root, &authority.source_gate_artifact)?;
+    if authority.source_gate_sha256 != gate_digest {
+        bail!(
+            "metadata recovery Writer {:?} source Writer gate changed after authorization",
+            task.id
+        );
+    }
+    let gate = read_prior_writer_gate(&gate_path).map_err(anyhow::Error::msg)?;
+    if gate.schema_version == 0
+        || gate.schema_version > crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+        || gate.phase != CandidateGatePhase::Writer
+        || gate.disposition != CandidateGateDisposition::Passed
+        || gate.candidate_commit != authority.source_candidate_commit
+        || gate.checks.iter().any(|check| {
+            matches!(
+                check.status,
+                CandidateCheckStatus::Failed | CandidateCheckStatus::Error
+            )
+        })
+    {
+        bail!(
+            "metadata recovery Writer {:?} source Writer gate is no longer a passing gate for its candidate",
+            task.id
+        );
+    }
+    Ok(Some(
+        crate::candidate_gate::AuthorizedMetadataRewriteContext {
+            source_candidate_commit: authority.source_candidate_commit,
+            protected_base_commit: authority.protected_base_commit,
+            candidate_tree: authority.candidate_tree,
+        },
+    ))
+}
+
+/// Resolve a metadata recovery authority in a Writer correction context. This
+/// lets the Writer receive the same explicit rewrite instructions that the
+/// candidate gate will later enforce, even when no rejected candidate-gate
+/// artifact is part of the correction input.
+pub(crate) fn authorized_metadata_rewrite_base(
+    project_root: &Path,
+    authority_path: &Path,
+    expected_candidate: &str,
+) -> Option<String> {
+    let authority: MetadataRepairAuthority =
+        serde_json::from_slice(&fs::read(authority_path).ok()?).ok()?;
+    if authority.schema_version != SCHEMA_VERSION
+        || authority.source_candidate_commit != expected_candidate
+        || authority.protected_base_commit.is_empty()
+        || authority.candidate_tree.is_empty()
+        || authority.source_gate_artifact.is_empty()
+        || authority.source_gate_sha256.is_empty()
+        || authority.source_review_artifact.is_some() != authority.source_review_sha256.is_some()
+        || authority.source_review_artifact.is_some() != authority.source_finding_id.is_some()
+    {
+        return None;
+    }
+    let gate_digest = digest_path(project_root, &authority.source_gate_artifact).ok()?;
+    (gate_digest == authority.source_gate_sha256).then_some(authority.protected_base_commit)
 }
 
 fn digest_path(project_root: &Path, relative: &str) -> Result<String> {
@@ -1203,6 +1720,7 @@ mod tests {
                 candidate_commit: &replacement,
                 completion_contract: None,
                 allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
                 tester_results_path: None,
                 accepted_tester_commands: &[],
                 artifact_path: &artifact_path,

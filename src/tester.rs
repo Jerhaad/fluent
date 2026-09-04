@@ -158,6 +158,7 @@ pub struct TesterSandbox {
     profile: Option<os::SandboxProfile>,
     settlement_directories: Vec<Option<PathBuf>>,
     commands: Vec<TesterCommand>,
+    launch_env: Vec<(String, String)>,
 }
 
 /// Canonical settlement paths created for an authorized Tester Task.
@@ -215,6 +216,54 @@ pub fn plan_failed_commands(
     Ok((TesterPlan { commands }, failed_indexes))
 }
 
+/// Build a recheck plan from a prior failed-command recheck result.
+///
+/// A recheck result contains only the commands selected from its source
+/// Tester, so its local indexes no longer refer to the full current Tester
+/// configuration. Match each failed command by its exact command text and
+/// harness, using each configured entry at most once. The ordinary
+/// `plan_failed_commands` path remains index-strict for the first recheck.
+pub(crate) fn plan_chained_failed_commands(
+    candidate_workspace: &Path,
+    source_results: &TesterResults,
+) -> Result<(TesterPlan, Vec<usize>)> {
+    let current = read_tester_config(&candidate_workspace.join(TESTER_YAML_PATH))?;
+    let failed_indexes = source_results
+        .commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| (command.exit_code != 0).then_some(index))
+        .collect::<Vec<_>>();
+    if failed_indexes.is_empty() {
+        anyhow::bail!("failed-command recheck source has no nonzero command exits");
+    }
+
+    let mut used = std::collections::BTreeSet::new();
+    let mut commands = Vec::with_capacity(failed_indexes.len());
+    for index in &failed_indexes {
+        let source = &source_results.commands[*index];
+        let matches = current
+            .commands
+            .iter()
+            .enumerate()
+            .filter(|(configured_index, configured)| {
+                !used.contains(configured_index)
+                    && configured.command == source.command
+                    && configured.test_harness == source.test_harness
+            })
+            .collect::<Vec<_>>();
+        let [(configured_index, configured)] = matches.as_slice() else {
+            anyhow::bail!(
+                "failed-command recheck source command {index} does not uniquely match current {TESTER_YAML_PATH}"
+            );
+        };
+        used.insert(*configured_index);
+        commands.push((*configured).clone());
+    }
+
+    Ok((TesterPlan { commands }, failed_indexes))
+}
+
 /// Return whether a path uses the host-owned Tester command-log spelling.
 pub(crate) fn is_command_log_path(path: &Path) -> bool {
     if !path
@@ -235,15 +284,26 @@ pub(crate) fn is_command_log_path(path: &Path) -> bool {
 }
 
 fn tester_writable_roots(candidate: &Path, artifact: &Path, home: &Path) -> Vec<PathBuf> {
+    tester_writable_roots_with_cargo_access(candidate, artifact, home, true)
+}
+
+fn tester_writable_roots_with_cargo_access(
+    candidate: &Path,
+    artifact: &Path,
+    home: &Path,
+    include_cargo_stores: bool,
+) -> Vec<PathBuf> {
     let mut roots = vec![candidate.to_path_buf(), artifact.to_path_buf()];
 
-    let cargo_registry = home.join(".cargo/registry");
-    let cargo_git = home.join(".cargo/git/db");
-    if cargo_registry.is_dir() {
-        roots.push(cargo_registry);
-    }
-    if cargo_git.is_dir() {
-        roots.push(cargo_git);
+    if include_cargo_stores {
+        let cargo_registry = home.join(".cargo/registry");
+        let cargo_git = home.join(".cargo/git/db");
+        if cargo_registry.is_dir() {
+            roots.push(cargo_registry);
+        }
+        if cargo_git.is_dir() {
+            roots.push(cargo_git);
+        }
     }
 
     if candidate.join("package.json").is_file() {
@@ -463,15 +523,39 @@ pub fn render_sandbox_profile(
     resolver: &ContentResolver,
     settlement: TesterSettlement,
 ) -> Result<TesterSandbox> {
+    render_sandbox_profile_with_cache(
+        candidate_workspace,
+        artifact_dir,
+        no_sandbox,
+        resolver,
+        settlement,
+        None,
+    )
+}
+
+/// Render the Tester boundary with the Attempt-scoped dependency cache shared
+/// by Writer rounds and the final Tester for the same Attempt.
+pub(crate) fn render_sandbox_profile_with_cache(
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    no_sandbox: bool,
+    resolver: &ContentResolver,
+    settlement: TesterSettlement,
+    dependency_cache: Option<&crate::writer_cache::WriterDependencyCache>,
+) -> Result<TesterSandbox> {
     let TesterSettlement {
         settlement_directories,
         commands,
     } = settlement;
+    let launch_env = dependency_cache
+        .map(|cache| cache.launch_env())
+        .unwrap_or_default();
     if no_sandbox {
         return Ok(TesterSandbox {
             profile: None,
             settlement_directories,
             commands,
+            launch_env,
         });
     }
     // Test-support can force the host preflight result while macOS test runners
@@ -487,6 +571,7 @@ pub fn render_sandbox_profile(
             profile: None,
             settlement_directories,
             commands,
+            launch_env,
         });
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -494,7 +579,18 @@ pub fn render_sandbox_profile(
         fs::canonicalize(candidate_workspace).unwrap_or_else(|_| candidate_workspace.to_path_buf());
     let artifact_abs =
         fs::canonicalize(artifact_dir).unwrap_or_else(|_| artifact_dir.to_path_buf());
-    let mut writable_roots = tester_writable_roots(&candidate_abs, &artifact_abs, Path::new(&home));
+    let mut writable_roots = match dependency_cache {
+        Some(_) => tester_writable_roots_with_cargo_access(
+            &candidate_abs,
+            &artifact_abs,
+            Path::new(&home),
+            false,
+        ),
+        None => tester_writable_roots(&candidate_abs, &artifact_abs, Path::new(&home)),
+    };
+    if let Some(cache) = dependency_cache {
+        writable_roots.push(cache.root().to_path_buf());
+    }
     writable_roots.extend(settlement_directories.iter().flatten().cloned());
     let common_git_dir = tester_git_metadata_root(&candidate_abs)?;
     match os::render_profile_common_only_with_denied_access(
@@ -511,6 +607,7 @@ pub fn render_sandbox_profile(
                 profile: Some(profile),
                 settlement_directories,
                 commands,
+                launch_env,
             })
         }
         Err(err) => Err(err),
@@ -528,6 +625,7 @@ pub fn run_with_sandbox_profile(
         sandbox.profile(),
         &sandbox.commands,
         Some(&sandbox.settlement_directories),
+        &sandbox.launch_env,
         &HostProcessInventoryCollector,
     )
 }
@@ -538,6 +636,7 @@ fn run_with_prepared_sandbox_profile_and_collector(
     sandbox_profile: Option<&os::SandboxProfile>,
     commands: &[TesterCommand],
     settlement_directories: Option<&[Option<PathBuf>]>,
+    launch_env: &[(String, String)],
     collector: &dyn ProcessInventoryCollector,
 ) -> Result<TesterOutcome> {
     record_test_boundary(sandbox_profile.is_some());
@@ -558,8 +657,6 @@ fn run_with_prepared_sandbox_profile_and_collector(
     if let Some(profile) = sandbox_profile {
         eprintln!("  Sandbox profile  {}", profile.path.display());
     }
-
-    let sandbox_path = sandbox_profile.as_ref().map(|p| &p.path);
 
     let mut command_results = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
@@ -596,7 +693,8 @@ fn run_with_prepared_sandbox_profile_and_collector(
             &cmd.test_harness,
             index,
             &commands_dir,
-            sandbox_path,
+            sandbox_profile,
+            launch_env,
             settlement
                 .as_ref()
                 .map(|settlement| settlement.directory.as_path()),
@@ -672,7 +770,8 @@ fn run_with_prepared_sandbox_profile_and_collector(
         candidate_workspace,
         &extractor_path,
         artifact_dir,
-        sandbox_path,
+        sandbox_profile,
+        launch_env,
     ) {
         Ok(normalized) => normalized,
         Err(error) => {
@@ -744,6 +843,7 @@ fn run_with_sandbox_profile_and_collector(
                 .as_ref()
                 .map(|settlement| settlement.settlement_directories.as_slice())
         }),
+        &[],
         collector,
     )
 }
@@ -808,12 +908,9 @@ fn structural_problems(
     } else {
         if let Err(error) = fs::write(artifact_dir.join("commands.json"), "[]") {
             problems.push(format!("readiness artifact: {error}"));
-        } else if let Err(error) = extract_and_normalize(
-            candidate_workspace,
-            &extractor,
-            artifact_dir,
-            profile.map(|p| &p.path),
-        ) {
+        } else if let Err(error) =
+            extract_and_normalize(candidate_workspace, &extractor, artifact_dir, profile, &[])
+        {
             problems.push(format!(
                 "{EXTRACTOR_PATH}: invalid empty artifact: {error:#}"
             ));
@@ -826,13 +923,15 @@ fn extract_and_normalize(
     candidate_workspace: &Path,
     extractor_path: &Path,
     artifact_dir: &Path,
-    sandbox_path: Option<&PathBuf>,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    launch_env: &[(String, String)],
 ) -> Result<(Vec<TestResult>, Summary)> {
     let tests = run_extractor(
         candidate_workspace,
         extractor_path,
         artifact_dir,
-        sandbox_path,
+        sandbox_profile,
+        launch_env,
     )?;
     let duplicate_ids = find_duplicate_ids(&tests);
     if !duplicate_ids.is_empty() {
@@ -869,21 +968,17 @@ fn run_command(
     test_harness: &str,
     index: usize,
     commands_dir: &Path,
-    sandbox_path: Option<&PathBuf>,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    launch_env: &[(String, String)],
     settlement_directory: Option<&Path>,
 ) -> Result<CommandResult> {
     let stdout_path = commands_dir.join(format!("{index}-stdout.log"));
     let stderr_path = commands_dir.join(format!("{index}-stderr.log"));
 
     let start = Instant::now();
-    let mut process = if let Some(profile) = sandbox_path {
-        let mut process = Command::new("sandbox-exec");
-        process
-            .arg("-f")
-            .arg(profile)
-            .arg("sh")
-            .arg("-c")
-            .arg(command);
+    let mut process = if let Some(profile) = sandbox_profile {
+        let mut process = os::command_under_profile(profile, Path::new("sh"));
+        process.arg("-c").arg(command);
         process
     } else {
         let mut process = Command::new("sh");
@@ -891,6 +986,9 @@ fn run_command(
         process
     };
     bind_tester_child_to_workspace(&mut process, working_dir);
+    for (key, value) in launch_env {
+        process.env(key, value);
+    }
     if let Some(directory) = settlement_directory {
         process
             .env("TMPDIR", directory)
@@ -944,15 +1042,12 @@ fn run_extractor(
     candidate_workspace: &Path,
     extractor_path: &Path,
     artifact_dir: &Path,
-    sandbox_path: Option<&PathBuf>,
+    sandbox_profile: Option<&os::SandboxProfile>,
+    launch_env: &[(String, String)],
 ) -> Result<Vec<TestResult>> {
-    let mut command = if let Some(profile) = sandbox_path {
-        let mut command = Command::new("sandbox-exec");
-        command
-            .arg("-f")
-            .arg(profile)
-            .arg(extractor_path)
-            .arg(artifact_dir);
+    let mut command = if let Some(profile) = sandbox_profile {
+        let mut command = os::command_under_profile(profile, extractor_path);
+        command.arg(artifact_dir);
         command
     } else {
         let mut command = Command::new(extractor_path);
@@ -960,6 +1055,9 @@ fn run_extractor(
         command
     };
     bind_tester_child_to_workspace(&mut command, candidate_workspace);
+    for (key, value) in launch_env {
+        command.env(key, value);
+    }
     let output = command
         .output()
         .with_context(|| format!("running {}", extractor_path.display()))?;
@@ -1444,6 +1542,7 @@ mod tests {
             sandbox.profile(),
             &sandbox.commands,
             Some(&sandbox.settlement_directories),
+            &[],
             &collector,
         )
         .unwrap();

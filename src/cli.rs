@@ -505,6 +505,17 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
+    /// Retry a paused Writer that did not produce a valid completion result
+    RepairWriterCompletion {
+        /// Work Item ID
+        work_item_id: String,
+        /// Attempt ID
+        attempt_id: String,
+        /// Human decision authorizing the exact Writer retry
+        #[arg(long)]
+        resolution: String,
+    },
+
     /// Revise selected behavior Test references on a paused Attempt
     ReviseTestReferences {
         /// Work Item ID

@@ -2004,6 +2004,14 @@ fn run_tester_task_with_settlement_preparer(
         Some(recheck) => recheck.plan.clone(),
         None => crate::tester::plan(&candidate_workspace)?,
     };
+    // Share one rebuildable dependency cache with every Writer round and the
+    // final Tester for this exact Attempt. Resolve the path before reservation;
+    // materialization happens below only after the Task start is durable.
+    let tester_cache = crate::writer_cache::preflight_writer_dependency_cache(
+        config.project_root,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
 
     // The preflight passed: reserve the start in one lock-held transaction. A peer
     // that took the Attempt terminal rejects the reservation here.
@@ -2033,6 +2041,11 @@ fn run_tester_task_with_settlement_preparer(
         || {
             fs::create_dir_all(&artifact_dir)?;
             let settlement = prepare_settlement(&artifact_dir, &tester_plan)?;
+            crate::writer_cache::prepare_writer_dependency_cache_for_launch(
+                &tester_cache,
+                config.store,
+                crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+            )?;
             if let Some(recheck) = &recheck {
                 let manifest = crate::tester::FailedCommandRecheckManifest {
                     schema_version: crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION,
@@ -2071,12 +2084,13 @@ fn run_tester_task_with_settlement_preparer(
     // A sandbox render or host preflight failure is a recoverable Tester harness
     // failure after reservation: do not launch a command or fall back to an
     // unsandboxed boundary.
-    let tester_sandbox = match crate::tester::render_sandbox_profile(
+    let tester_sandbox = match crate::tester::render_sandbox_profile_with_cache(
         &candidate_workspace,
         &artifact_dir,
         config.no_sandbox,
         config.resolver,
         tester_settlement,
+        Some(&tester_cache),
     ) {
         Ok(sandbox) => sandbox,
         Err(error) => {
@@ -2400,9 +2414,7 @@ fn plan_failed_command_recheck(
         .iter()
         .find(|candidate| candidate.id == source.producer_id)
         .filter(|candidate| {
-            candidate.kind == TaskKind::Tester
-                && candidate.status == TaskStatus::Complete
-                && !candidate.is_failed_command_recheck()
+            candidate.kind == TaskKind::Tester && candidate.status == TaskStatus::Complete
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -2447,8 +2459,11 @@ fn plan_failed_command_recheck(
             review_context.candidate_commit
         );
     }
-    let (plan, failed_command_indexes) =
-        crate::tester::plan_failed_commands(candidate_workspace, &results)?;
+    let (plan, failed_command_indexes) = if source_task.is_failed_command_recheck() {
+        crate::tester::plan_chained_failed_commands(candidate_workspace, &results)?
+    } else {
+        crate::tester::plan_failed_commands(candidate_workspace, &results)?
+    };
     Ok(Some(FailedCommandRecheckPlan {
         plan,
         source_results: source.path.clone(),
@@ -4897,6 +4912,23 @@ fn correction_lineage(
                 path,
                 prior_candidate_commit,
             )
+            })
+    }).or_else(|| {
+        correction_artifacts.iter().rev().find_map(|path| {
+            let is_metadata_authority = path
+                .file_name()
+                .is_some_and(|name| name == "repair.json")
+                && path
+                    .to_string_lossy()
+                    .contains("/candidate-metadata-repairs/");
+            if !is_metadata_authority {
+                return None;
+            }
+            crate::candidate_metadata_recovery::authorized_metadata_rewrite_base(
+                project_root,
+                path,
+                prior_candidate_commit,
+            )
         })
     });
     let mode = if protected_base_commit.is_some() {
@@ -6522,7 +6554,9 @@ pub(crate) fn materialize_writer_completion_before_writer(
     let prior = attempt.tasks[..task_index]
         .iter()
         .rev()
-        .find(|candidate| candidate.kind == TaskKind::Write)
+        .find(|candidate| {
+            candidate.kind == TaskKind::Write && candidate.status != TaskStatus::Superseded
+        })
         .map(|candidate| authoritative_writer_completion_matrix(project_root, attempt, candidate))
         .transpose()?
         .flatten();
@@ -14331,7 +14365,8 @@ mod tests {
         fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
         commit_tester_candidate_fixture(&project_root, &mut item);
-        source_json["candidate_commit"] = serde_json::json!(head_commit(&candidate).unwrap());
+        let candidate_commit = head_commit(&candidate).unwrap();
+        source_json["candidate_commit"] = serde_json::json!(&candidate_commit);
         fs::write(
             source_dir.join("tester-results.json"),
             serde_json::to_vec_pretty(&source_json).unwrap(),
@@ -14377,6 +14412,59 @@ mod tests {
                 .status,
             TaskStatus::Complete
         );
+
+        // A failed-command recheck can itself be retried after a host-mode
+        // recovery.  Keep the first recheck as the immutable source rather
+        // than requiring every retry to point back to the original Tester.
+        let first_recheck = stored.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == recheck_id)
+            .unwrap()
+            .clone();
+        let chained_source = ArtifactRef {
+            producer_id: first_recheck.id.clone(),
+            path: format!(
+                "{}/tester-results.json",
+                first_recheck.artifact_area.as_ref().unwrap().path
+            ),
+        };
+        let mut chained_id = String::new();
+        store
+            .mutate_work_item("work-1", |item| {
+                chained_id = item.add_failed_command_recheck_task("attempt-1", chained_source)?;
+                Ok(())
+            })
+            .unwrap();
+        run_task(WorkTaskRunConfig {
+            project_root: &project_root,
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            task_id: &chained_id,
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            store_lock: None,
+        })
+        .unwrap();
+        let chained = store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == chained_id)
+            .unwrap()
+            .clone();
+        assert_eq!(chained.status, TaskStatus::Complete);
+        let chained_results = project_root
+            .join(chained.artifact_area.unwrap().path)
+            .join("tester-results.json");
+        let chained_results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(chained_results).unwrap()).unwrap();
+        assert_eq!(
+            chained_results.candidate_commit.as_deref(),
+            Some(candidate_commit.as_str())
+        );
+        assert_eq!(chained_results.commands.len(), 1);
     }
 
     fn review_item_with_role(role: &str) -> WorkItem {

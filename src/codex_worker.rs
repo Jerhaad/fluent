@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -808,10 +809,12 @@ impl CodexWorkerEnvironment {
 
 fn copy_private_tree_atomic(source: &Path, destination: &Path) -> Result<()> {
     if destination.exists() {
-        anyhow::bail!(
-            "private tree destination {} already exists",
-            destination.display()
-        );
+        // A Writer retry reuses the same Task artifact directory.  The Codex
+        // rollout snapshot at that path is durable evidence, not a reason to
+        // fail the retry.  Merge the newer session files into the existing
+        // private tree while rejecting type changes and unrelated contents.
+        merge_private_tree(source, destination)?;
+        return Ok(());
     }
     let parent = destination
         .parent()
@@ -831,6 +834,99 @@ fn copy_private_tree_atomic(source: &Path, destination: &Path) -> Result<()> {
             destination.display()
         )
     })?;
+    Ok(())
+}
+
+/// Merge a later private session snapshot into an earlier one. Codex normally
+/// appends to a rollout file when a resumed session continues, but it may also
+/// rewrite the same uniquely named rollout while settling a retry. The path is
+/// the session identity, so replacing bytes at that path is safe; unrelated
+/// files and entry-type changes still fail closed.
+fn merge_private_tree(source: &Path, destination: &Path) -> Result<()> {
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("inspect private tree {}", source.display()))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
+        anyhow::bail!(
+            "private tree source {} is not a directory",
+            source.display()
+        );
+    }
+    let destination_metadata = fs::symlink_metadata(destination)
+        .with_context(|| format!("inspect private tree destination {}", destination.display()))?;
+    if destination_metadata.file_type().is_symlink() || !destination_metadata.is_dir() {
+        anyhow::bail!(
+            "private tree destination {} is not a directory",
+            destination.display()
+        );
+    }
+    set_private_mode(destination, 0o700)?;
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read private directory {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "private tree {} contains unsupported symlink {}",
+                source.display(),
+                source_path.display()
+            );
+        }
+        if file_type.is_dir() {
+            match fs::symlink_metadata(&destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    anyhow::bail!(
+                        "private tree destination {} changes entry type",
+                        destination_path.display()
+                    )
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    fs::create_dir_all(&destination_path)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            merge_private_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            let source_bytes = fs::read(&source_path)
+                .with_context(|| format!("read private session file {}", source_path.display()))?;
+            match fs::symlink_metadata(&destination_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                    anyhow::bail!(
+                        "private tree destination {} changes entry type",
+                        destination_path.display()
+                    )
+                }
+                Ok(_) => {
+                    let destination_bytes = fs::read(&destination_path).with_context(|| {
+                        format!(
+                            "read existing private session file {}",
+                            destination_path.display()
+                        )
+                    })?;
+                    // The rollout filename contains Codex's immutable session
+                    // identity. Keep the newest bytes for that identity,
+                    // including a provider rewrite that is not a byte prefix.
+                    if destination_bytes != source_bytes {
+                        crate::atomic_write::atomic_write(&destination_path, &source_bytes)?;
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    crate::atomic_write::atomic_write(&destination_path, &source_bytes)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            set_private_mode(&destination_path, 0o600)?;
+        } else {
+            anyhow::bail!(
+                "private tree {} contains unsupported entry {}",
+                source.display(),
+                source_path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1498,6 +1594,49 @@ mod tests {
             "auth"
         );
         assert!(!second.home().join("config.toml").exists());
+    }
+
+    #[test]
+    fn writer_session_snapshot_retry_merges_an_extended_rollout() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("auth.json"), "auth").unwrap();
+        let worker = CodexWorkerEnvironment::prepare_from(source.path()).unwrap();
+        let rollout = worker
+            .home()
+            .join("sessions/2026/08/04/rollout-writer-thread.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, "first\n").unwrap();
+        let artifact = tempfile::tempdir().unwrap();
+        let snapshot = artifact.path().join("codex-session");
+
+        worker.snapshot_sessions_to(&snapshot).unwrap();
+        fs::write(&rollout, "first\nsecond\n").unwrap();
+        worker.snapshot_sessions_to(&snapshot).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(snapshot.join("2026/08/04/rollout-writer-thread.jsonl")).unwrap(),
+            "first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn writer_session_snapshot_retry_replaces_same_rollout_identity() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("auth.json"), "auth").unwrap();
+        let worker = CodexWorkerEnvironment::prepare_from(source.path()).unwrap();
+        let rollout = worker.home().join("sessions/rollout.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, "new\n").unwrap();
+        let artifact = tempfile::tempdir().unwrap();
+        let snapshot = artifact.path().join("codex-session");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("rollout.jsonl"), "unrelated\n").unwrap();
+
+        worker.snapshot_sessions_to(&snapshot).unwrap();
+        assert_eq!(
+            fs::read_to_string(snapshot.join("rollout.jsonl")).unwrap(),
+            "new\n"
+        );
     }
 
     #[cfg(unix)]

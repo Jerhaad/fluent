@@ -57,6 +57,7 @@ pub mod work_status;
 pub mod work_task_executor;
 pub mod worktree;
 pub(crate) mod writer_cache;
+pub mod writer_completion_recovery;
 pub(crate) mod writer_context;
 
 pub mod observations;

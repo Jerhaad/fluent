@@ -486,7 +486,12 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                         config.attempt_id,
                     )?;
                 } else {
-                    reopen_resumable_attempt(config.store, config.work_item_id, config.attempt_id)?;
+                    reopen_resumable_attempt(
+                        config.project_root,
+                        config.store,
+                        config.work_item_id,
+                        config.attempt_id,
+                    )?;
                 }
                 continue;
             }
@@ -1355,6 +1360,7 @@ fn reconcile_premature_parallel_review_failure(
 /// under the model lock so the transition preserves that peer instead of
 /// attempting to write the stale aggregate back.
 fn reopen_resumable_attempt(
+    project_root: &Path,
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
@@ -1380,8 +1386,43 @@ fn reopen_resumable_attempt(
                     && task.role == crate::work_model::TESTER_HARNESS_REPAIR_ROLE
                     && task.status == TaskStatus::NeedsUser
             });
+        // A Writer that ended in NeedsUser without output is the same logical
+        // task that must be retried after its completion evidence is fixed.
+        // Do not append another Writer: the old task would remain first and be
+        // selected again, creating duplicate rounds on every resume. A
+        // completed no-change Writer likewise needs to pass through the normal
+        // candidate gate before Fluent decides whether another Writer is needed.
+        let retry_existing_writer = attempt.pause_kind == Some(PauseKind::WriterCompletion)
+            && attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::NeedsUser
+                    && task.output.is_none()
+            });
+        let latest_writer_is_no_change = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .is_some_and(|output| output.no_change.is_some());
+        let latest_writer_has_recoverable_format = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.artifact_area.as_ref())
+            .map(|area| {
+                project_root
+                    .join(&area.path)
+                    .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE)
+            })
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|source| recover_writer_completion_result_format(&source).is_ok());
         let writer_completion_artifacts = (attempt.pause_kind == Some(PauseKind::WriterCompletion)
-            && !repair_retry)
+            && !repair_retry
+            && !retry_existing_writer
+            && !latest_writer_is_no_change
+            && !latest_writer_has_recoverable_format)
             .then(|| writer_completion_resume_artifacts(attempt));
         crate::work_model::reopen_attempt(&mut item.attempts[attempt_index]);
         if let Some(artifacts) = writer_completion_artifacts {
@@ -4263,6 +4304,7 @@ fn run_learner_candidate_gate(
             candidate_commit,
             completion_contract: attempt.writer_completion_contract.as_ref(),
             allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
             tester_results_path: tester_results.as_deref(),
             accepted_tester_commands: &accepted_tester_commands,
             artifact_path: &artifact_path,
@@ -6187,6 +6229,125 @@ fn writer_completion_artifact(task: &Task) -> Option<ArtifactRef> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct WriterCompletionFormatRepair {
+    row_id: String,
+    verification_index: usize,
+    original_result: String,
+    normalized_result: String,
+}
+
+/// Accept the harmless formatting mistake that model writers have made in
+/// completion evidence: appending a human-readable summary to the machine
+/// result (`pass: ...` or `pass (...)`). The summary is not part of the
+/// recorded result. Keep every other malformed value rejected so a real
+/// disagreement still pauses before review.
+fn recover_writer_completion_result_format(
+    source: &str,
+) -> Result<
+    (
+        crate::work_model::WriterCompletionMatrix,
+        Vec<WriterCompletionFormatRepair>,
+    ),
+    String,
+> {
+    let mut value: serde_json::Value = serde_json::from_str(source)
+        .map_err(|error| format!("parse Writer completion matrix JSON: {error}"))?;
+    let rows = value
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "Writer completion matrix has no rows array".to_string())?;
+    let mut repairs = Vec::new();
+    for (row_index, row) in rows.iter_mut().enumerate() {
+        let row_id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("row-{row_index}"));
+        let Some(verification) = row
+            .get_mut("verification")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (verification_index, claim) in verification.iter_mut().enumerate() {
+            // Some writers have emitted a compact human-readable claim such
+            // as `cargo test passed` instead of the recorded object shape.
+            // Accept only an explicitly successful claim with a non-empty
+            // command. A failed or otherwise ambiguous string remains a hard
+            // error so malformed evidence cannot be admitted as a pass.
+            if let Some(original_claim) = claim.as_str().map(str::to_string) {
+                let Some(command) = original_claim.strip_suffix(" passed") else {
+                    return Err(format!(
+                        "unsupported Writer completion verification claim {:?}",
+                        original_claim
+                    ));
+                };
+                let command = command.trim_end();
+                if command.is_empty() {
+                    return Err(format!(
+                        "Writer completion verification claim {:?} has no command",
+                        original_claim
+                    ));
+                }
+                *claim = serde_json::json!({
+                    "command": command,
+                    "result": "pass",
+                });
+                repairs.push(WriterCompletionFormatRepair {
+                    row_id: row_id.clone(),
+                    verification_index,
+                    original_result: original_claim,
+                    normalized_result: "pass".to_string(),
+                });
+                continue;
+            }
+            let Some(result) = claim.get_mut("result") else {
+                continue;
+            };
+            let Some(original_result) = result.as_str().map(str::to_string) else {
+                continue;
+            };
+            if original_result == "pass" {
+                continue;
+            }
+            let summary = if let Some(summary) = original_result.strip_prefix("pass:") {
+                summary
+            } else if let Some(summary) = original_result
+                .strip_prefix("pass (")
+                .and_then(|summary| summary.strip_suffix(')'))
+            {
+                summary
+            } else {
+                return Err(format!(
+                    "unsupported Writer completion result {:?}",
+                    original_result
+                ));
+            };
+            if summary.trim().is_empty() {
+                return Err(format!(
+                    "Writer completion result {:?} has no explanatory suffix",
+                    original_result
+                ));
+            }
+            *result = serde_json::Value::String("pass".to_string());
+            repairs.push(WriterCompletionFormatRepair {
+                row_id: row_id.clone(),
+                verification_index,
+                original_result,
+                normalized_result: "pass".to_string(),
+            });
+        }
+    }
+    if repairs.is_empty() {
+        return Err("no supported Writer completion format repair found".to_string());
+    }
+    let matrix = serde_json::from_value(value)
+        .map_err(|error| format!("parse normalized Writer completion matrix: {error}"))?;
+    Ok((matrix, repairs))
+}
+
 pub(crate) fn plan_after_completed_writer(
     project_root: &Path,
     store: &WorkModelStore,
@@ -6468,6 +6629,12 @@ fn gate_candidate_after_writer(
             crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &input.path)
         })
         .transpose()?;
+    let metadata_rewrite_authorization =
+        crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+            project_root,
+            &item.attempts[attempt_index],
+            task,
+        )?;
     let evidence = crate::candidate_gate::run_candidate_gate_with_prior(
         crate::candidate_gate::CandidateGateRequest {
             project_root,
@@ -6485,6 +6652,7 @@ fn gate_candidate_after_writer(
                 artifact.producer_id == "writer-completion-repair"
                     && artifact.path.ends_with("writer-completion.json")
             }),
+            metadata_rewrite_authorization: metadata_rewrite_authorization.as_ref(),
             tester_results_path: None,
             accepted_tester_commands: &[],
             artifact_path: &project_root.join(&artifact.path),
@@ -6620,6 +6788,7 @@ fn gate_candidate_after_final_tester(
             candidate_commit: &output.commit,
             completion_contract: attempt.writer_completion_contract.as_ref(),
             allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
             tester_results_path: Some(tester_results_path),
             accepted_tester_commands: &accepted_tester_commands,
             artifact_path: &project_root.join(&artifact.path),
@@ -6844,6 +7013,13 @@ fn gate_writer_completion_before_reviews(
         &item.attempts[attempt_index],
         &latest_writer,
     )
+    .or_else(|| {
+        crate::host_evidence::writer_completion_matrix_ref(
+            project_root,
+            &item.attempts[attempt_index],
+            &latest_writer,
+        )
+    })
     .or_else(|| writer_completion_artifact(&latest_writer));
     let mut validated_matrix = None;
     let mut repaired_writer_claims = false;
@@ -6913,24 +7089,59 @@ fn gate_writer_completion_before_reviews(
                 });
             }
         };
+        let mut format_repairs = Vec::new();
         let mut matrix =
             match serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&source) {
                 Ok(matrix) => matrix,
-                Err(error) => {
-                    return pause_writer_completion_before_reviews(
-                        project_root,
-                        store,
-                        item,
-                        attempt_index,
-                        attempt_id,
-                        artifact,
-                        &format!("Writer completion matrix is malformed: {error}"),
-                        0,
-                        0,
-                    )
-                    .map(Some);
-                }
+                Err(error) => match recover_writer_completion_result_format(&source) {
+                    Ok((matrix, repairs)) => {
+                        let (repaired_matrix, repair_evidence) =
+                            write_writer_completion_format_repair(
+                                project_root,
+                                &item.id,
+                                attempt_id,
+                                &latest_writer.id,
+                                artifact,
+                                &source,
+                                &matrix,
+                                &repairs,
+                            )?;
+                        matrix_artifact = Some(repaired_matrix.clone());
+                        for repair_artifact in [repaired_matrix, repair_evidence] {
+                            if !item.attempts[attempt_index]
+                                .artifacts
+                                .contains(&repair_artifact)
+                            {
+                                item.attempts[attempt_index].artifacts.push(repair_artifact);
+                            }
+                        }
+                        format_repairs = repairs;
+                        matrix
+                    }
+                    Err(_) => {
+                        return pause_writer_completion_before_reviews(
+                            project_root,
+                            store,
+                            item,
+                            attempt_index,
+                            attempt_id,
+                            artifact,
+                            &format!("Writer completion matrix is malformed: {error}"),
+                            0,
+                            0,
+                        )
+                        .map(Some);
+                    }
+                },
             };
+        if !format_repairs.is_empty() {
+            // This normalization only converts a Writer's explanatory suffix
+            // on the one currently supported enum value (`pass: ...` or
+            // `pass (...)`) back to the recorded machine value (`pass`). The
+            // original bytes and the exact normalization are retained in
+            // immutable repair artifacts.
+            repaired_writer_claims = true;
+        }
         let findings =
             crate::work_task_executor::writer_completion_findings(project_root, &latest_writer)?;
         let repairs =
@@ -7450,6 +7661,51 @@ fn write_writer_completion_handoff(
             "# {title}\n\nFluent stopped before Tester and review planning because the {contract} cannot be repaired safely.\n\nReason: {reason}\n\nInspect `{progress_path}` and {repair}.\n"
         ),
     )?;
+    if matrix {
+        // A pending Documentation finding can be a deliberate, tree-identical
+        // commit-metadata repair rather than a malformed completion matrix.
+        // Prefer that more specific audited transition so the handoff does not
+        // send the operator through a Writer retry that cannot change the
+        // candidate under the ordinary append-only rules.
+        let metadata_action = crate::work_model::WorkModelStore::new(project_root)
+            .read_work_item(work_item_id)
+            .ok()
+            .and_then(|item| {
+                item.attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .and_then(|attempt| {
+                        crate::candidate_metadata_recovery::recovery_action(project_root, attempt)
+                    })
+            });
+        if let Some(action) = metadata_action.as_deref() {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(
+                file,
+                "\n\nThis matrix's pending Documentation finding is a commit-metadata-only issue. Authorize the audited history repair instead of retrying the ordinary Writer:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}`."
+            )?;
+        }
+        // A retryable Writer-completion pause has one audited recovery that
+        // reuses the same Task. Include it only when the just-persisted state
+        // proves that command is eligible; malformed matrices and other
+        // completion failures retain the ordinary diagnostic below.
+        if metadata_action.is_none()
+            && let Ok(item) =
+                crate::work_model::WorkModelStore::new(project_root).read_work_item(work_item_id)
+            && let Some(attempt) = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+            && let Some(action) =
+                crate::writer_completion_recovery::recovery_action(project_root, attempt)
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(
+                file,
+                "\n\nTo retry the exact paused Writer without adding duplicate rounds, authorize this audited recovery:\n\n`{action}`\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}`."
+            )?;
+        }
+    }
     if let Some(action) = host_action {
         let mut file = fs::OpenOptions::new().append(true).open(&path)?;
         writeln!(
@@ -7537,6 +7793,90 @@ fn write_writer_completion_repair(
                 return Err(error).with_context(|| {
                     format!(
                         "inspect Writer completion repair artifact: {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: matrix_relative,
+        },
+        ArtifactRef {
+            producer_id: "writer-completion-repair".to_string(),
+            path: evidence_relative,
+        },
+    ))
+}
+
+fn write_writer_completion_format_repair(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    source_artifact: &ArtifactRef,
+    source: &str,
+    matrix: &crate::work_model::WriterCompletionMatrix,
+    repairs: &[WriterCompletionFormatRepair],
+) -> Result<(ArtifactRef, ArtifactRef)> {
+    let directory = format!("writer-completion-repairs/{task_id}/format");
+    let matrix_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/writer-completion.json"),
+    );
+    let evidence_relative = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("{directory}/format-repair.json"),
+    );
+    let matrix_bytes = serde_json::to_vec_pretty(matrix)
+        .context("serialize format-repaired Writer completion matrix")?;
+    let source_digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let repaired_digest = format!("{:x}", Sha256::digest(&matrix_bytes));
+    let evidence_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema-version": 1,
+        "kind": "writer-completion-format-normalization",
+        "source-artifact": source_artifact.path,
+        "source-sha256": source_digest,
+        "repaired-artifact": matrix_relative,
+        "repaired-sha256": repaired_digest,
+        "normalizations": repairs,
+    }))
+    .context("serialize Writer completion format repair evidence")?;
+    for (relative, bytes) in [
+        (&matrix_relative, matrix_bytes.as_slice()),
+        (&evidence_relative, evidence_bytes.as_slice()),
+    ] {
+        let path = project_root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "create Writer completion format repair directory: {}",
+                    parent.display()
+                )
+            })?;
+        }
+        match fs::read(&path) {
+            Ok(existing) if existing == bytes => {}
+            Ok(_) => bail!(
+                "Writer completion format repair artifact already exists with different bytes: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                crate::atomic_write::atomic_write(&path, bytes).with_context(|| {
+                    format!(
+                        "write Writer completion format repair artifact: {}",
+                        path.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect Writer completion format repair artifact: {}",
                         path.display()
                     )
                 });
@@ -8931,7 +9271,7 @@ mod tests {
             "repeated cancellation must be idempotent"
         );
 
-        reopen_resumable_attempt(&store, "work-1", "attempt-1").unwrap();
+        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
         let resumed = store.read_work_item("work-1").unwrap();
         assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
         assert_eq!(resumed.attempts[0].pause_kind, None);
@@ -13595,6 +13935,7 @@ mod tests {
                 candidate_commit: &candidate,
                 completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
                 allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
                 tester_results_path: Some(&tester_results),
                 accepted_tester_commands: &[],
                 artifact_path: &learner_gate,
@@ -16800,6 +17141,189 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explanatory_pass_result_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] =
+            serde_json::Value::String("pass: 2,824 nextest tests; 2 skipped".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(evidence["kind"], "writer-completion-format-normalization");
+        assert_eq!(
+            evidence["source-sha256"],
+            format!("{:x}", Sha256::digest(&original))
+        );
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "pass: 2,824 nextest tests; 2 skipped"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        for review in stored.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            assert!(
+                review
+                    .input_artifacts
+                    .iter()
+                    .any(|artifact| { artifact.path.ends_with("/format/writer-completion.json") })
+            );
+        }
+    }
+
+    #[test]
+    fn parenthetical_pass_result_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0]["result"] =
+            serde_json::Value::String("pass (clean)".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "pass (clean)"
+        );
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+    }
+
+    #[test]
+    fn string_verification_claim_is_normalized_before_review() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = make_completed_writer_matrix_fixture(tmp.path(), true);
+        let path = tmp.path().join(
+            ".fluent/work/artifacts/matrix-work/attempt-1/attempt-1-write-1/writer-completion.json",
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["rows"][0]["verification"][0] =
+            serde_json::Value::String("cargo test matrix passed".to_string());
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            tmp.path(),
+            &store,
+            store.read_work_item("matrix-work").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let stored = store.read_work_item("matrix-work").unwrap();
+        assert_eq!(stored.attempts[0].status, AttemptStatus::Reviewing);
+        let repaired_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format/writer-completion.json"))
+            .expect("format-repaired matrix is attached");
+        let repaired: crate::work_model::WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(tmp.path().join(&repaired_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            repaired.rows[0].verification[0].command,
+            "cargo test matrix"
+        );
+        assert_eq!(
+            repaired.rows[0].verification[0].result,
+            crate::work_model::WriterVerificationResult::Pass
+        );
+        let evidence_ref = stored.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/format-repair.json"))
+            .expect("format repair evidence is attached");
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(&evidence_ref.path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            evidence["normalizations"][0]["original-result"],
+            "cargo test matrix passed"
+        );
+    }
+
     fn make_candidate_gate_fixture(
         project_root: &Path,
         candidate_source: &str,
@@ -18084,7 +18608,7 @@ mod tests {
             })
             .unwrap();
 
-        reopen_resumable_attempt(&store, "matrix-progress-work", "attempt-1").unwrap();
+        reopen_resumable_attempt(tmp.path(), &store, "matrix-progress-work", "attempt-1").unwrap();
 
         let stored = store.read_work_item("matrix-progress-work").unwrap();
         let attempt = &stored.attempts[0];
@@ -19838,7 +20362,13 @@ mod tests {
             })
             .unwrap();
 
-        reopen_resumable_attempt(&store, "provider-pause-peer", "provider-pause-attempt").unwrap();
+        reopen_resumable_attempt(
+            tmp.path(),
+            &store,
+            "provider-pause-peer",
+            "provider-pause-attempt",
+        )
+        .unwrap();
 
         let attempt = &store
             .read_work_item("provider-pause-peer")
@@ -19879,7 +20409,7 @@ mod tests {
         });
         store.create_work_item(&item).unwrap();
 
-        let error = reopen_resumable_attempt(&store, "round-cap-race", "attempt-1")
+        let error = reopen_resumable_attempt(tmp.path(), &store, "round-cap-race", "attempt-1")
             .expect_err("generic recovery must not reopen a round-cap pause");
 
         assert!(error.to_string().contains("changed to round-cap"));
@@ -20848,7 +21378,7 @@ mod tests {
         attempt.completed_at = Some("2026-08-22T12:02:00Z".to_string());
         store.create_work_item(&item).unwrap();
 
-        reopen_resumable_attempt(&store, "work-1", "attempt-1").unwrap();
+        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
 
         let stored = store.read_work_item("work-1").unwrap();
         let attempt = &stored.attempts[0];
@@ -21004,7 +21534,7 @@ mod tests {
             reject_terminal_attempt(&item.attempts[0]).unwrap(),
             TerminalCheck::Reopen
         ));
-        reopen_resumable_attempt(&store, "work-1", "attempt-1").unwrap();
+        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
 
         let stored = store.read_work_item("work-1").unwrap();
         assert_eq!(stored.attempts[0].status, AttemptStatus::Planned);

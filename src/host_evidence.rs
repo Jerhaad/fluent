@@ -836,7 +836,7 @@ pub(crate) fn apply_completed_plan_host_evidence(
     changed
 }
 
-fn writer_completion_matrix_ref(
+pub(crate) fn writer_completion_matrix_ref(
     project_root: &Path,
     attempt: &work_model::Attempt,
     writer: &Task,

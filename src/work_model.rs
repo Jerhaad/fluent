@@ -4696,6 +4696,7 @@ impl Attempt {
             .iter()
             .filter(|task| {
                 task.kind == TaskKind::Write
+                    && task.status != TaskStatus::Superseded
                     && !self.is_superseded_tester_harness_followup(&task.id)
             })
             .count()
@@ -4711,6 +4712,7 @@ impl Attempt {
             .rev()
             .find_map(|(index, task)| {
                 (task.kind == TaskKind::Write
+                    && task.status != TaskStatus::Superseded
                     && !self.is_superseded_tester_harness_followup(&task.id))
                 .then_some(index)
             })
