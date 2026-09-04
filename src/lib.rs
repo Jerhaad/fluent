@@ -64,6 +64,7 @@ pub(crate) mod writer_context;
 pub mod observations;
 pub mod queue;
 pub(crate) mod recovery_contracts;
+pub mod recovery_replay;
 pub mod scheduler;
 pub mod scheduler_service;
 pub mod scope_calibration;

@@ -2082,6 +2082,24 @@ connects them to the public operation and gives status and later recovery code a
 single history to inspect. The field is optional when reading older Attempts so
 old model records remain readable.
 
+### Offline recovery replay corpus
+
+The repository keeps a small versioned corpus at
+`tests/fixtures/recovery-corpus.json`. Its cases are sanitized descriptions of
+real recovery failures: they use synthetic Work Item and commit IDs and never
+copy a checkout, provider transcript, host path, or credential. Each Attempt
+case is replayed without launching a coder. The replay creates the minimum
+candidate-bound model, checks the exact operation through the shared validator,
+repeats it to verify idempotence, rejects a stale candidate, and verifies that
+the original Task history and operation record survive serialization. Workflow
+cases also check their public reconciliation command and preserved history.
+
+This corpus complements, rather than replaces, focused recovery tests. Focused
+tests cover each recovery's Git and artifact rules; the corpus checks the common
+operator promise across all of them: a saved failure has a usable command,
+stale input is rejected, history is retained, and the same Attempt can be
+continued without provider access.
+
 ### progress.md
 
 Each Attempt with a plan.md records a `progress.md` file at

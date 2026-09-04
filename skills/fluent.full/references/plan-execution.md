@@ -103,6 +103,15 @@ next action. Repeating the identical command reuses that result without
 creating duplicate Tasks or evidence; a changed identity is rejected before
 the Work Item is modified.
 
+Fluent also runs a small offline replay corpus from
+`tests/fixtures/recovery-corpus.json`. The corpus contains sanitized examples
+of observed recovery failures and synthetic identifiers only. Its Attempt
+cases replay the shared candidate-bound operation checks, confirm exact replay
+is idempotent, reject a stale candidate, and verify that history survives
+serialization. Keep the corpus updated when a new user-facing recovery shape
+appears; focused module tests remain responsible for provider, Git, and host
+evidence details.
+
 Without planning-wide delegation, after discussing each step or group of steps,
 ask:
 
