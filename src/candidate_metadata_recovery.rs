@@ -1619,7 +1619,7 @@ mod tests {
             fixture.candidate
         );
         let hook = format!(
-            "commit {} body line 1 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata, &invalid_author], &hook, &[]);
@@ -1673,7 +1673,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 1 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -2679,7 +2679,7 @@ mod tests {
         let fixture = fixture();
         let metadata = metadata_diagnostic(&fixture.candidate);
         let hook = format!(
-            "commit {} body line 1 exceeds 72 characters\n",
+            "commit {} body line 3 exceeds 72 characters\n",
             fixture.candidate
         );
         fixture.configure_project_check(&[&metadata], &hook, &[]);
@@ -2697,7 +2697,8 @@ mod tests {
         writer
             .input_artifacts
             .retain(|artifact| !artifact.path.ends_with("/hooks/check-pre-merge.log"));
-        fixture.store.write_work_item(&item).unwrap();
+        let storage_error = fixture.store.write_work_item(&item).unwrap_err();
+        assert!(format!("{storage_error:?}").contains("InvalidCandidateMetadataRepairTask"));
 
         let error = is_resume_ready(&fixture.project, &item, "attempt-1").unwrap_err();
         assert!(error.to_string().contains("candidate-gate frontier"));
