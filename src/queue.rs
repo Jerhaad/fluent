@@ -1277,7 +1277,7 @@ fn ensure_code_change_classification_resume_ready(
     if completed.commit != recovery.candidate_commit {
         return Err(ineligible("the source candidate commit changed"));
     }
-    if !crate::recovery_contracts::candidate_workspace_is_clean_at(
+    if !crate::recovery_contracts::candidate_workspace_is_clean_at_managed(
         project_root,
         completed,
         &recovery.candidate_commit,

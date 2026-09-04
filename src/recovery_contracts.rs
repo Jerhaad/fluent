@@ -1275,28 +1275,52 @@ pub(crate) fn classification_audit_bytes(
     .context("serialize host-evidence classification audit")
 }
 
+/// Check candidate HEAD and cleanliness for ordinary evidence paths.
+///
+/// Classified recovery callers use `candidate_workspace_is_clean_at_managed`
+/// when they must also prove the workspace is a registered worktree in the
+/// source repository.
 pub(crate) fn candidate_workspace_is_clean_at(
     project_root: &Path,
     output: &work_model::TaskOutput,
     candidate: &str,
 ) -> bool {
-    let workspace = Path::new(&output.workspace_path);
-    let workspace = if workspace.is_absolute() {
-        workspace.to_path_buf()
-    } else {
-        project_root.join(workspace)
-    };
+    let workspace = candidate_workspace_path(project_root, output);
+    candidate_workspace_is_clean_at_path(&workspace, candidate)
+}
+
+/// Check the candidate commit and cleanliness of a classified recovery's
+/// registered managed worktree.
+pub(crate) fn candidate_workspace_is_clean_at_managed(
+    project_root: &Path,
+    output: &work_model::TaskOutput,
+    candidate: &str,
+) -> bool {
+    let workspace = candidate_workspace_path(project_root, output);
     if crate::worktree::ensure_candidate_worktree(project_root, &workspace).is_err() {
         return false;
     }
+    candidate_workspace_is_clean_at_path(&workspace, candidate)
+}
+
+fn candidate_workspace_path(project_root: &Path, output: &work_model::TaskOutput) -> PathBuf {
+    let workspace = Path::new(&output.workspace_path);
+    if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        project_root.join(workspace)
+    }
+}
+
+fn candidate_workspace_is_clean_at_path(workspace: &Path, candidate: &str) -> bool {
     git::run_stdout(
-        &workspace,
+        workspace,
         &["rev-parse", "HEAD"],
         "inspect evidence candidate",
     )
     .is_ok_and(|head| head == candidate)
         && git::run_stdout(
-            &workspace,
+            workspace,
             &["status", "--porcelain", "--untracked-files=all"],
             "inspect evidence candidate cleanliness",
         )
@@ -1435,7 +1459,7 @@ pub(crate) fn validate_code_change_candidate_binding(
     let rejected = |reason: &str| reason.to_string();
     if source_output.commit != candidate_commit
         || recovery.candidate_commit != candidate_commit
-        || !candidate_workspace_is_clean_at(project_root, source_output, candidate_commit)
+        || !candidate_workspace_is_clean_at_managed(project_root, source_output, candidate_commit)
     {
         return Err(rejected(
             "the candidate workspace no longer matches the classified commit",
@@ -1477,7 +1501,7 @@ pub(crate) fn validate_code_change_post_correction_binding(
     if source_output.commit != recovery.candidate_commit
         || corrective_output.workspace_id != source_output.workspace_id
         || corrective_output.workspace_path != source_output.workspace_path
-        || !candidate_workspace_is_clean_at(
+        || !candidate_workspace_is_clean_at_managed(
             project_root,
             corrective_output,
             &corrective_output.commit,
