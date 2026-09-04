@@ -385,7 +385,8 @@ pub fn work_item_show_value(
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
     }
     let attempt = display_attempt(item, Some(project_root));
-    if attempt.is_some_and(|attempt| attempt.pause_recovery.is_some())
+    if attempt
+        .is_some_and(|attempt| attempt.pause_recovery.is_some() || attempt.pause_record.is_some())
         && let Some(next_action) = attempt_recovery_next_action(attempt, Some(project_root))
     {
         output["next-action"] = serde_json::to_value(next_action)?;
@@ -544,6 +545,9 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                     release.criteria, release.blockers, release.proposed_follow_ups
                 ));
             }
+            if let Some(next_action) = row.next_action.as_deref() {
+                output.push_str(&format!("  next-action: {next_action}\n"));
+            }
             output.push_str(&format!(
                 "  metrics: rounds:{} duration:{}ms active:{}ms provider-wait:{}ms tokens:{}/{} repeated:{} artifacts:{}B avoided:{}\n",
                 row.metrics.review_rounds,
@@ -597,6 +601,9 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
             row.metrics.artifact_bytes,
             row.metrics.avoided_cycles
         ));
+        if let Some(next_action) = row.next_action.as_deref() {
+            lines.push(format!("  Next action: {next_action}"));
+        }
         for warning in &row.compatibility_warnings {
             lines.push(format!("  Warning: {warning}"));
         }
@@ -862,7 +869,11 @@ fn action_label_with_liveness(
     }
 }
 
-pub fn attempt_recovery_next_action(
+/// Derive the current recovery operation from live Attempt state and artifacts.
+/// This is deliberately separate from the persisted pause record: persistence
+/// uses it to refresh the record, while display uses the wrapper below to reject
+/// stale recorded commands.
+pub(crate) fn derive_attempt_recovery_next_action(
     attempt: Option<&Attempt>,
     project_root: Option<&Path>,
 ) -> Option<String> {
@@ -998,6 +1009,82 @@ pub fn attempt_recovery_next_action(
             attempt.work_item_id, attempt.id
         )
     })
+}
+
+/// Return the saved operation only while its identity still matches the current
+/// Attempt. If the Attempt changed, derive a fresh operation instead of printing
+/// an old command to the operator.
+pub fn attempt_recovery_next_action(
+    attempt: Option<&Attempt>,
+    project_root: Option<&Path>,
+) -> Option<String> {
+    let attempt = attempt?;
+    let derived = derive_attempt_recovery_next_action(Some(attempt), project_root);
+    if let Some(record) = attempt.pause_record.as_ref() {
+        if record.matches_attempt(attempt) {
+            match (&record.next_operation, &record.no_safe_operation_reason) {
+                (Some(operation), _) if derived.as_deref() == Some(operation.command.as_str()) => {
+                    return Some(operation.command.clone());
+                }
+                (None, Some(_)) if derived.is_none() => return None,
+                _ => {}
+            }
+        }
+    }
+    derived
+}
+
+/// Render the common pause section appended to operator handoffs.
+pub fn render_pause_record(record: &crate::work_model::PauseRecord) -> String {
+    let mut output = String::from("## Saved pause record\n\n");
+    output.push_str(&format!("Blocker: {}\n", record.blocker));
+    if let Some(candidate) = record.candidate_commit.as_deref() {
+        output.push_str(&format!("Candidate: `{candidate}`\n"));
+    }
+    if let Some(task_id) = record.task_id.as_deref() {
+        output.push_str(&format!("Task: `{task_id}`\n"));
+    }
+    output.push_str(&format!(
+        "Required evidence or decision: {}\n",
+        record.required_evidence_or_decision
+    ));
+    match (&record.next_operation, &record.no_safe_operation_reason) {
+        (Some(operation), _) => {
+            output.push_str(&format!("Next operation: `{}`\n", operation.command));
+        }
+        (None, Some(reason)) => {
+            output.push_str(&format!("No safe operation: {reason}\n"));
+        }
+        (None, None) => output.push_str("No safe operation recorded.\n"),
+    }
+    output
+}
+
+/// Append the shared pause record to a handoff after the Attempt state has been
+/// persisted. Handoff-specific explanation remains intact; this section gives
+/// every surface the same blocker and recovery command.
+pub fn append_pause_record_to_handoff(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    mut body: String,
+) -> String {
+    let store = WorkModelStore::new(project_root);
+    if let Ok(item) = store.read_work_item(work_item_id)
+        && let Some(attempt) = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        && let Some(record) = attempt.pause_record.as_ref()
+        && record.matches_attempt(attempt)
+    {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+        body.push_str(&render_pause_record(record));
+    }
+    body
 }
 
 fn tester_pause_requires_project_repair(project_root: &Path, attempt: &Attempt) -> bool {
@@ -1883,6 +1970,64 @@ mod tests {
             row.next_action.as_deref(),
             Some("fluent queue resume work-1 --attempt attempt-1")
         );
+    }
+
+    #[test]
+    fn saved_pause_operation_is_used_only_for_the_same_attempt_state() {
+        let mut item = WorkItem::planned("work-pause-status", "Pause status");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        let command = "fluent queue resume work-pause-status --attempt attempt-1";
+        attempt.pause_record = Some(crate::work_model::PauseRecord::generated(
+            attempt,
+            Some(command.to_string()),
+            None,
+        ));
+
+        assert_eq!(
+            attempt_recovery_next_action(Some(attempt), None).as_deref(),
+            Some(command)
+        );
+
+        // A changed saved command means the recorded operation no longer agrees
+        // with the current derivation. The wrapper must not print stale text.
+        let stale_command = "fluent attempt run work-pause-status attempt-1";
+        attempt
+            .pause_record
+            .as_mut()
+            .unwrap()
+            .next_operation
+            .as_mut()
+            .unwrap()
+            .command = stale_command.to_string();
+        let current = attempt_recovery_next_action(Some(attempt), None);
+        assert_eq!(current.as_deref(), Some(command));
+        assert_ne!(current.as_deref(), Some(stale_command));
+    }
+
+    #[test]
+    fn saved_pause_record_renders_the_same_operator_fields() {
+        let mut item = WorkItem::planned("work-pause-render", "Pause render");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::Auth);
+        attempt.tasks[0].status = TaskStatus::NeedsUser;
+        attempt.pause_record = Some(crate::work_model::PauseRecord::generated(
+            attempt,
+            Some("fluent queue resume work-pause-render --attempt attempt-1".to_string()),
+            None,
+        ));
+
+        let output = render_pause_record(attempt.pause_record.as_ref().unwrap());
+        assert!(output.contains("Blocker: Provider authentication is required."));
+        assert!(output.contains("Task: `attempt-1-write-1`"));
+        assert!(output.contains(
+            "Next operation: `fluent queue resume work-pause-render --attempt attempt-1`"
+        ));
     }
 
     #[test]

@@ -83,6 +83,16 @@ the explanation remains the row's normal state and verification text. Older
 Attempts without this stored field use one compatibility parser and pause when
 the old text names zero or multiple commands.
 
+When an Attempt pauses for user input, Fluent also stores one versioned pause
+record beside the Attempt. It contains the plain-language blocker, the current
+candidate and blocking Task when known, the evidence or decision needed, and
+either one exact eligible public command or a reason no safe command exists.
+Status, `work-item show`, resume errors, and needs-user handoffs render this
+record. Fluent rechecks its candidate, Task, and pause-kind preconditions before
+showing the command; a changed Attempt gets freshly derived guidance instead of
+stale instructions. Older Attempts can be read without this record and are
+upgraded on their next managed write.
+
 Without planning-wide delegation, after discussing each step or group of steps,
 ask:
 

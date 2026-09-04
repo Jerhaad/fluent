@@ -2045,6 +2045,24 @@ under the canonical project root. Missing targets, cycles, directories, and
 targets outside the project fail closed; Fluent never substitutes a parent
 directory grant.
 
+### Paused Attempt records
+
+Every persisted `needs-user` Attempt may carry one versioned pause record. The
+record is the shared source for the blocker, the candidate and Task involved,
+the evidence or decision still needed, and either one exact public recovery
+command or an explicit explanation that no safe command is currently eligible.
+The Work-model store refreshes this record whenever it writes a Work Item and
+clears it when the Attempt resumes or reaches another terminal state. Older
+Attempts without the field remain readable and use the existing compatibility
+derivation until their next write.
+
+`fluent status`, `work-item show`, resume errors, and needs-user handoffs use the
+same saved record. Before a command is shown, Fluent checks that the Attempt's
+pause kind, candidate, and blocking Task still match the record; if they do not,
+the old command is suppressed and a current operation is derived instead. This
+keeps a handoff from directing an operator to a transition that the current
+Attempt would reject.
+
 ### progress.md
 
 Each Attempt with a plan.md records a `progress.md` file at

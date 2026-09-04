@@ -635,6 +635,42 @@ impl WorkItem {
         Ok(())
     }
 
+    /// Fill the shared pause record for every Attempt that is waiting for a
+    /// user. This is called immediately before an aggregate is persisted so
+    /// direct lifecycle updates and older callers that assign fields directly
+    /// still produce the same durable blocker and next-operation description.
+    pub(crate) fn synchronize_pause_records(&mut self, project_root: &Path) {
+        for attempt in &mut self.attempts {
+            if attempt.status != AttemptStatus::NeedsUser {
+                attempt.pause_record = None;
+                continue;
+            }
+            let next_action = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            let no_safe_operation_reason = next_action.is_none().then(|| {
+                format!(
+                    "No public recovery operation is currently eligible for pause kind {}.",
+                    attempt
+                        .pause_kind
+                        .as_ref()
+                        .map(PauseKind::as_str)
+                        .unwrap_or("unknown")
+                )
+            });
+            let mut generated =
+                PauseRecord::generated(attempt, next_action, no_safe_operation_reason);
+            if let Some(existing) = attempt.pause_record.as_ref() {
+                if existing.same_content(&generated) {
+                    continue;
+                }
+                generated.created_at = existing.created_at.clone();
+            }
+            attempt.pause_record = Some(generated);
+        }
+    }
+
     /// Approve one exact planning revision through the Work Item lifecycle.
     pub fn approve_planning_revision(
         &mut self,
@@ -4550,6 +4586,11 @@ pub struct Attempt {
     /// classification while only one requires a dispatch-scoped sandbox approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_recovery: Option<PauseRecovery>,
+    /// One host-owned description of why this Attempt is waiting and the exact
+    /// operation that is currently safe to try. Older records may omit it; the
+    /// store fills it when a paused Attempt is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_record: Option<PauseRecord>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactRef>,
     /// Append-only host-owned recovery frontiers for an unchanged candidate.
@@ -4610,6 +4651,7 @@ impl Default for Attempt {
             review_state: None,
             pause_kind: None,
             pause_recovery: None,
+            pause_record: None,
             artifacts: Vec::new(),
             evidence_recoveries: Vec::new(),
             approach_revision_superseded_tasks: Vec::new(),
@@ -4825,9 +4867,27 @@ impl Attempt {
     /// supported pause vocabulary. Checks that depend on live Git or artifact
     /// bytes remain in the Attempt loop and run immediately before reopening.
     pub fn ensure_resume_ready(&self) -> Result<(), WorkModelError> {
-        let ineligible = |reason: String| WorkModelError::AttemptResumeIneligible {
-            attempt_id: self.id.clone(),
-            reason,
+        let ineligible = |reason: String| {
+            let reason = match self
+                .pause_record
+                .as_ref()
+                .filter(|record| record.matches_attempt(self))
+            {
+                Some(record) => match (&record.next_operation, &record.no_safe_operation_reason) {
+                    (Some(operation), _) => {
+                        format!("{reason} Recorded next operation: `{}`.", operation.command)
+                    }
+                    (None, Some(no_safe)) => {
+                        format!("{reason} No safe operation is currently recorded: {no_safe}")
+                    }
+                    _ => reason,
+                },
+                None => reason,
+            };
+            WorkModelError::AttemptResumeIneligible {
+                attempt_id: self.id.clone(),
+                reason,
+            }
         };
         let failed_candidate_gate_correction = self.is_failed_candidate_gate_correction();
         let pending_evidence_reviews = self.has_pending_evidence_review_tasks();
@@ -5548,6 +5608,18 @@ impl Attempt {
     }
 
     pub fn validate(&self, work_item_id: &str) -> Result<(), WorkModelError> {
+        if let Some(record) = self.pause_record.as_ref() {
+            // Older callers may change the Attempt fields directly before the
+            // next persistence boundary. Keep the stale record readable; the
+            // status wrapper will not present its operation, and the store will
+            // refresh or clear it before writing the next snapshot.
+            record
+                .validate(&self.id)
+                .map_err(|reason| WorkModelError::InvalidPauseRecord {
+                    attempt_id: self.id.clone(),
+                    reason,
+                })?;
+        }
         for task in &self.tasks {
             if task.work_item_id != work_item_id {
                 return Err(WorkModelError::TaskWorkItemMismatch {
@@ -5813,6 +5885,275 @@ pub enum PauseKind {
 pub enum PauseRecovery {
     /// Resume through the scheduler with one exact Tester-only no-sandbox grant.
     TesterNoSandbox,
+}
+
+/// Version of the durable description stored for a paused Attempt.
+pub const PAUSE_RECORD_SCHEMA_VERSION: u32 = 1;
+
+/// The kind of public operation recorded as the next safe step for a pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PauseOperationKind {
+    AttemptRun,
+    QueueResume,
+    EvidenceRun,
+    EvidenceAttach,
+    AttemptExtend,
+    RepairTester,
+    Other,
+}
+
+impl PauseOperationKind {
+    fn from_command(command: &str) -> Self {
+        let words = command.split_whitespace().collect::<Vec<_>>();
+        match words.as_slice() {
+            ["fluent", "attempt", "run", ..] => Self::AttemptRun,
+            ["fluent", "queue", "resume", ..] => Self::QueueResume,
+            ["fluent", "attempt", "evidence", "run", ..] => Self::EvidenceRun,
+            ["fluent", "attempt", "evidence", "attach", ..] => Self::EvidenceAttach,
+            ["fluent", "attempt", "extend", ..] => Self::AttemptExtend,
+            ["fluent", "attempt", "repair-tester", ..] => Self::RepairTester,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A precondition that must still hold before a recorded operation is used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausePrecondition {
+    pub name: String,
+    pub expected: String,
+}
+
+/// One exact, bounded public operation that can be offered for a pause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseOperation {
+    pub kind: PauseOperationKind,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preconditions: Vec<PausePrecondition>,
+}
+
+impl PauseOperation {
+    pub fn from_command(command: impl Into<String>, attempt: &Attempt) -> Option<Self> {
+        let command = command.into();
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return None;
+        }
+        let arguments = command
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut preconditions = vec![PausePrecondition {
+            name: "attempt-status".to_string(),
+            expected: AttemptStatus::NeedsUser.as_str().to_string(),
+        }];
+        if let Some(pause) = attempt.pause_kind.as_ref() {
+            preconditions.push(PausePrecondition {
+                name: "pause-kind".to_string(),
+                expected: pause.as_str().to_string(),
+            });
+        }
+        Some(Self {
+            kind: PauseOperationKind::from_command(&command),
+            command,
+            arguments,
+            preconditions,
+        })
+    }
+
+    fn validate(&self, attempt_id: &str) -> Result<(), String> {
+        if self.command.trim().is_empty() {
+            return Err("next operation has an empty command".to_string());
+        }
+        if self.command.len() > 4_096 {
+            return Err("next operation command exceeds 4096 bytes".to_string());
+        }
+        if self.arguments.len() > 64 || self.arguments.iter().any(|arg| arg.len() > 512) {
+            return Err(format!(
+                "next operation arguments are too large for Attempt {attempt_id:?}"
+            ));
+        }
+        if self.preconditions.len() > 16
+            || self
+                .preconditions
+                .iter()
+                .any(|condition| condition.name.len() > 256 || condition.expected.len() > 256)
+        {
+            return Err("next operation preconditions are too large".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// The one durable description shared by status, handoffs, and CLI recovery
+/// checks for an Attempt waiting at `needs-user`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PauseRecord {
+    pub schema_version: u32,
+    pub pause_kind: PauseKind,
+    pub blocker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    pub required_evidence_or_decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_operation: Option<PauseOperation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_safe_operation_reason: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl PauseRecord {
+    fn blocker_for(kind: &PauseKind) -> String {
+        match kind {
+            PauseKind::Auth => "Provider authentication is required.".to_string(),
+            PauseKind::Uncertain => "A review result is uncertain or incomplete.".to_string(),
+            PauseKind::WriterCompletion => {
+                "Writer completion evidence is missing or invalid.".to_string()
+            }
+            PauseKind::CandidateGate => "Candidate checks need operator recovery.".to_string(),
+            PauseKind::HostEvidence => "Candidate-bound host evidence is required.".to_string(),
+            PauseKind::RoundCap => "The authorized Writer rounds are exhausted.".to_string(),
+            PauseKind::TranscriptPump => "Transcript or console transport failed.".to_string(),
+            PauseKind::HostSandbox => "The host sandbox blocked execution.".to_string(),
+            PauseKind::TesterHarness => "Tester evidence is not trustworthy yet.".to_string(),
+            PauseKind::ProviderUnavailable => "The model provider is unavailable.".to_string(),
+            PauseKind::Interrupted => "A previous Task stopped before settlement.".to_string(),
+            PauseKind::Unknown(_) => "An unknown pause kind was stored.".to_string(),
+        }
+    }
+
+    fn current_candidate(attempt: &Attempt) -> Option<String> {
+        attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::Complete
+                    && task.output.is_some()
+            })
+            .and_then(|task| task.output.as_ref().map(|output| output.commit.clone()))
+    }
+
+    fn current_task(attempt: &Attempt) -> Option<String> {
+        attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser))
+            .map(|task| task.id.clone())
+    }
+
+    pub(crate) fn generated(
+        attempt: &Attempt,
+        next_action: Option<String>,
+        no_safe_operation_reason: Option<String>,
+    ) -> Self {
+        let now = now_iso8601();
+        Self {
+            schema_version: PAUSE_RECORD_SCHEMA_VERSION,
+            pause_kind: attempt.pause_kind.clone().unwrap_or(PauseKind::Unknown(
+                "missing-pause-kind".to_string(),
+            )),
+            blocker: attempt
+                .pause_kind
+                .as_ref()
+                .map(Self::blocker_for)
+                .unwrap_or_else(|| "The Attempt needs user input before it can advance.".to_string()),
+            candidate_commit: Self::current_candidate(attempt),
+            task_id: Self::current_task(attempt),
+            required_evidence_or_decision: "Resolve the blocker, then use the recorded operation when its preconditions still hold.".to_string(),
+            next_operation: next_action.and_then(|command| PauseOperation::from_command(command, attempt)),
+            no_safe_operation_reason,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    pub fn validate(&self, attempt_id: &str) -> Result<(), String> {
+        if self.schema_version != PAUSE_RECORD_SCHEMA_VERSION {
+            return Err(format!(
+                "pause record schema version {} is not supported",
+                self.schema_version
+            ));
+        }
+        if self.blocker.trim().is_empty() || self.blocker.len() > 4_096 {
+            return Err("pause record blocker is empty or too large".to_string());
+        }
+        if self.required_evidence_or_decision.trim().is_empty()
+            || self.required_evidence_or_decision.len() > 4_096
+        {
+            return Err("pause record required input is empty or too large".to_string());
+        }
+        if self
+            .candidate_commit
+            .as_ref()
+            .is_some_and(|candidate| candidate.is_empty() || candidate.len() > 128)
+        {
+            return Err("pause record candidate commit is invalid".to_string());
+        }
+        if self
+            .task_id
+            .as_ref()
+            .is_some_and(|task| task.is_empty() || task.len() > 256)
+        {
+            return Err("pause record task id is invalid".to_string());
+        }
+        if self.next_operation.is_some() == self.no_safe_operation_reason.is_some() {
+            return Err(
+                "pause record must contain exactly one next operation or no-safe reason"
+                    .to_string(),
+            );
+        }
+        if let Some(operation) = self.next_operation.as_ref() {
+            operation.validate(attempt_id)?;
+        }
+        if self
+            .no_safe_operation_reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty() || reason.len() > 4_096)
+        {
+            return Err("pause record no-safe reason is empty or too large".to_string());
+        }
+        if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
+            return Err("pause record timestamps must not be empty".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn matches_attempt(&self, attempt: &Attempt) -> bool {
+        attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind.as_ref() == Some(&self.pause_kind)
+            && self.candidate_commit.as_ref().is_none_or(|candidate| {
+                Self::current_candidate(attempt).as_deref() == Some(candidate)
+            })
+            && self.task_id.as_ref().is_none_or(|task_id| {
+                attempt.tasks.iter().any(|task| {
+                    task.id == *task_id
+                        && matches!(task.status, TaskStatus::Failed | TaskStatus::NeedsUser)
+                })
+            })
+    }
+
+    fn same_content(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.pause_kind == other.pause_kind
+            && self.blocker == other.blocker
+            && self.candidate_commit == other.candidate_commit
+            && self.task_id == other.task_id
+            && self.required_evidence_or_decision == other.required_evidence_or_decision
+            && self.next_operation == other.next_operation
+            && self.no_safe_operation_reason == other.no_safe_operation_reason
+    }
 }
 
 impl PauseKind {
@@ -6816,7 +7157,11 @@ pub fn set_attempt_terminal(attempt: &mut Attempt, status: AttemptStatus) {
         status,
         AttemptStatus::Complete | AttemptStatus::Failed | AttemptStatus::NeedsUser
     ));
+    let is_needs_user = status == AttemptStatus::NeedsUser;
     attempt.status = status;
+    if !is_needs_user {
+        attempt.pause_record = None;
+    }
     attempt.completed_at.get_or_insert_with(now_iso8601);
 }
 
@@ -6877,9 +7222,13 @@ pub fn transition_attempt(
         status,
         AttemptStatus::Complete | AttemptStatus::Failed | AttemptStatus::NeedsUser
     );
+    let is_needs_user = status == AttemptStatus::NeedsUser;
     attempt.status = status;
     attempt.pause_kind = pause;
     attempt.pause_recovery = None;
+    if !is_needs_user {
+        attempt.pause_record = None;
+    }
     if is_terminal {
         attempt.completed_at.get_or_insert_with(now_iso8601);
     } else {
@@ -6898,6 +7247,7 @@ pub fn reopen_attempt(attempt: &mut Attempt) {
     attempt.status = AttemptStatus::Planned;
     attempt.pause_kind = None;
     attempt.pause_recovery = None;
+    attempt.pause_record = None;
     attempt.completed_at = None;
     for task in &mut attempt.tasks {
         if task.status == TaskStatus::NeedsUser {
@@ -6948,6 +7298,10 @@ pub fn set_merge_candidate_terminal(
 pub enum WorkModelError {
     TransitionLedgerModified,
     AttemptResumeIneligible {
+        attempt_id: String,
+        reason: String,
+    },
+    InvalidPauseRecord {
         attempt_id: String,
         reason: String,
     },
@@ -7155,6 +7509,12 @@ impl fmt::Display for WorkModelError {
                 f.write_str("durable transition history is append-only and host-owned")
             }
             Self::AttemptResumeIneligible { reason, .. } => f.write_str(reason),
+            Self::InvalidPauseRecord { attempt_id, reason } => {
+                write!(
+                    f,
+                    "Attempt {attempt_id:?} has an invalid pause record: {reason}"
+                )
+            }
             Self::RoundCapExtensionIncrementOutOfRange { requested } => write!(
                 f,
                 "round-cap extensions must add {MIN_ADDITIONAL_WRITE_ROUNDS} to {MAX_ADDITIONAL_WRITE_ROUNDS} Writer rounds, not {requested}"
@@ -7796,6 +8156,8 @@ struct AttemptRecord {
     pause_kind: Option<PauseKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pause_recovery: Option<PauseRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pause_record: Option<PauseRecord>,
     #[serde(default)]
     artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7892,6 +8254,7 @@ impl AttemptRecord {
             review_state: attempt.review_state.clone(),
             pause_kind: attempt.pause_kind.clone(),
             pause_recovery: attempt.pause_recovery,
+            pause_record: attempt.pause_record.clone(),
             artifacts: attempt.artifacts.clone(),
             evidence_recoveries: attempt.evidence_recoveries.clone(),
             approach_revision_superseded_tasks: attempt.approach_revision_superseded_tasks.clone(),
@@ -7918,6 +8281,7 @@ impl From<AttemptRecord> for Attempt {
             review_state: record.review_state,
             pause_kind: record.pause_kind,
             pause_recovery: record.pause_recovery,
+            pause_record: record.pause_record,
             artifacts: record.artifacts,
             evidence_recoveries: record.evidence_recoveries,
             approach_revision_superseded_tasks: record.approach_revision_superseded_tasks,
@@ -8347,6 +8711,7 @@ impl WorkModelStore {
                 path: path.clone(),
                 source,
             })?;
+        work_item.synchronize_pause_records(&self.project_root);
         reject_transition_history_change(&prior, &work_item, &path)?;
         if work_item != prior {
             append_transition_ledger(&prior, &mut work_item, metadata);
@@ -8373,13 +8738,6 @@ impl WorkModelStore {
                 }
             })?;
         }
-        work_item
-            .validate()
-            .map_err(|source| WorkModelStorageError::InvalidModel {
-                path: path.clone(),
-                source,
-            })?;
-
         let _lock = self.lock_work_item_model(&work_item.id)?;
         if create_new && !work_item.transitions.is_empty() {
             return Err(WorkModelStorageError::InvalidModel {
@@ -8421,6 +8779,13 @@ impl WorkModelStore {
                 _ => {}
             }
         }
+        target.synchronize_pause_records(&self.project_root);
+        target
+            .validate()
+            .map_err(|source| WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source,
+            })?;
         self.write_work_item_file_unchecked(&target, create_new)?;
         work_item
             .storage_revision
@@ -16275,6 +16640,68 @@ random banner prose that must be ignored
         assert_eq!(attempt.status, AttemptStatus::NeedsUser);
         assert_eq!(attempt.pause_kind, Some(PauseKind::RoundCap));
         assert!(attempt.completed_at.is_some());
+    }
+
+    #[test]
+    fn persisted_pause_record_carries_one_safe_operation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-pause-record", "Pause record");
+        item.add_initial_attempt("attempt-1").unwrap();
+        item.attempts[0].tasks[0].status = TaskStatus::NeedsUser;
+        suspend_attempt(&mut item.attempts[0], PauseKind::WriterCompletion);
+
+        store.create_work_item(&item).unwrap();
+        let loaded = store.read_work_item("work-pause-record").unwrap();
+        let record = loaded.attempts[0].pause_record.as_ref().unwrap();
+
+        assert_eq!(record.schema_version, PAUSE_RECORD_SCHEMA_VERSION);
+        assert_eq!(record.pause_kind, PauseKind::WriterCompletion);
+        assert!(record.next_operation.is_some());
+        assert!(record.no_safe_operation_reason.is_none());
+        assert_eq!(
+            record.next_operation.as_ref().unwrap().command,
+            "fluent queue resume work-pause-record --attempt attempt-1"
+        );
+        loaded.attempts[0].validate("work-pause-record").unwrap();
+    }
+
+    #[test]
+    fn persisted_pause_record_explicitly_explains_when_no_operation_is_safe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-pause-cap", "Pause cap");
+        item.add_initial_attempt("attempt-1").unwrap();
+        suspend_attempt(&mut item.attempts[0], PauseKind::RoundCap);
+
+        store.create_work_item(&item).unwrap();
+        let loaded = store.read_work_item("work-pause-cap").unwrap();
+        let record = loaded.attempts[0].pause_record.as_ref().unwrap();
+
+        assert!(record.next_operation.is_none());
+        assert!(
+            record
+                .no_safe_operation_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("round-cap"))
+        );
+    }
+
+    #[test]
+    fn reopening_an_attempt_clears_its_pause_record() {
+        let mut item = WorkItem::planned("work-pause-clear", "Pause clear");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        suspend_attempt(attempt, PauseKind::RoundCap);
+        attempt.pause_record = Some(PauseRecord::generated(
+            attempt,
+            None,
+            Some("no operation".to_string()),
+        ));
+
+        reopen_attempt(attempt);
+
+        assert!(attempt.pause_record.is_none());
     }
 
     #[test]

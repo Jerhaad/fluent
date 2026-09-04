@@ -3399,7 +3399,12 @@ fn write_task_error_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = render_task_error_handoff(work_item_id, attempt_id, task_id, failure);
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        render_task_error_handoff(work_item_id, attempt_id, task_id, failure),
+    );
     fs::write(&path, body)?;
     Ok(relative_path)
 }
@@ -3416,7 +3421,12 @@ fn write_current_task_error_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = render_task_error_handoff(work_item_id, attempt_id, task_id, failure);
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
+        render_task_error_handoff(work_item_id, attempt_id, task_id, failure),
+    );
     crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }

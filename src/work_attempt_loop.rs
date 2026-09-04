@@ -6960,12 +6960,15 @@ fn write_candidate_gate_handoff(
                 "After resolving the reported condition, resume this same Attempt through the scheduler:\n\n`fluent queue resume {work_item_id} --attempt {attempt_id}`"
             )
         });
-    fs::write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\n{recovery}\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
         ),
-    )?;
+    );
+    fs::write(&path, body)?;
     Ok(relative_path)
 }
 
@@ -7656,12 +7659,15 @@ fn write_writer_completion_handoff(
             "restore its entries to the approved Plan",
         )
     };
-    fs::write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# {title}\n\nFluent stopped before Tester and review planning because the {contract} cannot be repaired safely.\n\nReason: {reason}\n\nInspect `{progress_path}` and {repair}.\n"
         ),
-    )?;
+    );
+    fs::write(&path, body)?;
     if matrix {
         // A pending Documentation finding can be a deliberate, tree-identical
         // commit-metadata repair rather than a malformed completion matrix.
@@ -8880,13 +8886,15 @@ fn write_needs_user_handoff(
         .map(|artifact| format!("- {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
-    crate::atomic_write::atomic_write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop found uncertain or missing review verdicts.\n\n{artifacts}\n"
-        )
-        .as_bytes(),
-    )?;
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -8904,14 +8912,16 @@ fn write_focused_evidence_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::atomic_write::atomic_write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs focused test evidence\n\nThe failed Tests Review requested one focused check against the unchanged candidate. Fluent did not plan another Writer.\n\nReview: `{}`\n\nTo authorize the exact command recorded in that review, run:\n\n`fluent attempt evidence run {} {} --review-artifact {}`\n",
             review.path, work_item_id, attempt_id, review.path
-        )
-        .as_bytes(),
-    )?;
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -8926,14 +8936,16 @@ fn write_candidate_gate_evidence_handoff(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    crate::atomic_write::atomic_write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs candidate-gate host evidence\n\nThe final candidate gate requires one command-shaped Test reference that did not run inside canonical Tester. Run this exact command on an authorized host against the unchanged candidate:\n\n`{}`\n\nRecord its result as a schema-version-1 evidence document whose `check` is that exact command and whose `working_directory` is `.`. Use `result: pass` when the command succeeds or `result: fail` when it exposes a candidate defect, then attach it to the immutable rejected gate:\n\n`{}`\n\nFluent sends either result to a targeted Tests Review. An accepted passing result can satisfy the gate; a reviewed failing result can request a corrective Writer without discarding the candidate or review history. Then run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return that Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nRejected gate: `{}`\n",
             action.command, action.attach_command, action.gate_artifact
-        )
-        .as_bytes(),
-    )?;
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -8964,13 +8976,15 @@ fn write_budget_exhausted_handoff(
             max_no_progress_rounds()
         )
     };
-    crate::atomic_write::atomic_write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs user input\n\nThe Attempt loop stopped advancing. The candidate commit and review history remain unchanged.\n\n{recovery}\n\nFailed correction artifacts still need attention:\n\n{artifacts}\n"
-        )
-        .as_bytes(),
-    )?;
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
@@ -8991,13 +9005,15 @@ fn write_failed_recheck_evidence_handoff(
         .map(|artifact| format!("- {}", artifact.path))
         .collect::<Vec<_>>()
         .join("\n");
-    crate::atomic_write::atomic_write(
-        &path,
+    let body = crate::work_status::append_pause_record_to_handoff(
+        project_root,
+        work_item_id,
+        attempt_id,
         format!(
             "# Attempt needs external test evidence\n\nThe unchanged candidate stopped after one failed-command recheck. Run the exact command on an authorized host and attach a schema-version-1 evidence document with `result: pass` when it succeeds. If a related direct public command exposes a candidate defect before the exact command can run, you may attach a `result: fail` diagnostic; Fluent will route it to a targeted Tests Review but will never treat that different command as a passing recheck.\n\n`{action}`\n\nFluent binds the evidence to the unchanged candidate and immutable recheck. Accepted passing evidence can supersede the host-only failure; reviewed failing evidence can request a corrective Writer.\n\nThen run `fluent queue resume {work_item_id} --attempt {attempt_id}` to return the targeted Tests Review to the scheduler, or `fluent attempt run {work_item_id} {attempt_id}` to resume it directly.\n\nThe evidence must address these immutable recheck artifacts:\n\n{artifacts}\n"
-        )
-        .as_bytes(),
-    )?;
+        ),
+    );
+    crate::atomic_write::atomic_write(&path, body.as_bytes())?;
     Ok(relative_path)
 }
 
