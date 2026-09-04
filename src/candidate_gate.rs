@@ -8,8 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::work_model::{
-    CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract,
-    WriterCompletionRequirementKind,
+    CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract, WriterCompletionRequirementKind,
 };
 
 pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
@@ -769,8 +768,8 @@ pub(crate) fn validate_derived_project_check(
     {
         bail!("derived project-check evidence must contain two failed checks");
     }
-    let gate_findings =
-        metadata_findings(project_root, &metadata_check.diagnostics, &[], false).ok_or_else(|| {
+    let gate_findings = metadata_findings(project_root, &metadata_check.diagnostics, &[], false)
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "project-check failure is not explained by structured commit-metadata diagnostics"
             )
@@ -853,8 +852,8 @@ pub(crate) fn validate_derived_project_check(
     if log_diagnostics.is_empty() {
         bail!("derived project-check hook log has no structured hook diagnostics");
     }
-    let log_findings =
-        metadata_findings(project_root, &log_diagnostics, &known_commits, true).ok_or_else(|| {
+    let log_findings = metadata_findings(project_root, &log_diagnostics, &known_commits, true)
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "project-check hook log contains a diagnostic unrelated to commit-metadata findings"
             )
@@ -883,12 +882,17 @@ pub(crate) fn validate_derived_project_check(
         .filter(|diagnostic| !is_project_check_exit_diagnostic(diagnostic))
         .cloned()
         .collect::<Vec<_>>();
-    let diagnostic_findings =
-        metadata_findings(project_root, &diagnostic_findings, &known_commits, true).ok_or_else(|| {
-            anyhow::anyhow!(
-                "project-check diagnostics contain a diagnostic unrelated to commit-metadata findings"
-            )
-        })?;
+    let diagnostic_findings = metadata_findings(
+        project_root,
+        &diagnostic_findings,
+        &known_commits,
+        true,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "project-check diagnostics contain a diagnostic unrelated to commit-metadata findings"
+        )
+    })?;
     if diagnostic_findings
         .iter()
         .any(|finding| !log_findings.contains(finding))
@@ -2020,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-fn derived_hook_classifier_normalizes_project_body_line_wording() {
+    fn derived_hook_classifier_normalizes_project_body_line_wording() {
         assert_eq!(
             normalize_metadata_reason("body line 2 exceeds 72 characters", true),
             Some("literal-line-breaks".to_string())

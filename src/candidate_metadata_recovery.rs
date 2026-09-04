@@ -18,8 +18,8 @@ use std::path::Path;
 
 use crate::candidate_gate::{
     CandidateCheckStatus, CandidateGateDisposition, CandidateGatePhase,
-    authorized_tree_identical_metadata_rewrite_base,
-    read_prior_writer_gate, validate_prior_writer_gate,
+    authorized_tree_identical_metadata_rewrite_base, read_prior_writer_gate,
+    validate_prior_writer_gate,
 };
 use crate::follow_up::content_digest;
 use crate::git;
