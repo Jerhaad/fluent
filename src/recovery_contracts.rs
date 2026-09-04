@@ -1286,6 +1286,9 @@ pub(crate) fn candidate_workspace_is_clean_at(
     } else {
         project_root.join(workspace)
     };
+    if crate::worktree::ensure_candidate_worktree(project_root, &workspace).is_err() {
+        return false;
+    }
     git::run_stdout(
         &workspace,
         &["rev-parse", "HEAD"],

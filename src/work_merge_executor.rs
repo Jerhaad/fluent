@@ -3091,40 +3091,11 @@ fn cleanup_managed_workspace(project_root: &Path, source_workspace: &Path) -> Re
 }
 
 fn ensure_same_git_repository(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let source_common = fs::canonicalize(worktree::git_common_dir(project_root)?)?;
-    let workspace_common = fs::canonicalize(worktree::git_common_dir(workspace_path)?)?;
-    if source_common != workspace_common {
-        bail!(
-            "Workspace {} belongs to a different git repository",
-            workspace_path.display()
-        );
-    }
-    Ok(())
+    worktree::ensure_same_git_repository(project_root, workspace_path)
 }
 
 fn ensure_registered_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
-    let expected = fs::canonicalize(workspace_path)?;
-    let output = git::run_raw(project_root, &["worktree", "list", "--porcelain"])?;
-    if !output.status.success() {
-        bail!(
-            "Failed to list git worktrees: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(path) = line.strip_prefix("worktree ") else {
-            continue;
-        };
-        if fs::canonicalize(path).is_ok_and(|actual| actual == expected) {
-            return Ok(());
-        }
-    }
-
-    bail!(
-        "Workspace {} exists but is not a registered git worktree",
-        workspace_path.display()
-    )
+    worktree::ensure_registered_worktree(project_root, workspace_path)
 }
 
 fn ensure_clean_worktree(workspace_path: &Path) -> Result<()> {

@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::git;
@@ -28,6 +29,51 @@ pub fn git_common_dir(dir: &Path) -> Result<PathBuf> {
         "resolve common git directory",
     )?;
     Ok(PathBuf::from(path))
+}
+
+/// Require a workspace to belong to the project's Git repository.
+pub(crate) fn ensure_same_git_repository(project_root: &Path, workspace_path: &Path) -> Result<()> {
+    let source_common = fs::canonicalize(git_common_dir(project_root)?)?;
+    let workspace_common = fs::canonicalize(git_common_dir(workspace_path)?)?;
+    if source_common != workspace_common {
+        bail!(
+            "Workspace {} belongs to a different git repository",
+            workspace_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Require a workspace to remain registered in the project's worktree set.
+pub(crate) fn ensure_registered_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
+    let expected = fs::canonicalize(workspace_path)?;
+    let output = git::run_raw(project_root, &["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        bail!(
+            "Failed to list git worktrees: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        if fs::canonicalize(path).is_ok_and(|actual| actual == expected) {
+            return Ok(());
+        }
+    }
+
+    bail!(
+        "Workspace {} exists but is not a registered git worktree",
+        workspace_path.display()
+    )
+}
+
+/// Require a candidate workspace to remain the project's registered worktree.
+pub(crate) fn ensure_candidate_worktree(project_root: &Path, workspace_path: &Path) -> Result<()> {
+    ensure_same_git_repository(project_root, workspace_path)?;
+    ensure_registered_worktree(project_root, workspace_path)
 }
 
 #[cfg(test)]

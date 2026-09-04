@@ -26452,6 +26452,277 @@ fn exact_host_evidence_classification_replay_accepts_completed_correction_withou
 }
 
 #[test]
+fn exact_host_evidence_classification_replay_rejects_stale_completed_correction_without_mutation() {
+    for stale in ["dirty", "advanced"] {
+        let tmp = TempDir::new().unwrap();
+        let run_suffix = tmp
+            .path()
+            .file_name()
+            .expect("fixture TempDir has a name")
+            .to_string_lossy();
+        let work_item_id = format!("evidence-classify-stale-completed-{stale}-{run_suffix}");
+        let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+            setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+        let resolution = "The failed candidate-bound check needs a source correction.";
+        let classify_args = [
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id.as_str(),
+            "attempt-1",
+            "--candidate",
+            candidate.as_str(),
+            "--review-artifact",
+            targeted_path.as_str(),
+            "--evidence-digest",
+            digest.as_str(),
+            "--resolution",
+            resolution,
+        ];
+        let first = fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .output()
+            .unwrap();
+        assert!(
+            first.status.success(),
+            "initial classification failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let classified = work_item_value(&project, &work_item_id);
+        let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+            ["code_change_classification"]["writer_task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let audit_path = classified["attempts"][0]["evidence_recoveries"][0]
+            ["code_change_classification"]["audit_artifact"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        commit_file(
+            &project,
+            "stale-completed-correction.txt",
+            "candidate correction\n",
+            "Apply completed correction",
+        );
+        let corrected_candidate = git_head(&project);
+        WorkModelStore::new(&project)
+            .mutate_work_item(&work_item_id, |item| {
+                let source_output = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.kind == fluent::work_model::TaskKind::Write
+                            && task.id != writer_id
+                            && task.status == fluent::work_model::TaskStatus::Complete
+                    })
+                    .and_then(|task| task.output.clone())
+                    .expect("fixture has a completed source Writer");
+                let writer = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.id == writer_id)
+                    .expect("classification has a corrective Writer");
+                writer.status = fluent::work_model::TaskStatus::Complete;
+                writer.output = Some(fluent::work_model::TaskOutput {
+                    workspace_id: source_output.workspace_id,
+                    workspace_path: source_output.workspace_path,
+                    source_branch: source_output.source_branch,
+                    base_commit: Some(candidate.clone()),
+                    commit: corrected_candidate,
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                writer.completed_at = Some(fluent::work_model::now_iso8601());
+                Ok(())
+            })
+            .unwrap();
+
+        let before_model = work_item_value(&project, &work_item_id);
+        let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+        let before_audit = fs::read(project.join(&audit_path)).unwrap();
+        let before_head = git_head(&project);
+        let before_status = git::run_stdout(
+            &project,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect completed correction before stale replay",
+        )
+        .unwrap();
+
+        match stale {
+            "dirty" => {
+                fs::write(project.join("stale-completed-marker"), b"dirty\n").unwrap();
+            }
+            "advanced" => commit_file(
+                &project,
+                "after-completed-correction.txt",
+                "later candidate\n",
+                "Advance completed correction",
+            ),
+            _ => unreachable!("stale completed correction cases are exhaustive"),
+        }
+        let stale_head = git_head(&project);
+        let stale_status = git::run_stdout(
+            &project,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect stale completed correction before replay",
+        )
+        .unwrap();
+
+        let replay = fluent_cmd()
+            .current_dir(&project)
+            .args(classify_args)
+            .output()
+            .unwrap();
+        assert!(
+            !replay.status.success(),
+            "stale completed {stale} replay unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&replay.stderr)
+                .contains("completed corrective Writer output is not the current clean candidate"),
+            "stale completed {stale} replay reported the wrong failure: stderr={}",
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        assert_eq!(work_item_value(&project, &work_item_id), before_model);
+        assert_eq!(
+            persisted_work_snapshot(&project, &work_item_id),
+            before_persisted,
+            "stale completed {stale} replay changed persisted model or artifacts"
+        );
+        assert_eq!(fs::read(project.join(&audit_path)).unwrap(), before_audit);
+        assert_eq!(git_head(&project), stale_head);
+        assert_eq!(
+            git::run_stdout(
+                &project,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "inspect stale completed correction after replay rejection",
+            )
+            .unwrap(),
+            stale_status
+        );
+        if stale == "dirty" {
+            assert_eq!(stale_head, before_head);
+            assert_ne!(stale_status, before_status);
+        } else {
+            assert_ne!(stale_head, before_head);
+            assert_eq!(stale_status, before_status);
+        }
+    }
+}
+
+#[test]
+fn host_evidence_classification_rejects_clean_replacement_clone_without_mutation() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-replacement-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
+    let replacement = workspace_cleanup.workspace.clone();
+    let replacement_string = replacement.to_string_lossy().into_owned();
+    git::run(
+        &project,
+        &["worktree", "remove", "--force", replacement_string.as_str()],
+        "replace recorded candidate worktree",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &[
+            "clone",
+            project.to_str().unwrap(),
+            replacement_string.as_str(),
+        ],
+        "create clean replacement candidate clone",
+    )
+    .unwrap();
+    assert_eq!(git_head(&replacement), candidate);
+    let before_model = work_item_value(&project, &work_item_id);
+    let before_persisted = persisted_work_snapshot(&project, &work_item_id);
+    let before_project_head = git_head(&project);
+    let before_project_status = git::run_stdout(
+        &project,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect project before replacement rejection",
+    )
+    .unwrap();
+    let before_replacement_status = git::run_stdout(
+        &replacement,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect replacement before classification",
+    )
+    .unwrap();
+
+    let output = fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id.as_str(),
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            "The replacement candidate is not the recorded worktree.",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "classification accepted a clean replacement clone: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("candidate workspace no longer matches the classified commit"),
+        "classification did not report the replacement identity failure: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(work_item_value(&project, &work_item_id), before_model);
+    assert_eq!(
+        persisted_work_snapshot(&project, &work_item_id),
+        before_persisted,
+        "replacement classification changed the Work Item, Attempt, task, audit, or evidence"
+    );
+    assert_eq!(git_head(&project), before_project_head);
+    assert_eq!(
+        git::run_stdout(
+            &project,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect project after replacement rejection",
+        )
+        .unwrap(),
+        before_project_status
+    );
+    assert_eq!(
+        git::run_stdout(
+            &replacement,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "inspect replacement after classification rejection",
+        )
+        .unwrap(),
+        before_replacement_status
+    );
+    assert_eq!(git_head(&replacement), candidate);
+}
+
+#[test]
 fn exact_host_evidence_classification_replay_rejects_superseded_writer_without_mutation() {
     let tmp = TempDir::new().unwrap();
     let run_suffix = tmp
@@ -27748,6 +28019,120 @@ exit 0
             "stale {stale} reservation changed candidate worktree"
         );
     }
+}
+
+#[test]
+fn classified_host_evidence_scheduler_claim_dispatches_one_writer() {
+    let tmp = TempDir::new().unwrap();
+    let run_suffix = tmp
+        .path()
+        .file_name()
+        .expect("fixture TempDir has a name")
+        .to_string_lossy();
+    let work_item_id = format!("evidence-classify-scheduler-{run_suffix}");
+    let (project, candidate, _prior_review_path, targeted_path, digest, _snapshot_path) =
+        setup_paused_code_change_classification_fixture(&tmp, &work_item_id);
+    let workspace_cleanup = bind_candidate_to_managed_sibling(&project, &work_item_id, &candidate);
+    let resolution = "The failed candidate-bound check needs a source correction.";
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "classify",
+            work_item_id.as_str(),
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--review-artifact",
+            &targeted_path,
+            "--evidence-digest",
+            &digest,
+            "--resolution",
+            resolution,
+        ])
+        .assert()
+        .success();
+
+    let classified = work_item_value(&project, &work_item_id);
+    let writer_id = classified["attempts"][0]["evidence_recoveries"][0]
+        ["code_change_classification"]["writer_task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", &work_item_id, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    assert_eq!(dispatch_count(&project, &work_item_id), 1);
+    assert_eq!(latest_dispatch_status(&project, &work_item_id), "queued");
+
+    let marker = tmp.path().join("classified-scheduler-writer-invocations");
+    let bin_dir = tmp.path().join("classified-scheduler-writer-bin");
+    let marker_path = marker.to_string_lossy();
+    let writer_workspace_suffix = format!("{work_item_id}-attempt-1");
+    let script = format!(
+        r##"#!/bin/bash
+set -euo pipefail
+PROMPT=""
+NEXT_IS_PROMPT=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+done
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{{"learning_summary":"learned","follow_ups":[]}}' > "$DRAFT"
+else
+case "$PWD" in
+  *{writer_workspace_suffix})
+    printf invoked >> "{marker_path}"
+    printf 'scheduler classified correction\n' >> README.md
+    git add README.md
+    git commit -m "Apply scheduler classified correction" >/dev/null
+    ;;
+  *)
+    printf 'Verdict: pass\n\nScheduler follow-up review.\n' > review.md
+    ;;
+esac
+fi
+exit 0
+"##
+    );
+    write_scheduler_claude(&bin_dir, &script);
+
+    let scheduler_output =
+        run_scheduler_until_dispatch_status(&project, &work_item_id, &bin_dir, "candidate-ready");
+
+    let completed = work_item_value(&project, &work_item_id);
+    let writer = completed["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == writer_id)
+        .expect("scheduler must retain the classified Writer");
+    assert_eq!(
+        writer["status"],
+        "complete",
+        "scheduler did not complete the classified Writer: {completed}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&scheduler_output.stdout),
+        String::from_utf8_lossy(&scheduler_output.stderr)
+    );
+    let output = writer["output"].as_object().expect("Writer has output");
+    assert_ne!(output["commit"], candidate);
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "invoked",
+        "scheduler claimed or dispatched the classified Writer more than once"
+    );
+    assert_eq!(dispatch_count(&project, &work_item_id), 1);
+    assert_eq!(
+        latest_dispatch_status(&project, &work_item_id),
+        "candidate-ready"
+    );
+    assert_eq!(git_head(&workspace_cleanup.workspace), output["commit"]);
 }
 
 #[test]

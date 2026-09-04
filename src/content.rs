@@ -849,6 +849,8 @@ Check item {{ITEM_ID}}.
 
         let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md")
             .expect("bundled host-evidence recovery guide must be present");
+        assert!(guide.contains("## Contents"));
+        assert!(guide.contains("[Classify a candidate-bound source correction]"));
         let attachment = guide
             .split_once("## Attach host-only evidence")
             .and_then(|(_, rest)| {
@@ -867,6 +869,9 @@ Check item {{ITEM_ID}}.
             .expect("the guide must document candidate-bound classification");
         assert!(classification.contains("source correction"));
         assert!(classification.contains("malformed qualification"));
+        assert!(classification.contains("new-review qualification rule"));
+        assert!(classification.contains("`--evidence-digest` remains required"));
+        assert!(classification.contains("derive only the missing persisted"));
         assert!(guide.contains("## Run one focused Tests check"));
         assert!(guide.contains("fluent attempt evidence run <work-item-id> <attempt-id>"));
         let normalized_guide = guide.split_whitespace().collect::<Vec<_>>().join(" ");

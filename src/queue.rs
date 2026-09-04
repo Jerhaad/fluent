@@ -1277,27 +1277,14 @@ fn ensure_code_change_classification_resume_ready(
     if completed.commit != recovery.candidate_commit {
         return Err(ineligible("the source candidate commit changed"));
     }
-    let workspace = Path::new(&completed.workspace_path);
-    let workspace = if workspace.is_absolute() {
-        workspace.to_path_buf()
-    } else {
-        project_root.join(workspace)
-    };
-    let head = crate::git::run_stdout(
-        &workspace,
-        &["rev-parse", "HEAD"],
-        "inspect classified candidate",
-    )?;
-    if head != recovery.candidate_commit {
-        return Err(ineligible("the candidate workspace HEAD changed"));
-    }
-    let status = crate::git::run_stdout(
-        &workspace,
-        &["status", "--porcelain", "--untracked-files=all"],
-        "inspect classified candidate cleanliness",
-    )?;
-    if !status.is_empty() {
-        return Err(ineligible("the candidate workspace is not clean"));
+    if !crate::recovery_contracts::candidate_workspace_is_clean_at(
+        project_root,
+        completed,
+        &recovery.candidate_commit,
+    ) {
+        return Err(ineligible(
+            "the candidate workspace is not the current clean registered worktree",
+        ));
     }
     if !writer
         .input_artifacts

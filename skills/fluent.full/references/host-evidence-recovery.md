@@ -4,12 +4,19 @@ Use exactly one recovery path. Attach host-only evidence when the candidate is
 correct and a concrete external condition needs another host run. Classify only
 a paused candidate-bound recovery when the operator authorizes a source
 correction: a new recovery must have an actionable `evidence-needed` review,
-while a legacy paused recovery may contain an unqualified marker. A single
-malformed `Disposition: evidence-needed` marker follows the ordinary
-`code-change` Writer path; missing, duplicate, or unknown disposition markers
-remain an uncertain pause. These paths are not interchangeable: attachment
-keeps the candidate waiting, while classification schedules a Writer on the
-existing Attempt.
+while a legacy paused recovery may contain an unqualified marker. For a new
+review, a single malformed `Disposition: evidence-needed` marker follows the
+ordinary `code-change` Writer path; missing, duplicate, or unknown disposition
+markers remain an uncertain pause. The legacy paused-recovery exception keeps
+an unqualified marker eligible for its saved recovery. These paths are not
+interchangeable: attachment keeps the candidate waiting, while classification
+schedules a Writer on the existing Attempt.
+
+## Contents
+
+- [Attach host-only evidence](#attach-host-only-evidence)
+- [Run one focused Tests check](#run-one-focused-tests-check)
+- [Classify a candidate-bound source correction](#classify-a-candidate-bound-source-correction)
 
 ## Attach host-only evidence
 
@@ -95,7 +102,8 @@ non-empty `Additional-Proof` that would resolve it. A single
 `Disposition: evidence-needed` marker with missing, empty, or otherwise
 malformed qualification follows the ordinary `code-change` Writer path. Missing,
 duplicate, or unknown `Disposition` markers remain an uncertain pause. A legacy
-paused recovery with an unqualified marker is the only documented exception.
+paused recovery with an unqualified marker preserves the only documented
+exception to that new-review qualification rule.
 When the saved targeted review names the actionable condition above and the
 operator authorizes a source correction, classify that correction on the
 existing paused Attempt instead of attaching the same proof:
@@ -107,6 +115,11 @@ fluent attempt evidence classify <work-item-id> <attempt-id> \
   --evidence-digest <attached-evidence-sha256> \
   --resolution 'The candidate-bound failure requires a source correction.'
 ```
+
+`--evidence-digest` remains required for every `classify` invocation, including
+legacy recovery. Legacy compatibility may derive only the missing persisted
+target review digest from the exact bound Review bytes; it never derives the
+supplied evidence digest or permits that argument to be omitted.
 
 Source-correction classification requires an immutable candidate-bound evidence
 snapshot whose `result` is `fail`. A passing snapshot belongs to the host-only
