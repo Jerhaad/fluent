@@ -2205,6 +2205,17 @@ cleanup eligibility. It rejects an unknown pause or newer writer version before
 candidate, artifact, Git, or model effects, preventing an older binary from
 silently normalizing state it does not understand.
 
+The split Work Item and Attempt records also carry a storage schema version.
+Records from before that marker read as legacy version 0, but a newer unknown
+version is rejected rather than guessed. `fluent work-item upgrade [id]` is the
+explicit conversion boundary: it verifies the stored versions and writer
+version, records the source and destination in an immutable audit file under
+`artifacts/<work-item-id>/model-upgrades/`, and rewrites the Work Item, Attempts,
+Tasks, and Merge Candidates through the normal transaction. Running it again
+after success is a no-op. The command accepts an optional ID; without one it
+processes each stored Work Item independently, so a future-format record is
+reported instead of being silently changed.
+
 The Work storage contract is:
 
 ```

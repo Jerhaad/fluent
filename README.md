@@ -65,6 +65,12 @@ rebuild stored artifact metrics once with `fluent work-item rebuild-metrics` if
 you want historical Work Items to report their complete storage totals
 immediately.
 
+If an older Work Item was written before the current split-record format, make
+its conversion explicit with `fluent work-item upgrade <work-item-id>` (or omit
+the ID to process all stored Work Items). Fluent records the source and target
+format in an audit file, rewrites the records transactionally, and treats a
+repeat as a no-op. Unknown future formats are rejected rather than guessed.
+
 See the [v0.3.0 release notes](documentation/releases/v0.3.0.md) for behavior
 changes and recovery commands.
 

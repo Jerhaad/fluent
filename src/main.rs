@@ -501,6 +501,24 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         },
+        WorkItemCommands::Upgrade { id } => {
+            let ids = match id {
+                Some(id) => vec![id],
+                None => store.list_work_item_ids()?,
+            };
+            for work_item_id in ids {
+                let report = store.upgrade_work_item(&work_item_id)?;
+                if report.already_current {
+                    println!("Work Item {work_item_id} already uses the current model format");
+                } else {
+                    println!(
+                        "Upgraded Work Item {work_item_id} to model record schema {} (audit {})",
+                        fluent::work_model::WORK_MODEL_RECORD_SCHEMA_VERSION,
+                        report.audit_path.as_deref().unwrap_or("<none>")
+                    );
+                }
+            }
+        }
         WorkItemCommands::RebuildMetrics { id } => {
             let items = match id {
                 Some(id) => vec![store.read_work_item(&id)?],

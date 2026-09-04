@@ -26,6 +26,12 @@ const WORK_TRANSACTIONS_DIR: &str = "transactions";
 pub const WORK_ARTIFACTS_DIR: &str = ".fluent/work/artifacts";
 pub const WORK_PROGRESS_DIR: &str = ".fluent/work/progress";
 pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Version of the split Work Item and Attempt record format. Records written
+/// before this marker omit the field and are read as version 0. They remain
+/// readable, but the explicit `work-item upgrade` command rewrites them using
+/// this version after checking every record.
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
 pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
@@ -497,6 +503,46 @@ pub struct DurableTransitionMetadata {
     pub origin: DurableTransitionOrigin,
     pub reason: Option<String>,
     pub evidence_ref: Option<String>,
+}
+
+/// One explicit conversion of persisted Work Item records to the current
+/// storage format. The record is written beside the Work Item so an operator
+/// can see which older format was accepted and when it was converted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WorkModelUpgradeRecord {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub work_item_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_model_writer_version: Option<String>,
+    pub to_model_writer_version: String,
+    pub from_record_schema_version: u32,
+    pub to_record_schema_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<WorkModelAttemptUpgrade>,
+    pub upgraded_at: String,
+}
+
+/// The format conversion applied to one split Attempt record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WorkModelAttemptUpgrade {
+    pub attempt_id: String,
+    pub from_record_schema_version: u32,
+    pub to_record_schema_version: u32,
+}
+
+/// Result returned by the public Work Item format-upgrade operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkModelUpgradeReport {
+    pub work_item_id: String,
+    pub operation_id: Option<String>,
+    pub from_model_writer_version: Option<String>,
+    pub from_record_schema_version: u32,
+    pub upgraded_attempts: Vec<WorkModelAttemptUpgrade>,
+    pub audit_path: Option<String>,
+    pub already_current: bool,
 }
 
 pub const MAX_TRANSITION_REASON_BYTES: usize = 1_024;
@@ -2090,18 +2136,50 @@ impl WorkItem {
     }
 }
 
+fn version_triplet(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value.split_once('-').map_or(value, |(core, _)| core);
+    let mut parts = core.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
+}
+
 fn version_is_newer(writer: &str, installed: &str) -> bool {
-    fn triplet(value: &str) -> Option<(u64, u64, u64)> {
-        let core = value.split_once('-').map_or(value, |(core, _)| core);
-        let mut parts = core.split('.');
-        let parsed = (
-            parts.next()?.parse().ok()?,
-            parts.next()?.parse().ok()?,
-            parts.next()?.parse().ok()?,
-        );
-        parts.next().is_none().then_some(parsed)
+    matches!(
+        (version_triplet(writer), version_triplet(installed)),
+        (Some(writer), Some(installed)) if writer > installed
+    )
+}
+
+fn model_upgrade_operation_id(
+    work_item_id: &str,
+    from_model_writer_version: Option<&str>,
+    from_record_schema_version: u32,
+    attempts: &[(String, u32)],
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        "work-model-upgrade",
+        work_item_id,
+        from_model_writer_version.unwrap_or("<legacy>"),
+        &from_record_schema_version.to_string(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
     }
-    matches!((triplet(writer), triplet(installed)), (Some(writer), Some(installed)) if writer > installed)
+    for (attempt_id, version) in attempts {
+        hasher.update((attempt_id.len() as u64).to_be_bytes());
+        hasher.update(attempt_id.as_bytes());
+        hasher.update(version.to_be_bytes());
+    }
+    format!("upgrade-{:x}", hasher.finalize())
+}
+
+fn model_upgrade_audit_path(work_item_id: &str, operation_id: &str) -> String {
+    format!("{WORK_ARTIFACTS_DIR}/{work_item_id}/model-upgrades/{operation_id}.json")
 }
 
 /// Durable marker that a Work Item was explicitly abandoned.
@@ -7713,6 +7791,18 @@ pub enum WorkModelError {
         attempt_id: String,
         reason: String,
     },
+    UnsupportedStoredRecordVersion {
+        record_kind: &'static str,
+        found: u32,
+        supported: u32,
+    },
+    InvalidStoredWriterVersion {
+        version: String,
+    },
+    WorkModelUpgradeConflict {
+        work_item_id: String,
+        operation_id: String,
+    },
     RecoveryOperationIneligible {
         attempt_id: String,
         reason: String,
@@ -7937,6 +8027,25 @@ impl fmt::Display for WorkModelError {
                     "Attempt {attempt_id:?} has an invalid recovery operation: {reason}"
                 )
             }
+            Self::UnsupportedStoredRecordVersion {
+                record_kind,
+                found,
+                supported,
+            } => write!(
+                f,
+                "{record_kind} record schema version {found} is newer than supported version {supported}; upgrade Fluent before reading it"
+            ),
+            Self::InvalidStoredWriterVersion { version } => write!(
+                f,
+                "stored Fluent model-writer version {version:?} is not a valid semantic version; refusing to guess its format"
+            ),
+            Self::WorkModelUpgradeConflict {
+                work_item_id,
+                operation_id,
+            } => write!(
+                f,
+                "model upgrade {operation_id:?} for Work Item {work_item_id:?} has different audit bytes"
+            ),
             Self::RecoveryOperationIneligible { attempt_id, reason } => {
                 write!(
                     f,
@@ -8508,6 +8617,8 @@ pub struct WorkModelStore {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkItemRecord {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    schema_version: u32,
     id: String,
     title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8558,6 +8669,11 @@ struct WorkItemTransaction {
     work_item: WorkItem,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredRecordVersions {
+    attempts: Vec<(String, u32)>,
+}
+
 impl WorkItemTransaction {
     const SCHEMA_VERSION: u32 = 1;
 }
@@ -8576,6 +8692,8 @@ fn is_zero_u32(value: &u32) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AttemptRecord {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    schema_version: u32,
     id: String,
     work_item_id: String,
     #[serde(default, skip_serializing_if = "attempt_kind_is_write")]
@@ -8628,6 +8746,7 @@ struct TaskRecord {
 impl From<&WorkItem> for WorkItemRecord {
     fn from(work_item: &WorkItem) -> Self {
         Self {
+            schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
             id: work_item.id.clone(),
             title: work_item.title.clone(),
             model_writer_version: Some(WORK_MODEL_WRITER_VERSION.to_string()),
@@ -8682,6 +8801,7 @@ impl From<WorkItemRecord> for WorkItem {
 impl AttemptRecord {
     fn from_attempt(attempt: &Attempt, order: usize) -> Self {
         Self {
+            schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
             id: attempt.id.clone(),
             work_item_id: attempt.work_item_id.clone(),
             kind: attempt.kind.clone(),
@@ -8841,6 +8961,16 @@ impl WorkModelStore {
             .collect()
     }
 
+    /// List Work Item IDs without deserializing their records. The upgrade
+    /// command uses this so one newer/unknown record does not get guessed at
+    /// merely while discovering the remaining IDs.
+    pub fn list_work_item_ids(&self) -> Result<Vec<String>, WorkModelStorageError> {
+        self.list_work_item_paths()?
+            .into_iter()
+            .map(|path| file_stem_id(&path))
+            .collect()
+    }
+
     pub fn list_work_item_results(
         &self,
     ) -> Result<Vec<Result<WorkItem, WorkModelStorageError>>, WorkModelStorageError> {
@@ -8884,6 +9014,150 @@ impl WorkModelStore {
     pub fn read_work_item(&self, id: &str) -> Result<WorkItem, WorkModelStorageError> {
         let path = self.work_item_path(id)?;
         self.read_work_item_file(&path, true)
+    }
+
+    /// Convert one legacy Work Item and all of its split Attempt records to the
+    /// current storage format. The operation is deliberately explicit: normal
+    /// reads still accept older records, while this method records the source
+    /// versions and rewrites every record through the normal transaction path.
+    /// Repeating it after success reports `already_current` and performs no
+    /// second rewrite.
+    pub fn upgrade_work_item(
+        &self,
+        id: &str,
+    ) -> Result<WorkModelUpgradeReport, WorkModelStorageError> {
+        let path = self.work_item_path(id)?;
+        let _lock = self.lock_work_item_model(id)?;
+        self.recover_work_item_transaction(id)?;
+
+        let stored = read_json_file::<WorkItemRecord>(&path)?;
+        ensure_supported_record_schema(&path, "Work Item", stored.schema_version)?;
+        let versions = self.read_stored_record_versions_unlocked(id)?;
+        let item = self.read_work_item_file_unlocked(&path, true)?;
+        item.ensure_mutation_compatible().map_err(|source| {
+            WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        if let Some(writer) = item.model_writer_version.as_deref()
+            && version_triplet(writer).is_none()
+        {
+            return Err(WorkModelStorageError::InvalidModel {
+                path,
+                source: WorkModelError::InvalidStoredWriterVersion {
+                    version: writer.to_string(),
+                },
+            });
+        }
+
+        let legacy_attempts = versions
+            .attempts
+            .iter()
+            .filter(|(_, version)| *version != WORK_MODEL_RECORD_SCHEMA_VERSION)
+            .map(|(attempt_id, version)| WorkModelAttemptUpgrade {
+                attempt_id: attempt_id.clone(),
+                from_record_schema_version: *version,
+                to_record_schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
+            })
+            .collect::<Vec<_>>();
+        let needs_upgrade = stored.schema_version != WORK_MODEL_RECORD_SCHEMA_VERSION
+            || !legacy_attempts.is_empty()
+            || item.model_writer_version.as_deref() != Some(WORK_MODEL_WRITER_VERSION);
+        if !needs_upgrade {
+            return Ok(WorkModelUpgradeReport {
+                work_item_id: id.to_string(),
+                operation_id: None,
+                from_model_writer_version: item.model_writer_version.clone(),
+                from_record_schema_version: stored.schema_version,
+                upgraded_attempts: Vec::new(),
+                audit_path: None,
+                already_current: true,
+            });
+        }
+
+        let operation_id = model_upgrade_operation_id(
+            id,
+            item.model_writer_version.as_deref(),
+            stored.schema_version,
+            &versions.attempts,
+        );
+        let audit_relative = model_upgrade_audit_path(id, &operation_id);
+        let audit_path = self.project_root.join(&audit_relative);
+        let audit = WorkModelUpgradeRecord {
+            schema_version: WORK_MODEL_UPGRADE_SCHEMA_VERSION,
+            operation_id: operation_id.clone(),
+            work_item_id: id.to_string(),
+            from_model_writer_version: item.model_writer_version.clone(),
+            to_model_writer_version: WORK_MODEL_WRITER_VERSION.to_string(),
+            from_record_schema_version: stored.schema_version,
+            to_record_schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
+            attempts: legacy_attempts.clone(),
+            upgraded_at: now_iso8601(),
+        };
+        if audit_path.exists() {
+            let existing = read_json_file::<WorkModelUpgradeRecord>(&audit_path)?;
+            if existing.schema_version != WORK_MODEL_UPGRADE_SCHEMA_VERSION
+                || existing.operation_id != audit.operation_id
+                || existing.work_item_id != audit.work_item_id
+                || existing.from_model_writer_version != audit.from_model_writer_version
+                || existing.to_model_writer_version != audit.to_model_writer_version
+                || existing.from_record_schema_version != audit.from_record_schema_version
+                || existing.to_record_schema_version != audit.to_record_schema_version
+                || existing.attempts != audit.attempts
+            {
+                return Err(WorkModelStorageError::InvalidModel {
+                    path: audit_path,
+                    source: WorkModelError::WorkModelUpgradeConflict {
+                        work_item_id: id.to_string(),
+                        operation_id,
+                    },
+                });
+            }
+        } else {
+            write_json_file(&audit_path, &audit)?;
+        }
+
+        let mut upgraded = item.clone();
+        upgraded.model_writer_version = Some(WORK_MODEL_WRITER_VERSION.to_string());
+        upgraded.synchronize_pause_records(&self.project_root);
+        upgraded
+            .validate()
+            .map_err(|source| WorkModelStorageError::InvalidModel {
+                path: self.work_item_path(id).unwrap_or_default(),
+                source,
+            })?;
+        self.write_work_item_file_unchecked_for_upgrade(&upgraded)?;
+
+        Ok(WorkModelUpgradeReport {
+            work_item_id: id.to_string(),
+            operation_id: Some(audit.operation_id),
+            from_model_writer_version: audit.from_model_writer_version,
+            from_record_schema_version: audit.from_record_schema_version,
+            upgraded_attempts: audit.attempts,
+            audit_path: Some(audit_relative),
+            already_current: false,
+        })
+    }
+
+    fn read_stored_record_versions_unlocked(
+        &self,
+        work_item_id: &str,
+    ) -> Result<StoredRecordVersions, WorkModelStorageError> {
+        let path = self.work_item_path(work_item_id)?;
+        let record = read_json_file::<WorkItemRecord>(&path)?;
+        ensure_supported_record_schema(&path, "Work Item", record.schema_version)?;
+        let attempts_dir = self.work_attempts_dir().join(work_item_id);
+        let mut attempts = Vec::new();
+        if attempts_dir.exists() {
+            for path in list_json_paths(&attempts_dir)? {
+                let record = read_json_file::<AttemptRecord>(&path)?;
+                ensure_supported_record_schema(&path, "Attempt", record.schema_version)?;
+                attempts.push((record.id, record.schema_version));
+            }
+        }
+        attempts.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(StoredRecordVersions { attempts })
     }
 
     /// Read a Work Item while the caller holds its model lock.
@@ -9269,13 +9543,33 @@ impl WorkModelStore {
         work_item: &WorkItem,
         create_new: bool,
     ) -> Result<(), WorkModelStorageError> {
+        self.write_work_item_file_unchecked_with_options(work_item, create_new, false)
+    }
+
+    /// Persist a format upgrade even when the typed Work Item is otherwise
+    /// unchanged. Normal writes may short-circuit on an identical aggregate;
+    /// an upgrade must still rewrite the split records with their new schema
+    /// marker.
+    fn write_work_item_file_unchecked_for_upgrade(
+        &self,
+        work_item: &WorkItem,
+    ) -> Result<(), WorkModelStorageError> {
+        self.write_work_item_file_unchecked_with_options(work_item, false, true)
+    }
+
+    fn write_work_item_file_unchecked_with_options(
+        &self,
+        work_item: &WorkItem,
+        create_new: bool,
+        force_persist: bool,
+    ) -> Result<(), WorkModelStorageError> {
         let path = self.work_item_path(&work_item.id)?;
         let dir = self.work_items_dir();
         fs::create_dir_all(&dir)
             .map_err(|source| WorkModelStorageError::CreateDirectory { path: dir, source })?;
 
         if let Some(transaction) = self.read_work_item_transaction(&work_item.id)? {
-            if aggregate_snapshot_matches(&transaction.work_item, work_item)? {
+            if !force_persist && aggregate_snapshot_matches(&transaction.work_item, work_item)? {
                 self.apply_work_item_transaction(&transaction)?;
                 work_item.storage_revision.set(transaction.target_revision);
                 return Ok(());
@@ -9286,6 +9580,7 @@ impl WorkModelStore {
         let expected_revision = work_item.storage_revision.get();
         let base_revision = if path.exists() {
             let current: WorkItemRecord = read_json_file(&path)?;
+            ensure_supported_record_schema(&path, "Work Item", current.schema_version)?;
             if create_new {
                 return Err(WorkModelStorageError::WorkItemAlreadyExists {
                     path,
@@ -9301,7 +9596,7 @@ impl WorkModelStore {
                 });
             }
             if let Ok(current_item) = self.read_work_item_file_unlocked(&path, false) {
-                if aggregate_snapshot_matches(&current_item, work_item)? {
+                if !force_persist && aggregate_snapshot_matches(&current_item, work_item)? {
                     work_item.storage_revision.set(current.storage_revision);
                     return Ok(());
                 }
@@ -9395,6 +9690,7 @@ impl WorkModelStore {
                 path: path.to_path_buf(),
                 source,
             })?;
+        ensure_supported_record_schema(path, "Work Item", record.schema_version)?;
         if let Some(expected) = path.file_stem().and_then(|stem| stem.to_str()) {
             work_item_file_name(expected)?;
             if record.id != expected {
@@ -9480,7 +9776,9 @@ impl WorkModelStore {
     ) -> Result<(), WorkModelStorageError> {
         let path = self.work_item_path(&transaction.id)?;
         let current_revision = if path.exists() {
-            Some(read_json_file::<WorkItemRecord>(&path)?.storage_revision)
+            let current = read_json_file::<WorkItemRecord>(&path)?;
+            ensure_supported_record_schema(&path, "Work Item", current.schema_version)?;
+            Some(current.storage_revision)
         } else {
             None
         };
@@ -9625,6 +9923,7 @@ impl WorkModelStore {
         let mut attempts = Vec::new();
         for path in list_json_paths(&attempts_dir)? {
             let record = read_json_file::<AttemptRecord>(&path)?;
+            ensure_supported_record_schema(&path, "Attempt", record.schema_version)?;
             let order = record.order;
             let mut attempt: Attempt = record.into();
             let expected = file_stem_id(&path)?;
@@ -10363,6 +10662,24 @@ fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, WorkMo
     from_json(&content).map_err(|source| WorkModelStorageError::ParseFile {
         path: path.to_path_buf(),
         source,
+    })
+}
+
+fn ensure_supported_record_schema(
+    path: &Path,
+    record_kind: &'static str,
+    version: u32,
+) -> Result<(), WorkModelStorageError> {
+    if version <= WORK_MODEL_RECORD_SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(WorkModelStorageError::InvalidModel {
+        path: path.to_path_buf(),
+        source: WorkModelError::UnsupportedStoredRecordVersion {
+            record_kind,
+            found: version,
+            supported: WORK_MODEL_RECORD_SCHEMA_VERSION,
+        },
     })
 }
 
@@ -17002,6 +17319,165 @@ random banner prose that must be ignored
             .mutate_work_item("newer-writer", |_| Ok(()))
             .unwrap_err();
         assert!(error.to_string().contains("999.0.0"));
+    }
+
+    #[test]
+    fn explicit_model_upgrade_rewrites_legacy_records_and_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("legacy-upgrade", "Legacy upgrade");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let item_path = store.work_item_path("legacy-upgrade").unwrap();
+        let attempt_path = store
+            .work_attempt_path("legacy-upgrade", "attempt-1")
+            .unwrap();
+        let mut item_record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        item_record
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        item_record["model_writer_version"] = serde_json::json!("0.2.0");
+        fs::write(
+            &item_path,
+            serde_json::to_string_pretty(&item_record).unwrap(),
+        )
+        .unwrap();
+        let mut attempt_record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&attempt_path).unwrap()).unwrap();
+        attempt_record
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        fs::write(
+            &attempt_path,
+            serde_json::to_string_pretty(&attempt_record).unwrap(),
+        )
+        .unwrap();
+
+        let legacy = store.read_work_item("legacy-upgrade").unwrap();
+        assert_eq!(legacy.model_writer_version.as_deref(), Some("0.2.0"));
+        let report = store.upgrade_work_item("legacy-upgrade").unwrap();
+        assert!(!report.already_current);
+        assert_eq!(report.from_model_writer_version.as_deref(), Some("0.2.0"));
+        assert_eq!(report.from_record_schema_version, 0);
+        assert_eq!(report.upgraded_attempts.len(), 1);
+        assert!(
+            report
+                .audit_path
+                .as_deref()
+                .is_some_and(|path| tmp.path().join(path).is_file())
+        );
+
+        let upgraded = store.read_work_item("legacy-upgrade").unwrap();
+        assert_eq!(upgraded.id, legacy.id);
+        assert_eq!(upgraded.title, legacy.title);
+        assert_eq!(upgraded.attempts, legacy.attempts);
+        assert_eq!(
+            upgraded.model_writer_version.as_deref(),
+            Some(WORK_MODEL_WRITER_VERSION)
+        );
+        let persisted_item: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_item["schema_version"],
+            serde_json::json!(WORK_MODEL_RECORD_SCHEMA_VERSION)
+        );
+        let persisted_attempt: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&attempt_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_attempt["schema_version"],
+            serde_json::json!(WORK_MODEL_RECORD_SCHEMA_VERSION)
+        );
+
+        let repeated = store.upgrade_work_item("legacy-upgrade").unwrap();
+        assert!(repeated.already_current);
+        assert!(repeated.operation_id.is_none());
+        assert!(repeated.audit_path.is_none());
+        assert_eq!(store.read_work_item("legacy-upgrade").unwrap(), upgraded);
+    }
+
+    #[test]
+    fn model_upgrade_audit_survives_a_failed_write_and_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let item = WorkItem::planned("upgrade-retry", "Upgrade retry");
+        store.create_work_item(&item).unwrap();
+        let item_path = store.work_item_path("upgrade-retry").unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("schema_version");
+        record["model_writer_version"] = serde_json::json!("0.2.0");
+        fs::write(&item_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+        let fault = persist_fault::arm_split_write("upgrade-retry");
+        let first = store.upgrade_work_item("upgrade-retry").unwrap_err();
+        drop(fault);
+        assert!(
+            first
+                .to_string()
+                .contains("injected split-record storage fault")
+        );
+        let audit_dir = tmp
+            .path()
+            .join(WORK_ARTIFACTS_DIR)
+            .join("upgrade-retry")
+            .join("model-upgrades");
+        assert_eq!(fs::read_dir(audit_dir).unwrap().count(), 1);
+
+        let second = store.upgrade_work_item("upgrade-retry").unwrap();
+        assert!(second.already_current);
+        assert_eq!(
+            second.from_model_writer_version.as_deref(),
+            Some(WORK_MODEL_WRITER_VERSION)
+        );
+        assert!(
+            store
+                .upgrade_work_item("upgrade-retry")
+                .unwrap()
+                .already_current
+        );
+    }
+
+    #[test]
+    fn future_model_record_schema_is_rejected_without_guessing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let item = WorkItem::planned("future-record", "Future record");
+        store.create_work_item(&item).unwrap();
+        let item_path = store.work_item_path("future-record").unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        record["schema_version"] = serde_json::json!(99);
+        fs::write(&item_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+        let error = store.read_work_item("future-record").unwrap_err();
+        assert!(error.to_string().contains("newer than supported version"));
+        assert!(error.to_string().contains("upgrade Fluent before reading"));
+    }
+
+    #[test]
+    fn malformed_model_writer_version_is_not_upgraded_by_guessing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let item = WorkItem::planned("invalid-writer", "Invalid writer");
+        store.create_work_item(&item).unwrap();
+        let item_path = store.work_item_path("invalid-writer").unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        record["model_writer_version"] = serde_json::json!("unknown-writer");
+        fs::write(&item_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+        let error = store.upgrade_work_item("invalid-writer").unwrap_err();
+        assert!(error.to_string().contains("not a valid semantic version"));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&item_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["model_writer_version"],
+            serde_json::json!("unknown-writer")
+        );
     }
 
     #[test]

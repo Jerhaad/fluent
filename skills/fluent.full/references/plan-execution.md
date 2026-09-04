@@ -90,8 +90,10 @@ either one exact eligible public command or a reason no safe command exists.
 Status, `work-item show`, resume errors, and needs-user handoffs render this
 record. Fluent rechecks its candidate, Task, and pause-kind preconditions before
 showing the command; a changed Attempt gets freshly derived guidance instead of
-stale instructions. Older Attempts can be read without this record and are
-upgraded on their next managed write.
+stale instructions. Older Attempts can be read without this record. Use
+`fluent work-item upgrade [id]` when you want to make the format conversion
+explicit; it records the source and destination versions and is safe to repeat.
+An unknown future record version is rejected instead of being guessed.
 
 Public recovery commands also append one operation record to the Attempt. It
 binds the operation to the exact candidate, Task or evidence, workspace,

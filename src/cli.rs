@@ -344,6 +344,12 @@ pub enum WorkItemCommands {
         id: String,
     },
 
+    /// Upgrade one Work Item's legacy split records to the current model format
+    Upgrade {
+        /// Work Item ID; omit to upgrade every readable Work Item
+        id: Option<String>,
+    },
+
     /// Rebuild persisted status metrics after upgrade or manual artifact changes
     RebuildMetrics {
         /// Rebuild only this Work Item; omit to rebuild all
