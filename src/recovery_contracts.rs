@@ -63,16 +63,14 @@ pub(crate) fn inspect_interrupted_plan_host_recovery(
         candidate_workspace_is_clean_at_managed(project_root, output, &output.commit),
         "interrupted host recovery needs the unchanged managed candidate"
     );
-    let source_path = writer
-        .artifact_area
-        .as_ref()
-        .map(|area| format!("{}/writer-completion.json", area.path))
+    let selected = writer_completion_matrix_ref(project_root, attempt, &writer)
         .context("source Writer has no matrix")?;
+    let preserved = validated_ownership_approval(project_root, attempt)?
+        .filter(|audit| audit.matrix_artifact == selected)
+        .map(|audit| audit.preview.source_matrix)
+        .unwrap_or(selected);
     anyhow::ensure!(
-        canceled
-            .input_artifacts
-            .iter()
-            .any(|artifact| artifact.path == source_path),
+        canceled.input_artifacts.contains(&preserved),
         "canceled Writer does not name the preserved source completion evidence"
     );
     for task in &attempt.tasks {
@@ -317,49 +315,15 @@ pub(crate) fn owned_host_completion_matrix(
         "completion matrix exceeds size limit"
     );
     let mut matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
-    if let Some(audit_ref) = attempt.artifacts.iter().rev().find(|artifact| {
-        artifact.producer_id == "ownership-recovery" && artifact.path.ends_with("/approval.json")
-    }) {
-        let audit: work_model::OwnershipApproval = serde_json::from_slice(&fs::read(
-            resolve_input_artifact_path(project_root, &audit_ref.path)?,
-        )?)?;
-        let preview = &audit.preview;
+    if let Some(audit) = validated_ownership_approval(project_root, attempt)?
+        && artifact.producer_id == "ownership-recovery"
+    {
         anyhow::ensure!(
-            preview.work_item_id == attempt.work_item_id && preview.attempt_id == attempt.id,
-            "ownership approval belongs to another Attempt"
+            audit.matrix_artifact == artifact
+                && audit.preview.candidate_commit == output.commit
+                && audit.preview.writer_task_id == writer.id,
+            "ownership mapping no longer names this Writer candidate"
         );
-        let source_bytes = fs::read(resolve_input_artifact_path(
-            project_root,
-            &preview.source_matrix.path,
-        )?)?;
-        anyhow::ensure!(
-            format!("sha256:{:x}", Sha256::digest(&source_bytes)) == preview.source_matrix_digest,
-            "approved source completion evidence changed"
-        );
-        let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&source_bytes)?;
-        let (approved_contract, approved_matrix) = preview
-            .proposal
-            .apply(&preview.original_contract, &source)
-            .map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(
-            &approved_contract == contract,
-            "approved responsibility contract changed"
-        );
-        let adopted: work_model::WriterCompletionMatrix = serde_json::from_slice(&fs::read(
-            resolve_input_artifact_path(project_root, &audit.matrix_artifact.path)?,
-        )?)?;
-        anyhow::ensure!(
-            adopted == approved_matrix,
-            "approved completion mapping changed"
-        );
-        if artifact.producer_id == "ownership-recovery" {
-            anyhow::ensure!(
-                audit.matrix_artifact == artifact
-                    && preview.candidate_commit == output.commit
-                    && preview.writer_task_id == writer.id,
-                "ownership mapping no longer names this Writer candidate"
-            );
-        }
     }
     let findings = writer_completion_findings(project_root, writer)?;
     matrix
@@ -369,6 +333,123 @@ pub(crate) fn owned_host_completion_matrix(
         .repair_writer_claims_against(contract, &writer.id, &findings)
         .map_err(anyhow::Error::msg)?;
     Ok(Some((writer.clone(), artifact, matrix)))
+}
+
+/// Recheck the immutable approval before any consumer uses its completion.
+fn validated_ownership_approval(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<work_model::OwnershipApproval>> {
+    let Some(audit_ref) = attempt.artifacts.iter().rev().find(|artifact| {
+        artifact.producer_id == "ownership-recovery" && artifact.path.ends_with("/approval.json")
+    }) else {
+        return Ok(None);
+    };
+    let audit: work_model::OwnershipApproval = serde_json::from_slice(&fs::read(
+        resolve_input_artifact_path(project_root, &audit_ref.path)?,
+    )?)?;
+    let preview = &audit.preview;
+    anyhow::ensure!(
+        preview.work_item_id == attempt.work_item_id && preview.attempt_id == attempt.id,
+        "ownership approval belongs to another Attempt"
+    );
+    let source_bytes = fs::read(resolve_input_artifact_path(
+        project_root,
+        &preview.source_matrix.path,
+    )?)?;
+    anyhow::ensure!(
+        format!("sha256:{:x}", Sha256::digest(&source_bytes)) == preview.source_matrix_digest,
+        "approved source completion evidence changed"
+    );
+    let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&source_bytes)?;
+    validate_preserved_completion_repair(project_root, attempt, &preview.source_matrix)?;
+    let (approved_contract, approved_matrix) = preview
+        .proposal
+        .apply(&preview.original_contract, &source)
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        attempt.writer_completion_contract.as_ref() == Some(&approved_contract),
+        "approved responsibility contract changed"
+    );
+    let adopted: work_model::WriterCompletionMatrix = serde_json::from_slice(&fs::read(
+        resolve_input_artifact_path(project_root, &audit.matrix_artifact.path)?,
+    )?)?;
+    anyhow::ensure!(
+        adopted == approved_matrix,
+        "approved completion mapping changed"
+    );
+    let writer = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == preview.writer_task_id)
+        .context("approved source Writer disappeared")?;
+    anyhow::ensure!(
+        source.task_id == writer.id
+            && adopted.task_id == writer.id
+            && writer
+                .output
+                .as_ref()
+                .is_some_and(|output| output.commit == preview.candidate_commit),
+        "ownership approval no longer names its source Writer candidate"
+    );
+    Ok(Some(audit))
+}
+
+/// Validate the saved repair chain without rewriting the original matrices.
+fn validate_preserved_completion_repair(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    artifact: &ArtifactRef,
+) -> Result<()> {
+    let mut current = artifact.clone();
+    let mut seen = std::collections::HashSet::new();
+    while current.producer_id == "writer-completion-repair" {
+        anyhow::ensure!(
+            seen.insert(current.path.clone()),
+            "completion repair source cycle"
+        );
+        let parent = Path::new(&current.path)
+            .parent()
+            .context("repair has no directory")?;
+        let audit_name = if parent.file_name().is_some_and(|name| name == "format") {
+            "format-repair.json"
+        } else {
+            "repair.json"
+        };
+        let audit_path = parent.join(audit_name).to_string_lossy().into_owned();
+        anyhow::ensure!(
+            attempt
+                .artifacts
+                .iter()
+                .any(
+                    |reference| reference.producer_id == "writer-completion-repair"
+                        && reference.path == audit_path
+                ),
+            "approved completion source has no recorded repair audit"
+        );
+        let audit: serde_json::Value = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &audit_path)?,
+        )?)?;
+        let source = audit["source-artifact"]
+            .as_str()
+            .context("repair has no source artifact")?;
+        let source_bytes = fs::read(resolve_input_artifact_path(project_root, source)?)?;
+        let repaired_bytes = fs::read(resolve_input_artifact_path(project_root, &current.path)?)?;
+        anyhow::ensure!(
+            audit["schema-version"] == 1
+                && audit["repaired-artifact"] == current.path
+                && audit["source-sha256"] == format!("{:x}", Sha256::digest(&source_bytes))
+                && audit["repaired-sha256"] == format!("{:x}", Sha256::digest(&repaired_bytes)),
+            "approved completion repair provenance changed"
+        );
+        let Some(prior) = attempt.artifacts.iter().find(|reference| {
+            reference.path == source && reference.producer_id == "writer-completion-repair"
+        }) else {
+            break;
+        };
+        current = prior.clone();
+    }
+    Ok(())
 }
 
 pub use crate::work_model::{EvidenceDocument, EvidenceResult};
@@ -1997,43 +2078,91 @@ mod tests {
     }
 }
 
+/// Read recoveries once through the same policy for source selection and
+/// Writer inheritance. An invalid approval never falls back to unsplit evidence.
+fn recovered_completion_matrices(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Vec<(ArtifactRef, work_model::WriterCompletionMatrix)>> {
+    let approval = validated_ownership_approval(project_root, attempt)?;
+    let mut recovered = Vec::new();
+    for artifact in attempt.artifacts.iter().rev().filter(|artifact| {
+        matches!(
+            artifact.producer_id.as_str(),
+            "writer-completion-repair" | "planning-reference-recovery" | "ownership-recovery"
+        ) && artifact.path.ends_with("/writer-completion.json")
+    }) {
+        if artifact.producer_id == "ownership-recovery" {
+            let approval = approval
+                .as_ref()
+                .context("recovered ownership matrix has no recorded approval")?;
+            // The latest approved mapping includes every retained obligation.
+            // Older mappings remain history, not competing completion authority.
+            if artifact != &approval.matrix_artifact {
+                continue;
+            }
+        }
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("inspect recovered completion matrix: {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.len() <= work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64,
+            "recovered Writer completion matrix exceeds size limit: {}",
+            path.display()
+        );
+        let matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("parse recovered completion matrix: {}", path.display()))?;
+        if artifact.producer_id == "writer-completion-repair"
+            && !artifact
+                .path
+                .contains(&format!("/writer-completion-repairs/{}/", matrix.task_id))
+        {
+            continue;
+        }
+        recovered.push((artifact.clone(), matrix));
+    }
+    Ok(recovered)
+}
+
+/// Carry matching immutable claims through already-materialized repair lineage.
+pub(crate) fn authoritative_writer_completion_matrix(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+) -> Result<Option<work_model::WriterCompletionMatrix>> {
+    let recovered = recovered_completion_matrices(project_root, attempt)?;
+    let mut matrix =
+        if let Some((_, matrix)) = recovered
+            .iter()
+            .find(|(_, matrix)| matrix.task_id == writer.id)
+        {
+            matrix.clone()
+        } else {
+            let Some(path) = managed_writer_completion_matrix_path(project_root, writer)? else {
+                return Ok(None);
+            };
+            serde_json::from_slice(&fs::read(&path).with_context(|| {
+                format!("read prior Writer completion matrix: {}", path.display())
+            })?)
+            .with_context(|| format!("parse prior Writer completion matrix: {}", path.display()))?
+        };
+    for (_, repaired) in &recovered {
+        matrix.inherit_completed_planning_claims(repaired);
+    }
+    Ok(Some(matrix))
+}
+
 pub(crate) fn writer_completion_matrix_ref(
     project_root: &Path,
     attempt: &work_model::Attempt,
     writer: &Task,
 ) -> Option<ArtifactRef> {
-    // A planning-reference recovery can leave several immutable matrices in
-    // the Attempt. Select only the one whose task identity matches this
-    // Writer; otherwise an older recovery could make a valid current row look
-    // absent and produce an ineligible handoff.
-    for artifact in attempt.artifacts.iter().rev() {
-        if !artifact.path.ends_with("/writer-completion.json") {
-            continue;
-        }
-        if artifact.producer_id == "writer-completion-repair"
-            && !artifact
-                .path
-                .contains(&format!("/writer-completion-repairs/{}/", writer.id))
-        {
-            continue;
-        }
-        if artifact.producer_id != "writer-completion-repair"
-            && artifact.producer_id != "planning-reference-recovery"
-            && artifact.producer_id != "ownership-recovery"
-        {
-            continue;
-        }
-        let Ok(bytes) = fs::read(project_root.join(&artifact.path)) else {
-            // An unreadable recovery artifact cannot be selected as the
-            // authoritative matrix; the task-owned fallback below still gives
-            // the caller a deterministic path to diagnose.
-            continue;
-        };
-        if serde_json::from_slice::<work_model::WriterCompletionMatrix>(&bytes)
-            .is_ok_and(|matrix| matrix.task_id == writer.id)
-        {
-            return Some(artifact.clone());
-        }
+    if let Some((artifact, _)) = recovered_completion_matrices(project_root, attempt)
+        .ok()?
+        .into_iter()
+        .find(|(_, matrix)| matrix.task_id == writer.id)
+    {
+        return Some(artifact);
     }
     writer.artifact_area.as_ref().map(|area| ArtifactRef {
         producer_id: writer.id.clone(),

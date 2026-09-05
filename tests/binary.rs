@@ -35773,6 +35773,14 @@ fn setup_interrupted_owned_host_fixture(
     tmp: &TempDir,
     id: &str,
 ) -> (PathBuf, String, PathBuf, ManagedWorktreeCleanup) {
+    setup_interrupted_owned_host_fixture_with_source(tmp, id, false)
+}
+
+fn setup_interrupted_owned_host_fixture_with_source(
+    tmp: &TempDir,
+    id: &str,
+    repaired_source: bool,
+) -> (PathBuf, String, PathBuf, ManagedWorktreeCleanup) {
     use fluent::work_model::*;
     let (project, original, proposal) = setup_legacy_ownership_fixture(tmp, id);
     let workspace = bind_candidate_to_managed_sibling(&project, id, &original);
@@ -35871,6 +35879,52 @@ fn setup_interrupted_owned_host_fixture(
     let progress = project.join(format!(".fluent/work/progress/{id}/attempt-1/progress.md"));
     fs::create_dir_all(progress.parent().unwrap()).unwrap();
     fs::write(&progress, "## Required completion\n\n- [x] Fix source.\n- [ ] Fix source. Check host. Review. Test. Learn.\n").unwrap();
+    let matrix_ref = if repaired_source {
+        // Preserve the same audited claim repair that continuation planning
+        // uses, before adopting responsibility for the pending mixed row.
+        matrix.rows[1].implementation_evidence = vec!["unfinished host check".into()];
+        let source_bytes = serde_json::to_vec_pretty(&matrix).unwrap();
+        fs::write(project.join(&matrix_path), &source_bytes).unwrap();
+        let repairs = matrix
+            .repair_writer_claims_against(
+                item.attempts[0]
+                    .writer_completion_contract
+                    .as_ref()
+                    .unwrap(),
+                "attempt-1-write-2",
+                &[],
+            )
+            .unwrap();
+        assert!(!repairs.is_empty());
+        let area = format!(
+            ".fluent/work/artifacts/{id}/attempt-1/writer-completion-repairs/attempt-1-write-2"
+        );
+        let repaired_path = format!("{area}/writer-completion.json");
+        let repaired_bytes = serde_json::to_vec_pretty(&matrix).unwrap();
+        let audit_path = format!("{area}/repair.json");
+        fs::create_dir_all(project.join(&area)).unwrap();
+        fs::write(project.join(&repaired_path), &repaired_bytes).unwrap();
+        fs::write(project.join(&audit_path), serde_json::to_vec_pretty(&serde_json::json!({
+            "schema-version": 1, "source-artifact": matrix_path,
+            "source-sha256": format!("{:x}", Sha256::digest(&source_bytes)),
+            "repaired-artifact": repaired_path,
+            "repaired-sha256": format!("{:x}", Sha256::digest(&repaired_bytes)), "repairs": repairs,
+        })).unwrap()).unwrap();
+        let recovered = ArtifactRef {
+            producer_id: "writer-completion-repair".into(),
+            path: repaired_path,
+        };
+        item.attempts[0].artifacts.extend([
+            recovered.clone(),
+            ArtifactRef {
+                producer_id: "writer-completion-repair".into(),
+                path: audit_path,
+            },
+        ]);
+        recovered
+    } else {
+        matrix_ref
+    };
     item.add_next_write_round("attempt-1", vec![matrix_ref])
         .unwrap();
     let continuation = item.attempts[0].tasks.last_mut().unwrap();
@@ -35916,9 +35970,18 @@ fn attach_interrupted_host(
 
 #[test]
 fn interrupted_plan_host_evidence_recovers_same_attempt() {
+    check_interrupted_plan_host_evidence_recovery(false);
+}
+
+#[test]
+fn interrupted_plan_host_evidence_recovers_from_repaired_source() {
+    check_interrupted_plan_host_evidence_recovery(true);
+}
+
+fn check_interrupted_plan_host_evidence_recovery(repaired_source: bool) {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, passing, workspace) =
-        setup_interrupted_owned_host_fixture(&tmp, "interrupted-plan");
+        setup_interrupted_owned_host_fixture_with_source(&tmp, "interrupted-plan", repaired_source);
     let before = work_item_value(&project, "interrupted-plan");
     assert_eq!(before["attempts"][0]["pause_kind"], "interrupted");
     let status = fluent_cmd()
@@ -36320,4 +36383,45 @@ fn legacy_ownership_adoption_rechecks_source_before_host_attachment() {
         .assert()
         .failure();
     assert_eq!(work_item_value(&project, id), before);
+}
+
+#[test]
+fn interrupted_plan_host_evidence_rejects_changed_repair_provenance() {
+    for drift in ["original-source", "repair-audit", "unrelated-input"] {
+        let tmp = TempDir::new().unwrap();
+        let id = "repaired-host-proof";
+        let (project, candidate, passing, _workspace) =
+            setup_interrupted_owned_host_fixture_with_source(&tmp, id, true);
+        if drift == "unrelated-input" {
+            fluent::work_model::WorkModelStore::new(&project).mutate_work_item(id, |item| {
+                item.attempts[0].tasks[3].input_artifacts[0].path = format!(".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-2/writer-completion.json");
+                Ok(())
+            }).unwrap();
+        } else {
+            let relative = if drift == "original-source" {
+                format!(
+                    ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-2/writer-completion.json"
+                )
+            } else {
+                format!(
+                    ".fluent/work/artifacts/{id}/attempt-1/writer-completion-repairs/attempt-1-write-2/repair.json"
+                )
+            };
+            let path = project.join(relative);
+            let mut bytes = fs::read(&path).unwrap();
+            if drift == "repair-audit" {
+                let mut audit: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                audit["source-sha256"] = serde_json::json!("changed");
+                bytes = serde_json::to_vec(&audit).unwrap();
+            } else {
+                bytes.push(b'\n');
+            }
+            fs::write(path, bytes).unwrap();
+        }
+        let before = work_item_value(&project, id);
+        attach_interrupted_host(&project, id, &candidate, &passing)
+            .assert()
+            .failure();
+        assert_eq!(work_item_value(&project, id), before, "{drift}");
+    }
 }
