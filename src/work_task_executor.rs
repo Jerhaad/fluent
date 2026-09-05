@@ -19683,31 +19683,46 @@ mod tests {
 
     #[test]
     fn write_user_prompt_directs_advisory_commit_presentation() {
-        let prompt = build_write_task_prompt(&review_item(), "attempt-1", "attempt-1-write-1", &[]);
-        let d1_region = prompt
-            .find("### D. Commit and advance")
-            .expect("prompt should contain §D heading");
-        let d1_text = &prompt[d1_region..];
-        assert!(
-            d1_text.contains("commit conventions"),
-            "§D.1 should reference the project's commit conventions"
-        );
-        assert!(
-            d1_text.contains("AGENTS.md") || d1_text.contains("CLAUDE.md"),
-            "§D.1 should reference AGENTS.md or CLAUDE.md as the source of commit conventions"
-        );
-        assert!(
-            d1_text.contains("presentation advice"),
-            "§D.1 should classify commit-message presentation as advice"
-        );
-        assert!(
-            d1_text.contains("do not create corrective work or block completion solely"),
-            "§D.1 should keep presentation advice from controlling completion"
-        );
-        assert!(
-            d1_text.contains("Co-Authored-By"),
-            "§D.1 should retain the attribution prohibition"
-        );
+        fn assert_advisory_writer_prompt(prompt: &str) {
+            let d1_region = prompt
+                .find("### D. Commit and advance")
+                .expect("prompt should contain §D heading");
+            let d1_text = &prompt[d1_region..];
+            assert!(
+                d1_text.contains("commit conventions"),
+                "§D.1 should reference the project's commit conventions"
+            );
+            assert!(
+                d1_text.contains("AGENTS.md") || d1_text.contains("CLAUDE.md"),
+                "§D.1 should reference AGENTS.md or CLAUDE.md as the source of commit conventions"
+            );
+            assert!(
+                d1_text.contains("presentation advice"),
+                "§D.1 should classify commit-message presentation as advice"
+            );
+            assert!(
+                d1_text.contains("do not create corrective work or block completion solely"),
+                "§D.1 should keep presentation advice from controlling completion"
+            );
+            assert!(
+                d1_text.contains("Co-Authored-By"),
+                "§D.1 should retain the attribution prohibition"
+            );
+        }
+
+        let mut item = review_item();
+        let followup = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        for task_id in ["attempt-1-write-1", followup.as_str()] {
+            let prompt = build_write_task_prompt(&item, "attempt-1", task_id, &[]);
+            assert_advisory_writer_prompt(&prompt);
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = materialize_skill("review-documentation", tmp.path()).unwrap();
+        let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(skill.contains("commit-message presentation as advice"));
+        assert!(skill.contains("Do not emit a finding or failing verdict solely"));
+        assert!(skill.contains("Co-Authored-By"));
     }
 
     #[test]

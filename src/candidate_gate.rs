@@ -2581,6 +2581,15 @@ mod tests {
             "pub fn value() {    \n}\n",
             "Add value\\n\\nExplain value",
         );
+        let hooks = fixture.project.path().join(".fluent/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("check-pre-merge");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf 'dependency cycle: app -> render -> app\\n'\nexit 9\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
 
         let evidence =
@@ -2595,6 +2604,13 @@ mod tests {
             check(&evidence, "commit-metadata").status,
             CandidateCheckStatus::Failed
         );
+        let project = check(&evidence, "project-check");
+        assert_eq!(project.status, CandidateCheckStatus::Failed);
+        assert!(project.log_path.as_ref().is_some_and(|path| {
+            fs::read_to_string(Path::new(path))
+                .unwrap()
+                .contains("dependency cycle")
+        }));
         let parsed: CandidateGateEvidence =
             serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
         assert_eq!(parsed, evidence);
