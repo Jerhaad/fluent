@@ -17844,6 +17844,52 @@ mod tests {
         candidate_tree: String,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct RetiredCommitStyleBoundarySnapshot {
+        work_item: serde_json::Value,
+        candidate_head: String,
+        candidate_tree: String,
+        candidate_status: String,
+        gate: Vec<u8>,
+        hook_log: Vec<u8>,
+    }
+
+    fn retired_commit_style_boundary_snapshot(
+        fixture: &RetiredCommitStyleFixture,
+    ) -> RetiredCommitStyleBoundarySnapshot {
+        RetiredCommitStyleBoundarySnapshot {
+            work_item: serde_json::to_value(fixture.store.read_work_item("work-1").unwrap())
+                .unwrap(),
+            candidate_head: crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "snapshot retired-style candidate HEAD",
+            )
+            .unwrap(),
+            candidate_tree: crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD^{tree}"],
+                "snapshot retired-style candidate tree",
+            )
+            .unwrap(),
+            candidate_status: crate::git::run_stdout(
+                &fixture.workspace,
+                &["status", "--porcelain", "--untracked-files=all"],
+                "snapshot retired-style candidate status",
+            )
+            .unwrap(),
+            gate: fs::read(&fixture.gate_path).unwrap(),
+            hook_log: fs::read(&fixture.log_path).unwrap(),
+        }
+    }
+
+    fn assert_retired_commit_style_boundary_unchanged(
+        fixture: &RetiredCommitStyleFixture,
+        before: RetiredCommitStyleBoundarySnapshot,
+    ) {
+        assert_eq!(retired_commit_style_boundary_snapshot(fixture), before);
+    }
+
     fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
         use std::os::unix::fs::PermissionsExt;
 
@@ -18148,7 +18194,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let before = serde_json::to_value(mixed.store.read_work_item("work-1").unwrap()).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&mixed);
         assert!(
             recover_retired_commit_style_pause(
                 &mixed.project_root,
@@ -18160,14 +18206,11 @@ mod tests {
             .to_string()
             .contains("unknown retired commit-style hook diagnostic")
         );
-        assert_eq!(
-            serde_json::to_value(mixed.store.read_work_item("work-1").unwrap()).unwrap(),
-            before
-        );
+        assert_retired_commit_style_boundary_unchanged(&mixed, before);
 
         let dirty = make_retired_commit_style_pause_fixture(false);
         fs::write(dirty.workspace.join("untracked.txt"), "dirty\n").unwrap();
-        let before = serde_json::to_value(dirty.store.read_work_item("work-1").unwrap()).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&dirty);
         assert!(
             recover_retired_commit_style_pause(
                 &dirty.project_root,
@@ -18179,10 +18222,7 @@ mod tests {
             .to_string()
             .contains("not clean and unchanged")
         );
-        assert_eq!(
-            serde_json::to_value(dirty.store.read_work_item("work-1").unwrap()).unwrap(),
-            before
-        );
+        assert_retired_commit_style_boundary_unchanged(&dirty, before);
 
         let live = make_retired_commit_style_pause_fixture(false);
         let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
@@ -18191,7 +18231,7 @@ mod tests {
             "attempt-1-write-2",
         ))
         .unwrap();
-        let before = serde_json::to_value(live.store.read_work_item("work-1").unwrap()).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&live);
         assert!(
             recover_retired_commit_style_pause(
                 &live.project_root,
@@ -18203,24 +18243,26 @@ mod tests {
             .to_string()
             .contains("live execution")
         );
-        assert_eq!(
-            serde_json::to_value(live.store.read_work_item("work-1").unwrap()).unwrap(),
-            before
-        );
+        assert_retired_commit_style_boundary_unchanged(&live, before);
 
         let output = make_retired_commit_style_pause_fixture(false);
         let mut item = output.store.read_work_item("work-1").unwrap();
+        crate::work_model::set_task_terminal(&mut item.attempts[0].tasks[1], TaskStatus::Complete);
         item.attempts[0].tasks[1].output = item.attempts[0].tasks[0].output.clone();
+        output.store.write_work_item(&item).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&output);
         assert!(
-            crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+            recover_retired_commit_style_pause(
                 &output.project_root,
-                &item,
+                &output.store,
+                "work-1",
                 "attempt-1",
             )
             .unwrap_err()
             .to_string()
             .contains("produced output")
         );
+        assert_retired_commit_style_boundary_unchanged(&output, before);
 
         let drifted = make_retired_commit_style_pause_fixture(false);
         fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
@@ -18243,7 +18285,7 @@ mod tests {
             "commit drifted candidate",
         )
         .unwrap();
-        let before = serde_json::to_value(drifted.store.read_work_item("work-1").unwrap()).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&drifted);
         assert!(
             recover_retired_commit_style_pause(
                 &drifted.project_root,
@@ -18255,10 +18297,71 @@ mod tests {
             .to_string()
             .contains("not clean and unchanged")
         );
-        assert_eq!(
-            serde_json::to_value(drifted.store.read_work_item("work-1").unwrap()).unwrap(),
-            before
+        assert_retired_commit_style_boundary_unchanged(&drifted, before);
+
+        let unbound = make_retired_commit_style_pause_fixture(false);
+        unbound
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts[0].producer_id =
+                    "attempt-1-write-other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&unbound);
+        assert!(
+            recover_retired_commit_style_pause(
+                &unbound.project_root,
+                &unbound.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not bound to the source Writer")
         );
+        assert_retired_commit_style_boundary_unchanged(&unbound, before);
+
+        let changed_hook = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            changed_hook
+                .project_root
+                .join(".fluent/hooks/check-pre-merge"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_hook.project_root,
+            &["add", ".fluent/hooks/check-pre-merge"],
+            "stage changed retired-style hook",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_hook.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Change candidate hook",
+                "-m",
+                "- Stop invoking the advisory policy",
+            ],
+            "commit changed retired-style hook",
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_hook);
+        assert!(
+            recover_retired_commit_style_pause(
+                &changed_hook.project_root,
+                &changed_hook.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not invoke Factory's commit-message policy")
+        );
+        assert_retired_commit_style_boundary_unchanged(&changed_hook, before);
 
         let changed_gate = make_retired_commit_style_pause_fixture(false);
         recover_retired_commit_style_pause(
@@ -18271,8 +18374,7 @@ mod tests {
         let mut changed_gate_bytes = fs::read(&changed_gate.gate_path).unwrap();
         changed_gate_bytes.push(b'\n');
         fs::write(&changed_gate.gate_path, &changed_gate_bytes).unwrap();
-        let before =
-            serde_json::to_value(changed_gate.store.read_work_item("work-1").unwrap()).unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_gate);
         let error = plan_after_completed_writer(
             &changed_gate.project_root,
             &changed_gate.store,
@@ -18281,14 +18383,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("no longer matches"));
-        assert_eq!(
-            serde_json::to_value(changed_gate.store.read_work_item("work-1").unwrap()).unwrap(),
-            before
-        );
-        assert_eq!(
-            fs::read(&changed_gate.gate_path).unwrap(),
-            changed_gate_bytes
-        );
+        assert_retired_commit_style_boundary_unchanged(&changed_gate, before);
     }
 
     #[test]

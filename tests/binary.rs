@@ -22696,13 +22696,43 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
 
 #[test]
 fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
+    struct FixtureQueueRunner {
+        bin_dir: PathBuf,
+    }
+
+    impl fluent::scheduler::AttemptRunner for FixtureQueueRunner {
+        fn run(
+            &self,
+            project_root: &Path,
+            work_item_id: &str,
+            attempt_id: &str,
+            _tester_no_sandbox: bool,
+        ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+            let output = fluent_cmd()
+                .current_dir(project_root)
+                .args(["attempt", "run", work_item_id, attempt_id, "--no-sandbox"])
+                .env("PATH", mock_path(&self.bin_dir))
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "queued retired-style recovery failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fluent::scheduler::classify_attempt_outcome(project_root, work_item_id, attempt_id)
+        }
+    }
+
     let fixture = make_retired_commit_style_binary_fixture();
     let bin_dir = fixture
         .project_root
         .parent()
         .unwrap()
         .join("bin-retired-idempotent");
-    write_mock_claude(&bin_dir, &stateful_loop_mock_script("uncertain"));
+    write_mock_claude(
+        &bin_dir,
+        &learner_mock_script(r#"{"learning_summary":"learned","follow_ups":[]}"#),
+    );
 
     fluent_cmd()
         .current_dir(&fixture.project_root)
@@ -22710,23 +22740,43 @@ fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Queued resume"));
-    let queued = WorkModelStore::new(&fixture.project_root)
+    let dispatch = fluent::scheduler::pick_next_queued(&fixture.project_root)
+        .unwrap()
+        .expect("retired-style resume should be queued");
+    fluent::scheduler::dispatch_one(
+        &fixture.project_root,
+        &dispatch,
+        &FixtureQueueRunner {
+            bin_dir: bin_dir.clone(),
+        },
+    )
+    .unwrap();
+
+    let after_queued = WorkModelStore::new(&fixture.project_root)
         .read_work_item("work-1")
         .unwrap();
-    fluent_cmd()
-        .current_dir(&fixture.project_root)
-        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("already queued"));
-    assert_eq!(
-        WorkModelStore::new(&fixture.project_root)
-            .read_work_item("work-1")
-            .unwrap()
-            .attempts[0]
-            .tasks,
-        queued.attempts[0].tasks
-    );
+    let attempt = &after_queued.attempts[0];
+    let receipt = attempt
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path.ends_with("/reclassification.json"))
+        .expect("queued recovery records its reclassification")
+        .clone();
+    let receipt_before = fs::read(fixture.project_root.join(&receipt.path)).unwrap();
+    let tasks_before = attempt.tasks.clone();
+    let candidate_head_before = git::run_stdout(
+        &fixture.workspace,
+        &["rev-parse", "HEAD"],
+        "read candidate after queued recovery",
+    )
+    .unwrap();
+    let candidate_history_before = git::run_stdout(
+        &fixture.workspace,
+        &["rev-list", "--reverse", "HEAD"],
+        "read candidate history after queued recovery",
+    )
+    .unwrap();
+
     fluent_cmd()
         .current_dir(&fixture.project_root)
         .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
@@ -22760,6 +22810,11 @@ fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
             .count(),
         fluent::review::REVIEWERS.len()
     );
+    assert_eq!(after.attempts[0].tasks, tasks_before);
+    assert_eq!(
+        fs::read(fixture.project_root.join(&receipt.path)).unwrap(),
+        receipt_before
+    );
     assert_eq!(
         git::run_stdout(
             &fixture.workspace,
@@ -22767,7 +22822,16 @@ fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
             "verify candidate"
         )
         .unwrap(),
-        fixture.candidate
+        candidate_head_before
+    );
+    assert_eq!(
+        git::run_stdout(
+            &fixture.workspace,
+            &["rev-list", "--reverse", "HEAD"],
+            "verify candidate history after replay",
+        )
+        .unwrap(),
+        candidate_history_before
     );
 }
 
