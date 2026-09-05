@@ -722,6 +722,36 @@ pub(crate) fn classify_retired_commit_style_gate(
         &["rev-parse", "HEAD"],
         "resolve commit-message presentation policy",
     )?;
+    validate_retired_commit_style_policy(project_root, &policy_commit)?;
+
+    let candidate_tree = crate::git::run_stdout(
+        workspace,
+        &["rev-parse", &format!("{expected_candidate}^{{tree}}")],
+        "resolve retired commit-style candidate tree",
+    )?;
+    Ok(RetiredCommitStyleGate {
+        candidate_tree,
+        gate_digest: sha256_digest(&gate_bytes),
+        hook_log_path: expected_log_relative,
+        hook_log_digest: sha256_digest(&log_bytes),
+        findings,
+        policy_commit,
+    })
+}
+
+fn validate_retired_commit_style_policy(project_root: &Path, policy_commit: &str) -> Result<()> {
+    let resolved = crate::git::run_stdout(
+        project_root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{policy_commit}^{{commit}}"),
+        ],
+        "resolve checked-in commit-message presentation policy",
+    )?;
+    if resolved != policy_commit {
+        bail!("retired commit-style policy must name one exact commit");
+    }
     let policy_script = crate::git::run_stdout(
         project_root,
         &[
@@ -751,19 +781,21 @@ pub(crate) fn classify_retired_commit_style_gate(
         bail!("the checked-in project hook does not invoke Factory's commit-message policy");
     }
 
-    let candidate_tree = crate::git::run_stdout(
-        workspace,
-        &["rev-parse", &format!("{expected_candidate}^{{tree}}")],
-        "resolve retired commit-style candidate tree",
-    )?;
-    Ok(RetiredCommitStyleGate {
-        candidate_tree,
-        gate_digest: sha256_digest(&gate_bytes),
-        hook_log_path: expected_log_relative,
-        hook_log_digest: sha256_digest(&log_bytes),
-        findings,
-        policy_commit,
-    })
+    Ok(())
+}
+
+/// Keep the receipt's original policy commit as immutable audit evidence while
+/// allowing ordinary project commits to advance the still-active policy.
+pub(crate) fn validate_retired_commit_style_policy_replay(
+    project_root: &Path,
+    recorded_policy_commit: &str,
+    current_policy_commit: &str,
+) -> Result<()> {
+    validate_retired_commit_style_policy(project_root, recorded_policy_commit)?;
+    if !is_ancestor(project_root, recorded_policy_commit, current_policy_commit)? {
+        bail!("retired commit-style policy commit is not an ancestor of the current policy");
+    }
+    Ok(())
 }
 
 fn read_bounded_regular_file(path: &Path, maximum: u64, subject: &str) -> Result<Vec<u8>> {

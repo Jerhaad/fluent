@@ -18363,6 +18363,47 @@ mod tests {
         );
         assert_retired_commit_style_boundary_unchanged(&changed_hook, before);
 
+        let changed_policy = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            changed_policy
+                .project_root
+                .join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_policy.project_root,
+            &["add", "scripts/check-commit-message-policy.sh"],
+            "stage changed retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &changed_policy.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Change commit policy",
+                "-m",
+                "- Remove the advisory policy marker",
+            ],
+            "commit changed retired-style policy",
+        )
+        .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&changed_policy);
+        assert!(
+            recover_retired_commit_style_pause(
+                &changed_policy.project_root,
+                &changed_policy.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("has not retired presentation findings")
+        );
+        assert_retired_commit_style_boundary_unchanged(&changed_policy, before);
+
         let changed_gate = make_retired_commit_style_pause_fixture(false);
         recover_retired_commit_style_pause(
             &changed_gate.project_root,
@@ -18384,6 +18425,98 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("no longer matches"));
         assert_retired_commit_style_boundary_unchanged(&changed_gate, before);
+    }
+
+    #[test]
+    fn retired_commit_style_admission_survives_unrelated_policy_advance() {
+        let fixture = make_retired_commit_style_pause_fixture(false);
+        let gate_before = fs::read(&fixture.gate_path).unwrap();
+        let log_before = fs::read(&fixture.log_path).unwrap();
+        recover_retired_commit_style_pause(
+            &fixture.project_root,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        let receipt = recovered.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/reclassification.json"))
+            .expect("policy reclassification is recorded")
+            .clone();
+        let receipt_before = fs::read(fixture.project_root.join(&receipt.path)).unwrap();
+
+        fs::write(
+            fixture.project_root.join("CHANGELOG.md"),
+            "Unrelated project update\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &["add", "CHANGELOG.md"],
+            "stage unrelated policy advance",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update project notes",
+                "-m",
+                "- Leave the advisory commit policy unchanged",
+            ],
+            "commit unrelated policy advance",
+        )
+        .unwrap();
+
+        let outcome = plan_after_completed_writer(
+            &fixture.project_root,
+            &fixture.store,
+            recovered,
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .count(),
+            crate::review::REVIEWERS.len()
+        );
+        assert_eq!(
+            fs::read(fixture.project_root.join(&receipt.path)).unwrap(),
+            receipt_before
+        );
+        assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+        assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "verify candidate after unrelated policy advance",
+            )
+            .unwrap(),
+            fixture.candidate
+        );
+        assert_eq!(
+            crate::git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD^{tree}"],
+                "verify candidate tree after unrelated policy advance",
+            )
+            .unwrap(),
+            fixture.candidate_tree
+        );
     }
 
     #[test]

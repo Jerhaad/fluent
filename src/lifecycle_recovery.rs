@@ -321,6 +321,11 @@ pub(crate) fn inspect_retired_commit_style_admission(
             .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base"))?,
         &output.commit,
     )?;
+    crate::candidate_gate::validate_retired_commit_style_policy_replay(
+        project_root,
+        &receipt.policy_commit,
+        &classified.policy_commit,
+    )?;
     let expected = RetiredCommitStyleReclassification {
         schema_version: RETIRED_COMMIT_STYLE_RECLASSIFICATION_SCHEMA_VERSION,
         work_item_id: item.id.clone(),
@@ -336,7 +341,7 @@ pub(crate) fn inspect_retired_commit_style_admission(
         hook_log_path: classified.hook_log_path,
         hook_log_digest: classified.hook_log_digest,
         findings: classified.findings,
-        policy_commit: classified.policy_commit,
+        policy_commit: receipt.policy_commit.clone(),
         recorded_at: receipt.recorded_at.clone(),
     };
     if receipt.recorded_at.trim().is_empty() || receipt != expected {
