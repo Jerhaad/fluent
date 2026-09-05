@@ -107,6 +107,7 @@
 - [retired-persisted-fields-canonicalize-on-save](retired-persisted-fields-canonicalize-on-save.md) — Retired persisted JSON fields must remain readable and disappear when a record is next saved
 - [reviewed-git-tree-uses-isolated-index](reviewed-git-tree-uses-isolated-index.md) — Build an exact approved Git tree through a temporary index so unrelated staged, unstaged, and untracked work remains untouched
 - [route-tests-drive-real-launch-wiring](route-tests-drive-real-launch-wiring.md) — A launch-route regression must drive the real phase or resume path and observe what reaches the coder; helper or persistence-only assertions do not verify execution wiring
+- [rust-test-evidence-preserves-native-qualifiers](rust-test-evidence-preserves-native-qualifiers.md) — Resolve Rust test evidence with every supplied path, binary, and module qualifier before requiring passing results
 - [sandbox-denials-track-template-grants](sandbox-denials-track-template-grants.md) — Handoff-only sandbox confinement depends on stripping exact shared-temp grant strings from the rendered profile
 - [sandbox-tests-assert-invariant-in-both-host-branches](sandbox-tests-assert-invariant-in-both-host-branches.md) — A confinement test asserts its security invariant unconditionally, then branches on sandbox availability only to add the stronger observation each host permits — never skips when the sandbox is unavailable
 - [scheduler-resume-requires-explicit-dispatch-intent](scheduler-resume-requires-explicit-dispatch-intent.md) — Scheduler recovery of NeedsUser work requires a new explicit resume dispatch; an Attempt binding alone is not user authorization
@@ -116,6 +117,7 @@
 - [shell-fakes-inject-malformed-cli-output](shell-fakes-inject-malformed-cli-output.md) — Shell CLI fakes must inject malformed and incomplete JSON responses to cover jq parse failure paths
 - [shell-phase-failure-all-exit-paths](shell-phase-failure-all-exit-paths.md) — Every exit path in a shell multi-phase workflow must route through fail_phase, not bare set -e
 - [shell-printed-commands-quote-paths](shell-printed-commands-quote-paths.md) — Shell paths interpolated into user-facing commands must be escaped with printf %q
+- [shell-test-evidence-uses-script-path](shell-test-evidence-uses-script-path.md) — Match shell Test references by exact committed script path while treating parentheticals and harness labels as descriptive text
 - [shell-test-pipelines-fail-under-pipefail](shell-test-pipelines-fail-under-pipefail.md) — Shell behavior tests run under set -euo pipefail, so a short-circuiting consumer like grep -q gives the producer SIGPIPE (exit 141); match in-process with `[[ "$1" == *"$2"* ]]` (quoted needle) instead
 - [shell-tests-invisible-to-compiler](shell-tests-invisible-to-compiler.md) — Shell behavior tests query JSON via jq and are not caught by the compiler when serialized field names change
 - [skill-reference-files-keep-main-bundle-small](skill-reference-files-keep-main-bundle-small.md) — Keep the full skill under its line budget and move low-frequency procedures into explicitly discoverable reference files
