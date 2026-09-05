@@ -7799,26 +7799,68 @@ fn gate_writer_completion_before_reviews(
         .writer_runs
         .last()
         .map(|run| (run.checked_required, run.completed_matrix));
+    let current_identity = writer_completion_identity(project_root, attempt, task)?;
+    let previous_identity = attempt
+        .writer_runs
+        .last()
+        .and_then(|run| attempt.tasks.iter().find(|task| task.id == run.task_id))
+        .map(|task| writer_completion_identity(project_root, attempt, task))
+        .transpose()?
+        .flatten();
     let regressed = previous_completion.is_some_and(|(checked, completed)| {
-        progress.checked < checked || matrix_status.complete < completed
+        progress.checked < checked
+            || match (&previous_identity, &current_identity) {
+                (Some(previous), Some(current)) => previous.iter().any(|old| {
+                    old.state == crate::work_model::WriterCompletionState::Complete
+                        && current.iter().any(|row| {
+                            row.id == old.id
+                                && row.state != crate::work_model::WriterCompletionState::Complete
+                        })
+                }),
+                _ => matrix_status.complete < completed,
+            }
     });
-    let current_kind = writer_run_kind(attempt, task);
-    let stagnant_continuations = if current_kind == WriterRunKind::PreReviewContinuation
-        && previous_completion == Some((progress.checked, matrix_status.complete))
-    {
-        1 + attempt
-            .writer_runs
-            .iter()
-            .rev()
-            .take_while(|run| {
-                run.kind == WriterRunKind::PreReviewContinuation
-                    && run.checked_required == progress.checked
-                    && run.completed_matrix == matrix_status.complete
-            })
-            .count()
-    } else {
-        0
-    };
+    let mut latest_task = task;
+    let mut latest_kind = writer_run_kind(attempt, task);
+    let mut latest_counts = (progress.checked, matrix_status.complete);
+    let mut latest_identity = current_identity;
+    let mut stagnant_continuations = 0;
+    for run in attempt.writer_runs.iter().rev() {
+        if latest_kind == WriterRunKind::Initial
+            || latest_counts != (run.checked_required, run.completed_matrix)
+        {
+            break;
+        }
+        let Some(previous_task) = attempt.tasks.iter().find(|task| task.id == run.task_id) else {
+            break;
+        };
+        let previous_identity = writer_completion_identity(project_root, attempt, previous_task)?;
+        let same_requirements = match (&latest_identity, &previous_identity) {
+            (Some(current), Some(previous)) => current == previous,
+            (None, None) => {
+                crate::recovery_contracts::writer_completion_findings(project_root, latest_task)?
+                    .iter()
+                    .map(|finding| &finding.id)
+                    .collect::<Vec<_>>()
+                    == crate::recovery_contracts::writer_completion_findings(
+                        project_root,
+                        previous_task,
+                    )?
+                    .iter()
+                    .map(|finding| &finding.id)
+                    .collect::<Vec<_>>()
+            }
+            _ => false,
+        };
+        if !same_requirements {
+            break;
+        }
+        stagnant_continuations += 1;
+        latest_task = previous_task;
+        latest_kind = run.kind;
+        latest_counts = (run.checked_required, run.completed_matrix);
+        latest_identity = previous_identity;
+    }
     let blocked_reason = if !changed_candidate && !repaired_writer_claims {
         Some(format!(
             "Writer did not create a candidate commit while {reason}"
@@ -7832,7 +7874,7 @@ fn gate_writer_completion_before_reviews(
         ))
     } else if stagnant_continuations >= 2 {
         Some(format!(
-            "two pre-review Writer continuations made no completion progress; {reason}"
+            "two Writer continuations made no completion progress; {reason}"
         ))
     } else {
         None
@@ -7998,6 +8040,35 @@ fn record_writer_run(
         completed_matrix,
         candidate_commit,
     });
+}
+
+fn writer_completion_identity(
+    project_root: &Path,
+    attempt: &Attempt,
+    task: &crate::work_model::Task,
+) -> Result<Option<Vec<crate::work_model::WriterCompletionRow>>> {
+    let Some(contract) = &attempt.writer_completion_contract else {
+        return Ok(None);
+    };
+    let Some(artifact) =
+        crate::recovery_contracts::writer_completion_matrix_ref(project_root, attempt, task)
+    else {
+        return Ok(None);
+    };
+    let bytes = match fs::read(project_root.join(&artifact.path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let matrix: crate::work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    let findings = crate::recovery_contracts::writer_completion_findings(project_root, task)?;
+    if matrix
+        .status_against(contract, &task.id, &findings)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(matrix.completion_identity()))
 }
 
 fn writer_run_kind(attempt: &Attempt, task: &Task) -> WriterRunKind {
@@ -17259,6 +17330,143 @@ mod tests {
             let stored = store.read_work_item("ownership").unwrap();
             assert_eq!(stored.attempts[0].tasks, before_tasks);
             assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        }
+    }
+
+    #[test]
+    fn stagnant_post_review_continuations_pause() {
+        for scenario in [
+            "stagnant",
+            "new-finding",
+            "progress",
+            "no-output",
+            "regressed",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = make_completed_writer_matrix_fixture(tmp.path(), false);
+            let mut item = store.read_work_item("matrix-work").unwrap();
+            let review_path = ".fluent/work/artifacts/matrix-work/attempt-1/review-tests/review.md";
+            fs::create_dir_all(tmp.path().join(review_path).parent().unwrap()).unwrap();
+            fs::write(
+                tmp.path().join(review_path),
+                "Verdict: fail\n- [ ] Keep the pending correction (blocking)\n",
+            )
+            .unwrap();
+            let review = ArtifactRef {
+                producer_id: "review-tests".into(),
+                path: review_path.into(),
+            };
+            // Each corrective Writer receives a stable finding and a new commit.
+            for round in 0..3 {
+                item.add_next_write_round("attempt-1", vec![review.clone()])
+                    .unwrap();
+                let task_id = item.attempts[0].tasks.last().unwrap().id.clone();
+                if round == 2 && scenario == "new-finding" {
+                    // A new review artifact keeps earlier finding history intact.
+                    let path =
+                        ".fluent/work/artifacts/matrix-work/attempt-1/new-review-tests/review.md";
+                    fs::create_dir_all(tmp.path().join(path).parent().unwrap()).unwrap();
+                    fs::write(
+                        tmp.path().join(path),
+                        "Verdict: fail\n- [ ] A genuinely new correction (blocking)\n",
+                    )
+                    .unwrap();
+                    item.attempts[0].tasks.last_mut().unwrap().input_artifacts =
+                        vec![ArtifactRef {
+                            producer_id: "review-tests".into(),
+                            path: path.into(),
+                        }];
+                }
+                let path = crate::work_task_executor::materialize_writer_completion_before_writer(
+                    tmp.path(),
+                    &item,
+                    "attempt-1",
+                    &task_id,
+                )
+                .unwrap()
+                .unwrap();
+                let mut matrix: crate::work_model::WriterCompletionMatrix =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                if (scenario == "progress" && round == 2) || (scenario == "regressed" && round < 2)
+                {
+                    matrix.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+                    matrix.rows[0].implementation_evidence = vec!["src/dashboard.rs".into()];
+                    matrix.rows[0].verification =
+                        vec![crate::work_model::WriterVerificationClaim {
+                            command: "cargo test preserves_selection".into(),
+                            result: crate::work_model::WriterVerificationResult::Pass,
+                        }];
+                } else if scenario == "regressed" {
+                    matrix.rows[0].state = crate::work_model::WriterCompletionState::Pending;
+                    matrix.rows[0].implementation_evidence.clear();
+                    matrix.rows[0].verification.clear();
+                }
+                if scenario == "new-finding" && round < 2 {
+                    let finding = matrix.rows.last_mut().unwrap();
+                    finding.state = crate::work_model::WriterCompletionState::Complete;
+                    finding.implementation_evidence = vec!["src/dashboard.rs".into()];
+                    finding.verification = vec![crate::work_model::WriterVerificationClaim {
+                        command: "cargo test preserves_selection".into(),
+                        result: crate::work_model::WriterVerificationResult::Pass,
+                    }];
+                    finding.applicable_constraints = vec!["behavior:dashboard:b1".into()];
+                }
+                fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                let task = item.attempts[0].tasks.last_mut().unwrap();
+                task.status = TaskStatus::Complete;
+                task.output = Some(TaskOutput {
+                    workspace_id: "candidate".into(),
+                    workspace_path: "candidate".into(),
+                    source_branch: "main".into(),
+                    base_commit: Some(if round == 2 && scenario == "no-output" {
+                        format!("commit-{round}")
+                    } else {
+                        format!("commit-{}", round - 1i32)
+                    }),
+                    commit: format!("commit-{round}"),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                if round < 2 {
+                    record_writer_run(
+                        tmp.path(),
+                        &mut item,
+                        0,
+                        WriterOutcome::Continue,
+                        0,
+                        usize::from(matches!(scenario, "regressed" | "new-finding")),
+                    );
+                }
+            }
+            store.write_work_item(&item).unwrap();
+            let prior_tasks = item.attempts[0].tasks.len();
+            let outcome =
+                gate_writer_completion_before_reviews(tmp.path(), &store, &mut item, "attempt-1")
+                    .unwrap()
+                    .unwrap();
+            if matches!(scenario, "stagnant" | "no-output" | "regressed") {
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("{scenario}: {outcome:?}");
+                };
+                let handoff = fs::read_to_string(tmp.path().join(handoff_path)).unwrap();
+                if scenario == "stagnant" {
+                    assert!(
+                        handoff.contains("two") && handoff.contains("no completion progress"),
+                        "{handoff}"
+                    );
+                }
+                assert_eq!(
+                    store.read_work_item("matrix-work").unwrap().attempts[0]
+                        .tasks
+                        .len(),
+                    prior_tasks
+                );
+            } else {
+                assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+                    "{scenario}: {outcome:?}"
+                );
+            }
         }
     }
 

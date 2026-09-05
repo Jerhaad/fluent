@@ -6509,7 +6509,7 @@ Test: src/work_attempt_loop.rs (incomplete_no_change_writer_pauses_instead_of_co
 
 ### B8
 
-WHEN two consecutive pre-review Writer continuations create commits without
+WHEN two consecutive Writer continuations, including after review, create commits against the same obligations without
 increasing the applicable matrix or legacy required-progress completion count,
 THE SYSTEM SHALL preserve the candidate and pause the Attempt before planning a
 Tester or reviewer.
@@ -9729,3 +9729,12 @@ Test: tests/binary.rs (legacy_ownership_adoption_requires_approval)
 Test: tests/binary.rs (legacy_ownership_adoption_rejects_stale_state)
 Test: tests/binary.rs (legacy_ownership_adoption_exact_retry_preserves_history)
 Test: tests/binary.rs (legacy_ownership_old_reader_refuses_mutation)
+
+## Writer continuation recovery
+
+### B1
+
+WHEN two consecutive Writer continuations complete no additional work against
+the same outstanding requirements, THE SYSTEM SHALL preserve the candidate and
+pause before launching another Writer, including after earlier reviews.
+Test: src/work_attempt_loop.rs (stagnant_post_review_continuations_pause)

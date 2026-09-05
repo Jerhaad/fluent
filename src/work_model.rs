@@ -3782,6 +3782,26 @@ impl WriterCompletionMatrixStatus {
 }
 
 impl WriterCompletionMatrix {
+    /// Compare stable obligations and completed identities across continuations.
+    /// Finding paths may change when the same finding is reported again; evidence
+    /// wording and commit counts do not themselves establish additional work.
+    pub(crate) fn completion_identity(&self) -> Vec<WriterCompletionRow> {
+        self.rows
+            .iter()
+            .filter(|row| writer_responsibility(row.responsibility))
+            .map(|row| {
+                let mut identity = row.clone();
+                if identity.kind == WriterCompletionRequirementKind::Finding {
+                    identity.source.clear();
+                }
+                identity.implementation_evidence.clear();
+                identity.verification.clear();
+                identity.applicable_constraints.clear();
+                identity
+            })
+            .collect()
+    }
+
     /// Carry forward completed planning claims from an authoritative earlier
     /// matrix without changing findings or any claim the current Writer already
     /// made. Host-produced planning repairs use this when a later Writer was

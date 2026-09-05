@@ -3803,3 +3803,10 @@ Tasks. The aggregate transaction adopts that mapping and records one recovery
 operation. Record syntax upgrades and status reads do not invoke adoption.
 See the saved mixed-row example in
 `skills/fluent.full/references/host-evidence-recovery.md` for the public commands.
+
+Writer stagnation compares consecutive completion matrices by stable obligation
+identity and completed rows. Repeated corrective reviews do not exempt a Writer
+from the two-continuation guard. New findings reset the comparison; replacing an
+old finding does not regress an unchanged completed Plan row. Legacy progress
+without a matrix retains its counts and compares the finding identities. A new
+commit alone never counts as additional completion.
