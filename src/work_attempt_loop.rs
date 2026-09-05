@@ -6839,7 +6839,7 @@ fn gate_candidate_after_writer(
         ),
     };
     let prior_candidate_gate =
-        select_prior_writer_candidate_gate(&item.attempts[attempt_index], write_index)?;
+        select_prior_writer_candidate_gate(item, attempt_index, write_index)?;
     let repeated_rejection = prior_candidate_gate.is_some();
     let prior_candidate_gate_path = prior_candidate_gate
         .map(|input| {
@@ -6927,14 +6927,19 @@ fn gate_candidate_after_writer(
 }
 
 /// Select the one prior candidate gate that this Writer may use as correction
-/// authority. Work Item inputs remain context even when their snapshot names
-/// end in `candidate-gate.json`; every other gate-shaped input must bind an
-/// earlier completed Writer and either that Writer's gate or the canonical
-/// final-Tester gate for that exact Writer candidate.
+/// authority. Recorded Work Item snapshots and canonical final-Tester
+/// correction evidence remain non-authoritative context; every other
+/// gate-shaped input must bind an earlier completed Writer and that Writer's
+/// exact managed gate path.
 fn select_prior_writer_candidate_gate(
-    attempt: &Attempt,
+    item: &WorkItem,
+    attempt_index: usize,
     write_index: usize,
 ) -> Result<Option<&ArtifactRef>> {
+    let attempt = item
+        .attempts
+        .get(attempt_index)
+        .ok_or_else(|| anyhow::anyhow!("Attempt index {attempt_index} is out of range"))?;
     let task = attempt
         .tasks
         .get(write_index)
@@ -6947,7 +6952,18 @@ fn select_prior_writer_candidate_gate(
             .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
     }) {
         if input.producer_id == "work-item" {
-            continue;
+            if item
+                .input_artifacts
+                .iter()
+                .any(|artifact| artifact.snapshot_path == input.path)
+            {
+                continue;
+            }
+            bail!(
+                "Writer Task {:?} gate-shaped Work Item input {:?} is not a recorded immutable snapshot",
+                task.id,
+                input.path
+            );
         }
         let Some((producer_index, producer)) = attempt.tasks[..write_index]
             .iter()
@@ -6975,6 +6991,17 @@ fn select_prior_writer_candidate_gate(
                 attempt.id
             );
         }
+        if is_canonical_final_tester_correction_gate(
+            attempt,
+            write_index,
+            producer_index,
+            producer,
+            input,
+        ) {
+            // The final Tester gate explains why this Writer was planned, but
+            // it cannot set a prior candidate base or metadata-rewrite scope.
+            continue;
+        }
         let expected_writer_path = work_artifact_path(
             &attempt.work_item_id,
             &attempt.id,
@@ -6984,19 +7011,12 @@ fn select_prior_writer_candidate_gate(
                 crate::candidate_gate::CANDIDATE_GATE_FILE
             ),
         );
-        if input.path != expected_writer_path
-            && !is_canonical_final_tester_gate_for_writer(
-                attempt,
-                write_index,
-                producer_index,
-                producer,
-                input,
-            )
-        {
+        if input.path != expected_writer_path {
             bail!(
-                "Writer Task {:?} prior candidate gate for producer {:?} must use its canonical Writer or final-Tester path, found {:?}",
+                "Writer Task {:?} prior candidate gate for producer {:?} must use its canonical Writer path {:?}, found {:?}",
                 task.id,
                 producer.id,
+                expected_writer_path,
                 input.path
             );
         }
@@ -7011,7 +7031,7 @@ fn select_prior_writer_candidate_gate(
     Ok(selected)
 }
 
-fn is_canonical_final_tester_gate_for_writer(
+fn is_canonical_final_tester_correction_gate(
     attempt: &Attempt,
     write_index: usize,
     producer_index: usize,
@@ -12191,8 +12211,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            select_prior_writer_candidate_gate(&item.attempts[0], write_index).unwrap(),
-            Some(final_gate)
+            select_prior_writer_candidate_gate(&item, 0, write_index).unwrap(),
+            None
         );
 
         let tester_index = item.attempts[0]
@@ -12331,7 +12351,7 @@ mod tests {
             }
 
             assert!(
-                select_prior_writer_candidate_gate(&invalid.attempts[0], write_index).is_err(),
+                select_prior_writer_candidate_gate(&invalid, 0, write_index).is_err(),
                 "{invalid_binding:?} must not grant prior-gate authority"
             );
         }
@@ -18265,15 +18285,19 @@ mod tests {
         item.add_next_write_round("attempt-1", vec![first_gate.clone()])
             .unwrap();
         assert_eq!(
-            select_prior_writer_candidate_gate(&item.attempts[0], 1).unwrap(),
+            select_prior_writer_candidate_gate(&item, 0, 1).unwrap(),
             Some(&first_gate)
         );
 
         let mut wrong_producer = item.clone();
         wrong_producer.attempts[0].tasks[0].kind = TaskKind::Review;
-        assert!(select_prior_writer_candidate_gate(&wrong_producer.attempts[0], 1).is_err());
+        assert!(select_prior_writer_candidate_gate(&wrong_producer, 0, 1).is_err());
 
         let invalid = [
+            ArtifactRef {
+                producer_id: "work-item".to_string(),
+                path: first_gate.path.clone(),
+            },
             ArtifactRef {
                 producer_id: "attempt-1-review-tests".to_string(),
                 path: first_gate.path.clone(),
@@ -18314,7 +18338,7 @@ mod tests {
         for artifact in invalid {
             let mut invalid_item = item.clone();
             invalid_item.attempts[0].tasks[1].input_artifacts = vec![artifact];
-            assert!(select_prior_writer_candidate_gate(&invalid_item.attempts[0], 1).is_err());
+            assert!(select_prior_writer_candidate_gate(&invalid_item, 0, 1).is_err());
         }
 
         let mut ambiguous = item;
@@ -18333,7 +18357,7 @@ mod tests {
         ambiguous
             .add_next_write_round("attempt-1", vec![first_gate, second_gate])
             .unwrap();
-        assert!(select_prior_writer_candidate_gate(&ambiguous.attempts[0], 2).is_err());
+        assert!(select_prior_writer_candidate_gate(&ambiguous, 0, 2).is_err());
     }
 
     struct RetiredCommitStyleFixture {
@@ -20391,7 +20415,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(
-                select_prior_writer_candidate_gate(attempt, correction_index).unwrap(),
+                select_prior_writer_candidate_gate(&item, 0, correction_index).unwrap(),
                 Some(prior_writer_gate)
             );
         }
