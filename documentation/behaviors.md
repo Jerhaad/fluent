@@ -2930,10 +2930,12 @@ Test: src/work_task_executor.rs (write_user_prompt_directs_codebase_orientation)
 WHEN `fluent task run <work-item-id> <attempt-id> <task-id>` or
 `fluent attempt run <work-item-id> <attempt-id>` launches a
 `write` Task,
-THE SYSTEM SHALL direct the writer to follow the project's stated
-commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length,
-mood, prohibited trailers — when writing commit messages.
-Test: src/work_task_executor.rs (write_user_prompt_directs_commit_conventions)
+THE SYSTEM SHALL identify subject length and style, body presence, wrapping,
+and formatting conventions from `AGENTS.md` / `CLAUDE.md` as presentation
+advice and SHALL NOT request corrective work solely for that advice, while
+continuing to require valid history, identity, message encoding, and
+attribution, including the `Co-Authored-By` prohibition.
+Test: src/work_task_executor.rs (write_user_prompt_directs_advisory_commit_presentation)
 
 ## Atomic state-file writes
 
@@ -8054,13 +8056,12 @@ Test: tests/binary.rs (skills_add_does_not_report_user_owned_discovery_as_manage
 WHEN the documentation reviewer reviews a normal Attempt candidate and
 the project states commit-message conventions in `AGENTS.md` or
 `CLAUDE.md`,
-THE SYSTEM SHALL flag any of the candidate's commits (over
-`{{source_branch}}..{{candidate_commit}}`) that violate those
-conventions as documentation findings, and SHALL NOT flag against
-conventions the project did not state.
-Untestable: requires an end-to-end LLM reviewer run against a
-repository with stated commit conventions; verified by dogfood and the
-review-skills reviewer, not a deterministic test.
+THE SYSTEM SHALL treat subject length and style, body presence, wrapping, and
+formatting as non-blocking presentation advice and SHALL NOT emit a finding or
+failing verdict solely for that advice, while continuing to flag violations
+that affect linear history, identity, message encoding, or attribution,
+including prohibited `Co-Authored-By` trailers.
+Test: src/work_task_executor.rs (documentation_review_treats_commit_presentation_as_advice)
 
 ---
 

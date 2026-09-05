@@ -1,15 +1,17 @@
 ---
 name: commit-subject-line-fifty-char-limit
-description: Commit subject lines must be 50 characters or fewer per project convention
+description: Commit subject lines should stay within 50 characters when practical
 metadata:
   type: convention
 ---
 
 The project's stated commit-message convention caps subject lines at 50
 characters. Descriptive module names and test lists easily push subjects past
-this limit; the documentation reviewer counts characters and flags violations
-even when they are otherwise clear.
+this limit. Treat the cap as presentation advice: follow it when practical, but
+do not create corrective work or a failing review solely for a long subject.
 
-Enforce this during drafting, not after: a subject like "Add scheduler service
-foundation module with identity and registry" (62 chars) must be shortened to
-"Add scheduler service foundation module" or similar before committing.
+Apply it during drafting: a subject like "Add scheduler service
+foundation module with identity and registry" (62 chars) can be shortened to
+"Add scheduler service foundation module" or similar when that remains clear.
+History, identity, message encoding, and attribution restrictions still block
+admission.
