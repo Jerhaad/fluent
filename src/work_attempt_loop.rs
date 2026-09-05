@@ -17916,7 +17916,7 @@ mod tests {
     fn make_retired_commit_style_pause_fixture_with_options(
         long_body_line: bool,
         preserved_input: bool,
-        prohibited_trailer: bool,
+        prior_prohibited_trailer: bool,
     ) -> RetiredCommitStyleFixture {
         use std::os::unix::fs::PermissionsExt;
 
@@ -17992,6 +17992,34 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(workspace.join("src")).unwrap();
+        if prior_prohibited_trailer {
+            fs::write(
+                workspace.join("src/attributed.rs"),
+                "pub fn attributed() {}\n",
+            )
+            .unwrap();
+            crate::git::run(
+                &workspace,
+                &["add", "src/attributed.rs"],
+                "stage attributed retired-style precursor",
+            )
+            .unwrap();
+            crate::git::run(
+                &workspace,
+                &[
+                    "commit",
+                    "-q",
+                    "-m",
+                    "Add attributed precursor",
+                    "-m",
+                    "- Prepare the candidate history",
+                    "-m",
+                    "Co-Authored-By: Bot <bot@example.com>",
+                ],
+                "commit attributed retired-style precursor",
+            )
+            .unwrap();
+        }
         fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
         crate::git::run(
             &workspace,
@@ -18001,18 +18029,14 @@ mod tests {
         .unwrap();
         if long_body_line {
             let body = "x".repeat(73);
-            let mut args = vec!["commit", "-q", "-m", "Add candidate", "-m", &body];
-            if prohibited_trailer {
-                args.extend(["-m", "Co-Authored-By: Bot <bot@example.com>"]);
-            }
             crate::git::run(
                 &workspace,
-                &args,
+                &["commit", "-q", "-m", "Add candidate", "-m", &body],
                 "commit long-line retired-style candidate",
             )
             .unwrap();
         } else {
-            assert!(!prohibited_trailer);
+            assert!(!prior_prohibited_trailer);
             crate::git::run(
                 &workspace,
                 &["commit", "-q", "-m", "Add candidate"],
@@ -18325,6 +18349,39 @@ mod tests {
     fn retired_commit_style_recovery_rejects_unsafe_frontiers() {
         let unlogged_provenance =
             make_retired_commit_style_pause_fixture_with_options(true, false, true);
+        let item = unlogged_provenance.store.read_work_item("work-1").unwrap();
+        let source = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let base = source.base_commit.as_ref().unwrap();
+        let commits = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &[
+                "rev-list",
+                "--reverse",
+                &format!("{base}..{}", unlogged_provenance.candidate),
+            ],
+            "inspect unlogged provenance fixture history",
+        )
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(commits.len(), 2);
+        let prior_message = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &["show", "-s", "--format=%B", &commits[0]],
+            "inspect earlier unlogged attribution",
+        )
+        .unwrap();
+        assert!(prior_message.contains("Co-Authored-By: Bot <bot@example.com>"));
+        assert_eq!(commits[1], unlogged_provenance.candidate);
+        let tip_message = crate::git::run_stdout(
+            &unlogged_provenance.workspace,
+            &["show", "-s", "--format=%B", &commits[1]],
+            "inspect presentation-only tip",
+        )
+        .unwrap();
+        assert!(!tip_message.contains("Co-Authored-By:"));
+        assert!(tip_message.lines().any(|line| line.chars().count() > 72));
         let before = retired_commit_style_boundary_snapshot(&unlogged_provenance);
         assert!(
             recover_retired_commit_style_pause(
