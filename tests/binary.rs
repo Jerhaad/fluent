@@ -4874,6 +4874,120 @@ fn every_writer_receives_preserved_work_item_input_artifacts_read_only() {
 }
 
 #[test]
+fn work_item_gate_named_input_reaches_review() {
+    use fluent::candidate_gate::{
+        CANDIDATE_GATE_SCHEMA_VERSION, CandidateCheckEvidence, CandidateCheckStatus,
+        CandidateGateDisposition, CandidateGateEvidence, CandidateGatePhase,
+    };
+    use fluent::work_model::{PauseKind, TaskKind};
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let input = main_dir.join(".fluent/work/artifacts/evidence/candidate-gate.json");
+    fs::create_dir_all(input.parent().unwrap()).unwrap();
+    let checks = [
+        ("candidate-identity", CandidateCheckStatus::Passed),
+        ("whitespace", CandidateCheckStatus::Failed),
+        ("commit-metadata", CandidateCheckStatus::Passed),
+        ("behavior-references", CandidateCheckStatus::Skipped),
+        ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+        ("project-check", CandidateCheckStatus::Passed),
+    ]
+    .into_iter()
+    .map(|(name, status)| CandidateCheckEvidence {
+        name: name.to_string(),
+        status,
+        diagnostics: Vec::new(),
+        log_path: None,
+    })
+    .collect();
+    fs::write(
+        &input,
+        serde_json::to_vec_pretty(&CandidateGateEvidence {
+            schema_version: CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: CandidateGatePhase::Writer,
+            disposition: CandidateGateDisposition::Rejected,
+            base_commit: "preserved-base".to_string(),
+            candidate_commit: "preserved-candidate".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Keep candidate gate evidence",
+            "--input-artifact",
+            ".fluent/work/artifacts/evidence/candidate-gate.json",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let bin_dir = tmp.path().join("bin-gate-named-input");
+    write_mock_claude(&bin_dir, &stateful_loop_mock_script("uncertain"));
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Planned 5 review Tasks for Attempt attempt-1",
+        ));
+
+    let stored = WorkModelStore::new(&main_dir)
+        .read_work_item("work-1")
+        .unwrap();
+    let attempt = &stored.attempts[0];
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        1,
+        "the preserved gate must not trigger a correction Writer"
+    );
+    assert_eq!(attempt.pause_kind, Some(PauseKind::Uncertain));
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Review)
+            .count(),
+        fluent::review::REVIEWERS.len()
+    );
+    let preserved = &attempt.tasks[0].input_artifacts[0];
+    assert_eq!(preserved.producer_id, "work-item");
+    assert!(preserved.path.ends_with("0000-candidate-gate.json"));
+    let current_gate = attempt
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == "attempt-1-write-1"
+                && artifact.path.ends_with("/candidate-gate.json")
+        })
+        .expect("ordinary Writer admission publishes its current gate");
+    let evidence: CandidateGateEvidence =
+        serde_json::from_slice(&fs::read(main_dir.join(&current_gate.path)).unwrap()).unwrap();
+    assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+    assert_ne!(evidence.candidate_commit, "preserved-candidate");
+}
+
+#[test]
 fn reviewers_receive_preserved_work_item_inputs_and_attempt_inputs() {
     use fluent::work_model::{TaskOutput, TaskStatus};
 
