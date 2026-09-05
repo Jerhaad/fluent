@@ -2753,6 +2753,272 @@ mod tests {
     }
 
     #[test]
+    fn metadata_recovery_allows_a_later_candidate_after_an_earlier_repair() {
+        let fixture = fixture();
+        let first = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Repair the first malformed commit metadata.",
+        )
+        .unwrap();
+
+        // Simulate the first audited Writer completing with a tree-identical
+        // replacement, then an ordinary later Writer producing a new
+        // tree-identical candidate with another metadata defect.
+        git_ok(
+            &fixture.workspace,
+            &["commit", "--amend", "-q", "-m", "First repaired candidate"],
+        );
+        let first_repaired_candidate = candidate_head(&fixture);
+        let mut item = fixture.store.read_work_item("work-1").unwrap();
+        let first_task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == first.task_id)
+            .unwrap();
+        first_task.status = TaskStatus::Complete;
+        first_task.completed_at = Some(now_iso8601());
+        first_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate-metadata".to_string(),
+            source_branch: "work/candidate-metadata".to_string(),
+            base_commit: Some(fixture.candidate.clone()),
+            commit: first_repaired_candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let later_task_id = item.add_next_write_round("attempt-1", Vec::new()).unwrap();
+        git_ok(
+            &fixture.workspace,
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Second malformed candidate with literal \\n text",
+            ],
+        );
+        let later_candidate = candidate_head(&fixture);
+        let later_task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == later_task_id)
+            .unwrap();
+        later_task.status = TaskStatus::Complete;
+        later_task.completed_at = Some(now_iso8601());
+        later_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate-metadata".to_string(),
+            source_branch: "work/candidate-metadata".to_string(),
+            base_commit: Some(first_repaired_candidate),
+            commit: later_candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let later_gate = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &format!("candidate-gates/{later_task_id}/candidate-gate.json"),
+        );
+        let later_gate_path = fixture.project.join(&later_gate);
+        fs::create_dir_all(later_gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Failed),
+            ("behavior-references", CandidateCheckStatus::Passed),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Skipped),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: Vec::new(),
+            log_path: None,
+        })
+        .collect();
+        fs::write(
+            &later_gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: fixture.base.clone(),
+                candidate_commit: later_candidate,
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: later_task_id,
+            path: later_gate,
+        });
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+        item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+        fixture.store.write_work_item(&item).unwrap();
+
+        let second = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Repair the second malformed commit metadata.",
+        )
+        .unwrap();
+        assert!(!second.already_authorized);
+        assert_ne!(second.task_id, first.task_id);
+        assert_ne!(second.audit_artifact, first.audit_artifact);
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.role == CANDIDATE_METADATA_REPAIR_ROLE)
+                .count(),
+            2
+        );
+        assert_eq!(stored.attempts[0].recovery_operations.len(), 2);
+        assert!(stored.attempts[0].artifacts.iter().any(|artifact| {
+            artifact
+                .path
+                .ends_with(&format!("{}/repair.json", first.task_id))
+        }));
+        assert!(stored.attempts[0].artifacts.iter().any(|artifact| {
+            artifact
+                .path
+                .ends_with(&format!("{}/repair.json", second.task_id))
+        }));
+    }
+
+    #[test]
+    fn metadata_recovery_allows_a_second_repair_after_the_first_repair_completes() {
+        let fixture = fixture();
+        let first = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Repair the first malformed commit metadata.",
+        )
+        .unwrap();
+
+        // The first recovery Writer completes with a tree-identical rewrite.
+        // A later candidate gate can still find another metadata problem in
+        // that same candidate history. It needs a new audited Writer, while
+        // the first authorization remains immutable history.
+        git_ok(
+            &fixture.workspace,
+            &["commit", "--amend", "-q", "-m", "First repaired candidate"],
+        );
+        let first_repaired_candidate = candidate_head(&fixture);
+        let mut item = fixture.store.read_work_item("work-1").unwrap();
+        let first_task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == first.task_id)
+            .unwrap();
+        first_task.status = TaskStatus::Complete;
+        first_task.completed_at = Some(now_iso8601());
+        first_task.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate-metadata".to_string(),
+            source_branch: "work/candidate-metadata".to_string(),
+            base_commit: Some(fixture.candidate.clone()),
+            commit: first_repaired_candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        let gate = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            &format!("candidate-gates/{}/candidate-gate.json", first.task_id),
+        );
+        let gate_path = fixture.project.join(&gate);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Failed),
+            ("behavior-references", CandidateCheckStatus::Passed),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Skipped),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: Vec::new(),
+            log_path: None,
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: fixture.base.clone(),
+                candidate_commit: first_repaired_candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: first.task_id.clone(),
+            path: gate,
+        });
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::CandidateGate);
+        item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+        fixture.store.write_work_item(&item).unwrap();
+
+        let second = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Repair the second malformed commit metadata.",
+        )
+        .unwrap();
+        assert!(!second.already_authorized);
+        assert_ne!(second.task_id, first.task_id);
+        assert_eq!(second.candidate_commit, first_repaired_candidate);
+
+        let replay = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Repair the second malformed commit metadata.",
+        )
+        .unwrap();
+        assert!(replay.already_authorized);
+        assert_eq!(replay.task_id, second.task_id);
+
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].recovery_operations.len(), 2);
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.role == CANDIDATE_METADATA_REPAIR_ROLE)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn authorized_recovery_rejects_drift_before_resume() {
         let fixture = fixture();
         repair(
