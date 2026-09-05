@@ -60,6 +60,7 @@
 - [keep-architecture-doc-in-sync](keep-architecture-doc-in-sync.md) — documentation/architecture.md is a living present-tense doc; subsystem changes must update its file map and subsystem sections in the same change
 - [lease-acquire-types-contention-vs-infrastructure](lease-acquire-types-contention-vs-infrastructure.md) — Lock/lease acquisition must return a typed result — only a non-blocking flock WouldBlock is a live peer (fail open); every other lock-path IO error propagates as a real failure
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
+- [legacy-recovery-rechecks-active-blockers](legacy-recovery-rechecks-active-blockers.md) — Historical hook output can authorize retired findings only; recheck active blockers across the complete candidate range
 - [lock-ordering-across-subsystems](lock-ordering-across-subsystems.md) — Release the queue lock before mutating the Work model; the codebase has a lock hierarchy that must not be inverted
 - [log-append-across-retries](log-append-across-retries.md) — Retried operation logs must append with timestamps rather than truncate so prior failures are preserved
 - [macos-flock-child-process-test-pattern](macos-flock-child-process-test-pattern.md) — macOS flock tests must spawn child processes via current_exe, not threads; a sentinel test function guards the child entry point
@@ -97,6 +98,7 @@
 - [recovered-approvals-preserve-delay-provenance](recovered-approvals-preserve-delay-provenance.md) — Mark every reconnect replay source as recovered so delayed consequential approvals require fresh confirmation
 - [recovery-contracts-form-neutral-boundary](recovery-contracts-form-neutral-boundary.md) — Keep shared recovery admission, evidence parsing, and Writer completion checks in a caller-independent crate-private module
 - [recovery-cursors-advance-after-durable-ingest](recovery-cursors-advance-after-durable-ingest.md) — Recover paginated event history from a durable high-water mark and advance it only after each event is durably processed
+- [recovery-receipts-separate-audit-from-live-policy](recovery-receipts-separate-audit-from-live-policy.md) — Replay recovery receipts against their recorded policy commit while revalidating the current descendant policy separately
 - [registry-read-modify-write-needs-flock](registry-read-modify-write-needs-flock.md) — JSON registry read-modify-write operations need flock around the full read-write pair; atomic_write alone only protects the individual write
 - [rejection-tests-snapshot-owned-trees](rejection-tests-snapshot-owned-trees.md) — A CLI rejection that promises no mutation must snapshot every project and home tree it can manage, byte-for-byte, including pre-existing files and empty directories
 - [release-fixture-process-group-ownership](release-fixture-process-group-ownership.md) — Every long-lived release fixture owns, terminates, and reaps its complete process group on every exit path
