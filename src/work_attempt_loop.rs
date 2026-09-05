@@ -12137,6 +12137,27 @@ mod tests {
 
     #[test]
     fn final_tester_gate_selection_requires_exact_tester_binding() {
+        #[derive(Clone, Copy, Debug)]
+        enum InvalidBinding {
+            GatePath,
+            ProducerStatus,
+            ProducerOutput,
+            TesterKind,
+            TesterRole,
+            FailedCommandRecheck,
+            TesterStatus,
+            WorkItem,
+            Attempt,
+            ArtifactArea,
+            LatestWriter,
+            MissingReviewContext,
+            CandidateWorkspaceId,
+            CandidateWorkspacePath,
+            SourceBranch,
+            CandidateCommit,
+            BaseCommit,
+        }
+
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
@@ -12179,28 +12200,141 @@ mod tests {
             .iter()
             .position(|task| task.kind == TaskKind::Tester)
             .unwrap();
-        let mut wrong_context = item.clone();
-        wrong_context.attempts[0].tasks[tester_index]
-            .review_context
-            .as_mut()
-            .unwrap()
-            .candidate_commit
-            .push_str("-other");
-        assert!(
-            select_prior_writer_candidate_gate(&wrong_context.attempts[0], write_index).is_err()
-        );
+        let producer_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.id == final_gate.producer_id)
+            .unwrap();
+        let invalid_bindings = [
+            InvalidBinding::GatePath,
+            InvalidBinding::ProducerStatus,
+            InvalidBinding::ProducerOutput,
+            InvalidBinding::TesterKind,
+            InvalidBinding::TesterRole,
+            InvalidBinding::FailedCommandRecheck,
+            InvalidBinding::TesterStatus,
+            InvalidBinding::WorkItem,
+            InvalidBinding::Attempt,
+            InvalidBinding::ArtifactArea,
+            InvalidBinding::LatestWriter,
+            InvalidBinding::MissingReviewContext,
+            InvalidBinding::CandidateWorkspaceId,
+            InvalidBinding::CandidateWorkspacePath,
+            InvalidBinding::SourceBranch,
+            InvalidBinding::CandidateCommit,
+            InvalidBinding::BaseCommit,
+        ];
+        for invalid_binding in invalid_bindings {
+            let mut invalid = item.clone();
+            let tasks = &mut invalid.attempts[0].tasks;
+            match invalid_binding {
+                InvalidBinding::GatePath => {
+                    let gate = tasks[write_index]
+                        .input_artifacts
+                        .iter_mut()
+                        .find(|artifact| {
+                            artifact.producer_id == final_gate.producer_id
+                                && artifact.path == final_gate.path
+                        })
+                        .unwrap();
+                    gate.path = work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "candidate-gates/other-tester/candidate-gate.json",
+                    );
+                }
+                InvalidBinding::ProducerStatus => {
+                    tasks[producer_index].status = TaskStatus::Failed;
+                }
+                InvalidBinding::ProducerOutput => {
+                    tasks[producer_index].output = None;
+                }
+                InvalidBinding::TesterKind => {
+                    tasks[tester_index].kind = TaskKind::Review;
+                }
+                InvalidBinding::TesterRole => {
+                    tasks[tester_index].role = "other-tester".to_string();
+                }
+                InvalidBinding::FailedCommandRecheck => {
+                    tasks[tester_index].role =
+                        crate::work_model::FAILED_COMMAND_RECHECK_ROLE.to_string();
+                }
+                InvalidBinding::TesterStatus => {
+                    tasks[tester_index].status = TaskStatus::Failed;
+                }
+                InvalidBinding::WorkItem => {
+                    tasks[tester_index].work_item_id = "other-work".to_string();
+                }
+                InvalidBinding::Attempt => {
+                    tasks[tester_index].attempt_id = Some("other-attempt".to_string());
+                }
+                InvalidBinding::ArtifactArea => {
+                    tasks[tester_index]
+                        .artifact_area
+                        .as_mut()
+                        .unwrap()
+                        .path
+                        .push_str("-other");
+                }
+                InvalidBinding::LatestWriter => {
+                    let output = tasks[producer_index].output.clone().unwrap();
+                    let reassigned = tasks[producer_index + 1..tester_index]
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Review)
+                        .unwrap();
+                    reassigned.kind = TaskKind::Write;
+                    reassigned.status = TaskStatus::Complete;
+                    reassigned.output = Some(output);
+                }
+                InvalidBinding::MissingReviewContext => {
+                    tasks[tester_index].review_context = None;
+                }
+                InvalidBinding::CandidateWorkspaceId => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_workspace_id
+                        .push_str("-other");
+                }
+                InvalidBinding::CandidateWorkspacePath => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_workspace_path
+                        .push_str("-other");
+                }
+                InvalidBinding::SourceBranch => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .source_branch
+                        .push_str("-other");
+                }
+                InvalidBinding::CandidateCommit => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .candidate_commit
+                        .push_str("-other");
+                }
+                InvalidBinding::BaseCommit => {
+                    tasks[tester_index]
+                        .review_context
+                        .as_mut()
+                        .unwrap()
+                        .base_commit = Some("unexpected-base".to_string());
+                }
+            }
 
-        let mut wrong_artifact_area = item;
-        wrong_artifact_area.attempts[0].tasks[tester_index]
-            .artifact_area
-            .as_mut()
-            .unwrap()
-            .path
-            .push_str("-other");
-        assert!(
-            select_prior_writer_candidate_gate(&wrong_artifact_area.attempts[0], write_index)
-                .is_err()
-        );
+            assert!(
+                select_prior_writer_candidate_gate(&invalid.attempts[0], write_index).is_err(),
+                "{invalid_binding:?} must not grant prior-gate authority"
+            );
+        }
     }
 
     #[test]
@@ -18036,14 +18170,9 @@ mod tests {
         (store, workspace)
     }
 
-    #[test]
-    fn work_item_gate_named_input_is_not_prior_writer_gate() {
-        let project = tempfile::tempdir().unwrap();
-        let (store, _workspace) =
-            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
-        let mut item = store.read_work_item("work-1").unwrap();
+    fn attach_gate_named_work_item_input(project_root: &Path, item: &mut WorkItem) -> ArtifactRef {
         let snapshot_path = work_artifact_path("work-1", "inputs", "0000-candidate-gate.json");
-        let snapshot = project.path().join(&snapshot_path);
+        let snapshot = project_root.join(&snapshot_path);
         fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
         let checks = [
             ("candidate-identity", CandidateCheckStatus::Passed),
@@ -18079,10 +18208,23 @@ mod tests {
                 snapshot_path: snapshot_path.clone(),
                 digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
             });
-        item.attempts[0].tasks[0].input_artifacts.push(ArtifactRef {
+        let artifact = ArtifactRef {
             producer_id: "work-item".to_string(),
             path: snapshot_path,
-        });
+        };
+        item.attempts[0].tasks[0]
+            .input_artifacts
+            .push(artifact.clone());
+        artifact
+    }
+
+    #[test]
+    fn work_item_gate_named_input_is_not_prior_writer_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        attach_gate_named_work_item_input(project.path(), &mut item);
 
         let outcome =
             gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0).unwrap();
@@ -20198,6 +20340,7 @@ mod tests {
         .unwrap();
         let mut item = store.read_work_item("work-1").unwrap();
         item.attempts[0].tasks[0].output.as_mut().unwrap().commit = rejected.clone();
+        let preserved_input = attach_gate_named_work_item_input(project.path(), &mut item);
         store.write_work_item(&item).unwrap();
 
         let first = plan_after_completed_writer(
@@ -20231,9 +20374,29 @@ mod tests {
         )
         .unwrap();
         let mut item = store.read_work_item("work-1").unwrap();
+        {
+            let attempt = &item.attempts[0];
+            let correction_index = attempt.tasks.len() - 1;
+            let correction = &attempt.tasks[correction_index];
+            assert_eq!(correction.kind, TaskKind::Write);
+            assert!(correction.input_artifacts.contains(&preserved_input));
+            let prior_writer_gate = correction
+                .input_artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.producer_id == "attempt-1-write-1"
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+                })
+                .unwrap();
+            assert_eq!(
+                select_prior_writer_candidate_gate(attempt, correction_index).unwrap(),
+                Some(prior_writer_gate)
+            );
+        }
         let original_output = item.attempts[0].tasks[0].output.clone().unwrap();
         let correction = item.attempts[0].tasks.last_mut().unwrap();
-        assert_eq!(correction.kind, TaskKind::Write);
         correction.status = TaskStatus::Complete;
         correction.output = Some(TaskOutput {
             base_commit: Some(rejected.clone()),
