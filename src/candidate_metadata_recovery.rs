@@ -738,10 +738,17 @@ fn parse_commit_body_length_finding(
     {
         bail!("Documentation finding is not the supported commit-body line-length finding");
     }
+    // Review prose often mentions the current candidate in the same sentence
+    // as the historical commit being reported (for example, "Commit <bad>
+    // remains in the reviewed main..<candidate> range").  The candidate is
+    // already bound by the review context, so do not count that range endpoint
+    // as another finding.  Any other full commit id remains part of the
+    // finding and must still resolve to exactly one historical commit.
     let commits = review_source
         .lines()
         .filter(|line| line.to_ascii_lowercase().contains("commit"))
         .flat_map(extract_full_commit_ids)
+        .filter(|commit| commit != candidate)
         .collect::<Vec<_>>();
     let mut commits = commits;
     commits.sort();
@@ -1321,7 +1328,11 @@ fn normalize_resolution(resolution: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::candidate_gate::{CandidateCheckEvidence, CandidateGateEvidence};
-    use crate::work_model::{PauseKind, TaskOutput, WorkItem, WorkModelError};
+    use crate::work_model::{
+        NoChangeOutput, NoChangeVerification, NoChangeVerificationResult, PauseKind, TaskOutput,
+        TaskStatus, WorkItem, WorkModelError, WriterCompletionMatrix,
+        WriterCompletionRequirementKind, WriterCompletionRow, WriterCompletionState,
+    };
     use std::fs;
     use tempfile::TempDir;
 
@@ -1336,8 +1347,228 @@ mod tests {
         gate: String,
     }
 
+    struct DocumentationFixture {
+        _tmp: TempDir,
+        project: std::path::PathBuf,
+        workspace: std::path::PathBuf,
+        store: WorkModelStore,
+        base: String,
+        historical_commit: String,
+        candidate: String,
+        gate: String,
+        review: String,
+        finding_id: String,
+    }
+
     fn git_ok(path: &Path, args: &[&str]) {
         git::run(path, args, "prepare candidate metadata recovery fixture").unwrap();
+    }
+
+    fn documentation_fixture() -> DocumentationFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("main");
+        let workspace = tmp.path().join("work-documentation-metadata");
+        fs::create_dir_all(&project).unwrap();
+        git_ok(&project, &["init", "-q"]);
+        git_ok(&project, &["config", "user.name", "Test Author"]);
+        git_ok(&project, &["config", "user.email", "test@example.com"]);
+        fs::write(project.join("README.md"), "base\n").unwrap();
+        git_ok(&project, &["add", "."]);
+        git_ok(&project, &["commit", "-q", "-m", "Create base"]);
+        let base = git::run_stdout(
+            &project,
+            &["rev-parse", "HEAD"],
+            "documentation fixture base",
+        )
+        .unwrap();
+        git_ok(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "work/documentation-metadata",
+                workspace.to_str().unwrap(),
+            ],
+        );
+
+        fs::write(workspace.join("documentation.md"), "documented\n").unwrap();
+        git_ok(&workspace, &["add", "."]);
+        git_ok(
+            &workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add documentation\n\nThis historical body line intentionally exceeds the repository's seventy-two character limit.",
+            ],
+        );
+        let historical_commit = git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD"],
+            "documentation historical commit",
+        )
+        .unwrap();
+
+        fs::write(workspace.join("follow-up.md"), "follow-up\n").unwrap();
+        git_ok(&workspace, &["add", "."]);
+        git_ok(&workspace, &["commit", "-q", "-m", "Keep candidate tree"]);
+        let candidate = git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD"],
+            "documentation candidate",
+        )
+        .unwrap();
+
+        let store = WorkModelStore::new(&project);
+        let mut item = WorkItem::planned("documentation-work", "Repair documentation metadata");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-documentation-metadata".to_string(),
+            source_branch: "work/documentation-metadata".to_string(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate.clone(),
+            no_change: Some(NoChangeOutput {
+                schema_version: 1,
+                declaration_path: ".fluent/work/artifacts/documentation-work/attempt-1/attempt-1-write-1/no-change.json".to_string(),
+                reason: "No source change is needed; only the recorded metadata finding remains.".to_string(),
+                verification: vec![NoChangeVerification {
+                    command: "git status --porcelain".to_string(),
+                    result: NoChangeVerificationResult::Pass,
+                }],
+            }),
+            learner_canonicalization: None,
+        });
+        let writer_artifact =
+            work_artifact_path("documentation-work", "attempt-1", "attempt-1-write-1");
+        let writer_root = project.join(&writer_artifact);
+        fs::create_dir_all(&writer_root).unwrap();
+        fs::write(
+            writer_root.join("no-change.json"),
+            serde_json::to_vec_pretty(writer.output.as_ref().unwrap().no_change.as_ref().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        let gate = work_artifact_path(
+            "documentation-work",
+            "attempt-1",
+            "candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate_path = project.join(&gate);
+        fs::create_dir_all(gate_path.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Passed),
+            ("behavior-references", CandidateCheckStatus::Passed),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Skipped),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: Vec::new(),
+            log_path: None,
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Passed,
+                base_commit: base.clone(),
+                candidate_commit: candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: gate.clone(),
+        });
+
+        let review = work_artifact_path(
+            "documentation-work",
+            "attempt-1",
+            "attempt-1-review-documentation/review.md",
+        );
+        let review_title = "Commit body exceeds the repository line-length limit (blocking)";
+        let review_path = project.join(&review);
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(
+            &review_path,
+            format!(
+                "Verdict: fail\n\n- [ ] {review_title}\n  - Commit `{historical_commit}` remains in the reviewed `main..{candidate}` range. Its body line exceeds 72 characters.\n"
+            ),
+        )
+        .unwrap();
+        let review_task_id = item
+            .add_review_tasks("attempt-1", &["documentation"])
+            .unwrap()[0]
+            .clone();
+        let review_task = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == review_task_id)
+            .unwrap();
+        crate::work_model::set_task_terminal(review_task, TaskStatus::Complete);
+        item.attempts[0].artifacts.push(ArtifactRef {
+            producer_id: review_task_id,
+            path: review.clone(),
+        });
+
+        let finding_id = format!(
+            "finding:documentation:sha256:{}",
+            crate::follow_up::content_digest(review_title.as_bytes())
+        );
+        let matrix = WriterCompletionMatrix {
+            schema_version: 1,
+            task_id: "attempt-1-write-1".to_string(),
+            rows: vec![WriterCompletionRow {
+                id: finding_id.clone(),
+                kind: WriterCompletionRequirementKind::Finding,
+                source: review.clone(),
+                requirement: format!("Address documentation review finding: {review_title}"),
+                verification_refs: Vec::new(),
+                command: None,
+                state: WriterCompletionState::Pending,
+                implementation_evidence: Vec::new(),
+                verification: Vec::new(),
+                applicable_constraints: Vec::new(),
+            }],
+        };
+        fs::write(
+            writer_root.join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE),
+            serde_json::to_vec_pretty(&matrix).unwrap(),
+        )
+        .unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        store.create_work_item(&item).unwrap();
+
+        DocumentationFixture {
+            _tmp: tmp,
+            project,
+            workspace,
+            store,
+            base,
+            historical_commit,
+            candidate,
+            gate,
+            review,
+            finding_id,
+        }
     }
 
     fn fixture() -> Fixture {
@@ -2163,6 +2394,52 @@ mod tests {
             Err(WorkModelError::InvalidCandidateMetadataRepairTask { .. })
         ));
         assert!(is_resume_ready(&fixture.project, &item, "attempt-1").is_err());
+    }
+
+    #[test]
+    fn completed_legacy_metadata_recovery_task_remains_readable() {
+        let fixture = fixture();
+        let metadata = metadata_diagnostic(&fixture.candidate);
+        let hook = format!(
+            "commit {} body line 3 exceeds 72 characters\n",
+            fixture.candidate
+        );
+        fixture.configure_project_check(&[&metadata], &hook, &[]);
+        let repair = repair(
+            &fixture.project,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+            "Authorize the metadata rewrite.",
+        )
+        .unwrap();
+
+        let mut item = fixture.store.read_work_item("work-1").unwrap();
+        let writer = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == repair.task_id)
+            .unwrap();
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate-metadata".to_string(),
+            source_branch: "work/candidate-metadata".to_string(),
+            base_commit: Some(fixture.candidate.clone()),
+            commit: fixture.candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        writer.instructions = writer.instructions.as_ref().map(|instructions| {
+            instructions
+                .split(crate::work_model::CANDIDATE_METADATA_DERIVED_PROJECT_CHECK_MARKER)
+                .next()
+                .unwrap()
+                .trim_end()
+                .to_string()
+        });
+
+        item.validate().unwrap();
     }
 
     #[test]
@@ -3063,6 +3340,147 @@ mod tests {
         let item = fixture.store.read_work_item("work-1").unwrap();
         let error = is_resume_ready(&fixture.project, &item, "attempt-1").unwrap_err();
         assert!(error.to_string().contains("project-check evidence"));
+    }
+
+    #[test]
+    fn documentation_review_metadata_recovery_is_public_and_idempotent() {
+        let fixture = documentation_fixture();
+        let item = fixture.store.read_work_item("documentation-work").unwrap();
+        let action = recovery_action(&fixture.project, &item.attempts[0]).unwrap();
+        assert!(action.contains("repair-candidate-metadata documentation-work attempt-1"));
+
+        let first = repair(
+            &fixture.project,
+            &fixture.store,
+            "documentation-work",
+            "attempt-1",
+            "Rewrite only the named historical commit message; preserve the candidate tree.",
+        )
+        .unwrap();
+        assert!(!first.already_authorized);
+        assert_eq!(first.candidate_commit, fixture.candidate);
+        assert_eq!(first.protected_base_commit, fixture.base);
+
+        let authority: MetadataRepairAuthority =
+            serde_json::from_slice(&fs::read(fixture.project.join(&first.audit_artifact)).unwrap())
+                .unwrap();
+        assert_eq!(authority.source_candidate_commit, fixture.candidate);
+        assert_eq!(authority.protected_base_commit, fixture.base);
+        let candidate_tree = git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", &format!("{}^{{tree}}", fixture.candidate)],
+            "resolve documentation candidate tree",
+        )
+        .unwrap();
+        assert_eq!(authority.candidate_tree, candidate_tree);
+        assert_eq!(
+            authority.source_review_artifact.as_deref(),
+            Some(fixture.review.as_str())
+        );
+        assert_eq!(
+            authority.source_finding_id.as_deref(),
+            Some(fixture.finding_id.as_str())
+        );
+        let review_digest = digest_path(&fixture.project, &fixture.review).unwrap();
+        assert_eq!(
+            authority.source_review_sha256.as_deref(),
+            Some(review_digest.as_str())
+        );
+
+        let stored = fixture.store.read_work_item("documentation-work").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Planned);
+        assert!(attempt.pause_kind.is_none());
+        assert!(is_resume_ready(&fixture.project, &stored, "attempt-1").unwrap());
+        let writer = attempt.tasks.last().unwrap();
+        assert_eq!(writer.id, first.task_id);
+        assert_eq!(writer.role, CANDIDATE_METADATA_REPAIR_ROLE);
+        assert!(writer.input_artifacts.contains(&ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: fixture.gate.clone(),
+        }));
+        assert!(writer.input_artifacts.contains(&ArtifactRef {
+            producer_id: "attempt-1-review-documentation".to_string(),
+            path: fixture.review.clone(),
+        }));
+        assert!(writer.input_artifacts.iter().any(|artifact| {
+            artifact.producer_id == PRODUCER && artifact.path == first.audit_artifact
+        }));
+        assert_eq!(attempt.recovery_operations.len(), 1);
+
+        let before = stored.clone();
+        let replay = repair(
+            &fixture.project,
+            &fixture.store,
+            "documentation-work",
+            "attempt-1",
+            "Rewrite only the named historical commit message; preserve the candidate tree.",
+        )
+        .unwrap();
+        assert!(replay.already_authorized);
+        assert_eq!(replay.task_id, first.task_id);
+        assert_eq!(replay.audit_artifact, first.audit_artifact);
+        assert_eq!(
+            fixture.store.read_work_item("documentation-work").unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn documentation_review_metadata_recovery_rejects_changed_review() {
+        let fixture = documentation_fixture();
+        let item = fixture.store.read_work_item("documentation-work").unwrap();
+        assert!(recovery_action(&fixture.project, &item.attempts[0]).is_some());
+        fs::write(
+            fixture.project.join(&fixture.review),
+            "Verdict: fail\n\n- [ ] A different finding (blocking)\n",
+        )
+        .unwrap();
+
+        let before = fixture.store.read_work_item("documentation-work").unwrap();
+        let error = repair(
+            &fixture.project,
+            &fixture.store,
+            "documentation-work",
+            "attempt-1",
+            "Rewrite only the named historical commit message; preserve the candidate tree.",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Documentation metadata")
+                || error.to_string().contains("finding")
+        );
+        assert_eq!(
+            fixture.store.read_work_item("documentation-work").unwrap(),
+            before
+        );
+        assert!(
+            !fixture
+                .project
+                .join(
+                    ".fluent/work/artifacts/documentation-work/attempt-1/candidate-metadata-repairs"
+                )
+                .exists()
+        );
+    }
+
+    #[test]
+    fn documentation_review_metadata_parser_ignores_candidate_range_endpoint() {
+        let fixture = documentation_fixture();
+        let item = fixture.store.read_work_item("documentation-work").unwrap();
+        let eligible =
+            inspect_documentation_review_frontier(&fixture.project, &item.attempts[0], None)
+                .unwrap();
+        assert_eq!(eligible.source_candidate_commit, fixture.candidate);
+        assert_eq!(eligible.protected_base_commit, fixture.base);
+        assert_eq!(eligible.source_review_ref.unwrap().path, fixture.review);
+        assert_eq!(fixture.historical_commit, {
+            let review = fs::read_to_string(fixture.project.join(&fixture.review)).unwrap();
+            extract_full_commit_ids(&review)
+                .into_iter()
+                .find(|commit| commit != &fixture.candidate)
+                .unwrap()
+        });
     }
 
     #[test]

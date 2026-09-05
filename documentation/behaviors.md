@@ -6754,6 +6754,20 @@ current rejected metadata gate, THE SYSTEM SHALL use the gate naming the
 current candidate to select tree-identical metadata-rewrite guidance.
 Test: src/work_task_executor.rs (latest_metadata_gate_wins_when_older_gate_history_is_preserved)
 
+### B25fc
+
+WHEN a Writer-completion pause contains one pending Documentation finding for
+an historical commit-body line-length defect, and the latest Writer has a
+verified no-change result, THE SYSTEM SHALL let the operator use the public
+`repair-candidate-metadata` operation to authorize one tree-identical metadata
+repair Writer. The operation SHALL bind the review, finding, current
+candidate, passing Writer gate, protected parent, candidate tree, and human
+decision before changing the Attempt, and SHALL return the same Writer when
+the exact authorization is repeated.
+Test: src/candidate_metadata_recovery.rs (documentation_review_metadata_recovery_is_public_and_idempotent)
+Test: src/candidate_metadata_recovery.rs (documentation_review_metadata_parser_ignores_candidate_range_endpoint)
+Test: src/candidate_metadata_recovery.rs (documentation_review_metadata_recovery_rejects_changed_review)
+
 ### B25g
 
 WHEN the operator approves candidate-ancestry repair for an authorized

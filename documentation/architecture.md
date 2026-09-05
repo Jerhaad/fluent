@@ -327,6 +327,17 @@ fluent queue resume <work-item-id> --attempt <attempt-id>
 This resumes the same Attempt and continues through the ordinary candidate
 gate, Tester, review, and Learner lifecycle.
 
+The same command also covers a narrower Writer-completion case. If the latest
+Writer has a verified no-change result and its completion matrix has exactly
+one pending Documentation finding for a historical commit-body line-length
+defect, Fluent binds the recovery to that review, the current candidate, and
+the Writer's passing gate. The operator can authorize the same
+`repair-candidate-metadata` command even when the ordinary Writer-round budget
+is exhausted. Fluent records the review digest and finding identity, derives
+the historical commit's protected parent from Git, and schedules one metadata
+repair Writer with the review and gate artifacts as inputs. A changed review,
+candidate, worktree, or finding is rejected before any state is changed.
+
 A generic `body line N exceeds 72 characters` finding must resolve to a gate
 commit, and the exact overlong commit message line must contain literal `\\n`
 text. A finding for an uncovered commit, an ordinary overlong line, any

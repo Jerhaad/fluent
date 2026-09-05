@@ -7024,7 +7024,16 @@ impl Task {
                                 .iter()
                                 .any(|artifact| artifact.path == path)
                     }
-                    None => !has_project_check_input,
+                    None => {
+                        // Fluent 0.3.0 began recording the exact derived
+                        // hook path in the Writer instructions. Older
+                        // metadata-recovery Writers already persisted the
+                        // canonical hook artifact, but had no marker to carry
+                        // that relationship. Keep completed historical Tasks
+                        // readable; newly planned Tasks must use the explicit
+                        // marker so an arbitrary hook log cannot be admitted.
+                        !has_project_check_input || self.status == TaskStatus::Complete
+                    }
                 };
             if self.kind != TaskKind::Write
                 || self.artifact_area.is_none()
