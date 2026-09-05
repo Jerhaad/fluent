@@ -17903,6 +17903,13 @@ mod tests {
     }
 
     fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
+        make_retired_commit_style_pause_fixture_with_input(long_body_line, false)
+    }
+
+    fn make_retired_commit_style_pause_fixture_with_input(
+        long_body_line: bool,
+        preserved_input: bool,
+    ) -> RetiredCommitStyleFixture {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::TempDir::new().unwrap();
@@ -17931,7 +17938,7 @@ mod tests {
         fs::write(project_root.join("README.md"), "base\n").unwrap();
         fs::write(
             project_root.join("scripts/check-commit-message-policy.sh"),
-            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+            "#!/bin/sh\nexit 1\n",
         )
         .unwrap();
         let hook = project_root.join(".fluent/hooks/check-pre-merge");
@@ -17945,8 +17952,15 @@ mod tests {
         .unwrap();
         crate::git::run(
             &project_root,
-            &["commit", "-q", "-m", "Make presentation advisory"],
-            "commit retired-style policy",
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Enforce presentation style",
+                "-m",
+                "- Model the policy that produced the stored rejection",
+            ],
+            "commit legacy retired-style policy",
         )
         .unwrap();
         let base = crate::git::run_stdout(
@@ -17971,9 +17985,18 @@ mod tests {
         .unwrap();
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        fs::write(
+            workspace.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
         crate::git::run(
             &workspace,
-            &["add", "src/lib.rs"],
+            &[
+                "add",
+                "src/lib.rs",
+                "scripts/check-commit-message-policy.sh",
+            ],
             "stage retired-style candidate",
         )
         .unwrap();
@@ -18003,6 +18026,31 @@ mod tests {
             &workspace,
             &["rev-parse", "HEAD^{tree}"],
             "read retired-style candidate tree",
+        )
+        .unwrap();
+
+        fs::write(
+            project_root.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["add", "scripts/check-commit-message-policy.sh"],
+            "stage advisory retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Make presentation advisory",
+                "-m",
+                "- Retire presentation-only failures",
+            ],
+            "commit advisory retired-style policy",
         )
         .unwrap();
 
@@ -18066,7 +18114,24 @@ mod tests {
         .unwrap();
 
         let store = WorkModelStore::new(&project_root);
-        let mut item = WorkItem::planned("work-1", "Recover retired commit style");
+        let approved_input = b"approved recovery context\n";
+        let input_artifacts = if preserved_input {
+            let snapshot_path = work_artifact_path("work-1", "inputs", "0000-context.md");
+            let snapshot = project_root.join(&snapshot_path);
+            fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+            fs::write(&snapshot, approved_input).unwrap();
+            vec![crate::work_model::WorkItemInputArtifact {
+                source_path: "approved/context.md".to_string(),
+                snapshot_path,
+                digest: format!("sha256:{:x}", Sha256::digest(approved_input)),
+            }]
+        } else {
+            Vec::new()
+        };
+        let mut item = WorkItem {
+            input_artifacts,
+            ..WorkItem::planned("work-1", "Recover retired commit style")
+        };
         item.add_initial_attempt("attempt-1").unwrap();
         let writer = &mut item.attempts[0].tasks[0];
         crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
@@ -18193,6 +18258,63 @@ mod tests {
             assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
             assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
         }
+    }
+
+    #[test]
+    fn retired_commit_style_pause_preserves_work_item_inputs() {
+        let fixture = make_retired_commit_style_pause_fixture_with_input(false, true);
+        let before = fixture.store.read_work_item("work-1").unwrap();
+        let preserved = ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: before.input_artifacts[0].snapshot_path.clone(),
+        };
+        let gate = before.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            before.attempts[0].tasks[1].input_artifacts,
+            vec![preserved.clone(), gate]
+        );
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        assert!(matches!(
+            plan_after_completed_writer(
+                &fixture.project_root,
+                &fixture.store,
+                recovered,
+                "attempt-1",
+            )
+            .unwrap(),
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+                .all(|task| task.input_artifacts.contains(&preserved))
+        );
     }
 
     #[test]

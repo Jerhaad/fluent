@@ -16,7 +16,7 @@ pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
-const COMMIT_PRESENTATION_ADVISORY_MARKER: &str =
+pub(crate) const COMMIT_PRESENTATION_ADVISORY_MARKER: &str =
     "# fluent-policy: commit-message-presentation-advisory-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -22433,6 +22433,16 @@ struct RetiredCommitStyleBinaryFixture {
 }
 
 fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture {
+    make_commit_style_binary_fixture(false)
+}
+
+fn make_current_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture {
+    make_commit_style_binary_fixture(true)
+}
+
+fn make_commit_style_binary_fixture(
+    source_uses_advisory_policy: bool,
+) -> RetiredCommitStyleBinaryFixture {
     use fluent::candidate_gate::{
         CANDIDATE_GATE_SCHEMA_VERSION, CandidateCheckEvidence, CandidateCheckStatus,
         CandidateGateDisposition, CandidateGateEvidence, CandidateGatePhase,
@@ -22445,19 +22455,39 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
     let project_root = setup_git_project(&root);
     let policy = project_root.join("scripts/check-commit-message-policy.sh");
     let hook = project_root.join(".fluent/hooks/check-pre-merge");
+    let required_behavior = project_root.join("tests/required-behavior.sh");
     fs::create_dir_all(policy.parent().unwrap()).unwrap();
     fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::create_dir_all(required_behavior.parent().unwrap()).unwrap();
+    let source_policy = if source_uses_advisory_policy {
+        "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nif [ -f blocked.txt ]; then\n  echo 'blocked.txt violates current project policy' >&2\n  exit 1\nfi\nexit 0\n"
+    } else {
+        "#!/bin/sh\nexit 1\n"
+    };
+    fs::write(&policy, source_policy).unwrap();
+    fs::write(&hook, "#!/bin/sh\nscripts/check-commit-message-policy.sh\n").unwrap();
+    fs::write(&required_behavior, "#!/bin/sh\nexit 0\n").unwrap();
     fs::write(
-        &policy,
-        "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        project_root.join(".fluent/tester.yaml"),
+        "commands:\n  - command: \"bash tests/required-behavior.sh\"\n    test_harness: shell-harness\n",
     )
     .unwrap();
-    fs::write(&hook, "#!/bin/sh\nscripts/check-commit-message-policy.sh\n").unwrap();
+    fs::write(
+        project_root.join(".fluent/extract-tester-results"),
+        "#!/bin/sh\necho '[{\"id\":\"tests/required-behavior.sh\",\"test_harness\":\"shell-harness\",\"status\":\"pass\",\"duration_ms\":null,\"failure_excerpt\":null}]'\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&policy, fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&required_behavior, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            project_root.join(".fluent/extract-tester-results"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
     }
     git::run(
         &project_root,
@@ -22465,14 +22495,17 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
             "add",
             "scripts/check-commit-message-policy.sh",
             ".fluent/hooks",
+            ".fluent/tester.yaml",
+            ".fluent/extract-tester-results",
+            "tests/required-behavior.sh",
         ],
-        "stage advisory commit policy",
+        "stage source commit policy",
     )
     .unwrap();
     git::run(
         &project_root,
-        &["commit", "-m", "Make presentation advisory"],
-        "commit advisory commit policy",
+        &["commit", "-m", "Set source commit policy"],
+        "commit source commit policy",
     )
     .unwrap();
     let base = git::run_stdout(&project_root, &["rev-parse", "HEAD"], "read policy base").unwrap();
@@ -22497,9 +22530,31 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
     )
     .unwrap();
     fs::write(workspace.join("candidate.txt"), "candidate\n").unwrap();
+    if source_uses_advisory_policy {
+        fs::write(workspace.join("blocked.txt"), "blocked\n").unwrap();
+    }
+    if !source_uses_advisory_policy {
+        fs::write(
+            workspace.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
+    }
+    if source_uses_advisory_policy {
+        git::run(
+            &workspace,
+            &["add", "blocked.txt"],
+            "stage current-policy violation",
+        )
+        .unwrap();
+    }
     git::run(
         &workspace,
-        &["add", "candidate.txt"],
+        &[
+            "add",
+            "candidate.txt",
+            "scripts/check-commit-message-policy.sh",
+        ],
         "stage retired-style binary candidate",
     )
     .unwrap();
@@ -22516,6 +22571,26 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
         "read candidate tree",
     )
     .unwrap();
+
+    if !source_uses_advisory_policy {
+        fs::write(
+            &policy,
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
+        git::run(
+            &project_root,
+            &["add", "scripts/check-commit-message-policy.sh"],
+            "stage advisory commit policy",
+        )
+        .unwrap();
+        git::run(
+            &project_root,
+            &["commit", "-m", "Make presentation advisory"],
+            "commit advisory commit policy",
+        )
+        .unwrap();
+    }
 
     let gate_artifact = ArtifactRef {
         producer_id: "attempt-1-write-1".to_string(),
@@ -22545,7 +22620,14 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
         ("candidate-identity", CandidateCheckStatus::Passed),
         ("whitespace", CandidateCheckStatus::Passed),
         ("commit-metadata", CandidateCheckStatus::Passed),
-        ("behavior-references", CandidateCheckStatus::Skipped),
+        (
+            "behavior-references",
+            if source_uses_advisory_policy {
+                CandidateCheckStatus::Skipped
+            } else {
+                CandidateCheckStatus::Passed
+            },
+        ),
         ("tester-reference-evidence", CandidateCheckStatus::Skipped),
         ("project-check", CandidateCheckStatus::Failed),
     ]
@@ -22576,8 +22658,34 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
     .unwrap();
 
     let store = WorkModelStore::new(&project_root);
-    let mut item = WorkItem::planned("work-1", "Recover retired commit style");
+    let approved_input = b"approved recovery context\n";
+    let snapshot_path = work_artifact_path("work-1", "inputs", "0000-context.md");
+    let snapshot = project_root.join(&snapshot_path);
+    fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    fs::write(&snapshot, approved_input).unwrap();
+    let mut item = WorkItem {
+        input_artifacts: vec![fluent::work_model::WorkItemInputArtifact {
+            source_path: "approved/context.md".to_string(),
+            snapshot_path,
+            digest: format!("sha256:{:x}", Sha256::digest(approved_input)),
+        }],
+        ..WorkItem::planned("work-1", "Recover retired commit style")
+    };
     item.add_initial_attempt("attempt-1").unwrap();
+    if !source_uses_advisory_policy {
+        item.attempts[0].writer_completion_contract =
+            Some(fluent::work_model::WriterCompletionContract {
+                version: fluent::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+                requirements: vec![fluent::work_model::WriterCompletionRequirement {
+                    id: "behavior:required:b1".to_string(),
+                    kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
+                    source: "behaviors.md#required:b1".to_string(),
+                    requirement: "The required behavior remains verified.".to_string(),
+                    verification_refs: vec!["tests/required-behavior.sh".to_string()],
+                    command: None,
+                }],
+            });
+    }
     let writer = &mut item.attempts[0].tasks[0];
     fluent::work_model::set_task_terminal(writer, TaskStatus::Complete);
     writer.output = Some(TaskOutput {
@@ -22589,6 +22697,36 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
         no_change: None,
         learner_canonicalization: None,
     });
+    if !source_uses_advisory_policy {
+        let matrix_path = project_root
+            .join(&writer.artifact_area.as_ref().unwrap().path)
+            .join("writer-completion.json");
+        fs::create_dir_all(matrix_path.parent().unwrap()).unwrap();
+        fs::write(
+            matrix_path,
+            serde_json::to_vec_pretty(&fluent::work_model::WriterCompletionMatrix {
+                schema_version: 1,
+                task_id: writer.id.clone(),
+                rows: vec![fluent::work_model::WriterCompletionRow {
+                    id: "behavior:required:b1".to_string(),
+                    kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
+                    source: "behaviors.md#required:b1".to_string(),
+                    requirement: "The required behavior remains verified.".to_string(),
+                    verification_refs: vec!["tests/required-behavior.sh".to_string()],
+                    command: None,
+                    state: fluent::work_model::WriterCompletionState::Complete,
+                    implementation_evidence: vec!["tests/required-behavior.sh".to_string()],
+                    verification: vec![fluent::work_model::WriterVerificationClaim {
+                        command: "bash tests/required-behavior.sh".to_string(),
+                        result: fluent::work_model::WriterVerificationResult::Pass,
+                    }],
+                    applicable_constraints: Vec::new(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
     item.attempts[0].artifacts.push(gate_artifact.clone());
     let correction = item
         .add_next_write_round("attempt-1", vec![gate_artifact])
@@ -22624,6 +22762,126 @@ fn make_retired_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
 }
 
 #[test]
+fn current_candidate_gate_correction_uses_ordinary_resume_paths() {
+    struct CurrentGateQueueRunner {
+        bin_dir: PathBuf,
+    }
+
+    impl fluent::scheduler::AttemptRunner for CurrentGateQueueRunner {
+        fn run(
+            &self,
+            project_root: &Path,
+            work_item_id: &str,
+            attempt_id: &str,
+            _tester_no_sandbox: bool,
+        ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+            let output = fluent_cmd()
+                .current_dir(project_root)
+                .args(["attempt", "run", work_item_id, attempt_id, "--no-sandbox"])
+                .env("PATH", mock_path(&self.bin_dir))
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "queued current-policy correction failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fluent::scheduler::classify_attempt_outcome(project_root, work_item_id, attempt_id)
+        }
+    }
+
+    for queued in [false, true] {
+        let fixture = make_current_commit_style_binary_fixture();
+        fs::write(
+            &fixture.log_path,
+            "blocked.txt violates current project policy\n",
+        )
+        .unwrap();
+        let bin_dir = fixture.project_root.parent().unwrap().join(if queued {
+            "bin-current-gate-queued"
+        } else {
+            "bin-current-gate-foreground"
+        });
+        write_mock_claude(
+            &bin_dir,
+            r##"#!/bin/bash
+PROMPT=""
+NEXT_IS_PROMPT=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  if [ -n "$DRAFT" ]; then
+    mkdir -p "$(dirname "$DRAFT")"
+    printf '%s\n' '{"learning_summary":"ordinary","follow_ups":[]}' > "$DRAFT"
+  fi
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    rm blocked.txt
+    git add -u blocked.txt
+    git commit -m "Remove blocked fixture" >/dev/null 2>&1
+    ;;
+  *)
+    printf 'Verdict: pass\n\nCurrent-policy review passed.\n' > review.md
+    ;;
+esac
+exit 0
+"##,
+        );
+
+        if queued {
+            fluent_cmd()
+                .current_dir(&fixture.project_root)
+                .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+                .assert()
+                .success()
+                .stdout(predicate::str::contains("Queued resume"));
+            let dispatch = fluent::scheduler::pick_next_queued(&fixture.project_root)
+                .unwrap()
+                .expect("current-policy correction should be queued");
+            fluent::scheduler::dispatch_one(
+                &fixture.project_root,
+                &dispatch,
+                &CurrentGateQueueRunner {
+                    bin_dir: bin_dir.clone(),
+                },
+            )
+            .unwrap();
+        } else {
+            fluent_cmd()
+                .current_dir(&fixture.project_root)
+                .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                .env("PATH", mock_path(&bin_dir))
+                .assert()
+                .success();
+        }
+
+        let stored = WorkModelStore::new(&fixture.project_root)
+            .read_work_item("work-1")
+            .unwrap();
+        let attempt = &stored.attempts[0];
+        let correction = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == "attempt-1-write-2")
+            .unwrap();
+        assert_eq!(correction.status, fluent::work_model::TaskStatus::Complete);
+        assert!(correction.output.is_some());
+        assert!(
+            attempt
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.path.ends_with("/reclassification.json"))
+        );
+    }
+}
+
+#[test]
 fn retired_commit_style_resume_reaches_review_without_writer() {
     let fixture = make_retired_commit_style_binary_fixture();
     let bin_dir = fixture
@@ -22652,6 +22910,10 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
         .read_work_item("work-1")
         .unwrap();
     let attempt = &stored.attempts[0];
+    let preserved_input = fluent::work_model::ArtifactRef {
+        producer_id: "work-item".to_string(),
+        path: stored.input_artifacts[0].snapshot_path.clone(),
+    };
     assert_eq!(
         attempt
             .tasks
@@ -22664,6 +22926,7 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
         attempt.tasks[1].status,
         fluent::work_model::TaskStatus::Superseded
     );
+    assert!(attempt.tasks[1].input_artifacts.contains(&preserved_input));
     assert_eq!(
         attempt
             .tasks
@@ -22671,6 +22934,13 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
             .filter(|task| task.kind == fluent::work_model::TaskKind::Review)
             .count(),
         fluent::review::REVIEWERS.len()
+    );
+    assert!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Review)
+            .all(|task| task.input_artifacts.contains(&preserved_input))
     );
     assert_eq!(
         git::run_stdout(
@@ -22823,6 +23093,53 @@ fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
         .read_work_item("work-1")
         .unwrap();
     let attempt = &after_queued.attempts[0];
+    assert_eq!(
+        attempt.status,
+        fluent::work_model::AttemptStatus::Complete,
+        "pause={:?} tasks={:?}",
+        attempt.pause_kind,
+        attempt
+            .tasks
+            .iter()
+            .map(|task| (&task.id, task.kind, task.status.clone()))
+            .collect::<Vec<_>>()
+    );
+    let tester = attempt
+        .tasks
+        .iter()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Tester)
+        .expect("recovered candidate runs the final Tester");
+    assert_eq!(tester.status, fluent::work_model::TaskStatus::Complete);
+    let tester_results = serde_json::from_slice::<serde_json::Value>(
+        &fs::read(
+            fixture
+                .project_root
+                .join(&tester.artifact_area.as_ref().unwrap().path)
+                .join("tester-results.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        tester_results["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| { test["id"] == "tests/required-behavior.sh" && test["status"] == "pass" })
+    );
+    assert!(
+        attempt
+            .learning
+            .as_ref()
+            .is_some_and(fluent::work_model::AttemptLearning::is_succeeded)
+    );
+    let merge_candidate = after_queued
+        .merge_candidates
+        .iter()
+        .find(|candidate| candidate.attempt_id == "attempt-1")
+        .expect("recovered Attempt creates a Merge Candidate");
+    assert_eq!(merge_candidate.candidate_commit, fixture.candidate);
+    assert!(merge_candidate.ready_at.is_some());
     let receipt = attempt
         .artifacts
         .iter()

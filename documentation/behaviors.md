@@ -6901,13 +6901,22 @@ Test: src/work_task_executor.rs (recovered_ancestry_prompts_protect_immutable_hi
 
 WHEN an older Attempt paused solely because Factory's former project hook
 rejected missing commit bodies or long body lines, THE SYSTEM SHALL recover
-only when the preceding candidate and stopped output-free Writer remain exact,
-the Writer's inputs equal the Work Item's preserved inputs plus its bound gate,
-and the gate and canonical hook log exactly match the stored legacy evidence.
-It SHALL preserve that evidence, supersede only the corrective Writer, record
-a separate reclassification receipt, and continue the same Attempt to review.
+only when the source Writer's base predates the advisory policy marker, the
+preceding candidate and stopped output-free Writer remain exact, the Writer's
+inputs equal the Work Item's preserved inputs plus its bound gate, and the gate
+and canonical hook log exactly match the stored legacy evidence. It SHALL
+preserve that evidence, supersede only the corrective Writer, record a separate
+reclassification receipt, and continue the same Attempt to review.
 Test: src/work_attempt_loop.rs (retired_commit_style_pause_reuses_preceding_candidate)
+Test: src/work_attempt_loop.rs (retired_commit_style_pause_preserves_work_item_inputs)
 Test: tests/binary.rs (retired_commit_style_resume_reaches_review_without_writer)
+
+### B25sa
+
+IF a gate-backed corrective Writer's source base already contains the advisory
+policy marker, THEN THE SYSTEM SHALL keep foreground and queued resume on the
+ordinary corrective-Writer path instead of applying legacy reclassification.
+Test: tests/binary.rs (current_candidate_gate_correction_uses_ordinary_resume_paths)
 
 ### B25t
 
@@ -6928,6 +6937,13 @@ an unrelated project-branch advance that retains the recorded policy commit
 and current advisory marker and hook.
 Test: src/work_attempt_loop.rs (retired_commit_style_admission_survives_unrelated_policy_advance)
 Test: src/work_attempt_loop.rs (retired_commit_style_recovery_reuses_matching_unbound_receipt)
+Test: tests/binary.rs (retired_commit_style_resume_is_idempotent_across_execution_paths)
+
+### B25v
+
+WHEN Fluent recovers a retired commit-style pause, THE SYSTEM SHALL still
+require completion-contract behavior evidence, reviews, the final Tester, and
+the Learner before it marks the Merge Candidate ready.
 Test: tests/binary.rs (retired_commit_style_resume_is_idempotent_across_execution_paths)
 
 ### B26

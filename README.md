@@ -234,9 +234,12 @@ Work, or `fluent attempt run <work-item-id> <attempt-id>` in the foreground.
 
 Automatic recovery requires a stopped, output-free corrective Writer; a clean,
 exact preceding candidate; bound and unchanged gate and canonical hook
-evidence; and the checked-in Factory advisory commit-message policy. Fluent
-preserves the failed evidence, supersedes only that Writer, records a separate
-reclassification, and continues the same Attempt to review.
+evidence; a recorded source base that predates Factory's advisory policy
+marker; and the checked-in Factory advisory commit-message policy. A pause
+whose source base already contains the marker follows the ordinary corrective
+Writer path. Fluent preserves the failed evidence, supersedes only that Writer,
+records a separate reclassification, and continues the same Attempt through
+its required reviews, final Tester, and Learner.
 
 Recovery fails closed for a live or output-producing Writer, dirty workspace,
 candidate drift, unbound or changed evidence, and mixed, provenance, or unknown

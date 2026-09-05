@@ -108,8 +108,9 @@ pub(crate) fn retired_commit_style_reclassification_artifact(
 
 /// Recognize a stopped output-free Writer whose only candidate-gate failure is
 /// exact, candidate-bound output from Factory's retired presentation policy.
-/// `Ok(None)` is reserved for unrelated Writer-completion pauses; once a pause
-/// names a rejected candidate gate, every mismatch fails closed.
+/// A source base that already contains the advisory policy remains on the
+/// ordinary corrective-Writer path. Once a pre-policy source base establishes
+/// the legacy boundary, every mismatch fails closed.
 pub(crate) fn inspect_retired_commit_style_recovery(
     project_root: &Path,
     item: &WorkItem,
@@ -146,6 +147,38 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     if gate_inputs.is_empty() {
         return Ok(None);
     }
+    if correction_index == 0 {
+        anyhow::bail!("retired commit-style Writer has no preceding candidate Writer");
+    }
+    let source = &attempt.tasks[correction_index - 1];
+    if source.kind != TaskKind::Write || source.status != TaskStatus::Complete {
+        anyhow::bail!(
+            "retired commit-style correction does not immediately follow a completed Writer"
+        );
+    }
+    if attempt.tasks[..correction_index - 1]
+        .iter()
+        .any(|task| !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded))
+    {
+        anyhow::bail!("retired commit-style Attempt contains another unresolved Task");
+    }
+    let output = source
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no candidate"))?;
+    let base_commit = output
+        .base_commit
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base commit"))?;
+    let source_policy_spec = format!("{base_commit}:scripts/check-commit-message-policy.sh");
+    let source_policy = crate::git::run_raw(project_root, &["show", &source_policy_spec])?;
+    if source_policy.status.success()
+        && String::from_utf8_lossy(&source_policy.stdout)
+            .lines()
+            .any(|line| line == crate::candidate_gate::COMMIT_PRESENTATION_ADVISORY_MARKER)
+    {
+        return Ok(None);
+    }
     if gate_inputs.len() != 1 {
         anyhow::bail!("retired commit-style Writer names multiple candidate gates");
     }
@@ -170,29 +203,6 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         anyhow::bail!("a Merge Candidate already owns the retired commit-style candidate");
     }
-    if correction_index == 0 {
-        anyhow::bail!("retired commit-style Writer has no preceding candidate Writer");
-    }
-    let source = &attempt.tasks[correction_index - 1];
-    if source.kind != TaskKind::Write || source.status != TaskStatus::Complete {
-        anyhow::bail!(
-            "retired commit-style correction does not immediately follow a completed Writer"
-        );
-    }
-    if attempt.tasks[..correction_index - 1]
-        .iter()
-        .any(|task| !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded))
-    {
-        anyhow::bail!("retired commit-style Attempt contains another unresolved Task");
-    }
-    let output = source
-        .output
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no candidate"))?;
-    let base_commit = output
-        .base_commit
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base commit"))?;
     let gate_artifact = gate_inputs[0].clone();
     let expected_gate = ArtifactRef {
         producer_id: source.id.clone(),
