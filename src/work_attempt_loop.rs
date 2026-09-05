@@ -1537,6 +1537,9 @@ pub(crate) fn recover_retired_commit_style_pause(
                 id: current.correction_writer_task_id.clone(),
             })?;
         crate::work_model::set_task_terminal(correction, TaskStatus::Superseded);
+        if !attempt.artifacts.contains(&current.gate_artifact) {
+            attempt.artifacts.push(current.gate_artifact.clone());
+        }
         if !attempt.artifacts.contains(&artifact) {
             attempt.artifacts.push(artifact.clone());
         }
@@ -18433,6 +18436,20 @@ mod tests {
         make_retired_commit_style_pause_fixture_with_options(long_body_line, preserved_input, false)
     }
 
+    fn make_legacy_omitted_gate_index_fixture() -> RetiredCommitStyleFixture {
+        let fixture = make_retired_commit_style_pause_fixture(true);
+        fixture
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0]
+                    .artifacts
+                    .retain(|artifact| !artifact.path.ends_with("/candidate-gate.json"));
+                Ok(())
+            })
+            .unwrap();
+        fixture
+    }
+
     fn make_retired_commit_style_pause_fixture_with_options(
         long_body_line: bool,
         preserved_input: bool,
@@ -18806,6 +18823,76 @@ mod tests {
             assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
             assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
         }
+    }
+
+    #[test]
+    fn retired_commit_style_recovers_legacy_omitted_gate_index() {
+        let fixture = make_legacy_omitted_gate_index_fixture();
+        let gate_before = fs::read(&fixture.gate_path).unwrap();
+        let log_before = fs::read(&fixture.log_path).unwrap();
+        let omitted = fixture.store.read_work_item("work-1").unwrap();
+        assert!(
+            omitted.attempts[0]
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.path.ends_with("/candidate-gate.json"))
+        );
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+
+        let recovered = fixture.store.read_work_item("work-1").unwrap();
+        let attempt = &recovered.attempts[0];
+        let gate = attempt.tasks[1].input_artifacts[0].clone();
+        assert_eq!(attempt.tasks[1].status, TaskStatus::Superseded);
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| **artifact == gate)
+                .count(),
+            1,
+            "recovery must normalize the omitted aggregate gate reference"
+        );
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.path.ends_with("/reclassification.json"))
+                .count(),
+            1
+        );
+        assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+        assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+
+        let outcome = plan_after_completed_writer(
+            &fixture.project_root,
+            &fixture.store,
+            recovered,
+            "attempt-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedReviews { .. }
+        ));
+        let reviewed = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2,
+            "legacy recovery must not plan another Writer"
+        );
     }
 
     #[test]

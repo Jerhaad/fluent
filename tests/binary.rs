@@ -22651,6 +22651,19 @@ fn make_current_commit_style_binary_fixture() -> RetiredCommitStyleBinaryFixture
     make_commit_style_binary_fixture(true)
 }
 
+fn make_legacy_omitted_gate_index_binary_fixture() -> RetiredCommitStyleBinaryFixture {
+    let fixture = make_retired_commit_style_binary_fixture();
+    WorkModelStore::new(&fixture.project_root)
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0]
+                .artifacts
+                .retain(|artifact| !artifact.path.ends_with("/candidate-gate.json"));
+            Ok(())
+        })
+        .unwrap();
+    fixture
+}
+
 fn make_commit_style_binary_fixture(
     source_uses_advisory_policy: bool,
 ) -> RetiredCommitStyleBinaryFixture {
@@ -23081,9 +23094,9 @@ exit 0
     }
 }
 
-#[test]
-fn retired_commit_style_resume_reaches_review_without_writer() {
-    let fixture = make_retired_commit_style_binary_fixture();
+fn assert_retired_commit_style_reaches_review_without_writer(
+    fixture: RetiredCommitStyleBinaryFixture,
+) {
     let bin_dir = fixture
         .project_root
         .parent()
@@ -23162,6 +23175,41 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
     );
     assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
     assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+    let source_gate = attempt.tasks[1]
+        .input_artifacts
+        .iter()
+        .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+        .expect("the stopped correction must retain its source gate");
+    assert_eq!(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| *artifact == source_gate)
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.path.ends_with("/reclassification.json"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn retired_commit_style_resume_reaches_review_without_writer() {
+    assert_retired_commit_style_reaches_review_without_writer(
+        make_retired_commit_style_binary_fixture(),
+    );
+}
+
+#[test]
+fn retired_commit_style_legacy_projection_reaches_review_without_writer() {
+    assert_retired_commit_style_reaches_review_without_writer(
+        make_legacy_omitted_gate_index_binary_fixture(),
+    );
 }
 
 #[test]

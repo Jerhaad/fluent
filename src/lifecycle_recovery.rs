@@ -32,6 +32,7 @@ pub(crate) struct RetiredCommitStyleRecovery {
     pub candidate_tree: String,
     pub workspace_path: String,
     pub gate_artifact: ArtifactRef,
+    pub gate_was_indexed: bool,
     pub gate_digest: String,
     pub hook_log_path: String,
     pub hook_log_digest: String,
@@ -213,15 +214,21 @@ pub(crate) fn inspect_retired_commit_style_recovery(
             crate::candidate_gate::CANDIDATE_GATE_FILE
         ),
     };
-    if gate_artifact != expected_gate
+    if gate_artifact != expected_gate {
+        anyhow::bail!("retired commit-style gate is not bound to the source Writer");
+    }
+    let indexed_gate_count = attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| **artifact == expected_gate)
+        .count();
+    if indexed_gate_count > 1
         || attempt
             .artifacts
             .iter()
-            .filter(|artifact| **artifact == expected_gate)
-            .count()
-            != 1
+            .any(|artifact| artifact.path == expected_gate.path && *artifact != expected_gate)
     {
-        anyhow::bail!("retired commit-style gate is not bound to the source Writer");
+        anyhow::bail!("retired commit-style gate index is ambiguous");
     }
     let mut expected_inputs = item
         .input_artifacts
@@ -280,6 +287,7 @@ pub(crate) fn inspect_retired_commit_style_recovery(
         candidate_tree: classified.candidate_tree,
         workspace_path: output.workspace_path.clone(),
         gate_artifact,
+        gate_was_indexed: indexed_gate_count == 1,
         gate_digest: classified.gate_digest,
         hook_log_path: classified.hook_log_path,
         hook_log_digest: classified.hook_log_digest,
