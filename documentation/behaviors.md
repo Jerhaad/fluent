@@ -6731,6 +6731,14 @@ Test: src/candidate_gate.rs (blocks_non_ancestor_candidate_without_prior_gate)
 
 ### B25c
 
+WHEN Fluent first rejects a Writer candidate, THE SYSTEM SHALL add its gate
+exactly once to the Attempt artifact index before planning a corrective Writer
+with that same canonical reference.
+Test: src/work_attempt_loop.rs (first_rejected_candidate_gate_is_indexed_before_correction)
+Test: tests/binary.rs (first_rejected_candidate_gate_persists_source_binding)
+
+### B25ca
+
 WHEN a corrective Writer returns a candidate after a rejected candidate gate,
 THE SYSTEM SHALL re-run deterministic checks across the complete candidate
 range from the original base so a later commit cannot hide an earlier defect.
@@ -6903,13 +6911,19 @@ WHEN an older Attempt paused solely because Factory's former project hook
 rejected missing commit bodies or long body lines, THE SYSTEM SHALL recover
 only when the source Writer's base predates the advisory policy marker, the
 preceding candidate and stopped output-free Writer remain exact, the Writer's
-inputs equal the Work Item's preserved inputs plus its bound gate, and the gate
-and canonical hook log exactly match the stored legacy evidence. It SHALL
-preserve that evidence, supersede only the corrective Writer, record a separate
-reclassification receipt, and continue the same Attempt to review.
+inputs equal the Work Item's preserved inputs plus its exact canonical gate from
+the immediately preceding Writer, and the gate and canonical hook log exactly
+match the stored legacy evidence. The correction Task's gate input SHALL remain
+the source binding when the old first-rejection transition omitted its duplicate
+Attempt artifact entry. Fluent SHALL add that missing entry only inside the
+audited reclassification transition, preserve the original evidence, supersede
+only the corrective Writer, record a separate reclassification receipt, and
+continue the same Attempt to review.
 Test: src/work_attempt_loop.rs (retired_commit_style_pause_reuses_preceding_candidate)
 Test: src/work_attempt_loop.rs (retired_commit_style_pause_preserves_work_item_inputs)
+Test: src/work_attempt_loop.rs (retired_commit_style_recovers_legacy_omitted_gate_index)
 Test: tests/binary.rs (retired_commit_style_resume_reaches_review_without_writer)
+Test: tests/binary.rs (retired_commit_style_legacy_projection_reaches_review_without_writer)
 
 ### B25sa
 
@@ -6921,13 +6935,16 @@ Test: tests/binary.rs (current_candidate_gate_correction_uses_ordinary_resume_pa
 ### B25t
 
 IF a retired commit-style pause has a live or output-producing Writer, a dirty
-or changed candidate, extra or missing Writer inputs, unbound or changed gate
+or changed candidate, extra, missing, or duplicate Writer inputs, a
+noncanonical or reassigned gate, an ambiguous aggregate gate entry, changed gate
 or hook evidence, a prohibited attribution trailer anywhere in the recovered
 commit range even when the hook log omits it, or mixed, provenance, or unknown
 hook findings, THEN THE SYSTEM SHALL refuse automatic recovery without changing
 the Attempt, Task history, candidate, gate, or hook evidence.
 Test: src/work_attempt_loop.rs (retired_commit_style_recovery_rejects_unsafe_frontiers)
+Test: src/work_attempt_loop.rs (retired_commit_style_legacy_index_recovery_rejects_unsafe_frontiers)
 Test: tests/binary.rs (retired_commit_style_resume_rejects_extra_correction_inputs)
+Test: tests/binary.rs (retired_commit_style_legacy_projection_rejects_unsafe_frontiers)
 
 ### B25u
 

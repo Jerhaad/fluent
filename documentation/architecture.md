@@ -288,9 +288,11 @@ style conventions remain project-owned and may be enforced by
 `check-pre-merge`. Factory's hook reports missing bodies and long body lines as
 advice, while prohibited attribution and other project-check failures remain
 blocking. Fluent stores the results under the Attempt's `candidate-gates/`
-artifacts, separate from the Writer's private artifact directory. A first
-candidate defect becomes the sole input to one
-corrective Writer. Failed check diagnostics are also promoted into the
+artifacts, separate from the Writer's private artifact directory. When the gate
+first rejects a candidate, Fluent adds its canonical reference exactly once to
+the Attempt artifact index before it creates a corrective Writer with the same
+reference as an input. A first candidate defect becomes the sole gate input to
+that corrective Writer. Failed check diagnostics are also promoted into the
 Writer's authoritative current findings, so the correction does not depend on
 enumerating the gate artifact's parent directory or retaining an unbounded path
 in the context index. A repeated rejection pauses. Explicit recovery preserves
@@ -307,15 +309,21 @@ transition accepts only the exact preceding clean candidate and a stopped,
 output-free corrective Writer. Its source-bound candidate gate and canonical
 hook log must contain only the former missing-body or body-line-length
 findings, and the Writer's complete input set must equal the Work Item's
-preserved inputs plus that gate. Fluent preserves that failed gate and log,
-supersedes only the corrective Writer, and stores a separate reclassification
-receipt that binds the gate digest, candidate tree, and project-policy commit
-before it reuses the candidate and continues to review. Live or
+preserved inputs plus that gate. The exact gate input on the correction Task is
+the legacy provenance record. Current Attempts also index that reference in the
+Attempt aggregate; the compatibility path accepts an older first-rejection
+projection where this duplicate aggregate entry is absent. During the audited
+reclassification mutation, Fluent adds the missing aggregate reference together
+with the receipt and correction-Task supersession. It preserves the failed gate
+and log, and the separate receipt binds the gate digest, candidate tree, and
+project-policy commit before Fluent reuses the candidate and continues to
+review. Live or
 output-producing Writers, dirty or changed candidates, extra or missing
-Writer inputs, unbound or changed evidence, and mixed, provenance, or unknown
-findings fail closed. Because the candidate's historical policy can omit a
-finding, recovery also scans every candidate commit independently and rejects
-any prohibited attribution trailer that is absent from the stored hook log.
+Writer inputs, duplicate gates, noncanonical or reassigned paths, ambiguous
+aggregate entries, changed evidence, and mixed, provenance, or unknown findings
+fail closed. Because the candidate's historical policy can omit a finding,
+recovery also scans every candidate commit independently and rejects any
+prohibited attribution trailer that is absent from the stored hook log.
 
 Recovery replay validates the receipt's recorded policy commit separately from
 the current policy marker and hook. The recorded commit must remain an ancestor
