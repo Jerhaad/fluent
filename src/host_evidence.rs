@@ -963,7 +963,7 @@ pub(crate) fn pending_owned_host_resume_action(
         return Ok(None);
     };
     if attempt.pause_kind == Some(work_model::PauseKind::Interrupted) {
-        crate::recovery_contracts::inspect_interrupted_plan_host_recovery(
+        crate::lifecycle_recovery::inspect_interrupted_plan_host_recovery(
             project_root,
             attempt,
             &action.plan_row,
@@ -2165,7 +2165,7 @@ pub fn attach_plan_row(
             }
             crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)
                 .map_err(|error| ineligible(&format!("{error:#}")))?;
-            let interrupted_writer = crate::recovery_contracts::inspect_interrupted_plan_host_recovery(
+            let interrupted_writer = crate::lifecycle_recovery::inspect_interrupted_plan_host_recovery(
                 project_root, attempt, &plan_row,
             ).map_err(|error| ineligible(&format!("{error:#}")))?;
             let writer = attempt

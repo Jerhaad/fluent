@@ -24,20 +24,14 @@ pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
-/// Prove that the interrupted continuation can yield to its exact approved
-/// host obligation. Probe both owner mechanisms; timestamps grant no authority.
-pub(crate) fn inspect_interrupted_plan_host_recovery(
+/// Validate candidate and evidence facts for a continuation recognized by the
+/// lifecycle layer. This boundary never invokes its lifecycle callers.
+pub(crate) fn validate_interrupted_plan_host_recovery(
     project_root: &Path,
     attempt: &work_model::Attempt,
     row_id: &str,
-) -> Result<Option<String>> {
-    if attempt.status != work_model::AttemptStatus::NeedsUser
-        || attempt.pause_kind != Some(work_model::PauseKind::Interrupted)
-    {
-        return Ok(None);
-    }
-    let canceled = crate::lifecycle_recovery::interrupted_plan_host_writer(attempt)
-        .context("interruption is not one output-free Writer continuation")?;
+    canceled: &Task,
+) -> Result<()> {
     let (writer, _, matrix) = owned_host_completion_matrix(project_root, attempt)?
         .context("interrupted recovery requires approved host ownership")?;
     let contract = attempt
@@ -100,7 +94,7 @@ pub(crate) fn inspect_interrupted_plan_host_recovery(
             );
         }
     }
-    Ok(Some(canceled.id.clone()))
+    Ok(())
 }
 
 /// Revalidate active Plan evidence before foreground resume, queue admission,
@@ -2060,6 +2054,22 @@ pub(crate) fn review_artifact_path(task: &Task) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{EvidenceResult, parse_evidence_document, validate_failed_evidence_snapshot};
+
+    #[test]
+    fn recovery_contracts_remain_independent_of_lifecycle_callers() {
+        let source = include_str!("recovery_contracts.rs");
+        for caller in [
+            "lifecycle_recovery",
+            "work_task_executor",
+            "host_evidence",
+            "queue",
+        ] {
+            assert!(
+                !source.contains(&format!("crate::{caller}::")),
+                "neutral recovery contracts must not depend on {caller}"
+            );
+        }
+    }
 
     #[test]
     fn failed_evidence_snapshot_rejects_pass_result() {

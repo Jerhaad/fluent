@@ -481,6 +481,28 @@ pub(crate) fn interrupted_plan_host_writer(attempt: &Attempt) -> Option<&crate::
     .then_some(writer)
 }
 
+/// Recognize the stopped continuation before validating its bound host action.
+pub(crate) fn inspect_interrupted_plan_host_recovery(
+    project_root: &Path,
+    attempt: &Attempt,
+    row_id: &str,
+) -> Result<Option<String>> {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(crate::work_model::PauseKind::Interrupted)
+    {
+        return Ok(None);
+    }
+    let canceled = interrupted_plan_host_writer(attempt)
+        .context("interruption is not one output-free Writer continuation")?;
+    crate::recovery_contracts::validate_interrupted_plan_host_recovery(
+        project_root,
+        attempt,
+        row_id,
+        canceled,
+    )?;
+    Ok(Some(canceled.id.clone()))
+}
+
 /// The immutable frontier that authorizes a targeted uncertain-review retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UncertainReviewRecovery {
