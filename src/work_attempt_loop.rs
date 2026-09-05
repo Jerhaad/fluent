@@ -17903,12 +17903,20 @@ mod tests {
     }
 
     fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
-        make_retired_commit_style_pause_fixture_with_input(long_body_line, false)
+        make_retired_commit_style_pause_fixture_with_options(long_body_line, false, false)
     }
 
     fn make_retired_commit_style_pause_fixture_with_input(
         long_body_line: bool,
         preserved_input: bool,
+    ) -> RetiredCommitStyleFixture {
+        make_retired_commit_style_pause_fixture_with_options(long_body_line, preserved_input, false)
+    }
+
+    fn make_retired_commit_style_pause_fixture_with_options(
+        long_body_line: bool,
+        preserved_input: bool,
+        prohibited_trailer: bool,
     ) -> RetiredCommitStyleFixture {
         use std::os::unix::fs::PermissionsExt;
 
@@ -17993,13 +18001,18 @@ mod tests {
         .unwrap();
         if long_body_line {
             let body = "x".repeat(73);
+            let mut args = vec!["commit", "-q", "-m", "Add candidate", "-m", &body];
+            if prohibited_trailer {
+                args.extend(["-m", "Co-Authored-By: Bot <bot@example.com>"]);
+            }
             crate::git::run(
                 &workspace,
-                &["commit", "-q", "-m", "Add candidate", "-m", &body],
+                &args,
                 "commit long-line retired-style candidate",
             )
             .unwrap();
         } else {
+            assert!(!prohibited_trailer);
             crate::git::run(
                 &workspace,
                 &["commit", "-q", "-m", "Add candidate"],
@@ -18310,6 +18323,22 @@ mod tests {
 
     #[test]
     fn retired_commit_style_recovery_rejects_unsafe_frontiers() {
+        let unlogged_provenance =
+            make_retired_commit_style_pause_fixture_with_options(true, false, true);
+        let before = retired_commit_style_boundary_snapshot(&unlogged_provenance);
+        assert!(
+            recover_retired_commit_style_pause(
+                &unlogged_provenance.project_root,
+                &unlogged_provenance.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("prohibited Co-Authored-By trailer")
+        );
+        assert_retired_commit_style_boundary_unchanged(&unlogged_provenance, before);
+
         let mixed = make_retired_commit_style_pause_fixture(false);
         fs::write(
             &mixed.log_path,

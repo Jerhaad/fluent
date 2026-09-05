@@ -242,11 +242,14 @@ records a separate reclassification, and continues the same Attempt through
 its required reviews, final Tester, and Learner.
 
 Recovery fails closed for a live or output-producing Writer, dirty workspace,
-candidate drift, unbound or changed evidence, and mixed, provenance, or unknown
-hook findings. Re-entry reuses a successful transition without rewriting
-history or duplicating Tasks. An unrelated project-branch fast-forward keeps a
-receipt valid only while its recorded policy commit remains in the current
-history and the current policy marker and hook remain active.
+candidate drift, unbound or changed evidence, prohibited attribution trailers
+anywhere in the recovered commit range, and mixed, provenance, or unknown hook
+findings. This independent attribution check still applies when the stored hook
+log omits the trailer. Re-entry reuses a successful transition without
+rewriting history or duplicating Tasks. An unrelated project-branch
+fast-forward keeps a receipt valid only while its recorded policy commit
+remains in the current history and the current policy marker and hook remain
+active.
 
 When a metadata-only correction accidentally rewrites the candidate's protected base, `fluent status` and the candidate-gate handoff report `fluent attempt repair-candidate-ancestry <work-item-id> <attempt-id> --resolution "<approved repair>"`. The command accepts only this exact tree-identical failure, preserves the rejected history, and reconstructs the unchanged candidate tree directly on the protected base using the accepted source commit's product-focused message. Resume that exact Attempt afterward with `fluent queue resume <work-item-id> --attempt <attempt-id>`; Fluent runs its ordinary candidate gate, reviews, Tester, and Learner against the recovered commit. A dirty or drifted candidate is rejected, and retrying the same interrupted or completed frontier reuses its durable recovery record. A later tree-identical rewrite receives a new repair record only when it preserves a substantive base descended from the earlier recovery. Reviewers treat that protected base as immutable history and review commit metadata only after it. If older Fluent guidance admitted a fresh Attempt before the retry, cancel its running task and remove its dispatch; repeating the repair then preserves that admission as superseded history and restores the exact-Attempt resume path. If its initially output-free Writer settles late, Fluent retains the output and branch as history without allowing them to replace the recovered candidate.
 

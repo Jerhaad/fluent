@@ -313,7 +313,9 @@ receipt that binds the gate digest, candidate tree, and project-policy commit
 before it reuses the candidate and continues to review. Live or
 output-producing Writers, dirty or changed candidates, extra or missing
 Writer inputs, unbound or changed evidence, and mixed, provenance, or unknown
-findings fail closed.
+findings fail closed. Because the candidate's historical policy can omit a
+finding, recovery also scans every candidate commit independently and rejects
+any prohibited attribution trailer that is absent from the stored hook log.
 
 Recovery replay validates the receipt's recorded policy commit separately from
 the current policy marker and hook. The recorded commit must remain an ancestor

@@ -6922,9 +6922,10 @@ Test: tests/binary.rs (current_candidate_gate_correction_uses_ordinary_resume_pa
 
 IF a retired commit-style pause has a live or output-producing Writer, a dirty
 or changed candidate, extra or missing Writer inputs, unbound or changed gate
-or hook evidence, or mixed, provenance, or unknown hook findings, THEN THE
-SYSTEM SHALL refuse automatic recovery without changing the Attempt, Task
-history, candidate, gate, or hook evidence.
+or hook evidence, a prohibited attribution trailer anywhere in the recovered
+commit range even when the hook log omits it, or mixed, provenance, or unknown
+hook findings, THEN THE SYSTEM SHALL refuse automatic recovery without changing
+the Attempt, Task history, candidate, gate, or hook evidence.
 Test: src/work_attempt_loop.rs (retired_commit_style_recovery_rejects_unsafe_frontiers)
 Test: tests/binary.rs (retired_commit_style_resume_rejects_extra_correction_inputs)
 

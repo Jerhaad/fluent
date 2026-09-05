@@ -713,6 +713,25 @@ pub(crate) fn classify_retired_commit_style_gate(
     if commits.is_empty() {
         bail!("retired commit-style candidate has no commits after its base");
     }
+    // The candidate's own historical checker may have omitted a still-active
+    // project blocker, so the stored presentation log is not sufficient proof
+    // of attribution safety.
+    for commit in &commits {
+        let message = crate::git::run_stdout(
+            workspace,
+            &["show", "-s", "--format=%B", commit],
+            "inspect retired commit-style attribution",
+        )?;
+        if message.lines().any(|line| {
+            line.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("co-authored-by:")
+        }) {
+            bail!(
+                "retired commit-style candidate {commit} contains a prohibited Co-Authored-By trailer"
+            );
+        }
+    }
     for finding in &findings {
         validate_retired_commit_style_finding(workspace, finding, &commits)?;
     }
