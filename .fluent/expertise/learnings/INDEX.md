@@ -14,7 +14,7 @@
 - [backward-compatible-serde-fields](backward-compatible-serde-fields.md) — Persisted Work model field additions and renames must preserve backward compatibility with existing on-disk JSON
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
 - [bound-conversation-state-follows-project-authority](bound-conversation-state-follows-project-authority.md) — Keep bound conversation payloads and active state in the project runtime; the runner-owner root retains only routing, deduplication, and unbound ingress
-- [candidate-commits-should-use-separated-body](candidate-commits-require-separated-body.md) — Candidate commits should use a non-whitespace body separated from the subject by a blank line
+- [candidate-commits-should-use-separated-body](candidate-commits-should-use-separated-body.md) — Candidate commits should use a non-whitespace body separated from the subject by a blank line
 - [candidate-gate-owns-derived-recovery-policy](candidate-gate-owns-derived-recovery-policy.md) — Keep recovery eligibility classifiers at the host-owned candidate gate and keep recovery modules responsible for orchestration
 - [canonical-recovery-hook-evidence](canonical-recovery-hook-evidence.md) — Bind recovery eligibility to the canonical stored hook log and its digest, not to a serialized diagnostic summary
 - [canonical-reviewer-cache-cleanup](canonical-reviewer-cache-cleanup.md) — Shared reviewer caches retire only when no nonterminal Work references their candidate commit; legacy artifact-cache cleanup removes only recognized canonical directories

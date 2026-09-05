@@ -285,7 +285,9 @@ identities, empty subjects, and literal `\\n` message text, and resolves approve
 behavior references against committed test files and native test identifiers.
 Commit-body presence, line wrapping, attribution trailers, and other repository
 style conventions remain project-owned and may be enforced by
-`check-pre-merge`. Fluent stores the results under the Attempt's `candidate-gates/`
+`check-pre-merge`. Factory's hook reports missing bodies and long body lines as
+advice, while prohibited attribution and other project-check failures remain
+blocking. Fluent stores the results under the Attempt's `candidate-gates/`
 artifacts, separate from the Writer's private artifact directory. A first
 candidate defect becomes the sole input to one
 corrective Writer. Failed check diagnostics are also promoted into the
@@ -298,6 +300,28 @@ shape by replanning only the same output-free Writer whose attached gate was
 produced by an earlier completed Writer; unrelated failed Attempts stay
 terminal. Unreadable Git or Tester evidence and a mutating check hook pause
 immediately.
+
+Ordinary foreground and queued resume also include a narrow compatibility
+transition for Attempts that Factory's retired presentation checks paused. The
+transition accepts only the exact preceding clean candidate and a stopped,
+output-free corrective Writer. Its source-bound candidate gate and canonical
+hook log must contain only the former missing-body or body-line-length
+findings. Fluent preserves that failed gate and log, supersedes only the
+corrective Writer, and stores a separate reclassification receipt that binds
+the gate digest, candidate tree, and project-policy commit before it reuses the
+candidate and continues to review. Live or output-producing Writers, dirty or
+changed candidates, unbound or changed evidence, and mixed, provenance, or
+unknown findings fail closed.
+
+Recovery replay validates the receipt's recorded policy commit separately from
+the current policy marker and hook. The recorded commit must remain an ancestor
+of the current project branch, and the current checkout must still expose the
+advisory marker and invoke the same hook. This lets an unrelated descendant
+project commit retain a completed transition, including a receipt written
+before the Work-model mutation was bound, without weakening the exact
+classification of legacy evidence. Re-entry then completes or reuses the same
+candidate transition instead of rewriting candidate history or duplicating
+Tasks.
 
 A metadata recovery is eligible when `commit-metadata` is the only failed
 check, or when `project-check` is the one additional failure and is derived

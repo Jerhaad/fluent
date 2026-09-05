@@ -1,5 +1,5 @@
 ---
-name: candidate-commits-require-separated-body
+name: candidate-commits-should-use-separated-body
 description: Candidate commits should use a non-whitespace body separated from the subject by a blank line
 metadata:
   type: convention

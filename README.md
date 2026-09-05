@@ -225,7 +225,25 @@ When an uncertain review came from an external problem and the candidate does no
 
 After a Reviewer `fail`, Fluent starts another round immediately. The Writer receives the failed reports, revises the candidate, runs focused checks, and commits the revision; then the affected Reviewers inspect it and mark earlier findings as addressed or still open. The full Tester runs only after the reviewers pass. A Tester regression then returns its evidence to the Writer for another focused correction and review. If the Attempt reaches its configured review-round limit, Fluent pauses with the evidence collected rather than continuing indefinitely. You can approve a bounded continuation with `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N`; Fluent binds that approval to the exact candidate and failed-review bytes before the same Attempt resumes. Scoped Writers produced by evidence-targeted `code-change` reviews count in that effective limit, so a later extension starts from the actual Writer frontier.
 
-An older Attempt paused at Writer completion solely for Factory's former missing-body or body-line-length checks resumes through the ordinary interface. Use `fluent queue resume <work-item-id> --attempt <attempt-id>` for scheduler-owned Work, or `fluent attempt run <work-item-id> <attempt-id>` in the foreground. Fluent applies this automatic recovery only when the corrective Writer is stopped and output-free, the preceding candidate remains clean and exact, the rejected gate and canonical hook log remain bound and unchanged, and the checked-in project hook invokes Factory's advisory commit-message policy. It preserves the failed evidence, supersedes only that corrective Writer, and records a separate reclassification before continuing to review. A live or output-producing Writer, dirty workspace, candidate drift, unbound or changed gate, or mixed, provenance, or unknown hook output fails closed. Re-entering after a successful reclassification reuses the recorded transition without rewriting candidate history or duplicating Tasks. An unrelated fast-forward of the project branch keeps that receipt valid only while its recorded policy commit remains in the current history and the current policy marker and hook stay active.
+### Resume retired commit-style pauses
+
+For an older Attempt paused at Writer completion solely for Factory's former
+missing-body or body-line-length checks, use
+`fluent queue resume <work-item-id> --attempt <attempt-id>` for scheduler-owned
+Work, or `fluent attempt run <work-item-id> <attempt-id>` in the foreground.
+
+Automatic recovery requires a stopped, output-free corrective Writer; a clean,
+exact preceding candidate; bound and unchanged gate and canonical hook
+evidence; and the checked-in Factory advisory commit-message policy. Fluent
+preserves the failed evidence, supersedes only that Writer, records a separate
+reclassification, and continues the same Attempt to review.
+
+Recovery fails closed for a live or output-producing Writer, dirty workspace,
+candidate drift, unbound or changed evidence, and mixed, provenance, or unknown
+hook findings. Re-entry reuses a successful transition without rewriting
+history or duplicating Tasks. An unrelated project-branch fast-forward keeps a
+receipt valid only while its recorded policy commit remains in the current
+history and the current policy marker and hook remain active.
 
 When a metadata-only correction accidentally rewrites the candidate's protected base, `fluent status` and the candidate-gate handoff report `fluent attempt repair-candidate-ancestry <work-item-id> <attempt-id> --resolution "<approved repair>"`. The command accepts only this exact tree-identical failure, preserves the rejected history, and reconstructs the unchanged candidate tree directly on the protected base using the accepted source commit's product-focused message. Resume that exact Attempt afterward with `fluent queue resume <work-item-id> --attempt <attempt-id>`; Fluent runs its ordinary candidate gate, reviews, Tester, and Learner against the recovered commit. A dirty or drifted candidate is rejected, and retrying the same interrupted or completed frontier reuses its durable recovery record. A later tree-identical rewrite receives a new repair record only when it preserves a substantive base descended from the earlier recovery. Reviewers treat that protected base as immutable history and review commit metadata only after it. If older Fluent guidance admitted a fresh Attempt before the retry, cancel its running task and remove its dispatch; repeating the repair then preserves that admission as superseded history and restores the exact-Attempt resume path. If its initially output-free Writer settles late, Fluent retains the output and branch as history without allowing them to replace the recovered candidate.
 

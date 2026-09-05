@@ -6688,6 +6688,17 @@ acceptance to the project's check hook.
 Test: src/candidate_gate.rs (accepts_subject_only_and_coauthored_commits_as_project_policy)
 Test: src/candidate_gate.rs (accepts_overlong_commit_body_lines_as_project_policy)
 
+### B25ab
+
+WHEN Factory's project hook evaluates a structurally valid candidate whose
+commit messages lack bodies or contain body lines longer than 72 characters,
+THE SYSTEM SHALL report those presentation issues as advice and allow the
+project check to pass, while continuing to reject prohibited attribution and
+other project-check failures.
+Test: tests/behaviors/operations/test-commit-message-policy.sh (commit-message presentation is advisory)
+Test: tests/behaviors/operations/test-commit-message-policy.sh (provenance and non-presentation failures remain blocking)
+Test: src/candidate_gate.rs (rejects_whitespace_errors_and_malformed_commit_metadata)
+
 ### B25a
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL require the workspace
@@ -6868,6 +6879,36 @@ and Reviewers not to request metadata rewrites at or before the latest protected
 base.
 Test: src/candidate_ancestry_recovery.rs (repairs_a_later_tree_identical_rewrite_after_an_earlier_recovery)
 Test: src/work_task_executor.rs (recovered_ancestry_prompts_protect_immutable_history)
+
+### B25s
+
+WHEN an older Attempt paused solely because Factory's former project hook
+rejected missing commit bodies or long body lines, THE SYSTEM SHALL recover
+only when the preceding candidate, stopped output-free Writer, bound gate, and
+canonical hook log exactly match the stored legacy evidence. It SHALL preserve
+that evidence, supersede only the corrective Writer, record a separate
+reclassification receipt, and continue the same Attempt to review.
+Test: src/work_attempt_loop.rs (retired_commit_style_pause_reuses_preceding_candidate)
+Test: tests/binary.rs (retired_commit_style_resume_reaches_review_without_writer)
+
+### B25t
+
+IF a retired commit-style pause has a live or output-producing Writer, a dirty
+or changed candidate, unbound or changed evidence, or mixed, provenance, or
+unknown hook findings, THEN THE SYSTEM SHALL refuse automatic recovery without
+changing Attempt state or candidate history.
+Test: src/work_attempt_loop.rs (retired_commit_style_recovery_rejects_unsafe_frontiers)
+
+### B25u
+
+WHEN foreground or queued execution revisits a completed retired commit-style
+reclassification, THE SYSTEM SHALL reuse its recorded candidate transition and
+policy commit without rewriting history or duplicating Tasks, including after
+an unrelated project-branch advance that retains the recorded policy commit
+and current advisory marker and hook.
+Test: src/work_attempt_loop.rs (retired_commit_style_admission_survives_unrelated_policy_advance)
+Test: src/work_attempt_loop.rs (retired_commit_style_recovery_reuses_matching_unbound_receipt)
+Test: tests/binary.rs (retired_commit_style_resume_is_idempotent_across_execution_paths)
 
 ### B26
 
