@@ -17938,7 +17938,7 @@ mod tests {
         fs::write(project_root.join("README.md"), "base\n").unwrap();
         fs::write(
             project_root.join("scripts/check-commit-message-policy.sh"),
-            "#!/bin/sh\nexit 1\n",
+            "#!/bin/sh\ncandidate=$(git rev-parse HEAD)\nif [ \"${FLUENT_BASE_COMMIT:-}\" = \"$candidate\" ]; then\n  exit 0\nfi\nprintf 'commit %s has no body separated from its subject by a blank line\\n' \"$candidate\" >&2\nexit 1\n",
         )
         .unwrap();
         let hook = project_root.join(".fluent/hooks/check-pre-merge");
@@ -17985,18 +17985,9 @@ mod tests {
         .unwrap();
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
-        fs::write(
-            workspace.join("scripts/check-commit-message-policy.sh"),
-            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
-        )
-        .unwrap();
         crate::git::run(
             &workspace,
-            &[
-                "add",
-                "src/lib.rs",
-                "scripts/check-commit-message-policy.sh",
-            ],
+            &["add", "src/lib.rs"],
             "stage retired-style candidate",
         )
         .unwrap();

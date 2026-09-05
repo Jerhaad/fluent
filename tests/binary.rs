@@ -22462,7 +22462,7 @@ fn make_commit_style_binary_fixture(
     let source_policy = if source_uses_advisory_policy {
         "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nif [ -f blocked.txt ]; then\n  echo 'blocked.txt violates current project policy' >&2\n  exit 1\nfi\nexit 0\n"
     } else {
-        "#!/bin/sh\nexit 1\n"
+        "#!/bin/sh\ncandidate=$(git rev-parse HEAD)\nif [ \"${FLUENT_BASE_COMMIT:-}\" = \"$candidate\" ]; then\n  exit 0\nfi\nprintf 'commit %s has no body separated from its subject by a blank line\\n' \"$candidate\" >&2\nexit 1\n"
     };
     fs::write(&policy, source_policy).unwrap();
     fs::write(&hook, "#!/bin/sh\nscripts/check-commit-message-policy.sh\n").unwrap();
@@ -22533,13 +22533,6 @@ fn make_commit_style_binary_fixture(
     if source_uses_advisory_policy {
         fs::write(workspace.join("blocked.txt"), "blocked\n").unwrap();
     }
-    if !source_uses_advisory_policy {
-        fs::write(
-            workspace.join("scripts/check-commit-message-policy.sh"),
-            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
-        )
-        .unwrap();
-    }
     if source_uses_advisory_policy {
         git::run(
             &workspace,
@@ -22550,11 +22543,7 @@ fn make_commit_style_binary_fixture(
     }
     git::run(
         &workspace,
-        &[
-            "add",
-            "candidate.txt",
-            "scripts/check-commit-message-policy.sh",
-        ],
+        &["add", "candidate.txt"],
         "stage retired-style binary candidate",
     )
     .unwrap();

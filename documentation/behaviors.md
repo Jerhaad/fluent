@@ -6941,9 +6941,9 @@ Test: tests/binary.rs (retired_commit_style_resume_is_idempotent_across_executio
 
 ### B25v
 
-WHEN Fluent recovers a retired commit-style pause, THE SYSTEM SHALL still
-require completion-contract behavior evidence, reviews, the final Tester, and
-the Learner before it marks the Merge Candidate ready.
+WHEN Fluent recovers a retired commit-style pause, THE SYSTEM SHALL retain any
+completion-contract behavior requirements and still require reviews, the final
+Tester, and the Learner before it marks the Merge Candidate ready.
 Test: tests/binary.rs (retired_commit_style_resume_is_idempotent_across_execution_paths)
 
 ### B26
