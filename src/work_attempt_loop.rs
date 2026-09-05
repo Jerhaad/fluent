@@ -522,6 +522,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             continue;
         }
 
+        crate::host_evidence::ensure_owned_host_resume_ready(config.project_root, attempt)?;
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
                 if candidate_gate_pause {
@@ -6333,10 +6334,10 @@ fn recover_legacy_learner_tester_evidence_failure(
 /// a reconciled one produces nothing, so a passing review advances normally.
 fn required_progress_finding(project_root: &Path, attempt: &Attempt) -> Option<ArtifactRef> {
     attempt.progress_contract.as_ref()?;
-    // A passed authorized-host Plan-row recovery owns a host-generated
-    // completion matrix. Project it before checking the durable progress
-    // manifest so the evidence-only path does not send the candidate back to a
-    // Writer for a commit it must not create.
+    // Project accepted recovery evidence before checking durable progress. An
+    // approved ownership split uses its validated source matrix and projects
+    // only Writer rows; legacy host evidence uses its completed host matrix.
+    // Neither path needs another Writer to serialize the required section.
     if let Some(writer) = attempt
         .tasks
         .iter()
@@ -6344,6 +6345,12 @@ fn required_progress_finding(project_root: &Path, attempt: &Attempt) -> Option<A
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         && let Some(matrix_artifact) =
             crate::host_evidence::completed_plan_host_matrix_ref(project_root, attempt, writer)
+                .or_else(|| {
+                    crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)
+                        .ok()
+                        .flatten()
+                        .map(|(_, source, _)| source)
+                })
         && let Ok(matrix_source) = fs::read_to_string(project_root.join(&matrix_artifact.path))
         && let Ok(matrix) =
             serde_json::from_str::<crate::work_model::WriterCompletionMatrix>(&matrix_source)

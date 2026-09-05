@@ -381,6 +381,15 @@ fn reserve_task_start(
             )?;
         }
         let attempt = &item.attempts[attempt_index];
+        if expected_kind == TaskKind::Review {
+            crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
+                .map_err(
+                |error| crate::work_model::WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.into(),
+                    reason: format!("{error:#}"),
+                },
+            )?;
+        }
         if attempt.tasks[task_index].kind != expected_kind {
             return Err(crate::work_model::WorkModelError::TaskNotFound {
                 id: task_id.to_string(),

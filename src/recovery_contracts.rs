@@ -6,7 +6,6 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,6 +23,181 @@ use crate::work_model::{
 pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
+
+/// Prove that the interrupted continuation can yield to its exact approved
+/// host obligation. Probe both owner mechanisms; timestamps grant no authority.
+pub(crate) fn inspect_interrupted_plan_host_recovery(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    row_id: &str,
+) -> Result<Option<String>> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::Interrupted)
+    {
+        return Ok(None);
+    }
+    let canceled = crate::lifecycle_recovery::interrupted_plan_host_writer(attempt)
+        .context("interruption is not one output-free Writer continuation")?;
+    let (writer, _, matrix) = owned_host_completion_matrix(project_root, attempt)?
+        .context("interrupted recovery requires approved host ownership")?;
+    let contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .expect("owned matrix has a contract");
+    let findings = writer_completion_findings(project_root, &writer)?;
+    anyhow::ensure!(
+        matrix
+            .status_against(contract, &writer.id, &findings)
+            .map_err(anyhow::Error::msg)?
+            .is_complete(),
+        "Writer obligations remain incomplete"
+    );
+    anyhow::ensure!(
+        matrix.rows.iter().any(|row| row.id == row_id
+            && row.responsibility == Some(work_model::CompletionResponsibility::Host)
+            && row.state == work_model::WriterCompletionState::Pending),
+        "pending obligation is not approved host work"
+    );
+    let output = writer.output.as_ref().expect("validated source output");
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at_managed(project_root, output, &output.commit),
+        "interrupted host recovery needs the unchanged managed candidate"
+    );
+    let source_path = writer
+        .artifact_area
+        .as_ref()
+        .map(|area| format!("{}/writer-completion.json", area.path))
+        .context("source Writer has no matrix")?;
+    anyhow::ensure!(
+        canceled
+            .input_artifacts
+            .iter()
+            .any(|artifact| artifact.path == source_path),
+        "canceled Writer does not name the preserved source completion evidence"
+    );
+    for task in &attempt.tasks {
+        anyhow::ensure!(
+            task.id == canceled.id
+                || matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded),
+            "unrelated unresolved Task {}",
+            task.id
+        );
+        anyhow::ensure!(
+            !crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                &attempt.work_item_id,
+                &task.id
+            )),
+            "Task {} has a live owner",
+            task.id
+        );
+        if let Some(area) = &task.artifact_area {
+            anyhow::ensure!(
+                !crate::execution::execution_is_live(&crate::execution::record_path_for_artifact(
+                    project_root,
+                    &area.path
+                ))?,
+                "Task {} still owns a live execution",
+                task.id
+            );
+        }
+    }
+    Ok(Some(canceled.id.clone()))
+}
+
+/// Revalidate active Plan evidence before foreground resume, queue admission,
+/// scheduler claim, and Reviewer launch. Legacy attachment semantics remain intact.
+pub(crate) fn validate_owned_plan_evidence_review(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    let Some(recovery) = attempt
+        .active_evidence_recovery()
+        .filter(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
+    else {
+        return Ok(());
+    };
+    for target in &recovery.targets {
+        if !attempt.artifacts.iter().any(|artifact| {
+            artifact.producer_id == "plan-host-evidence"
+                && artifact.path == target.prior_review_artifact
+        }) {
+            continue;
+        }
+        let binding: work_model::PlanHostEvidenceBinding = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &target.prior_review_artifact)?,
+        )?)?;
+        let Some((writer, source, matrix)) = owned_host_completion_matrix(project_root, attempt)?
+        else {
+            continue;
+        };
+        let row = matrix
+            .rows
+            .iter()
+            .find(|row| row.id == binding.plan_row)
+            .context("host evidence row disappeared")?;
+        if row.responsibility.is_none() {
+            continue;
+        }
+        anyhow::ensure!(
+            row.responsibility == Some(work_model::CompletionResponsibility::Host),
+            "evidence row is not host-owned"
+        );
+        let output = writer.output.as_ref().expect("validated output");
+        let command = row.command.as_ref().context("host command disappeared")?;
+        anyhow::ensure!(
+            binding.schema_version == 1
+                && binding.work_item_id == attempt.work_item_id
+                && binding.attempt_id == attempt.id
+                && binding.writer_task_id == writer.id
+                && binding.candidate_commit == output.commit
+                && recovery.candidate_commit == output.commit
+                && binding.requirement == row.requirement
+                && binding.command == command.command
+                && binding.working_directory == command.working_directory
+                && binding.source_matrix.path == source.path
+                && binding.evidence.path == recovery.attachment.snapshot_path
+                && binding.evidence.digest == recovery.attachment.digest,
+            "host evidence no longer matches its candidate, row, command, or source"
+        );
+        for artifact in [&binding.source_matrix, &binding.evidence] {
+            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            anyhow::ensure!(
+                format!("sha256:{:x}", Sha256::digest(&bytes)) == artifact.digest,
+                "host evidence digest changed: {}",
+                artifact.path
+            );
+        }
+        let evidence = parse_evidence_document(&fs::read(resolve_input_artifact_path(
+            project_root,
+            &binding.evidence.path,
+        )?)?)?;
+        anyhow::ensure!(
+            evidence.check == binding.command
+                && evidence.result == binding.result
+                && evidence.working_directory == binding.working_directory
+                && evidence.run_at == binding.run_at,
+            "host evidence document changed"
+        );
+        let reviewer = target
+            .review_task_id
+            .as_ref()
+            .and_then(|id| attempt.tasks.iter().find(|task| task.id == *id))
+            .context("targeted reviewer disappeared")?;
+        let context = reviewer
+            .evidence_review_context
+            .as_ref()
+            .context("targeted review lost its evidence binding")?;
+        anyhow::ensure!(
+            context.recovery_id == recovery.id
+                && context.candidate_commit == output.commit
+                && context.attachment == recovery.attachment
+                && context.prior_review_artifact == target.prior_review_artifact,
+            "targeted review binding changed"
+        );
+    }
+    Ok(())
+}
 
 /// Verify the candidate and stopped owners before an operator adopts a saved
 /// responsibility split. Approval itself never retries a Writer.
@@ -143,6 +317,50 @@ pub(crate) fn owned_host_completion_matrix(
         "completion matrix exceeds size limit"
     );
     let mut matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    if let Some(audit_ref) = attempt.artifacts.iter().rev().find(|artifact| {
+        artifact.producer_id == "ownership-recovery" && artifact.path.ends_with("/approval.json")
+    }) {
+        let audit: work_model::OwnershipApproval = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &audit_ref.path)?,
+        )?)?;
+        let preview = &audit.preview;
+        anyhow::ensure!(
+            preview.work_item_id == attempt.work_item_id && preview.attempt_id == attempt.id,
+            "ownership approval belongs to another Attempt"
+        );
+        let source_bytes = fs::read(resolve_input_artifact_path(
+            project_root,
+            &preview.source_matrix.path,
+        )?)?;
+        anyhow::ensure!(
+            format!("sha256:{:x}", Sha256::digest(&source_bytes)) == preview.source_matrix_digest,
+            "approved source completion evidence changed"
+        );
+        let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&source_bytes)?;
+        let (approved_contract, approved_matrix) = preview
+            .proposal
+            .apply(&preview.original_contract, &source)
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(
+            &approved_contract == contract,
+            "approved responsibility contract changed"
+        );
+        let adopted: work_model::WriterCompletionMatrix = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &audit.matrix_artifact.path)?,
+        )?)?;
+        anyhow::ensure!(
+            adopted == approved_matrix,
+            "approved completion mapping changed"
+        );
+        if artifact.producer_id == "ownership-recovery" {
+            anyhow::ensure!(
+                audit.matrix_artifact == artifact
+                    && preview.candidate_commit == output.commit
+                    && preview.writer_task_id == writer.id,
+                "ownership mapping no longer names this Writer candidate"
+            );
+        }
+    }
     let findings = writer_completion_findings(project_root, writer)?;
     matrix
         .status_against(contract, &writer.id, &findings)
@@ -153,27 +371,7 @@ pub(crate) fn owned_host_completion_matrix(
     Ok(Some((writer.clone(), artifact, matrix)))
 }
 
-/// Version-one operator evidence document. The parser below is the single
-/// validation boundary for host-evidence attachment and source correction.
-/// Callers retain the exact serialized bytes separately as the audit artifact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvidenceDocument {
-    pub schema_version: u32,
-    pub producer: String,
-    pub check: String,
-    pub working_directory: String,
-    pub result: EvidenceResult,
-    pub run_at: String,
-    pub output: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvidenceResult {
-    Pass,
-    Fail,
-}
+pub use crate::work_model::{EvidenceDocument, EvidenceResult};
 
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct CodeChangeClassificationAudit<'a> {

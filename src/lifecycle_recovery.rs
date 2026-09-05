@@ -460,6 +460,27 @@ fn read_reclassification_bytes(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
+/// Recognize only the canceled output-free continuation after a completed
+/// candidate. Filesystem and owner checks remain in recovery_contracts.
+pub(crate) fn interrupted_plan_host_writer(attempt: &Attempt) -> Option<&crate::work_model::Task> {
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(crate::work_model::PauseKind::Interrupted)
+    {
+        return None;
+    }
+    let latest = attempt.tasks.iter().rposition(|task| {
+        task.kind == TaskKind::Write && task.status == TaskStatus::Complete && task.output.is_some()
+    })?;
+    let [writer] = &attempt.tasks[latest + 1..] else {
+        return None;
+    };
+    (writer.kind == TaskKind::Write
+        && writer.status == TaskStatus::NeedsUser
+        && writer.output.is_none()
+        && writer.completed_at.is_some())
+    .then_some(writer)
+}
+
 /// The immutable frontier that authorizes a targeted uncertain-review retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UncertainReviewRecovery {

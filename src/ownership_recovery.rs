@@ -133,7 +133,11 @@ pub fn approve(
         slug.len() == 64 && slug.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid preview identity"
     );
-    let directory = work_model::work_artifact_path(id, attempt_id, &format!("ownership/{slug}"));
+    let directory = work_model::work_artifact_path(
+        id,
+        attempt_id,
+        &format!("ownership/{}/{slug}", preview.writer_task_id),
+    );
     let audit_path = format!("{directory}/approval.json");
     let matrix_artifact = ArtifactRef {
         producer_id: PRODUCER.into(),

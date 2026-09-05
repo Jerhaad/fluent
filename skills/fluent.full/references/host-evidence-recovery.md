@@ -197,3 +197,34 @@ Tasks or evidence. Older readers reject the new record schema before mutation.
 Approval assigns responsibility; it does not authorize the host command, retry
 a hard-failed Writer, or declare any host check passed. The existing Test-reference
 and Approach revision commands retain their separate meanings.
+
+## Recover an interrupted Writer awaiting a host check
+
+After approval, `fluent work-item show work-id` names the exact candidate and
+host Plan row. An output-free canceled continuation can yield to that check
+only when its Task lease and execution owner have stopped, its input names the
+preserved source matrix, all Writer obligations are complete, and the managed
+candidate remains clean at the saved commit. Fluent supersedes only that
+continuation; earlier completed Tasks and failed evidence remain history.
+
+After the operator authorizes and runs the displayed command, attach its fresh
+result and resume the same Attempt:
+
+```sh
+fluent attempt evidence attach work-id attempt-1 --candidate <SHA> --plan-row plan:step-2:part-2 --evidence-file host-result.json
+fluent queue resume work-id --attempt attempt-1
+fluent scheduler run
+```
+
+For foreground execution, use `fluent attempt run work-id attempt-1` after
+attachment. Resuming before attachment returns the exact host handoff. A failed
+check never completes the host obligation. Passing evidence must pass targeted
+Tests Review before ordinary review, the canonical final Tester, and Learning
+can establish readiness.
+
+An identical attachment reuses its pending targeted review. An identical active
+queue resume reuses its dispatch. A foreground retry while its reviewer is live
+refuses to advance the same Task. All paths recheck the bound candidate and
+evidence; a changed attachment, source matrix, or dirty candidate requires
+inspection before recovery can continue. Scheduler claim and Review launch
+repeat those checks, including when a queue entry predates the changed evidence.

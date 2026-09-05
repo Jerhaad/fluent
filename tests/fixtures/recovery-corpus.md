@@ -16,6 +16,14 @@ commands. Each replay verifies that:
 - a stale candidate is rejected before mutation; and
 - the original Task history and operation record survive serialization.
 
+These are model validation and serialization checks. The corpus does not parse
+or dispatch its saved command strings. Executed CLI coverage lives separately
+in `tests/binary.rs`: `legacy_ownership_*` drives preview and approval, and
+`interrupted_plan_host_evidence_recovers_same_attempt` plus
+`host_plan_recovery_public_commands_are_idempotent` drive cancellation,
+attachment, foreground resume, queue resume, and scheduler execution against
+isolated Git repositories with controlled external providers.
+
 Workflow cases document public reconciliation commands whose state lives outside
 an Attempt, such as an already-landed Merge Candidate. Their command and history
 are still checked for safe, machine-independent shape.

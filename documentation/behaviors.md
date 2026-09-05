@@ -6509,11 +6509,12 @@ Test: src/work_attempt_loop.rs (incomplete_no_change_writer_pauses_instead_of_co
 
 ### B8
 
-WHEN two consecutive Writer continuations, including after review, create commits against the same obligations without
-increasing the applicable matrix or legacy required-progress completion count,
+WHEN two consecutive Writer continuations, including after review, create commits
+without completing additional work against the same obligations,
 THE SYSTEM SHALL preserve the candidate and pause the Attempt before planning a
-Tester or reviewer.
+Writer, Tester, or reviewer.
 Test: src/work_attempt_loop.rs (second_stagnant_pre_review_continuation_pauses)
+Test: src/work_attempt_loop.rs (stagnant_post_review_continuations_pause)
 
 ### B9
 
@@ -9738,3 +9739,20 @@ WHEN two consecutive Writer continuations complete no additional work against
 the same outstanding requirements, THE SYSTEM SHALL preserve the candidate and
 pause before launching another Writer, including after earlier reviews.
 Test: src/work_attempt_loop.rs (stagnant_post_review_continuations_pause)
+
+### B2
+
+WHEN an interrupted Writer has stopped without output, all Writer obligations
+are complete, and the clean unchanged candidate awaits an approved host check,
+THE SYSTEM SHALL admit fresh evidence to targeted Tests Review in the same
+Attempt, preserving completed history and leaving failed evidence uncredited.
+Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt)
+Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt_rejects_unsafe_state)
+
+### B3
+
+WHEN identical attachment or resume commands repeat while recovery remains
+eligible, THE SYSTEM SHALL retain the recorded Task and dispatch identities,
+rechecking candidate and evidence bindings through foreground and queued paths.
+Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent)
+Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent_recheck_changed_evidence)

@@ -35768,3 +35768,556 @@ fn legacy_ownership_preview_rejects_dropped_or_credited_work() {
         );
     }
 }
+
+fn setup_interrupted_owned_host_fixture(
+    tmp: &TempDir,
+    id: &str,
+) -> (PathBuf, String, PathBuf, ManagedWorktreeCleanup) {
+    use fluent::work_model::*;
+    let (project, original, proposal) = setup_legacy_ownership_fixture(tmp, id);
+    let workspace = bind_candidate_to_managed_sibling(&project, id, &original);
+    let failed = tmp.path().join("failed-host.json");
+    fs::write(&failed, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"fail","run_at":"2026-09-04T20:00:00Z","output":"source correction required"}"#).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            id,
+            "attempt-1",
+            "--candidate",
+            &original,
+            "--plan-row",
+            "plan:step-2",
+            "--evidence-file",
+            failed.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item(id).unwrap();
+    // Preserve an earlier failed check and its legitimate source correction as
+    // fixture history. The public journey below starts at cancellation.
+    let reviewer = item.attempts[0].tasks.last_mut().unwrap();
+    set_task_terminal(reviewer, TaskStatus::Complete);
+    let review = ArtifactRef {
+        producer_id: reviewer.id.clone(),
+        path: format!(
+            "{}/review.md",
+            reviewer.artifact_area.as_ref().unwrap().path
+        ),
+    };
+    fs::create_dir_all(project.join(&review.path).parent().unwrap()).unwrap();
+    fs::write(
+        project.join(&review.path),
+        "Verdict: fail\nDisposition: code-change\n",
+    )
+    .unwrap();
+    item.attempts[0].evidence_recoveries[0].state = EvidenceRecoveryState::Complete;
+    item.add_next_write_round("attempt-1", vec![review])
+        .unwrap();
+    fs::write(workspace.workspace.join("README.md"), "corrected source\n").unwrap();
+    git::run(
+        &workspace.workspace,
+        &["add", "README.md"],
+        "stage source correction",
+    )
+    .unwrap();
+    git::run(
+        &workspace.workspace,
+        &["commit", "-m", "Fix host verification source"],
+        "commit correction",
+    )
+    .unwrap();
+    let candidate = git_head(&workspace.workspace);
+    let prior_output = item.attempts[0].tasks[0].output.clone().unwrap();
+    let correction = item.attempts[0].tasks.last_mut().unwrap();
+    set_task_terminal(correction, TaskStatus::Complete);
+    correction.output = Some(TaskOutput {
+        base_commit: Some(original),
+        commit: candidate.clone(),
+        ..prior_output
+    });
+    let matrix_path = format!(
+        "{}/writer-completion.json",
+        correction.artifact_area.as_ref().unwrap().path
+    );
+    let matrix_ref = ArtifactRef {
+        producer_id: correction.id.clone(),
+        path: matrix_path.clone(),
+    };
+    let source_path = project.join(format!(
+        ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-1/writer-completion.json"
+    ));
+    let mut matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(source_path).unwrap()).unwrap();
+    matrix.task_id = correction.id.clone();
+    fs::create_dir_all(project.join(&matrix_path).parent().unwrap()).unwrap();
+    fs::write(
+        project.join(&matrix_path),
+        serde_json::to_vec_pretty(&matrix).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        project
+            .join(&matrix_path)
+            .parent()
+            .unwrap()
+            .join("transcript.jsonl"),
+        "{\"type\":\"result\",\"result\":\"source corrected\"}\n",
+    )
+    .unwrap();
+    let progress = project.join(format!(".fluent/work/progress/{id}/attempt-1/progress.md"));
+    fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    fs::write(&progress, "## Required completion\n\n- [x] Fix source.\n- [ ] Fix source. Check host. Review. Test. Learn.\n").unwrap();
+    item.add_next_write_round("attempt-1", vec![matrix_ref])
+        .unwrap();
+    let continuation = item.attempts[0].tasks.last_mut().unwrap();
+    continuation.status = TaskStatus::Executing;
+    continuation.started_at = Some(now_iso8601());
+    item.attempts[0].status = AttemptStatus::Executing;
+    store.write_work_item(&item).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", id, "attempt-1"])
+        .assert()
+        .success();
+    let preview = tmp.path().join("interrupted-preview.json");
+    ownership_preview(&project, id, &proposal, &preview);
+    ownership_approve(&project, id, &preview).assert().success();
+    let passing = tmp.path().join("passing-host.json");
+    fs::write(&passing,br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T21:00:00Z","output":"corrected candidate passed"}"#).unwrap();
+    (project, candidate, passing, workspace)
+}
+
+fn attach_interrupted_host(
+    project: &Path,
+    id: &str,
+    candidate: &str,
+    evidence: &Path,
+) -> log::LoggedCommand {
+    let mut command = fluent_cmd();
+    command.current_dir(project).args([
+        "attempt",
+        "evidence",
+        "attach",
+        id,
+        "attempt-1",
+        "--candidate",
+        candidate,
+        "--plan-row",
+        "plan:step-2:part-2",
+        "--evidence-file",
+        evidence.to_str().unwrap(),
+    ]);
+    command
+}
+
+#[test]
+fn interrupted_plan_host_evidence_recovers_same_attempt() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, passing, workspace) =
+        setup_interrupted_owned_host_fixture(&tmp, "interrupted-plan");
+    let before = work_item_value(&project, "interrupted-plan");
+    assert_eq!(before["attempts"][0]["pause_kind"], "interrupted");
+    let status = fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", "interrupted-plan"])
+        .output()
+        .unwrap();
+    let guidance = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        guidance.contains(&candidate) && guidance.contains("plan:step-2:part-2"),
+        "{guidance}"
+    );
+    for _ in 0..2 {
+        let refusal = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "run",
+                "interrupted-plan",
+                "attempt-1",
+                "--no-sandbox",
+            ])
+            .assert()
+            .failure();
+        let reason = String::from_utf8_lossy(&refusal.get_output().stderr);
+        assert!(
+            reason.contains(&candidate)
+                && reason.contains("bash tests/host.sh")
+                && reason.contains("plan:step-2:part-2"),
+            "{reason}"
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "queue",
+                "resume",
+                "interrupted-plan",
+                "--attempt",
+                "attempt-1",
+            ])
+            .assert()
+            .failure();
+    }
+    assert_eq!(work_item_value(&project, "interrupted-plan"), before);
+    attach_interrupted_host(&project, "interrupted-plan", &candidate, &passing)
+        .assert()
+        .success();
+    let attached = work_item_value(&project, "interrupted-plan");
+    assert_eq!(attached["attempts"].as_array().unwrap().len(), 1);
+    assert_eq!(attached["attempts"][0]["status"], "reviewing");
+    let tasks = attached["attempts"][0]["tasks"].as_array().unwrap();
+    assert_eq!(
+        &tasks[..3],
+        &before["attempts"][0]["tasks"].as_array().unwrap()[..3]
+    );
+    assert_eq!(tasks[3]["status"], "superseded");
+    assert!(tasks[3]["output"].is_null());
+    assert_eq!(
+        tasks[4]["evidence_review_context"]["candidate_commit"],
+        candidate
+    );
+    assert_eq!(
+        attached["attempts"][0]["evidence_recoveries"][0],
+        before["attempts"][0]["evidence_recoveries"][0]
+    );
+    assert_eq!(git_head(&workspace.workspace), candidate);
+    attach_interrupted_host(&project, "interrupted-plan", &candidate, &passing)
+        .assert()
+        .success();
+    assert_eq!(work_item_value(&project, "interrupted-plan"), attached);
+    let bin = tmp.path().join("review-provider");
+    write_scheduler_claude(
+        &bin,
+        r#"#!/bin/bash
+case "$PWD" in
+  */attempt-1-review-2-tests)
+    : > "$HOST_REVIEW_STARTED"
+    while [ ! -f "$HOST_REVIEW_RELEASE" ]; do sleep 0.05; done
+    printf 'Verdict: pass\n' > review.md ;;
+
+  *) printf 'Verdict: uncertain\nFixture stops at ordinary review.\n' > review.md ;;
+esac
+"#,
+    );
+    let started = tmp.path().join("review-started");
+    let release = tmp.path().join("review-release");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("fluent"));
+    command
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .env_remove("FLUENT_TASK_KIND")
+        .env("FLUENT_MAX_TASK_RETRIES", "0")
+        .env("HOST_REVIEW_STARTED", &started)
+        .env("HOST_REVIEW_RELEASE", &release)
+        .args([
+            "attempt",
+            "run",
+            "interrupted-plan",
+            "attempt-1",
+            "--no-sandbox",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut owner = OwnedFixtureProcess::spawn(&mut command);
+    assert!(
+        poll_until(std::time::Duration::from_secs(20), || started.exists()),
+        "targeted reviewer did not start"
+    );
+    let running = work_item_value(&project, "interrupted-plan");
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args([
+            "attempt",
+            "run",
+            "interrupted-plan",
+            "attempt-1",
+            "--no-sandbox",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(
+        work_item_value(&project, "interrupted-plan")["attempts"][0]["tasks"],
+        running["attempts"][0]["tasks"]
+    );
+    fs::write(release, "continue").unwrap();
+    let output = owner.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(
+        log::test_log_dir_path().join("interrupted-plan-foreground.stdout.log"),
+        &output.stdout,
+    )
+    .unwrap();
+    fs::write(
+        log::test_log_dir_path().join("interrupted-plan-foreground.stderr.log"),
+        &output.stderr,
+    )
+    .unwrap();
+    let reviewed = work_item_value(&project, "interrupted-plan");
+    assert_eq!(reviewed["attempts"][0]["tasks"][4]["status"], "complete");
+    assert_eq!(
+        reviewed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        3
+    );
+    assert_eq!(git_head(&workspace.workspace), candidate);
+}
+
+#[test]
+fn host_plan_recovery_public_commands_are_idempotent() {
+    let tmp = TempDir::new().unwrap();
+    let id = format!(
+        "queued-plan-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    let (project, candidate, passing, workspace) = setup_interrupted_owned_host_fixture(&tmp, &id);
+    attach_interrupted_host(&project, &id, &candidate, &passing)
+        .assert()
+        .success();
+    attach_interrupted_host(&project, &id, &candidate, &passing)
+        .assert()
+        .success();
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+            .assert()
+            .success();
+    }
+    assert_eq!(dispatch_count(&project, &id), 1);
+    let bin = tmp.path().join("queue-review-provider");
+    write_scheduler_claude(
+        &bin,
+        r#"#!/bin/bash
+set -euo pipefail
+PROMPT=""
+NEXT_IS_PROMPT=0
+for arg in "$@"; do
+  if [ "$NEXT_IS_PROMPT" = 1 ]; then PROMPT="$arg"; break; fi
+  if [ "$arg" = "-p" ]; then NEXT_IS_PROMPT=1; fi
+done
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$DRAFT"
+else
+  printf 'Verdict: pass\n' > review.md
+fi
+"#,
+    );
+    let scheduler = run_scheduler_until_dispatch_status(&project, &id, &bin, "candidate-ready");
+    fs::write(
+        log::test_log_dir_path().join("owned-host-scheduler.stdout.log"),
+        &scheduler.stdout,
+    )
+    .unwrap();
+    fs::write(
+        log::test_log_dir_path().join("owned-host-scheduler.stderr.log"),
+        &scheduler.stderr,
+    )
+    .unwrap();
+    let reviewed = work_item_value(&project, &id);
+    assert_eq!(
+        reviewed["attempts"][0]["tasks"][4]["status"],
+        "complete",
+        "scheduler: {}",
+        String::from_utf8_lossy(&scheduler.stderr)
+    );
+    assert!(reviewed["attempts"][0]["tasks"].as_array().unwrap().len() > 5);
+    assert_eq!(
+        reviewed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        3
+    );
+    assert!(
+        reviewed["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["kind"] == "tester" && task["status"] == "complete")
+    );
+    assert_eq!(reviewed["attempts"][0]["learning"]["status"], "succeeded");
+    assert_eq!(dispatch_count(&project, &id), 1);
+    assert_eq!(git_head(&workspace.workspace), candidate);
+}
+
+#[test]
+fn interrupted_plan_host_evidence_recovers_same_attempt_rejects_unsafe_state() {
+    use fluent::work_model::*;
+    for drift in [
+        "dirty",
+        "candidate",
+        "live",
+        "source",
+        "command",
+        "unrelated",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let id = "unsafe-interrupted-plan";
+        let (project, candidate, passing, workspace) =
+            setup_interrupted_owned_host_fixture(&tmp, id);
+        let _lease = (drift == "live").then(|| {
+            fluent::lease::acquire(&fluent::lease::task_lock_path(
+                &project,
+                id,
+                "attempt-1-write-3",
+            ))
+            .unwrap()
+        });
+        match drift {
+            "dirty" => fs::write(workspace.workspace.join("README.md"), "dirty\n").unwrap(),
+            "candidate" => {
+                git::run(
+                    &workspace.workspace,
+                    &["commit", "--allow-empty", "-m", "Change candidate"],
+                    "drift",
+                )
+                .unwrap();
+            }
+            "source" => {
+                let source = project.join(format!(
+                    ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-2/writer-completion.json"
+                ));
+                let mut bytes = fs::read(&source).unwrap();
+                bytes.push(b'\n');
+                fs::write(source, bytes).unwrap();
+            }
+            "command" => {
+                let mut doc = read_json_path(&passing);
+                doc["check"] = serde_json::json!("bash other.sh");
+                fs::write(&passing, serde_json::to_vec(&doc).unwrap()).unwrap();
+            }
+            "unrelated" => {
+                WorkModelStore::new(&project)
+                    .mutate_work_item(id, |item| {
+                        item.attempts[0].tasks[3].input_artifacts.clear();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let before = work_item_value(&project, id);
+        attach_interrupted_host(&project, id, &candidate, &passing)
+            .assert()
+            .failure();
+        assert_eq!(work_item_value(&project, id), before, "{drift}");
+    }
+}
+
+#[test]
+fn host_plan_recovery_public_commands_are_idempotent_recheck_changed_evidence() {
+    for drift in ["evidence", "matrix", "dirty"] {
+        let tmp = TempDir::new().unwrap();
+        let id = format!(
+            "changed-plan-{}",
+            tmp.path().file_name().unwrap().to_string_lossy()
+        );
+        let (project, candidate, passing, workspace) =
+            setup_interrupted_owned_host_fixture(&tmp, &id);
+        attach_interrupted_host(&project, &id, &candidate, &passing)
+            .assert()
+            .success();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+            .assert()
+            .success();
+        let before = work_item_value(&project, &id);
+        let artifact = if drift == "evidence" {
+            before["attempts"][0]["evidence_recoveries"][1]["attachment"]["snapshot_path"]
+                .as_str()
+                .unwrap()
+        } else {
+            before["attempts"][0]["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| {
+                    a["producer_id"] == "ownership-recovery"
+                        && a["path"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("writer-completion.json")
+                })
+                .unwrap()["path"]
+                .as_str()
+                .unwrap()
+        };
+        if drift == "dirty" {
+            fs::write(workspace.workspace.join("README.md"), "dirty\n").unwrap();
+        } else {
+            let path = project.join(artifact);
+            let mut bytes = fs::read(&path).unwrap();
+            bytes.push(b'\n');
+            fs::write(path, bytes).unwrap();
+        }
+        attach_interrupted_host(&project, &id, &candidate, &passing)
+            .assert()
+            .failure();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+            .assert()
+            .failure();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+            .assert()
+            .failure();
+        let bin = tmp.path().join("unused-provider");
+        write_scheduler_claude(&bin, "#!/bin/bash\nexit 89\n");
+        fluent_cmd()
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .args(["scheduler", "run", "--poll-seconds", "1"])
+            .assert()
+            .failure();
+        assert_eq!(latest_dispatch_status(&project, &id), "queued");
+        assert_eq!(
+            work_item_value(&project, &id)["attempts"][0]["tasks"],
+            before["attempts"][0]["tasks"],
+            "{drift}"
+        );
+        assert_eq!(dispatch_count(&project, &id), 1);
+    }
+}
+
+#[test]
+fn legacy_ownership_adoption_rechecks_source_before_host_attachment() {
+    let tmp = TempDir::new().unwrap();
+    let id = "changed-approved-source";
+    let (project, candidate, proposal) = setup_legacy_ownership_fixture(&tmp, id);
+    let preview = tmp.path().join("preview.json");
+    ownership_preview(&project, id, &proposal, &preview);
+    ownership_approve(&project, id, &preview).assert().success();
+    let source = project.join(format!(
+        ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-1/writer-completion.json"
+    ));
+    let mut bytes = fs::read(&source).unwrap();
+    bytes.push(b'\n');
+    fs::write(source, bytes).unwrap();
+    let evidence = tmp.path().join("host.json");
+    fs::write(&evidence, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T21:00:00Z","output":"passed"}"#).unwrap();
+    let before = work_item_value(&project, id);
+    attach_interrupted_host(&project, id, &candidate, &evidence)
+        .assert()
+        .failure();
+    assert_eq!(work_item_value(&project, id), before);
+}

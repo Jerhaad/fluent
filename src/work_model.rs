@@ -1426,7 +1426,11 @@ impl WorkItem {
                                     "/writer-completion-repairs/{}/",
                                     latest_write.id
                                 )))
-                                || artifact.producer_id == "planning-reference-recovery")
+                                || artifact.producer_id == "planning-reference-recovery"
+                                || (artifact.producer_id == "ownership-recovery"
+                                    && artifact
+                                        .path
+                                        .contains(&format!("/ownership/{}/", latest_write.id))))
                     })
                     .cloned()
                     .unwrap_or_else(|| ArtifactRef {
@@ -19792,4 +19796,55 @@ pub(crate) fn publish_recovery_snapshot(
     // snapshot directory entry durable before that model can reference it.
     fs::File::open(path.parent().expect("snapshot has a parent"))?.sync_all()?;
     Ok(())
+}
+
+/// Version-one operator evidence document. The parser below is the single
+/// validation boundary for host-evidence attachment and source correction.
+/// Callers retain the exact serialized bytes separately as the audit artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceDocument {
+    pub schema_version: u32,
+    pub producer: String,
+    pub check: String,
+    pub working_directory: String,
+    pub result: EvidenceResult,
+    pub run_at: String,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceResult {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BoundRecheckArtifact {
+    pub(crate) path: String,
+    pub(crate) digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub(crate) struct PlanHostEvidenceBinding {
+    pub(crate) schema_version: u32,
+    pub(crate) work_item_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) writer_task_id: String,
+    pub(crate) candidate_commit: String,
+    pub(crate) plan_row: String,
+    pub(crate) requirement: String,
+    pub(crate) command: String,
+    /// `structured:<row>` for current matrices; old matrices record the text
+    /// fields used by the one compatibility parser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command_source: Option<String>,
+    pub(crate) working_directory: String,
+    pub(crate) source_matrix: BoundRecheckArtifact,
+    pub(crate) evidence: BoundRecheckArtifact,
+    pub(crate) result: EvidenceResult,
+    pub(crate) run_at: String,
 }

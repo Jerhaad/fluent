@@ -3810,3 +3810,13 @@ from the two-continuation guard. New findings reset the comparison; replacing an
 old finding does not regress an unchanged completed Plan row. Legacy progress
 without a matrix retains its counts and compares the finding identities. A new
 commit alone never counts as additional completion.
+
+For a stopped, output-free interrupted continuation, `lifecycle_recovery`
+recognizes the narrow Task sequence and `recovery_contracts` verifies the managed
+candidate, approved host row, source completion, and both owner mechanisms.
+Attachment supersedes only that continuation and uses the existing targeted
+Tests Review transition. Shared checks validate the original ownership approval
+and source bytes, attachment digests, exact command, and candidate before
+attachment, foreground resume, queue resume, scheduler claim, and Review launch.
+An active queue retry revalidates evidence before returning its original dispatch.
+Later gates retain their existing order, including capture-mode Learning.

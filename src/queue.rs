@@ -762,6 +762,13 @@ pub fn resume_with_tester_no_sandbox(
         if active.intent == DispatchIntent::ResumeAttempt
             && active.bound_attempt_id.as_deref() == Some(attempt_id)
         {
+            if let Some(attempt) = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+            {
+                crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+            }
             if active.tester_no_sandbox != tester_no_sandbox {
                 bail!(
                     "resume of Attempt {attempt_id:?} is already queued with tester_no_sandbox={}; remove it before changing that approval",
@@ -1110,6 +1117,7 @@ fn ensure_resume_eligible(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
+    crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let candidate_metadata_repair = known_candidate_metadata_repair

@@ -15,11 +15,11 @@ use crate::recovery_contracts::parse_evidence_document;
 pub use crate::recovery_contracts::{EvidenceDocument, EvidenceResult};
 use crate::review::{self, Verdict};
 use crate::work_model::{
-    self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
-    EvidenceReviewContext, EvidenceReviewTarget, HostEvidenceClassification, Task, TaskKind,
-    TaskStatus, WorkModelError, WorkModelStore, WriterCompletionMatrix,
-    WriterCompletionRequirementKind, WriterCompletionRow, WriterCompletionState,
-    WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
+    self, ArtifactRef, BoundRecheckArtifact, EvidenceAttachment, EvidenceRecovery,
+    EvidenceRecoveryState, EvidenceReviewContext, EvidenceReviewTarget, HostEvidenceClassification,
+    PlanHostEvidenceBinding, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
+    WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionRow,
+    WriterCompletionState, WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
 };
 
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
@@ -29,13 +29,6 @@ const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
 const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
 const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BoundRecheckArtifact {
-    path: String,
-    digest: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,28 +90,6 @@ pub(crate) struct PlanHostEvidenceAction {
 struct ResolvedPlanCommand {
     command: String,
     source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct PlanHostEvidenceBinding {
-    schema_version: u32,
-    work_item_id: String,
-    attempt_id: String,
-    writer_task_id: String,
-    candidate_commit: String,
-    plan_row: String,
-    requirement: String,
-    command: String,
-    /// `structured:<row>` for current matrices; old matrices record the text
-    /// fields used by the one compatibility parser.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    command_source: Option<String>,
-    working_directory: String,
-    source_matrix: BoundRecheckArtifact,
-    evidence: BoundRecheckArtifact,
-    result: EvidenceResult,
-    run_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -929,7 +900,7 @@ pub(crate) fn pending_plan_host_evidence_action(
                 .any(|row| row.responsibility.is_some())
         })
     {
-        return required_host_verification_pending(project_root, attempt)
+        return pending_owned_host_resume_action(project_root, attempt)
             .ok()
             .flatten();
     }
@@ -973,6 +944,71 @@ pub(crate) fn pending_plan_host_evidence_action(
             matrix_artifact: matrix_ref.path.clone(),
         })
     })
+}
+
+/// Use the same exact host handoff for status, direct resume, and queue claim.
+pub(crate) fn pending_owned_host_resume_action(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<PlanHostEvidenceAction>> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || !matches!(
+            attempt.pause_kind,
+            Some(work_model::PauseKind::WriterCompletion | work_model::PauseKind::Interrupted)
+        )
+    {
+        return Ok(None);
+    }
+    let Some(action) = required_host_verification_pending(project_root, attempt)? else {
+        return Ok(None);
+    };
+    if attempt.pause_kind == Some(work_model::PauseKind::Interrupted) {
+        crate::recovery_contracts::inspect_interrupted_plan_host_recovery(
+            project_root,
+            attempt,
+            &action.plan_row,
+        )?;
+    } else if let Some((writer, _, matrix)) =
+        crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)?
+    {
+        let findings =
+            crate::recovery_contracts::writer_completion_findings(project_root, &writer)?;
+        if !matrix
+            .status_against(
+                attempt
+                    .writer_completion_contract
+                    .as_ref()
+                    .expect("owned contract"),
+                &writer.id,
+                &findings,
+            )
+            .map_err(anyhow::Error::msg)?
+            .is_complete()
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(action))
+}
+
+pub(crate) fn ensure_owned_host_resume_ready(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)?;
+    if let Some(action) = pending_owned_host_resume_action(project_root, attempt)? {
+        bail!(
+            "candidate {} requires host action {}: {}; attach the evidence before resume: fluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}",
+            action.candidate_commit,
+            action.plan_row,
+            action.command,
+            attempt.work_item_id,
+            attempt.id,
+            action.candidate_commit,
+            action.plan_row
+        );
+    }
+    Ok(())
 }
 
 /// Keep every explicitly assigned host check required until its exact evidence
@@ -2113,6 +2149,25 @@ pub fn attach_plan_row(
             {
                 return Err(ineligible("the Attempt has an executing Task"));
             }
+            for task in &attempt.tasks {
+                if crate::lease::is_leased(&crate::lease::task_lock_path(
+                    project_root, work_item_id, &task.id,
+                )) {
+                    return Err(ineligible("the Attempt has a live Task owner"));
+                }
+                if let Some(area) = &task.artifact_area {
+                    if crate::execution::execution_is_live(
+                        &crate::execution::record_path_for_artifact(project_root, &area.path),
+                    ).map_err(|error| ineligible(&error.to_string()))? {
+                        return Err(ineligible("the Attempt has a live execution owner"));
+                    }
+                }
+            }
+            crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)
+                .map_err(|error| ineligible(&format!("{error:#}")))?;
+            let interrupted_writer = crate::recovery_contracts::inspect_interrupted_plan_host_recovery(
+                project_root, attempt, &plan_row,
+            ).map_err(|error| ineligible(&format!("{error:#}")))?;
             let writer = attempt
                 .tasks
                 .iter()
@@ -2261,6 +2316,11 @@ pub fn attach_plan_row(
                             target.role == "tests" && target.prior_review_artifact == binding_path
                         }))
             }) {
+                if row.responsibility.is_some() && existing.state != EvidenceRecoveryState::Reviewing {
+                    return Err(ineligible("the recorded Plan evidence transition is no longer eligible for attachment replay"));
+                }
+                crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
+                    .map_err(|error| ineligible(&format!("{error:#}")))?;
                 return Ok(existing.clone());
             }
 
@@ -2269,9 +2329,10 @@ pub fn attach_plan_row(
             // different attachment or Plan row must still begin at the original
             // Writer-completion pause, so it cannot silently hijack a live
             // recovery frontier.
-            if !(attempt.status == work_model::AttemptStatus::NeedsUser
-                && attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
-                && attempt.review_state == Some(work_model::AttemptReviewState::NotReviewed))
+            if interrupted_writer.is_none()
+                && !(attempt.status == work_model::AttemptStatus::NeedsUser
+                    && attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
+                    && attempt.review_state == Some(work_model::AttemptReviewState::NotReviewed))
             {
                 return Err(ineligible(
                     "the Attempt is not paused at Writer completion for a pending Plan row",
@@ -2324,6 +2385,13 @@ pub fn attach_plan_row(
                 created_at: work_model::now_iso8601(),
                 code_change_classification: None,
             };
+            if let Some(task_id) = interrupted_writer {
+                let attempt = item.attempts.iter_mut()
+                    .find(|attempt| attempt.id == attempt_id).expect("validated Attempt");
+                let writer = attempt.tasks.iter_mut()
+                    .find(|task| task.id == task_id).expect("validated stopped Writer");
+                work_model::set_task_terminal(writer, TaskStatus::Superseded);
+            }
             let recovery = item
                 .attempts
                 .iter_mut()
@@ -2393,6 +2461,8 @@ pub fn attach_plan_row(
                 })
                 .ok_or_else(|| ineligible("Plan-row evidence recovery target disappeared"))?;
             target.review_task_id = Some(task_id);
+            attempt.pause_kind = None;
+            attempt.completed_at = None;
             let next_action = crate::work_status::derive_attempt_recovery_next_action(
                 Some(attempt),
                 Some(project_root),
