@@ -1471,11 +1471,23 @@ pub(crate) fn recover_retired_commit_style_pause(
                     "an unbound retired commit-style reclassification is invalid: {error:#}"
                 ),
             })?;
+            crate::candidate_gate::validate_retired_commit_style_policy_replay(
+                project_root,
+                &existing.policy_commit,
+                &current.policy_commit,
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "an unbound retired commit-style reclassification is invalid: {error:#}"
+                ),
+            })?;
             let mut exact =
                 crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
                     fresh, attempt_id, &current,
                 );
             exact.recorded_at = existing.recorded_at.clone();
+            exact.policy_commit = existing.policy_commit.clone();
             if existing.recorded_at.trim().is_empty() || existing != exact {
                 return Err(WorkModelError::AttemptResumeIneligible {
                     attempt_id: attempt_id.to_string(),
@@ -18544,6 +18556,31 @@ mod tests {
         let path = fixture.project_root.join(&artifact.path);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, &receipt_bytes).unwrap();
+
+        fs::write(
+            fixture.project_root.join("CHANGELOG.md"),
+            "Unrelated project update\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &["add", "CHANGELOG.md"],
+            "stage unrelated unbound-receipt advance",
+        )
+        .unwrap();
+        crate::git::run(
+            &fixture.project_root,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Update project notes",
+                "-m",
+                "- Leave the advisory commit policy unchanged",
+            ],
+            "commit unrelated unbound-receipt advance",
+        )
+        .unwrap();
 
         assert!(
             recover_retired_commit_style_pause(
