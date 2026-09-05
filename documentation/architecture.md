@@ -441,6 +441,19 @@ committed script path identifies the test at both gates. A parenthetical such as
 need not appear in source or result text. The structured result may use a
 project-specific harness display label, but must still name the exact path and
 pass. Applicable reviewers assess whether the script covers the stated behavior.
+
+The gate builds its Rust evidence view before selecting a passing result.
+Failed and skipped tests still count when resolving a short name. Matching
+representations must agree on supplied qualifiers and all report a pass;
+an underspecified result cannot bridge conflicting paths, binaries, or modules.
+An explicit reference can distinguish otherwise colliding identities. Missing,
+unrelated, ambiguous, or non-passing evidence leaves the reference unsatisfied,
+and stale or unbound evidence blocks the gate. Diagnostics retain the unresolved
+path and selector and show relevant observed identities with their statuses.
+These checks consume the canonical final Tester output; they add no test run
+before review. Required coverage, applicable reviews, the complete final Tester,
+and a successful Learner remain mandatory.
+
 Missing selector evidence starts a corrective Writer round and
 invalidates the superseded review and Tester frontier. When the only missing
 evidence is one complete command-shaped `Test:` reference that did not run in

@@ -1740,6 +1740,13 @@ fn check_tester_evidence(
             ));
         }
     }
+    // Non-passing identities participate in resolution too. Filtering them
+    // out first would let whichever same-named test passed define the match.
+    let rust_tests = results
+        .tests
+        .iter()
+        .filter_map(|test| RustTestIdentity::parse(&test.id).map(|identity| (identity, test)))
+        .collect::<Vec<_>>();
     let mut missing_references = Vec::new();
     for reference in references {
         let matched = if let Some(expected_command) = reference.command.as_deref() {
@@ -1750,22 +1757,57 @@ fn check_tester_evidence(
                 || results.commands.iter().any(|command| {
                     command.exit_code == 0 && command.command.trim() == expected_command
                 })
+        } else if reference.path.ends_with(".rs") && reference.selector.is_some() {
+            reference
+                .rust_identity()
+                .is_some_and(|expected| rust_evidence_matches_reference(&expected, &rust_tests))
         } else {
-            results.tests.iter().any(|test| {
-                if test.status != "pass" {
-                    return false;
-                }
-                test_result_matches_reference(test, reference)
-            })
+            let mut matching = results
+                .tests
+                .iter()
+                .filter(|test| test_result_matches_reference(test, reference))
+                .peekable();
+            matching.peek().is_some() && matching.all(|test| test.status == "pass")
         };
         if !matched {
-            missing_references.push(format!(
-                "no passing Tester result matches {}",
-                reference.command.as_deref().unwrap_or_else(|| reference
-                    .selector
-                    .as_deref()
-                    .unwrap_or(reference.path.as_str()))
-            ));
+            let label = reference.command.clone().unwrap_or_else(|| {
+                reference.selector.as_deref().map_or_else(
+                    || reference.path.clone(),
+                    |selector| format!("{} ({selector})", reference.path),
+                )
+            });
+            missing_references.push(format!("no passing Tester result matches {label}"));
+            if reference.command.is_none() {
+                let expected = reference.rust_identity();
+                let relevant = results
+                    .tests
+                    .iter()
+                    .filter(|test| {
+                        // This selects diagnostic context only; matching above
+                        // always uses parsed identities or an exact script path.
+                        expected
+                            .as_ref()
+                            .is_some_and(|identity| test.id.contains(identity.short_name()))
+                            || test.id == reference.path
+                    })
+                    .collect::<Vec<_>>();
+                let observed = if relevant.is_empty() {
+                    results.tests.iter().collect::<Vec<_>>()
+                } else {
+                    relevant
+                };
+                let identities = observed
+                    .iter()
+                    .take(20)
+                    .map(|test| format!("{:?} ({})", test.id, test.status))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                missing_references.push(format!(
+                    "observed Tester identities for {label} (showing {} of {}): {identities}",
+                    observed.len().min(20),
+                    observed.len()
+                ));
+            }
         }
     }
     let mut diagnostics = Vec::new();
@@ -1801,6 +1843,26 @@ fn check_tester_evidence(
     Ok(check("tester-reference-evidence", status, diagnostics))
 }
 
+fn rust_evidence_matches_reference(
+    expected: &RustTestIdentity<'_>,
+    tests: &[(RustTestIdentity<'_>, &crate::tester::TestResult)],
+) -> bool {
+    let matching = tests
+        .iter()
+        .filter(|(identity, _)| expected.compatible_with(identity))
+        .collect::<Vec<_>>();
+    !matching.is_empty()
+        && matching.iter().all(|(identity, test)| {
+            test.status == "pass"
+                && matching.iter().all(|(other, _)| identity.compatible_with(other))
+                // A result that omitted qualifiers cannot stand in for this
+                // reference if it could instead name a conflicting identity.
+                && tests.iter().all(|(other, _)| {
+                    !identity.compatible_with(other) || expected.compatible_with(other)
+                })
+        })
+}
+
 fn test_result_matches_reference(
     test: &crate::tester::TestResult,
     reference: &TestReference,
@@ -1809,12 +1871,6 @@ fn test_result_matches_reference(
         // The structured result's harness label is project-defined. Only the
         // exact script path identifies this test, never its coverage prose.
         return test.id == reference.path;
-    }
-    if reference.path.ends_with(".rs") && reference.selector.is_some() {
-        return reference.rust_identity().is_some_and(|expected| {
-            RustTestIdentity::parse(&test.id)
-                .is_some_and(|observed| expected.compatible_with(&observed))
-        });
     }
     if test.test_harness == "shell-harness" && test.id == reference.path {
         return true;
@@ -3236,6 +3292,271 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_or_ambiguous_test_evidence() {
+        let fixture = Fixture::new();
+        fixture.commit(
+            "tests/lifecycle.sh",
+            "#!/bin/sh\nexit 0\n",
+            "Add lifecycle check\n\n- Exercise lifecycle commands",
+        );
+        let candidate = fixture.commit(
+            "src/lib.rs",
+            "#[cfg(test)] mod tests { mod a { #[test] fn works() {} } mod b { #[test] fn works() {} } }\n",
+            "Add qualified tests\n\n- Cover module distinctions",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let cases: &[(&str, &[(&str, &str)], bool)] = &[
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "pass"), ("tests::b::works", "fail")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "pass"), ("tests::b::works", "skipped")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "pass"), ("tests::b::works", "pass")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("one$tests::a::works", "pass"),
+                    ("two tests::a::works", "fail"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("one$tests::a::works", "pass"),
+                    ("two tests::a::works", "skipped"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("src/lib.rs (tests::a::works)", "pass"),
+                    ("src/lib.rs (tests::b::works)", "fail"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "pass"), ("tests::a::works", "fail")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("tests::a::works", "pass"),
+                    ("src/lib.rs (tests::a::works)", "skipped"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (tests::a::works)",
+                &[("works", "pass"), ("tests::b::works", "fail")],
+                false,
+            ),
+            ("src/lib.rs (works)", &[], false),
+            ("src/lib.rs (works)", &[("tests::a::works", "fail")], false),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "skipped")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::works", "not_run")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("tests::a::unrelated", "pass")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("src/other.rs (works)", "pass")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("src/lib.rs (works", "pass")],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[("arbitrary prose works", "pass")],
+                false,
+            ),
+            ("src/lib.rs (works)", &[("tests::a::works", "pass")], true),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("tests::a::works", "pass"),
+                    ("src/lib.rs (tests::a::works)", "pass"),
+                ],
+                true,
+            ),
+            (
+                "src/lib.rs (tests::a::works)",
+                &[("tests::a::works", "pass"), ("tests::b::works", "fail")],
+                true,
+            ),
+            (
+                "src/lib.rs (one$tests::a::works)",
+                &[
+                    ("one tests::a::works", "pass"),
+                    ("two$tests::a::works", "skipped"),
+                ],
+                true,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("src/lib.rs (tests::a::works)", "pass"),
+                    ("src/other.rs (tests::a::works)", "fail"),
+                ],
+                true,
+            ),
+            (
+                "tests/lifecycle.sh (covers lifecycle)",
+                &[
+                    ("tests/lifecycle.sh", "pass"),
+                    ("tests/lifecycle.sh", "fail"),
+                ],
+                false,
+            ),
+        ];
+        for (reference, rows, accepted) in cases {
+            // Evidence order must never decide which same-named test wins.
+            for reverse in [false, true] {
+                let mut tests = rows
+                    .iter()
+                    .map(|(id, status)| {
+                        serde_json::json!({
+                            "id": id, "test_harness": "project checks", "status": status
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if reverse {
+                    tests.reverse();
+                }
+                let results = serde_json::json!({
+                    "candidate_commit": candidate,
+                    "commands": [],
+                    "tests": tests,
+                    "summary": {
+                        "total": rows.len(),
+                        "pass": rows.iter().filter(|(_, status)| *status == "pass").count(),
+                        "fail": rows.iter().filter(|(_, status)| *status == "fail").count(),
+                        "skipped": rows.iter().filter(|(_, status)| *status == "skipped").count()
+                    },
+                    "error": null
+                });
+                fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+                let contract = behavior_contract(reference);
+                let mut request =
+                    fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+                request.phase = CandidateGatePhase::FinalTester;
+                let evidence = run_candidate_gate(request).unwrap();
+                assert_eq!(
+                    check(&evidence, "behavior-references").status,
+                    CandidateCheckStatus::Passed
+                );
+                let tester_check = check(&evidence, "tester-reference-evidence");
+                assert_eq!(
+                    tester_check.status,
+                    if *accepted {
+                        CandidateCheckStatus::Passed
+                    } else {
+                        CandidateCheckStatus::Failed
+                    },
+                    "{reference}, {rows:?}, reversed={reverse}: {evidence:#?}"
+                );
+                assert_eq!(
+                    evidence.disposition,
+                    if *accepted {
+                        CandidateGateDisposition::Passed
+                    } else {
+                        CandidateGateDisposition::Rejected
+                    }
+                );
+                if !accepted {
+                    assert!(
+                        tester_check
+                            .diagnostics
+                            .iter()
+                            .any(|line| line.contains(reference)),
+                        "{tester_check:#?}"
+                    );
+                    for (id, _) in *rows {
+                        assert!(
+                            tester_check
+                                .diagnostics
+                                .iter()
+                                .any(|line| line.contains(id)),
+                            "missing observed {id}: {tester_check:#?}"
+                        );
+                    }
+                }
+                let preserved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&tester).unwrap()).unwrap();
+                assert_eq!(preserved, results);
+            }
+        }
+
+        for (reference, id) in [
+            ("src/lib.rs (works)", "tests::a::works"),
+            (
+                "tests/lifecycle.sh (covers lifecycle)",
+                "tests/lifecycle.sh",
+            ),
+        ] {
+            for commit in [Some(candidate.as_str()), Some(fixture.base.as_str()), None] {
+                let results = serde_json::json!({
+                    "candidate_commit": commit,
+                    "commands": [],
+                    "tests": [{"id": id, "test_harness": "project checks", "status": "pass"}],
+                    "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+                    "error": null
+                });
+                fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+                let contract = behavior_contract(reference);
+                let mut request =
+                    fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+                request.phase = CandidateGatePhase::FinalTester;
+                let evidence = run_candidate_gate(request).unwrap();
+                let bound = commit == Some(candidate.as_str());
+                assert_eq!(
+                    check(&evidence, "tester-reference-evidence").status,
+                    if bound {
+                        CandidateCheckStatus::Passed
+                    } else {
+                        CandidateCheckStatus::Error
+                    },
+                    "{evidence:#?}"
+                );
+                assert_eq!(
+                    evidence.disposition,
+                    if bound {
+                        CandidateGateDisposition::Passed
+                    } else {
+                        CandidateGateDisposition::Blocked
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validates_parenthesized_source_path_test_identity() {
         let fixture = Fixture::new();
         let selector = "drain_is_idempotent";
@@ -3500,7 +3821,8 @@ mod tests {
                         .join("commands/0-stderr.log")
                         .display()
                 ),
-                "no passing Tester result matches preserves_selection".to_string(),
+                "no passing Tester result matches tests/dashboard.rs (preserves_selection)".to_string(),
+                "observed Tester identities for tests/dashboard.rs (preserves_selection) (showing 0 of 0): ".to_string(),
             ]
         );
     }

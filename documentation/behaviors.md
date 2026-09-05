@@ -6902,6 +6902,13 @@ match that exact committed path regardless of its harness display label, without
 requiring the coverage description in the result.
 Test: src/candidate_gate.rs (matches_shell_script_without_description_literals)
 
+IF evidence is failed, skipped, missing, stale, ambiguous, or unrelated, THEN
+THE SYSTEM SHALL leave the verification requirement unsatisfied.
+Example: A passing qualified Rust test and a failed or skipped qualified test
+with the same short name do not disambiguate a short reference. Evidence from
+another candidate cannot satisfy the current candidate's requirement.
+Test: src/candidate_gate.rs (rejects_invalid_or_ambiguous_test_evidence)
+
 ### B27a
 
 WHEN the final Tester has completed and ordinary baseline comparison would
