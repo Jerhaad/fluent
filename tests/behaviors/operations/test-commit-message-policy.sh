@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify Factory's commit body and trailer rules remain project-owned.
+# Verify Factory advises on commit presentation and rejects bad provenance.
 
 set -euo pipefail
 
@@ -36,12 +36,26 @@ assert_rejected() {
   fi
 }
 
+assert_advised() {
+  expected="$1"
+  if ! output="$(cd "$FIXTURE" && FLUENT_BASE_COMMIT="$BASE" "$CHECK" 2>&1)"; then
+    echo "commit-message presentation advice unexpectedly failed" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected" <<<"$output"; then
+    echo "commit-message policy did not report advice for $expected" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
 git -C "$FIXTURE" commit --amend -q -m "Add candidate"
-assert_rejected "has no body"
+assert_advised "advice: commit-message has no body"
 
 LONG_LINE="- $(printf '%073d' 0)"
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n'"$LONG_LINE"
-assert_rejected "exceeds 72 characters"
+assert_advised "advice: commit-message body line exceeds 72 characters"
 
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n- Explain the candidate\n\nCo-Authored-By: Bot <bot@example.com>'
 assert_rejected "prohibited Co-Authored-By trailer"

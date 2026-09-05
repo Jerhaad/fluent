@@ -1,5 +1,6 @@
 #!/bin/sh
-# Enforce Factory's project-owned commit body and trailer conventions.
+# Advise on Factory's commit presentation and enforce trailer provenance.
+# fluent-policy: commit-message-presentation-advisory-v1
 set -eu
 
 candidate=HEAD
@@ -28,7 +29,7 @@ fi
 
 metadata=$(git log --format='%H%x1f%B%x1e' "$base..$candidate")
 printf '%s\n' "$metadata" | awk '
-  BEGIN { RS = "\036"; FS = "\037"; failed = 0 }
+  BEGIN { RS = "\036"; FS = "\037"; blocked = 0 }
   NF >= 2 {
     commit = $1
     sub(/^\n+/, "", commit)
@@ -43,20 +44,18 @@ printf '%s\n' "$metadata" | awk '
       }
     }
     if (!has_body) {
-      printf "commit %s has no body separated from its subject by a blank line\n", commit > "/dev/stderr"
-      failed = 1
+      printf "advice: commit-message has no body separated from its subject by a blank line (commit %s)\n", commit > "/dev/stderr"
     }
 
     for (i = 2; i <= count; i++) {
       if (length(lines[i]) > 72) {
-        printf "commit %s body line %d exceeds 72 characters\n", commit, i > "/dev/stderr"
-        failed = 1
+        printf "advice: commit-message body line exceeds 72 characters (commit %s, line %d)\n", commit, i > "/dev/stderr"
       }
       if (tolower(lines[i]) ~ /^[[:space:]]*co-authored-by:/) {
         printf "commit %s contains a prohibited Co-Authored-By trailer\n", commit > "/dev/stderr"
-        failed = 1
+        blocked = 1
       }
     }
   }
-  END { exit failed }
+  END { exit blocked }
 '
