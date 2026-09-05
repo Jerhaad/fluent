@@ -173,6 +173,11 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 
 {{#if is_followup_writer}}
 1. When the step requires a correction, make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
+   Treat subject length or style, body presence, body-line length or wrapping,
+   and body formatting as presentation advice: follow it when practical, but
+   do not create corrective work or block completion solely to satisfy it.
+   Continue to obey commit-history, identity, message-encoding, and
+   `Co-Authored-By` requirements.
 2. If verification proves the previous Writer commit already satisfies the requested correction, preserve the clean candidate without creating a commit. Write {{no_change_declaration_path}} with this exact JSON shape:
 
    ```json
@@ -189,6 +194,11 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 3. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit or verified no-change evidence.
 {{else}}
 1. Make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
+   Treat subject length or style, body presence, body-line length or wrapping,
+   and body formatting as presentation advice: follow it when practical, but
+   do not create corrective work or block completion solely to satisfy it.
+   Continue to obey commit-history, identity, message-encoding, and
+   `Co-Authored-By` requirements.
 2. Record completion in the interface described in Phase 2: update the matrix when present and leave its host-owned progress projection unchanged; otherwise mark the progress item with commit evidence.
 {{/if}}
 Then move to the next `- [ ]` item.
