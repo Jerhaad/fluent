@@ -1382,7 +1382,8 @@ fn check_behavior_references(
                         continue;
                     }
                     if let Some(selector) = test_reference.selector.as_deref()
-                        && !String::from_utf8_lossy(&output.stdout).contains(selector)
+                        && !test_reference
+                            .source_contains_selector(&String::from_utf8_lossy(&output.stdout))
                     {
                         diagnostics.push(format!(
                             "{} references test identifier {selector:?}, which is absent from {}",
@@ -1414,6 +1415,90 @@ struct TestReference {
     path: String,
     selector: Option<String>,
     command: Option<String>,
+}
+
+impl TestReference {
+    fn rust_identity(&self) -> Option<RustTestIdentity<'_>> {
+        if !self.path.ends_with(".rs") {
+            return None;
+        }
+        let mut identity = RustTestIdentity::parse(self.selector.as_deref()?)?;
+        if identity.path.is_some_and(|path| path != self.path) {
+            return None;
+        }
+        identity.path = Some(&self.path);
+        Some(identity)
+    }
+
+    fn source_contains_selector(&self, source: &str) -> bool {
+        if self.path.ends_with(".rs") {
+            // Rust declares modules separately from the test function. The
+            // final evidence check resolves its full native qualification.
+            self.rust_identity()
+                .is_some_and(|identity| source.contains(identity.short_name()))
+        } else {
+            self.selector
+                .as_deref()
+                .is_none_or(|selector| source.contains(selector))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RustTestIdentity<'a> {
+    path: Option<&'a str>,
+    binary: Option<&'a str>,
+    name: &'a str,
+}
+
+impl<'a> RustTestIdentity<'a> {
+    fn parse(identity: &'a str) -> Option<Self> {
+        let (path, native) = if let Some((path, wrapped)) = identity.split_once(" (") {
+            (Some(path), wrapped.strip_suffix(')')?)
+        } else if let Some((path, native)) = identity.split_once(".rs::") {
+            (Some(&identity[..path.len() + 3]), native)
+        } else {
+            (None, identity)
+        };
+        if let Some(path) = path
+            && (!path.ends_with(".rs") || validate_test_path(path).is_err())
+        {
+            return None;
+        }
+        let (binary, name) = if let Some((binary, name)) = native.split_once('$') {
+            (Some(binary), name)
+        } else if let Some((binary, name)) = native.split_once(' ') {
+            (Some(binary), name)
+        } else {
+            (None, native)
+        };
+        // Admit native names and the known nextest separators, never arbitrary
+        // display prose or suffixes. Keep every supplied qualifier for matching.
+        let valid_name = |name: &str, binary: bool| {
+            name.split("::").all(|part| {
+                let part = part.strip_prefix("r#").unwrap_or(part);
+                let mut chars = part.chars();
+                chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
+                    && chars.all(|c| c == '_' || c.is_alphanumeric() || (binary && c == '-'))
+            })
+        };
+        if !valid_name(name, false) || binary.is_some_and(|binary| !valid_name(binary, true)) {
+            return None;
+        }
+        Some(Self { path, binary, name })
+    }
+
+    fn short_name(&self) -> &str {
+        self.name.rsplit("::").next().unwrap_or(self.name)
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        !matches!((self.path, other.path), (Some(a), Some(b)) if a != b)
+            && !matches!((self.binary, other.binary), (Some(a), Some(b)) if a != b)
+            && (self.name == other.name
+                || ((!self.name.contains("::") || !other.name.contains("::"))
+                    && self.short_name() == other.short_name()))
+    }
 }
 
 fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, String> {
@@ -1716,6 +1801,12 @@ fn test_result_matches_reference(
     test: &crate::tester::TestResult,
     reference: &TestReference,
 ) -> bool {
+    if reference.path.ends_with(".rs") && reference.selector.is_some() {
+        return reference.rust_identity().is_some_and(|expected| {
+            RustTestIdentity::parse(&test.id)
+                .is_some_and(|observed| expected.compatible_with(&observed))
+        });
+    }
     if test.test_harness == "shell-harness" && test.id == reference.path {
         return true;
     }
@@ -3006,6 +3097,133 @@ mod tests {
             check(&evidence, "tester-reference-evidence").status,
             CandidateCheckStatus::Passed
         );
+    }
+
+    #[test]
+    fn accepts_equivalent_native_rust_identities() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "src/lib.rs",
+            "#[cfg(test)] mod tests { mod lifecycle { #[test] fn drain_is_idempotent() {} } }\n",
+            "Add drain lifecycle\n\n- Cover idempotent drain",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        for (selector, identity, accepted) in [
+            (
+                "drain_is_idempotent",
+                "src/lib.rs (tests::lifecycle::drain_is_idempotent)",
+                true,
+            ),
+            ("drain_is_idempotent", "drain_is_idempotent", true),
+            (
+                "drain_is_idempotent",
+                "tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "src/lib.rs (drain_is_idempotent)",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "src/lib.rs::tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "fluent::lib$tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "fluent::lib tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "tests::lifecycle::drain_is_idempotent",
+                "src/lib.rs (tests::lifecycle::drain_is_idempotent)",
+                true,
+            ),
+            (
+                "tests::lifecycle::drain_is_idempotent",
+                "fluent::lib$tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "fluent::lib$tests::lifecycle::drain_is_idempotent",
+                "fluent::lib tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "src/other.rs (tests::lifecycle::drain_is_idempotent)",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "src/other.rs::drain_is_idempotent",
+                false,
+            ),
+            (
+                "tests::lifecycle::drain_is_idempotent",
+                "other::lifecycle::drain_is_idempotent",
+                false,
+            ),
+            (
+                "lifecycle::drain_is_idempotent",
+                "tests::lifecycle::drain_is_idempotent",
+                false,
+            ),
+            (
+                "fluent::lib$tests::lifecycle::drain_is_idempotent",
+                "other::lib tests::lifecycle::drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "arbitrary display text drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "unrelated_drain_is_idempotent",
+                false,
+            ),
+        ] {
+            let results = serde_json::json!({
+                "candidate_commit": candidate,
+                "commands": [],
+                "tests": [{"id": identity, "test_harness": "cargo-nextest", "status": "pass"}],
+                "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+                "error": null
+            });
+            fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+            let contract = behavior_contract(&format!("src/lib.rs ({selector})"));
+            let mut request =
+                fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+            request.phase = CandidateGatePhase::FinalTester;
+            let evidence = run_candidate_gate(request).unwrap();
+
+            assert_eq!(
+                check(&evidence, "behavior-references").status,
+                CandidateCheckStatus::Passed,
+                "source reference {selector}: {evidence:#?}"
+            );
+            assert_eq!(
+                evidence.disposition,
+                if accepted {
+                    CandidateGateDisposition::Passed
+                } else {
+                    CandidateGateDisposition::Rejected
+                },
+                "reference {selector}, result {identity}: {evidence:#?}"
+            );
+            let preserved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&tester).unwrap()).unwrap();
+            assert_eq!(preserved, results);
+        }
     }
 
     #[test]

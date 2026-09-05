@@ -6883,6 +6883,15 @@ Test: src/candidate_gate.rs (validates_test_references_against_passing_structure
 Test: src/candidate_gate.rs (validates_nextest_integration_test_references)
 Test: src/candidate_gate.rs (shell_evidence_uses_the_harness_native_script_identity)
 
+WHEN Rust results unambiguously identify the referenced test, THE SYSTEM SHALL
+accept bare or qualified native names, source-path wrappers, and nextest binary
+and test-name representations while preserving supplied path, binary, and module
+distinctions.
+Example: `src/lib.rs (drain_is_idempotent)` can match
+`src/lib.rs (tests::lifecycle::drain_is_idempotent)`; a different supplied source
+path or conflicting module qualification cannot establish the same identity.
+Test: src/candidate_gate.rs (accepts_equivalent_native_rust_identities)
+
 ### B27a
 
 WHEN the final Tester has completed and ordinary baseline comparison would

@@ -426,11 +426,18 @@ but never repair. The later landing check remains an independent final safeguard
 
 After the final Tester, the host runs a final-Tester candidate gate before it
 creates a Merge Candidate or launches the Learner. The gate matches each `Test:`
-reference to its passing structured result. Rust selectors match the harness
-test ID; shell selectors use the script path because that is the shell harness's
-native test identity. A nextest result may use its native `binary test-name`
-identity; the gate matches only the exact final test-name token rather than a
-substring. Missing selector evidence starts a corrective Writer round and
+reference to its passing structured result. Inside `candidate_gate.rs`, Rust
+identities retain any supplied source path, binary, and module qualification.
+Supported forms are bare or qualified names, `path.rs (name)`, `path.rs::name`,
+and nextest's `binary$name` or `binary name`, including qualified names inside
+source wrappers. A bare name can match a qualified name with the same final
+identifier; two qualified names must agree in full, as must any paths or
+binaries supplied on both sides. The cheap pre-review source check looks for
+the function identifier because Rust declares modules separately. The final
+evidence check retains the full reference; it does not rewrite references or
+Tester artifacts or maintain an alias registry. Shell selectors use the script
+path because that is the shell harness's native test identity.
+Missing selector evidence starts a corrective Writer round and
 invalidates the superseded review and Tester frontier. When the only missing
 evidence is one complete command-shaped `Test:` reference that did not run in
 canonical Tester, Fluent pauses before another Writer. It binds
