@@ -510,6 +510,18 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             continue;
         }
 
+        // Factory's current project policy treats body presence and wrapping as
+        // advice. Reclassify only the exact legacy gate-backed pause before the
+        // generic Writer-completion resume would relaunch its output-free Writer.
+        if recover_retired_commit_style_pause(
+            config.project_root,
+            config.store,
+            config.work_item_id,
+            config.attempt_id,
+        )? {
+            continue;
+        }
+
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {
                 if candidate_gate_pause {
@@ -1399,6 +1411,131 @@ fn reconcile_premature_parallel_review_failure(
             Ok(true)
         })?,
     )
+}
+
+/// Reclassify one exact stored Factory presentation-only rejection without
+/// replacing its gate, changing its candidate, or launching another Writer.
+pub(crate) fn recover_retired_commit_style_pause(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let item = store.read_work_item(work_item_id)?;
+    let Some(expected) = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+        project_root,
+        &item,
+        attempt_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    let artifact = crate::lifecycle_recovery::retired_commit_style_reclassification_artifact(
+        work_item_id,
+        attempt_id,
+        &expected.source_writer_task_id,
+    );
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::AttemptExecutor,
+        reason: Some("reclassify retired commit-message presentation finding".to_string()),
+        evidence_ref: Some(artifact.path.clone()),
+    };
+    let artifact_path = project_root.join(&artifact.path);
+    store.mutate_work_item_with_transition(work_item_id, &transition, |fresh| {
+        let current = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+            project_root,
+            fresh,
+            attempt_id,
+        )
+        .map_err(|error| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: format!("retired commit-style frontier changed: {error:#}"),
+        })?
+        .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
+            attempt_id: attempt_id.to_string(),
+            reason: "retired commit-style frontier changed before recovery".to_string(),
+        })?;
+        if current != expected {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "retired commit-style frontier changed before recovery".to_string(),
+            });
+        }
+        let _receipt = if artifact_path.exists() {
+            let existing = crate::lifecycle_recovery::read_retired_commit_style_reclassification(
+                &artifact_path,
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: format!(
+                    "an unbound retired commit-style reclassification is invalid: {error:#}"
+                ),
+            })?;
+            let mut exact =
+                crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+                    fresh, attempt_id, &current,
+                );
+            exact.recorded_at = existing.recorded_at.clone();
+            if existing.recorded_at.trim().is_empty() || existing != exact {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "an unbound retired commit-style reclassification does not match the current frontier"
+                        .to_string(),
+                });
+            }
+            existing
+        } else {
+            let receipt = crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+                fresh, attempt_id, &current,
+            );
+            let bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("cannot serialize retired commit-style evidence: {error}"),
+                }
+            })?;
+            if let Some(parent) = artifact_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    WorkModelError::AttemptResumeIneligible {
+                        attempt_id: attempt_id.to_string(),
+                        reason: format!("cannot create retired commit-style evidence: {error}"),
+                    }
+                })?;
+            }
+            crate::atomic_write::atomic_write(&artifact_path, &bytes).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("cannot record retired commit-style evidence: {error}"),
+                }
+            })?;
+            receipt
+        };
+        let attempt = fresh
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.to_string(),
+            })?;
+        let correction = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == current.correction_writer_task_id)
+            .ok_or_else(|| WorkModelError::TaskNotFound {
+                id: current.correction_writer_task_id.clone(),
+            })?;
+        crate::work_model::set_task_terminal(correction, TaskStatus::Superseded);
+        if !attempt.artifacts.contains(&artifact) {
+            attempt.artifacts.push(artifact.clone());
+        }
+        attempt.status = AttemptStatus::Planned;
+        attempt.review_state = Some(AttemptReviewState::NotReviewed);
+        attempt.pause_kind = None;
+        attempt.pause_recovery = None;
+        attempt.completed_at = None;
+        Ok(())
+    })?;
+    Ok(true)
 }
 
 /// Reopen a supported pause from a fresh Work-model aggregate.
@@ -6454,10 +6591,33 @@ pub(crate) fn plan_after_completed_writer(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", attempt_id))?;
+    let latest_write = attempt.tasks[latest_write_index].clone();
     let requested_roles = next_review_roles(attempt);
     let invalidated_roles = review_roles_invalidated_after_latest_write(project_root, attempt);
     let review_roles = merge_review_roles(&requested_roles, &invalidated_roles);
+    let reclassification = crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+        project_root,
+        &item,
+        attempt_id,
+        &latest_write,
+    )?;
     let task_ids = item.add_next_review_tasks(attempt_id, &review_roles)?;
+    if let Some(reclassification) = reclassification {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .expect("review-planning Attempt exists");
+        for task in attempt
+            .tasks
+            .iter_mut()
+            .filter(|task| task_ids.contains(&task.id))
+        {
+            if !task.input_artifacts.contains(&reclassification) {
+                task.input_artifacts.push(reclassification.clone());
+            }
+        }
+    }
     write_attempt_work_item(store, &item)?;
     Ok(WorkAttemptRunOutcome::PlannedReviews { task_ids })
 }
@@ -6642,6 +6802,16 @@ fn gate_candidate_after_writer(
     let Some(base_commit) = output.base_commit.as_deref() else {
         return Ok(None);
     };
+    if crate::lifecycle_recovery::inspect_retired_commit_style_admission(
+        project_root,
+        item,
+        attempt_id,
+        task,
+    )?
+    .is_some()
+    {
+        return Ok(None);
+    }
     let workspace = resolve_managed_sibling_workspace_path(
         project_root,
         &output.workspace_path,
@@ -17661,6 +17831,512 @@ mod tests {
         });
         store.create_work_item(&item).unwrap();
         (store, workspace)
+    }
+
+    struct RetiredCommitStyleFixture {
+        _root: tempfile::TempDir,
+        project_root: PathBuf,
+        workspace: PathBuf,
+        store: WorkModelStore,
+        gate_path: PathBuf,
+        log_path: PathBuf,
+        candidate: String,
+        candidate_tree: String,
+    }
+
+    fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let project_root = root.path().join("project");
+        let workspace = root.path().join("work-candidate");
+        fs::create_dir_all(project_root.join("scripts")).unwrap();
+        fs::create_dir_all(project_root.join(".fluent/hooks")).unwrap();
+        crate::git::run(
+            &project_root,
+            &["init", "-q", "-b", "main"],
+            "initialize retired-style project",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.name", "Test Author"],
+            "configure retired-style author",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["config", "user.email", "test@example.com"],
+            "configure retired-style email",
+        )
+        .unwrap();
+        fs::write(project_root.join("README.md"), "base\n").unwrap();
+        fs::write(
+            project_root.join("scripts/check-commit-message-policy.sh"),
+            "#!/bin/sh\n# fluent-policy: commit-message-presentation-advisory-v1\nexit 0\n",
+        )
+        .unwrap();
+        let hook = project_root.join(".fluent/hooks/check-pre-merge");
+        fs::write(&hook, "#!/bin/sh\nscripts/check-commit-message-policy.sh\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::git::run(
+            &project_root,
+            &["add", "README.md", "scripts", ".fluent/hooks"],
+            "stage retired-style policy",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &["commit", "-q", "-m", "Make presentation advisory"],
+            "commit retired-style policy",
+        )
+        .unwrap();
+        let base = crate::git::run_stdout(
+            &project_root,
+            &["rev-parse", "HEAD"],
+            "read retired-style base",
+        )
+        .unwrap();
+        crate::git::run(
+            &project_root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "work/attempt-1",
+                workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "create retired-style candidate worktree",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/lib.rs"), "pub fn value() {}\n").unwrap();
+        crate::git::run(
+            &workspace,
+            &["add", "src/lib.rs"],
+            "stage retired-style candidate",
+        )
+        .unwrap();
+        if long_body_line {
+            let body = "x".repeat(73);
+            crate::git::run(
+                &workspace,
+                &["commit", "-q", "-m", "Add candidate", "-m", &body],
+                "commit long-line retired-style candidate",
+            )
+            .unwrap();
+        } else {
+            crate::git::run(
+                &workspace,
+                &["commit", "-q", "-m", "Add candidate"],
+                "commit bodyless retired-style candidate",
+            )
+            .unwrap();
+        }
+        let candidate = crate::git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD"],
+            "read retired-style candidate",
+        )
+        .unwrap();
+        let candidate_tree = crate::git::run_stdout(
+            &workspace,
+            &["rev-parse", "HEAD^{tree}"],
+            "read retired-style candidate tree",
+        )
+        .unwrap();
+
+        let gate_artifact = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+        };
+        let gate_path = project_root.join(&gate_artifact.path);
+        let log_path = gate_path
+            .parent()
+            .unwrap()
+            .join("hooks/check-pre-merge.log");
+        fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        let finding = if long_body_line {
+            format!("commit {candidate} body line 3 exceeds 72 characters\n")
+        } else {
+            format!("commit {candidate} has no body separated from its subject by a blank line\n")
+        };
+        fs::write(&log_path, finding).unwrap();
+        let log_relative = log_path
+            .strip_prefix(&project_root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Passed),
+            ("commit-metadata", CandidateCheckStatus::Passed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Failed),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: (name == "project-check")
+                .then(|| vec!["check-pre-merge exited 1".to_string()])
+                .unwrap_or_default(),
+            log_path: (name == "project-check").then(|| log_relative.clone()),
+        })
+        .collect();
+        fs::write(
+            &gate_path,
+            serde_json::to_vec_pretty(&CandidateGateEvidence {
+                schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                phase: CandidateGatePhase::Writer,
+                disposition: CandidateGateDisposition::Rejected,
+                base_commit: base.clone(),
+                candidate_commit: candidate.clone(),
+                tester_results_path: None,
+                metadata_rewrite: None,
+                checks,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = WorkModelStore::new(&project_root);
+        let mut item = WorkItem::planned("work-1", "Recover retired commit style");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        crate::work_model::set_task_terminal(writer, TaskStatus::Complete);
+        writer.output = Some(TaskOutput {
+            workspace_id: "candidate".to_string(),
+            workspace_path: "../work-candidate".to_string(),
+            source_branch: "work/attempt-1".to_string(),
+            base_commit: Some(base),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].artifacts.push(gate_artifact.clone());
+        let correction = item
+            .add_next_write_round("attempt-1", vec![gate_artifact])
+            .unwrap();
+        let attempt = &mut item.attempts[0];
+        let correction = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == correction)
+            .unwrap();
+        crate::work_model::set_task_terminal(correction, TaskStatus::NeedsUser);
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::WriterCompletion);
+        store.create_work_item(&item).unwrap();
+
+        RetiredCommitStyleFixture {
+            _root: root,
+            project_root,
+            workspace,
+            store,
+            gate_path,
+            log_path,
+            candidate,
+            candidate_tree,
+        }
+    }
+
+    #[test]
+    fn retired_commit_style_pause_reuses_preceding_candidate() {
+        for long_body_line in [false, true] {
+            let fixture = make_retired_commit_style_pause_fixture(long_body_line);
+            let gate_before = fs::read(&fixture.gate_path).unwrap();
+            let log_before = fs::read(&fixture.log_path).unwrap();
+
+            assert!(
+                recover_retired_commit_style_pause(
+                    &fixture.project_root,
+                    &fixture.store,
+                    "work-1",
+                    "attempt-1",
+                )
+                .unwrap()
+            );
+
+            let recovered = fixture.store.read_work_item("work-1").unwrap();
+            let attempt = &recovered.attempts[0];
+            assert_eq!(attempt.tasks.len(), 2);
+            assert_eq!(attempt.tasks[0].status, TaskStatus::Complete);
+            assert_eq!(
+                attempt.tasks[0].output.as_ref().unwrap().commit,
+                fixture.candidate
+            );
+            assert_eq!(attempt.tasks[1].status, TaskStatus::Superseded);
+            assert!(attempt.tasks[1].output.is_none());
+            assert_eq!(attempt.status, AttemptStatus::Planned);
+            assert_eq!(attempt.pause_kind, None);
+            assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+            assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+            assert_eq!(
+                crate::git::run_stdout(
+                    &fixture.workspace,
+                    &["rev-parse", "HEAD^{tree}"],
+                    "verify recovered candidate tree",
+                )
+                .unwrap(),
+                fixture.candidate_tree
+            );
+            let receipt = attempt
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.path.ends_with("/reclassification.json"))
+                .expect("policy reclassification is recorded")
+                .clone();
+            let parsed: serde_json::Value = serde_json::from_slice(
+                &fs::read(fixture.project_root.join(&receipt.path)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(parsed["candidate-commit"], fixture.candidate);
+            assert_eq!(parsed["candidate-tree"], fixture.candidate_tree);
+
+            let outcome = plan_after_completed_writer(
+                &fixture.project_root,
+                &fixture.store,
+                recovered,
+                "attempt-1",
+            )
+            .unwrap();
+            assert!(matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedReviews { .. }
+            ));
+            let reviewed = fixture.store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                reviewed.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                2
+            );
+            for reviewer in reviewed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Review)
+            {
+                assert_eq!(
+                    reviewer.review_context.as_ref().unwrap().candidate_commit,
+                    fixture.candidate
+                );
+                assert!(reviewer.input_artifacts.contains(&receipt));
+            }
+            assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+            assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+        }
+    }
+
+    #[test]
+    fn retired_commit_style_recovery_rejects_unsafe_frontiers() {
+        let mixed = make_retired_commit_style_pause_fixture(false);
+        fs::write(
+            &mixed.log_path,
+            format!(
+                "commit {} has no body separated from its subject by a blank line\ncommit {} contains a prohibited Co-Authored-By trailer\n",
+                mixed.candidate, mixed.candidate
+            ),
+        )
+        .unwrap();
+        let before = serde_json::to_value(mixed.store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            recover_retired_commit_style_pause(
+                &mixed.project_root,
+                &mixed.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown retired commit-style hook diagnostic")
+        );
+        assert_eq!(
+            serde_json::to_value(mixed.store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+
+        let dirty = make_retired_commit_style_pause_fixture(false);
+        fs::write(dirty.workspace.join("untracked.txt"), "dirty\n").unwrap();
+        let before = serde_json::to_value(dirty.store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            recover_retired_commit_style_pause(
+                &dirty.project_root,
+                &dirty.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not clean and unchanged")
+        );
+        assert_eq!(
+            serde_json::to_value(dirty.store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+
+        let live = make_retired_commit_style_pause_fixture(false);
+        let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+            &live.project_root,
+            "work-1",
+            "attempt-1-write-2",
+        ))
+        .unwrap();
+        let before = serde_json::to_value(live.store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            recover_retired_commit_style_pause(
+                &live.project_root,
+                &live.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("live execution")
+        );
+        assert_eq!(
+            serde_json::to_value(live.store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+
+        let output = make_retired_commit_style_pause_fixture(false);
+        let mut item = output.store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[1].output = item.attempts[0].tasks[0].output.clone();
+        assert!(
+            crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+                &output.project_root,
+                &item,
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("produced output")
+        );
+
+        let drifted = make_retired_commit_style_pause_fixture(false);
+        fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &["add", "later.txt"],
+            "stage drifted candidate",
+        )
+        .unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add later change",
+                "-m",
+                "- Explain drift",
+            ],
+            "commit drifted candidate",
+        )
+        .unwrap();
+        let before = serde_json::to_value(drifted.store.read_work_item("work-1").unwrap()).unwrap();
+        assert!(
+            recover_retired_commit_style_pause(
+                &drifted.project_root,
+                &drifted.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not clean and unchanged")
+        );
+        assert_eq!(
+            serde_json::to_value(drifted.store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+
+        let changed_gate = make_retired_commit_style_pause_fixture(false);
+        recover_retired_commit_style_pause(
+            &changed_gate.project_root,
+            &changed_gate.store,
+            "work-1",
+            "attempt-1",
+        )
+        .unwrap();
+        let mut changed_gate_bytes = fs::read(&changed_gate.gate_path).unwrap();
+        changed_gate_bytes.push(b'\n');
+        fs::write(&changed_gate.gate_path, &changed_gate_bytes).unwrap();
+        let before =
+            serde_json::to_value(changed_gate.store.read_work_item("work-1").unwrap()).unwrap();
+        let error = plan_after_completed_writer(
+            &changed_gate.project_root,
+            &changed_gate.store,
+            changed_gate.store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no longer matches"));
+        assert_eq!(
+            serde_json::to_value(changed_gate.store.read_work_item("work-1").unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(&changed_gate.gate_path).unwrap(),
+            changed_gate_bytes
+        );
+    }
+
+    #[test]
+    fn retired_commit_style_recovery_reuses_matching_unbound_receipt() {
+        let fixture = make_retired_commit_style_pause_fixture(false);
+        let item = fixture.store.read_work_item("work-1").unwrap();
+        let recovery = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+            &fixture.project_root,
+            &item,
+            "attempt-1",
+        )
+        .unwrap()
+        .unwrap();
+        let artifact = crate::lifecycle_recovery::retired_commit_style_reclassification_artifact(
+            "work-1",
+            "attempt-1",
+            &recovery.source_writer_task_id,
+        );
+        let receipt = crate::lifecycle_recovery::RetiredCommitStyleReclassification::from_recovery(
+            &item,
+            "attempt-1",
+            &recovery,
+        );
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt).unwrap();
+        let path = fixture.project_root.join(&artifact.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &receipt_bytes).unwrap();
+
+        assert!(
+            recover_retired_commit_style_pause(
+                &fixture.project_root,
+                &fixture.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(path).unwrap(), receipt_bytes);
+        let stored = fixture.store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].tasks[1].status, TaskStatus::Superseded);
+        assert_eq!(
+            stored.attempts[0]
+                .artifacts
+                .iter()
+                .filter(|candidate| **candidate == artifact)
+                .count(),
+            1
+        );
     }
 
     fn make_uncertain_review_pause_fixture(

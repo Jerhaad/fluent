@@ -4,16 +4,393 @@
 //! resume cannot authorize a broader state than execution knows how to repair.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::work_model::{
-    Attempt, AttemptReviewState, AttemptStatus, LearningFailureKind, MergeCandidateMergeStatus,
-    MergeReviewState, TaskKind, TaskStatus, WorkItem, resolve_managed_sibling_workspace_path,
+    ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, LearningFailureKind,
+    MergeCandidateMergeStatus, MergeReviewState, PauseKind, Task, TaskKind, TaskStatus, WorkItem,
+    resolve_managed_sibling_workspace_path, work_artifact_path,
 };
 
 const LEGACY_LEARNER_GATE_SCHEMA_VERSION: u32 = 2;
+const RETIRED_COMMIT_STYLE_RECLASSIFICATION_PRODUCER: &str = "commit-style-policy";
+const RETIRED_COMMIT_STYLE_RECLASSIFICATION_FILE: &str = "reclassification.json";
+const RETIRED_COMMIT_STYLE_RECLASSIFICATION_SCHEMA_VERSION: u32 = 1;
+const RETIRED_COMMIT_STYLE_RECLASSIFICATION_MAX_BYTES: u64 = 256 * 1024;
+
+/// The immutable paused frontier that may reuse a candidate after Factory
+/// retires only the stored commit-message presentation findings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredCommitStyleRecovery {
+    pub source_writer_task_id: String,
+    pub correction_writer_task_id: String,
+    pub base_commit: String,
+    pub candidate_commit: String,
+    pub candidate_tree: String,
+    pub workspace_path: String,
+    pub gate_artifact: ArtifactRef,
+    pub gate_digest: String,
+    pub hook_log_path: String,
+    pub hook_log_digest: String,
+    pub findings: Vec<String>,
+    pub policy_commit: String,
+}
+
+/// Separate evidence that preserves the rejected gate while recording why the
+/// same candidate may continue through the ordinary review lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct RetiredCommitStyleReclassification {
+    pub schema_version: u32,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub source_writer_task_id: String,
+    pub superseded_writer_task_id: String,
+    pub base_commit: String,
+    pub candidate_commit: String,
+    pub candidate_tree: String,
+    pub workspace_path: String,
+    pub gate_path: String,
+    pub gate_digest: String,
+    pub hook_log_path: String,
+    pub hook_log_digest: String,
+    pub findings: Vec<String>,
+    pub policy_commit: String,
+    pub recorded_at: String,
+}
+
+impl RetiredCommitStyleReclassification {
+    pub(crate) fn from_recovery(
+        item: &WorkItem,
+        attempt_id: &str,
+        recovery: &RetiredCommitStyleRecovery,
+    ) -> Self {
+        Self {
+            schema_version: RETIRED_COMMIT_STYLE_RECLASSIFICATION_SCHEMA_VERSION,
+            work_item_id: item.id.clone(),
+            attempt_id: attempt_id.to_string(),
+            source_writer_task_id: recovery.source_writer_task_id.clone(),
+            superseded_writer_task_id: recovery.correction_writer_task_id.clone(),
+            base_commit: recovery.base_commit.clone(),
+            candidate_commit: recovery.candidate_commit.clone(),
+            candidate_tree: recovery.candidate_tree.clone(),
+            workspace_path: recovery.workspace_path.clone(),
+            gate_path: recovery.gate_artifact.path.clone(),
+            gate_digest: recovery.gate_digest.clone(),
+            hook_log_path: recovery.hook_log_path.clone(),
+            hook_log_digest: recovery.hook_log_digest.clone(),
+            findings: recovery.findings.clone(),
+            policy_commit: recovery.policy_commit.clone(),
+            recorded_at: crate::work_model::now_iso8601(),
+        }
+    }
+}
+
+pub(crate) fn retired_commit_style_reclassification_artifact(
+    work_item_id: &str,
+    attempt_id: &str,
+    source_writer_task_id: &str,
+) -> ArtifactRef {
+    ArtifactRef {
+        producer_id: RETIRED_COMMIT_STYLE_RECLASSIFICATION_PRODUCER.to_string(),
+        path: work_artifact_path(
+            work_item_id,
+            attempt_id,
+            &format!(
+                "retired-commit-style-recovery/{source_writer_task_id}/{RETIRED_COMMIT_STYLE_RECLASSIFICATION_FILE}"
+            ),
+        ),
+    }
+}
+
+/// Recognize a stopped output-free Writer whose only candidate-gate failure is
+/// exact, candidate-bound output from Factory's retired presentation policy.
+/// `Ok(None)` is reserved for unrelated Writer-completion pauses; once a pause
+/// names a rejected candidate gate, every mismatch fails closed.
+pub(crate) fn inspect_retired_commit_style_recovery(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> Result<Option<RetiredCommitStyleRecovery>> {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        anyhow::bail!("Attempt {attempt_id:?} not found");
+    };
+    if attempt.status != AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(PauseKind::WriterCompletion)
+    {
+        return Ok(None);
+    }
+    let Some((correction_index, correction)) = attempt.tasks.iter().enumerate().next_back() else {
+        return Ok(None);
+    };
+    if correction.kind != TaskKind::Write {
+        return Ok(None);
+    }
+    let gate_inputs = correction
+        .input_artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact
+                .path
+                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if gate_inputs.is_empty() {
+        return Ok(None);
+    }
+    if gate_inputs.len() != 1 {
+        anyhow::bail!("retired commit-style Writer names multiple candidate gates");
+    }
+    if correction.status != TaskStatus::NeedsUser || correction.output.is_some() {
+        anyhow::bail!("retired commit-style Writer is live or produced output");
+    }
+    if crate::lease::is_leased(&crate::lease::task_lock_path(
+        project_root,
+        &item.id,
+        &correction.id,
+    )) || task_execution_is_live(project_root, correction)?
+    {
+        anyhow::bail!("retired commit-style Writer still has a live execution");
+    }
+    if item.attempts.last().map(|attempt| attempt.id.as_str()) != Some(attempt_id) {
+        anyhow::bail!("retired commit-style Attempt is no longer current");
+    }
+    if item
+        .merge_candidates
+        .iter()
+        .any(|candidate| candidate.attempt_id == attempt_id)
+    {
+        anyhow::bail!("a Merge Candidate already owns the retired commit-style candidate");
+    }
+    if correction_index == 0 {
+        anyhow::bail!("retired commit-style Writer has no preceding candidate Writer");
+    }
+    let source = &attempt.tasks[correction_index - 1];
+    if source.kind != TaskKind::Write || source.status != TaskStatus::Complete {
+        anyhow::bail!(
+            "retired commit-style correction does not immediately follow a completed Writer"
+        );
+    }
+    if attempt.tasks[..correction_index - 1]
+        .iter()
+        .any(|task| !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded))
+    {
+        anyhow::bail!("retired commit-style Attempt contains another unresolved Task");
+    }
+    let output = source
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no candidate"))?;
+    let base_commit = output
+        .base_commit
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base commit"))?;
+    let gate_artifact = gate_inputs[0].clone();
+    let expected_gate = ArtifactRef {
+        producer_id: source.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
+            source.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
+    if gate_artifact != expected_gate
+        || attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| **artifact == expected_gate)
+            .count()
+            != 1
+    {
+        anyhow::bail!("retired commit-style gate is not bound to the source Writer");
+    }
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "retired commit-style candidate workspace",
+    )?;
+    if !crate::recovery_contracts::candidate_workspace_is_clean_at_managed(
+        project_root,
+        output,
+        &output.commit,
+    ) {
+        anyhow::bail!("retired commit-style candidate workspace is not clean and unchanged");
+    }
+    let gate_path =
+        crate::recovery_contracts::resolve_input_artifact_path(project_root, &gate_artifact.path)?;
+    let classified = crate::candidate_gate::classify_retired_commit_style_gate(
+        project_root,
+        &workspace,
+        &gate_path,
+        base_commit,
+        &output.commit,
+    )?;
+    Ok(Some(RetiredCommitStyleRecovery {
+        source_writer_task_id: source.id.clone(),
+        correction_writer_task_id: correction.id.clone(),
+        base_commit: base_commit.clone(),
+        candidate_commit: output.commit.clone(),
+        candidate_tree: classified.candidate_tree,
+        workspace_path: output.workspace_path.clone(),
+        gate_artifact,
+        gate_digest: classified.gate_digest,
+        hook_log_path: classified.hook_log_path,
+        hook_log_digest: classified.hook_log_digest,
+        findings: classified.findings,
+        policy_commit: classified.policy_commit,
+    }))
+}
+
+/// Validate the recorded admission before the Attempt loop skips the rejected
+/// gate. The original gate and hook bytes remain the authority, so later drift
+/// blocks instead of silently trusting the receipt.
+pub(crate) fn inspect_retired_commit_style_admission(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+    source_writer: &Task,
+) -> Result<Option<ArtifactRef>> {
+    let artifact =
+        retired_commit_style_reclassification_artifact(&item.id, attempt_id, &source_writer.id);
+    let matches = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .into_iter()
+        .flat_map(|attempt| attempt.artifacts.iter())
+        .filter(|candidate| **candidate == artifact)
+        .count();
+    if matches == 0 {
+        return Ok(None);
+    }
+    if matches != 1 {
+        anyhow::bail!("retired commit-style reclassification artifact is duplicated");
+    }
+    let path =
+        crate::recovery_contracts::resolve_input_artifact_path(project_root, &artifact.path)?;
+    let receipt = read_retired_commit_style_reclassification(&path)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    let correction = attempt
+        .tasks
+        .iter()
+        .find(|task| task.id == receipt.superseded_writer_task_id)
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style superseded Writer is missing"))?;
+    if correction.status != TaskStatus::Superseded || correction.output.is_some() {
+        anyhow::bail!(
+            "retired commit-style corrective Writer is no longer superseded and output-free"
+        );
+    }
+    let output = source_writer
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no candidate"))?;
+    let gate_path =
+        crate::recovery_contracts::resolve_input_artifact_path(project_root, &receipt.gate_path)?;
+    let workspace = resolve_managed_sibling_workspace_path(
+        project_root,
+        &output.workspace_path,
+        "retired commit-style admitted candidate workspace",
+    )?;
+    if !crate::recovery_contracts::candidate_workspace_is_clean_at_managed(
+        project_root,
+        output,
+        &output.commit,
+    ) {
+        anyhow::bail!("retired commit-style admitted candidate is no longer clean and unchanged");
+    }
+    let classified = crate::candidate_gate::classify_retired_commit_style_gate(
+        project_root,
+        &workspace,
+        &gate_path,
+        output
+            .base_commit
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base"))?,
+        &output.commit,
+    )?;
+    let expected = RetiredCommitStyleReclassification {
+        schema_version: RETIRED_COMMIT_STYLE_RECLASSIFICATION_SCHEMA_VERSION,
+        work_item_id: item.id.clone(),
+        attempt_id: attempt_id.to_string(),
+        source_writer_task_id: source_writer.id.clone(),
+        superseded_writer_task_id: correction.id.clone(),
+        base_commit: output.base_commit.clone().unwrap(),
+        candidate_commit: output.commit.clone(),
+        candidate_tree: classified.candidate_tree,
+        workspace_path: output.workspace_path.clone(),
+        gate_path: receipt.gate_path.clone(),
+        gate_digest: classified.gate_digest,
+        hook_log_path: classified.hook_log_path,
+        hook_log_digest: classified.hook_log_digest,
+        findings: classified.findings,
+        policy_commit: classified.policy_commit,
+        recorded_at: receipt.recorded_at.clone(),
+    };
+    if receipt.recorded_at.trim().is_empty() || receipt != expected {
+        anyhow::bail!(
+            "retired commit-style reclassification no longer matches its candidate evidence"
+        );
+    }
+    if !correction.input_artifacts.contains(&ArtifactRef {
+        producer_id: source_writer.id.clone(),
+        path: receipt.gate_path.clone(),
+    }) {
+        anyhow::bail!("retired commit-style corrective Writer lost its source gate binding");
+    }
+    Ok(Some(artifact))
+}
+
+fn task_execution_is_live(project_root: &Path, task: &Task) -> Result<bool> {
+    let Some(area) = task.artifact_area.as_ref() else {
+        return Ok(false);
+    };
+    let path = crate::execution::record_path_for_artifact(project_root, &area.path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    crate::execution::execution_is_live(&path)
+}
+
+pub(crate) fn read_retired_commit_style_reclassification(
+    path: &Path,
+) -> Result<RetiredCommitStyleReclassification> {
+    serde_json::from_slice(&read_reclassification_bytes(path)?)
+        .context("parse retired commit-style reclassification")
+}
+
+fn read_reclassification_bytes(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "inspect retired commit-style reclassification {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!("retired commit-style reclassification is not a regular file");
+    }
+    if metadata.len() > RETIRED_COMMIT_STYLE_RECLASSIFICATION_MAX_BYTES {
+        anyhow::bail!("retired commit-style reclassification is too large");
+    }
+    fs::read(path).with_context(|| {
+        format!(
+            "read retired commit-style reclassification {}",
+            path.display()
+        )
+    })
+}
 
 /// The immutable frontier that authorizes a targeted uncertain-review retry.
 #[derive(Debug, Clone, PartialEq, Eq)]

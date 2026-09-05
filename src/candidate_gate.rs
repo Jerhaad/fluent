@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -15,6 +16,8 @@ pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
+const COMMIT_PRESENTATION_ADVISORY_MARKER: &str =
+    "# fluent-policy: commit-message-presentation-advisory-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -62,6 +65,18 @@ pub struct CandidateGateEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_rewrite: Option<CandidateMetadataRewriteEvidence>,
     pub checks: Vec<CandidateCheckEvidence>,
+}
+
+/// Immutable candidate-gate evidence that the current project policy has
+/// retired without weakening any other candidate check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetiredCommitStyleGate {
+    pub candidate_tree: String,
+    pub gate_digest: String,
+    pub hook_log_path: String,
+    pub hook_log_digest: String,
+    pub findings: Vec<String>,
+    pub policy_commit: String,
 }
 
 /// Host-verified provenance for a pre-review rewrite that changed only commit
@@ -598,6 +613,221 @@ pub(crate) fn validate_prior_writer_gate(
         return Err("prior candidate gate did not establish candidate identity".to_string());
     }
     Ok(())
+}
+
+/// Reclassify only the exact legacy project-check output that Factory's
+/// checked-in policy now treats as presentation advice.
+pub(crate) fn classify_retired_commit_style_gate(
+    project_root: &Path,
+    workspace: &Path,
+    gate_path: &Path,
+    expected_base: &str,
+    expected_candidate: &str,
+) -> Result<RetiredCommitStyleGate> {
+    let gate_bytes = read_bounded_regular_file(
+        gate_path,
+        CANDIDATE_GATE_MAX_BYTES,
+        "retired commit-style candidate gate",
+    )?;
+    let gate: CandidateGateEvidence =
+        serde_json::from_slice(&gate_bytes).context("parse retired commit-style candidate gate")?;
+    validate_prior_writer_gate(&gate, expected_candidate)
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    if gate.phase != CandidateGatePhase::Writer
+        || gate.base_commit != expected_base
+        || gate.tester_results_path.is_some()
+        || gate.metadata_rewrite.is_some()
+    {
+        bail!("retired commit-style gate does not bind the exact source Writer candidate");
+    }
+    let failed = gate
+        .checks
+        .iter()
+        .filter(|check| check.status == CandidateCheckStatus::Failed)
+        .collect::<Vec<_>>();
+    if failed.len() != 1 || failed[0].name != "project-check" {
+        bail!("retired commit-style gate must fail only the project check");
+    }
+    for required in ["candidate-identity", "whitespace", "commit-metadata"] {
+        if gate
+            .checks
+            .iter()
+            .find(|check| check.name == required)
+            .is_none_or(|check| check.status != CandidateCheckStatus::Passed)
+        {
+            bail!("retired commit-style gate did not pass {required}");
+        }
+    }
+    let project_check = failed[0];
+    let exit_codes = project_check
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| project_check_exit_code(diagnostic))
+        .collect::<Vec<_>>();
+    if project_check.diagnostics.len() != 1 || exit_codes.as_slice() != [1] {
+        bail!("retired commit-style project check must record the canonical hook exit");
+    }
+
+    let expected_log_path = gate_path
+        .parent()
+        .context("retired commit-style gate path has no parent")?
+        .join("hooks/check-pre-merge.log");
+    let expected_log_relative = expected_log_path
+        .strip_prefix(project_root)
+        .map_err(|_| anyhow::anyhow!("retired commit-style gate is outside the project"))?
+        .to_string_lossy()
+        .to_string();
+    if project_check.log_path.as_deref() != Some(expected_log_relative.as_str()) {
+        bail!(
+            "retired commit-style project check must bind the canonical hook log {expected_log_relative}"
+        );
+    }
+    let log_bytes = read_bounded_regular_file(
+        &expected_log_path,
+        MAX_PROJECT_CHECK_LOG_BYTES,
+        "retired commit-style hook log",
+    )?;
+    let log = String::from_utf8(log_bytes.clone())
+        .map_err(|_| anyhow::anyhow!("retired commit-style hook log is not valid UTF-8"))?;
+    let findings = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if findings.is_empty() {
+        bail!("retired commit-style hook log has no findings");
+    }
+
+    let commits = crate::git::run_stdout(
+        workspace,
+        &[
+            "rev-list",
+            "--reverse",
+            &format!("{expected_base}..{expected_candidate}"),
+        ],
+        "enumerate retired commit-style candidate commits",
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if commits.is_empty() {
+        bail!("retired commit-style candidate has no commits after its base");
+    }
+    for finding in &findings {
+        validate_retired_commit_style_finding(workspace, finding, &commits)?;
+    }
+
+    let policy_commit = crate::git::run_stdout(
+        project_root,
+        &["rev-parse", "HEAD"],
+        "resolve commit-message presentation policy",
+    )?;
+    let policy_script = crate::git::run_stdout(
+        project_root,
+        &[
+            "show",
+            &format!("{policy_commit}:scripts/check-commit-message-policy.sh"),
+        ],
+        "read checked-in commit-message presentation policy",
+    )?;
+    if !policy_script
+        .lines()
+        .any(|line| line == COMMIT_PRESENTATION_ADVISORY_MARKER)
+    {
+        bail!("the checked-in commit-message policy has not retired presentation findings");
+    }
+    let project_hook = crate::git::run_stdout(
+        project_root,
+        &[
+            "show",
+            &format!("{policy_commit}:.fluent/hooks/check-pre-merge"),
+        ],
+        "read checked-in project candidate hook",
+    )?;
+    if !project_hook.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#') && line == "scripts/check-commit-message-policy.sh"
+    }) {
+        bail!("the checked-in project hook does not invoke Factory's commit-message policy");
+    }
+
+    let candidate_tree = crate::git::run_stdout(
+        workspace,
+        &["rev-parse", &format!("{expected_candidate}^{{tree}}")],
+        "resolve retired commit-style candidate tree",
+    )?;
+    Ok(RetiredCommitStyleGate {
+        candidate_tree,
+        gate_digest: sha256_digest(&gate_bytes),
+        hook_log_path: expected_log_relative,
+        hook_log_digest: sha256_digest(&log_bytes),
+        findings,
+        policy_commit,
+    })
+}
+
+fn read_bounded_regular_file(path: &Path, maximum: u64, subject: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {subject} {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{subject} is not a regular file: {}", path.display());
+    }
+    if metadata.len() > maximum {
+        bail!(
+            "{subject} is {} bytes; maximum is {maximum} bytes",
+            metadata.len()
+        );
+    }
+    fs::read(path).with_context(|| format!("read {subject} {}", path.display()))
+}
+
+fn validate_retired_commit_style_finding(
+    workspace: &Path,
+    diagnostic: &str,
+    known_commits: &[String],
+) -> Result<()> {
+    let normalized = normalize_diagnostic_text(diagnostic);
+    let rest = normalized
+        .strip_prefix("commit ")
+        .ok_or_else(|| anyhow::anyhow!("unknown retired commit-style hook diagnostic"))?;
+    let (raw_commit, reason) = rest
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("malformed retired commit-style hook diagnostic"))?;
+    let commit = resolve_commit_id(raw_commit.trim_end_matches(':'), known_commits)
+        .ok_or_else(|| anyhow::anyhow!("retired commit-style finding has an unknown commit"))?;
+    let message = crate::git::run_stdout(
+        workspace,
+        &["show", "-s", "--format=%B", &commit],
+        "read retired commit-style message",
+    )?;
+    let lines = message.split('\n').collect::<Vec<_>>();
+    if reason == "has no body separated from its subject by a blank line" {
+        let has_body = lines.len() >= 3
+            && lines[1].trim().is_empty()
+            && lines[2..].iter().any(|line| !line.trim().is_empty());
+        if has_body {
+            bail!("retired missing-body finding does not match commit {commit}");
+        }
+        return Ok(());
+    }
+    let line_number = reason
+        .strip_prefix("body line ")
+        .and_then(|value| value.strip_suffix(" exceeds 72 characters"))
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|line| *line >= 2)
+        .ok_or_else(|| anyhow::anyhow!("unknown retired commit-style hook diagnostic"))?;
+    let line = lines
+        .get(line_number - 1)
+        .ok_or_else(|| anyhow::anyhow!("retired line-length finding names a missing line"))?;
+    if line.chars().count() <= 72 {
+        bail!("retired line-length finding does not match commit {commit}");
+    }
+    Ok(())
+}
+
+fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 /// Validate the passing source gate used by an explicitly authorized review

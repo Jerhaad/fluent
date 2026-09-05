@@ -713,6 +713,14 @@ pub fn resume_with_tester_no_sandbox(
     })?;
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
+    // Queue admission and foreground execution recognize the same narrow
+    // legacy presentation-only pause. A candidate-gate-shaped mismatch fails
+    // before this command changes the dispatch ledger.
+    let _ = crate::lifecycle_recovery::inspect_retired_commit_style_recovery(
+        project_root,
+        &item,
+        attempt_id,
+    )?;
     let failed_candidate_gate_correction = item
         .attempts
         .iter()
