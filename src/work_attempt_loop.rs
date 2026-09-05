@@ -6838,23 +6838,10 @@ fn gate_candidate_after_writer(
             crate::candidate_gate::CANDIDATE_GATE_FILE
         ),
     };
-    let prior_candidate_gate_refs = task
-        .input_artifacts
-        .iter()
-        .filter(|input| {
-            input
-                .path
-                .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
-        })
-        .collect::<Vec<_>>();
-    if prior_candidate_gate_refs.len() > 1 {
-        anyhow::bail!(
-            "Writer Task {:?} has multiple prior candidate gate artifacts",
-            task.id
-        );
-    }
-    let prior_candidate_gate_path = prior_candidate_gate_refs
-        .first()
+    let prior_candidate_gate =
+        select_prior_writer_candidate_gate(&item.attempts[attempt_index], write_index)?;
+    let repeated_rejection = prior_candidate_gate.is_some();
+    let prior_candidate_gate_path = prior_candidate_gate
         .map(|input| {
             crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &input.path)
         })
@@ -6898,14 +6885,6 @@ fn gate_candidate_after_writer(
             Ok(None)
         }
         crate::candidate_gate::CandidateGateDisposition::Rejected => {
-            let repeated_rejection = item.attempts[attempt_index].tasks[write_index]
-                .input_artifacts
-                .iter()
-                .any(|input| {
-                    input
-                        .path
-                        .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
-                });
             if repeated_rejection {
                 return pause_candidate_gate_before_reviews(
                     project_root,
@@ -6945,6 +6924,82 @@ fn gate_candidate_after_writer(
             .map(Some)
         }
     }
+}
+
+/// Select the one prior candidate gate that this Writer may use as correction
+/// authority. Work Item inputs remain context even when their snapshot names
+/// end in `candidate-gate.json`; every other gate-shaped input must bind an
+/// earlier completed Writer and that Writer's exact managed gate path.
+fn select_prior_writer_candidate_gate(
+    attempt: &Attempt,
+    write_index: usize,
+) -> Result<Option<&ArtifactRef>> {
+    let task = attempt
+        .tasks
+        .get(write_index)
+        .ok_or_else(|| anyhow::anyhow!("Writer Task index {write_index} is out of range"))?;
+    let mut selected = None;
+
+    for input in task.input_artifacts.iter().filter(|input| {
+        input
+            .path
+            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+    }) {
+        if input.producer_id == "work-item" {
+            continue;
+        }
+        let Some(producer) = attempt.tasks[..write_index]
+            .iter()
+            .find(|candidate| candidate.id == input.producer_id)
+        else {
+            bail!(
+                "Writer Task {:?} prior candidate gate names producer {:?}, which is not an earlier Task in Attempt {:?}",
+                task.id,
+                input.producer_id,
+                attempt.id
+            );
+        };
+        if producer.kind != TaskKind::Write
+            || producer.status != TaskStatus::Complete
+            || producer.output.is_none()
+            || producer.work_item_id != attempt.work_item_id
+            || producer.attempt_id.as_deref() != Some(attempt.id.as_str())
+        {
+            bail!(
+                "Writer Task {:?} prior candidate gate producer {:?} is not an earlier completed Writer in Work Item {:?} Attempt {:?}",
+                task.id,
+                input.producer_id,
+                attempt.work_item_id,
+                attempt.id
+            );
+        }
+        let expected_path = work_artifact_path(
+            &attempt.work_item_id,
+            &attempt.id,
+            &format!(
+                "candidate-gates/{}/{}",
+                producer.id,
+                crate::candidate_gate::CANDIDATE_GATE_FILE
+            ),
+        );
+        if input.path != expected_path {
+            bail!(
+                "Writer Task {:?} prior candidate gate for producer {:?} must use canonical path {:?}, found {:?}",
+                task.id,
+                producer.id,
+                expected_path,
+                input.path
+            );
+        }
+        if selected.replace(input).is_some() {
+            bail!(
+                "Writer Task {:?} has multiple prior Writer candidate gate artifacts",
+                task.id
+            );
+        }
+    }
+
+    Ok(selected)
 }
 
 /// Validate the exact final Tester identities before Fluent creates a Merge
@@ -17843,6 +17898,164 @@ mod tests {
         });
         store.create_work_item(&item).unwrap();
         (store, workspace)
+    }
+
+    #[test]
+    fn work_item_gate_named_input_is_not_prior_writer_gate() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let snapshot_path = work_artifact_path("work-1", "inputs", "0000-candidate-gate.json");
+        let snapshot = project.path().join(&snapshot_path);
+        fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        let checks = [
+            ("candidate-identity", CandidateCheckStatus::Passed),
+            ("whitespace", CandidateCheckStatus::Failed),
+            ("commit-metadata", CandidateCheckStatus::Passed),
+            ("behavior-references", CandidateCheckStatus::Skipped),
+            ("tester-reference-evidence", CandidateCheckStatus::Skipped),
+            ("project-check", CandidateCheckStatus::Passed),
+        ]
+        .into_iter()
+        .map(|(name, status)| CandidateCheckEvidence {
+            name: name.to_string(),
+            status,
+            diagnostics: Vec::new(),
+            log_path: None,
+        })
+        .collect();
+        let bytes = serde_json::to_vec_pretty(&CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: CandidateGatePhase::Writer,
+            disposition: CandidateGateDisposition::Rejected,
+            base_commit: "preserved-base".to_string(),
+            candidate_commit: "preserved-candidate".to_string(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks,
+        })
+        .unwrap();
+        fs::write(&snapshot, &bytes).unwrap();
+        item.input_artifacts
+            .push(crate::work_model::WorkItemInputArtifact {
+                source_path: "approved/candidate-gate.json".to_string(),
+                snapshot_path: snapshot_path.clone(),
+                digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+            });
+        item.attempts[0].tasks[0].input_artifacts.push(ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: snapshot_path,
+        });
+
+        let outcome =
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0).unwrap();
+
+        assert!(outcome.is_none());
+        let gate_path = project.path().join(
+            ".fluent/work/artifacts/work-1/attempt-1/candidate-gates/attempt-1-write-1/candidate-gate.json",
+        );
+        let gate: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(gate_path).unwrap()).unwrap();
+        assert_eq!(gate.disposition, CandidateGateDisposition::Passed);
+        assert_eq!(
+            gate.base_commit,
+            item.attempts[0].tasks[0]
+                .output
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .as_deref()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn prior_writer_gate_selection_rejects_unsafe_ownership() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {}\n", None);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let first_gate = ArtifactRef {
+            producer_id: "attempt-1-write-1".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+        };
+        item.add_next_write_round("attempt-1", vec![first_gate.clone()])
+            .unwrap();
+        assert_eq!(
+            select_prior_writer_candidate_gate(&item.attempts[0], 1).unwrap(),
+            Some(&first_gate)
+        );
+
+        let mut wrong_producer = item.clone();
+        wrong_producer.attempts[0].tasks[0].kind = TaskKind::Review;
+        assert!(select_prior_writer_candidate_gate(&wrong_producer.attempts[0], 1).is_err());
+
+        let invalid = [
+            ArtifactRef {
+                producer_id: "attempt-1-review-tests".to_string(),
+                path: first_gate.path.clone(),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "other-work",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "work-1",
+                    "other-attempt",
+                    "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: first_gate.producer_id.clone(),
+                path: work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-1/./candidate-gate.json",
+                ),
+            },
+            ArtifactRef {
+                producer_id: "attempt-1-write-missing".to_string(),
+                path: work_artifact_path(
+                    "work-1",
+                    "attempt-1",
+                    "candidate-gates/attempt-1-write-missing/candidate-gate.json",
+                ),
+            },
+        ];
+        for artifact in invalid {
+            let mut invalid_item = item.clone();
+            invalid_item.attempts[0].tasks[1].input_artifacts = vec![artifact];
+            assert!(select_prior_writer_candidate_gate(&invalid_item.attempts[0], 1).is_err());
+        }
+
+        let mut ambiguous = item;
+        let repeated_output = ambiguous.attempts[0].tasks[0].output.clone().unwrap();
+        let second = &mut ambiguous.attempts[0].tasks[1];
+        second.output = Some(repeated_output);
+        crate::work_model::set_task_terminal(second, TaskStatus::Complete);
+        let second_gate = ArtifactRef {
+            producer_id: "attempt-1-write-2".to_string(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-2/candidate-gate.json",
+            ),
+        };
+        ambiguous
+            .add_next_write_round("attempt-1", vec![first_gate, second_gate])
+            .unwrap();
+        assert!(select_prior_writer_candidate_gate(&ambiguous.attempts[0], 2).is_err());
     }
 
     struct RetiredCommitStyleFixture {
