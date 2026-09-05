@@ -22695,6 +22695,73 @@ fn retired_commit_style_resume_reaches_review_without_writer() {
 }
 
 #[test]
+fn retired_commit_style_resume_rejects_extra_correction_inputs() {
+    use fluent::work_model::{ArtifactRef, TaskKind, work_artifact_path};
+
+    for queued in [false, true] {
+        let fixture = make_retired_commit_style_binary_fixture();
+        let store = WorkModelStore::new(&fixture.project_root);
+        store
+            .mutate_work_item("work-1", |item| {
+                let correction = item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.kind == TaskKind::Write && task.output.is_none())
+                    .unwrap();
+                correction.input_artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-review-tests/review.md",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let item_before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+        let gate_before = fs::read(&fixture.gate_path).unwrap();
+        let log_before = fs::read(&fixture.log_path).unwrap();
+
+        let mut command = fluent_cmd();
+        command.current_dir(&fixture.project_root);
+        if queued {
+            command.args(["queue", "resume", "work-1", "--attempt", "attempt-1"]);
+        } else {
+            command.args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"]);
+        }
+        command
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("inputs do not match"));
+
+        assert_eq!(
+            serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap(),
+            item_before
+        );
+        assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+        assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+        assert_eq!(
+            git::run_stdout(
+                &fixture.workspace,
+                &["rev-parse", "HEAD"],
+                "verify rejected retired-style candidate",
+            )
+            .unwrap(),
+            fixture.candidate
+        );
+        if queued {
+            assert!(
+                fluent::queue::read_ledger(&fixture.project_root, "work-1")
+                    .unwrap()
+                    .is_none(),
+                "queue rejection must not create a dispatch ledger"
+            );
+        }
+    }
+}
+
+#[test]
 fn retired_commit_style_resume_is_idempotent_across_execution_paths() {
     struct FixtureQueueRunner {
         bin_dir: PathBuf,

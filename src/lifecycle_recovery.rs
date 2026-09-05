@@ -213,6 +213,34 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         anyhow::bail!("retired commit-style gate is not bound to the source Writer");
     }
+    let mut expected_inputs = item
+        .input_artifacts
+        .iter()
+        .map(|input| ArtifactRef {
+            producer_id: "work-item".to_string(),
+            path: input.snapshot_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !expected_inputs.contains(&expected_gate) {
+        expected_inputs.push(expected_gate.clone());
+    }
+    let inputs_match = correction.input_artifacts.len() == expected_inputs.len()
+        && expected_inputs.iter().all(|expected| {
+            correction
+                .input_artifacts
+                .iter()
+                .filter(|actual| *actual == expected)
+                .count()
+                == expected_inputs
+                    .iter()
+                    .filter(|candidate| *candidate == expected)
+                    .count()
+        });
+    if !inputs_match {
+        anyhow::bail!(
+            "retired commit-style Writer inputs do not match the exact Work Item inputs and candidate gate"
+        );
+    }
     let workspace = resolve_managed_sibling_workspace_path(
         project_root,
         &output.workspace_path,

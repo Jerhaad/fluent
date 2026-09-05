@@ -18334,6 +18334,62 @@ mod tests {
         );
         assert_retired_commit_style_boundary_unchanged(&unbound, before);
 
+        let extra_input = make_retired_commit_style_pause_fixture(false);
+        extra_input
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-review-tests/review.md",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&extra_input);
+        assert!(
+            recover_retired_commit_style_pause(
+                &extra_input.project_root,
+                &extra_input.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inputs do not match")
+        );
+        assert_retired_commit_style_boundary_unchanged(&extra_input, before);
+
+        let missing_input = make_retired_commit_style_pause_fixture(false);
+        missing_input
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.input_artifacts
+                    .push(crate::work_model::WorkItemInputArtifact {
+                        source_path: "approved/evidence.json".to_string(),
+                        snapshot_path: work_artifact_path("work-1", "inputs", "0000-evidence.json"),
+                        digest: "sha256:approved".to_string(),
+                    });
+                Ok(())
+            })
+            .unwrap();
+        let before = retired_commit_style_boundary_snapshot(&missing_input);
+        assert!(
+            recover_retired_commit_style_pause(
+                &missing_input.project_root,
+                &missing_input.store,
+                "work-1",
+                "attempt-1",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("inputs do not match")
+        );
+        assert_retired_commit_style_boundary_unchanged(&missing_input, before);
+
         let changed_hook = make_retired_commit_style_pause_fixture(false);
         fs::write(
             changed_hook
