@@ -9697,3 +9697,25 @@ corresponding commit,
 THE SYSTEM SHALL persist `Conform code to project standards` as the subject
 and `Apply project formatting fixes.` as its body.
 Test: src/work_merge_executor.rs (commit_autofix_writes_approved_message)
+
+## Host-action ownership
+
+### B1
+
+WHEN Fluent evaluates Writer completion, THE SYSTEM SHALL require only
+Writer-owned obligations while retaining host verification and later workflow
+stages as separate requirements.
+Test: src/work_attempt_loop.rs (writer_completion_excludes_host_and_later_stage_work)
+
+### B2
+
+WHEN completed Writer work leaves a host-only action next, THE SYSTEM SHALL
+pause at `needs-user` with the exact candidate, action, and required evidence
+before launching another Writer, including after earlier reviews.
+Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
+
+### B3
+
+WHILE required host verification lacks accepted passing evidence for the exact
+candidate, THE SYSTEM SHALL keep the candidate ineligible for readiness.
+Test: src/host_evidence.rs (pending_host_verification_blocks_readiness)

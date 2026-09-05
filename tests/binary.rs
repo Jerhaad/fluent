@@ -23733,6 +23733,7 @@ fn queue_resume_requires_exact_legacy_learner_evidence() {
     item.attempts[0].writer_completion_contract = Some(WriterCompletionContract {
         version: WRITER_COMPLETION_CONTRACT_VERSION,
         requirements: vec![WriterCompletionRequirement {
+            responsibility: None,
             id: "behavior:b1".to_string(),
             kind: WriterCompletionRequirementKind::Behavior,
             source: "behaviors.md#b1".to_string(),
@@ -28593,6 +28594,7 @@ exit 0
             schema_version: 1,
             task_id: writer_id.clone(),
             rows: vec![fluent::work_model::WriterCompletionRow {
+                responsibility: None,
                 id: "behavior:e2e:b1".to_string(),
                 kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
                 source: "behaviors.md#b1".to_string(),
@@ -28619,6 +28621,7 @@ exit 0
                 Some(fluent::work_model::WriterCompletionContract {
                     version: fluent::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
                     requirements: vec![fluent::work_model::WriterCompletionRequirement {
+                        responsibility: None,
                         id: "behavior:e2e:b1".to_string(),
                         kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
                         source: "behaviors.md#b1".to_string(),

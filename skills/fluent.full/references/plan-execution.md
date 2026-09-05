@@ -75,6 +75,30 @@ and record the same four things without intermediate questions:
 - The verification — a test path, a curl command, a screen to check. Without this the writer doesn't know when to stop.
 - Required or optional. Optional steps are the ones you'd trade away if execution runs into trouble.
 
+Give every required row a `Responsibility` column, before `Req?`, using exactly
+`writer`, `host`, `review`, `tester`, or `learner`. Split a mixed obligation into
+separate required rows before approval. The planning agent supplies the division;
+the user reviews who does each action. Host assignment requires a separate
+execution authorization and one exact command. Behavior implementation and
+applicable corrective findings remain Writer work.
+
+For example, split “fix the source, smoke-test the host, review, test, and learn”:
+
+| # | State reached | Behaviors | Verification | Responsibility | Req? |
+|---|---------------|-----------|--------------|----------------|------|
+| 1 | Source handles the corrected case | Fix:B1 | `cargo test corrected_case` | writer | Yes |
+| 2 | Host smoke check passes for the candidate | Fix:B1 | `bash tests/host-smoke.sh` | host | Yes |
+| 3 | Applicable reviews pass | | Existing review gates | review | Yes |
+| 4 | Declared suite passes | | Canonical final Tester | tester | Yes |
+| 5 | Learning succeeds | | Existing Learner gate | learner | Yes |
+
+The immutable completion contract retains all rows. Writer progress includes only
+Writer work. When that work finishes, a pending host check pauses at `needs-user`
+with the exact candidate, row, command, and required evidence. Passing evidence
+must complete targeted Tests Review before readiness; reviews, final testing,
+and successful Learning remain required. Legacy Plans without the column keep
+their existing meaning and are never reinterpreted from command text.
+
 For an executable verification, include one exact command in the row (inline
 code is clearest) and keep the surrounding explanation about what the check
 proves. When Fluent creates an Attempt, it stores that command separately with

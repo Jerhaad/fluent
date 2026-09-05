@@ -10,6 +10,8 @@ Reference paths:
 - Plan: {{plan_path}}
 - Generated current context: {{execution_context_path}}
 {{#if has_writer_completion_matrix}}
+Rows assigned to `host`, `review`, `tester`, or `learner` are read-only context: leave their state pending and their evidence arrays empty. Complete only `writer` rows (or legacy rows with no responsibility) and applicable findings. Fluent verifies host evidence and later stages separately; assignment never authorizes host execution.
+
 - Writer completion matrix: {{writer_completion_matrix_path}}
 {{/if}}
 

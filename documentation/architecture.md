@@ -3767,3 +3767,24 @@ Attempts it exits without waiting for the polling interval.
 When queued Work exists but no live coordinator can claim it, the Work
 stays `queued` and `fluent status` reports that execution is stopped,
 naming `fluent scheduler run` as the start or recovery action.
+
+### Assign required actions to existing roles
+
+The Plan's `Responsibility` column freezes `writer`, `host`, `review`, `tester`,
+or `learner` on each required completion-contract row. Behavior implementation,
+Approach constraints, and corrective findings remain Writer work. The planning
+agent splits mixed rows before approval; command text never grants host access.
+Legacy Plans without the column retain their prior meaning.
+
+The full completion contract preserves every obligation and verification
+reference. Required progress projects Writer rows; external rows remain pending
+read-only context in the Writer matrix. The host rejects edited responsibility
+and external completion claims before admitting a candidate. Work record schema
+2 prevents older readers from ignoring ownership when mutating records.
+
+`recovery_contracts` validates the source matrix and unchanged clean candidate.
+`host_evidence` overlays only accepted candidate-bound evidence after targeted
+Tests Review passes. The Attempt loop pauses before another Writer when only a
+host check remains, and checks required host evidence before advancing past
+reviews. Required reviewers, the canonical final Tester, and a successful
+Learner retain their existing gates.

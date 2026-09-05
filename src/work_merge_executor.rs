@@ -157,6 +157,20 @@ pub fn merge_candidate(config: WorkMergeConfig<'_>) -> Result<WorkMergeOutcome> 
     if let Err(error) = candidate.validate_advancement(&item) {
         bail!("{error}");
     }
+    if let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == candidate.attempt_id)
+        && let Some(action) =
+            crate::host_evidence::required_host_verification_pending(config.project_root, attempt)?
+    {
+        bail!(
+            "candidate {} still requires host verification for {}: {}",
+            action.candidate_commit,
+            action.plan_row,
+            action.command
+        );
+    }
 
     // Resolve the frozen reviewed identity once from the durable model. A value
     // here means this Attempt is no-expertise and its Learner has SUCCEEDED, so the

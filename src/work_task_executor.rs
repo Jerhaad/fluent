@@ -17639,6 +17639,7 @@ mod tests {
             Some(crate::work_model::WriterCompletionContract {
                 version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
                 requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    responsibility: None,
                     id: "plan:step-2".to_string(),
                     kind: crate::work_model::WriterCompletionRequirementKind::Plan,
                     source: "plan.md#step-2".to_string(),
@@ -17780,6 +17781,7 @@ mod tests {
             Some(crate::work_model::WriterCompletionContract {
                 version: crate::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
                 requirements: vec![crate::work_model::WriterCompletionRequirement {
+                    responsibility: None,
                     id: "plan:step-2".to_string(),
                     kind: crate::work_model::WriterCompletionRequirementKind::Plan,
                     source: "plan.md#step-2".to_string(),
@@ -19178,6 +19180,7 @@ mod tests {
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stale.rows.len(), 1);
         stale.rows.push(crate::work_model::WriterCompletionRow {
+            responsibility: None,
             id: "finding:tester:legacy".to_string(),
             kind: crate::work_model::WriterCompletionRequirementKind::Finding,
             source: tester_rel.to_string(),

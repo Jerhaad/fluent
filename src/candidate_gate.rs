@@ -2445,6 +2445,7 @@ mod tests {
         WriterCompletionContract {
             version: WRITER_COMPLETION_CONTRACT_VERSION,
             requirements: vec![WriterCompletionRequirement {
+                responsibility: None,
                 id: "behavior:area:b1".to_string(),
                 kind: WriterCompletionRequirementKind::Behavior,
                 source: "behaviors.md#area:b1".to_string(),

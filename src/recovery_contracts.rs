@@ -25,6 +25,57 @@ pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
+/// Read the approved host obligations against the exact clean Writer candidate.
+/// Consumers may overlay accepted evidence, but the Writer cannot supply it.
+pub(crate) fn owned_host_completion_matrix(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<(Task, ArtifactRef, work_model::WriterCompletionMatrix)>> {
+    let Some(contract) = attempt
+        .writer_completion_contract
+        .as_ref()
+        .filter(|contract| {
+            contract
+                .requirements
+                .iter()
+                .any(|row| row.responsibility == Some(work_model::CompletionResponsibility::Host))
+        })
+    else {
+        return Ok(None);
+    };
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .context("required host verification has no completed Writer")?;
+    let output = writer
+        .output
+        .as_ref()
+        .context("required host verification has no candidate")?;
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at(project_root, output, &output.commit),
+        "required host verification needs the unchanged clean candidate {}",
+        output.commit
+    );
+    let artifact = writer_completion_matrix_ref(project_root, attempt, writer)
+        .context("required host verification has no source matrix")?;
+    let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+    anyhow::ensure!(
+        bytes.len() <= work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES,
+        "completion matrix exceeds size limit"
+    );
+    let mut matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    let findings = writer_completion_findings(project_root, writer)?;
+    matrix
+        .status_against(contract, &writer.id, &findings)
+        .map_err(anyhow::Error::msg)?;
+    matrix
+        .repair_writer_claims_against(contract, &writer.id, &findings)
+        .map_err(anyhow::Error::msg)?;
+    Ok(Some((writer.clone(), artifact, matrix)))
+}
+
 /// Version-one operator evidence document. The parser below is the single
 /// validation boundary for host-evidence attachment and source correction.
 /// Callers retain the exact serialized bytes separately as the audit artifact.
@@ -1669,4 +1720,51 @@ mod tests {
                 .contains("evidence snapshot result must be fail")
         );
     }
+}
+
+pub(crate) fn writer_completion_matrix_ref(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+) -> Option<ArtifactRef> {
+    // A planning-reference recovery can leave several immutable matrices in
+    // the Attempt. Select only the one whose task identity matches this
+    // Writer; otherwise an older recovery could make a valid current row look
+    // absent and produce an ineligible handoff.
+    for artifact in attempt.artifacts.iter().rev() {
+        if !artifact.path.ends_with("/writer-completion.json") {
+            continue;
+        }
+        if artifact.producer_id == "writer-completion-repair"
+            && !artifact
+                .path
+                .contains(&format!("/writer-completion-repairs/{}/", writer.id))
+        {
+            continue;
+        }
+        if artifact.producer_id != "writer-completion-repair"
+            && artifact.producer_id != "planning-reference-recovery"
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(project_root.join(&artifact.path)) else {
+            // An unreadable recovery artifact cannot be selected as the
+            // authoritative matrix; the task-owned fallback below still gives
+            // the caller a deterministic path to diagnose.
+            continue;
+        };
+        if serde_json::from_slice::<work_model::WriterCompletionMatrix>(&bytes)
+            .is_ok_and(|matrix| matrix.task_id == writer.id)
+        {
+            return Some(artifact.clone());
+        }
+    }
+    writer.artifact_area.as_ref().map(|area| ArtifactRef {
+        producer_id: writer.id.clone(),
+        path: format!(
+            "{}/{}",
+            area.path,
+            crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE
+        ),
+    })
 }

@@ -1534,6 +1534,7 @@ mod tests {
             schema_version: 1,
             task_id: "attempt-1-write-1".to_string(),
             rows: vec![WriterCompletionRow {
+                responsibility: None,
                 id: finding_id.clone(),
                 kind: WriterCompletionRequirementKind::Finding,
                 source: review.clone(),

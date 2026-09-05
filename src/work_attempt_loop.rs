@@ -7741,6 +7741,34 @@ fn gate_writer_completion_before_reviews(
         }
     };
     if progress.is_complete() && matrix_status.is_complete() {
+        let host_check = crate::host_evidence::required_host_verification_pending(
+            project_root,
+            &item.attempts[attempt_index],
+        );
+        let reason = match host_check {
+            Ok(Some(action)) => Some(format!(
+                "candidate {} requires host verification for {}: {}; attach candidate-bound passing evidence and complete targeted Tests Review",
+                action.candidate_commit, action.plan_row, action.command
+            )),
+            Err(error) => Some(format!(
+                "cannot validate required host verification: {error:#}"
+            )),
+            Ok(None) => None,
+        };
+        if let Some(reason) = reason {
+            return pause_writer_completion_before_reviews(
+                project_root,
+                store,
+                item,
+                attempt_index,
+                attempt_id,
+                matrix_artifact.as_ref().unwrap_or(&progress_artifact),
+                &reason,
+                progress.checked,
+                matrix_status.complete,
+            )
+            .map(Some);
+        }
         record_writer_run(
             project_root,
             item,
@@ -8556,6 +8584,34 @@ fn interpret_reviews(
     // An unmarked (legacy) Attempt has no contract, so this never scans its prose.
     let reviews_would_pass = failed.is_empty() && uncertain.is_empty();
     if reviews_would_pass {
+        let host_check = crate::host_evidence::required_host_verification_pending(
+            project_root,
+            &item.attempts[attempt_index],
+        );
+        let reason = match host_check {
+            Ok(Some(action)) => Some(format!(
+                "candidate {} requires host verification for {}: {}; attach candidate-bound passing evidence and complete targeted Tests Review",
+                action.candidate_commit, action.plan_row, action.command
+            )),
+            Err(error) => Some(format!(
+                "cannot validate required host verification: {error:#}"
+            )),
+            Ok(None) => None,
+        };
+        if let Some(reason) = reason {
+            let artifact = required_progress_artifact(&item.attempts[attempt_index]);
+            return pause_writer_completion_before_reviews(
+                project_root,
+                store,
+                &mut item,
+                attempt_index,
+                attempt_id,
+                &artifact,
+                &reason,
+                0,
+                0,
+            );
+        }
         if let Some(finding) =
             required_progress_finding(project_root, &item.attempts[attempt_index])
         {
@@ -17068,6 +17124,142 @@ mod tests {
             stored.attempts[0].writer_runs[0].outcome,
             WriterOutcome::Continue
         );
+    }
+
+    #[test]
+    fn writer_completion_excludes_host_and_later_stage_work() {
+        let context = crate::work_model::PlanningContext {
+            behaviors: Some("## Fix\n### B1\nWHEN invoked, THE SYSTEM SHALL work.\nTest: src/lib.rs (fix)\n".into()),
+            plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source | Fix:B1 | `cargo test fix` | writer | Yes |\n| 2 | Check host | | `bash tests/host.sh` | host | Yes |\n| 3 | Review | | All reviews | review | Yes |\n| 4 | Test | | Canonical suite | tester | Yes |\n| 5 | Learn | | Successful Learner | learner | Yes |\n".into()),
+            ..Default::default()
+        };
+        let contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(&context).unwrap();
+        let findings = vec![crate::work_model::WriterCompletionFinding {
+            id: "finding:tests:fix".into(),
+            role: "tests".into(),
+            source: "review.md".into(),
+            requirement: "Fix the regression".into(),
+        }];
+        let mut matrix = crate::work_model::WriterCompletionMatrix::skeleton(
+            &contract, "writer", &findings, None,
+        )
+        .unwrap();
+        for row in &mut matrix.rows {
+            if row.id.starts_with("behavior:")
+                || row.id == "plan:step-1"
+                || row.id.starts_with("finding:")
+            {
+                row.state = crate::work_model::WriterCompletionState::Complete;
+                row.implementation_evidence = vec!["src/lib.rs: fix".into()];
+                row.verification = vec![crate::work_model::WriterVerificationClaim {
+                    command: "cargo test fix".into(),
+                    result: crate::work_model::WriterVerificationResult::Pass,
+                }];
+                if row.id.starts_with("finding:") {
+                    row.applicable_constraints = vec!["behavior:fix:b1".into()];
+                }
+            }
+        }
+        let status = matrix
+            .status_against(&contract, "writer", &findings)
+            .unwrap();
+        assert!(status.is_complete(), "{status:?}");
+        assert_eq!(status.required, 3);
+        matrix.rows.last_mut().unwrap().state = crate::work_model::WriterCompletionState::Pending;
+        matrix
+            .rows
+            .last_mut()
+            .unwrap()
+            .implementation_evidence
+            .clear();
+        matrix.rows.last_mut().unwrap().verification.clear();
+        matrix
+            .rows
+            .last_mut()
+            .unwrap()
+            .applicable_constraints
+            .clear();
+        assert!(
+            !matrix
+                .status_against(&contract, "writer", &findings)
+                .unwrap()
+                .is_complete()
+        );
+    }
+
+    #[test]
+    fn pending_host_action_pauses_before_another_writer() {
+        for after_review in [false, true] {
+            let project = tempfile::TempDir::new().unwrap();
+            let workspace = tempfile::TempDir::new().unwrap();
+            init_learner_repo(workspace.path());
+            fs::write(workspace.path().join("source.rs"), "fixed\n").unwrap();
+            git::run(workspace.path(), &["add", "."], "stage").unwrap();
+            git::run(workspace.path(), &["commit", "-m", "Fix source"], "commit").unwrap();
+            let candidate =
+                git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "candidate").unwrap();
+            let mut item = WorkItem::planned("ownership", "Assign work");
+            item.planning_context = Some(crate::work_model::PlanningContext {
+                plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source | | `cargo test fix` | writer | Yes |\n| 2 | Check host | | `bash tests/host.sh` | host | Yes |\n| 3 | Review | | Applicable reviews | review | Yes |\n".into()),
+                ..Default::default()
+            });
+            item.add_initial_attempt("attempt-1").unwrap();
+            let path = crate::work_task_executor::materialize_writer_completion_before_writer(
+                project.path(),
+                &item,
+                "attempt-1",
+                "attempt-1-write-1",
+            )
+            .unwrap()
+            .unwrap();
+            let mut matrix: crate::work_model::WriterCompletionMatrix =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            matrix.rows[0].state = crate::work_model::WriterCompletionState::Complete;
+            matrix.rows[0].implementation_evidence = vec!["source.rs".into()];
+            matrix.rows[0].verification = vec![crate::work_model::WriterVerificationClaim {
+                command: "cargo test fix".into(),
+                result: crate::work_model::WriterVerificationResult::Pass,
+            }];
+            fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+            let writer = &mut item.attempts[0].tasks[0];
+            writer.status = TaskStatus::Complete;
+            writer.output = Some(TaskOutput {
+                workspace_id: "candidate".into(),
+                workspace_path: workspace.path().display().to_string(),
+                source_branch: "main".into(),
+                base_commit: None,
+                commit: candidate.clone(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            if after_review {
+                item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+                let review = item.attempts[0].tasks.last_mut().unwrap();
+                review.status = TaskStatus::Complete;
+                item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+            }
+            let store = WorkModelStore::new(project.path());
+            store.create_work_item(&item).unwrap();
+            let before_tasks = item.attempts[0].tasks.clone();
+            let outcome = gate_writer_completion_before_reviews(
+                project.path(),
+                &store,
+                &mut item,
+                "attempt-1",
+            )
+            .unwrap();
+            let Some(WorkAttemptRunOutcome::NeedsUser { handoff_path }) = outcome else {
+                panic!("expected host pause: {outcome:?}")
+            };
+            let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+            for value in [&candidate, "plan:step-2", "bash tests/host.sh", "evidence"] {
+                assert!(handoff.contains(value), "missing {value}: {handoff}");
+            }
+            let stored = store.read_work_item("ownership").unwrap();
+            assert_eq!(stored.attempts[0].tasks, before_tasks);
+            assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);
+        }
     }
 
     #[test]

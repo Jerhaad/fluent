@@ -919,6 +919,20 @@ pub(crate) fn pending_plan_host_evidence_action(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Option<PlanHostEvidenceAction> {
+    if attempt
+        .writer_completion_contract
+        .as_ref()
+        .is_some_and(|contract| {
+            contract
+                .requirements
+                .iter()
+                .any(|row| row.responsibility.is_some())
+        })
+    {
+        return required_host_verification_pending(project_root, attempt)
+            .ok()
+            .flatten();
+    }
     if attempt.status != work_model::AttemptStatus::NeedsUser
         || attempt.pause_kind != Some(work_model::PauseKind::WriterCompletion)
         || attempt.review_state != Some(work_model::AttemptReviewState::NotReviewed)
@@ -959,6 +973,39 @@ pub(crate) fn pending_plan_host_evidence_action(
             matrix_artifact: matrix_ref.path.clone(),
         })
     })
+}
+
+/// Keep every explicitly assigned host check required until its exact evidence
+/// and targeted Tests Review pass. Errors also block advancement.
+pub(crate) fn required_host_verification_pending(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<PlanHostEvidenceAction>> {
+    let Some((writer, source, mut matrix)) =
+        crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)?
+    else {
+        return Ok(None);
+    };
+    apply_completed_plan_host_evidence(project_root, attempt, &writer, &source, &mut matrix);
+    let row = matrix.rows.iter().find(|row| {
+        row.responsibility == Some(work_model::CompletionResponsibility::Host)
+            && row.state != WriterCompletionState::Complete
+    });
+    row.map(|row| {
+        Ok(PlanHostEvidenceAction {
+            plan_row: row.id.clone(),
+            command: resolve_plan_row_command(row)
+                .context("required host check has no exact command")?,
+            candidate_commit: writer
+                .output
+                .as_ref()
+                .expect("validated candidate")
+                .commit
+                .clone(),
+            matrix_artifact: source.path.clone(),
+        })
+    })
+    .transpose()
 }
 
 /// Resolve one exact executable command from a Plan row without changing the
@@ -1032,6 +1079,20 @@ pub(crate) fn completed_plan_host_matrix_ref(
     attempt: &work_model::Attempt,
     writer: &Task,
 ) -> Option<ArtifactRef> {
+    // Explicit ownership keeps external claims out of the Writer artifact. The
+    // readiness gate overlays the accepted evidence from its bound source.
+    if attempt
+        .writer_completion_contract
+        .as_ref()
+        .is_some_and(|contract| {
+            contract
+                .requirements
+                .iter()
+                .any(|row| row.responsibility.is_some())
+        })
+    {
+        return None;
+    }
     attempt.artifacts.iter().rev().find_map(|artifact| {
         if artifact.producer_id != PLAN_HOST_EVIDENCE_PRODUCER
             || !artifact.path.ends_with("/writer-completion.json")
@@ -1264,52 +1325,7 @@ pub(crate) fn apply_completed_plan_host_evidence(
     changed
 }
 
-pub(crate) fn writer_completion_matrix_ref(
-    project_root: &Path,
-    attempt: &work_model::Attempt,
-    writer: &Task,
-) -> Option<ArtifactRef> {
-    // A planning-reference recovery can leave several immutable matrices in
-    // the Attempt. Select only the one whose task identity matches this
-    // Writer; otherwise an older recovery could make a valid current row look
-    // absent and produce an ineligible handoff.
-    for artifact in attempt.artifacts.iter().rev() {
-        if !artifact.path.ends_with("/writer-completion.json") {
-            continue;
-        }
-        if artifact.producer_id == "writer-completion-repair"
-            && !artifact
-                .path
-                .contains(&format!("/writer-completion-repairs/{}/", writer.id))
-        {
-            continue;
-        }
-        if artifact.producer_id != "writer-completion-repair"
-            && artifact.producer_id != "planning-reference-recovery"
-        {
-            continue;
-        }
-        let Ok(bytes) = fs::read(project_root.join(&artifact.path)) else {
-            // An unreadable recovery artifact cannot be selected as the
-            // authoritative matrix; the task-owned fallback below still gives
-            // the caller a deterministic path to diagnose.
-            continue;
-        };
-        if serde_json::from_slice::<WriterCompletionMatrix>(&bytes)
-            .is_ok_and(|matrix| matrix.task_id == writer.id)
-        {
-            return Some(artifact.clone());
-        }
-    }
-    writer.artifact_area.as_ref().map(|area| ArtifactRef {
-        producer_id: writer.id.clone(),
-        path: format!(
-            "{}/{}",
-            area.path,
-            crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE
-        ),
-    })
-}
+pub(crate) use crate::recovery_contracts::writer_completion_matrix_ref;
 
 fn resolve_requested_value(
     name: &str,
@@ -2157,6 +2173,9 @@ pub fn attach_plan_row(
                     "row {plan_row:?} is not a required Plan row"
                 )));
             }
+            if row.responsibility.is_some() && row.responsibility != Some(work_model::CompletionResponsibility::Host) {
+                return Err(ineligible("the approved obligation is not host-owned"));
+            }
             if row.state != WriterCompletionState::Pending {
                 return Err(ineligible(&format!(
                     "Plan row {plan_row:?} is already complete"
@@ -2173,6 +2192,11 @@ pub fn attach_plan_row(
                     "evidence check {:?} does not match Plan row command {:?}",
                     document.check, command
                 )));
+            }
+            if row.responsibility == Some(work_model::CompletionResponsibility::Host)
+                && row.command.as_ref().is_none_or(|command| command.working_directory != document.working_directory)
+            {
+                return Err(ineligible("evidence working directory does not match the approved host command"));
             }
             let source_matrix_digest = format!("sha256:{:x}", Sha256::digest(&matrix_bytes));
             let binding = PlanHostEvidenceBinding {
@@ -4157,6 +4181,92 @@ mod tests {
     }
 
     #[test]
+    fn pending_host_verification_blocks_readiness() {
+        let command = "bash tests/host.sh";
+        let (project, workspace, store, candidate, evidence_path) =
+            plan_host_evidence_fixture(command);
+        let mut item = store.read_work_item("work-1").unwrap();
+        let attempt = &mut item.attempts[0];
+        attempt
+            .writer_completion_contract
+            .as_mut()
+            .unwrap()
+            .requirements[0]
+            .responsibility = Some(work_model::CompletionResponsibility::Host);
+        let writer = &attempt.tasks[0];
+        let matrix_ref = writer_completion_matrix_ref(project.path(), attempt, writer).unwrap();
+        let mut matrix: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(project.path().join(&matrix_ref.path)).unwrap())
+                .unwrap();
+        matrix.rows[0].responsibility = Some(work_model::CompletionResponsibility::Host);
+        fs::write(
+            project.path().join(&matrix_ref.path),
+            serde_json::to_vec_pretty(&matrix).unwrap(),
+        )
+        .unwrap();
+        store.write_work_item(&item).unwrap();
+        assert!(
+            required_host_verification_pending(project.path(), &item.attempts[0])
+                .unwrap()
+                .is_some()
+        );
+        let recovery = attach_plan_row(
+            project.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            &candidate,
+            "plan:step-6",
+            &evidence_path,
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        assert!(
+            required_host_verification_pending(project.path(), &item.attempts[0])
+                .unwrap()
+                .is_some(),
+            "attachment alone cannot pass a required check"
+        );
+        let attempt = &mut item.attempts[0];
+        let review = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| Some(&task.id) == recovery.targets[0].review_task_id.as_ref())
+            .unwrap();
+        let review_path = project
+            .path()
+            .join(&review.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        fs::write(&review_path, "Verdict: pass\n").unwrap();
+        work_model::set_task_terminal(review, TaskStatus::Complete);
+        attempt.evidence_recoveries[0].state = EvidenceRecoveryState::Complete;
+        assert!(
+            required_host_verification_pending(project.path(), attempt)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(&review_path, "Verdict: fail\n").unwrap();
+        assert!(
+            required_host_verification_pending(project.path(), attempt)
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&review_path, "Verdict: pass\n").unwrap();
+        let snapshot = project.path().join(&recovery.attachment.snapshot_path);
+        let saved = fs::read(&snapshot).unwrap();
+        fs::write(&snapshot, b"changed evidence").unwrap();
+        assert!(
+            required_host_verification_pending(project.path(), attempt)
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&snapshot, saved).unwrap();
+        fs::write(workspace.path().join("README.md"), "dirty\n").unwrap();
+        assert!(required_host_verification_pending(project.path(), attempt).is_err());
+    }
+
+    #[test]
     fn plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent() {
         let command = "python3 tests/readiness.py";
         let (project, _workspace, store, candidate, evidence_path) =
@@ -4534,6 +4644,7 @@ mod tests {
     #[test]
     fn structured_plan_command_wins_over_explanatory_text() {
         let row = WriterCompletionRow {
+            responsibility: None,
             id: "plan:step-6".to_string(),
             kind: WriterCompletionRequirementKind::Plan,
             source: "plan.md#step-6".to_string(),
@@ -4574,6 +4685,7 @@ mod tests {
     #[test]
     fn legacy_plan_command_resolution_records_which_text_field_supplied_it() {
         let row = WriterCompletionRow {
+            responsibility: None,
             id: "plan:step-6".to_string(),
             kind: WriterCompletionRequirementKind::Plan,
             source: "plan.md#step-6".to_string(),
