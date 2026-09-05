@@ -1515,6 +1515,39 @@ pub fn requeue_active(project_root: &Path, work_item_id: &str, clear_binding: bo
     })
 }
 
+/// Return the named dispatch to `queued` only if it is still the same latest
+/// dispatch the caller inspected. A concurrent queue operation makes the
+/// operation a no-op, so recovery cannot rewrite a newer authorization.
+pub fn requeue_if_current(
+    project_root: &Path,
+    work_item_id: &str,
+    dispatch_id: &str,
+    generation: u64,
+    clear_binding: bool,
+) -> Result<bool> {
+    mutate_latest_if_current(
+        project_root,
+        work_item_id,
+        dispatch_id,
+        generation,
+        |dispatch| {
+            let changed = dispatch.status != DispatchStatus::Queued
+                || dispatch.claimed_at.is_some()
+                || (clear_binding && dispatch.bound_attempt_id.is_some());
+            if !changed {
+                return Ok(false);
+            }
+            dispatch.status = DispatchStatus::Queued;
+            dispatch.claimed_at = None;
+            if clear_binding {
+                dispatch.bound_attempt_id = None;
+            }
+            dispatch.generation += 1;
+            Ok(true)
+        },
+    )
+}
+
 /// Force the latest dispatch to a terminal disposition during recovery, without
 /// a matching token. Used to reconcile a stale claim from its Attempt's outcome
 /// or to reflect a human-resumed suspension.
@@ -1530,6 +1563,33 @@ pub fn reconcile_active(
     })
 }
 
+/// Reconcile the named dispatch only if it is still the same latest dispatch
+/// the caller inspected. This is the generation-checked form used by
+/// scheduler recovery after it reads Work-model state without holding the
+/// queue lock.
+pub fn reconcile_if_current(
+    project_root: &Path,
+    work_item_id: &str,
+    dispatch_id: &str,
+    generation: u64,
+    status: DispatchStatus,
+) -> Result<bool> {
+    mutate_latest_if_current(
+        project_root,
+        work_item_id,
+        dispatch_id,
+        generation,
+        |dispatch| {
+            if dispatch.status == status {
+                return Ok(false);
+            }
+            dispatch.status = status;
+            dispatch.generation += 1;
+            Ok(true)
+        },
+    )
+}
+
 /// Block the latest dispatch with a reason, leaving it as durable evidence for
 /// operator inspection.
 pub fn block_active(project_root: &Path, work_item_id: &str, reason: &str) -> Result<()> {
@@ -1540,6 +1600,35 @@ pub fn block_active(project_root: &Path, work_item_id: &str, reason: &str) -> Re
     })
 }
 
+/// Block the named dispatch only if it is still the same latest dispatch the
+/// caller inspected. A concurrent queue operation makes the operation a
+/// no-op, preserving the newer dispatch for its own reconciliation.
+pub fn block_if_current(
+    project_root: &Path,
+    work_item_id: &str,
+    dispatch_id: &str,
+    generation: u64,
+    reason: &str,
+) -> Result<bool> {
+    mutate_latest_if_current(
+        project_root,
+        work_item_id,
+        dispatch_id,
+        generation,
+        |dispatch| {
+            if dispatch.status == DispatchStatus::Blocked
+                && dispatch.blocked_reason.as_deref() == Some(reason)
+            {
+                return Ok(false);
+            }
+            dispatch.status = DispatchStatus::Blocked;
+            dispatch.blocked_reason = Some(reason.to_string());
+            dispatch.generation += 1;
+            Ok(true)
+        },
+    )
+}
+
 /// Cancel the latest dispatch — used when queued Work becomes abandoned before
 /// any Attempt is created.
 pub fn cancel_active(project_root: &Path, work_item_id: &str) -> Result<()> {
@@ -1547,6 +1636,31 @@ pub fn cancel_active(project_root: &Path, work_item_id: &str) -> Result<()> {
         dispatch.status = DispatchStatus::Canceled;
         dispatch.generation += 1;
     })
+}
+
+/// Cancel the named dispatch only if it is still the same latest dispatch the
+/// caller inspected. A concurrent queue operation makes the operation a
+/// no-op, preserving the newer dispatch for its own reconciliation.
+pub fn cancel_if_current(
+    project_root: &Path,
+    work_item_id: &str,
+    dispatch_id: &str,
+    generation: u64,
+) -> Result<bool> {
+    mutate_latest_if_current(
+        project_root,
+        work_item_id,
+        dispatch_id,
+        generation,
+        |dispatch| {
+            if dispatch.status == DispatchStatus::Canceled {
+                return Ok(false);
+            }
+            dispatch.status = DispatchStatus::Canceled;
+            dispatch.generation += 1;
+            Ok(true)
+        },
+    )
 }
 
 fn mutate_latest(
@@ -1565,6 +1679,31 @@ fn mutate_latest(
     mutate(dispatch);
     write_ledger(project_root, &ledger)?;
     Ok(())
+}
+
+fn mutate_latest_if_current(
+    project_root: &Path,
+    work_item_id: &str,
+    dispatch_id: &str,
+    generation: u64,
+    mutate: impl FnOnce(&mut Dispatch) -> Result<bool>,
+) -> Result<bool> {
+    let _lock = lock_queue(project_root)?;
+    let mut ledger = match read_ledger(project_root, work_item_id)? {
+        Some(ledger) => ledger,
+        None => return Ok(false),
+    };
+    let Some(dispatch) = ledger.dispatches.last_mut() else {
+        return Ok(false);
+    };
+    if dispatch.dispatch_id != dispatch_id || dispatch.generation != generation {
+        return Ok(false);
+    }
+    let changed = mutate(dispatch)?;
+    if changed {
+        write_ledger(project_root, &ledger)?;
+    }
+    Ok(changed)
 }
 
 fn with_matching_active(
@@ -2957,6 +3096,40 @@ mod tests {
 
         let result = reconcile(dir.path(), &token, DispatchStatus::Failed);
         assert!(result.is_err(), "stale generation must fail closed");
+    }
+
+    #[test]
+    fn recovery_update_ignores_a_replaced_dispatch_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_ready_work_item(dir.path(), "wi-1");
+        add(dir.path(), "wi-1", None).unwrap();
+        let first = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        let first = first.latest().unwrap().clone();
+
+        // A different recovery operation changes the same dispatch before the
+        // first reader attempts to apply its older observation.
+        reconcile_active(dir.path(), "wi-1", DispatchStatus::NeedsUser).unwrap();
+
+        assert!(
+            !reconcile_if_current(
+                dir.path(),
+                "wi-1",
+                &first.dispatch_id,
+                first.generation,
+                DispatchStatus::Failed,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            read_ledger(dir.path(), "wi-1")
+                .unwrap()
+                .unwrap()
+                .latest()
+                .unwrap()
+                .status,
+            DispatchStatus::NeedsUser
+        );
     }
 
     #[test]

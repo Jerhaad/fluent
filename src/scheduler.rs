@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::fs::{FlockOperation, flock};
 
 use crate::lease::{self, TaskLease};
-use crate::queue::{self, Dispatch, DispatchStatus, DispatchToken};
+use crate::queue::{self, Dispatch, DispatchIntent, DispatchStatus, DispatchToken};
 use crate::scheduler_service::BuildIdentity;
 use crate::work_model::{AttemptStatus, WorkModelStore};
 
@@ -410,17 +410,11 @@ pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
             continue;
         };
         let result = match dispatch.status {
-            DispatchStatus::Queued => reconcile_queued(project_root, &work_item_id),
-            DispatchStatus::Claimed | DispatchStatus::Running => reconcile_claim(
-                project_root,
-                &work_item_id,
-                dispatch.bound_attempt_id.as_deref(),
-            ),
-            DispatchStatus::NeedsUser => reconcile_suspension(
-                project_root,
-                &work_item_id,
-                dispatch.bound_attempt_id.as_deref(),
-            ),
+            DispatchStatus::Queued => reconcile_queued(project_root, dispatch),
+            DispatchStatus::Claimed | DispatchStatus::Running => {
+                reconcile_claim(project_root, dispatch)
+            }
+            DispatchStatus::NeedsUser => reconcile_suspension(project_root, dispatch),
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -430,30 +424,141 @@ pub fn recover_and_reconcile(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reconcile a queue dispatch after a foreground `fluent attempt run` has
+/// advanced the exact bound Attempt. Direct runs do not claim a queue entry,
+/// so without this small boundary the queue can keep showing an old
+/// `needs-user` pause (or a queued resume) after the Attempt has completed.
+///
+/// The operation is deliberately limited to the dispatch bound to the exact
+/// Attempt just run. A live scheduler claim is left to its owning worker, and
+/// a changed dispatch is ignored by the generation-checked queue update.
+pub fn reconcile_direct_attempt(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let Some(ledger) = queue::read_ledger(project_root, work_item_id)? else {
+        return Ok(());
+    };
+    let Some(dispatch) = ledger.latest().cloned() else {
+        return Ok(());
+    };
+    if dispatch.bound_attempt_id.as_deref() != Some(attempt_id)
+        || matches!(
+            dispatch.status,
+            DispatchStatus::Claimed | DispatchStatus::Running
+        )
+    {
+        return Ok(());
+    }
+
+    let store = WorkModelStore::new(project_root);
+    let item = store.read_work_item(work_item_id)?;
+    match bound_attempt_terminal_status_for_item(&item, attempt_id) {
+        BoundAttemptState::Terminal(status) => {
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
+        }
+        BoundAttemptState::Nonterminal => {
+            let should_requeue = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::Planned
+                        && !attempt
+                            .tasks
+                            .iter()
+                            .any(|task| task.status == crate::work_model::TaskStatus::Executing)
+                });
+            if should_requeue && dispatch.status == DispatchStatus::NeedsUser {
+                let _ = queue::requeue_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                    false,
+                )?;
+            }
+        }
+        BoundAttemptState::Unbound => {}
+    }
+    Ok(())
+}
+
 /// A queued dispatch that has since become abandoned is canceled; one that
 /// references missing, malformed, or non-executable Work is blocked. Both leave
 /// other eligible entries untouched.
-fn reconcile_queued(project_root: &Path, work_item_id: &str) -> Result<()> {
+fn reconcile_queued(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
     let store = WorkModelStore::new(project_root);
     match store.read_work_item(work_item_id) {
         Ok(item) => {
             if item.abandonment.is_some() {
-                queue::cancel_active(project_root, work_item_id)?;
-            } else if item.authorization.is_proposed() {
-                queue::block_active(
+                let _ = queue::cancel_if_current(
                     project_root,
                     work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                )?;
+            } else if item.authorization.is_proposed() {
+                let _ = queue::block_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
                     "Work Item is not execution-ready",
                 )?;
+            } else if let Some(attempt_id) = dispatch.bound_attempt_id.as_deref() {
+                // A foreground `attempt run` may finish a queued, bound
+                // resume before a coordinator gets to claim it. Reconcile
+                // that durable outcome instead of launching the same Attempt
+                // a second time.
+                if let BoundAttemptState::Terminal(status) =
+                    bound_attempt_terminal_status_for_item(&item, attempt_id)
+                {
+                    // A queued explicit resume is still waiting for the
+                    // scheduler when the Attempt remains paused. A normal
+                    // dispatch, however, may have been run in the foreground
+                    // and then paused again; record that outcome instead of
+                    // trying to launch it a second time.
+                    if status != DispatchStatus::NeedsUser || dispatch.intent == DispatchIntent::Run
+                    {
+                        let _ = queue::reconcile_if_current(
+                            project_root,
+                            work_item_id,
+                            &dispatch.dispatch_id,
+                            dispatch.generation,
+                            status,
+                        )?;
+                    }
+                }
             }
             Ok(())
         }
         Err(error) if is_missing(&error) => {
-            queue::block_active(project_root, work_item_id, "Work Item not found")?;
+            let _ = queue::block_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                "Work Item not found",
+            )?;
             Ok(())
         }
         Err(_) => {
-            queue::block_active(project_root, work_item_id, "Work Item could not be read")?;
+            let _ = queue::block_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                "Work Item could not be read",
+            )?;
             Ok(())
         }
     }
@@ -464,42 +569,108 @@ fn reconcile_queued(project_root: &Path, work_item_id: &str) -> Result<()> {
 /// terminal Attempt reconciles the dispatch from its outcome, and a nonterminal
 /// Attempt returns to `queued` with its binding preserved so the same Attempt
 /// resumes.
-fn reconcile_claim(
-    project_root: &Path,
-    work_item_id: &str,
-    bound_attempt_id: Option<&str>,
-) -> Result<()> {
+fn reconcile_claim(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
     if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
         return Ok(());
     }
 
-    match bound_attempt_terminal_status(project_root, work_item_id, bound_attempt_id)? {
+    match bound_attempt_terminal_status(
+        project_root,
+        work_item_id,
+        dispatch.bound_attempt_id.as_deref(),
+    )? {
         BoundAttemptState::Unbound => {
-            queue::requeue_active(project_root, work_item_id, true)?;
+            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+                return Ok(());
+            }
+            let _ = queue::requeue_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                true,
+            )?;
         }
         BoundAttemptState::Nonterminal => {
-            queue::requeue_active(project_root, work_item_id, false)?;
+            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+                return Ok(());
+            }
+            let _ = queue::requeue_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                false,
+            )?;
         }
         BoundAttemptState::Terminal(status) => {
-            queue::reconcile_active(project_root, work_item_id, status)?;
+            if lease::is_leased(&queue::dispatch_lease_path(project_root, work_item_id)) {
+                return Ok(());
+            }
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
         }
     }
     Ok(())
 }
 
 /// A needs-user dispatch whose bound Attempt has been resumed to a new terminal
-/// outcome reconciles to that outcome; one still suspended is left untouched.
-fn reconcile_suspension(
-    project_root: &Path,
-    work_item_id: &str,
-    bound_attempt_id: Option<&str>,
-) -> Result<()> {
-    if let BoundAttemptState::Terminal(status) =
-        bound_attempt_terminal_status(project_root, work_item_id, bound_attempt_id)?
-    {
-        if status != DispatchStatus::NeedsUser {
-            queue::reconcile_active(project_root, work_item_id, status)?;
+/// outcome reconciles to that outcome; a reopened, idle Attempt returns the
+/// dispatch to `queued`; one still suspended is left untouched.
+fn reconcile_suspension(project_root: &Path, dispatch: &Dispatch) -> Result<()> {
+    let work_item_id = &dispatch.work_item_id;
+    match bound_attempt_terminal_status(
+        project_root,
+        work_item_id,
+        dispatch.bound_attempt_id.as_deref(),
+    )? {
+        BoundAttemptState::Terminal(status) if status != DispatchStatus::NeedsUser => {
+            let _ = queue::reconcile_if_current(
+                project_root,
+                work_item_id,
+                &dispatch.dispatch_id,
+                dispatch.generation,
+                status,
+            )?;
         }
+        BoundAttemptState::Nonterminal => {
+            // A direct foreground resume clears the Attempt pause before it
+            // starts the next Writer. If that run exits or is interrupted in
+            // this planned state, return the old suspension dispatch to the
+            // queue so the scheduler can continue the same Attempt.
+            let Some(attempt_id) = dispatch.bound_attempt_id.as_deref() else {
+                return Ok(());
+            };
+            let store = WorkModelStore::new(project_root);
+            let item = store.read_work_item(work_item_id)?;
+            let should_requeue = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .is_some_and(|attempt| {
+                    attempt.status == AttemptStatus::Planned
+                        && !attempt
+                            .tasks
+                            .iter()
+                            .any(|task| task.status == crate::work_model::TaskStatus::Executing)
+                });
+            if should_requeue {
+                let _ = queue::requeue_if_current(
+                    project_root,
+                    work_item_id,
+                    &dispatch.dispatch_id,
+                    dispatch.generation,
+                    false,
+                )?;
+            }
+        }
+        BoundAttemptState::Unbound | BoundAttemptState::Terminal(_) => {}
     }
     Ok(())
 }
@@ -520,18 +691,28 @@ fn bound_attempt_terminal_status(
     };
     let store = WorkModelStore::new(project_root);
     let item = store.read_work_item(work_item_id)?;
-    let Some(attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
+    let Some(_attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
         // The binding was recorded but the Attempt was never created.
         return Ok(BoundAttemptState::Unbound);
     };
-    Ok(match attempt.status {
+    Ok(bound_attempt_terminal_status_for_item(&item, attempt_id))
+}
+
+fn bound_attempt_terminal_status_for_item(
+    item: &crate::work_model::WorkItem,
+    attempt_id: &str,
+) -> BoundAttemptState {
+    let Some(attempt) = item.attempts.iter().find(|a| a.id == attempt_id) else {
+        return BoundAttemptState::Unbound;
+    };
+    match attempt.status {
         AttemptStatus::Complete => BoundAttemptState::Terminal(
             classify_persisted_attempt(&item, attempt_id).to_dispatch_status(),
         ),
         AttemptStatus::Failed => BoundAttemptState::Terminal(DispatchStatus::Failed),
         AttemptStatus::NeedsUser => BoundAttemptState::Terminal(DispatchStatus::NeedsUser),
         _ => BoundAttemptState::Nonterminal,
-    })
+    }
 }
 
 fn is_missing(error: &crate::work_model::WorkModelStorageError) -> bool {
@@ -1057,7 +1238,7 @@ fn sleep_until_shutdown(
 pub(crate) mod test_support {
     use super::*;
     use crate::work_model::{
-        AttemptReviewState, TaskOutput, TaskStatus, WorkspaceAccess, WorkspaceRef,
+        AttemptReviewState, TaskOutput, TaskStatus, WorkItem, WorkspaceAccess, WorkspaceRef,
     };
     use std::fs;
     use std::sync::Mutex;
@@ -1134,6 +1315,13 @@ pub(crate) mod test_support {
             format!(r#"{{"id": "{id}", "title": "Test"}}"#),
         )
         .unwrap();
+    }
+
+    pub fn write_planned_attempt(tmp: &Path, id: &str, attempt_id: &str) {
+        let store = WorkModelStore::new(tmp);
+        let mut item = WorkItem::planned(id, "Test");
+        item.add_initial_attempt(attempt_id).unwrap();
+        store.create_work_item(&item).unwrap();
     }
 
     /// Drive a bound write Attempt to `Complete` + passing review with a Merge
@@ -2070,6 +2258,146 @@ mod tests {
             DispatchStatus::CandidateReady
         );
         assert_eq!(store.read_work_item("wi-1").unwrap().attempts.len(), 1);
+    }
+
+    #[test]
+    fn queued_resume_reconciles_after_foreground_attempt_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-foreground", "attempt-1");
+        add_queued(dir.path(), "wi-foreground", 0);
+        queue::claim(dir.path(), "wi-foreground", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-foreground", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-foreground", DispatchStatus::NeedsUser).unwrap();
+
+        // Authorize a scheduler resume, then let a foreground `attempt run`
+        // finish the same Attempt before the scheduler claims that dispatch.
+        queue::resume(dir.path(), "wi-foreground", "attempt-1", None).unwrap();
+        make_attempt_pass_with_candidate(dir.path(), "wi-foreground", "attempt-1");
+
+        // The foreground command reconciles its bound queue entry immediately;
+        // a later scheduler restart is therefore a harmless no-op.
+        reconcile_direct_attempt(dir.path(), "wi-foreground", "attempt-1").unwrap();
+        assert_eq!(
+            latest_status(dir.path(), "wi-foreground"),
+            DispatchStatus::CandidateReady
+        );
+
+        recover_and_reconcile(dir.path()).unwrap();
+        recover_and_reconcile(dir.path()).unwrap();
+
+        let ledger = queue::read_ledger(dir.path(), "wi-foreground")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::CandidateReady);
+        assert!(ledger.active().is_none());
+        assert_eq!(
+            classify_attempt_outcome(dir.path(), "wi-foreground", "attempt-1").unwrap(),
+            AttemptOutcome::CandidateReady
+        );
+    }
+
+    #[test]
+    fn suspended_dispatch_requeues_after_foreground_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-reopen", "attempt-1");
+        add_queued(dir.path(), "wi-reopen", 0);
+        queue::claim(dir.path(), "wi-reopen", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-reopen", "attempt-1");
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-reopen", |item| {
+                item.attempts[0].completed_at = Some("2026-08-19T00:00:00Z".to_string());
+                Ok(())
+            })
+            .unwrap();
+        queue::reconcile_active(dir.path(), "wi-reopen", DispatchStatus::NeedsUser).unwrap();
+
+        // This is the state written by a direct `attempt run` immediately
+        // after it reopens a Writer-completion pause.
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-reopen", |item| {
+                crate::work_model::reopen_attempt(&mut item.attempts[0]);
+                Ok(())
+            })
+            .unwrap();
+
+        let store = WorkModelStore::new(dir.path());
+        let reopened = store.read_work_item("wi-reopen").unwrap();
+        assert_eq!(reopened.attempts[0].status, AttemptStatus::Planned);
+        assert!(reopened.attempts[0].completed_at.is_none());
+
+        // A direct resume that reopens the paused Attempt returns its old
+        // suspension dispatch to the queue before the scheduler is restarted.
+        reconcile_direct_attempt(dir.path(), "wi-reopen", "attempt-1").unwrap();
+        let active = active_dispatch(dir.path(), "wi-reopen");
+        assert_eq!(active.status, DispatchStatus::Queued);
+        assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        recover_and_reconcile(dir.path()).unwrap();
+        let active = active_dispatch(dir.path(), "wi-reopen");
+        assert_eq!(active.status, DispatchStatus::Queued);
+        assert_eq!(active.bound_attempt_id.as_deref(), Some("attempt-1"));
+
+        dispatch_one(dir.path(), &active, &PassingRunner).unwrap();
+        assert_eq!(
+            latest_status(dir.path(), "wi-reopen"),
+            DispatchStatus::CandidateReady
+        );
+        let final_item = store.read_work_item("wi-reopen").unwrap();
+        assert_eq!(final_item.attempts.len(), 1);
+        assert_eq!(final_item.attempts[0].status, AttemptStatus::Complete);
+    }
+
+    #[test]
+    fn direct_resume_that_pauses_again_settles_its_queued_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_planned_attempt(dir.path(), "wi-pauses-again", "attempt-1");
+        add_queued(dir.path(), "wi-pauses-again", 0);
+        queue::claim(dir.path(), "wi-pauses-again", "attempt-1")
+            .unwrap()
+            .unwrap();
+        suspend_bound_attempt(dir.path(), "wi-pauses-again", "attempt-1");
+        queue::reconcile_active(dir.path(), "wi-pauses-again", DispatchStatus::NeedsUser).unwrap();
+        queue::resume(dir.path(), "wi-pauses-again", "attempt-1", None).unwrap();
+
+        // Simulate a direct resume that reopens the Attempt and then reaches a
+        // second needs-user pause before the foreground command returns.
+        WorkModelStore::new(dir.path())
+            .mutate_work_item("wi-pauses-again", |item| {
+                let attempt = &mut item.attempts[0];
+                crate::work_model::reopen_attempt(attempt);
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::WriterCompletion);
+                attempt.tasks[0].status = TaskStatus::NeedsUser;
+                Ok(())
+            })
+            .unwrap();
+
+        reconcile_direct_attempt(dir.path(), "wi-pauses-again", "attempt-1").unwrap();
+        let ledger = queue::read_ledger(dir.path(), "wi-pauses-again")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.dispatches[1].status, DispatchStatus::NeedsUser);
+
+        let before_repeat = ledger.clone();
+        reconcile_direct_attempt(dir.path(), "wi-pauses-again", "attempt-1").unwrap();
+        assert_eq!(
+            queue::read_ledger(dir.path(), "wi-pauses-again")
+                .unwrap()
+                .unwrap(),
+            before_repeat,
+            "repeating direct reconciliation does not change queue history"
+        );
     }
 
     #[test]

@@ -3504,6 +3504,15 @@ resume dispatch. The scheduler later launches the bound Attempt through the
 ordinary Attempt loop, which revalidates the frontier before reopening only the
 uncertain roles.
 
+A foreground `fluent attempt run` does not claim a queue dispatch. After the
+run returns, Fluent checks the latest dispatch bound to that exact Attempt and
+reconciles it from the Attempt's durable result: a completed or failed Attempt
+settles the dispatch, while a reopened planned Attempt with no executing Task
+returns a prior `needs-user` dispatch to `queued`. A live `claimed` or
+`running` dispatch is left to its scheduler worker. The update names the
+dispatch generation that was read, so a concurrent resume or queue mutation is
+left untouched rather than being overwritten by the foreground command.
+
 A pending evidence-targeted Review is also resumed through that exact Attempt
 binding, even when its preceding dispatch is `blocked`; this includes the brief
 frontier where the Review Task is complete but its verdict has not yet been
@@ -3654,6 +3663,8 @@ that same Attempt; a stale claim whose bound Attempt became terminal
 reconciles the dispatch from that outcome without rerunning it; an
 interrupted claim with no bound Attempt returns to `queued` and creates
 at most one Attempt on the next claim.
+The same generation check is used after a foreground `attempt run`, so an
+already-replaced queue dispatch remains the authority for its own recovery.
 
 When an Attempt terminates, the coordinator reconciles the dispatch and
 releases its claim. It sets `candidate-ready` only when the Attempt's pending

@@ -5482,6 +5482,17 @@ IF a durable stop request names an earlier coordinator instance, THEN THE SYSTEM
 SHALL keep the replacement coordinator running.
 Test: src/scheduler.rs (stale_stop_request_cannot_stop_replacement_instance)
 
+### B17
+
+WHEN a foreground `fluent attempt run` advances an Attempt that is bound to a
+queued or `needs-user` dispatch, THE SYSTEM SHALL reconcile that dispatch from
+the same Attempt outcome before the command returns. If the Attempt is
+reopened and remains planned without an executing Task, THE SYSTEM SHALL
+return the bound dispatch to `queued`; a live `claimed` or `running` dispatch
+remains owned by its scheduler worker.
+Test: src/scheduler.rs (queued_resume_reconciles_after_foreground_attempt_finishes)
+Test: src/scheduler.rs (suspended_dispatch_requeues_after_foreground_reopen)
+
 ## Scheduler cross-cutting
 
 ### B1

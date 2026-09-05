@@ -1191,6 +1191,11 @@ fn cmd_attempt(
                 tester_no_sandbox,
                 coder_mapping_inputs: cli_inputs.has_run_overrides().then_some(&cli_inputs),
             })?;
+            // A foreground Attempt does not claim a scheduler dispatch. If it
+            // advances an Attempt that was previously paused by the scheduler,
+            // reconcile that exact queue entry before printing status hints so
+            // direct and queued recovery expose the same durable outcome.
+            fluent::scheduler::reconcile_direct_attempt(project_root, &work_item_id, &attempt_id)?;
             // Resolve the runtime context the guidance hints need — why the
             // Attempt paused, which coder to re-authenticate, and where its latest
             // review verdicts live — from the persisted Attempt.
