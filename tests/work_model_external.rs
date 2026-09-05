@@ -638,6 +638,7 @@ fn work_model_store_writes_deterministic_pretty_json() {
     assert_eq!(
         content,
         r#"{
+  "schema_version": 1,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": "0.3.0"
@@ -684,6 +685,7 @@ fn capture_mode_preserves_minimal_work_item_json() {
     assert_eq!(
         content,
         r#"{
+  "schema_version": 1,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": "0.3.0"
