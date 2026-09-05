@@ -6929,7 +6929,8 @@ fn gate_candidate_after_writer(
 /// Select the one prior candidate gate that this Writer may use as correction
 /// authority. Work Item inputs remain context even when their snapshot names
 /// end in `candidate-gate.json`; every other gate-shaped input must bind an
-/// earlier completed Writer and that Writer's exact managed gate path.
+/// earlier completed Writer and either that Writer's gate or the canonical
+/// final-Tester gate for that exact Writer candidate.
 fn select_prior_writer_candidate_gate(
     attempt: &Attempt,
     write_index: usize,
@@ -6948,9 +6949,10 @@ fn select_prior_writer_candidate_gate(
         if input.producer_id == "work-item" {
             continue;
         }
-        let Some(producer) = attempt.tasks[..write_index]
+        let Some((producer_index, producer)) = attempt.tasks[..write_index]
             .iter()
-            .find(|candidate| candidate.id == input.producer_id)
+            .enumerate()
+            .find(|(_, candidate)| candidate.id == input.producer_id)
         else {
             bail!(
                 "Writer Task {:?} prior candidate gate names producer {:?}, which is not an earlier Task in Attempt {:?}",
@@ -6973,7 +6975,7 @@ fn select_prior_writer_candidate_gate(
                 attempt.id
             );
         }
-        let expected_path = work_artifact_path(
+        let expected_writer_path = work_artifact_path(
             &attempt.work_item_id,
             &attempt.id,
             &format!(
@@ -6982,12 +6984,19 @@ fn select_prior_writer_candidate_gate(
                 crate::candidate_gate::CANDIDATE_GATE_FILE
             ),
         );
-        if input.path != expected_path {
+        if input.path != expected_writer_path
+            && !is_canonical_final_tester_gate_for_writer(
+                attempt,
+                write_index,
+                producer_index,
+                producer,
+                input,
+            )
+        {
             bail!(
-                "Writer Task {:?} prior candidate gate for producer {:?} must use canonical path {:?}, found {:?}",
+                "Writer Task {:?} prior candidate gate for producer {:?} must use its canonical Writer or final-Tester path, found {:?}",
                 task.id,
                 producer.id,
-                expected_path,
                 input.path
             );
         }
@@ -7000,6 +7009,65 @@ fn select_prior_writer_candidate_gate(
     }
 
     Ok(selected)
+}
+
+fn is_canonical_final_tester_gate_for_writer(
+    attempt: &Attempt,
+    write_index: usize,
+    producer_index: usize,
+    producer: &Task,
+    input: &ArtifactRef,
+) -> bool {
+    let Some(output) = producer.output.as_ref() else {
+        return false;
+    };
+    attempt.tasks[producer_index + 1..write_index]
+        .iter()
+        .enumerate()
+        .any(|(offset, tester)| {
+            let tester_index = producer_index + 1 + offset;
+            let expected_gate_path = work_artifact_path(
+                &attempt.work_item_id,
+                &attempt.id,
+                &format!(
+                    "candidate-gates/{}/{}",
+                    tester.id,
+                    crate::candidate_gate::CANDIDATE_GATE_FILE
+                ),
+            );
+            let expected_artifact_area =
+                work_artifact_path(&attempt.work_item_id, &attempt.id, &tester.id);
+            let latest_writer_id = attempt.tasks[..tester_index]
+                .iter()
+                .rev()
+                .find(|task| {
+                    task.kind == TaskKind::Write
+                        && task.status == TaskStatus::Complete
+                        && task.output.is_some()
+                })
+                .map(|task| task.id.as_str());
+            let context_matches = tester.review_context.as_ref().is_some_and(|context| {
+                context.candidate_workspace_id == output.workspace_id
+                    && context.candidate_workspace_path == output.workspace_path
+                    && context.source_branch == output.source_branch
+                    && context.candidate_commit == output.commit
+                    && context.base_commit.is_none()
+            });
+
+            input.path == expected_gate_path
+                && tester.kind == TaskKind::Tester
+                && tester.role == "tester"
+                && tester.status == TaskStatus::Complete
+                && !tester.is_failed_command_recheck()
+                && tester.work_item_id == attempt.work_item_id
+                && tester.attempt_id.as_deref() == Some(attempt.id.as_str())
+                && tester
+                    .artifact_area
+                    .as_ref()
+                    .is_some_and(|area| area.path == expected_artifact_area)
+                && latest_writer_id == Some(producer.id.as_str())
+                && context_matches
+        })
 }
 
 /// Validate the exact final Tester identities before Fluent creates a Merge
@@ -12064,6 +12132,74 @@ mod tests {
                 .rev()
                 .take_while(|task| { task.kind != TaskKind::Write })
                 .all(|task| task.kind != TaskKind::Review)
+        );
+    }
+
+    #[test]
+    fn final_tester_gate_selection_requires_exact_tester_binding() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+
+        let outcome = interpret_reviews(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+            true,
+            None,
+        )
+        .unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+            panic!("failed final evidence must plan a corrective Writer")
+        };
+        let item = store.read_work_item("work-1").unwrap();
+        let write_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.id == task_id)
+            .unwrap();
+        let final_gate = item.attempts[0].tasks[write_index]
+            .input_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact
+                    .path
+                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
+            })
+            .unwrap();
+
+        assert_eq!(
+            select_prior_writer_candidate_gate(&item.attempts[0], write_index).unwrap(),
+            Some(final_gate)
+        );
+
+        let tester_index = item.attempts[0]
+            .tasks
+            .iter()
+            .position(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let mut wrong_context = item.clone();
+        wrong_context.attempts[0].tasks[tester_index]
+            .review_context
+            .as_mut()
+            .unwrap()
+            .candidate_commit
+            .push_str("-other");
+        assert!(
+            select_prior_writer_candidate_gate(&wrong_context.attempts[0], write_index).is_err()
+        );
+
+        let mut wrong_artifact_area = item;
+        wrong_artifact_area.attempts[0].tasks[tester_index]
+            .artifact_area
+            .as_mut()
+            .unwrap()
+            .path
+            .push_str("-other");
+        assert!(
+            select_prior_writer_candidate_gate(&wrong_artifact_area.attempts[0], write_index)
+                .is_err()
         );
     }
 
