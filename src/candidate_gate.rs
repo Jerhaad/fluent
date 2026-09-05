@@ -1431,7 +1431,11 @@ impl TestReference {
     }
 
     fn source_contains_selector(&self, source: &str) -> bool {
-        if self.path.ends_with(".rs") {
+        if self.path.ends_with(".sh") {
+            // A shell script is one native test; its parenthetical describes
+            // coverage and need not appear in the committed script.
+            true
+        } else if self.path.ends_with(".rs") {
             // Rust declares modules separately from the test function. The
             // final evidence check resolves its full native qualification.
             self.rust_identity()
@@ -1801,6 +1805,11 @@ fn test_result_matches_reference(
     test: &crate::tester::TestResult,
     reference: &TestReference,
 ) -> bool {
+    if reference.path.ends_with(".sh") {
+        // The structured result's harness label is project-defined. Only the
+        // exact script path identifies this test, never its coverage prose.
+        return test.id == reference.path;
+    }
     if reference.path.ends_with(".rs") && reference.selector.is_some() {
         return reference.rust_identity().is_some_and(|expected| {
             RustTestIdentity::parse(&test.id)
@@ -3581,6 +3590,131 @@ mod tests {
         assert_eq!(
             check(&evidence, "tester-reference-evidence").status,
             CandidateCheckStatus::Passed
+        );
+    }
+
+    #[test]
+    fn matches_shell_script_without_description_literals() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/lifecycle.sh",
+            "#!/bin/sh\nset -eu\nexit 0\n",
+            "Add lifecycle script\n\n- Exercise lifecycle commands",
+        );
+        let contract = behavior_contract("tests/lifecycle.sh (help documents drain lifecycle)");
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let source_gate =
+            run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                .unwrap();
+        assert_eq!(
+            source_gate.disposition,
+            CandidateGateDisposition::Passed,
+            "{source_gate:#?}"
+        );
+        assert_eq!(
+            check(&source_gate, "tester-reference-evidence").status,
+            CandidateCheckStatus::Skipped
+        );
+
+        for harness in ["shell-harness", "project lifecycle checks"] {
+            for (path, status, accepted) in [
+                ("tests/lifecycle.sh", "pass", true),
+                ("tests/other.sh", "pass", false),
+                ("lifecycle.sh", "pass", false),
+                ("tests/./lifecycle.sh", "pass", false),
+                (
+                    "tests/lifecycle.sh (help documents drain lifecycle)",
+                    "pass",
+                    false,
+                ),
+                ("help documents drain lifecycle", "pass", false),
+                ("tests/lifecycle.sh", "fail", false),
+                ("tests/lifecycle.sh", "skipped", false),
+            ] {
+                let results = serde_json::json!({
+                    "candidate_commit": candidate,
+                    "commands": [],
+                    "tests": [{"id": path, "test_harness": harness, "status": status}],
+                    "summary": {"total": 1, "pass": usize::from(status == "pass"), "fail": usize::from(status == "fail"), "skipped": usize::from(status == "skipped")},
+                    "error": null
+                });
+                fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+                let mut request =
+                    fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+                request.phase = CandidateGatePhase::FinalTester;
+                let evidence = run_candidate_gate(request).unwrap();
+                assert_eq!(
+                    check(&evidence, "behavior-references").status,
+                    CandidateCheckStatus::Passed
+                );
+                assert_eq!(
+                    evidence.disposition,
+                    if accepted {
+                        CandidateGateDisposition::Passed
+                    } else {
+                        CandidateGateDisposition::Rejected
+                    },
+                    "{harness}, {path}, {status}: {evidence:#?}"
+                );
+                let preserved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&tester).unwrap()).unwrap();
+                assert_eq!(preserved, results);
+            }
+        }
+
+        // A passing path-shaped result cannot replace a committed script.
+        let missing = behavior_contract("tests/missing.sh (help documents drain lifecycle)");
+        let mut results = serde_json::json!({
+            "candidate_commit": candidate,
+            "commands": [],
+            "tests": [{"id": "tests/missing.sh", "test_harness": "shell-harness", "status": "pass"}],
+            "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0},
+            "error": null
+        });
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&missing),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+        assert_eq!(
+            check(&evidence, "behavior-references").status,
+            CandidateCheckStatus::Failed
+        );
+        assert!(
+            check(&evidence, "behavior-references")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("missing committed test path tests/missing.sh"))
+        );
+
+        // The display label cannot make malformed structured evidence valid.
+        results["tests"][0]["id"] = "tests/lifecycle.sh".into();
+        results["tests"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let evidence = run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &artifact,
+        ))
+        .unwrap();
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Blocked);
+        assert_eq!(
+            check(&evidence, "tester-reference-evidence").status,
+            CandidateCheckStatus::Error
+        );
+        assert!(
+            check(&evidence, "tester-reference-evidence")
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("cannot parse"))
         );
     }
 

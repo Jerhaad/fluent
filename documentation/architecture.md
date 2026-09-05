@@ -435,8 +435,12 @@ identifier; two qualified names must agree in full, as must any paths or
 binaries supplied on both sides. The cheap pre-review source check looks for
 the function identifier because Rust declares modules separately. The final
 evidence check retains the full reference; it does not rewrite references or
-Tester artifacts or maintain an alias registry. Shell selectors use the script
-path because that is the shell harness's native test identity.
+Tester artifacts or maintain an alias registry. For `.sh` references, the exact
+committed script path identifies the test at both gates. A parenthetical such as
+`tests/lifecycle.sh (help documents drain lifecycle)` describes coverage; it
+need not appear in source or result text. The structured result may use a
+project-specific harness display label, but must still name the exact path and
+pass. Applicable reviewers assess whether the script covers the stated behavior.
 Missing selector evidence starts a corrective Writer round and
 invalidates the superseded review and Tester frontier. When the only missing
 evidence is one complete command-shaped `Test:` reference that did not run in

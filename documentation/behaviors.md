@@ -6874,6 +6874,11 @@ approved `Test:` path and native test identifier without introducing aliases.
 Test: src/candidate_gate.rs (rejects_missing_test_paths_and_selectors_without_aliases)
 Test: src/candidate_gate.rs (validates_documented_double_colon_test_references)
 
+WHEN a shell reference names a script with a descriptive parenthetical, THE
+SYSTEM SHALL check the committed script path without requiring that description
+to appear in its source.
+Test: src/candidate_gate.rs (matches_shell_script_without_description_literals)
+
 ### B27
 
 WHEN final structured Tester evidence is available, THE SYSTEM SHALL require a
@@ -6891,6 +6896,11 @@ Example: `src/lib.rs (drain_is_idempotent)` can match
 `src/lib.rs (tests::lifecycle::drain_is_idempotent)`; a different supplied source
 path or conflicting module qualification cannot establish the same identity.
 Test: src/candidate_gate.rs (accepts_equivalent_native_rust_identities)
+
+WHEN a shell result uses its script path as its native identity, THE SYSTEM SHALL
+match that exact committed path regardless of its harness display label, without
+requiring the coverage description in the result.
+Test: src/candidate_gate.rs (matches_shell_script_without_description_literals)
 
 ### B27a
 
