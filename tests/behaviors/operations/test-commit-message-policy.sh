@@ -50,6 +50,7 @@ assert_advised() {
   fi
 }
 
+# commit-message presentation is advisory
 git -C "$FIXTURE" commit --amend -q -m "Add candidate"
 assert_advised "advice: commit-message has no body"
 
@@ -57,6 +58,7 @@ LONG_LINE="- $(printf '%073d' 0)"
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n'"$LONG_LINE"
 assert_advised "advice: commit-message body line exceeds 72 characters"
 
+# provenance and non-presentation failures remain blocking
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n- Explain the candidate\n\nCo-Authored-By: Bot <bot@example.com>'
 assert_rejected "prohibited Co-Authored-By trailer"
 
