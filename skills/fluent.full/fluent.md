@@ -155,16 +155,24 @@ Continue with the same command and Work Item or Attempt.
 Delegated execution runs as a loop until it produces a ready Merge Candidate,
 stops at a Learner failure, or pauses at `needs-user`. Each round:
 
-1. The Writer produces a candidate commit, updates required progress, and fills
-   the host-generated `writer-completion.json` coverage matrix with implementation
-   evidence and focused harness-native verification. Fluent gives every Writer
+1. The Writer produces a candidate commit, updates mutable progress sections, and
+   fills Writer-owned rows and applicable findings in the host-generated
+   `writer-completion.json` matrix with implementation evidence and focused
+   harness-native verification. External rows remain pending with empty evidence;
+   Fluent projects Writer completion into the required progress section.
+   Fluent gives every Writer
    round in the exact Attempt the same confined Cargo dependency cache, seeded
    only with the host's admitted `registry/` and `git/` stores; Writers do not
    use or modify the operator's global Cargo home.
-2. Fluent reconciles required progress and the completion matrix. If approved
-   work remains incomplete, it
-   resumes the same Writer provider session without running the Tester or
-   reviewers. The continuation reads a bounded generated context containing the
+2. Fluent reconciles Writer-owned progress, matrix rows, and applicable findings.
+   If that work remains incomplete and the no-output, regression, stagnation,
+   and structural pause rules permit continuation, it resumes the same Writer
+   provider session without running the Tester or reviewers. When finished
+   Writer work leaves a required host check next, Fluent pauses with the exact
+   candidate, command, and required evidence, including after earlier reviews.
+   Passing host evidence must complete targeted Tests Review; host and later
+   workflow obligations remain required outside Writer completion.
+   The continuation reads a bounded generated context containing the
    exact candidate/base commits, unresolved progress, changed files, current
    deduplicated findings, passing evidence, executed commands, and paths to full
    historical artifacts. If the session identity is unavailable, Fluent starts a
@@ -178,7 +186,8 @@ stops at a Learner failure, or pauses at `needs-user`. Each round:
    current-context artifact, and references full historical evidence by path.
    It saves complete command output under its Task artifact and keeps only
    summaries or relevant failure excerpts in the model conversation.
-4. Once required progress, every matrix row, and deterministic gate are complete,
+4. Once Writer-owned progress and matrix rows, applicable findings, required host
+   evidence with targeted Tests Review, and the deterministic gate are satisfied,
    domain reviewers evaluate the candidate in parallel using the matrix, gate
    artifact, and Writer's focused verification as advisory evidence. After a
    reviewed correction, Fluent reruns failed reviewers plus reviewers whose
@@ -431,21 +440,27 @@ The writer produces tests alongside code. When committing a candidate:
 - Run focused harness-native selections before committing and report the exact
   commands, results, and covered risks. Leave the complete configured suite to
   Fluent's final Tester.
-- Before declaring completion, reconcile every host-generated matrix row with a
-  concrete changed-file reference and focused passing evidence. Do not defer a
-  known boundary, cleanup path, or navigation requirement to reviewers.
+- Before declaring Writer completion, reconcile every Writer-owned matrix row
+  and applicable finding with concrete implementation evidence and focused
+  passing verification. Leave `host`, `review`, `tester`, and `learner` rows
+  pending with empty evidence arrays. Do not defer a known implementation
+  boundary, cleanup path, or navigation requirement to reviewers.
 
-Reviewer Tasks run only after a completed Writer has satisfied the Work Item's
-required-progress contract and task-specific `writer-completion.json`. Fluent
+Ordinary reviewer Tasks run after a completed Writer satisfies its required
+progress, Writer-owned rows, and applicable findings, and any required host
+check has passing candidate-bound evidence accepted by targeted Tests Review. Fluent
 generates immutable rows from the approved behaviors and their existing
 `Test:`/`Untestable:` markers, applicable Approach decisions, structural
 boundaries, and execution guidance, required Plan rows and Verification cells,
 and the current round's open review findings. This references harness-native
 commands; it does not introduce
-another selector vocabulary. The Writer fills concrete implementation evidence,
-passing focused commands, and each finding's applicable behavior or approach
-constraint (or a specific reason none applies). Incomplete work continues on the
-Writer path and does not spend a review or Tester cycle. Domain reviewers inspect
+another selector vocabulary. For Writer-owned rows, the Writer fills concrete
+implementation evidence and passing focused commands. Each finding also names
+an applicable Behavior, Approach, or required Plan constraint (or a specific
+reason none applies). Incomplete Writer work follows the continuation or pause
+rules above. Required host checks use the candidate-bound evidence handoff;
+review, final Tester, and Learner obligations use their existing stage gates.
+Domain reviewers inspect
 the candidate and use the matrix and reported focused checks as advisory evidence
 instead of rerunning the full suite. Only the tests reviewer may run one named
 missing check, using the candidate-keyed shared cache.

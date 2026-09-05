@@ -39,7 +39,7 @@ commit messages without changing the candidate tree. Do not append a commit to
 hide the rejected commits; Fluent rechecks the complete candidate range.
 
 {{#if has_writer_completion_matrix}}
-Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a row complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name an applicable Behavior, Approach, or required Plan row ID, or `["none: <specific reason>"]` when no approved constraint applies. These are the exact allowed IDs for this Attempt:
+Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a Writer-owned row or applicable finding complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name an applicable Behavior, Approach, or required Plan row ID, or `["none: <specific reason>"]` when no approved constraint applies. These are the exact allowed IDs for this Attempt:
 
 {{writer_completion_allowed_constraints}}
 

@@ -173,6 +173,38 @@ boundary does not depend on any of those callers. This keeps the immutable
 candidate, workspace, review, and host-evidence binding contract shared without
 introducing a reciprocal executor-to-host-evidence dependency.
 
+Lifecycle recognition feeds candidate and evidence facts into this boundary.
+The neutral module must not invoke `lifecycle_recovery`, which can itself depend
+on executor services. Authoritative completion selection and ownership-proof
+validation are shared here so host attachment and later Writer materialization
+cannot choose different source matrices.
+
+## Saved ownership approvals preserve exact obligations and identities
+
+An ownership proposal partitions each original required Plan row into ordered
+parts whose text joins back to the original requirement byte for byte. Child
+identities append `:part-N` to the original row ID, and every part retains the
+source-row provenance and verification references. This intentionally requires
+explicit text boundaries: adopting responsibility cannot silently summarize,
+drop, optionalize, or reinterpret approved work. Changing the partition or its
+identities changes durable approval and completion identity and needs a fresh
+approval; it is not a serialization cleanup.
+
+`completion_from` may reuse concrete passing completion only from an identical
+Writer obligation. Host, review, Tester, and Learner parts always remain pending
+in Writer matrices and use their separate evidence gates. Matching text alone
+does not grant completion without the saved approved source and verification.
+Future Writer admission consumes the approved mapping while preserving original
+matrices and completed Task history.
+
+Work record schema 2 is the mutation guard for readers predating responsibility
+assignments. A package version still labeled 0.3.0 cannot provide that guard:
+an older reader could otherwise ignore the new fields and overwrite approved
+meaning. Retain actual pinned-older-executable refusal coverage when changing
+this schema. Reading legacy records or upgrading their syntax does not infer or
+approve ownership; legacy rows retain Writer responsibility until an explicit
+saved-ownership approval adopts a split.
+
 ## Source-correction recovery fails closed on Writer lifecycle
 
 Source-correction classification requires an immutable candidate-bound evidence

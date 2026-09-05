@@ -11539,6 +11539,47 @@ mod tests {
     }
 
     #[test]
+    fn canonical_plan_template_assigns_required_responsibility() {
+        let reference = include_str!("../skills/fluent.full/references/plan-execution.md");
+        let template = reference
+            .split("## Plan format")
+            .nth(1)
+            .unwrap()
+            .split("```markdown\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let mut item = WorkItem::planned("template", "Use the canonical Plan template");
+        item.planning_context = Some(PlanningContext {
+            plan: Some(template.into()),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let contract = item.attempts[0]
+            .writer_completion_contract
+            .as_ref()
+            .unwrap();
+        assert!(!contract.requirements.is_empty());
+        assert!(
+            contract
+                .requirements
+                .iter()
+                .filter(|row| row.kind == WriterCompletionRequirementKind::Plan)
+                .all(|row| row.responsibility.is_some()),
+            "required template rows need explicit responsibility"
+        );
+        assert!(
+            template
+                .lines()
+                .find(|line| line.starts_with("| #"))
+                .unwrap()
+                .ends_with("| Responsibility | Req? |")
+        );
+    }
+
+    #[test]
     fn explicit_plan_responsibility_survives_intake_and_rejects_writer_claims() {
         let mut item = WorkItem::planned("ownership", "Assign required work");
         item.planning_context = Some(PlanningContext {

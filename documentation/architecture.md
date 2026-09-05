@@ -219,7 +219,7 @@ immutable completion contract from approved behavior statements and their existi
 verification markers, Approach choices and execution guidance, and required Plan
 rows and Verification cells. Before each Writer launch the host materializes a
 bounded task-owned `writer-completion.json` matrix from that contract and an
-unchecked `## Required completion` projection from the Plan. Wrapped
+unchecked `## Required completion` projection of Writer-owned Plan rows. Wrapped
 execution-guidance bullets retain every continuation line until the next bullet
 or section. Physical line breaks therefore cannot remove an approved constraint
 from the matrix.
@@ -230,23 +230,30 @@ identity. The row's state and verification prose stay separate. Host evidence
 and later Plan checks use this record instead of searching the prose again.
 Matrices from older Attempts omit the record and go through one explicit
 compatibility parser; an ambiguous legacy row remains paused for correction.
-Planning claims from the prior Writer carry forward; open findings from the
+Planning claims from the prior Writer's authoritative completion matrix carry
+forward, including approved ownership mappings and retained repair lineage.
+The shared resolver validates the approval and its source evidence before using
+those claims; original matrices remain history. Open findings from the
 current review artifacts
 become pending rows identified by stable role-scoped finding identities. The
 Writer may fill only completion state, implementation evidence, passing focused
-commands, and finding-to-constraint mappings. Findings may cite the exact
+commands, and finding-to-constraint mappings for Writer-owned obligations.
+External rows remain pending with empty evidence arrays. Findings may cite the exact
 Behavior, Approach, or required Plan row IDs that the host enumerates in the
 Writer prompt. It does not edit the host-owned
 required-progress projection or choose a second set of test-selector names.
 
 After each completed Writer, the Attempt loop validates the latest Task's matrix
-before it creates any Tester or reviewer Task. An incomplete matrix creates a
-pre-review Writer continuation only when the Writer created a candidate commit and
-the completion count did not regress. Missing or malformed matrices,
+before it creates any Tester or reviewer Task. Incomplete Writer-owned rows or
+applicable findings create a continuation only when the no-output, regression,
+stagnation, and structural pause rules permit it. Once Writer work is complete,
+a required host check pauses with the exact candidate, action, and evidence
+handoff. Passing evidence must complete targeted Tests Review before ordinary
+review and the separate final Tester and Learner gates. Missing or malformed matrices,
 immutable-field edits, unknown constraint references, and pending rows that carry
-completion claims pause for repair. Once every row is valid, the host replaces only
-the required-completion section with exact requirement text from the immutable
-Plan contract and evidence links to the corresponding matrix rows. It preserves
+completion claims pause for repair. Once Writer-owned Plan completion is valid,
+the host replaces only the required-completion section with exact Writer-owned
+requirement text and evidence links to the corresponding matrix rows. It preserves
 separate progress sections and verifies its own projection before planning review.
 A disagreement between the Plan and matrix contracts pauses rather than selecting
 one authority. The valid matrix is attached to every reviewer as an advisory
@@ -596,8 +603,11 @@ input, cached-input, uncached-input, and output tokens, plus warnings when cache
 replay, uncached input, or transcript size crosses the host-owned budget. It
 does not truncate the audit transcript or fail completed model work.
 
-Two consecutive pre-review continuations that create commits without increasing
-either completion count pause for user inspection. A no-change incomplete Writer
+Two consecutive Writer continuations, including after review, that create commits
+without completing additional work against the same obligations pause for user
+inspection. Matrix comparisons use stable requirement and finding identities;
+new findings reset the comparison. Legacy progress compares counts only against
+the same finding identities. A no-change incomplete Writer
 also pauses. A malformed, unknown, duplicate, rewritten, or regressed contract
 pauses for user repair. Only a reconciled candidate reaches
 reviewer planning.
@@ -3812,11 +3822,14 @@ without a matrix retains its counts and compares the finding identities. A new
 commit alone never counts as additional completion.
 
 For a stopped, output-free interrupted continuation, `lifecycle_recovery`
-recognizes the narrow Task sequence and `recovery_contracts` verifies the managed
+recognizes the narrow Task sequence and passes it to `recovery_contracts` to verify the managed
 candidate, approved host row, source completion, and both owner mechanisms.
 Attachment supersedes only that continuation and uses the existing targeted
 Tests Review transition. Shared checks validate the original ownership approval
 and source bytes, attachment digests, exact command, and candidate before
 attachment, foreground resume, queue resume, scheduler claim, and Review launch.
+The canceled continuation must name the preserved pre-adoption source from the
+approval, including validated repair provenance when that source was repaired.
+The neutral boundary does not call lifecycle recognition or its executor callers.
 An active queue retry revalidates evidence before returning its original dispatch.
 Later gates retain their existing order, including capture-mode Learning.

@@ -6467,8 +6467,8 @@ Test: src/work_task_executor.rs (matrix_backed_writer_prompt_keeps_required_prog
 
 ### B2
 
-WHEN every Writer completion row is valid, THE SYSTEM SHALL replace only the
-required-progress section with exact immutable Plan text and matrix evidence
+WHEN Writer-owned Plan completion is valid, THE SYSTEM SHALL replace only the
+required-progress section with exact immutable Writer-owned Plan text and matrix evidence
 references while preserving separate progress sections.
 Test: src/work_attempt_loop.rs (complete_matrix_repairs_writer_progress_before_review)
 Test: src/work_model.rs (completed_matrix_projects_exact_required_progress)
@@ -6587,34 +6587,40 @@ WHEN Fluent creates a new code-producing Attempt from approved Behaviors,
 Approach, and Plan inputs, THE SYSTEM SHALL stamp an immutable Writer completion
 contract containing every EARS statement and its existing verification marker,
 the complete text of every applicable Approach decision, structural boundary,
-and execution-guidance constraint, and every required Plan row and its existing
-Verification cell.
+and execution-guidance constraint, and every required Plan row with its existing
+Verification cell and approved responsibility assignment.
 Test: src/work_model.rs (writer_completion_contract_maps_approved_planning_inputs)
 Test: src/work_task_executor.rs (writer_route_preserves_wrapped_execution_guidance_in_matrix)
+Test: src/work_model.rs (explicit_plan_responsibility_survives_intake_and_rejects_writer_claims)
 
 ### B17
 
 WHEN Fluent launches an initial or corrective Writer, THE SYSTEM SHALL
 materialize a bounded task-owned `writer-completion.json` matrix before launch,
-carry forward completed planning claims from the preceding Writer, and add every
+carry forward completed planning claims from the preceding Writer's authoritative
+matrix, including its approved ownership mapping, and add every
 currently open review finding as a pending row without inventing test-selector
 names. THE SYSTEM SHALL enumerate in the Writer instructions every Behavior,
 Approach, and required Plan row ID that a finding may cite.
 Test: src/work_task_executor.rs (corrective_writer_matrix_carries_planning_rows_and_adds_open_findings)
+Test: src/work_task_executor.rs (corrective_writer_inherits_approved_ownership_matrix)
 Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execution_context)
 Test: src/work_task_executor.rs (reviewed_correction_prompt_is_bounded_and_references_full_artifacts_by_path)
 Test: src/work_model.rs (writer_completion_matrix_refuses_unbounded_context)
 
 ### B18
 
-WHEN a completed Writer leaves any matrix row pending, without implementation
-evidence, without a passing focused verification claim, or, for a finding,
-without an applicable Behavior, Approach, or required Plan reference or a
-specific not-applicable reason, THE SYSTEM SHALL plan one Writer continuation
-before any reviewer or final Tester.
+WHEN a completed Writer leaves a Writer-owned obligation pending or without
+required implementation evidence, passing focused verification, or applicable
+finding constraints, and the no-output, regression, stagnation, and structural
+pause rules permit continuation, THE SYSTEM SHALL plan one Writer continuation
+before any ordinary reviewer or final Tester. Pending host and workflow rows
+follow Host-action ownership:B1–B3 and their existing stage gates.
 Test: src/work_attempt_loop.rs (incomplete_writer_completion_matrix_returns_to_writer_before_review)
 Test: src/work_model.rs (writer_completion_matrix_reconciles_claims_and_corrective_findings)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix blocks review and final Tester)
+Test: src/work_attempt_loop.rs (writer_completion_excludes_host_and_later_stage_work)
+Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
 
 ### B19
 
@@ -6627,12 +6633,16 @@ Test: src/work_model.rs (writer_completion_matrix_reconciles_claims_and_correcti
 
 ### B20
 
-WHEN every Writer completion row is satisfied and the host-owned required-progress
-projection reconciles, THE SYSTEM SHALL attach the matrix to every reviewer as an
-advisory coverage map and plan reviewers without planning the final Tester yet.
+WHEN every Writer-owned obligation and applicable finding is satisfied, the
+host-owned required-progress projection and deterministic gates reconcile, and
+required host checks have passing evidence accepted by targeted Tests Review,
+THE SYSTEM SHALL attach the matrix to every ordinary reviewer as an advisory
+coverage map and plan those reviewers without planning the final Tester yet.
 Test: src/work_attempt_loop.rs (complete_writer_completion_matrix_reaches_review_and_is_attached)
 Test: src/work_task_executor.rs (work_review_prompt_renders_role_conditional_blocks)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix admits review and final Tester)
+Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
+Test: src/host_evidence.rs (pending_host_verification_blocks_readiness)
 
 ### B21
 
@@ -9735,10 +9745,10 @@ Test: tests/binary.rs (legacy_ownership_old_reader_refuses_mutation)
 
 ### B1
 
-WHEN two consecutive Writer continuations complete no additional work against
-the same outstanding requirements, THE SYSTEM SHALL preserve the candidate and
-pause before launching another Writer, including after earlier reviews.
-Test: src/work_attempt_loop.rs (stagnant_post_review_continuations_pause)
+The canonical stagnation guarantee is Pre-review completion gate:B8 in
+[Pre-review completion gate](#pre-review-completion-gate), including corrective
+continuations after review. Host-action ownership:B2 requires an immediate host
+handoff when that is the next action, without waiting for the stagnation guard.
 
 ### B2
 
@@ -9748,6 +9758,8 @@ THE SYSTEM SHALL admit fresh evidence to targeted Tests Review in the same
 Attempt, preserving completed history and leaving failed evidence uncredited.
 Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt)
 Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt_rejects_unsafe_state)
+Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_from_repaired_source)
+Test: tests/binary.rs (interrupted_plan_host_evidence_rejects_changed_repair_provenance)
 
 ### B3
 

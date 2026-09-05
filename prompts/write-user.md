@@ -88,7 +88,7 @@ Rows assigned to `host`, `review`, `tester`, or `learner` are read-only context:
 
 Read {{writer_completion_matrix_path}}. Fluent generated its rows from the approved behaviors and their existing `Test:` or `Untestable:` references, required Plan rows and their existing Verification cells, applicable Approach decisions, structural boundaries, execution guidance, and this round's open review findings.
 
-The row identity, kind, source, requirement, and verification references are immutable. Do not add, remove, reorder, or rewrite rows. For every row you genuinely satisfy, set `state` to `complete`, list concrete files, symbols, commits, or a verified no-change reason in `implementation-evidence`, and add at least one focused harness-native command with `result: pass` under `verification`. Keep each editable collection as a JSON array, even when it contains one value:
+The row identity, kind, source, requirement, responsibility, and verification references are immutable. Do not add, remove, reorder, or rewrite rows. For each Writer-owned row or applicable finding you satisfy, set `state` to `complete`, list concrete files, symbols, commits, or a verified no-change reason in `implementation-evidence`, and add at least one focused harness-native command with `result: pass` under `verification`. Keep each editable collection as a JSON array, even when it contains one value:
 
     "state": "complete",
     "implementation-evidence": ["src/module.rs: changed symbol"],
@@ -101,7 +101,7 @@ For each review-finding row, list applicable Behavior, Approach, or required Pla
 
 {{writer_completion_allowed_constraints}}
 
-Fluent validates this matrix before starting reviewers. Pending or evidence-less rows return to Writer work without spending a review or final-Tester cycle. Structural edits or contradictory claims pause for repair. The matrix is advisory evidence for reviewers; it does not replace the project's test selectors or Fluent's final Tester.
+Fluent validates this matrix before starting ordinary reviewers. Incomplete Writer-owned rows or applicable findings return to Writer work when the no-output, regression, stagnation, and structural pause rules permit continuation. Once Writer work finishes, a pending required host check pauses with the exact candidate, action, and evidence handoff instead of another Writer. Host checks require passing evidence and targeted Tests Review; review, final Tester, and Learner rows remain pending context governed by their separate stage gates. Structural edits or contradictory claims pause for repair. The matrix is advisory evidence for reviewers; it does not replace the project's test selectors or Fluent's final Tester.
 {{/if}}
 
 ## Phase 2 — Set up progress

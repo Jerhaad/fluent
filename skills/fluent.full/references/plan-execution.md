@@ -323,12 +323,12 @@ Brief: [one-line summary from the brief]
 
 ## Steps
 
-| # | State reached | Behaviors | Verification | Req? |
-|---|---------------|-----------|--------------|------|
-| 1 | [observable state] | [Feed:B1, Feed:B2] | [test path or command] | Yes |
-| 2 | [observable state] | [Feed:B3] | [test path or command] | Yes |
-| 3 | [observable state] | [Dashboard:B1] | [test path or command] | Optional |
-| 4+ | TBD — depends on [what step 3 reveals] | | | |
+| # | State reached | Behaviors | Verification | Responsibility | Req? |
+|---|---------------|-----------|--------------|----------------|------|
+| 1 | [observable implementation state] | [Feed:B1, Feed:B2] | [test path or command] | writer | Yes |
+| 2 | [observable implementation state] | [Feed:B3] | [test path or command] | writer | Yes |
+| 3 | [observable optional implementation state] | [Dashboard:B1] | [test path or command] | writer | Optional |
+| 4+ | TBD — depends on [what step 3 reveals] | | | | |
 
 ## Scope trades
 
@@ -347,7 +347,7 @@ Brief: [one-line summary from the brief]
 - [Contract with another Work Item — event shape, endpoint, types, file paths]
 ```
 
-Omit sections with no content. A single-Work-Item plan has no Sync points or Interfaces. A minimal plan may contain only the Steps table, but every EARS statement in the behaviors diff still needs a row or an explicit TBD. A TBD row leaves Behaviors, Verification, and Req? blank — those are pinned during execution once earlier steps reveal the shape.
+Omit sections with no content. A single-Work-Item plan has no Sync points or Interfaces. A minimal plan may contain only the Steps table, but every EARS statement in the behaviors diff still needs a row or an explicit TBD. Assign each concrete row to `writer`, `host`, `review`, `tester`, or `learner`; the template's implementation examples use `writer`. Split mixed obligations as shown above, and keep `Req?` last. A TBD row leaves Behaviors, Verification, Responsibility, and Req? blank until the work is defined and approved; it is not a required execution obligation yet.
 
 When the plan splits, each Work Item's plan opens with a header naming itself and the others:
 
