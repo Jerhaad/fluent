@@ -463,12 +463,15 @@ Test: src/work_attempt_loop.rs (malformed_single_evidence_needed_review_plans_wr
 ### B9b
 
 WHEN a legacy paused recovery contains exactly one unqualified
-`Disposition: evidence-needed` marker, AND an operator supplies the explicit
-candidate, review, evidence-digest, and resolution authorization through
-`fluent attempt evidence classify`, THE SYSTEM SHALL record the decision and
+`Disposition: evidence-needed` marker, including a Plan-row recovery whose
+targeted review was persisted with `review_state: not-reviewed`, AND an
+operator supplies the explicit candidate, review, evidence-digest, and
+resolution authorization through `fluent attempt evidence classify`, THE
+SYSTEM SHALL verify the immutable Plan-row binding, record the decision, and
 schedule one corrective Writer on the same Attempt with the failed review and
 immutable host-evidence snapshot as inputs.
 Test: tests/binary.rs (legacy_unqualified_host_evidence_can_be_classified_for_code_change)
+Test: src/host_evidence.rs (plan_row_failed_review_with_legacy_not_reviewed_state_can_start_correction)
 
 ### B9c
 

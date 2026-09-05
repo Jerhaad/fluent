@@ -1042,9 +1042,13 @@ snapshot whose `result` is `fail`. For a current actionable recovery, the
 command requires the saved review digest and disposition. A legacy paused
 recovery may omit that digest and contain only the unqualified `Disposition:
 evidence-needed` line; Fluent derives and persists the digest during this
-one-time migration. The legacy form is the only place an unqualified marker is
-classified: an unqualified new review never pauses for this command and already
-follows the ordinary Writer path. Both classification forms require the exact
+one-time migration. This includes the older Plan-row shape that retained
+`review_state: not-reviewed` after its failed targeted Tests Review; Fluent
+admits it only after verifying the immutable Plan-row binding and records the
+failure as reviewed before scheduling the corrective Writer. The legacy form is
+the only place an unqualified marker is classified: an unqualified new review
+never pauses for this command and already follows the ordinary Writer path.
+Both classification forms require the exact
 candidate and evidence snapshot, current clean worktree, and complete targeted
 Tests Review frontier. A new classification must target the current paused
 recovery; a later `Reviewing` or `NeedsEvidence` recovery rejects the older

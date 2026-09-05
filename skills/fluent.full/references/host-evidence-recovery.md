@@ -8,7 +8,11 @@ while a legacy paused recovery may contain an unqualified marker. For a new
 review, a single malformed `Disposition: evidence-needed` marker follows the
 ordinary `code-change` Writer path; missing, duplicate, or unknown disposition
 markers remain an uncertain pause. The legacy paused-recovery exception keeps
-an unqualified marker eligible for its saved recovery. These paths are not
+an unqualified marker eligible for its saved recovery. An older Plan-row
+recovery may also retain `review_state: not-reviewed` after its failed targeted
+Tests Review; Fluent admits that shape only after rechecking its immutable
+Plan-row binding and records the failed review before it schedules the
+corrective Writer. These paths are not
 interchangeable: attachment keeps the candidate waiting, while classification
 schedules a Writer on the existing Attempt.
 
