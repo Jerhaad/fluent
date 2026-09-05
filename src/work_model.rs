@@ -3228,6 +3228,166 @@ impl WriterCompletionContract {
     }
 }
 
+/// An operator-proposed partition of existing approved Plan text. Parts retain
+/// the original row as provenance and cannot remove or optionalize any text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipProposal {
+    pub splits: Vec<OwnershipSplit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipSplit {
+    pub row_id: String,
+    pub parts: Vec<OwnershipPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipPart {
+    pub requirement: String,
+    pub responsibility: CompletionResponsibility,
+    /// Reuse an already completed identical source obligation, never a new claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_from: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipPreview {
+    pub schema_version: u32,
+    pub preview_id: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub candidate_commit: String,
+    pub writer_task_id: String,
+    pub original_contract: WriterCompletionContract,
+    pub proposal: OwnershipProposal,
+    pub source_matrix: ArtifactRef,
+    pub source_matrix_digest: String,
+    pub planning_digest: String,
+    pub tasks_digest: String,
+    pub input_digests: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipApproval {
+    pub preview: OwnershipPreview,
+    pub resolution: String,
+    pub approved_at: String,
+    pub matrix_artifact: ArtifactRef,
+}
+
+impl OwnershipProposal {
+    /// Preserve every source byte and verification reference while dividing who
+    /// completes each part. A saved passing claim may support an identical part.
+    pub fn apply(
+        &self,
+        original: &WriterCompletionContract,
+        source: &WriterCompletionMatrix,
+    ) -> Result<(WriterCompletionContract, WriterCompletionMatrix), String> {
+        if self.splits.is_empty() {
+            return Err("ownership proposal has no splits".into());
+        }
+        let mut seen = HashSet::new();
+        for split in &self.splits {
+            if !seen.insert(&split.row_id) {
+                return Err("duplicate ownership split".into());
+            }
+            let row = original
+                .requirements
+                .iter()
+                .find(|row| row.id == split.row_id)
+                .ok_or("ownership split names an unknown row")?;
+            if row.kind != WriterCompletionRequirementKind::Plan || row.responsibility.is_some() {
+                return Err("ownership adoption requires an unassigned legacy Plan row".into());
+            }
+            if split.parts.is_empty()
+                || split
+                    .parts
+                    .iter()
+                    .any(|part| part.requirement.trim().is_empty())
+                || split
+                    .parts
+                    .iter()
+                    .map(|part| part.requirement.as_str())
+                    .collect::<String>()
+                    != row.requirement
+            {
+                return Err("ownership parts must preserve the entire original requirement in order, byte for byte".into());
+            }
+        }
+        let mut contract = original.clone();
+        contract.requirements.clear();
+        let mut matrix = source.clone();
+        matrix.rows.clear();
+        for row in &original.requirements {
+            let source_row = source
+                .rows
+                .iter()
+                .find(|claim| claim.id == row.id)
+                .ok_or("source matrix omits a requirement")?;
+            let Some(split) = self.splits.iter().find(|split| split.row_id == row.id) else {
+                contract.requirements.push(row.clone());
+                matrix.rows.push(source_row.clone());
+                continue;
+            };
+            for (index, part) in split.parts.iter().enumerate() {
+                let mut requirement = row.clone();
+                requirement.id = format!("{}:part-{}", row.id, index + 1);
+                requirement.requirement = part.requirement.clone();
+                requirement.responsibility = Some(part.responsibility);
+                if let Some(command) = &mut requirement.command {
+                    command.source_row = requirement.id.clone();
+                }
+                let mut claim = WriterCompletionRow::from(&requirement);
+                if let Some(from) = &part.completion_from {
+                    let evidence = source
+                        .rows
+                        .iter()
+                        .find(|claim| claim.id == *from)
+                        .ok_or("source completion row is missing")?;
+                    if part.responsibility != CompletionResponsibility::Writer
+                        || !writer_responsibility(evidence.responsibility)
+                        || evidence.state != WriterCompletionState::Complete
+                        || evidence.requirement.trim() != part.requirement.trim()
+                        || evidence
+                            .implementation_evidence
+                            .iter()
+                            .all(|claim| claim.trim().is_empty())
+                        || evidence.verification.is_empty()
+                        || evidence
+                            .verification
+                            .iter()
+                            .any(|claim| claim.command.trim().is_empty())
+                    {
+                        return Err(
+                            "a part can reuse only an identical completed Writer obligation".into(),
+                        );
+                    }
+                    claim.state = evidence.state;
+                    claim.implementation_evidence = evidence.implementation_evidence.clone();
+                    claim.verification = evidence.verification.clone();
+                }
+                contract.requirements.push(requirement);
+                matrix.rows.push(claim);
+            }
+        }
+        // Corrective findings retain their exact identity and source evidence.
+        matrix.rows.extend(
+            source
+                .rows
+                .iter()
+                .filter(|row| row.kind == WriterCompletionRequirementKind::Finding)
+                .cloned(),
+        );
+        contract.validate()?;
+        Ok((contract, matrix))
+    }
+}
+
 fn completion_slug(value: &str) -> String {
     let mut slug = String::new();
     let mut pending_dash = false;
@@ -19549,4 +19709,67 @@ random banner prose that must be ignored
         assert!(extension.human_resolution_digest.is_empty());
         extension.validate_human_resolution().unwrap();
     }
+}
+
+pub(crate) fn publish_recovery_snapshot(
+    project_root: &Path,
+    relative: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    let relative_path = Path::new(relative);
+    let managed_root = Path::new(".fluent/work/artifacts");
+    if relative_path.is_absolute() || !relative_path.starts_with(managed_root) {
+        anyhow::bail!("evidence snapshot path must stay under the managed artifact root");
+    }
+    let mut current = project_root.to_path_buf();
+    for component in relative_path.components() {
+        let Component::Normal(part) = component else {
+            anyhow::bail!("evidence snapshot path must use normal managed components");
+        };
+        current.push(part);
+        if current == project_root.join(relative_path) {
+            break;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("evidence snapshot path must not traverse a symlink")
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!("evidence snapshot parent must be a directory")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| {
+                    format!("create managed evidence directory {}", current.display())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let path = project_root.join(relative_path);
+    match tempfile::NamedTempFile::new_in(path.parent().expect("snapshot has a parent")) {
+        Ok(mut file) => {
+            file.write_all(bytes)?;
+            file.as_file().sync_all()?;
+            match file.persist_noclobber(&path) {
+                Ok(_) => {}
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                        anyhow::bail!("evidence snapshot path must not be a symlink");
+                    }
+                    if fs::read(&path)? != bytes {
+                        anyhow::bail!("evidence snapshot digest collision at {}", path.display());
+                    }
+                }
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // The Work-model write that follows may survive a power loss, so make the
+    // snapshot directory entry durable before that model can reference it.
+    fs::File::open(path.parent().expect("snapshot has a parent"))?.sync_all()?;
+    Ok(())
 }

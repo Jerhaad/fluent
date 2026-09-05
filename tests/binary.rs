@@ -35418,3 +35418,353 @@ fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
             && artifact.digest.starts_with("sha256:")
     }));
 }
+
+fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, PathBuf) {
+    use fluent::work_model::*;
+    let project = setup_git_project(tmp);
+    let candidate = git_head(&project);
+    let mut item = WorkItem::planned(id, "Assign saved host obligations");
+    item.planning_context = Some(PlanningContext {
+        plan: Some("| # | State reached | Behaviors | Verification | Req? |\n| 1 | Fix source. | | `cargo test fix` | Yes |\n| 2 | Fix source. Check host. Review. Test. Learn. | | `bash tests/host.sh` | Yes |\n".into()),
+        ..Default::default()
+    });
+    item.add_initial_attempt("attempt-1").unwrap();
+    let attempt = &mut item.attempts[0];
+    let writer = &mut attempt.tasks[0];
+    writer.status = TaskStatus::Complete;
+    writer.output = Some(TaskOutput {
+        workspace_id: "candidate".into(),
+        workspace_path: project.display().to_string(),
+        source_branch: "main".into(),
+        base_commit: None,
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    let matrix_path = project
+        .join(&writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let mut matrix = WriterCompletionMatrix::skeleton(
+        attempt.writer_completion_contract.as_ref().unwrap(),
+        &writer.id,
+        &[],
+        None,
+    )
+    .unwrap();
+    matrix.rows[0].state = WriterCompletionState::Complete;
+    matrix.rows[0].implementation_evidence = vec!["src/lib.rs: fix".into()];
+    matrix.rows[0].verification = vec![WriterVerificationClaim {
+        command: "cargo test fix".into(),
+        result: WriterVerificationResult::Pass,
+    }];
+    fs::create_dir_all(matrix_path.parent().unwrap()).unwrap();
+    fs::write(matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    attempt.status = AttemptStatus::NeedsUser;
+    attempt.pause_kind = Some(PauseKind::WriterCompletion);
+    attempt.review_state = Some(AttemptReviewState::NotReviewed);
+    WorkModelStore::new(&project)
+        .create_work_item(&item)
+        .unwrap();
+    let proposal = tmp.path().join("proposal.json");
+    fs::write(&proposal, serde_json::to_vec_pretty(&serde_json::json!({"splits": [{"row_id": "plan:step-2", "parts": [
+        {"requirement": "Fix source.", "responsibility": "writer", "completion_from": "plan:step-1"},
+        {"requirement": " Check host.", "responsibility": "host"},
+        {"requirement": " Review.", "responsibility": "review"},
+        {"requirement": " Test.", "responsibility": "tester"},
+        {"requirement": " Learn.", "responsibility": "learner"}
+    ]}]})).unwrap()).unwrap();
+    (project, candidate, proposal)
+}
+
+fn ownership_preview(
+    project: &Path,
+    id: &str,
+    proposal: &Path,
+    output: &Path,
+) -> serde_json::Value {
+    let result = fluent_cmd()
+        .current_dir(project)
+        .args([
+            "attempt",
+            "ownership",
+            "preview",
+            id,
+            "attempt-1",
+            "--proposal-file",
+            proposal.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&result.get_output().stdout).unwrap();
+    fs::write(output, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    value
+}
+
+fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCommand {
+    let mut command = fluent_cmd();
+    command.current_dir(project).args([
+        "attempt",
+        "ownership",
+        "approve",
+        id,
+        "attempt-1",
+        "--preview-file",
+        preview.to_str().unwrap(),
+        "--resolution",
+        "Approve this responsibility split; host execution needs separate authorization",
+    ]);
+    command
+}
+
+#[test]
+fn legacy_ownership_adoption_requires_approval() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, proposal) = setup_legacy_ownership_fixture(&tmp, "legacy-ownership");
+    let before = work_item_value(&project, "legacy-ownership");
+    let source = project.join(".fluent/work/artifacts/legacy-ownership/attempt-1/attempt-1-write-1/writer-completion.json");
+    let source_bytes = fs::read(&source).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "upgrade", "legacy-ownership"])
+        .assert()
+        .success();
+    assert_eq!(
+        work_item_value(&project, "legacy-ownership")["attempts"][0]["writer_completion_contract"],
+        before["attempts"][0]["writer_completion_contract"]
+    );
+    let before = work_item_value(&project, "legacy-ownership");
+    let preview_path = tmp.path().join("preview.json");
+    let preview = ownership_preview(&project, "legacy-ownership", &proposal, &preview_path);
+    assert_eq!(work_item_value(&project, "legacy-ownership"), before);
+    assert_eq!(preview["candidate_commit"], candidate);
+    assert_eq!(
+        preview["proposal"]["splits"][0]["parts"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    ownership_approve(&project, "legacy-ownership", &preview_path)
+        .assert()
+        .success();
+    let after = work_item_value(&project, "legacy-ownership");
+    assert_eq!(
+        after["attempts"][0]["tasks"],
+        before["attempts"][0]["tasks"]
+    );
+    assert_eq!(after["planning_context"], before["planning_context"]);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(git_head(&project), candidate);
+    let rows = after["attempts"][0]["writer_completion_contract"]["requirements"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[2]["responsibility"], "host");
+    assert_eq!(rows[2]["source"], "plan.md#step-2");
+    assert_eq!(
+        rows[2]["verification_refs"],
+        before["attempts"][0]["writer_completion_contract"]["requirements"][1]["verification_refs"]
+    );
+    assert_eq!(
+        after["attempts"][0]["recovery_operations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn legacy_ownership_adoption_rejects_stale_state() {
+    for drift in [
+        "candidate",
+        "dirty",
+        "source",
+        "planning",
+        "live",
+        "omission",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, "stale-ownership");
+        let preview_path = tmp.path().join("preview.json");
+        ownership_preview(&project, "stale-ownership", &proposal, &preview_path);
+        let store = WorkModelStore::new(&project);
+        let _lease = if drift == "live" {
+            Some(
+                fluent::lease::acquire(&fluent::lease::task_lock_path(
+                    &project,
+                    "stale-ownership",
+                    "attempt-1-write-1",
+                ))
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        match drift {
+            "dirty" => fs::write(project.join("Cargo.toml"), "changed\n").unwrap(),
+            "candidate" => {
+                git::run(
+                    &project,
+                    &["commit", "--allow-empty", "-m", "Change candidate"],
+                    "drift",
+                )
+                .unwrap();
+            }
+            "source" => {
+                let p=project.join(".fluent/work/artifacts/stale-ownership/attempt-1/attempt-1-write-1/writer-completion.json");
+                let mut bytes = fs::read(&p).unwrap();
+                bytes.push(b'\n');
+                fs::write(p, bytes).unwrap();
+            }
+            "planning" => {
+                store
+                    .mutate_work_item("stale-ownership", |item| {
+                        item.planning_context
+                            .as_mut()
+                            .unwrap()
+                            .plan
+                            .as_mut()
+                            .unwrap()
+                            .push_str("\nchanged");
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            "omission" => {
+                let mut value = read_json_path(&preview_path);
+                value["proposal"]["splits"][0]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+                fs::write(&preview_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            _ => {}
+        }
+        let before = work_item_value(&project, "stale-ownership");
+        ownership_approve(&project, "stale-ownership", &preview_path)
+            .assert()
+            .failure();
+        assert_eq!(
+            work_item_value(&project, "stale-ownership"),
+            before,
+            "{drift}"
+        );
+    }
+}
+
+#[test]
+fn legacy_ownership_adoption_exact_retry_preserves_history() {
+    let tmp = TempDir::new().unwrap();
+    let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, "retry-ownership");
+    let preview = tmp.path().join("preview.json");
+    ownership_preview(&project, "retry-ownership", &proposal, &preview);
+    ownership_approve(&project, "retry-ownership", &preview)
+        .assert()
+        .success();
+    let before = work_item_value(&project, "retry-ownership");
+    ownership_approve(&project, "retry-ownership", &preview)
+        .assert()
+        .success();
+    assert_eq!(work_item_value(&project, "retry-ownership"), before);
+}
+
+#[test]
+fn legacy_ownership_old_reader_refuses_mutation() {
+    // The canonical command builds this exact older executable before fixtures.
+    let binary = PathBuf::from(
+        std::env::var_os("FLUENT_OWNERSHIP_OLD_BIN")
+            .expect("build tests/fixtures/build-ownership-old-reader.sh before this selection"),
+    );
+    let identity = read_json_path(
+        &binary
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("identity.json"),
+    );
+    assert_eq!(
+        identity["source_commit"],
+        "f71d20bb11f241c9ab9ba38b401f22e692d9e19f"
+    );
+    assert_eq!(
+        identity["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
+    let tmp = TempDir::new().unwrap();
+    let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, "old-reader-ownership");
+    let preview = tmp.path().join("preview.json");
+    ownership_preview(&project, "old-reader-ownership", &proposal, &preview);
+    ownership_approve(&project, "old-reader-ownership", &preview)
+        .assert()
+        .success();
+    let before = work_item_value(&project, "old-reader-ownership");
+    let output = Command::new(binary)
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["work-item", "upgrade", "old-reader-ownership"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("schema"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(work_item_value(&project, "old-reader-ownership"), before);
+}
+
+#[test]
+fn legacy_ownership_preview_rejects_dropped_or_credited_work() {
+    for change in [
+        "drop",
+        "optional",
+        "credit-host",
+        "rewrite",
+        "unknown-owner",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, "invalid-ownership");
+        let mut value = read_json_path(&proposal);
+        match change {
+            "drop" => {
+                value["splits"][0]["parts"].as_array_mut().unwrap().pop();
+            }
+            "optional" => value["splits"][0]["parts"][1]["required"] = serde_json::json!(false),
+            "credit-host" => {
+                value["splits"][0]["parts"][1]["completion_from"] = serde_json::json!("plan:step-1")
+            }
+            "rewrite" => {
+                value["splits"][0]["parts"][0]["requirement"] =
+                    serde_json::json!("Different source work.")
+            }
+            "unknown-owner" => {
+                value["splits"][0]["parts"][1]["responsibility"] = serde_json::json!("robot")
+            }
+            _ => unreachable!(),
+        }
+        fs::write(&proposal, serde_json::to_vec(&value).unwrap()).unwrap();
+        let before = work_item_value(&project, "invalid-ownership");
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "ownership",
+                "preview",
+                "invalid-ownership",
+                "attempt-1",
+                "--proposal-file",
+                proposal.to_str().unwrap(),
+            ])
+            .assert()
+            .failure();
+        assert_eq!(
+            work_item_value(&project, "invalid-ownership"),
+            before,
+            "{change}"
+        );
+    }
+}

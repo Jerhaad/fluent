@@ -3788,3 +3788,18 @@ Tests Review passes. The Attempt loop pauses before another Writer when only a
 host check remains, and checks required host evidence before advancing past
 reviews. Required reviewers, the canonical final Tester, and a successful
 Learner retain their existing gates.
+
+`ownership_recovery` exposes `attempt ownership preview` and `approve`. A preview
+binds a proposed exact partition to the original contract, current Attempt,
+clean candidate, Task history, planning inputs, and source completion bytes.
+`OwnershipProposal::apply` in `work_model` preserves original source links and
+verification references, and permits reuse only of an identical completed Writer
+obligation. It never transfers a Writer claim to a host or later stage.
+
+Approval revalidates through `recovery_contracts` under the Work mutation and
+land locks. Immutable sidecars retain the original contract and audit; a new
+matrix supplies the approved mapping without rewriting historical matrices or
+Tasks. The aggregate transaction adopts that mapping and records one recovery
+operation. Record syntax upgrades and status reads do not invoke adoption.
+See the saved mixed-row example in
+`skills/fluent.full/references/host-evidence-recovery.md` for the public commands.

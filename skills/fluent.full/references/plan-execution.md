@@ -378,3 +378,7 @@ Brief: [one-line summary from the brief]
   in the same exercise.
 - Behavior references are area-qualified — `Feed:B1`, not `B1` — because IDs restart per area.
 - When the plan splits, each Work Item's plan lives at `.fluent/drafts/<draft-id>/items/<slug>/plan.md` and its `<work-item-id>` is `<draft-id>-<slug>`.
+
+For saved mixed rows, follow the explicit preview and approval example in
+`references/host-evidence-recovery.md`. Loading an Attempt or upgrading its record
+syntax never authorizes a responsibility split.

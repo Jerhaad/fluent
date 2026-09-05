@@ -9719,3 +9719,13 @@ Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer
 WHILE required host verification lacks accepted passing evidence for the exact
 candidate, THE SYSTEM SHALL keep the candidate ineligible for readiness.
 Test: src/host_evidence.rs (pending_host_verification_blocks_readiness)
+
+### B4
+
+WHEN an operator previews responsibility for a saved mixed Plan obligation,
+THE SYSTEM SHALL show the exact candidate and complete proposed split without
+adopting it until a fresh explicit approval is recorded.
+Test: tests/binary.rs (legacy_ownership_adoption_requires_approval)
+Test: tests/binary.rs (legacy_ownership_adoption_rejects_stale_state)
+Test: tests/binary.rs (legacy_ownership_adoption_exact_retry_preserves_history)
+Test: tests/binary.rs (legacy_ownership_old_reader_refuses_mutation)

@@ -3701,62 +3701,7 @@ fn latest_passing_tests_review<'a>(
         .filter(|task| read_verdict(project_root, task) == Some(Verdict::Pass))
 }
 
-fn publish_snapshot(project_root: &Path, relative: &str, bytes: &[u8]) -> Result<()> {
-    let relative_path = Path::new(relative);
-    let managed_root = Path::new(".fluent/work/artifacts");
-    if relative_path.is_absolute() || !relative_path.starts_with(managed_root) {
-        bail!("evidence snapshot path must stay under the managed artifact root");
-    }
-    let mut current = project_root.to_path_buf();
-    for component in relative_path.components() {
-        let Component::Normal(part) = component else {
-            bail!("evidence snapshot path must use normal managed components");
-        };
-        current.push(part);
-        if current == project_root.join(relative_path) {
-            break;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                bail!("evidence snapshot path must not traverse a symlink")
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                bail!("evidence snapshot parent must be a directory")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current).with_context(|| {
-                    format!("create managed evidence directory {}", current.display())
-                })?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let path = project_root.join(relative_path);
-    match tempfile::NamedTempFile::new_in(path.parent().expect("snapshot has a parent")) {
-        Ok(mut file) => {
-            file.write_all(bytes)?;
-            file.as_file().sync_all()?;
-            match file.persist_noclobber(&path) {
-                Ok(_) => {}
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
-                        bail!("evidence snapshot path must not be a symlink");
-                    }
-                    if fs::read(&path)? != bytes {
-                        bail!("evidence snapshot digest collision at {}", path.display());
-                    }
-                }
-                Err(error) => return Err(error.error.into()),
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    // The Work-model write that follows may survive a power loss, so make the
-    // snapshot directory entry durable before that model can reference it.
-    fs::File::open(path.parent().expect("snapshot has a parent"))?.sync_all()?;
-    Ok(())
-}
+use crate::work_model::publish_recovery_snapshot as publish_snapshot;
 
 #[cfg(test)]
 mod tests {

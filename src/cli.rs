@@ -399,6 +399,11 @@ pub enum WorkItemCommands {
 
 #[derive(Subcommand)]
 pub enum AttemptCommands {
+    /// Preview or explicitly approve responsibility for saved Plan obligations
+    Ownership {
+        #[command(subcommand)]
+        command: OwnershipCommands,
+    },
     /// Run, attach, or classify host-evidence recovery
     Evidence {
         #[command(subcommand)]
@@ -645,6 +650,26 @@ pub enum AttemptCommands {
         /// Poll interval in seconds (default 15)
         #[arg(long, default_value_t = 15)]
         interval: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OwnershipCommands {
+    /// Read a proposed split and print a candidate-bound preview without adoption
+    Preview {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        proposal_file: std::path::PathBuf,
+    },
+    /// Adopt the exact preview with a recorded operator decision
+    Approve {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        preview_file: std::path::PathBuf,
+        #[arg(long)]
+        resolution: String,
     },
 }
 

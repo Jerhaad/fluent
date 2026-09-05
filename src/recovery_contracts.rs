@@ -25,6 +25,83 @@ pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
+/// Verify the candidate and stopped owners before an operator adopts a saved
+/// responsibility split. Approval itself never retries a Writer.
+pub(crate) fn inspect_ownership_adoption(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .last()
+        .filter(|attempt| attempt.id == attempt_id)
+        .context("ownership adoption requires the current Attempt")?;
+    anyhow::ensure!(
+        attempt.status == work_model::AttemptStatus::NeedsUser
+            && matches!(
+                attempt.pause_kind,
+                Some(work_model::PauseKind::WriterCompletion | work_model::PauseKind::Interrupted)
+            ),
+        "ownership adoption requires a Writer-completion or interrupted pause"
+    );
+    anyhow::ensure!(
+        !item
+            .merge_candidates
+            .iter()
+            .any(|candidate| candidate.attempt_id == attempt_id),
+        "ownership adoption is ineligible after a Merge Candidate exists"
+    );
+    for task in &attempt.tasks {
+        anyhow::ensure!(
+            task.status != TaskStatus::Executing,
+            "Task {} is executing",
+            task.id
+        );
+        anyhow::ensure!(
+            !crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                &item.id,
+                &task.id
+            )),
+            "Task {} has a live owner",
+            task.id
+        );
+        if let Some(area) = &task.artifact_area {
+            anyhow::ensure!(
+                !crate::execution::execution_is_live(&crate::execution::record_path_for_artifact(
+                    project_root,
+                    &area.path
+                ))?,
+                "Task {} has a live execution owner",
+                task.id
+            );
+        }
+        anyhow::ensure!(
+            matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
+                || (attempt.pause_kind == Some(work_model::PauseKind::Interrupted)
+                    && task.kind == TaskKind::Write
+                    && task.status == TaskStatus::NeedsUser
+                    && task.output.is_none()),
+            "Task {} has an incompatible lifecycle state",
+            task.id
+        );
+    }
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .context("ownership adoption needs a completed source candidate")?;
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at(project_root, output, &output.commit),
+        "ownership adoption requires the unchanged clean candidate {}",
+        output.commit
+    );
+    Ok(())
+}
+
 /// Read the approved host obligations against the exact clean Writer candidate.
 /// Consumers may overlay accepted evidence, but the Writer cannot supply it.
 pub(crate) fn owned_host_completion_matrix(
@@ -1744,6 +1821,7 @@ pub(crate) fn writer_completion_matrix_ref(
         }
         if artifact.producer_id != "writer-completion-repair"
             && artifact.producer_id != "planning-reference-recovery"
+            && artifact.producer_id != "ownership-recovery"
         {
             continue;
         }

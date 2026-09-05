@@ -158,3 +158,42 @@ exact command returns the same Writer and audit identifiers without creating
 another record; stale or different inputs are rejected without mutation. A
 passing targeted review still requires all exact-commit evidence and Learning
 before landing.
+
+## Approve responsibility for a saved mixed Plan row
+
+Reading status or running `work-item upgrade` does not adopt ownership. Prepare
+an explicit JSON proposal for the original required row. Its parts must join
+back to the original State reached text, byte for byte, in order. For an original
+row `plan:step-2` saying `Fix source. Check host. Review. Test. Learn.`, use:
+
+```json
+{"splits":[{"row_id":"plan:step-2","parts":[
+  {"requirement":"Fix source.","responsibility":"writer","completion_from":"plan:step-1"},
+  {"requirement":" Check host.","responsibility":"host"},
+  {"requirement":" Review.","responsibility":"review"},
+  {"requirement":" Test.","responsibility":"tester"},
+  {"requirement":" Learn.","responsibility":"learner"}
+]}]}
+```
+
+`completion_from` is optional. Use it only when that source row already completed
+an identical Writer obligation with concrete passing verification. Omit it to
+leave the Writer part pending. Host and later-stage parts always start pending.
+Every part retains the original source-row link and verification references;
+the approval audit preserves the complete original contract and matrix digest.
+
+```sh
+fluent attempt ownership preview work-id attempt-1 --proposal-file split.json > preview.json
+fluent attempt ownership approve work-id attempt-1 --preview-file preview.json --resolution 'Approve the displayed responsibility split'
+```
+
+The first command is read-only. Inspect its exact candidate, source evidence,
+and proposed parts before approving. Approval rechecks the current Attempt,
+clean candidate, planning inputs, source matrix bytes, and stopped Task owners
+under the mutation lock. A stale preview requires a fresh preview and decision.
+An identical eligible approval returns its original audit without duplicate
+Tasks or evidence. Older readers reject the new record schema before mutation.
+
+Approval assigns responsibility; it does not authorize the host command, retry
+a hard-failed Writer, or declare any host check passed. The existing Test-reference
+and Approach revision commands retain their separate meanings.

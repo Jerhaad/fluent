@@ -1041,6 +1041,40 @@ fn cmd_attempt(
             println!("Audit: {}", revision.audit_artifact);
             println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
         }
+        AttemptCommands::Ownership { command } => match command {
+            fluent::cli::OwnershipCommands::Preview {
+                work_item_id,
+                attempt_id,
+                proposal_file,
+            } => {
+                let proposal = serde_json::from_slice(&fs::read(proposal_file)?)?;
+                let preview = fluent::ownership_recovery::preview(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &proposal,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&preview)?);
+            }
+            fluent::cli::OwnershipCommands::Approve {
+                work_item_id,
+                attempt_id,
+                preview_file,
+                resolution,
+            } => {
+                let preview = serde_json::from_slice(&fs::read(preview_file)?)?;
+                let approval = fluent::ownership_recovery::approve(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &preview,
+                    &resolution,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&approval)?);
+            }
+        },
         AttemptCommands::ReviseApproach {
             work_item_id,
             attempt_id,
