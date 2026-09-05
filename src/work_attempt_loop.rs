@@ -6907,6 +6907,11 @@ fn gate_candidate_after_writer(
             );
             item.attempts[attempt_index].status = AttemptStatus::Planned;
             item.attempts[attempt_index].pause_kind = None;
+            if !item.attempts[attempt_index].artifacts.contains(&artifact) {
+                item.attempts[attempt_index]
+                    .artifacts
+                    .push(artifact.clone());
+            }
             let task_id = item.add_next_write_round(attempt_id, vec![artifact])?;
             write_attempt_work_item(store, item)?;
             Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
@@ -19748,6 +19753,43 @@ mod tests {
         assert_eq!(
             evidence.disposition,
             crate::candidate_gate::CandidateGateDisposition::Rejected
+        );
+    }
+
+    #[test]
+    fn first_rejected_candidate_gate_is_indexed_before_correction() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace) =
+            make_candidate_gate_fixture(project.path(), "pub fn value() {    \n}\n", None);
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkAttemptRunOutcome::PlannedWriteRound { .. }
+        ));
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        let correction = attempt.tasks.last().unwrap();
+        let gate = correction
+            .input_artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+            .expect("the correction must name its rejected source gate");
+        assert_eq!(
+            attempt
+                .artifacts
+                .iter()
+                .filter(|artifact| *artifact == gate)
+                .count(),
+            1,
+            "the Attempt must index the exact correction input once"
         );
     }
 

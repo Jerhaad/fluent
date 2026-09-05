@@ -13061,6 +13061,103 @@ fn work_attempt_run_drives_write_reviews_and_passes() {
 }
 
 #[test]
+fn first_rejected_candidate_gate_persists_source_binding() {
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "work-item",
+            "create",
+            "work-1",
+            "--title",
+            "Reject candidate",
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "create", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let bin_dir = tmp.path().join("bin-first-rejected-gate");
+    write_mock_claude(
+        &bin_dir,
+        r##"#!/bin/bash
+HAS_PROMPT=0
+for arg in "$@"; do
+  if [ "$arg" = "-p" ]; then HAS_PROMPT=1; break; fi
+done
+if [ "$HAS_PROMPT" = 0 ]; then exit 0; fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    if [ ! -f rejected.rs ]; then
+      printf 'pub fn rejected() {    \n}\n' > rejected.rs
+      git add rejected.rs
+      git commit -m "Add rejected candidate" >/dev/null
+    fi
+    ;;
+esac
+exit 0
+"##,
+    );
+
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args([
+            "task",
+            "run",
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            "--no-sandbox",
+        ])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Task \"attempt-1-write-2\" produced no commit",
+        ));
+
+    let value = read_work_show_json(&main_dir, "work-1");
+    let attempt = &value["attempts"][0];
+    let correction = attempt["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["id"] == "attempt-1-write-2")
+        .expect("the rejected gate must plan a correction");
+    let gate = correction["input_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| {
+            artifact["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/candidate-gate.json"))
+        })
+        .expect("the correction must name its rejected source gate");
+    assert_eq!(gate["producer_id"], "attempt-1-write-1");
+    assert_eq!(
+        attempt["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|artifact| *artifact == gate)
+            .count(),
+        1,
+        "the public route must index the exact correction input once"
+    );
+}
+
+#[test]
 fn work_attempt_run_review_only_passes_without_merge_candidate() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
