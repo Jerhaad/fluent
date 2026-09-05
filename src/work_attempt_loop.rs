@@ -18425,6 +18425,28 @@ mod tests {
         assert_eq!(retired_commit_style_boundary_snapshot(fixture), before);
     }
 
+    fn assert_legacy_gate_index_recovery_rejected(
+        fixture: &RetiredCommitStyleFixture,
+        expected_error: Option<&str>,
+    ) {
+        let before = retired_commit_style_boundary_snapshot(fixture);
+        let result = recover_retired_commit_style_pause(
+            &fixture.project_root,
+            &fixture.store,
+            "work-1",
+            "attempt-1",
+        );
+        if let Some(expected_error) = expected_error {
+            assert!(
+                result.unwrap_err().to_string().contains(expected_error),
+                "legacy rejection must report {expected_error:?}"
+            );
+        } else {
+            assert!(!result.unwrap(), "legacy recovery must not match");
+        }
+        assert_retired_commit_style_boundary_unchanged(fixture, before);
+    }
+
     fn make_retired_commit_style_pause_fixture(long_body_line: bool) -> RetiredCommitStyleFixture {
         make_retired_commit_style_pause_fixture_with_options(long_body_line, false, false)
     }
@@ -19299,6 +19321,172 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("no longer matches"));
         assert_retired_commit_style_boundary_unchanged(&changed_gate, before);
+    }
+
+    #[test]
+    fn retired_commit_style_legacy_index_recovery_rejects_unsafe_frontiers() {
+        let missing = make_legacy_omitted_gate_index_fixture();
+        missing
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&missing, None);
+
+        let duplicated = make_legacy_omitted_gate_index_fixture();
+        duplicated
+            .store
+            .mutate_work_item("work-1", |item| {
+                let gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                item.attempts[0].tasks[1].input_artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&duplicated, Some("multiple candidate gates"));
+
+        let noncanonical = make_legacy_omitted_gate_index_fixture();
+        noncanonical
+            .store
+            .mutate_work_item("work-1", |item| {
+                let gate = &mut item.attempts[0].tasks[1].input_artifacts[0];
+                gate.path = gate
+                    .path
+                    .replace("/candidate-gate.json", "/nested/../candidate-gate.json");
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&noncanonical, Some("not bound"));
+
+        let reassigned = make_legacy_omitted_gate_index_fixture();
+        reassigned
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts[0].producer_id =
+                    "attempt-1-write-other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&reassigned, Some("not bound"));
+
+        let ambiguous_index = make_legacy_omitted_gate_index_fixture();
+        ambiguous_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.producer_id = "attempt-1-write-other".to_string();
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&ambiguous_index, Some("index is ambiguous"));
+
+        let extra = make_legacy_omitted_gate_index_fixture();
+        extra
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                    producer_id: "attempt-1-review-tests".to_string(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "attempt-1-review-tests/review.md",
+                    ),
+                });
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&extra, Some("inputs do not match"));
+
+        let mixed = make_legacy_omitted_gate_index_fixture();
+        fs::write(
+            &mixed.log_path,
+            format!(
+                "commit {} body line 3 exceeds 72 characters\ncommit {} contains a prohibited Co-Authored-By trailer\n",
+                mixed.candidate, mixed.candidate
+            ),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &mixed,
+            Some("unknown retired commit-style hook diagnostic"),
+        );
+
+        let changed_gate = make_legacy_omitted_gate_index_fixture();
+        let mut gate: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&changed_gate.gate_path).unwrap()).unwrap();
+        gate.candidate_commit = "changed-candidate".to_string();
+        fs::write(
+            &changed_gate.gate_path,
+            serde_json::to_vec_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&changed_gate, Some("names candidate"));
+
+        let changed_hook = make_legacy_omitted_gate_index_fixture();
+        fs::write(
+            &changed_hook.log_path,
+            format!(
+                "commit {} contains a prohibited Co-Authored-By trailer\n",
+                changed_hook.candidate
+            ),
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &changed_hook,
+            Some("unknown retired commit-style hook diagnostic"),
+        );
+
+        let dirty = make_legacy_omitted_gate_index_fixture();
+        fs::write(dirty.workspace.join("untracked.txt"), "dirty\n").unwrap();
+        assert_legacy_gate_index_recovery_rejected(&dirty, Some("not clean and unchanged"));
+
+        let drifted = make_legacy_omitted_gate_index_fixture();
+        fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &["add", "later.txt"],
+            "stage legacy candidate drift",
+        )
+        .unwrap();
+        crate::git::run(
+            &drifted.workspace,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Add later change",
+                "-m",
+                "- Move the candidate beyond the stored gate",
+            ],
+            "commit legacy candidate drift",
+        )
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&drifted, Some("not clean and unchanged"));
+
+        let live = make_legacy_omitted_gate_index_fixture();
+        let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+            &live.project_root,
+            "work-1",
+            "attempt-1-write-2",
+        ))
+        .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&live, Some("live execution"));
+
+        let output = make_legacy_omitted_gate_index_fixture();
+        output
+            .store
+            .mutate_work_item("work-1", |item| {
+                crate::work_model::set_task_terminal(
+                    &mut item.attempts[0].tasks[1],
+                    TaskStatus::Complete,
+                );
+                item.attempts[0].tasks[1].output = item.attempts[0].tasks[0].output.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(&output, Some("produced output"));
     }
 
     #[test]

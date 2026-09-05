@@ -22664,6 +22664,75 @@ fn make_legacy_omitted_gate_index_binary_fixture() -> RetiredCommitStyleBinaryFi
     fixture
 }
 
+fn assert_legacy_gate_index_public_recovery_rejected(
+    fixture: &RetiredCommitStyleBinaryFixture,
+    expected_error: &str,
+) {
+    let store = WorkModelStore::new(&fixture.project_root);
+    let item_before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+    let gate_before = fs::read(&fixture.gate_path).unwrap();
+    let log_before = fs::read(&fixture.log_path).unwrap();
+    let head_before = git::run_stdout(
+        &fixture.workspace,
+        &["rev-parse", "HEAD"],
+        "snapshot rejected legacy candidate",
+    )
+    .unwrap();
+    let tree_before = git::run_stdout(
+        &fixture.workspace,
+        &["rev-parse", "HEAD^{tree}"],
+        "snapshot rejected legacy candidate tree",
+    )
+    .unwrap();
+    let status_before = git::run_stdout(
+        &fixture.workspace,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "snapshot rejected legacy candidate status",
+    )
+    .unwrap();
+
+    fluent_cmd()
+        .current_dir(&fixture.project_root)
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected_error));
+
+    assert_eq!(
+        serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap(),
+        item_before
+    );
+    assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+    assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
+    assert_eq!(
+        git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD"],
+            "verify rejected legacy candidate",
+        )
+        .unwrap(),
+        head_before
+    );
+    assert_eq!(
+        git::run_stdout(
+            &fixture.workspace,
+            &["rev-parse", "HEAD^{tree}"],
+            "verify rejected legacy candidate tree",
+        )
+        .unwrap(),
+        tree_before
+    );
+    assert_eq!(
+        git::run_stdout(
+            &fixture.workspace,
+            &["status", "--porcelain", "--untracked-files=all"],
+            "verify rejected legacy candidate status",
+        )
+        .unwrap(),
+        status_before
+    );
+}
+
 fn make_commit_style_binary_fixture(
     source_uses_advisory_policy: bool,
 ) -> RetiredCommitStyleBinaryFixture {
@@ -23277,6 +23346,101 @@ fn retired_commit_style_resume_rejects_extra_correction_inputs() {
             );
         }
     }
+}
+
+#[test]
+fn retired_commit_style_legacy_projection_rejects_unsafe_frontiers() {
+    use fluent::work_model::{ArtifactRef, work_artifact_path};
+
+    let reassigned = make_legacy_omitted_gate_index_binary_fixture();
+    WorkModelStore::new(&reassigned.project_root)
+        .mutate_work_item("work-1", |item| {
+            let gate = item.attempts[0].tasks[1]
+                .input_artifacts
+                .iter_mut()
+                .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+                .unwrap();
+            gate.producer_id = "attempt-1-write-other".to_string();
+            Ok(())
+        })
+        .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(&reassigned, "not bound");
+
+    let noncanonical = make_legacy_omitted_gate_index_binary_fixture();
+    WorkModelStore::new(&noncanonical.project_root)
+        .mutate_work_item("work-1", |item| {
+            let gate = item.attempts[0].tasks[1]
+                .input_artifacts
+                .iter_mut()
+                .find(|artifact| artifact.path.ends_with("/candidate-gate.json"))
+                .unwrap();
+            gate.path = gate
+                .path
+                .replace("/candidate-gate.json", "/nested/../candidate-gate.json");
+            Ok(())
+        })
+        .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(&noncanonical, "not bound");
+
+    let extra = make_legacy_omitted_gate_index_binary_fixture();
+    WorkModelStore::new(&extra.project_root)
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0].tasks[1].input_artifacts.push(ArtifactRef {
+                producer_id: "attempt-1-review-tests".to_string(),
+                path: work_artifact_path("work-1", "attempt-1", "attempt-1-review-tests/review.md"),
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(&extra, "inputs do not match");
+
+    let changed_gate = make_legacy_omitted_gate_index_binary_fixture();
+    let mut gate: fluent::candidate_gate::CandidateGateEvidence =
+        serde_json::from_slice(&fs::read(&changed_gate.gate_path).unwrap()).unwrap();
+    gate.candidate_commit = "changed-candidate".to_string();
+    fs::write(
+        &changed_gate.gate_path,
+        serde_json::to_vec_pretty(&gate).unwrap(),
+    )
+    .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(&changed_gate, "names candidate");
+
+    let changed_hook = make_legacy_omitted_gate_index_binary_fixture();
+    fs::write(
+        &changed_hook.log_path,
+        format!(
+            "commit {} contains a prohibited Co-Authored-By trailer\n",
+            changed_hook.candidate
+        ),
+    )
+    .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(
+        &changed_hook,
+        "unknown retired commit-style hook diagnostic",
+    );
+
+    let drifted = make_legacy_omitted_gate_index_binary_fixture();
+    fs::write(drifted.workspace.join("later.txt"), "later\n").unwrap();
+    git::run(
+        &drifted.workspace,
+        &["add", "later.txt"],
+        "stage public legacy candidate drift",
+    )
+    .unwrap();
+    git::run(
+        &drifted.workspace,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Add later change",
+            "-m",
+            "- Move the candidate beyond the stored gate",
+        ],
+        "commit public legacy candidate drift",
+    )
+    .unwrap();
+    assert_legacy_gate_index_public_recovery_rejected(&drifted, "not clean and unchanged");
 }
 
 #[test]
