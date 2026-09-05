@@ -6895,6 +6895,8 @@ distinctions.
 Example: `src/lib.rs (drain_is_idempotent)` can match
 `src/lib.rs (tests::lifecycle::drain_is_idempotent)`; a different supplied source
 path or conflicting module qualification cannot establish the same identity.
+Nextest's `my-crate::bin/tool drain_is_idempotent` also supplies a native binary
+identity; its target kind and target name remain part of that identity.
 Test: src/candidate_gate.rs (accepts_equivalent_native_rust_identities)
 
 WHEN a shell result uses its script path as its native identity, THE SYSTEM SHALL
@@ -6905,8 +6907,9 @@ Test: src/candidate_gate.rs (matches_shell_script_without_description_literals)
 IF evidence is failed, skipped, missing, stale, ambiguous, or unrelated, THEN
 THE SYSTEM SHALL leave the verification requirement unsatisfied.
 Example: A passing qualified Rust test and a failed or skipped qualified test
-with the same short name do not disambiguate a short reference. Evidence from
-another candidate cannot satisfy the current candidate's requirement.
+with the same short name do not disambiguate a short reference. This includes
+a passing `my-crate works` alongside a skipped `my-crate::bin/tool works`.
+Evidence from another candidate cannot satisfy the current candidate's requirement.
 Test: src/candidate_gate.rs (rejects_invalid_or_ambiguous_test_evidence)
 
 ### B27a

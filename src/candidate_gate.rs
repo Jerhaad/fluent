@@ -1478,15 +1478,15 @@ impl<'a> RustTestIdentity<'a> {
         };
         // Admit native names and the known nextest separators, never arbitrary
         // display prose or suffixes. Keep every supplied qualifier for matching.
-        let valid_name = |name: &str, binary: bool| {
+        let valid_name = |name: &str| {
             name.split("::").all(|part| {
                 let part = part.strip_prefix("r#").unwrap_or(part);
                 let mut chars = part.chars();
                 chars.next().is_some_and(|c| c == '_' || c.is_alphabetic())
-                    && chars.all(|c| c == '_' || c.is_alphanumeric() || (binary && c == '-'))
+                    && chars.all(|c| c == '_' || c.is_alphanumeric())
             })
         };
-        if !valid_name(name, false) || binary.is_some_and(|binary| !valid_name(binary, true)) {
+        if !valid_name(name) || binary.is_some_and(|binary| !is_nextest_binary_id(binary)) {
             return None;
         }
         Some(Self { path, binary, name })
@@ -1503,6 +1503,27 @@ impl<'a> RustTestIdentity<'a> {
                 || ((!self.name.contains("::") || !other.name.contains("::"))
                     && self.short_name() == other.short_name()))
     }
+}
+
+fn is_nextest_binary_id(binary: &str) -> bool {
+    // Nextest identifies libraries as `package`, integration tests as
+    // `package::target`, and other targets as `package::kind/target`.
+    // Validate those separators separately from Rust module qualification and
+    // retain the whole binary ID, including the kind and target, for matching.
+    let valid_component = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c == '_' || c == '-' || c.is_alphanumeric())
+    };
+    let Some((package, target)) = binary.split_once("::") else {
+        return valid_component(binary);
+    };
+    valid_component(package)
+        && match target.split_once('/') {
+            Some((kind, target)) => valid_component(kind) && valid_component(target),
+            None => valid_component(target),
+        }
 }
 
 fn parse_test_reference(reference: &str) -> std::result::Result<TestReference, String> {
@@ -3177,6 +3198,71 @@ mod tests {
         for (selector, identity, accepted) in [
             (
                 "drain_is_idempotent",
+                "my-crate::bin/tool drain_is_idempotent",
+                true,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::bin/01-tool$tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "tests::lifecycle::drain_is_idempotent",
+                "my-crate::bench/lifecycle tests::lifecycle::drain_is_idempotent",
+                true,
+            ),
+            (
+                "my-crate::example/tool$tests::lifecycle::drain_is_idempotent",
+                "src/lib.rs (my-crate::example/tool tests::lifecycle::drain_is_idempotent)",
+                true,
+            ),
+            (
+                "my-crate::bin/tool$tests::lifecycle::drain_is_idempotent",
+                "my-crate::example/tool tests::lifecycle::drain_is_idempotent",
+                false,
+            ),
+            (
+                "my-crate::bin/tool$tests::lifecycle::drain_is_idempotent",
+                "my-crate::bin/other tests::lifecycle::drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::bin/ drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::/tool drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "::bin/tool drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate/bin/tool drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::bin/tools/tool drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::bin/tool::nested drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
+                "my-crate::bin/tool tests/lifecycle/drain_is_idempotent",
+                false,
+            ),
+            (
+                "drain_is_idempotent",
                 "src/lib.rs (tests::lifecycle::drain_is_idempotent)",
                 true,
             ),
@@ -3307,6 +3393,46 @@ mod tests {
         let tester = fixture.artifacts.path().join("tester-results.json");
         let artifact = fixture.artifacts.path().join("candidate-gate.json");
         let cases: &[(&str, &[(&str, &str)], bool)] = &[
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("my-crate works", "pass"),
+                    ("my-crate::bin/tool works", "skipped"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("my-crate works", "pass"),
+                    ("my-crate::bin/tool$works", "fail"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("my-crate::bin/tool works", "pass"),
+                    ("my-crate::bin/other$works", "skipped"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (works)",
+                &[
+                    ("my-crate::bin/tool works", "pass"),
+                    ("my-crate::example/tool$works", "fail"),
+                ],
+                false,
+            ),
+            (
+                "src/lib.rs (my-crate::bin/tool$works)",
+                &[
+                    ("my-crate::bin/tool works", "pass"),
+                    ("my-crate::example/tool$works", "skipped"),
+                ],
+                true,
+            ),
             (
                 "src/lib.rs (works)",
                 &[("tests::a::works", "pass"), ("tests::b::works", "fail")],

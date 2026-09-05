@@ -430,7 +430,11 @@ reference to its passing structured result. Inside `candidate_gate.rs`, Rust
 identities retain any supplied source path, binary, and module qualification.
 Supported forms are bare or qualified names, `path.rs (name)`, `path.rs::name`,
 and nextest's `binary$name` or `binary name`, including qualified names inside
-source wrappers. A bare name can match a qualified name with the same final
+source wrappers. Nextest binary IDs use a separate grammar: `package`,
+`package::target`, or `package::kind/target`, such as `my-crate::bin/tool`.
+The gate preserves the complete binary ID, so failed or skipped binary targets
+still participate in ambiguity checks. A bare name can match a qualified name
+with the same final
 identifier; two qualified names must agree in full, as must any paths or
 binaries supplied on both sides. The cheap pre-review source check looks for
 the function identifier because Rust declares modules separately. The final
