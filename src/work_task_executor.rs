@@ -19708,6 +19708,12 @@ mod tests {
                 d1_text.contains("Co-Authored-By"),
                 "§D.1 should retain the attribution prohibition"
             );
+            for required_integrity in ["commit-history", "identity", "message-encoding"] {
+                assert!(
+                    d1_text.contains(required_integrity),
+                    "§D.1 should retain the {required_integrity} requirement"
+                );
+            }
         }
 
         let mut item = review_item();
@@ -19723,6 +19729,12 @@ mod tests {
         assert!(skill.contains("commit-message presentation as advice"));
         assert!(skill.contains("Do not emit a finding or failing verdict solely"));
         assert!(skill.contains("Co-Authored-By"));
+        for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
+            assert!(
+                skill.contains(required_integrity),
+                "documentation review should retain the {required_integrity} requirement"
+            );
+        }
     }
 
     #[test]
@@ -19734,6 +19746,12 @@ mod tests {
         assert!(skill.contains("commit-message presentation as advice"));
         assert!(skill.contains("Do not emit a finding or failing verdict solely"));
         assert!(skill.contains("Co-Authored-By"));
+        for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
+            assert!(
+                skill.contains(required_integrity),
+                "documentation review should retain the {required_integrity} requirement"
+            );
+        }
     }
 
     #[test]
