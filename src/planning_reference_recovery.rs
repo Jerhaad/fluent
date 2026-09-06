@@ -1,7 +1,6 @@
 //! Revise human-approved behavior Test references without rewriting candidate history.
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -11,6 +10,7 @@ use std::path::Path;
 use crate::work_model::{
     ApprovedPlanningRevision, ArtifactRef, AttemptReviewState, AttemptStatus,
     DurableTransitionMetadata, DurableTransitionOrigin, PauseKind, TaskKind, TaskStatus,
+    TestReferenceChange as ReferenceChange, TestReferenceRevisionAudit as RevisionAudit,
     WorkModelError, WorkModelStore, WriterCompletionContract, WriterCompletionMatrix,
     WriterCompletionRequirementKind, now_iso8601, work_artifact_path,
 };
@@ -31,31 +31,6 @@ pub struct TestReferenceRevision {
     pub audit_artifact: String,
     pub review_task_ids: Vec<String>,
     pub already_applied: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct ReferenceChange {
-    requirement_id: String,
-    old_references: Vec<String>,
-    new_references: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct RevisionAudit {
-    schema_version: u32,
-    revision_id: String,
-    work_item_id: String,
-    attempt_id: String,
-    candidate_commit: String,
-    resolution: String,
-    resolution_sha256: String,
-    changes: Vec<ReferenceChange>,
-    prior_behaviors_sha256: String,
-    revised_behaviors_sha256: String,
-    completion_matrix_artifact: String,
-    created_at: String,
 }
 
 pub fn revise(
@@ -88,9 +63,26 @@ pub fn revise(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Work Item has no stored planning context"))?;
     let source = authoritative_behavior_source(context)?;
-    let old_contract = WriterCompletionContract::from_planning_context(context)
+    let old_planning_contract = WriterCompletionContract::from_planning_context(context)
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
-    let changes = requested_changes(&old_contract, &desired)?;
+    let old_contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("Attempt has no Writer completion contract")?;
+    let latest_writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .context("Attempt has no completed Writer candidate")?;
+    // Validate the approved source even on an exact replay, before any mutation.
+    let source_matrix = crate::recovery_contracts::authoritative_writer_completion_matrix(
+        project_root,
+        attempt,
+        latest_writer,
+    )?
+    .context("latest Writer has no completion matrix artifact")?;
+    let changes = requested_changes(old_contract, &desired)?;
     if changes
         .iter()
         .all(|change| change.old_references == change.new_references)
@@ -126,16 +118,20 @@ pub fn revise(
             sha256: digest,
         };
     }
-    let new_contract = WriterCompletionContract::from_planning_context(&revised_context)
-        .ok_or_else(|| anyhow::anyhow!("revised planning context lost its completion contract"))?;
-    validate_contract_delta(&old_contract, &new_contract, &desired)?;
-
-    let latest_writer = attempt
-        .tasks
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-        .ok_or_else(|| anyhow::anyhow!("Attempt has no completed Writer candidate"))?;
+    let new_planning_contract = WriterCompletionContract::from_planning_context(&revised_context)
+        .ok_or_else(|| {
+        anyhow::anyhow!("revised planning context lost its completion contract")
+    })?;
+    validate_contract_delta(&old_planning_contract, &new_planning_contract, &desired)?;
+    // The Attempt owns adopted row identities and responsibility. Legacy Plan
+    // text is retained history and must not reconstruct that contract.
+    let mut new_contract = old_contract.clone();
+    for row in &mut new_contract.requirements {
+        if let Some(references) = desired.get(&row.id) {
+            row.verification_refs = references.clone();
+        }
+    }
+    validate_contract_delta(old_contract, &new_contract, &desired)?;
     let candidate_commit = latest_writer
         .output
         .as_ref()
@@ -154,7 +150,7 @@ pub fn revise(
         &format!("{directory}/revision.json"),
     );
     let revised_matrix =
-        revise_completion_matrix(project_root, attempt, latest_writer, &new_contract)?;
+        revise_completion_matrix(project_root, latest_writer, source_matrix, &new_contract)?;
     write_once(
         &project_root.join(&matrix_artifact),
         &serde_json::to_vec_pretty(&revised_matrix)?,
@@ -171,6 +167,7 @@ pub fn revise(
         prior_behaviors_sha256: digest(source.as_bytes()),
         revised_behaviors_sha256: digest(revised_source.as_bytes()),
         completion_matrix_artifact: matrix_artifact.clone(),
+        completion_matrix_sha256: Some(digest(&serde_json::to_vec_pretty(&revised_matrix)?)),
         created_at: now_iso8601(),
     };
     let audit_path = project_root.join(&audit_artifact);
@@ -188,6 +185,7 @@ pub fn revise(
                 || existing.prior_behaviors_sha256 != proposed_audit.prior_behaviors_sha256
                 || existing.revised_behaviors_sha256 != proposed_audit.revised_behaviors_sha256
                 || existing.completion_matrix_artifact != proposed_audit.completion_matrix_artifact
+                || existing.completion_matrix_sha256 != proposed_audit.completion_matrix_sha256
             {
                 bail!("existing Test-reference revision audit does not match this recovery");
             }
@@ -255,6 +253,12 @@ pub fn revise(
                     reason: format!("Test-reference frontier changed before revision: {e:#}"),
                 }
             })?;
+            if fresh.attempts[index].writer_completion_contract.as_ref() != Some(old_contract) {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "completion contract changed before revision".to_string(),
+                });
+            }
             fresh.planning_context = Some(revised_context.clone());
             fresh.attempts[index].writer_completion_contract = Some(new_contract.clone());
             for artifact in [&audit_ref, &matrix_ref] {
@@ -493,6 +497,8 @@ fn validate_contract_delta(
             || before.kind != after.kind
             || before.source != after.source
             || before.requirement != after.requirement
+            || before.responsibility != after.responsibility
+            || before.command != after.command
         {
             bail!(
                 "Test-reference revision changed requirement {:?}",
@@ -512,35 +518,11 @@ fn validate_contract_delta(
 
 fn revise_completion_matrix(
     project_root: &Path,
-    attempt: &crate::work_model::Attempt,
     writer: &crate::work_model::Task,
+    mut matrix: WriterCompletionMatrix,
     contract: &WriterCompletionContract,
 ) -> Result<WriterCompletionMatrix> {
-    let source = attempt
-        .artifacts
-        .iter()
-        .rev()
-        .find(|artifact| {
-            artifact.path.ends_with("/writer-completion.json")
-                && ((artifact.producer_id == "writer-completion-repair"
-                    && artifact
-                        .path
-                        .contains(&format!("/writer-completion-repairs/{}/", writer.id)))
-                    || artifact.producer_id == PRODUCER)
-        })
-        .cloned()
-        .or_else(|| {
-            writer.artifact_area.as_ref().map(|area| ArtifactRef {
-                producer_id: writer.id.clone(),
-                path: format!("{}/writer-completion.json", area.path),
-            })
-        })
-        .ok_or_else(|| anyhow::anyhow!("latest Writer has no completion matrix artifact"))?;
-    let text = fs::read_to_string(project_root.join(&source.path))
-        .with_context(|| format!("read Writer completion matrix {}", source.path))?;
-    let mut matrix: WriterCompletionMatrix = serde_json::from_str(&text)
-        .context("parse Writer completion matrix for Test-reference revision")?;
-    let findings = crate::work_task_executor::writer_completion_findings(project_root, writer)?;
+    let findings = crate::recovery_contracts::writer_completion_findings(project_root, writer)?;
     matrix
         .repair_writer_claims_against(contract, &writer.id, &findings)
         .map_err(anyhow::Error::msg)?;
@@ -646,6 +628,29 @@ mod tests {
         )]);
         let error = revise_markdown(BEHAVIORS, &desired).unwrap_err();
         assert!(format!("{error:#}").contains("did not contain selected requirements"));
+    }
+
+    #[test]
+    fn test_reference_delta_preserves_responsibility_and_commands() {
+        let context = PlanningContext {
+            plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Check host. | | `bash tests/host.sh` | host | Yes |\n".into()),
+            ..Default::default()
+        };
+        let mut contract = WriterCompletionContract::from_planning_context(&context).unwrap();
+        contract.requirements[0].command = Some(crate::work_model::PlanCommand {
+            command: "bash tests/host.sh".into(),
+            working_directory: ".".into(),
+            environment: BTreeMap::new(),
+            source_row: contract.requirements[0].id.clone(),
+        });
+        let mut changed = contract.clone();
+        changed.requirements[0].responsibility = None;
+        assert!(validate_contract_delta(&contract, &changed, &BTreeMap::new()).is_err());
+        let mut changed = contract.clone();
+        assert!(changed.requirements[0].command.is_some());
+        changed.requirements[0].command = None;
+        assert!(validate_contract_delta(&contract, &changed, &BTreeMap::new()).is_err());
+        validate_contract_delta(&contract, &contract, &BTreeMap::new()).unwrap();
     }
 
     #[test]

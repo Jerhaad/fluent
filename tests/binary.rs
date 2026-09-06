@@ -35517,6 +35517,326 @@ fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCom
 }
 
 #[test]
+fn legacy_ownership_survives_test_reference_recovery() {
+    use fluent::work_model::*;
+    use sha2::Digest;
+    let tmp = TempDir::new().unwrap();
+    let id = format!(
+        "owned-references-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, &id);
+    fs::create_dir_all(project.join("tests")).unwrap();
+    for name in ["original", "revised", "final"] {
+        fs::write(
+            project.join(format!("tests/{name}.sh")),
+            format!("#!/bin/sh\nset -eu\ntest -s README.md\nprintf 'ok tests/{name}.sh\\n'\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        project.join(".fluent/tester.yaml"),
+        "commands:\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join(".fluent/extract-tester-results"),
+        include_str!("../.fluent/extract-tester-results"),
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &[
+            "add",
+            "tests",
+            ".fluent/tester.yaml",
+            ".fluent/extract-tester-results",
+        ],
+        "stage reference fixtures",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add reference fixtures"],
+        "commit reference fixtures",
+    )
+    .unwrap();
+    let candidate = git_head(&project);
+    let store = WorkModelStore::new(&project);
+    store.mutate_work_item(&id, |item| {
+        let context = item.planning_context.as_mut().unwrap();
+        context.behaviors = Some("# Behaviors\n\n## Recovery\n\n### B1\n\nWHEN checks finish, THE SYSTEM SHALL retain evidence.\nTest: tests/original.sh\n".into());
+        let contract = WriterCompletionContract::from_planning_context(context).unwrap();
+        let attempt = &mut item.attempts[0];
+        let writer = &mut attempt.tasks[0];
+        writer.output.as_mut().unwrap().commit = candidate.clone();
+        let path = project.join(&writer.artifact_area.as_ref().unwrap().path).join("writer-completion.json");
+        let prior: WriterCompletionMatrix = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut matrix = WriterCompletionMatrix::skeleton(&contract, &writer.id, &[], Some(&prior)).unwrap();
+        let behavior = matrix.rows.iter_mut().find(|row| row.kind == WriterCompletionRequirementKind::Behavior).unwrap();
+        behavior.state = WriterCompletionState::Complete;
+        behavior.implementation_evidence = vec!["tests/original.sh: retained implementation".into()];
+        behavior.verification = vec![WriterVerificationClaim { command: "bash tests/original.sh".into(), result: WriterVerificationResult::Pass }];
+        fs::write(path.parent().unwrap().join("transcript.jsonl"), "{\"type\":\"result\",\"result\":\"source implemented\"}\n").unwrap();
+        fs::write(path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+        attempt.writer_completion_contract = Some(contract);
+        Ok(())
+    }).unwrap();
+    let workspace = bind_candidate_to_managed_sibling(&project, &id, &candidate);
+    let preview_path = tmp.path().join("preview.json");
+    ownership_preview(&project, &id, &proposal, &preview_path);
+    ownership_approve(&project, &id, &preview_path)
+        .assert()
+        .success();
+    let adopted = store.read_work_item(&id).unwrap();
+    let approval_matrix = adopted.attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == "ownership-recovery"
+                && artifact.path.ends_with("/writer-completion.json")
+        })
+        .unwrap();
+    let adopted_bytes = fs::read(project.join(&approval_matrix.path)).unwrap();
+    let adopted_matrix: WriterCompletionMatrix = serde_json::from_slice(&adopted_bytes).unwrap();
+    let progress = project.join(format!(".fluent/work/progress/{id}/attempt-1/progress.md"));
+    fs::create_dir_all(progress.parent().unwrap()).unwrap();
+    fs::write(
+        &progress,
+        adopted.attempts[0]
+            .progress_contract
+            .as_ref()
+            .unwrap()
+            .project_completed_required_progress("", &adopted_matrix, &approval_matrix.path)
+            .unwrap(),
+    )
+    .unwrap();
+    let passing = tmp.path().join("passing.json");
+    fs::write(&passing, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T22:00:00Z","output":"host check passed"}"#).unwrap();
+    attach_interrupted_host(&project, &id, &candidate, &passing)
+        .assert()
+        .success();
+    let bin = tmp.path().join("provider");
+    write_scheduler_claude(
+        &bin,
+        r#"#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == *"Evidence-targeted review"* ]]; then
+    printf 'Verdict: pass\n' > review.md
+    exit 0
+  fi
+done
+case "$PWD" in
+  *-behaviors|*-tests) printf 'Verdict: fail\n- [ ] Correct the Test reference.\n' > review.md ;;
+  *) printf 'Verdict: pass\n' > review.md ;;
+esac
+"#,
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+    let capped = store.read_work_item(&id).unwrap();
+    assert_eq!(capped.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+    assert_eq!(
+        capped.attempts[0].evidence_recoveries[0].state,
+        EvidenceRecoveryState::Complete
+    );
+
+    for name in ["revised", "final"] {
+        let before = store.read_work_item(&id).unwrap();
+        let reference = format!("behavior:recovery:b1=tests/{name}.sh");
+        for _ in 0..2 {
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "revise-test-references",
+                    &id,
+                    "attempt-1",
+                    "--reference",
+                    &reference,
+                    "--resolution",
+                    "Use the corrected test path without changing obligations.",
+                ])
+                .assert()
+                .success();
+        }
+        let revised = store.read_work_item(&id).unwrap();
+        let attempt = &revised.attempts[0];
+        let mut expected_contract = adopted.attempts[0]
+            .writer_completion_contract
+            .clone()
+            .unwrap();
+        expected_contract
+            .requirements
+            .iter_mut()
+            .find(|row| row.id == "behavior:recovery:b1")
+            .unwrap()
+            .verification_refs = vec![format!("tests/{name}.sh")];
+        assert_eq!(attempt.writer_completion_contract, Some(expected_contract));
+        assert_eq!(
+            attempt.progress_contract,
+            adopted.attempts[0].progress_contract
+        );
+        assert_eq!(
+            attempt.evidence_recoveries,
+            before.attempts[0].evidence_recoveries
+        );
+        assert_eq!(
+            &attempt.tasks[..before.attempts[0].tasks.len()],
+            &before.attempts[0].tasks
+        );
+        assert_eq!(
+            attempt.tasks.len(),
+            before.attempts[0].tasks.len() + 2,
+            "exact replay must not add reviews"
+        );
+        let artifact = attempt
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.producer_id == "planning-reference-recovery"
+                    && artifact.path.ends_with("/writer-completion.json")
+            })
+            .unwrap();
+        let matrix: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(project.join(&artifact.path)).unwrap()).unwrap();
+        let mut expected_matrix = adopted_matrix.clone();
+        expected_matrix
+            .rows
+            .iter_mut()
+            .find(|row| row.id == "behavior:recovery:b1")
+            .unwrap()
+            .verification_refs = vec![format!("tests/{name}.sh")];
+        assert_eq!(
+            matrix, expected_matrix,
+            "only approved Test references may change"
+        );
+        let audit_ref = attempt
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| {
+                artifact.producer_id == "planning-reference-recovery"
+                    && artifact.path.ends_with("/revision.json")
+            })
+            .unwrap();
+        for (path, field, replacement) in [
+            (
+                project.join(&audit_ref.path),
+                "resolution",
+                serde_json::json!("changed authorization"),
+            ),
+            (project.join(&artifact.path), "rows", serde_json::json!([])),
+        ] {
+            let bytes = fs::read(&path).unwrap();
+            let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            changed[field] = replacement;
+            if field == "resolution" {
+                changed["resolution-sha256"] = serde_json::json!(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(changed[field].as_str().unwrap().as_bytes())
+                ));
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+            let state_before = work_item_value(&project, &id);
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "revise-test-references",
+                    &id,
+                    "attempt-1",
+                    "--reference",
+                    &reference,
+                    "--resolution",
+                    "Use the corrected test path without changing obligations.",
+                ])
+                .assert()
+                .failure();
+            assert_eq!(
+                work_item_value(&project, &id),
+                state_before,
+                "changed audit or matrix must not mutate state on exact replay"
+            );
+            fs::write(path, bytes).unwrap();
+        }
+        if name == "final" {
+            write_scheduler_claude(
+                &bin,
+                r#"#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == *"You are the Learner"* ]]; then
+    draft=$(printf '%s' "$arg" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+    mkdir -p "$(dirname "$draft")"
+    printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$draft"
+    exit 0
+  fi
+done
+printf 'Verdict: pass\n' > review.md
+"#,
+            );
+        }
+        fluent_cmd()
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+            .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+            .assert()
+            .success();
+        let resumed = store.read_work_item(&id).unwrap();
+        if name == "revised" {
+            assert_eq!(resumed.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+            assert!(
+                resumed.attempts[0]
+                    .tasks
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .all(
+                        |task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete
+                    )
+            );
+        } else {
+            assert!(
+                resumed.attempts[0]
+                    .learning
+                    .as_ref()
+                    .is_some_and(|learning| learning.status == LearningStatus::Succeeded),
+                "revised reference must retain accepted host evidence through Learning: {:?}; handoff: {:?}",
+                resumed.attempts[0].pause_kind,
+                fs::read_to_string(project.join(format!(
+                    ".fluent/work/artifacts/{id}/attempt-1/needs-user.md"
+                )))
+            );
+            assert!(
+                resumed.attempts[0].tasks.iter().any(
+                    |task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete
+                )
+            );
+        }
+        assert_eq!(
+            resumed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(
+            fs::read(project.join(&approval_matrix.path)).unwrap(),
+            adopted_bytes
+        );
+        assert_eq!(git_head(&workspace.workspace), candidate);
+    }
+}
+
+#[test]
 fn legacy_ownership_adoption_requires_approval() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, proposal) = setup_legacy_ownership_fixture(&tmp, "legacy-ownership");

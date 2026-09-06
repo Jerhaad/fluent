@@ -3814,6 +3814,16 @@ operation. Record syntax upgrades and status reads do not invoke adoption.
 See the saved mixed-row example in
 `skills/fluent.full/references/host-evidence-recovery.md` for the public commands.
 
+Test-reference recovery revises the Attempt's adopted contract and reads its
+shared authoritative completion matrix. It changes only selected behavior
+references, preserving split Plan identities, responsibility, commands, progress,
+and completion claims. The neutral boundary replays recorded reference approvals
+over the ownership contract and verifies each revised matrix digest. Exact retries
+revalidate both approval histories before returning their recorded result.
+Accepted host evidence retains its original source bytes and targeted Review;
+a later reference matrix can reuse it only for the same Writer candidate and an
+identical Plan row in the validated history.
+
 Writer stagnation compares consecutive completion matrices by stable obligation
 identity and completed rows. Repeated corrective reviews do not exempt a Writer
 from the two-continuation guard. New findings reset the comparison; replacing an

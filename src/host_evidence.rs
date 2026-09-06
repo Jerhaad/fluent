@@ -1237,10 +1237,6 @@ pub(crate) fn apply_completed_plan_host_evidence(
     let Some(output) = writer.output.as_ref() else {
         return false;
     };
-    let source_bytes = fs::read(project_root.join(&source_matrix.path)).ok();
-    let source_digest = source_bytes
-        .as_deref()
-        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)));
     let mut changed = false;
     for artifact in attempt.artifacts.iter().filter(|artifact| {
         artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
@@ -1257,23 +1253,20 @@ pub(crate) fn apply_completed_plan_host_evidence(
             || binding.attempt_id != attempt.id
             || binding.writer_task_id != writer.id
             || binding.candidate_commit != output.commit
-            || binding.source_matrix.path != source_matrix.path
-            || source_digest.as_deref() != Some(binding.source_matrix.digest.as_str())
             || binding.result != EvidenceResult::Pass
         {
             continue;
         }
-        if !writer_completion_matrix_ref(project_root, attempt, writer)
-            .is_some_and(|expected| expected.path == source_matrix.path)
-        {
-            continue;
-        }
-        let source_matrix_value = match source_bytes
-            .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<WriterCompletionMatrix>(bytes).ok())
-        {
-            Some(source) if source.task_id == writer.id => source,
-            _ => continue,
+        let source_matrix_value = match crate::recovery_contracts::plan_host_source_matrix(
+            project_root,
+            attempt,
+            writer,
+            source_matrix,
+            &binding.source_matrix,
+            &binding.plan_row,
+        ) {
+            Ok(source) => source,
+            Err(_) => continue,
         };
         let Some(source_row) = source_matrix_value
             .rows

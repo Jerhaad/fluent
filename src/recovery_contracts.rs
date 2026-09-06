@@ -357,14 +357,10 @@ fn validated_ownership_approval(
     );
     let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&source_bytes)?;
     validate_preserved_completion_repair(project_root, attempt, &preview.source_matrix)?;
-    let (approved_contract, approved_matrix) = preview
+    let (mut approved_contract, approved_matrix) = preview
         .proposal
         .apply(&preview.original_contract, &source)
         .map_err(anyhow::Error::msg)?;
-    anyhow::ensure!(
-        attempt.writer_completion_contract.as_ref() == Some(&approved_contract),
-        "approved responsibility contract changed"
-    );
     let adopted: work_model::WriterCompletionMatrix = serde_json::from_slice(&fs::read(
         resolve_input_artifact_path(project_root, &audit.matrix_artifact.path)?,
     )?)?;
@@ -385,6 +381,96 @@ fn validated_ownership_approval(
                 .as_ref()
                 .is_some_and(|output| output.commit == preview.candidate_commit),
         "ownership approval no longer names its source Writer candidate"
+    );
+    // Later Test-reference approvals may change only behavior references. Replay
+    // their recorded deltas over the adopted contract, never over legacy Plan text.
+    for artifact in attempt
+        .artifacts
+        .iter()
+        .skip_while(|artifact| *artifact != audit_ref)
+        .skip(1)
+        .filter(|artifact| {
+            artifact.producer_id == "planning-reference-recovery"
+                && artifact.path.ends_with("/revision.json")
+        })
+    {
+        let revision: work_model::TestReferenceRevisionAudit = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &artifact.path)?,
+        )?)?;
+        let revision_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&revision)?));
+        anyhow::ensure!(
+            revision.schema_version == 1
+                && revision.work_item_id == attempt.work_item_id
+                && revision.attempt_id == attempt.id
+                && !revision.resolution.trim().is_empty()
+                && format!("{:x}", Sha256::digest(revision.resolution.as_bytes()))
+                    == revision.resolution_sha256
+                && attempt.recovery_operations.iter().any(|operation| {
+                    operation.operation_kind == "planning-test-reference-revision"
+                        && operation.work_item_id == attempt.work_item_id
+                        && operation.attempt_id == attempt.id
+                        && operation.candidate_commit.as_ref() == Some(&revision.candidate_commit)
+                        && operation.input_digest.as_ref() == Some(&revision_digest)
+                }),
+            "Test-reference revision has no matching recorded approval"
+        );
+        let mut changed = std::collections::HashSet::new();
+        anyhow::ensure!(
+            !revision.changes.is_empty(),
+            "Test-reference revision has no changes"
+        );
+        for change in &revision.changes {
+            let row = approved_contract
+                .requirements
+                .iter_mut()
+                .find(|row| row.id == change.requirement_id)
+                .context("approved Test-reference requirement disappeared")?;
+            anyhow::ensure!(
+                changed.insert(&change.requirement_id)
+                    && row.kind == work_model::WriterCompletionRequirementKind::Behavior
+                    && row.verification_refs == change.old_references
+                    && !change.new_references.is_empty(),
+                "approved Test-reference delta changed"
+            );
+            row.verification_refs = change.new_references.clone();
+        }
+        anyhow::ensure!(
+            attempt.artifacts.contains(&ArtifactRef {
+                producer_id: "planning-reference-recovery".into(),
+                path: revision.completion_matrix_artifact.clone(),
+            }),
+            "approved Test-reference matrix is not registered"
+        );
+        let bytes = fs::read(resolve_input_artifact_path(
+            project_root,
+            &revision.completion_matrix_artifact,
+        )?)?;
+        anyhow::ensure!(
+            revision.completion_matrix_sha256.as_ref()
+                == Some(&format!("{:x}", Sha256::digest(&bytes))),
+            "approved Test-reference completion evidence changed"
+        );
+        let matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| {
+                task.id == matrix.task_id
+                    && task.kind == TaskKind::Write
+                    && task
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.commit == revision.candidate_commit)
+            })
+            .context("approved Test-reference source Writer candidate changed")?;
+        let findings = writer_completion_findings(project_root, writer)?;
+        matrix
+            .status_against(&approved_contract, &writer.id, &findings)
+            .map_err(anyhow::Error::msg)?;
+    }
+    anyhow::ensure!(
+        attempt.writer_completion_contract.as_ref() == Some(&approved_contract),
+        "approved responsibility contract changed"
     );
     Ok(Some(audit))
 }
@@ -2072,6 +2158,78 @@ mod tests {
     }
 
     #[test]
+    fn plan_host_source_requires_bound_bytes_and_recorded_lineage() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = work_model::WorkItem::planned("work-1", "Retain host evidence");
+        item.planning_context = Some(work_model::PlanningContext {
+            plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Check host. | | `bash tests/host.sh` | host | Yes |\n".into()),
+            ..Default::default()
+        });
+        item.add_initial_attempt("attempt-1").unwrap();
+        let attempt = &item.attempts[0];
+        let writer = &attempt.tasks[0];
+        let matrix = work_model::WriterCompletionMatrix::skeleton(
+            attempt.writer_completion_contract.as_ref().unwrap(),
+            &writer.id,
+            &[],
+            None,
+        )
+        .unwrap();
+        let artifact = writer_completion_matrix_ref(tmp.path(), attempt, writer).unwrap();
+        let path = tmp.path().join(&artifact.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&matrix).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut bound = work_model::BoundRecheckArtifact {
+            path: artifact.path.clone(),
+            digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        };
+        assert_eq!(
+            plan_host_source_matrix(
+                tmp.path(),
+                attempt,
+                writer,
+                &artifact,
+                &bound,
+                "plan:step-1"
+            )
+            .unwrap(),
+            matrix
+        );
+        fs::write(&path, [bytes.as_slice(), b"\n"].concat()).unwrap();
+        assert!(
+            plan_host_source_matrix(
+                tmp.path(),
+                attempt,
+                writer,
+                &artifact,
+                &bound,
+                "plan:step-1"
+            )
+            .is_err()
+        );
+        fs::write(&path, &bytes).unwrap();
+        bound.path = format!(
+            "{}/unapproved.json",
+            writer.artifact_area.as_ref().unwrap().path
+        );
+        fs::write(tmp.path().join(&bound.path), &bytes).unwrap();
+        assert!(
+            plan_host_source_matrix(
+                tmp.path(),
+                attempt,
+                writer,
+                &artifact,
+                &bound,
+                "plan:step-1"
+            )
+            .is_err(),
+            "matching bytes cannot authorize an unrecorded source"
+        );
+    }
+
+    #[test]
     fn failed_evidence_snapshot_rejects_pass_result() {
         let passing = br#"{"schema_version":1,"producer":"host","check":"cargo test","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
 
@@ -2132,6 +2290,63 @@ fn recovered_completion_matrices(
         recovered.push((artifact.clone(), matrix));
     }
     Ok(recovered)
+}
+
+/// Retain a host check across approved Test-reference revisions only when its
+/// original bytes and exact Plan row still match the authoritative candidate.
+pub(crate) fn plan_host_source_matrix(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+    current: &ArtifactRef,
+    bound: &work_model::BoundRecheckArtifact,
+    row_id: &str,
+) -> Result<work_model::WriterCompletionMatrix> {
+    anyhow::ensure!(
+        writer_completion_matrix_ref(project_root, attempt, writer).as_ref() == Some(current),
+        "host evidence no longer names the authoritative completion source"
+    );
+    let bytes = fs::read(resolve_input_artifact_path(project_root, &bound.path)?)?;
+    anyhow::ensure!(
+        bytes.len() <= work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES
+            && format!("sha256:{:x}", Sha256::digest(&bytes)) == bound.digest,
+        "host evidence source completion bytes changed"
+    );
+    let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        source.task_id == writer.id,
+        "host evidence source Writer changed"
+    );
+    if bound.path != current.path {
+        let approval = validated_ownership_approval(project_root, attempt)?
+            .context("host evidence source changed without approved ownership")?;
+        let recovered = recovered_completion_matrices(project_root, attempt)?;
+        anyhow::ensure!(
+            recovered
+                .iter()
+                .any(|(artifact, matrix)| artifact.path == bound.path
+                    && matrix.task_id == writer.id
+                    && (artifact == &approval.matrix_artifact
+                        || artifact.producer_id == "planning-reference-recovery")),
+            "host evidence source is outside approved completion history"
+        );
+        let current_matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(
+            &fs::read(resolve_input_artifact_path(project_root, &current.path)?)?,
+        )?;
+        let source_row = source
+            .rows
+            .iter()
+            .find(|row| {
+                row.id == row_id && row.kind == work_model::WriterCompletionRequirementKind::Plan
+            })
+            .context("host evidence source Plan row disappeared")?;
+        anyhow::ensure!(
+            current_matrix.task_id == writer.id
+                && current_matrix.rows.iter().find(|row| row.id == row_id) == Some(source_row),
+            "host evidence Plan obligation changed"
+        );
+    }
+    Ok(source)
 }
 
 /// Carry matching immutable claims through already-materialized repair lineage.

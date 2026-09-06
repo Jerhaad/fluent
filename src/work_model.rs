@@ -3142,6 +3142,35 @@ pub struct WriterCompletionRequirement {
     pub command: Option<PlanCommand>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct TestReferenceChange {
+    pub requirement_id: String,
+    pub old_references: Vec<String>,
+    pub new_references: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct TestReferenceRevisionAudit {
+    pub schema_version: u32,
+    pub revision_id: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub candidate_commit: String,
+    pub resolution: String,
+    pub resolution_sha256: String,
+    pub changes: Vec<TestReferenceChange>,
+    pub prior_behaviors_sha256: String,
+    pub revised_behaviors_sha256: String,
+    pub completion_matrix_artifact: String,
+    // Older reference audits predate ownership adoption and omit this binding.
+    // Revisions after adoption must bind their exact completion evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_matrix_sha256: Option<String>,
+    pub created_at: String,
+}
+
 /// Immutable planning requirements stamped on a new code-producing Attempt.
 /// Legacy Attempts deserialize without this contract and retain their prior
 /// admission behavior.

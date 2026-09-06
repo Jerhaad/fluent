@@ -176,9 +176,10 @@ Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_
 ### B7
 
 WHEN Fluent accepts a Test-reference revision, THE SYSTEM SHALL preserve the
-candidate and prior review history and schedule fresh Behaviors and Tests
-reviews without consuming a Writer round.
+candidate, prior review history, adopted ownership, and accepted host evidence,
+and schedule fresh Behaviors and Tests reviews without consuming a Writer round.
 Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
+Test: tests/binary.rs (legacy_ownership_survives_test_reference_recovery)
 
 ### B8
 
