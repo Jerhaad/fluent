@@ -9,13 +9,19 @@ For an Attempt with a `ProgressContract`, `progress.md` serves two different
 purposes that must stay structurally separate:
 
 - `## Required completion` is a closed, host-owned projection. Its stable ids,
-  requirement text, and order come from required Plan rows. For a matrix-backed
-  Attempt, Writers do not edit this section. They report completion in the
-  task-owned matrix, and the host replaces the section with exact Plan text and
-  links to validated matrix rows before review.
+  requirement text, and order come from Writer-owned required Plan rows. For a
+  matrix-backed Attempt, Writers do not edit this section. They report completion
+  in the task-owned matrix, and the host replaces the section with exact
+  Writer-owned Plan text and links to validated matrix rows before review.
 - `## Review follow-ups` is the mutable queue for findings from later review
   rounds. Follow-up Writers address its unchecked entries before returning to
   required or ordinary plan work.
+
+The full completion contract retains host, review, Tester, and Learner
+obligations. Their matrix rows remain pending with empty evidence arrays in
+Writer output and pass through their separate host or workflow gates. An absent
+responsibility retains legacy Writer semantics. Projecting Writer progress must
+neither erase external obligations nor require the Writer to claim them complete.
 
 The host replaces only the required section and preserves every separate
 level-two section. Current open findings also appear as matrix finding rows, so

@@ -52,6 +52,7 @@
 - [git-subprocesses-use-central-wrapper](git-subprocesses-use-central-wrapper.md) — Production Git subprocesses must use src/git.rs rather than constructing git commands directly
 - [hermetic-release-provider-boundary](hermetic-release-provider-boundary.md) — Declared release suites isolate nested provider routes with fail-closed doubles and an explicit fixture credential allowlist
 - [hook-base-commit-is-context-specific](hook-base-commit-is-context-specific.md) — Treat FLUENT_BASE_COMMIT as optional hook context supplied by candidate-gate checks, not as a universal hook variable
+- [host-evidence-settles-against-bound-writer](host-evidence-settles-against-bound-writer.md) — Settle host-evidence reviews against their recorded Writer candidate while requiring fresh evidence for a later candidate
 - [host-evidence-writes-use-exclusive-create](host-evidence-writes-use-exclusive-create.md) — Host-owned run/handoff evidence is written with exclusive create-new and propagates every write error — never a best-effort copy
 - [host-owned-git-transaction-over-untrusted-coder](host-owned-git-transaction-over-untrusted-coder.md) — A host driving an untrusted coder over one workspace owns a Git transaction: cumulative per-return ledger, host-authored canonical squash, pointers only after clean verify
 - [http-test-server-reads-complete-body](http-test-server-reads-complete-body.md) — Local HTTP test servers must read headers and the complete Content-Length body before asserting a production request

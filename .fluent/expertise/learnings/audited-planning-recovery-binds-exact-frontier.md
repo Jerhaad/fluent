@@ -16,10 +16,28 @@ Record the prior and replacement planning bytes, their identities, the human
 resolution, candidate, and source-review identity in a deterministic audit.
 Validate every immutable input before writing it, and make a repeated identical
 request reuse that audit and its corrective Writer rather than creating another
-round. When a replacement changes a planning stage, rebuild the host-owned
-completion contract and reject it if it changes requirements outside that
-stage. If a combined planning representation is authoritative, revise it
-consistently or reject the recovery.
+round. Apply the approved stage delta to the Attempt's current completion
+contract and reject changes outside that stage. Retained planning text cannot
+reconstruct ownership splits adopted after intake. Preserve the other stages'
+row identities, responsibility, commands, progress, and completion evidence. If
+a combined planning representation is authoritative, revise it consistently or
+reject the recovery.
+
+Compose saved approvals in their recorded order through `recovery_contracts`.
+Decode Approach and Test-reference audits with their own schemas and validate
+their source contracts and matrix digests before source selection or exact
+replay. Contract history and replacement-matrix history have different edges:
+Approach approvals revise requirements, while Test-reference approvals produce
+replacement matrices. Follow recorded matrix predecessors, which may name an
+ordinary Writer matrix, rather than requiring an ownership-adoption artifact.
+An unchanged host obligation may retain accepted evidence only when its exact
+candidate, row, command, source bytes, and targeted review still agree.
+
+Verify recovery composition through public commands, including interleaved
+Approach and Test-reference revisions, both intake and adopted ownership, and
+a successful corrective Writer. Continue through evidence consumption and the
+later Tester and Learner gates; contract replay or Writer materialization alone
+does not establish that the next transition remains usable.
 
 Carry every actionable artifact from the settled review round into the
 corrective Writer and schedule the affected reviews for its corrected
@@ -31,4 +49,5 @@ ignore failed Tasks.
 
 Related: [[planning-approval-binds-exact-revision]],
 [[corrective-writers-preserve-candidate-lineage]],
-[[fresh-field-level-finalizer-preserves-concurrent-state]].
+[[fresh-field-level-finalizer-preserves-concurrent-state]],
+[[host-evidence-settles-against-bound-writer]].
