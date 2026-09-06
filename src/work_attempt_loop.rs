@@ -21155,6 +21155,107 @@ mod tests {
     }
 
     #[test]
+    fn literal_backslash_n_candidate_advances_without_corrective_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "pub fn value() {}\n",
+            Some(include_str!("../scripts/check-commit-message-policy.sh")),
+        );
+        crate::git::run(
+            workspace.path(),
+            &[
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                "Add candidate\\n\\nExplain candidate",
+            ],
+            "create literal newline candidate",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate.clone();
+        let writer = item.attempts[0].tasks[0].clone();
+        store.write_work_item(&item).unwrap();
+
+        let outcome =
+            plan_after_completed_writer(project.path(), &store, item, "attempt-1").unwrap();
+
+        let WorkAttemptRunOutcome::PlannedReviews { task_ids } = outcome else {
+            panic!("literal newline advice must advance directly to review: {outcome:?}");
+        };
+        let stored = store.read_work_item("work-1").unwrap();
+        let attempt = &stored.attempts[0];
+        assert_eq!(attempt.status, AttemptStatus::Reviewing);
+        assert_eq!(attempt.pause_kind, None);
+        assert_eq!(attempt.tasks[0], writer);
+        assert_eq!(
+            attempt
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
+        );
+        assert_eq!(attempt.tasks.len(), 1 + task_ids.len());
+        assert_eq!(task_ids.len(), crate::review::REVIEWERS.len());
+        let gate = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == writer.id && artifact.path.ends_with("/candidate-gate.json")
+            })
+            .unwrap();
+        let evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
+        assert_eq!(evidence.candidate_commit, candidate);
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+        assert!(evidence.metadata_rewrite.is_none());
+        let hook = evidence
+            .checks
+            .iter()
+            .find(|check| check.name == "project-check")
+            .unwrap();
+        assert_eq!(hook.status, CandidateCheckStatus::Passed);
+        assert!(
+            fs::read_to_string(project.path().join(hook.log_path.as_ref().unwrap()))
+                .unwrap()
+                .contains("advice: commit-message contains literal \\n text")
+        );
+        for reviewer in &attempt.tasks[1..] {
+            assert_eq!(reviewer.kind, TaskKind::Review);
+            assert!(task_ids.contains(&reviewer.id));
+            assert!(reviewer.input_artifacts.contains(gate));
+            assert_eq!(
+                reviewer.review_context.as_ref().unwrap().candidate_commit,
+                candidate
+            );
+        }
+        assert_eq!(
+            crate::git::run_stdout(
+                workspace.path(),
+                &["rev-parse", "HEAD"],
+                "verify unchanged candidate"
+            )
+            .unwrap(),
+            candidate
+        );
+        assert!(
+            crate::candidate_metadata_recovery::candidate_gate_authorization_context(
+                project.path(),
+                attempt,
+                &writer
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn metadata_only_history_repair_reaches_review() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, workspace) =
@@ -21168,7 +21269,7 @@ mod tests {
                 "-m",
                 "Add candidate\\n\\nExplain candidate",
             ],
-            "create invalid candidate metadata",
+            "create historical literal newline candidate",
         )
         .unwrap();
         let rejected = crate::git::run_stdout(
@@ -21182,17 +21283,31 @@ mod tests {
         let preserved_input = attach_gate_named_work_item_input(project.path(), &mut item);
         store.write_work_item(&item).unwrap();
 
-        let first = plan_after_completed_writer(
-            project.path(),
-            &store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-        )
-        .unwrap();
-        assert!(matches!(
-            first,
-            WorkAttemptRunOutcome::PlannedWriteRound { .. }
-        ));
+        // Reconstruct a persisted failure and corrective Task from an older Fluent.
+        // Current admission accepts this message and cannot create this history.
+        assert!(
+            gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0)
+                .unwrap()
+                .is_none()
+        );
+        let prior_gate = item.attempts[0].artifacts.last().unwrap().clone();
+        let prior_path = project.path().join(&prior_gate.path);
+        let mut evidence: CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(&prior_path).unwrap()).unwrap();
+        let metadata = evidence
+            .checks
+            .iter_mut()
+            .find(|check| check.name == "commit-metadata")
+            .unwrap();
+        metadata.status = CandidateCheckStatus::Failed;
+        metadata.diagnostics = vec![format!(
+            "commit {rejected} contains literal \\n text instead of line breaks"
+        )];
+        evidence.disposition = CandidateGateDisposition::Rejected;
+        fs::write(&prior_path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+        item.add_next_write_round("attempt-1", vec![prior_gate])
+            .unwrap();
+        store.write_work_item(&item).unwrap();
 
         crate::git::run(
             workspace.path(),
