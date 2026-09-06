@@ -36289,6 +36289,132 @@ fn attach_interrupted_host(
 }
 
 #[test]
+fn interrupted_owned_plan_writers_keep_ordinary_resume() {
+    use fluent::work_model::*;
+    for unfinished in [false, true] {
+        for queued in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let project = setup_git_project(&tmp);
+            let id = format!(
+                "ordinary-owned-{}",
+                tmp.path().file_name().unwrap().to_string_lossy()
+            );
+            let candidate = git_head(&project);
+            let store = WorkModelStore::new(&project);
+            let mut item = WorkItem::planned(&id, "Resume unfinished Writer work");
+            item.planning_context = Some(PlanningContext {
+                plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Implement source. | | `cargo test fix` | writer | Yes |\n| 2 | Check host. | | `bash tests/host.sh` | host | Yes |\n".into()),
+                ..Default::default()
+            });
+            item.add_initial_attempt("attempt-1").unwrap();
+            if unfinished {
+                let attempt = &mut item.attempts[0];
+                let writer = &mut attempt.tasks[0];
+                set_task_terminal(writer, TaskStatus::Complete);
+                writer.output = Some(TaskOutput {
+                    workspace_id: "candidate".into(),
+                    workspace_path: project.display().to_string(),
+                    source_branch: "main".into(),
+                    base_commit: None,
+                    commit: candidate.clone(),
+                    no_change: None,
+                    learner_canonicalization: None,
+                });
+                let source = ArtifactRef {
+                    producer_id: writer.id.clone(),
+                    path: format!(
+                        "{}/writer-completion.json",
+                        writer.artifact_area.as_ref().unwrap().path
+                    ),
+                };
+                let matrix = WriterCompletionMatrix::skeleton(
+                    attempt.writer_completion_contract.as_ref().unwrap(),
+                    &writer.id,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                fs::create_dir_all(project.join(&source.path).parent().unwrap()).unwrap();
+                fs::write(
+                    project.join(&source.path),
+                    serde_json::to_vec_pretty(&matrix).unwrap(),
+                )
+                .unwrap();
+                fs::write(
+                    project
+                        .join(&source.path)
+                        .parent()
+                        .unwrap()
+                        .join("transcript.jsonl"),
+                    "{\"type\":\"result\",\"result\":\"source still incomplete\"}\n",
+                )
+                .unwrap();
+                item.add_next_write_round("attempt-1", vec![source])
+                    .unwrap();
+            }
+            let writer = item.attempts[0].tasks.last_mut().unwrap();
+            let writer_id = writer.id.clone();
+            writer.status = TaskStatus::Executing;
+            writer.started_at = Some(now_iso8601());
+            item.attempts[0].status = AttemptStatus::Executing;
+            store.create_work_item(&item).unwrap();
+            let _workspace = bind_candidate_to_managed_sibling(&project, &id, &candidate);
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["attempt", "cancel", &id, "attempt-1"])
+                .assert()
+                .success();
+            let canceled = store.read_work_item(&id).unwrap();
+            assert_eq!(
+                canceled.attempts[0].pause_kind,
+                Some(PauseKind::Interrupted)
+            );
+            if queued {
+                for _ in 0..2 {
+                    fluent_cmd()
+                        .current_dir(&project)
+                        .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                        .assert()
+                        .success();
+                }
+                assert_eq!(dispatch_count(&project, &id), 1);
+            } else {
+                let bin = tmp.path().join("provider");
+                let marker = tmp.path().join("resumed");
+                write_scheduler_claude(
+                    &bin,
+                    "#!/bin/sh\nprintf 'resumed\\n' > \"$RETRY_MARKER\"\nexit 3\n",
+                );
+                let result = fluent_cmd()
+                    .current_dir(&project)
+                    .env("PATH", mock_path(&bin))
+                    .env("RETRY_MARKER", &marker)
+                    .env("FLUENT_MAX_TASK_RETRIES", "0")
+                    .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    marker.exists(),
+                    "ordinary Writer was not retried (unfinished={unfinished}): {}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let resumed = store.read_work_item(&id).unwrap();
+            assert_eq!(
+                resumed.attempts[0].tasks.len(),
+                canceled.attempts[0].tasks.len()
+            );
+            assert_eq!(resumed.attempts[0].tasks.last().unwrap().id, writer_id);
+            assert_eq!(
+                resumed.attempts[0].writer_completion_contract,
+                canceled.attempts[0].writer_completion_contract
+            );
+            assert!(resumed.attempts[0].evidence_recoveries.is_empty());
+        }
+    }
+}
+
+#[test]
 fn interrupted_plan_host_evidence_recovers_same_attempt() {
     check_interrupted_plan_host_evidence_recovery(false);
 }

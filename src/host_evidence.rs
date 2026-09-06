@@ -959,6 +959,44 @@ pub(crate) fn pending_owned_host_resume_action(
     {
         return Ok(None);
     }
+    if attempt.pause_kind == Some(work_model::PauseKind::Interrupted) {
+        // Ordinary initial Writers and unfinished continuations keep their normal
+        // retry path. Recognize host-only work before imposing its prerequisites.
+        if crate::lifecycle_recovery::interrupted_plan_host_writer(attempt).is_none() {
+            return Ok(None);
+        }
+        let Some(contract) = attempt
+            .writer_completion_contract
+            .as_ref()
+            .filter(|contract| {
+                contract.requirements.iter().any(|row| {
+                    row.responsibility == Some(work_model::CompletionResponsibility::Host)
+                })
+            })
+        else {
+            return Ok(None);
+        };
+        let writer = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .expect("recognized continuation has a completed Writer");
+        let matrix = crate::recovery_contracts::authoritative_writer_completion_matrix(
+            project_root,
+            attempt,
+            writer,
+        )?
+        .context("interrupted source Writer has no completion matrix")?;
+        let findings = crate::recovery_contracts::writer_completion_findings(project_root, writer)?;
+        if !matrix
+            .status_against(contract, &writer.id, &findings)
+            .map_err(anyhow::Error::msg)?
+            .is_complete()
+        {
+            return Ok(None);
+        }
+    }
     let Some(action) = required_host_verification_pending(project_root, attempt)? else {
         return Ok(None);
     };

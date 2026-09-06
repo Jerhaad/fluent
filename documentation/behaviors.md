@@ -9761,6 +9761,8 @@ Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt)
 Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_same_attempt_rejects_unsafe_state)
 Test: tests/binary.rs (interrupted_plan_host_evidence_recovers_from_repaired_source)
 Test: tests/binary.rs (interrupted_plan_host_evidence_rejects_changed_repair_provenance)
+Unrelated interrupted Writers retain ordinary foreground and queued retry rules.
+Test: tests/binary.rs (interrupted_owned_plan_writers_keep_ordinary_resume)
 
 ### B3
 

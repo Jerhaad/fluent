@@ -3831,6 +3831,11 @@ old finding does not regress an unchanged completed Plan row. Legacy progress
 without a matrix retains its counts and compares the finding identities. A new
 commit alone never counts as additional completion.
 
+An interrupted initial Writer or a continuation with unfinished Writer obligations
+uses ordinary Task retry. Host-resume admission first recognizes a completed
+Writer followed by an output-free continuation with complete Writer obligations;
+only that shape must satisfy the host-only candidate and evidence prerequisites.
+
 For a stopped, output-free interrupted continuation, `lifecycle_recovery`
 recognizes the narrow Task sequence and passes it to `recovery_contracts` to verify the managed
 candidate, approved host row, source completion, and both owner mechanisms.
