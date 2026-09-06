@@ -182,6 +182,7 @@ Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_
 Test: tests/binary.rs (legacy_ownership_survives_test_reference_recovery)
 Test: tests/binary.rs (later_writer_host_proof_survives_test_reference_recovery)
 Test: tests/binary.rs (explicit_plan_host_proof_survives_test_reference_recovery)
+Test: tests/binary.rs (interleaved_planning_revisions_retain_host_proof)
 
 ### B8
 

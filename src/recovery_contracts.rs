@@ -2550,10 +2550,11 @@ pub(crate) fn plan_host_source_matrix(
                 .iter()
                 .rev()
                 .filter(|artifact| {
-                    matches!(
-                        artifact.producer_id.as_str(),
-                        "planning-reference-recovery" | "planning-approach-recovery"
-                    ) && artifact.path.ends_with("/revision.json")
+                    // Only reference revisions produce replacement matrices.
+                    // The shared validator above checks Approach audit history
+                    // under its own schema; those audits add no matrix edge.
+                    artifact.producer_id == "planning-reference-recovery"
+                        && artifact.path.ends_with("/revision.json")
                 })
                 .map(
                     |artifact| -> Result<work_model::TestReferenceRevisionAudit> {

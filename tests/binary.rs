@@ -35525,30 +35525,53 @@ fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCom
 
 #[test]
 fn legacy_ownership_survives_test_reference_recovery() {
-    check_owned_planning_recovery(false, false, false);
+    check_owned_planning_recovery(false, false, OwnedPlanningRecovery::References);
 }
 
 #[test]
 fn later_writer_host_proof_survives_test_reference_recovery() {
-    check_owned_planning_recovery(false, true, false);
+    check_owned_planning_recovery(false, true, OwnedPlanningRecovery::References);
 }
 
 #[test]
 fn explicit_plan_host_proof_survives_test_reference_recovery() {
-    check_owned_planning_recovery(true, false, false);
+    check_owned_planning_recovery(true, false, OwnedPlanningRecovery::References);
 }
 
 #[test]
 fn explicit_plan_survives_approach_recovery() {
-    check_owned_planning_recovery(true, false, true);
+    check_owned_planning_recovery(true, false, OwnedPlanningRecovery::Approach);
 }
 
 #[test]
 fn legacy_ownership_survives_approach_recovery() {
-    check_owned_planning_recovery(false, false, true);
+    check_owned_planning_recovery(false, false, OwnedPlanningRecovery::Approach);
 }
 
-fn check_owned_planning_recovery(explicit: bool, corrective: bool, approach: bool) {
+#[test]
+fn interleaved_planning_revisions_retain_host_proof() {
+    for explicit in [false, true] {
+        check_owned_planning_recovery(
+            explicit,
+            false,
+            OwnedPlanningRecovery::ApproachThenReferences,
+        );
+    }
+}
+
+enum OwnedPlanningRecovery {
+    References,
+    Approach,
+    ApproachThenReferences,
+}
+
+fn check_owned_planning_recovery(
+    explicit: bool,
+    corrective: bool,
+    recovery: OwnedPlanningRecovery,
+) {
+    let approach = !matches!(recovery, OwnedPlanningRecovery::References);
+    let interleaved = matches!(recovery, OwnedPlanningRecovery::ApproachThenReferences);
     use fluent::work_model::*;
     use sha2::Digest;
     const APPROACH: &str = "# Approach\n\n## Key decisions\n\n### Keep the boundary\n\nChoice: Keep it narrow.\n\n## Structure\n\nRecover under a lock.\n";
@@ -35704,9 +35727,10 @@ fn check_owned_planning_recovery(explicit: bool, corrective: bool, approach: boo
             })
             .unwrap();
     }
-    let adopted = store.read_work_item(&id).unwrap();
-    let adopted_bytes = fs::read(project.join(&approval_matrix.path)).unwrap();
-    let adopted_matrix: WriterCompletionMatrix = serde_json::from_slice(&adopted_bytes).unwrap();
+    let mut adopted = store.read_work_item(&id).unwrap();
+    let mut adopted_bytes = fs::read(project.join(&approval_matrix.path)).unwrap();
+    let mut adopted_matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&adopted_bytes).unwrap();
     let progress = project.join(format!(".fluent/work/progress/{id}/attempt-1/progress.md"));
     fs::create_dir_all(progress.parent().unwrap()).unwrap();
     fs::write(
@@ -36043,6 +36067,17 @@ printf '{"type":"result","subtype":"success","result":"Implemented the approved 
                 .join(format!(".fluent/work/queue/{id}.json"))
                 .exists()
         );
+        if interleaved {
+            store
+                .mutate_work_item(&id, |item| {
+                    item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])?;
+                    item.attempts[0].status = AttemptStatus::NeedsUser;
+                    item.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
+                    item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+                    Ok(())
+                })
+                .unwrap();
+        }
         fluent_cmd()
             .current_dir(&project)
             .args([
@@ -36060,9 +36095,57 @@ printf '{"type":"result","subtype":"success","result":"Implemented the approved 
             ])
             .assert()
             .success();
-        write_scheduler_claude(
-            &bin,
-            r#"#!/bin/bash
+        if interleaved {
+            write_scheduler_claude(
+                &bin,
+                r#"#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == *"Evidence-targeted review"* ]]; then
+    printf 'Verdict: pass\n' > review.md
+    exit 0
+  fi
+done
+case "$PWD" in
+  *-behaviors|*-tests) printf 'Verdict: fail\n- [ ] Correct the Test reference.\n' > review.md ;;
+  *) printf 'Verdict: pass\n' > review.md ;;
+esac
+"#,
+            );
+            fluent_cmd()
+                .current_dir(&project)
+                .env("PATH", mock_path(&bin))
+                .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+                .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+                .assert()
+                .success();
+            let settled = store.read_work_item(&id).unwrap();
+            assert_eq!(settled.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+            assert_eq!(settled.attempts[0].evidence_recoveries.len(), 2);
+            assert_eq!(settled.attempts[0].evidence_recoveries[0], prior_recovery);
+            assert_eq!(
+                settled.attempts[0].evidence_recoveries[1].state,
+                EvidenceRecoveryState::Complete
+            );
+            assert_eq!(
+                fs::read(project.join(&approval_matrix.path)).unwrap(),
+                adopted_bytes
+            );
+            candidate = next_candidate.clone();
+            approval_matrix = ArtifactRef {
+                producer_id: writer.id.clone(),
+                path: matrix_path
+                    .strip_prefix(&project)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            adopted_bytes = fs::read(&matrix_path).unwrap();
+            adopted_matrix = serde_json::from_slice(&adopted_bytes).unwrap();
+            adopted = settled;
+        } else {
+            write_scheduler_claude(
+                &bin,
+                r#"#!/bin/bash
 for arg in "$@"; do
   if [[ "$arg" == *"You are the Learner"* ]]; then
     draft=$(printf '%s' "$arg" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
@@ -36073,69 +36156,69 @@ for arg in "$@"; do
 done
 printf 'Verdict: pass\n' > review.md
 "#,
-        );
-        if explicit {
-            for _ in 0..2 {
+            );
+            if explicit {
+                for _ in 0..2 {
+                    fluent_cmd()
+                        .current_dir(&project)
+                        .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                        .assert()
+                        .success();
+                }
+                assert_eq!(dispatch_count(&project, &id), 1);
+                let scheduler =
+                    run_scheduler_until_dispatch_status(&project, &id, &bin, "candidate-ready");
+                assert!(
+                    scheduler.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&scheduler.stderr)
+                );
+            } else {
                 fluent_cmd()
                     .current_dir(&project)
-                    .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                    .env("PATH", mock_path(&bin))
+                    .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
                     .assert()
                     .success();
             }
-            assert_eq!(dispatch_count(&project, &id), 1);
-            let scheduler =
-                run_scheduler_until_dispatch_status(&project, &id, &bin, "candidate-ready");
+            let ready = store.read_work_item(&id).unwrap();
             assert!(
-                scheduler.status.success(),
-                "{}",
-                String::from_utf8_lossy(&scheduler.stderr)
+                ready.attempts[0]
+                    .learning
+                    .as_ref()
+                    .is_some_and(|learning| learning.status == LearningStatus::Succeeded),
+                "{:?}",
+                ready.attempts[0].pause_kind
             );
-        } else {
-            fluent_cmd()
-                .current_dir(&project)
-                .env("PATH", mock_path(&bin))
-                .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
-                .assert()
-                .success();
+            assert!(
+                ready.attempts[0].tasks.iter().any(
+                    |task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete
+                )
+            );
+            assert_eq!(
+                ready.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                2
+            );
+            assert_eq!(ready.attempts[0].evidence_recoveries.len(), 2);
+            assert_eq!(ready.attempts[0].evidence_recoveries[0], prior_recovery);
+            assert_eq!(
+                ready.attempts[0].evidence_recoveries[1].candidate_commit,
+                *next_candidate
+            );
+            assert_eq!(
+                ready.attempts[0].evidence_recoveries[1].state,
+                EvidenceRecoveryState::Complete
+            );
+            assert_eq!(
+                fs::read(project.join(&approval_matrix.path)).unwrap(),
+                adopted_bytes
+            );
+            return;
         }
-        let ready = store.read_work_item(&id).unwrap();
-        assert!(
-            ready.attempts[0]
-                .learning
-                .as_ref()
-                .is_some_and(|learning| learning.status == LearningStatus::Succeeded),
-            "{:?}",
-            ready.attempts[0].pause_kind
-        );
-        assert!(
-            ready.attempts[0]
-                .tasks
-                .iter()
-                .any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
-        );
-        assert_eq!(
-            ready.attempts[0]
-                .tasks
-                .iter()
-                .filter(|task| task.kind == TaskKind::Write)
-                .count(),
-            2
-        );
-        assert_eq!(ready.attempts[0].evidence_recoveries.len(), 2);
-        assert_eq!(ready.attempts[0].evidence_recoveries[0], prior_recovery);
-        assert_eq!(
-            ready.attempts[0].evidence_recoveries[1].candidate_commit,
-            *next_candidate
-        );
-        assert_eq!(
-            ready.attempts[0].evidence_recoveries[1].state,
-            EvidenceRecoveryState::Complete
-        );
-        assert_eq!(
-            fs::read(project.join(&approval_matrix.path)).unwrap(),
-            adopted_bytes
-        );
-        return;
     }
 
     for name in ["revised", "final"] {
@@ -36284,13 +36367,7 @@ printf 'Verdict: pass\n' > review.md
             .env("PATH", mock_path(&bin))
             .env(
                 "FLUENT_MAX_TOTAL_WRITE_ROUNDS",
-                if approach {
-                    "3"
-                } else if corrective {
-                    "2"
-                } else {
-                    "1"
-                },
+                if corrective || approach { "2" } else { "1" },
             )
             .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
             .assert()
@@ -36332,13 +36409,17 @@ printf 'Verdict: pass\n' > review.md
                 .iter()
                 .filter(|task| task.kind == TaskKind::Write)
                 .count(),
-            if corrective { 2 } else { 1 }
+            if corrective || approach { 2 } else { 1 }
         );
         assert_eq!(
             fs::read(project.join(&approval_matrix.path)).unwrap(),
             adopted_bytes
         );
         assert_eq!(git_head(&workspace.workspace), candidate);
+        assert_eq!(
+            resumed.attempts[0].evidence_recoveries, before.attempts[0].evidence_recoveries,
+            "reference recovery must reuse accepted host proof without another attachment"
+        );
     }
 }
 

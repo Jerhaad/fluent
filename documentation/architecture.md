@@ -3826,6 +3826,10 @@ identical Plan row in the validated history. Each new revision binds its source
 contract, matrix path, and source digest, including ordinary Task-produced
 matrices and Plans with explicit ownership from intake. Recovery follows these
 recorded sources instead of requiring an ownership-adoption artifact.
+The matrix-source resolver follows reference-revision audits, which alone create
+replacement matrices. The shared history validator decodes Approach approvals
+under their own schema before evidence consumption, so interleaved approvals
+retain the accepted host check for the unchanged candidate.
 
 Approach recovery applies its authorized delta to the Attempt's current contract,
 retaining every non-Approach row, including adopted Plan splits and earlier Test
