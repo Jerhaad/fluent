@@ -1291,7 +1291,11 @@ suffix) and operates on the candidate workspace in its current state.
 
 Landing creates no Reviewer or Attempt Tester Tasks. Its host-owned verification
 uses the existing Tester sandbox, Attempt dependency cache, candidate guard, and
-failure comparison rules. The guard restores tracked index and worktree changes
+failure comparison rules. It prepares that cache under the project cache lock
+without reclaiming other caches or reading unrelated Work Items. Task launches
+and cleanup retain responsibility for reclamation, so a malformed follow-up
+record can report its error after landing without blocking verification.
+The guard restores tracked index and worktree changes
 after preserving test evidence; it rejects HEAD changes or failed restoration.
 The executor rechecks candidate cleanliness and the target head before merging.
 A failed verification records merge status `failed`, the exact Tester artifact,

@@ -1781,9 +1781,8 @@ fn run_merge_tester(
             config.work_item_id,
             &candidate.attempt_id,
         )?;
-        crate::writer_cache::prepare_writer_dependency_cache_for_launch(
+        crate::writer_cache::prepare_writer_dependency_cache_for_landing(
             &cache,
-            config.store,
             crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
         )?;
         let settlement = crate::tester::prepare_settlement_directories(artifact_dir, &plan)?;

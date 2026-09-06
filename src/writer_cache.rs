@@ -1,4 +1,4 @@
-//! Attempt-scoped Cargo caches for Writer and final Tester tasks.
+//! Attempt-scoped Cargo caches for Writer tasks, final Testers, and landing.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
@@ -103,6 +103,19 @@ pub(crate) fn prepare_writer_dependency_cache_for_launch(
     let _lease = crate::lease::acquire_blocking(&lock_path)
         .with_context(|| format!("acquire Writer cache lock {}", lock_path.display()))?;
     reclaim_terminal_writer_caches(&cache.project_root, store)?;
+    prepare_writer_dependency_cache(cache, canonical_cargo_home)
+}
+
+/// Prepare the landing Tester's exact-Attempt cache under the project cache lock.
+/// Leave reclamation to task launches and cleanup so unrelated Work Item records
+/// cannot block verification before post-land follow-ups can report their errors.
+pub(crate) fn prepare_writer_dependency_cache_for_landing(
+    cache: &WriterDependencyCache,
+    canonical_cargo_home: Option<&Path>,
+) -> Result<()> {
+    let lock_path = cache.project_root.join(WRITER_CACHE_LOCK_RELATIVE_PATH);
+    let _lease = crate::lease::acquire_blocking(&lock_path)
+        .with_context(|| format!("acquire Writer cache lock {}", lock_path.display()))?;
     prepare_writer_dependency_cache(cache, canonical_cargo_home)
 }
 
@@ -508,6 +521,45 @@ mod tests {
 
         assert!(format!("{error:#}").contains("must not be a symlink"));
         assert!(fs::read_dir(&external).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn landing_preparation_ignores_unrelated_work_and_preserves_other_caches() {
+        let tmp = TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        store
+            .write_work_item(&work_item(
+                "work-1",
+                AttemptStatus::Complete,
+                TaskStatus::Complete,
+            ))
+            .unwrap();
+        fs::write(
+            tmp.path().join(".fluent/work/items/unrelated.json"),
+            "{ not json",
+        )
+        .unwrap();
+        let other = preflight_writer_dependency_cache(tmp.path(), "other", "attempt-1").unwrap();
+        prepare_writer_dependency_cache(&other, None).unwrap();
+        fs::write(other.cargo_home().join("preserved"), "other cache").unwrap();
+
+        let source = tmp.path().join("canonical-cargo-home");
+        fs::create_dir_all(source.join("registry/cache")).unwrap();
+        fs::write(source.join("registry/cache/crate"), "dependency").unwrap();
+        fs::write(source.join("credentials.toml"), "secret").unwrap();
+        let cache = preflight_writer_dependency_cache(tmp.path(), "work-1", "attempt-1").unwrap();
+
+        prepare_writer_dependency_cache_for_landing(&cache, Some(&source)).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(cache.cargo_home().join("registry/cache/crate")).unwrap(),
+            "dependency"
+        );
+        assert!(!cache.cargo_home().join("credentials.toml").exists());
+        assert_eq!(
+            fs::read_to_string(other.cargo_home().join("preserved")).unwrap(),
+            "other cache"
+        );
     }
 
     #[test]

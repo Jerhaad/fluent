@@ -14363,6 +14363,59 @@ fn approved_land_retry_supersedes_the_host_sandbox_pause() {
         "work-1",
         "attempt-1-merge-candidate",
     ];
+    let target = git_head(&main_dir);
+    let completed = work_item_value(&main_dir, "work-1");
+    let workspace = PathBuf::from(
+        completed["merge_candidates"][0]["source_workspace"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    // A cold baseline fails before any Rebase Task exists. Keep that failure
+    // on the Merge Candidate without reopening the completed Attempt.
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(land_args)
+        .env("PATH", mock_path(&bin_dir))
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "fail")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Cannot verify target baseline"))
+        .stderr(predicate::str::contains("FLUENT_HOST_SANDBOX_BLOCKED"));
+    let blocked = work_item_value(&main_dir, "work-1");
+    assert_eq!(blocked["attempts"], completed["attempts"]);
+    assert_eq!(
+        blocked["merge_candidates"][0]["merge_state"]["status"],
+        "failed"
+    );
+    assert_eq!(git_head(&main_dir), target);
+    assert!(main_dir.join(&workspace).is_dir());
+    let artifact = &blocked["merge_candidates"][0]["merge_state"]["check_artifacts"][0];
+    assert_eq!(artifact["producer_id"], "merge-target-baseline");
+    let failure_path = main_dir.join(artifact["path"].as_str().unwrap());
+    let failure_bytes = fs::read(&failure_path).unwrap();
+    let failure = read_json_path(&failure_path);
+    assert_eq!(failure["candidate_commit"], target);
+    assert_eq!(failure["error"]["kind"], "merge_tester_boundary");
+
+    // Cache a passing baseline, then stop before reserving Rebase so the next
+    // injected sandbox failure exercises the Rebase pause and retry boundary.
+    let rebase_dir = main_dir.join(
+        ".fluent/work/artifacts/work-1/attempt-1/attempt-1-merge-candidate/merge/attempt-1-rebase",
+    );
+    fs::write(&rebase_dir, "obstruct Rebase artifacts").unwrap();
+    fluent_cmd()
+        .current_dir(&main_dir)
+        .args(land_args)
+        .env("PATH", mock_path(&bin_dir))
+        .assert()
+        .failure();
+    fs::remove_file(&rebase_dir).unwrap();
+    assert_eq!(
+        work_item_value(&main_dir, "work-1")["attempts"],
+        completed["attempts"]
+    );
+    assert_eq!(git_head(&main_dir), target);
+
     fluent_cmd()
         .current_dir(&main_dir)
         .args(land_args)
@@ -14420,6 +14473,7 @@ fn approved_land_retry_supersedes_the_host_sandbox_pause() {
         handoff.is_file(),
         "superseding must retain the first handoff"
     );
+    assert_eq!(fs::read(&failure_path).unwrap(), failure_bytes);
     let transitions = landed["transitions"].as_array().unwrap();
     assert!(
         transitions.iter().any(|event| {
