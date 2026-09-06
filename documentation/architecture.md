@@ -3827,6 +3827,15 @@ contract, matrix path, and source digest, including ordinary Task-produced
 matrices and Plans with explicit ownership from intake. Recovery follows these
 recorded sources instead of requiring an ownership-adoption artifact.
 
+Approach recovery applies its authorized delta to the Attempt's current contract,
+retaining every non-Approach row, including adopted Plan splits and earlier Test
+reference revisions. Its audit binds the prior contract and available source
+matrix bytes. The neutral boundary replays both kinds of planning revision in
+order before source selection, exact retry, or corrective Writer materialization.
+Host evidence keeps its original source contract and bytes; changed Approach rows
+remain pending until the corrective Writer completes them. A changed audit or
+source digest prevents replay without rewriting the preserved history.
+
 Writer stagnation compares consecutive completion matrices by stable obligation
 identity and completed rows. Repeated corrective reviews do not exempt a Writer
 from the two-continuation guard. New findings reset the comparison; replacing an

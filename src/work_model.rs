@@ -3150,6 +3150,43 @@ pub(crate) struct TestReferenceChange {
     pub new_references: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct ApproachRevisionAudit {
+    pub schema_version: u32,
+    pub revision_id: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub candidate_commit: String,
+    pub source_review_task_id: String,
+    pub superseded_task_id: Option<String>,
+    pub prior_approach_sha256: String,
+    pub replacement_approach_sha256: String,
+    pub prior_approach: String,
+    pub replacement_approach: String,
+    pub resolution: String,
+    pub resolution_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_contract: Option<WriterCompletionContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_completion: Option<PlanningCompletionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_reconciliation: Option<LegacyApproachReconciliationReceipt>,
+}
+
+/// Evidence that permits one pre-typed provider failure to enter the ordinary
+/// Approach-revision transaction without rewriting its historical Task state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct LegacyApproachReconciliationReceipt {
+    pub failed_review_task_id: String,
+    pub candidate_commit: String,
+    pub handoff_sha256: String,
+    pub stderr_sha256: String,
+    pub execution_sha256: String,
+    pub diagnostic_excerpt: String,
+}
+
 /// Bind a planning revision to its authoritative Writer evidence and contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PlanningCompletionSource {
@@ -3255,6 +3292,51 @@ impl WriterCompletionContract {
                 requirements,
             })
         }
+    }
+
+    /// Apply an authorized Approach replacement without reconstructing Plan rows.
+    pub fn with_revised_approach(&self, prior: &str, replacement: &str) -> Result<Self, String> {
+        let prior_rows = Self::from_planning_context(&PlanningContext {
+            approach: Some(prior.into()),
+            ..Default::default()
+        })
+        .map(|contract| contract.requirements)
+        .unwrap_or_default();
+        let replacement_rows = Self::from_planning_context(&PlanningContext {
+            approach: Some(replacement.into()),
+            ..Default::default()
+        })
+        .map(|contract| contract.requirements)
+        .unwrap_or_default();
+        let current = self
+            .requirements
+            .iter()
+            .filter(|row| row.kind == WriterCompletionRequirementKind::Approach)
+            .cloned()
+            .collect::<Vec<_>>();
+        if current != prior_rows {
+            return Err("approved Approach source requirements changed".into());
+        }
+        let insertion = self
+            .requirements
+            .iter()
+            .position(|row| {
+                matches!(
+                    row.kind,
+                    WriterCompletionRequirementKind::Approach
+                        | WriterCompletionRequirementKind::Plan
+                )
+            })
+            .unwrap_or(self.requirements.len());
+        let mut revised = self.clone();
+        revised
+            .requirements
+            .retain(|row| row.kind != WriterCompletionRequirementKind::Approach);
+        revised
+            .requirements
+            .splice(insertion..insertion, replacement_rows);
+        revised.validate()?;
+        Ok(revised)
     }
 
     /// Return every immutable planning row a corrective finding may cite.
@@ -11616,6 +11698,37 @@ mod tests {
                 .unwrap()
                 .ends_with("| Responsibility | Req? |")
         );
+    }
+
+    #[test]
+    fn approach_revision_preserves_owned_plan_contract() {
+        let prior = "# Approach\n\n## Key decisions\n\n### Keep boundary\n\nChoice: Original.\n";
+        let replacement = prior.replace("Keep boundary", "Change boundary");
+        let contract = WriterCompletionContract::from_planning_context(&PlanningContext {
+            approach: Some(prior.into()),
+            plan: Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Check host. | | `bash tests/host.sh` | host | Yes |\n".into()),
+            ..Default::default()
+        }).unwrap();
+        let revised = contract.with_revised_approach(prior, &replacement).unwrap();
+        assert_eq!(
+            revised
+                .requirements
+                .iter()
+                .filter(|row| row.kind == WriterCompletionRequirementKind::Plan)
+                .collect::<Vec<_>>(),
+            contract
+                .requirements
+                .iter()
+                .filter(|row| row.kind == WriterCompletionRequirementKind::Plan)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            revised
+                .requirements
+                .iter()
+                .any(|row| row.id == "approach:decision:change-boundary")
+        );
+        assert!(contract.with_revised_approach(&replacement, prior).is_err());
     }
 
     #[test]

@@ -35525,22 +35525,34 @@ fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCom
 
 #[test]
 fn legacy_ownership_survives_test_reference_recovery() {
-    check_owned_test_reference_recovery(false, false);
+    check_owned_planning_recovery(false, false, false);
 }
 
 #[test]
 fn later_writer_host_proof_survives_test_reference_recovery() {
-    check_owned_test_reference_recovery(false, true);
+    check_owned_planning_recovery(false, true, false);
 }
 
 #[test]
 fn explicit_plan_host_proof_survives_test_reference_recovery() {
-    check_owned_test_reference_recovery(true, false);
+    check_owned_planning_recovery(true, false, false);
 }
 
-fn check_owned_test_reference_recovery(explicit: bool, corrective: bool) {
+#[test]
+fn explicit_plan_survives_approach_recovery() {
+    check_owned_planning_recovery(true, false, true);
+}
+
+#[test]
+fn legacy_ownership_survives_approach_recovery() {
+    check_owned_planning_recovery(false, false, true);
+}
+
+fn check_owned_planning_recovery(explicit: bool, corrective: bool, approach: bool) {
     use fluent::work_model::*;
     use sha2::Digest;
+    const APPROACH: &str = "# Approach\n\n## Key decisions\n\n### Keep the boundary\n\nChoice: Keep it narrow.\n\n## Structure\n\nRecover under a lock.\n";
+    const REPLACEMENT: &str = "# Approach\n\n## Key decisions\n\n### Recover the boundary\n\nChoice: Keep recovery narrow.\n\n## Structure\n\nRecover under a lock.\n";
     let tmp = TempDir::new().unwrap();
     let id = format!(
         "owned-references-{}",
@@ -35587,6 +35599,7 @@ fn check_owned_test_reference_recovery(explicit: bool, corrective: bool) {
     store.mutate_work_item(&id, |item| {
         let context = item.planning_context.as_mut().unwrap();
         context.behaviors = Some("# Behaviors\n\n## Recovery\n\n### B1\n\nWHEN checks finish, THE SYSTEM SHALL retain evidence.\nTest: tests/original.sh\n".into());
+        if approach { context.approach = Some(APPROACH.into()); }
         let contract = WriterCompletionContract::from_planning_context(context).unwrap();
         let attempt = &mut item.attempts[0];
         let writer = &mut attempt.tasks[0];
@@ -35594,10 +35607,11 @@ fn check_owned_test_reference_recovery(explicit: bool, corrective: bool) {
         let path = project.join(&writer.artifact_area.as_ref().unwrap().path).join("writer-completion.json");
         let prior: WriterCompletionMatrix = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let mut matrix = WriterCompletionMatrix::skeleton(&contract, &writer.id, &[], Some(&prior)).unwrap();
-        let behavior = matrix.rows.iter_mut().find(|row| row.kind == WriterCompletionRequirementKind::Behavior).unwrap();
-        behavior.state = WriterCompletionState::Complete;
-        behavior.implementation_evidence = vec!["tests/original.sh: retained implementation".into()];
-        behavior.verification = vec![WriterVerificationClaim { command: "bash tests/original.sh".into(), result: WriterVerificationResult::Pass }];
+        for row in matrix.rows.iter_mut().filter(|row| matches!(row.kind, WriterCompletionRequirementKind::Behavior | WriterCompletionRequirementKind::Approach)) {
+            row.state = WriterCompletionState::Complete;
+            row.implementation_evidence = vec!["tests/original.sh: retained implementation".into()];
+            row.verification = vec![WriterVerificationClaim { command: "bash tests/original.sh".into(), result: WriterVerificationResult::Pass }];
+        }
         fs::write(path.parent().unwrap().join("transcript.jsonl"), "{\"type\":\"result\",\"result\":\"source implemented\"}\n").unwrap();
         fs::write(path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
         attempt.writer_completion_contract = Some(contract);
@@ -35701,6 +35715,26 @@ fn check_owned_test_reference_recovery(explicit: bool, corrective: bool) {
             .unwrap(),
     )
     .unwrap();
+    if approach {
+        store
+            .mutate_work_item(&id, |item| {
+                item.add_review_tasks(
+                    "attempt-1",
+                    &[
+                        "architecture",
+                        "behaviors",
+                        "tests",
+                        "documentation",
+                        "skills",
+                    ],
+                )?;
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
+                item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+                Ok(())
+            })
+            .unwrap();
+    }
     let passing = tmp.path().join("passing.json");
     fs::write(&passing, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T22:00:00Z","output":"host check passed"}"#).unwrap();
     let plan_row = if explicit {
@@ -35747,22 +35781,188 @@ case "$PWD" in
 esac
 "#,
     );
+    if approach {
+        write_scheduler_claude(
+            &bin,
+            r#"#!/bin/bash
+case "$PWD" in
+  *-architecture) printf 'Verdict: uncertain\n- [ ] Revise the Approach boundary.\n' > review.md ;;
+  *) printf 'Verdict: pass\n' > review.md ;;
+esac
+"#,
+        );
+    }
     fluent_cmd()
         .current_dir(&project)
         .env("PATH", mock_path(&bin))
         .env(
             "FLUENT_MAX_TOTAL_WRITE_ROUNDS",
-            if corrective { "2" } else { "1" },
+            if approach {
+                "3"
+            } else if corrective {
+                "2"
+            } else {
+                "1"
+            },
         )
         .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
         .assert()
         .success();
     let capped = store.read_work_item(&id).unwrap();
-    assert_eq!(capped.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+    assert_eq!(
+        capped.attempts[0].pause_kind,
+        Some(if approach {
+            PauseKind::Uncertain
+        } else {
+            PauseKind::RoundCap
+        })
+    );
     assert_eq!(
         capped.attempts[0].evidence_recoveries[0].state,
-        EvidenceRecoveryState::Complete
+        // An uncertain Architecture review preserves the active recovery receipt.
+        // The revision must retain that history as well as completed receipts.
+        if approach {
+            EvidenceRecoveryState::Reviewing
+        } else {
+            EvidenceRecoveryState::Complete
+        }
     );
+
+    if approach {
+        let replacement = tmp.path().join("replacement.md");
+        fs::write(&replacement, REPLACEMENT).unwrap();
+        let args = [
+            "attempt",
+            "revise-approach",
+            &id,
+            "attempt-1",
+            "--approach-file",
+            replacement.to_str().unwrap(),
+            "--resolution",
+            "Revise the Approach while retaining all Plan obligations.",
+        ];
+        for _ in 0..2 {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(args)
+                .assert()
+                .success();
+        }
+        let revised = store.read_work_item(&id).unwrap();
+        let attempt = &revised.attempts[0];
+        let contract = attempt.writer_completion_contract.as_ref().unwrap();
+        let original = adopted.attempts[0]
+            .writer_completion_contract
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            contract
+                .requirements
+                .iter()
+                .filter(|row| row.kind != WriterCompletionRequirementKind::Approach)
+                .collect::<Vec<_>>(),
+            original
+                .requirements
+                .iter()
+                .filter(|row| row.kind != WriterCompletionRequirementKind::Approach)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            attempt.progress_contract,
+            adopted.attempts[0].progress_contract
+        );
+        assert_eq!(
+            attempt.evidence_recoveries,
+            capped.attempts[0].evidence_recoveries
+        );
+        assert_eq!(attempt.tasks.len(), capped.attempts[0].tasks.len() + 1);
+        assert_eq!(
+            &attempt.tasks[..capped.attempts[0].tasks.len()],
+            &capped.attempts[0].tasks
+        );
+        let writer = attempt.tasks.last().unwrap();
+        assert_eq!(writer.kind, TaskKind::Write);
+        let audit = attempt
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .unwrap();
+        let audit_path = project.join(&audit.path);
+        let audit_bytes = fs::read(&audit_path).unwrap();
+        let before_tamper = work_item_value(&project, &id);
+        fs::write(
+            project.join(&approval_matrix.path),
+            [adopted_bytes.as_slice(), b"\n"].concat(),
+        )
+        .unwrap();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(args)
+            .assert()
+            .failure();
+        assert_eq!(work_item_value(&project, &id), before_tamper);
+        fs::write(project.join(&approval_matrix.path), &adopted_bytes).unwrap();
+        let mut changed: serde_json::Value = serde_json::from_slice(&audit_bytes).unwrap();
+        changed["prior-approach"] = serde_json::json!("forged original");
+        fs::write(&audit_path, serde_json::to_vec_pretty(&changed).unwrap()).unwrap();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(args)
+            .assert()
+            .failure();
+        assert_eq!(work_item_value(&project, &id), before_tamper);
+        fs::write(&audit_path, audit_bytes).unwrap();
+        let marker = tmp.path().join("approach-writer-started");
+        write_scheduler_claude(
+            &bin,
+            "#!/bin/sh\nprintf 'started\\n' > \"$RETRY_MARKER\"\nexit 3\n",
+        );
+        let result = fluent_cmd()
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .env("RETRY_MARKER", &marker)
+            .env("FLUENT_MAX_TASK_RETRIES", "0")
+            .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "corrective Writer could not materialize its input: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let path = project
+            .join(&writer.artifact_area.as_ref().unwrap().path)
+            .join("writer-completion.json");
+        let matrix: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        for row in &adopted_matrix.rows {
+            if row.kind != WriterCompletionRequirementKind::Approach {
+                assert_eq!(
+                    matrix.rows.iter().find(|current| current.id == row.id),
+                    Some(row)
+                );
+            }
+        }
+        assert!(
+            matrix
+                .rows
+                .iter()
+                .any(|row| row.id == "approach:decision:recover-the-boundary"
+                    && row.state == WriterCompletionState::Pending)
+        );
+        assert!(
+            !matrix
+                .rows
+                .iter()
+                .any(|row| row.id == "approach:decision:keep-the-boundary")
+        );
+        assert_eq!(
+            fs::read(project.join(&approval_matrix.path)).unwrap(),
+            adopted_bytes
+        );
+        assert_eq!(git_head(&workspace.workspace), candidate);
+        return;
+    }
 
     for name in ["revised", "final"] {
         let before = store.read_work_item(&id).unwrap();
@@ -35910,7 +36110,13 @@ printf 'Verdict: pass\n' > review.md
             .env("PATH", mock_path(&bin))
             .env(
                 "FLUENT_MAX_TOTAL_WRITE_ROUNDS",
-                if corrective { "2" } else { "1" },
+                if approach {
+                    "3"
+                } else if corrective {
+                    "2"
+                } else {
+                    "1"
+                },
             )
             .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
             .assert()

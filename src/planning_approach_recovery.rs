@@ -1,17 +1,17 @@
 //! Recover one exact uncertain Architecture review through an audited Approach revision.
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::work_model::{
-    ApproachRevisionSupersession, ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus,
-    DurableTransitionMetadata, DurableTransitionOrigin, PauseKind, RoundCapExtensionRequest,
-    RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
-    WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
+    ApproachRevisionAudit as RevisionAudit, ApproachRevisionSupersession, ApprovedPlanningRevision,
+    ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata, DurableTransitionOrigin,
+    LegacyApproachReconciliationReceipt as LegacyReconciliationReceipt, PauseKind,
+    RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError,
+    WorkModelStore, WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
@@ -24,39 +24,6 @@ pub struct ApproachRevision {
     pub audit_artifact: String,
     pub writer_task_id: String,
     pub already_applied: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct RevisionAudit {
-    schema_version: u32,
-    revision_id: String,
-    work_item_id: String,
-    attempt_id: String,
-    candidate_commit: String,
-    source_review_task_id: String,
-    superseded_task_id: Option<String>,
-    prior_approach_sha256: String,
-    replacement_approach_sha256: String,
-    prior_approach: String,
-    replacement_approach: String,
-    resolution: String,
-    resolution_sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_reconciliation: Option<LegacyReconciliationReceipt>,
-}
-
-/// Evidence that permits one pre-typed provider failure to enter the ordinary
-/// Approach-revision transaction without rewriting its historical Task state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct LegacyReconciliationReceipt {
-    failed_review_task_id: String,
-    candidate_commit: String,
-    handoff_sha256: String,
-    stderr_sha256: String,
-    execution_sha256: String,
-    diagnostic_excerpt: String,
 }
 
 /// Replace the approved Approach only at the narrowly audited review frontier.
@@ -96,6 +63,7 @@ pub fn revise(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
+    crate::recovery_contracts::validate_planning_completion_history(project_root, attempt)?;
     if let Some(existing) = existing_revision(project_root, attempt, &replacement, resolution)? {
         return Ok(existing);
     }
@@ -107,7 +75,7 @@ pub fn revise(
     {
         bail!("Approach revision has no remaining authorized Writer round");
     }
-    let old_contract = WriterCompletionContract::from_planning_context(context)
+    let old_planning_contract = WriterCompletionContract::from_planning_context(context)
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
     let mut revised_context = context.clone();
     revised_context.approach = Some(replacement.clone());
@@ -128,9 +96,51 @@ pub fn revise(
             sha256: digest(replacement.as_bytes()),
         },
     );
-    let new_contract = WriterCompletionContract::from_planning_context(&revised_context)
-        .ok_or_else(|| anyhow::anyhow!("replacement Approach lost the completion contract"))?;
-    validate_contract_delta(&old_contract, &new_contract)?;
+    let new_planning_contract =
+        WriterCompletionContract::from_planning_context(&revised_context)
+            .ok_or_else(|| anyhow::anyhow!("replacement Approach lost the completion contract"))?;
+    validate_contract_delta(&old_planning_contract, &new_planning_contract)?;
+    let old_contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("Attempt has no authoritative completion contract")?;
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .expect("frontier validates the completed Writer");
+    let source_completion =
+        crate::recovery_contracts::writer_completion_matrix_ref(project_root, attempt, writer)
+            .map(|artifact| {
+                let path = crate::recovery_contracts::resolve_input_artifact_path(
+                    project_root,
+                    &artifact.path,
+                )?;
+                let bytes = match fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                let matrix: crate::work_model::WriterCompletionMatrix =
+                    serde_json::from_slice(&bytes)?;
+                let findings =
+                    crate::recovery_contracts::writer_completion_findings(project_root, writer)?;
+                matrix
+                    .status_against(old_contract, &writer.id, &findings)
+                    .map_err(anyhow::Error::msg)?;
+                Ok::<_, anyhow::Error>(Some(crate::work_model::PlanningCompletionSource {
+                    artifact,
+                    sha256: digest(&bytes),
+                    contract: old_contract.clone(),
+                }))
+            })
+            .transpose()?
+            .flatten();
+    let new_contract = old_contract
+        .with_revised_approach(prior_approach, &replacement)
+        .map_err(anyhow::Error::msg)?;
+    validate_contract_delta(old_contract, &new_contract)?;
     let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
     let round_cap_reviews = legacy_cap_extension
         .then(|| {
@@ -169,6 +179,8 @@ pub fn revise(
             .failed_launch
             .as_ref()
             .map(|task| task.id.clone()),
+        prior_contract: Some(old_contract.clone()),
+        source_completion,
         prior_approach_sha256: digest(prior_approach.as_bytes()),
         replacement_approach_sha256: digest(replacement.as_bytes()),
         prior_approach: prior_approach.to_string(),
@@ -238,6 +250,11 @@ pub fn revise(
                     human_resolution: resolution.to_string(),
                 },
             )?;
+        }
+        if fresh.attempts[index].writer_completion_contract.as_ref() != Some(old_contract) {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(), reason: "completion contract changed before Approach revision".into(),
+            });
         }
         fresh.planning_context = Some(revised_context.clone());
         let mut inputs = vec![audit_ref.clone()];
@@ -838,6 +855,147 @@ mod tests {
     #[test]
     fn behavior_selector_manifest_covers_recovery_regressions() {
         assert_eq!(BEHAVIOR_TEST_SELECTORS.len(), 5);
+    }
+
+    #[test]
+    fn replays_reference_approach_reference_history() {
+        use crate::planning_reference_recovery::{self, TestReferenceUpdate};
+        use crate::work_model::{AttemptReviewState, WriterCompletionMatrix};
+
+        let (tmp, store) = fixture();
+        let root = tmp.path();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let writer = &attempt.tasks[0];
+                let matrix = WriterCompletionMatrix::skeleton(
+                    attempt.writer_completion_contract.as_ref().unwrap(),
+                    &writer.id,
+                    &[],
+                    None,
+                )
+                .unwrap();
+                let path = root
+                    .join(&writer.artifact_area.as_ref().unwrap().path)
+                    .join("writer-completion.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                item.add_next_review_tasks("attempt-1", &["behaviors", "tests"])?;
+                for task in item.attempts[0]
+                    .tasks
+                    .iter_mut()
+                    .filter(|task| task.kind == TaskKind::Review)
+                {
+                    task.status = TaskStatus::Complete;
+                    let path = root
+                        .join(&task.artifact_area.as_ref().unwrap().path)
+                        .join("review.md");
+                    if !path.exists() {
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(path, "Verdict: pass\n").unwrap();
+                    }
+                }
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+                item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        planning_reference_recovery::revise(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            &[TestReferenceUpdate {
+                requirement_id: "behavior:recovery:b1".into(),
+                reference: "revised_test".into(),
+            }],
+            "Correct the reference.",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in item.attempts[0].tasks.iter_mut().filter(|task| {
+                    task.kind == TaskKind::Review && task.status != TaskStatus::Complete
+                }) {
+                    task.status = TaskStatus::Complete;
+                    let path = root
+                        .join(&task.artifact_area.as_ref().unwrap().path)
+                        .join("review.md");
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, "Verdict: pass\n").unwrap();
+                }
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].pause_kind = Some(PauseKind::Uncertain);
+                Ok(())
+            })
+            .unwrap();
+        revise(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            REPLACEMENT.as_bytes(),
+            "Approve the Approach.",
+        )
+        .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                let output = attempt.tasks[0].output.clone();
+                let writer = attempt.tasks.last_mut().unwrap();
+                assert_eq!(writer.kind, TaskKind::Write);
+                writer.status = TaskStatus::Complete;
+                writer.output = output;
+                let findings =
+                    crate::recovery_contracts::writer_completion_findings(root, writer).unwrap();
+                let matrix = WriterCompletionMatrix::skeleton(
+                    attempt.writer_completion_contract.as_ref().unwrap(),
+                    &writer.id,
+                    &findings,
+                    None,
+                )
+                .unwrap();
+                let path = root
+                    .join(&writer.artifact_area.as_ref().unwrap().path)
+                    .join("writer-completion.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::RoundCap);
+                attempt.review_state = Some(AttemptReviewState::Failed);
+                Ok(())
+            })
+            .unwrap();
+        planning_reference_recovery::revise(
+            root,
+            &store,
+            "work-1",
+            "attempt-1",
+            &[TestReferenceUpdate {
+                requirement_id: "behavior:recovery:b1".into(),
+                reference: "final_test".into(),
+            }],
+            "Correct the final reference.",
+        )
+        .unwrap();
+        let item = store.read_work_item("work-1").unwrap();
+        let attempt = &item.attempts[0];
+        crate::recovery_contracts::validate_planning_completion_history(root, attempt).unwrap();
+        assert_eq!(
+            attempt.writer_completion_contract,
+            WriterCompletionContract::from_planning_context(
+                item.planning_context.as_ref().unwrap()
+            )
+        );
+        let mut missing_middle = attempt.clone();
+        missing_middle
+            .artifacts
+            .retain(|artifact| artifact.producer_id != PRODUCER);
+        assert!(
+            crate::recovery_contracts::validate_planning_completion_history(root, &missing_middle)
+                .is_err()
+        );
     }
 
     #[test]

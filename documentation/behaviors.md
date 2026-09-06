@@ -9744,6 +9744,17 @@ Test: tests/binary.rs (legacy_ownership_adoption_rejects_stale_state)
 Test: tests/binary.rs (legacy_ownership_adoption_exact_retry_preserves_history)
 Test: tests/binary.rs (legacy_ownership_old_reader_refuses_mutation)
 
+### B5
+
+WHEN an operator authorizes an Approach revision after ownership is assigned,
+THE SYSTEM SHALL retain the non-Approach contract, progress, and host-evidence
+history, and materialize the corrective Writer with the revised Approach.
+Exact retries SHALL reuse the recorded revision only while its audit and source
+completion bytes remain unchanged.
+Test: tests/binary.rs (legacy_ownership_survives_approach_recovery)
+Test: tests/binary.rs (explicit_plan_survives_approach_recovery)
+Test: src/planning_approach_recovery.rs (replays_reference_approach_reference_history)
+
 ## Writer continuation recovery
 
 ### B1

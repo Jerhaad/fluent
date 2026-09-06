@@ -319,10 +319,40 @@ pub(crate) fn owned_host_completion_matrix(
             "ownership mapping no longer names this Writer candidate"
         );
     }
+    // An approved Approach delta leaves the original host proof bound to the
+    // historical matrix. Validate those exact bytes before projecting current rows.
+    let mut source_contract = contract.clone();
+    for audit_ref in attempt.artifacts.iter().rev().filter(|entry| {
+        entry.producer_id == "planning-approach-recovery" && entry.path.ends_with("/revision.json")
+    }) {
+        let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&fs::read(
+            resolve_input_artifact_path(project_root, &audit_ref.path)?,
+        )?)?;
+        if let Some(source) = revision
+            .source_completion
+            .filter(|source| source.artifact == artifact)
+        {
+            anyhow::ensure!(
+                format!("{:x}", Sha256::digest(&bytes)) == source.sha256,
+                "approved Approach source completion evidence changed"
+            );
+            source_contract = source.contract;
+            break;
+        }
+    }
     let findings = writer_completion_findings(project_root, writer)?;
     matrix
-        .status_against(contract, &writer.id, &findings)
+        .status_against(&source_contract, &writer.id, &findings)
         .map_err(anyhow::Error::msg)?;
+    if &source_contract != contract {
+        matrix = work_model::WriterCompletionMatrix::skeleton(
+            contract,
+            &writer.id,
+            &findings,
+            Some(&matrix),
+        )
+        .map_err(anyhow::Error::msg)?;
+    }
     matrix
         .repair_writer_claims_against(contract, &writer.id, &findings)
         .map_err(anyhow::Error::msg)?;
@@ -393,6 +423,14 @@ fn validated_ownership_approval(
     Ok(Some(audit))
 }
 
+/// Check all recorded planning deltas before admitting another revision.
+pub(crate) fn validate_planning_completion_history(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    validated_ownership_approval(project_root, attempt).map(|_| ())
+}
+
 /// Revalidate planning approvals for adopted and explicitly owned Attempts.
 fn validate_planning_revisions(
     project_root: &Path,
@@ -401,9 +439,103 @@ fn validate_planning_revisions(
     start: usize,
 ) -> Result<()> {
     for artifact in attempt.artifacts.iter().skip(start).filter(|artifact| {
-        artifact.producer_id == "planning-reference-recovery"
-            && artifact.path.ends_with("/revision.json")
+        matches!(
+            artifact.producer_id.as_str(),
+            "planning-reference-recovery" | "planning-approach-recovery"
+        ) && artifact.path.ends_with("/revision.json")
     }) {
+        if artifact.producer_id == "planning-approach-recovery" {
+            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
+            if let Some(prior) = &revision.prior_contract {
+                if let Some(expected) = &contract {
+                    anyhow::ensure!(
+                        expected == prior,
+                        "approved Approach source contract changed"
+                    );
+                } else {
+                    contract = Some(prior.clone());
+                }
+            }
+            let Some(prior) = contract.as_ref() else {
+                // Legacy unowned revisions predate captured source contracts.
+                continue;
+            };
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            anyhow::ensure!(
+                revision.schema_version == 1
+                    && revision.work_item_id == attempt.work_item_id
+                    && revision.attempt_id == attempt.id
+                    && !revision.resolution.trim().is_empty()
+                    && format!("{:x}", Sha256::digest(revision.resolution.as_bytes()))
+                        == revision.resolution_sha256
+                    && format!("{:x}", Sha256::digest(revision.prior_approach.as_bytes()))
+                        == revision.prior_approach_sha256
+                    && format!(
+                        "{:x}",
+                        Sha256::digest(revision.replacement_approach.as_bytes())
+                    ) == revision.replacement_approach_sha256
+                    && attempt.recovery_operations.iter().any(|operation| {
+                        operation.operation_kind == "planning-approach-revision"
+                            && operation.work_item_id == attempt.work_item_id
+                            && operation.attempt_id == attempt.id
+                            && operation.candidate_commit.as_ref()
+                                == Some(&revision.candidate_commit)
+                            && operation.task_id.as_ref() == Some(&revision.source_review_task_id)
+                            && operation.input_digest.as_ref() == Some(&digest)
+                    }),
+                "Approach revision has no matching recorded approval"
+            );
+            anyhow::ensure!(
+                attempt
+                    .tasks
+                    .iter()
+                    .any(|task| task.id == revision.source_review_task_id
+                        && task.kind == TaskKind::Review
+                        && task.role == "architecture"
+                        && task.review_context.as_ref().is_some_and(|context| context
+                            .candidate_commit
+                            == revision.candidate_commit)),
+                "approved Approach source review candidate changed"
+            );
+            if let Some(source) = &revision.source_completion {
+                anyhow::ensure!(
+                    &source.contract == prior,
+                    "approved Approach source contract changed"
+                );
+                let bytes = fs::read(resolve_input_artifact_path(
+                    project_root,
+                    &source.artifact.path,
+                )?)?;
+                anyhow::ensure!(
+                    format!("{:x}", Sha256::digest(&bytes)) == source.sha256,
+                    "approved Approach source completion evidence changed"
+                );
+                let matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+                let writer = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| {
+                        task.id == matrix.task_id
+                            && task.kind == TaskKind::Write
+                            && task
+                                .output
+                                .as_ref()
+                                .is_some_and(|output| output.commit == revision.candidate_commit)
+                    })
+                    .context("approved Approach source Writer candidate changed")?;
+                let findings = writer_completion_findings(project_root, writer)?;
+                matrix
+                    .status_against(prior, &writer.id, &findings)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            contract = Some(
+                prior
+                    .with_revised_approach(&revision.prior_approach, &revision.replacement_approach)
+                    .map_err(anyhow::Error::msg)?,
+            );
+            continue;
+        }
         let revision: work_model::TestReferenceRevisionAudit = serde_json::from_slice(&fs::read(
             resolve_input_artifact_path(project_root, &artifact.path)?,
         )?)?;
@@ -2382,8 +2514,10 @@ pub(crate) fn plan_host_source_matrix(
                 .iter()
                 .rev()
                 .filter(|artifact| {
-                    artifact.producer_id == "planning-reference-recovery"
-                        && artifact.path.ends_with("/revision.json")
+                    matches!(
+                        artifact.producer_id.as_str(),
+                        "planning-reference-recovery" | "planning-approach-recovery"
+                    ) && artifact.path.ends_with("/revision.json")
                 })
                 .map(
                     |artifact| -> Result<work_model::TestReferenceRevisionAudit> {
