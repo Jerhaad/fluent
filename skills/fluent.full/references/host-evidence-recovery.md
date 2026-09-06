@@ -21,6 +21,8 @@ schedules a Writer on the existing Attempt.
 - [Attach host-only evidence](#attach-host-only-evidence)
 - [Run one focused Tests check](#run-one-focused-tests-check)
 - [Classify a candidate-bound source correction](#classify-a-candidate-bound-source-correction)
+- [Approve responsibility for a saved mixed Plan row](#approve-responsibility-for-a-saved-mixed-plan-row)
+- [Recover an interrupted Writer awaiting a host check](#recover-an-interrupted-writer-awaiting-a-host-check)
 
 ## Attach host-only evidence
 
@@ -63,8 +65,17 @@ fluent attempt evidence attach <work-item-id> <attempt-id> \
 ```
 
 The evidence `check` must exactly equal the one command Fluent resolves from the
-Plan row. The row may contain a direct command reference, an inline code
-command, or one command embedded in its Deliverable or Verification prose.
+Plan row. Its `working_directory` must exactly match the stored value shown in
+the handoff. For example, for a Plan command `bash tests/host.sh` with
+`working_directory` set to `.`, run the check from the candidate checkout root
+and record that relative value, not an absolute host checkout path:
+
+```json
+{"schema_version":1,"producer":"release-host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-08-03T17:59:47Z","output":"...captured output..."}
+```
+
+The row may contain a direct command reference, an inline code command, or one
+command embedded in its Deliverable or Verification prose.
 Fluent keeps the approved planning text unchanged; if the row contains no
 command or more than one command-shaped reference, it remains a human-recovery
 pause instead of guessing. Fluent binds the result to the unchanged Writer

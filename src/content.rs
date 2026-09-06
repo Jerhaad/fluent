@@ -851,6 +851,15 @@ Check item {{ITEM_ID}}.
             .expect("bundled host-evidence recovery guide must be present");
         assert!(guide.contains("## Contents"));
         assert!(guide.contains("[Classify a candidate-bound source correction]"));
+        assert!(guide.contains("[Approve responsibility for a saved mixed Plan row](#approve-responsibility-for-a-saved-mixed-plan-row)"));
+        assert!(guide.contains("[Recover an interrupted Writer awaiting a host check](#recover-an-interrupted-writer-awaiting-a-host-check)"));
+        let plan_evidence = guide
+            .split_once("For example, for a Plan command")
+            .expect("Plan-specific evidence example")
+            .1;
+        assert!(plan_evidence.contains("\"working_directory\":\".\""));
+        assert!(plan_evidence.contains("candidate checkout root"));
+
         let attachment = guide
             .split_once("## Attach host-only evidence")
             .and_then(|(_, rest)| {

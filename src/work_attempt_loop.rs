@@ -8204,10 +8204,11 @@ fn write_writer_completion_handoff(
         let mut file = fs::OpenOptions::new().append(true).open(&path)?;
         writeln!(
             file,
-            "\n\nThis pending Plan row is an authorized-host check and does not require a Writer commit.\n\nPlan row: {}\nExact command to run on an authorized host against candidate {}: {}\nCompletion matrix: {}\n\nWrite a schema-version-1 host evidence JSON document whose check exactly matches that command, then attach it with:\n\nfluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}\n\nFluent will bind the evidence to this unchanged candidate and create a targeted Tests Review. After that Review settles, resume the Attempt with fluent queue resume {} --attempt {} (or fluent attempt run {} {}).",
+            "\n\nThis pending Plan row is an authorized-host check and does not require a Writer commit.\n\nPlan row: {}\nExact command to run on an authorized host against candidate {}: {}\nEvidence working_directory: {} (use . for the candidate checkout root)\nCompletion matrix: {}\n\nWrite a schema-version-1 host evidence JSON document whose check and working_directory exactly match those values, then attach it with:\n\nfluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}\n\nFluent will bind the evidence to this unchanged candidate and create a targeted Tests Review. After that Review settles, resume the Attempt with fluent queue resume {} --attempt {} (or fluent attempt run {} {}).",
             action.plan_row,
             action.candidate_commit,
             action.command,
+            action.working_directory,
             action.matrix_artifact,
             work_item_id,
             attempt_id,
@@ -17334,6 +17335,11 @@ mod tests {
             for value in [&candidate, "plan:step-2", "bash tests/host.sh", "evidence"] {
                 assert!(handoff.contains(value), "missing {value}: {handoff}");
             }
+            assert!(
+                handoff.contains("Evidence working_directory: ."),
+                "{handoff}"
+            );
+            assert!(handoff.contains("candidate checkout root"), "{handoff}");
             let stored = store.read_work_item("ownership").unwrap();
             assert_eq!(stored.attempts[0].tasks, before_tasks);
             assert_eq!(stored.attempts[0].status, AttemptStatus::NeedsUser);

@@ -82,6 +82,7 @@ struct ValidatedCandidateGateFrontier {
 pub(crate) struct PlanHostEvidenceAction {
     pub plan_row: String,
     pub command: String,
+    pub working_directory: String,
     pub candidate_commit: String,
     pub matrix_artifact: String,
 }
@@ -940,6 +941,11 @@ pub(crate) fn pending_plan_host_evidence_action(
         Some(PlanHostEvidenceAction {
             plan_row: row.id,
             command,
+            working_directory: row
+                .command
+                .as_ref()
+                .map(|command| command.working_directory.clone())
+                .unwrap_or_else(|| ".".into()),
             candidate_commit: output.commit.clone(),
             matrix_artifact: matrix_ref.path.clone(),
         })
@@ -1068,6 +1074,11 @@ pub(crate) fn required_host_verification_pending(
     row.map(|row| {
         Ok(PlanHostEvidenceAction {
             plan_row: row.id.clone(),
+            working_directory: row
+                .command
+                .as_ref()
+                .map(|command| command.working_directory.clone())
+                .unwrap_or_else(|| ".".into()),
             command: resolve_plan_row_command(row)
                 .context("required host check has no exact command")?,
             candidate_commit: writer
