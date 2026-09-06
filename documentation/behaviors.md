@@ -9750,7 +9750,9 @@ WHEN an operator authorizes an Approach revision after ownership is assigned,
 THE SYSTEM SHALL retain the non-Approach contract, progress, and host-evidence
 history, and materialize the corrective Writer with the revised Approach.
 Exact retries SHALL reuse the recorded revision only while its audit and source
-completion bytes remain unchanged.
+completion bytes remain unchanged. After the corrective Writer succeeds, THE
+SYSTEM SHALL retain the settled historical review, require fresh host evidence
+for its new candidate, and allow foreground and queued continuation.
 Test: tests/binary.rs (legacy_ownership_survives_approach_recovery)
 Test: tests/binary.rs (explicit_plan_survives_approach_recovery)
 Test: src/planning_approach_recovery.rs (replays_reference_approach_reference_history)

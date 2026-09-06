@@ -1039,7 +1039,20 @@ pub(crate) fn ensure_owned_host_resume_ready(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<()> {
-    crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)?;
+    let mut settled;
+    let attempt =
+        if crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)? {
+            settled = attempt.clone();
+            settled
+                .evidence_recoveries
+                .iter_mut()
+                .find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
+                .expect("validated active receipt")
+                .state = EvidenceRecoveryState::Complete;
+            &settled
+        } else {
+            attempt
+        };
     if let Some(action) = pending_owned_host_resume_action(project_root, attempt)? {
         bail!(
             "candidate {} requires host action {}: {}; attach the evidence before resume: fluent attempt evidence attach {} {} --candidate {} --evidence-file <PATH> --plan-row {}",
@@ -2154,6 +2167,13 @@ pub fn attach_plan_row(
         format!("attach authorized-host evidence for Plan row {plan_row}"),
         Some(snapshot_path.clone()),
         |item| {
+            let historical = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
+            if crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, historical)
+                .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible { attempt_id: attempt_id.to_string(), reason: format!("{error:#}") })? {
+                historical.evidence_recoveries.iter_mut().find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
+                    .expect("validated active receipt").state = EvidenceRecoveryState::Complete;
+            }
             let attempt = item
                 .attempts
                 .iter()

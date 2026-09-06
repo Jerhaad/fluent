@@ -35569,7 +35569,11 @@ fn check_owned_planning_recovery(explicit: bool, corrective: bool, approach: boo
     }
     fs::write(
         project.join(".fluent/tester.yaml"),
-        "commands:\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n",
+        if approach {
+            "commands:\n  - command: bash tests/original.sh\n    test_harness: shell-harness\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n"
+        } else {
+            "commands:\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n"
+        },
     )
     .unwrap();
     fs::write(
@@ -35819,13 +35823,7 @@ esac
     );
     assert_eq!(
         capped.attempts[0].evidence_recoveries[0].state,
-        // An uncertain Architecture review preserves the active recovery receipt.
-        // The revision must retain that history as well as completed receipts.
-        if approach {
-            EvidenceRecoveryState::Reviewing
-        } else {
-            EvidenceRecoveryState::Complete
-        }
+        EvidenceRecoveryState::Complete
     );
 
     if approach {
@@ -35912,29 +35910,45 @@ esac
             .failure();
         assert_eq!(work_item_value(&project, &id), before_tamper);
         fs::write(&audit_path, audit_bytes).unwrap();
-        let marker = tmp.path().join("approach-writer-started");
-        write_scheduler_claude(
-            &bin,
-            "#!/bin/sh\nprintf 'started\\n' > \"$RETRY_MARKER\"\nexit 3\n",
-        );
-        let result = fluent_cmd()
-            .current_dir(&project)
-            .env("PATH", mock_path(&bin))
-            .env("RETRY_MARKER", &marker)
-            .env("FLUENT_MAX_TASK_RETRIES", "0")
-            .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
-            .output()
-            .unwrap();
-        assert!(
-            marker.exists(),
-            "corrective Writer could not materialize its input: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let path = project
+        let matrix_path = project
             .join(&writer.artifact_area.as_ref().unwrap().path)
             .join("writer-completion.json");
+        let inherited_path = tmp.path().join("inherited-matrix.json");
+        write_scheduler_claude(
+            &bin,
+            r#"#!/bin/bash
+set -eu
+cp "$WRITER_MATRIX" "$INHERITED_MATRIX"
+python3 - "$WRITER_MATRIX" <<'PYCODE'
+import json, pathlib, sys
+p=pathlib.Path(sys.argv[1]); matrix=json.loads(p.read_text())
+for row in matrix['rows']:
+    if row.get('responsibility', 'writer') == 'writer':
+        row['state']='complete'
+        row['implementation-evidence']=['README.md: apply the approved Approach']
+        row['verification']=[{'command':'bash tests/original.sh','result':'pass'}]
+        if row['kind']=='finding':
+            row['applicable-constraints']=['approach:decision:recover-the-boundary']
+p.write_text(json.dumps(matrix, indent=2)+'\n')
+PYCODE
+printf 'Apply the revised Approach.\n' >> README.md
+bash tests/original.sh
+git add README.md
+git commit -m 'Apply the revised Approach'
+printf '{"type":"result","subtype":"success","result":"Implemented the approved Approach."}\n'
+"#,
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .env("WRITER_MATRIX", &matrix_path)
+            .env("INHERITED_MATRIX", &inherited_path)
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+            .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+            .assert()
+            .success();
         let matrix: WriterCompletionMatrix =
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(&inherited_path).unwrap()).unwrap();
         for row in &adopted_matrix.rows {
             if row.kind != WriterCompletionRequirementKind::Approach {
                 assert_eq!(
@@ -35960,7 +35974,167 @@ esac
             fs::read(project.join(&approval_matrix.path)).unwrap(),
             adopted_bytes
         );
-        assert_eq!(git_head(&workspace.workspace), candidate);
+        let corrected = store.read_work_item(&id).unwrap();
+        let current = &corrected.attempts[0];
+        let output = current
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        assert_eq!(output.status, TaskStatus::Complete);
+        let next_candidate = &output.output.as_ref().unwrap().commit;
+        assert_ne!(next_candidate, &candidate);
+        assert_eq!(git_head(&workspace.workspace), *next_candidate);
+        assert_eq!(current.pause_kind, Some(PauseKind::WriterCompletion));
+        assert_eq!(
+            current.evidence_recoveries[0].state,
+            EvidenceRecoveryState::Complete
+        );
+        assert_eq!(current.evidence_recoveries[0].candidate_commit, candidate);
+        let mut prior_recovery = capped.attempts[0].evidence_recoveries[0].clone();
+        prior_recovery.state = EvidenceRecoveryState::Complete;
+        assert_eq!(current.evidence_recoveries[0], prior_recovery);
+        let handoff = fs::read_to_string(project.join(format!(
+            ".fluent/work/artifacts/{id}/attempt-1/writer-completion-needs-user.md"
+        )))
+        .unwrap();
+        assert!(
+            handoff.contains(next_candidate) && handoff.contains(plan_row),
+            "{handoff}"
+        );
+        if explicit {
+            // Reproduce a receipt saved by older Fluent after the correction.
+            store
+                .mutate_work_item(&id, |item| {
+                    item.attempts[0].evidence_recoveries[0].state =
+                        EvidenceRecoveryState::Reviewing;
+                    Ok(())
+                })
+                .unwrap();
+            let evidence_path = project.join(&prior_recovery.attachment.snapshot_path);
+            let original_evidence = fs::read(&evidence_path).unwrap();
+            fs::write(
+                &evidence_path,
+                [original_evidence.as_slice(), b"\n"].concat(),
+            )
+            .unwrap();
+            let before = work_item_value(&project, &id);
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("digest changed"));
+            assert_eq!(work_item_value(&project, &id), before);
+            fs::write(evidence_path, original_evidence).unwrap();
+        }
+        // The old accepted check cannot authorize this new candidate.
+        for _ in 0..2 {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(plan_row));
+        }
+        assert!(
+            !project
+                .join(format!(".fluent/work/queue/{id}.json"))
+                .exists()
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                &id,
+                "attempt-1",
+                "--candidate",
+                next_candidate,
+                "--plan-row",
+                plan_row,
+                "--evidence-file",
+                passing.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        write_scheduler_claude(
+            &bin,
+            r#"#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == *"You are the Learner"* ]]; then
+    draft=$(printf '%s' "$arg" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+    mkdir -p "$(dirname "$draft")"
+    printf '%s\n' '{"learning_summary":"learned","follow_ups":[]}' > "$draft"
+    exit 0
+  fi
+done
+printf 'Verdict: pass\n' > review.md
+"#,
+        );
+        if explicit {
+            for _ in 0..2 {
+                fluent_cmd()
+                    .current_dir(&project)
+                    .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+                    .assert()
+                    .success();
+            }
+            assert_eq!(dispatch_count(&project, &id), 1);
+            let scheduler =
+                run_scheduler_until_dispatch_status(&project, &id, &bin, "candidate-ready");
+            assert!(
+                scheduler.status.success(),
+                "{}",
+                String::from_utf8_lossy(&scheduler.stderr)
+            );
+        } else {
+            fluent_cmd()
+                .current_dir(&project)
+                .env("PATH", mock_path(&bin))
+                .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+                .assert()
+                .success();
+        }
+        let ready = store.read_work_item(&id).unwrap();
+        assert!(
+            ready.attempts[0]
+                .learning
+                .as_ref()
+                .is_some_and(|learning| learning.status == LearningStatus::Succeeded),
+            "{:?}",
+            ready.attempts[0].pause_kind
+        );
+        assert!(
+            ready.attempts[0]
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+        );
+        assert_eq!(
+            ready.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert_eq!(ready.attempts[0].evidence_recoveries.len(), 2);
+        assert_eq!(ready.attempts[0].evidence_recoveries[0], prior_recovery);
+        assert_eq!(
+            ready.attempts[0].evidence_recoveries[1].candidate_commit,
+            *next_candidate
+        );
+        assert_eq!(
+            ready.attempts[0].evidence_recoveries[1].state,
+            EvidenceRecoveryState::Complete
+        );
+        assert_eq!(
+            fs::read(project.join(&approval_matrix.path)).unwrap(),
+            adopted_bytes
+        );
         return;
     }
 

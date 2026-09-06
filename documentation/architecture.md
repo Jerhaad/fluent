@@ -3835,6 +3835,11 @@ order before source selection, exact retry, or corrective Writer materialization
 Host evidence keeps its original source contract and bytes; changed Approach rows
 remain pending until the corrective Writer completes them. A changed audit or
 source digest prevents replay without rewriting the preserved history.
+The shared evidence validator checks an active receipt against its recorded
+Writer and candidate. Once every targeted Plan review passes, Attempt execution
+settles that receipt before advancing a correction; queue admission checks the
+same facts without mutating history, and a later attachment revalidates inside
+its transaction. A new Writer candidate still requires its own host evidence.
 
 Writer stagnation compares consecutive completion matrices by stable obligation
 identity and completed rows. Repeated corrective reviews do not exempt a Writer

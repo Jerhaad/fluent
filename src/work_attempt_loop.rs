@@ -522,6 +522,39 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             continue;
         }
 
+        if crate::recovery_contracts::validate_owned_plan_evidence_review(
+            config.project_root,
+            attempt,
+        )? {
+            mutate_attempt_work_item(config.store, config.work_item_id, |fresh| {
+                let attempt = fresh
+                    .attempts
+                    .iter_mut()
+                    .find(|attempt| attempt.id == config.attempt_id)
+                    .ok_or_else(|| WorkModelError::AttemptNotFound {
+                        id: config.attempt_id.to_string(),
+                    })?;
+                if crate::recovery_contracts::validate_owned_plan_evidence_review(
+                    config.project_root,
+                    attempt,
+                )
+                .map_err(|error| {
+                    WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: config.attempt_id.to_string(),
+                        reason: format!("{error:#}"),
+                    }
+                })? {
+                    attempt
+                        .evidence_recoveries
+                        .iter_mut()
+                        .find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
+                        .expect("validated active receipt")
+                        .state = EvidenceRecoveryState::Complete;
+                }
+                Ok(())
+            })?;
+            continue;
+        }
         crate::host_evidence::ensure_owned_host_resume_ready(config.project_root, attempt)?;
         match reject_terminal_attempt(attempt)? {
             TerminalCheck::Reopen => {

@@ -98,44 +98,73 @@ pub(crate) fn validate_interrupted_plan_host_recovery(
 }
 
 /// Revalidate active Plan evidence before foreground resume, queue admission,
-/// scheduler claim, and Reviewer launch. Legacy attachment semantics remain intact.
+/// scheduler claim, and Reviewer launch. Return whether every targeted Plan
+/// review passed and its active receipt can settle without crediting a later Writer.
+/// Legacy attachment semantics remain intact.
 pub(crate) fn validate_owned_plan_evidence_review(
     project_root: &Path,
     attempt: &work_model::Attempt,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(recovery) = attempt
         .active_evidence_recovery()
         .filter(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
     else {
-        return Ok(());
+        return Ok(false);
     };
+    let mut completed = !recovery.targets.is_empty();
     for target in &recovery.targets {
         if !attempt.artifacts.iter().any(|artifact| {
             artifact.producer_id == "plan-host-evidence"
                 && artifact.path == target.prior_review_artifact
         }) {
+            completed = false;
             continue;
         }
         let binding: work_model::PlanHostEvidenceBinding = serde_json::from_slice(&fs::read(
             resolve_input_artifact_path(project_root, &target.prior_review_artifact)?,
         )?)?;
-        let Some((writer, source, matrix)) = owned_host_completion_matrix(project_root, attempt)?
-        else {
+        // Keep current candidate admission strict, but validate each receipt
+        // against the Writer it actually reviewed, including completed history.
+        if owned_host_completion_matrix(project_root, attempt)?.is_none() {
+            completed = false;
             continue;
-        };
+        }
+        let writer = attempt
+            .tasks
+            .iter()
+            .find(|task| {
+                task.id == binding.writer_task_id
+                    && task.kind == TaskKind::Write
+                    && task.status == TaskStatus::Complete
+            })
+            .context("host evidence source Writer disappeared")?;
+        let source = writer_completion_matrix_ref(project_root, attempt, writer)
+            .context("host evidence source matrix disappeared")?;
+        let matrix = plan_host_source_matrix(
+            project_root,
+            attempt,
+            writer,
+            &source,
+            &binding.source_matrix,
+            &binding.plan_row,
+        )?;
         let row = matrix
             .rows
             .iter()
             .find(|row| row.id == binding.plan_row)
             .context("host evidence row disappeared")?;
         if row.responsibility.is_none() {
+            completed = false;
             continue;
         }
         anyhow::ensure!(
             row.responsibility == Some(work_model::CompletionResponsibility::Host),
             "evidence row is not host-owned"
         );
-        let output = writer.output.as_ref().expect("validated output");
+        let output = writer
+            .output
+            .as_ref()
+            .context("host evidence source output disappeared")?;
         let command = row.command.as_ref().context("host command disappeared")?;
         anyhow::ensure!(
             binding.schema_version == 1
@@ -147,7 +176,6 @@ pub(crate) fn validate_owned_plan_evidence_review(
                 && binding.requirement == row.requirement
                 && binding.command == command.command
                 && binding.working_directory == command.working_directory
-                && binding.source_matrix.path == source.path
                 && binding.evidence.path == recovery.attachment.snapshot_path
                 && binding.evidence.digest == recovery.attachment.digest,
             "host evidence no longer matches its candidate, row, command, or source"
@@ -187,8 +215,16 @@ pub(crate) fn validate_owned_plan_evidence_review(
                 && context.prior_review_artifact == target.prior_review_artifact,
             "targeted review binding changed"
         );
+        completed &= binding.result == work_model::EvidenceResult::Pass
+            && reviewer.kind == TaskKind::Review
+            && reviewer.role == "tests"
+            && reviewer.status == TaskStatus::Complete
+            && reviewer.artifact_area.as_ref().is_some_and(|area| {
+                fs::read_to_string(project_root.join(&area.path).join("review.md"))
+                    .is_ok_and(|text| review::extract_verdict(&text) == review::Verdict::Pass)
+            });
     }
-    Ok(())
+    Ok(completed)
 }
 
 /// Verify the candidate and stopped owners before an operator adopts a saved
