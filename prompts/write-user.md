@@ -176,7 +176,8 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 {{#if is_followup_writer}}
 1. When the step requires a correction, make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
    Treat subject length or style, body presence, body-line length or wrapping,
-   and body formatting as presentation advice: follow it when practical, but
+   body formatting, and literal `\n` text as presentation advice: follow it
+   when practical, but
    do not create corrective work or block completion solely to satisfy it.
    Continue to obey commit-history, identity, message-encoding, and
    `Co-Authored-By` requirements.
@@ -197,7 +198,8 @@ Skip TDD only when the step has no new behavior to test. Skip-eligible examples:
 {{else}}
 1. Make one commit per step. Include everything the step touched — code, tests, `tester.yaml` updates, pattern files, docs — in that commit. Write a message that describes what changed and follows the project's stated commit conventions (`AGENTS.md` / `CLAUDE.md`) — subject length, mood, prohibited trailers, and the like.
    Treat subject length or style, body presence, body-line length or wrapping,
-   and body formatting as presentation advice: follow it when practical, but
+   body formatting, and literal `\n` text as presentation advice: follow it
+   when practical, but
    do not create corrective work or block completion solely to satisfy it.
    Continue to obey commit-history, identity, message-encoding, and
    `Co-Authored-By` requirements.

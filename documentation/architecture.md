@@ -288,14 +288,16 @@ publication.
 Writers with a persisted base commit also cross a deterministic admission gate
 before matrix reconciliation or review. The host verifies the exact candidate
 and clean workspace, runs `git diff --check`, rejects merge commits, invalid
-identities, empty subjects, and literal `\\n` message text, and resolves approved
-behavior references against committed test files and native test identifiers.
-Commit-body presence, line wrapping, attribution trailers, and other repository
+identities, and empty subjects, and resolves approved behavior references
+against committed test files and native test identifiers. Commit-body presence,
+line wrapping, literal `\n` text, attribution trailers, and other repository
 style conventions remain project-owned and may be enforced by
-`check-pre-merge`. Factory's hook reports missing bodies and long body lines as
-advice, while prohibited attribution and other project-check failures remain
-blocking. Fluent stores the results under the Attempt's `candidate-gates/`
-artifacts, separate from the Writer's private artifact directory. When the gate
+`check-pre-merge`. Factory's hook reports missing bodies, long body lines, and
+literal `\n` text as advice. Prohibited attribution and other project-check
+failures remain blocking. Literal `\n` advice alone sends the same candidate
+directly to review without a corrective Writer, rewrite authorization, or pause.
+Fluent stores the results under the Attempt's `candidate-gates/` artifacts,
+separate from the Writer's private artifact directory. When the gate
 first rejects a candidate, Fluent adds its canonical reference exactly once to
 the Attempt artifact index before it creates a corrective Writer with the same
 reference as an input. A first candidate defect becomes the sole gate input to
@@ -342,15 +344,21 @@ classification of legacy evidence. Re-entry then completes or reuses the same
 candidate transition instead of rewriting candidate history or duplicating
 Tasks.
 
+The metadata-recovery parsers and receipts still recognize literal `\n`
+failures persisted by older Fluent versions. These historical artifacts use
+the existing exact compatibility classifier; the active candidate gate never
+produces a literal-newline failure. New literal `\n` advice cannot authorize
+metadata recovery or corrective work.
+
 A metadata recovery is eligible when `commit-metadata` is the only failed
 check, or when `project-check` is the one additional failure and is derived
 from those findings. In the derived form, the gate entry must record exactly
 one nonzero `check-pre-merge exited N` diagnostic. Its canonical
 `hooks/check-pre-merge.log` must be non-empty and contain only nonblank
 hook-finding lines that normalize to the gate's commit-metadata findings,
-including the exact body-line length finding for a commit whose gate metadata
-finding is literal-line-breaks. The exit diagnostic belongs to the gate entry;
-the non-empty hook log supplies the findings. The protected base must remain an
+including the exact body-line length finding for a commit whose historical
+metadata finding is literal-line-breaks. The exit diagnostic belongs to the
+gate entry; the non-empty hook log supplies the findings. The protected base must remain an
 ancestor.
 
 An operator authorizes this recovery with:
@@ -381,10 +389,10 @@ the historical commit's protected parent from Git, and schedules one metadata
 repair Writer with the review and gate artifacts as inputs. A changed review,
 candidate, worktree, or finding is rejected before any state is changed.
 
-A generic `body line N exceeds 72 characters` finding must resolve to a gate
-commit, and the exact overlong commit message line must contain literal `\\n`
-text. A finding for an uncovered commit, an ordinary overlong line, any
-additional non-exit project-check diagnostic, diagnostic present only in the
+For historical evidence, a generic `body line N exceeds 72 characters` finding
+must resolve to a gate commit, and the exact overlong commit message line must
+contain literal `\n` text. A finding for an uncovered commit, an ordinary
+overlong line, any additional non-exit project-check diagnostic, diagnostic present only in the
 gate structure, unrelated or unparseable hook line, noncanonical path, or
 symlinked log remains rejected before Fluent writes recovery authority.
 
@@ -394,14 +402,14 @@ new trusted base. Corrective history remains append-only except for one bounded
 case: when commit metadata was the preceding gate's only failure, or when
 `project-check` was the one additional failure and its canonical stored hook
 log is non-empty and contains only matching metadata findings, including
-`commit <id> body line <positive integer> exceeds 72 characters` for the gate's
+`commit <id> body line <positive integer> exceeds 72 characters` for a historical
 literal-line-breaks finding, while its gate entry records exactly one nonzero
 hook exit. The Writer may rewrite those commits only after the host
 revalidates the prior gate, proves that both candidates descend from its
 original base, and requires identical Git trees, runs every gate check again
 over the replacement, and records both commit identities, the shared tree, and
 the prior artifact path. A project-check-only failure is never eligible. A
-generic overlong line must prove the corresponding literal `\\n` text in the
+generic overlong line must prove the corresponding literal `\n` text in the
 commit message; a changed tree, another prior failure, changed author identity,
 changed linear
 suffix shape, malformed or unproven hook evidence, or an ordinary non-ancestor

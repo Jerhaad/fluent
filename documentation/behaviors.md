@@ -2830,19 +2830,19 @@ WHEN `fluent task run <work-item-id> <attempt-id> <task-id>` or
 `fluent attempt run <work-item-id> <attempt-id>` launches a
 `write` Task,
 THE SYSTEM SHALL identify subject length and style, body presence, wrapping,
-and formatting conventions from `AGENTS.md` / `CLAUDE.md` as presentation
-advice and SHALL NOT request corrective work solely for that advice, while
-continuing to require valid history, identity, message encoding, and
-attribution, including the `Co-Authored-By` prohibition.
+formatting, and literal `\n` text conventions from `AGENTS.md` / `CLAUDE.md`
+as presentation advice and SHALL NOT request corrective work solely for that
+advice, while continuing to require valid history, identity, message encoding,
+and attribution, including the `Co-Authored-By` prohibition.
 Test: src/work_task_executor.rs (write_user_prompt_directs_advisory_commit_presentation)
 
 ### B166a
 
 WHEN Fluent instructs a reviewer to check Factory's commit conventions, THE
-SYSTEM SHALL identify subject length and style, body presence, wrapping, and
-formatting as presentation advice and SHALL NOT request corrective work or a
-failing verdict solely for that advice, while continuing to flag invalid
-history, identity, message encoding, and attribution, including prohibited
+SYSTEM SHALL identify subject length and style, body presence, wrapping,
+formatting, and literal `\n` text as presentation advice and SHALL NOT request
+corrective work or a failing verdict solely for that advice, while continuing
+to flag invalid history, identity, message encoding, and attribution, including prohibited
 `Co-Authored-By` trailers.
 Test: src/work_task_executor.rs (documentation_review_treats_commit_presentation_as_advice)
 
@@ -6595,37 +6595,51 @@ Test: src/work_attempt_loop.rs (passing_candidate_gate_is_attached_to_every_revi
 ### B25
 
 WHEN deterministic candidate checks run, THE SYSTEM SHALL reject a candidate
-whose whitespace, linear history, author or committer identity, subject, or
-literal newline encoding does not satisfy the cross-project integrity rules.
-Test: src/candidate_gate.rs (rejects_whitespace_errors_and_malformed_commit_metadata)
+whose whitespace, linear history, author or committer identity, or subject
+does not satisfy the cross-project integrity rules.
+Test: src/candidate_gate.rs (literal_backslash_n_does_not_mask_whitespace_or_project_failure)
+Test: src/candidate_gate.rs (literal_backslash_n_does_not_mask_blocking_metadata)
 Test: src/candidate_gate.rs (rejects_merge_commits)
 Test: src/candidate_gate.rs (rejects_invalid_identities)
 
 ### B25aa
 
 WHEN structurally valid commit metadata differs only in body presence, body
-line wrapping, or attribution-trailer style, THE SYSTEM SHALL leave its
-acceptance to the project's check hook.
+line wrapping, literal `\n` text, or attribution-trailer style, THE SYSTEM SHALL
+pass the built-in commit-metadata check and leave presentation policy to the
+project's check hook.
 Test: src/candidate_gate.rs (accepts_subject_only_and_coauthored_commits_as_project_policy)
 Test: src/candidate_gate.rs (accepts_overlong_commit_body_lines_as_project_policy)
+Test: src/candidate_gate.rs (accepts_literal_backslash_n_as_project_policy)
 
 ### B25ab
 
 WHEN a structurally valid candidate differs from Factory's commit-message
-guidance only because its commit messages lack bodies or contain body lines
-longer than 72 characters, THE SYSTEM SHALL allow the project check to pass and
-may report those presentation issues as advice.
+guidance only because its commit messages lack bodies, contain body lines
+longer than 72 characters, or contain literal `\n` text, THE SYSTEM SHALL allow
+the project check to pass and may report those presentation issues as advice.
 Test: tests/behaviors/operations/test-commit-message-policy.sh (commit-message presentation is advisory)
+Test: tests/behaviors/operations/test-commit-message-policy.sh (literal backslash-n text is advisory)
 
 ### B25ac
 
-IF a candidate violates commit-history or identity integrity, contains a
-`Co-Authored-By` trailer, or fails another project check, THEN THE SYSTEM SHALL
-continue to reject or block that candidate.
+IF a candidate violates commit-history or identity integrity, has an empty
+subject, contains a `Co-Authored-By` trailer, or fails another project check,
+THEN THE SYSTEM SHALL continue to reject or block that candidate even when its
+message also contains literal `\n` text.
 Test: tests/behaviors/operations/test-commit-message-policy.sh (provenance and non-presentation failures remain blocking)
-Test: src/candidate_gate.rs (rejects_whitespace_errors_and_malformed_commit_metadata)
+Test: tests/behaviors/operations/test-commit-message-policy.sh (literal backslash-n advice does not mask provenance failure)
+Test: src/candidate_gate.rs (literal_backslash_n_does_not_mask_whitespace_or_project_failure)
+Test: src/candidate_gate.rs (literal_backslash_n_does_not_mask_blocking_metadata)
 Test: src/candidate_gate.rs (rejects_merge_commits)
 Test: src/candidate_gate.rs (rejects_invalid_identities)
+
+### B25ad
+
+WHEN literal `\n` text is the only concern for a completed Writer candidate,
+THE SYSTEM SHALL send that same candidate to review without planning a
+corrective Writer, authorizing a commit-message rewrite, or pausing the Attempt.
+Test: src/work_attempt_loop.rs (literal_backslash_n_candidate_advances_without_corrective_writer)
 
 ### B25a
 
@@ -6658,10 +6672,10 @@ Test: src/candidate_gate.rs (appended_commit_cannot_hide_prior_metadata_failure)
 
 ### B25d
 
-IF the only prior candidate-gate failure was commit metadata and a corrective
-Writer replaces the rejected history, THEN THE SYSTEM SHALL admit the
-replacement only when both candidates descend from the same original base and
-have identical trees.
+IF the only prior candidate-gate failure was commit metadata (including
+historical literal `\n` failures) and a corrective Writer replaces the rejected
+history, THEN THE SYSTEM SHALL admit the replacement only when both candidates
+descend from the same original base and have identical trees.
 Test: src/candidate_gate.rs (accepts_tree_identical_metadata_rewrite_from_legacy_gate)
 Test: src/candidate_gate.rs (blocks_metadata_rewrite_when_the_candidate_tree_changes)
 Test: src/candidate_gate.rs (blocks_history_rewrite_after_mixed_gate_failures)
@@ -8062,10 +8076,10 @@ Test: tests/binary.rs (skills_add_does_not_report_user_owned_discovery_as_manage
 WHEN the documentation reviewer reviews a normal Attempt candidate and
 the project states commit-message conventions in `AGENTS.md` or
 `CLAUDE.md`,
-THE SYSTEM SHALL treat subject length and style, body presence, wrapping, and
-formatting as non-blocking presentation advice and SHALL NOT emit a finding or
-failing verdict solely for that advice, while continuing to flag violations
-that affect linear history, identity, message encoding, or attribution,
+THE SYSTEM SHALL treat subject length and style, body presence, wrapping,
+formatting, and literal `\n` text as non-blocking presentation advice and SHALL
+NOT emit a finding or failing verdict solely for that advice, while continuing
+to flag violations that affect linear history, identity, message encoding, or attribution,
 including prohibited `Co-Authored-By` trailers.
 Test: src/work_task_executor.rs (documentation_review_treats_commit_presentation_as_advice)
 

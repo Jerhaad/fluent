@@ -5,6 +5,12 @@ metadata:
   type: architecture
 ---
 
+The active candidate gate accepts literal `\n` text. Factory's project hook
+may report it as presentation advice, but that advice cannot authorize a
+rewrite, corrective Writer, or pause. The literal-line-breaks classifier below
+exists only to recover failed evidence persisted by older Fluent versions;
+keep its exact grammar and receipts separate from current admission.
+
 Metadata-only candidate recovery is an audited exception to the normal
 append-only correction path. Admit it only from the exact rejected candidate
 gate whose failed checks are either `commit-metadata` alone or
@@ -18,8 +24,8 @@ bounded, valid-UTF-8 regular file, not a symlink, must remain inside the
 project, and must contain at least one nonblank line. Every nonblank line must
 normalize to a complete commit-metadata finding from that same gate, with
 commit IDs resolved uniquely. A generic body-line length diagnostic is
-admissible only after the exact Git message line proves the literal `\\n`
-violation; ambiguous, uncovered, unrelated, unparseable, alternate-path, or
+admissible only after the exact Git message line proves the historical literal
+`\n` finding; ambiguous, uncovered, unrelated, unparseable, alternate-path, or
 changed evidence remains rejected.
 
 Persist the exact hook artifact path and digest in the recovery authority and

@@ -19805,6 +19805,10 @@ mod tests {
                 "§D.1 should reference AGENTS.md or CLAUDE.md as the source of commit conventions"
             );
             assert!(
+                d1_text.contains("literal `\\n` text"),
+                "§D.1 should classify literal newline text as presentation advice"
+            );
+            assert!(
                 d1_text.contains("presentation advice"),
                 "§D.1 should classify commit-message presentation as advice"
             );
@@ -19835,6 +19839,7 @@ mod tests {
         let skill_dir = materialize_skill("review-documentation", tmp.path()).unwrap();
         let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
         assert!(skill.contains("commit-message presentation as advice"));
+        assert!(skill.contains("literal `\\n` text"));
         assert!(skill.contains("Do not emit a finding or failing verdict solely"));
         assert!(skill.contains("Co-Authored-By"));
         for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
@@ -19852,6 +19857,7 @@ mod tests {
         let skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
 
         assert!(skill.contains("commit-message presentation as advice"));
+        assert!(skill.contains("literal `\\n` text"));
         assert!(skill.contains("Do not emit a finding or failing verdict solely"));
         assert!(skill.contains("Co-Authored-By"));
         for required_integrity in ["invalid history", "identity", "encoding", "attribution"] {
