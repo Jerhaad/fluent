@@ -2240,13 +2240,13 @@ struct TesterCandidateMutationEvidence {
 }
 
 #[derive(Debug)]
-struct TesterCandidateGuard {
+pub(crate) struct TesterCandidateGuard {
     path: PathBuf,
     candidate_commit: String,
 }
 
 impl TesterCandidateGuard {
-    fn begin(path: PathBuf, candidate_commit: &str) -> Result<Self> {
+    pub(crate) fn begin(path: PathBuf, candidate_commit: &str) -> Result<Self> {
         ensure_tester_candidate_head(&path, candidate_commit)?;
         ensure_tester_candidate_tracked_clean(&path)?;
         Ok(Self {
@@ -2316,7 +2316,7 @@ impl TesterCandidateGuard {
     }
 }
 
-fn run_tester_with_candidate_guard(
+pub(crate) fn run_tester_with_candidate_guard(
     guard: &TesterCandidateGuard,
     artifact_dir: &Path,
     sandbox: &crate::tester::TesterSandbox,

@@ -862,7 +862,7 @@ fn record_test_boundary(sandboxed: bool) {
 #[cfg(not(feature = "test-support"))]
 fn record_test_boundary(_: bool) {}
 
-fn persist_harness_error(
+pub(crate) fn persist_harness_error(
     artifact_dir: &Path,
     kind: &str,
     message: String,

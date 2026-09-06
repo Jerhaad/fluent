@@ -1516,6 +1516,51 @@ fn execute_merge_with_coder(
     )?;
     *base_commit = Some(target_head_before.clone());
 
+    // Preserve each verification run so a retry never overwrites failed evidence.
+    let verification_dir = tempfile::Builder::new()
+        .prefix("verification-")
+        .tempdir_in(artifact_dir)?
+        .keep();
+    let baseline_dir = verification_dir.join("target-baseline");
+    let baseline_artifact = ArtifactRef {
+        producer_id: "merge-target-baseline".to_string(),
+        path: path_for_model(
+            config.project_root,
+            &baseline_dir.join("tester-results.json"),
+        ),
+    };
+    let baseline_result = with_detached_landed_checkout(
+        config.project_root,
+        target_workspace,
+        &target_head_before,
+        |checkout| {
+            crate::baseline_cache::capture_landed_with(
+                config.project_root,
+                checkout,
+                &baseline_dir,
+                config.no_sandbox,
+                |artifact| {
+                    run_merge_tester(config, candidate, checkout, artifact, &target_head_before)
+                },
+            )
+        },
+    );
+    if let Err(error) = baseline_result {
+        let reason = format!(
+            "Cannot verify target baseline {target_head_before}: {error:#}. Inspect {} and retry landing after repairing the Tester boundary.",
+            baseline_dir.display()
+        );
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            reason.clone(),
+            vec![baseline_artifact],
+            Vec::new(),
+        )?;
+        bail!("{reason}");
+    }
+
     ensure_clean_worktree(source_workspace)?;
     let rebase_outcome = match rebase_candidate_with_coder(
         config,
@@ -1559,32 +1604,191 @@ fn execute_merge_with_coder(
     }
     ensure_clean_worktree(source_workspace)?;
 
-    let check_artifacts = match run_merge_checks(config, candidate, source_workspace, artifact_dir)
-    {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            let artifacts = check_artifacts_for_failure(config.project_root, artifact_dir);
-            record_candidate_failure(
-                config.store,
-                config.work_item_id,
-                &candidate.id,
-                error.to_string(),
-                artifacts,
-                Vec::new(),
-            )?;
-            return Err(error);
-        }
-    };
+    let mut check_artifacts =
+        match run_merge_checks(config, candidate, source_workspace, artifact_dir) {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let artifacts = check_artifacts_for_failure(config.project_root, artifact_dir);
+                record_candidate_failure(
+                    config.store,
+                    config.work_item_id,
+                    &candidate.id,
+                    error.to_string(),
+                    artifacts,
+                    Vec::new(),
+                )?;
+                return Err(error);
+            }
+        };
 
-    finalize_merge(
+    let candidate_commit = head_commit(source_workspace)?;
+    regenerate_provenance(
+        config.store,
+        config.work_item_id,
+        &candidate.id,
+        &candidate.attempt_id,
+        source_workspace,
+        &target_head_before,
+        &candidate_commit,
+    )?;
+    let tester_dir = verification_dir.join("tester");
+    let results_path = tester_dir.join("tester-results.json");
+    check_artifacts.push(baseline_artifact);
+    check_artifacts.push(ArtifactRef {
+        producer_id: "merge-tester".to_string(),
+        path: path_for_model(config.project_root, &results_path),
+    });
+    let verification = (|| {
+        run_merge_tester(
+            config,
+            candidate,
+            source_workspace,
+            &tester_dir,
+            &candidate_commit,
+        )?;
+        compare_merge_tester(
+            &results_path,
+            &baseline_dir.join("tester-results.json"),
+            &candidate_commit,
+        )?;
+        ensure_clean_worktree(source_workspace)?;
+        ensure_clean_worktree(target_workspace)?;
+        anyhow::ensure!(
+            head_commit(source_workspace)? == candidate_commit,
+            "candidate HEAD changed after post-rebase Tester verification"
+        );
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        let reason = format!(
+            "Exact post-rebase Tester verification failed for {candidate_commit}: {error:#}. Inspect {} and repair the retained candidate or Tester boundary before retrying landing.",
+            results_path.display()
+        );
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            reason.clone(),
+            check_artifacts,
+            Vec::new(),
+        )?;
+        bail!("{reason}");
+    }
+
+    let result = finalize_merge(
         config,
         candidate,
         source_workspace,
         target_workspace,
         &target_head_before,
-        check_artifacts,
+        check_artifacts.clone(),
         Vec::new(),
-    )
+    );
+    if let Err(error) = &result {
+        record_candidate_failure(
+            config.store,
+            config.work_item_id,
+            &candidate.id,
+            format!("{error:#}"),
+            check_artifacts,
+            Vec::new(),
+        )?;
+    }
+    result
+}
+
+/// Run the same sandboxed Tester and candidate guard used by final Tester Tasks.
+/// Landing owns these artifacts; it never reserves another Attempt Tester Task.
+fn run_merge_tester(
+    config: &WorkMergeConfig<'_>,
+    candidate: &MergeCandidate,
+    workspace: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+) -> Result<crate::tester::TesterOutcome> {
+    fs::create_dir_all(artifact_dir)?;
+    let result = (|| {
+        let guard = crate::work_task_executor::TesterCandidateGuard::begin(
+            workspace.to_path_buf(),
+            candidate_commit,
+        )?;
+        let plan = crate::tester::plan(workspace)?;
+        let cache = crate::writer_cache::preflight_writer_dependency_cache(
+            config.project_root,
+            config.work_item_id,
+            &candidate.attempt_id,
+        )?;
+        crate::writer_cache::prepare_writer_dependency_cache_for_launch(
+            &cache,
+            config.store,
+            crate::writer_cache::canonical_cargo_home_from_env().as_deref(),
+        )?;
+        let settlement = crate::tester::prepare_settlement_directories(artifact_dir, &plan)?;
+        let sandbox = crate::tester::render_sandbox_profile_with_cache(
+            workspace,
+            artifact_dir,
+            config.no_sandbox,
+            config.resolver,
+            settlement,
+            Some(&cache),
+        )?;
+        crate::work_task_executor::run_tester_with_candidate_guard(&guard, artifact_dir, &sandbox)
+    })();
+    if let Err(error) = &result {
+        // Keep completed command records if restoration or a later host check failed.
+        let commands = fs::read(artifact_dir.join("tester-results.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+            .map(|results| results.commands)
+            .unwrap_or_default();
+        crate::tester::persist_harness_error(
+            artifact_dir,
+            "merge_tester_boundary",
+            "Landing Tester could not verify the candidate".to_string(),
+            format!("{error:#}"),
+            commands,
+        )?;
+    }
+    crate::tester::bind_candidate_commit(artifact_dir, candidate_commit)?;
+    result
+}
+
+fn compare_merge_tester(
+    results_path: &Path,
+    baseline_path: &Path,
+    candidate_commit: &str,
+) -> Result<()> {
+    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(results_path)?)?;
+    anyhow::ensure!(
+        results.candidate_commit.as_deref() == Some(candidate_commit),
+        "Tester evidence does not name the exact candidate commit"
+    );
+    if let Some(error) = results.error {
+        bail!(
+            "Tester harness error {}: {} ({})",
+            error.kind,
+            error.message,
+            error.details
+        );
+    }
+    anyhow::ensure!(
+        !results.commands.iter().any(|command| command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())),
+        "Tester commands leaked processes"
+    );
+    let introduced =
+        crate::tester_evidence::introduced_tester_failures(results_path, Some(baseline_path));
+    let unexplained = crate::tester_evidence::unexplained_failed_tester_commands(
+        results_path,
+        Some(baseline_path),
+    );
+    anyhow::ensure!(
+        introduced == 0 && unexplained == 0,
+        "Tester found {introduced} newly failing tests and {unexplained} unexplained failed commands"
+    );
+    Ok(())
 }
 
 /// Whether the Attempt behind a landed candidate has a retryable (failed) Learner

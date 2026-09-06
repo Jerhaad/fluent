@@ -13718,6 +13718,174 @@ fn work_attempt_run_review_only_uncertain_needs_user() {
     assert_no_non_fluent_changes(&main_dir);
 }
 
+/// Drive real final Tester and landing boundaries with a small declared shell suite.
+fn setup_rebased_tester_candidate(tmp: &TempDir, failure: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let project = setup_git_project(tmp);
+    let events = tmp.path().join("tester-events");
+    fs::write(
+        project.join(".fluent/tester.yaml"),
+        "commands:\n  - command: sh verify.sh\n    test_harness: shell-harness\n  - command: printf 'ok independent\\n'\n    test_harness: shell-harness\n",
+    ).unwrap();
+    fs::write(
+        project.join(".fluent/extract-tester-results"),
+        include_str!("../.fluent/extract-tester-results"),
+    )
+    .unwrap();
+    fs::write(project.join("verify.sh"), format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(git rev-parse HEAD)\" \"$(git rev-parse main)\" >> '{}'\nif [ -f target-advance ]; then\n{failure}\nfi\nprintf 'ok integrated\\n'\n",
+        events.display(),
+    )).unwrap();
+    git::run(&project, &["add", "."], "stage Tester fixture").unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add landing checks"],
+        "commit Tester fixture",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_land_mock_script(r#"{"learning_summary":"verified","follow_ups":[]}"#),
+    );
+    create_and_run_learner_attempt(&project, &bin);
+    (project, bin, events)
+}
+
+fn advance_tester_target(project: &Path) -> String {
+    fs::write(project.join("target-advance"), "target changed\n").unwrap();
+    git::run(project, &["add", "target-advance"], "stage target advance").unwrap();
+    git::run(
+        project,
+        &["commit", "-m", "Advance target"],
+        "commit target advance",
+    )
+    .unwrap();
+    git_head(project)
+}
+
+fn merge_tester_results(project: &Path, candidate: &serde_json::Value) -> serde_json::Value {
+    let artifact = candidate["merge_state"]["check_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["producer_id"] == "merge-tester")
+        .expect("landing retains its exact Tester artifact");
+    read_json_path(&project.join(artifact["path"].as_str().unwrap()))
+}
+
+#[test]
+fn work_merge_candidate_runs_tester_for_rebased_tip_before_land() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, events) = setup_rebased_tester_candidate(&tmp, ":");
+    let target = advance_tester_target(&project);
+    let before = fs::read_to_string(&events).unwrap();
+    land_work_1(&project, &bin, false);
+    let landed = git_head(&project);
+    let runs = fs::read_to_string(&events).unwrap();
+    assert!(
+        runs[before.len()..]
+            .lines()
+            .any(|line| line == format!("{landed} {target}")),
+        "the final candidate must run before main moves: {runs}"
+    );
+    let item = read_work_show_json(&project, "work-1");
+    let results = merge_tester_results(&project, &item["merge_candidates"][0]);
+    assert_eq!(results["candidate_commit"], landed);
+    assert_eq!(results["commands"].as_array().unwrap().len(), 2);
+    assert_eq!(results["error"], serde_json::Value::Null);
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_failure_leaves_target_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then printf 'not ok integrated\\n'; exit 1; fi",
+    );
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("post-rebase Tester"));
+    assert_eq!(git_head(&project), target);
+    assert!(project.join("../work-6-work-1-attempt-1").is_dir());
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_failure_records_retry_evidence() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then printf 'not ok integrated\\n'; exit 1; fi",
+    );
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure();
+    let item = read_work_show_json(&project, "work-1");
+    let candidate = &item["merge_candidates"][0];
+    assert_eq!(candidate["merge_state"]["status"], "failed");
+    let reason = candidate["merge_state"]["failure_reason"].as_str().unwrap();
+    assert!(
+        reason.contains("post-rebase Tester") && reason.contains("tester-results.json"),
+        "{reason}"
+    );
+    let results = merge_tester_results(&project, candidate);
+    assert_eq!(results["candidate_commit"], candidate["candidate_commit"]);
+    assert_eq!(results["summary"]["fail"], 1);
+    assert_eq!(git_head(&project), target);
+    assert_eq!(item["attempts"][0]["status"], "complete");
+    assert_eq!(
+        item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "tester")
+            .count(),
+        1,
+        "landing must not create another Attempt Tester Task"
+    );
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_harness_error_leaves_target_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then chmod -x .fluent/extract-tester-results; fi",
+    );
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Tester harness error"));
+    assert_eq!(git_head(&project), target);
+    let item = read_work_show_json(&project, "work-1");
+    let candidate = &item["merge_candidates"][0];
+    let results = merge_tester_results(&project, candidate);
+    assert_eq!(results["candidate_commit"], candidate["candidate_commit"]);
+    assert!(!results["error"].is_null());
+    let source = project.join("../work-6-work-1-attempt-1");
+    assert!(
+        git::run_stdout(
+            &source,
+            &["status", "--porcelain", "--untracked-files=no"],
+            "read candidate after harness failure"
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
 #[test]
 fn work_merge_candidate_failed_check_leaves_target_unchanged() {
     let tmp = TempDir::new().unwrap();

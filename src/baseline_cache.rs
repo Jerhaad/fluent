@@ -416,13 +416,24 @@ pub(crate) fn capture_landed(
     no_sandbox: bool,
     resolver: &ContentResolver,
 ) -> Result<LandedSeedDisposition> {
-    let identity = resolve_identity(merged_workspace, no_sandbox, None)?;
-    match capture_with(
+    capture_landed_with(
         project_root,
+        merged_workspace,
         landing_artifact_dir,
-        identity,
+        no_sandbox,
         |artifact_dir| crate::tester::run(merged_workspace, artifact_dir, no_sandbox, resolver),
-    )? {
+    )
+}
+
+pub(crate) fn capture_landed_with(
+    project_root: &Path,
+    merged_workspace: &Path,
+    landing_artifact_dir: &Path,
+    no_sandbox: bool,
+    run: impl FnOnce(&Path) -> Result<TesterOutcome>,
+) -> Result<LandedSeedDisposition> {
+    let identity = resolve_identity(merged_workspace, no_sandbox, None)?;
+    match capture_with(project_root, landing_artifact_dir, identity, run)? {
         CaptureDisposition::Published { cache_key } => {
             Ok(LandedSeedDisposition::Captured { cache_key })
         }
