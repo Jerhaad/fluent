@@ -1,6 +1,6 @@
 ---
 name: test-fixtures-use-production-state
-description: Test fixtures must use state values that production code actually creates, not values reachable only after later transitions
+description: Use current production states for lifecycle tests and explicit historical evidence for compatibility tests
 metadata:
   type: testing
 ---
@@ -11,4 +11,20 @@ When testing a function that reads state (like `find_ready_candidate`), fixtures
 
 The test reviewer checks that fixture state values match production creation paths and will flag unreachable combinations.
 
-Related: [[test-names-match-assertions]]
+Compatibility tests deliberately exercise state that an older Fluent version
+produced. When candidate admission retires a rejection rule, construct its
+historical rejected gate explicitly instead of expecting the current gate to
+emit that failure. Assert current admission independently, then persist the
+historical status and exact diagnostic bound to the fixture's real candidate
+commit. Continue through the real downstream gate and recovery code, retaining
+the assertions that protect ancestry, trees, authors, and unchanged state on
+rejection.
+
+Check shared recovery fixtures across the candidate gate, ancestry recovery,
+and Attempt loop when admission policy changes. A stale setup assertion can
+stop every test using that fixture before it reaches the recovery behavior,
+even while tests focused on current admission pass.
+
+Related: [[test-names-match-assertions]],
+[[legacy-evidence-compatibility-stays-isolated]],
+[[semantic-validation-tests-reach-target-branch]]

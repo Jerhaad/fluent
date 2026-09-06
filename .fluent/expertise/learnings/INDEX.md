@@ -133,7 +133,7 @@
 - [strict-sandbox-capability-selection](strict-sandbox-capability-selection.md) — Select shared-temp-free sandbox profiles only for launches that receive an explicit private replacement boundary; preserve standard grants for other coders
 - [terminal-coder-errors-bypass-retry-budget](terminal-coder-errors-bypass-retry-budget.md) — Classify typed coder failures that may leave invisible side effects as terminal in should_retry_coder_error, never retried
 - [terminal-session-cleanup-covers-partial-setup](terminal-session-cleanup-covers-partial-setup.md) — Arm terminal cleanup before enabling raw mode or alternate-screen features so every setup failure restores prior terminal state
-- [test-fixtures-use-production-state](test-fixtures-use-production-state.md) — Test fixtures must use state values that production code actually creates, not unreachable states
+- [test-fixtures-use-production-state](test-fixtures-use-production-state.md) — Use current production states for lifecycle tests and explicit historical evidence for compatibility tests
 - [test-names-match-assertions](test-names-match-assertions.md) — Test function names must describe the behavior the test actually asserts, not what a behavior statement claims
 - [tester-readiness-shares-production-boundary](tester-readiness-shares-production-boundary.md) — Tester readiness validates structure and executes through the production sandbox, extraction, and normalization boundary; production boundary failures pause only the Tester for repair and retry
 - [tester-tracked-mutations-restore-after-evidence](tester-tracked-mutations-restore-after-evidence.md) — Work Task Testers retain command evidence while a host guard restores only tracked candidate side effects after every launch
