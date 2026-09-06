@@ -337,6 +337,7 @@ fn validated_ownership_approval(
     let Some(audit_ref) = attempt.artifacts.iter().rev().find(|artifact| {
         artifact.producer_id == "ownership-recovery" && artifact.path.ends_with("/approval.json")
     }) else {
+        validate_planning_revisions(project_root, attempt, None, 0)?;
         return Ok(None);
     };
     let audit: work_model::OwnershipApproval = serde_json::from_slice(&fs::read(
@@ -357,7 +358,7 @@ fn validated_ownership_approval(
     );
     let source: work_model::WriterCompletionMatrix = serde_json::from_slice(&source_bytes)?;
     validate_preserved_completion_repair(project_root, attempt, &preview.source_matrix)?;
-    let (mut approved_contract, approved_matrix) = preview
+    let (approved_contract, approved_matrix) = preview
         .proposal
         .apply(&preview.original_contract, &source)
         .map_err(anyhow::Error::msg)?;
@@ -382,21 +383,69 @@ fn validated_ownership_approval(
                 .is_some_and(|output| output.commit == preview.candidate_commit),
         "ownership approval no longer names its source Writer candidate"
     );
-    // Later Test-reference approvals may change only behavior references. Replay
-    // their recorded deltas over the adopted contract, never over legacy Plan text.
-    for artifact in attempt
+    let start = attempt
         .artifacts
         .iter()
-        .skip_while(|artifact| *artifact != audit_ref)
-        .skip(1)
-        .filter(|artifact| {
-            artifact.producer_id == "planning-reference-recovery"
-                && artifact.path.ends_with("/revision.json")
-        })
-    {
+        .position(|artifact| artifact == audit_ref)
+        .expect("registered ownership approval")
+        + 1;
+    validate_planning_revisions(project_root, attempt, Some(approved_contract), start)?;
+    Ok(Some(audit))
+}
+
+/// Revalidate planning approvals for adopted and explicitly owned Attempts.
+fn validate_planning_revisions(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    mut contract: Option<work_model::WriterCompletionContract>,
+    start: usize,
+) -> Result<()> {
+    for artifact in attempt.artifacts.iter().skip(start).filter(|artifact| {
+        artifact.producer_id == "planning-reference-recovery"
+            && artifact.path.ends_with("/revision.json")
+    }) {
         let revision: work_model::TestReferenceRevisionAudit = serde_json::from_slice(&fs::read(
             resolve_input_artifact_path(project_root, &artifact.path)?,
         )?)?;
+        if let Some(source) = &revision.source_completion {
+            if let Some(expected) = &contract {
+                anyhow::ensure!(
+                    expected == &source.contract,
+                    "approved planning source contract changed"
+                );
+            } else {
+                contract = Some(source.contract.clone());
+            }
+            let bytes = fs::read(resolve_input_artifact_path(
+                project_root,
+                &source.artifact.path,
+            )?)?;
+            anyhow::ensure!(
+                format!("{:x}", Sha256::digest(&bytes)) == source.sha256,
+                "approved planning source completion evidence changed"
+            );
+            let matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+            let writer = attempt
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.id == matrix.task_id
+                        && task.kind == TaskKind::Write
+                        && task
+                            .output
+                            .as_ref()
+                            .is_some_and(|output| output.commit == revision.candidate_commit)
+                })
+                .context("approved planning source Writer candidate changed")?;
+            let findings = writer_completion_findings(project_root, writer)?;
+            matrix
+                .status_against(&source.contract, &writer.id, &findings)
+                .map_err(anyhow::Error::msg)?;
+        }
+        let Some(approved_contract) = contract.as_mut() else {
+            // Older unowned recoveries have no captured source contract.
+            continue;
+        };
         let revision_digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&revision)?));
         anyhow::ensure!(
             revision.schema_version == 1
@@ -465,14 +514,16 @@ fn validated_ownership_approval(
             .context("approved Test-reference source Writer candidate changed")?;
         let findings = writer_completion_findings(project_root, writer)?;
         matrix
-            .status_against(&approved_contract, &writer.id, &findings)
+            .status_against(approved_contract, &writer.id, &findings)
             .map_err(anyhow::Error::msg)?;
     }
-    anyhow::ensure!(
-        attempt.writer_completion_contract.as_ref() == Some(&approved_contract),
-        "approved responsibility contract changed"
-    );
-    Ok(Some(audit))
+    if let Some(contract) = contract {
+        anyhow::ensure!(
+            attempt.writer_completion_contract.as_ref() == Some(&contract),
+            "approved responsibility contract changed"
+        );
+    }
+    Ok(())
 }
 
 /// Validate the saved repair chain without rewriting the original matrices.
@@ -2318,18 +2369,44 @@ pub(crate) fn plan_host_source_matrix(
         "host evidence source Writer changed"
     );
     if bound.path != current.path {
-        let approval = validated_ownership_approval(project_root, attempt)?
-            .context("host evidence source changed without approved ownership")?;
-        let recovered = recovered_completion_matrices(project_root, attempt)?;
-        anyhow::ensure!(
-            recovered
+        let approval = validated_ownership_approval(project_root, attempt)?;
+        let mut predecessor = current.clone();
+        let mut seen = std::collections::HashSet::new();
+        while predecessor.path != bound.path {
+            anyhow::ensure!(
+                seen.insert(predecessor.path.clone()),
+                "planning source cycle"
+            );
+            let revision = attempt
+                .artifacts
                 .iter()
-                .any(|(artifact, matrix)| artifact.path == bound.path
-                    && matrix.task_id == writer.id
-                    && (artifact == &approval.matrix_artifact
-                        || artifact.producer_id == "planning-reference-recovery")),
-            "host evidence source is outside approved completion history"
-        );
+                .rev()
+                .filter(|artifact| {
+                    artifact.producer_id == "planning-reference-recovery"
+                        && artifact.path.ends_with("/revision.json")
+                })
+                .map(
+                    |artifact| -> Result<work_model::TestReferenceRevisionAudit> {
+                        Ok(serde_json::from_slice(&fs::read(
+                            resolve_input_artifact_path(project_root, &artifact.path)?,
+                        )?)?)
+                    },
+                )
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .find(|revision| revision.completion_matrix_artifact == predecessor.path)
+                .context("host evidence source is outside approved completion history")?;
+            if let Some(source) = revision.source_completion {
+                predecessor = source.artifact;
+            } else {
+                // Preserve the original adoption-matrix route for older audits.
+                predecessor = approval
+                    .as_ref()
+                    .context("planning revision has no recorded source")?
+                    .matrix_artifact
+                    .clone();
+            }
+        }
         let current_matrix: work_model::WriterCompletionMatrix = serde_json::from_slice(
             &fs::read(resolve_input_artifact_path(project_root, &current.path)?)?,
         )?;

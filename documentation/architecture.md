@@ -3822,7 +3822,10 @@ over the ownership contract and verifies each revised matrix digest. Exact retri
 revalidate both approval histories before returning their recorded result.
 Accepted host evidence retains its original source bytes and targeted Review;
 a later reference matrix can reuse it only for the same Writer candidate and an
-identical Plan row in the validated history.
+identical Plan row in the validated history. Each new revision binds its source
+contract, matrix path, and source digest, including ordinary Task-produced
+matrices and Plans with explicit ownership from intake. Recovery follows these
+recorded sources instead of requiring an ownership-adoption artifact.
 
 Writer stagnation compares consecutive completion matrices by stable obligation
 identity and completed rows. Repeated corrective reviews do not exempt a Writer

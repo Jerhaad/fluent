@@ -180,6 +180,8 @@ candidate, prior review history, adopted ownership, and accepted host evidence,
 and schedule fresh Behaviors and Tests reviews without consuming a Writer round.
 Test: src/planning_reference_recovery.rs (public_recovery_revises_selected_test_references)
 Test: tests/binary.rs (legacy_ownership_survives_test_reference_recovery)
+Test: tests/binary.rs (later_writer_host_proof_survives_test_reference_recovery)
+Test: tests/binary.rs (explicit_plan_host_proof_survives_test_reference_recovery)
 
 ### B8
 

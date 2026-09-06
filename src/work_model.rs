@@ -3150,6 +3150,14 @@ pub(crate) struct TestReferenceChange {
     pub new_references: Vec<String>,
 }
 
+/// Bind a planning revision to its authoritative Writer evidence and contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PlanningCompletionSource {
+    pub artifact: ArtifactRef,
+    pub sha256: String,
+    pub contract: WriterCompletionContract,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct TestReferenceRevisionAudit {
@@ -3163,6 +3171,8 @@ pub(crate) struct TestReferenceRevisionAudit {
     pub changes: Vec<TestReferenceChange>,
     pub prior_behaviors_sha256: String,
     pub revised_behaviors_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_completion: Option<PlanningCompletionSource>,
     pub completion_matrix_artifact: String,
     // Older reference audits predate ownership adoption and omit this binding.
     // Revisions after adoption must bind their exact completion evidence.

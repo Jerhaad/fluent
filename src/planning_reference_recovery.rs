@@ -82,6 +82,22 @@ pub fn revise(
         latest_writer,
     )?
     .context("latest Writer has no completion matrix artifact")?;
+    let source_artifact = crate::recovery_contracts::writer_completion_matrix_ref(
+        project_root,
+        attempt,
+        latest_writer,
+    )
+    .context("latest Writer has no authoritative completion artifact")?;
+    let source_completion = crate::work_model::PlanningCompletionSource {
+        sha256: digest(&fs::read(
+            crate::recovery_contracts::resolve_input_artifact_path(
+                project_root,
+                &source_artifact.path,
+            )?,
+        )?),
+        artifact: source_artifact,
+        contract: old_contract.clone(),
+    };
     let changes = requested_changes(old_contract, &desired)?;
     if changes
         .iter()
@@ -166,6 +182,7 @@ pub fn revise(
         changes: changes.clone(),
         prior_behaviors_sha256: digest(source.as_bytes()),
         revised_behaviors_sha256: digest(revised_source.as_bytes()),
+        source_completion: Some(source_completion),
         completion_matrix_artifact: matrix_artifact.clone(),
         completion_matrix_sha256: Some(digest(&serde_json::to_vec_pretty(&revised_matrix)?)),
         created_at: now_iso8601(),
@@ -184,6 +201,7 @@ pub fn revise(
                 || existing.changes != proposed_audit.changes
                 || existing.prior_behaviors_sha256 != proposed_audit.prior_behaviors_sha256
                 || existing.revised_behaviors_sha256 != proposed_audit.revised_behaviors_sha256
+                || existing.source_completion != proposed_audit.source_completion
                 || existing.completion_matrix_artifact != proposed_audit.completion_matrix_artifact
                 || existing.completion_matrix_sha256 != proposed_audit.completion_matrix_sha256
             {
@@ -823,6 +841,18 @@ mod tests {
                 .len(),
             5,
             "a stale revision must not add Tasks"
+        );
+        fs::write(&matrix_path, "changed source").unwrap();
+        assert!(
+            revise(
+                project,
+                &store,
+                "work-1",
+                "attempt-1",
+                &updates,
+                "An exact retry cannot ignore changed source evidence."
+            )
+            .is_err()
         );
     }
 }

@@ -35420,6 +35420,10 @@ fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
 }
 
 fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, PathBuf) {
+    setup_ownership_fixture(tmp, id, false)
+}
+
+fn setup_ownership_fixture(tmp: &TempDir, id: &str, explicit: bool) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::*;
     let project = setup_git_project(tmp);
     let candidate = git_head(&project);
@@ -35428,6 +35432,9 @@ fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, 
         plan: Some("| # | State reached | Behaviors | Verification | Req? |\n| 1 | Fix source. | | `cargo test fix` | Yes |\n| 2 | Fix source. Check host. Review. Test. Learn. | | `bash tests/host.sh` | Yes |\n".into()),
         ..Default::default()
     });
+    if explicit {
+        item.planning_context.as_mut().unwrap().plan = Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source. | | `cargo test fix` | writer | Yes |\n| 2 | Check host. | | `bash tests/host.sh` | host | Yes |\n| 3 | Review. | | Review candidate | review | Yes |\n| 4 | Test. | | Run Tester | tester | Yes |\n| 5 | Learn. | | Capture expertise | learner | Yes |\n".into());
+    }
     item.add_initial_attempt("attempt-1").unwrap();
     let attempt = &mut item.attempts[0];
     let writer = &mut attempt.tasks[0];
@@ -35518,6 +35525,20 @@ fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCom
 
 #[test]
 fn legacy_ownership_survives_test_reference_recovery() {
+    check_owned_test_reference_recovery(false, false);
+}
+
+#[test]
+fn later_writer_host_proof_survives_test_reference_recovery() {
+    check_owned_test_reference_recovery(false, true);
+}
+
+#[test]
+fn explicit_plan_host_proof_survives_test_reference_recovery() {
+    check_owned_test_reference_recovery(true, false);
+}
+
+fn check_owned_test_reference_recovery(explicit: bool, corrective: bool) {
     use fluent::work_model::*;
     use sha2::Digest;
     let tmp = TempDir::new().unwrap();
@@ -35525,7 +35546,7 @@ fn legacy_ownership_survives_test_reference_recovery() {
         "owned-references-{}",
         tmp.path().file_name().unwrap().to_string_lossy()
     );
-    let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, &id);
+    let (project, _, proposal) = setup_ownership_fixture(&tmp, &id, explicit);
     fs::create_dir_all(project.join("tests")).unwrap();
     for name in ["original", "revised", "final"] {
         fs::write(
@@ -35561,7 +35582,7 @@ fn legacy_ownership_survives_test_reference_recovery() {
         "commit reference fixtures",
     )
     .unwrap();
-    let candidate = git_head(&project);
+    let mut candidate = git_head(&project);
     let store = WorkModelStore::new(&project);
     store.mutate_work_item(&id, |item| {
         let context = item.planning_context.as_mut().unwrap();
@@ -35583,20 +35604,89 @@ fn legacy_ownership_survives_test_reference_recovery() {
         Ok(())
     }).unwrap();
     let workspace = bind_candidate_to_managed_sibling(&project, &id, &candidate);
-    let preview_path = tmp.path().join("preview.json");
-    ownership_preview(&project, &id, &proposal, &preview_path);
-    ownership_approve(&project, &id, &preview_path)
-        .assert()
-        .success();
-    let adopted = store.read_work_item(&id).unwrap();
-    let approval_matrix = adopted.attempts[0]
-        .artifacts
-        .iter()
-        .find(|artifact| {
-            artifact.producer_id == "ownership-recovery"
-                && artifact.path.ends_with("/writer-completion.json")
-        })
+    if !explicit {
+        let preview_path = tmp.path().join("preview.json");
+        ownership_preview(&project, &id, &proposal, &preview_path);
+        ownership_approve(&project, &id, &preview_path)
+            .assert()
+            .success();
+    }
+    let initial = store.read_work_item(&id).unwrap();
+    let mut approval_matrix = if explicit {
+        let writer = &initial.attempts[0].tasks[0];
+        ArtifactRef {
+            producer_id: writer.id.clone(),
+            path: format!(
+                "{}/writer-completion.json",
+                writer.artifact_area.as_ref().unwrap().path
+            ),
+        }
+    } else {
+        initial.attempts[0]
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.producer_id == "ownership-recovery"
+                    && artifact.path.ends_with("/writer-completion.json")
+            })
+            .unwrap()
+            .clone()
+    };
+    if corrective {
+        // Seed a completed subsequent Writer as prior history; all recovery
+        // actions below use the public commands against its new candidate.
+        fs::write(workspace.workspace.join("README.md"), "corrected source\n").unwrap();
+        git::run(
+            &workspace.workspace,
+            &["add", "README.md"],
+            "stage correction",
+        )
         .unwrap();
+        git::run(
+            &workspace.workspace,
+            &["commit", "-m", "Correct source"],
+            "commit correction",
+        )
+        .unwrap();
+        candidate = git_head(&workspace.workspace);
+        store
+            .mutate_work_item(&id, |item| {
+                let prior_output = item.attempts[0].tasks[0].output.clone().unwrap();
+                let writer_id =
+                    item.add_next_write_round("attempt-1", vec![approval_matrix.clone()])?;
+                let writer = item.attempts[0].tasks.last_mut().unwrap();
+                set_task_terminal(writer, TaskStatus::Complete);
+                writer.output = Some(TaskOutput {
+                    commit: candidate.clone(),
+                    ..prior_output
+                });
+                let mut matrix: WriterCompletionMatrix =
+                    serde_json::from_slice(&fs::read(project.join(&approval_matrix.path)).unwrap())
+                        .unwrap();
+                matrix.task_id = writer_id.clone();
+                approval_matrix = ArtifactRef {
+                    producer_id: writer_id,
+                    path: format!(
+                        "{}/writer-completion.json",
+                        writer.artifact_area.as_ref().unwrap().path
+                    ),
+                };
+                let path = project.join(&approval_matrix.path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                fs::write(
+                    path.parent().unwrap().join("transcript.jsonl"),
+                    "{\"type\":\"result\",\"result\":\"source corrected\"}\n",
+                )
+                .unwrap();
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
+                item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+                Ok(())
+            })
+            .unwrap();
+    }
+    let adopted = store.read_work_item(&id).unwrap();
     let adopted_bytes = fs::read(project.join(&approval_matrix.path)).unwrap();
     let adopted_matrix: WriterCompletionMatrix = serde_json::from_slice(&adopted_bytes).unwrap();
     let progress = project.join(format!(".fluent/work/progress/{id}/attempt-1/progress.md"));
@@ -35613,7 +35703,32 @@ fn legacy_ownership_survives_test_reference_recovery() {
     .unwrap();
     let passing = tmp.path().join("passing.json");
     fs::write(&passing, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T22:00:00Z","output":"host check passed"}"#).unwrap();
-    attach_interrupted_host(&project, &id, &candidate, &passing)
+    let plan_row = if explicit {
+        "plan:step-2"
+    } else {
+        "plan:step-2:part-2"
+    };
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(plan_row));
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            &id,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--plan-row",
+            plan_row,
+            "--evidence-file",
+            passing.to_str().unwrap(),
+        ])
         .assert()
         .success();
     let bin = tmp.path().join("provider");
@@ -35635,7 +35750,10 @@ esac
     fluent_cmd()
         .current_dir(&project)
         .env("PATH", mock_path(&bin))
-        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .env(
+            "FLUENT_MAX_TOTAL_WRITE_ROUNDS",
+            if corrective { "2" } else { "1" },
+        )
         .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
         .assert()
         .success();
@@ -35728,6 +35846,11 @@ esac
             .unwrap();
         for (path, field, replacement) in [
             (
+                project.join(&approval_matrix.path),
+                "rows",
+                serde_json::json!([]),
+            ),
+            (
                 project.join(&audit_ref.path),
                 "resolution",
                 serde_json::json!("changed authorization"),
@@ -35785,7 +35908,10 @@ printf 'Verdict: pass\n' > review.md
         fluent_cmd()
             .current_dir(&project)
             .env("PATH", mock_path(&bin))
-            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+            .env(
+                "FLUENT_MAX_TOTAL_WRITE_ROUNDS",
+                if corrective { "2" } else { "1" },
+            )
             .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
             .assert()
             .success();
@@ -35826,7 +35952,7 @@ printf 'Verdict: pass\n' > review.md
                 .iter()
                 .filter(|task| task.kind == TaskKind::Write)
                 .count(),
-            1
+            if corrective { 2 } else { 1 }
         );
         assert_eq!(
             fs::read(project.join(&approval_matrix.path)).unwrap(),
