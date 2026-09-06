@@ -22984,6 +22984,7 @@ fn make_commit_style_binary_fixture(
             Some(fluent::work_model::WriterCompletionContract {
                 version: fluent::work_model::WRITER_COMPLETION_CONTRACT_VERSION,
                 requirements: vec![fluent::work_model::WriterCompletionRequirement {
+                    responsibility: Some(fluent::work_model::CompletionResponsibility::Writer),
                     id: "behavior:required:b1".to_string(),
                     kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
                     source: "behaviors.md#required:b1".to_string(),
@@ -23015,6 +23016,7 @@ fn make_commit_style_binary_fixture(
                 schema_version: 1,
                 task_id: writer.id.clone(),
                 rows: vec![fluent::work_model::WriterCompletionRow {
+                    responsibility: Some(fluent::work_model::CompletionResponsibility::Writer),
                     id: "behavior:required:b1".to_string(),
                     kind: fluent::work_model::WriterCompletionRequirementKind::Behavior,
                     source: "behaviors.md#required:b1".to_string(),
