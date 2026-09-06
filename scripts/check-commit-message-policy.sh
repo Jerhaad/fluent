@@ -37,6 +37,10 @@ printf '%s\n' "$metadata" | awk '
     sub(/^\n+/, "", message)
     count = split(message, lines, "\n")
 
+    if (index(message, "\\n")) {
+      printf "advice: commit-message contains literal \\n text (commit %s)\n", commit > "/dev/stderr"
+    }
+
     has_body = 0
     if (count >= 3 && lines[2] ~ /^[[:space:]]*$/) {
       for (i = 3; i <= count; i++) {

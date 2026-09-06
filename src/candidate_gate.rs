@@ -1596,11 +1596,6 @@ fn check_commit_metadata(
         {
             diagnostics.push(format!("commit {commit} has an empty subject"));
         }
-        if message.contains("\\n") {
-            diagnostics.push(format!(
-                "commit {commit} contains literal \\n text instead of line breaks"
-            ));
-        }
     }
     let status = if diagnostics.is_empty() {
         CandidateCheckStatus::Passed
@@ -2415,6 +2410,28 @@ mod tests {
                 .unwrap()
         }
 
+        fn legacy_literal_newline_gate(
+            &self,
+            candidate: &str,
+            artifact: &Path,
+        ) -> CandidateGateEvidence {
+            let mut evidence =
+                run_candidate_gate(self.request(candidate, None, None, artifact)).unwrap();
+            // Older Fluent versions rejected this valid Git message content.
+            let metadata = evidence
+                .checks
+                .iter_mut()
+                .find(|check| check.name == "commit-metadata")
+                .unwrap();
+            metadata.status = CandidateCheckStatus::Failed;
+            metadata.diagnostics = vec![format!(
+                "commit {candidate} contains literal \\n text instead of line breaks"
+            )];
+            evidence.disposition = CandidateGateDisposition::Rejected;
+            fs::write(artifact, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+            evidence
+        }
+
         fn request<'a>(
             &'a self,
             candidate: &'a str,
@@ -2626,46 +2643,148 @@ mod tests {
     }
 
     #[test]
-    fn rejects_whitespace_errors_and_malformed_commit_metadata() {
-        let fixture = Fixture::new();
-        let candidate = fixture.commit(
-            "src/lib.rs",
-            "pub fn value() {    \n}\n",
+    fn accepts_literal_backslash_n_as_project_policy() {
+        for message in [
             "Add value\\n\\nExplain value",
-        );
-        let hooks = fixture.project.path().join(".fluent/hooks");
-        fs::create_dir_all(&hooks).unwrap();
-        let hook = hooks.join("check-pre-merge");
-        fs::write(
-            &hook,
-            "#!/bin/sh\nprintf 'dependency cycle: app -> render -> app\\n'\nexit 9\n",
-        )
-        .unwrap();
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+            "Add value\n\n- Explain literal \\n text",
+        ] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit("src/lib.rs", "pub fn value() {}\n", message);
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
 
-        let evidence =
-            run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
 
-        assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
-        assert_eq!(
-            check(&evidence, "whitespace").status,
-            CandidateCheckStatus::Failed
-        );
-        assert_eq!(
-            check(&evidence, "commit-metadata").status,
-            CandidateCheckStatus::Failed
-        );
-        let project = check(&evidence, "project-check");
-        assert_eq!(project.status, CandidateCheckStatus::Failed);
-        assert!(project.log_path.as_ref().is_some_and(|path| {
-            fs::read_to_string(Path::new(path))
-                .unwrap()
-                .contains("dependency cycle")
-        }));
-        let parsed: CandidateGateEvidence =
-            serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
-        assert_eq!(parsed, evidence);
+            assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+            assert_eq!(
+                check(&evidence, "commit-metadata").status,
+                CandidateCheckStatus::Passed
+            );
+            assert!(check(&evidence, "commit-metadata").diagnostics.is_empty());
+            assert!(evidence.metadata_rewrite.is_none());
+        }
+    }
+
+    #[test]
+    fn literal_backslash_n_does_not_mask_blocking_metadata() {
+        for defect in ["identity", "empty subject"] {
+            let fixture = Fixture::new();
+            if defect == "identity" {
+                crate::git::run(
+                    fixture.root.path(),
+                    &["config", "user.email", "writer@example.invalid"],
+                    "set invalid identity",
+                )
+                .unwrap();
+            }
+            let mut candidate = fixture.commit(
+                "src/lib.rs",
+                "pub fn value() {}\n",
+                "Add value\\n\\nExplain value",
+            );
+            if defect == "empty subject" {
+                crate::git::run(
+                    fixture.root.path(),
+                    &[
+                        "commit",
+                        "--amend",
+                        "-q",
+                        "--cleanup=verbatim",
+                        "--allow-empty-message",
+                        "-m",
+                        "\n\nExplain literal \\n text",
+                    ],
+                    "create empty subject",
+                )
+                .unwrap();
+                candidate = crate::git::run_stdout(
+                    fixture.root.path(),
+                    &["rev-parse", "HEAD"],
+                    "read candidate",
+                )
+                .unwrap();
+            }
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
+
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
+
+            assert_eq!(
+                evidence.disposition,
+                CandidateGateDisposition::Rejected,
+                "{defect}"
+            );
+            let metadata = check(&evidence, "commit-metadata");
+            assert_eq!(metadata.status, CandidateCheckStatus::Failed);
+            let expected = if defect == "identity" {
+                vec!["invalid author email", "invalid committer email"]
+            } else {
+                vec!["has an empty subject"]
+            };
+            for reason in expected {
+                assert!(
+                    metadata
+                        .diagnostics
+                        .iter()
+                        .any(|line| line.contains(reason)),
+                    "{metadata:?}"
+                );
+            }
+            assert!(
+                metadata
+                    .diagnostics
+                    .iter()
+                    .all(|line| !line.contains("literal"))
+            );
+        }
+    }
+
+    #[test]
+    fn literal_backslash_n_does_not_mask_whitespace_or_project_failure() {
+        for failed_check in ["whitespace", "project-check"] {
+            let fixture = Fixture::new();
+            let contents = if failed_check == "whitespace" {
+                "pub fn value() {    \n}\n"
+            } else {
+                "pub fn value() {}\n"
+            };
+            let candidate = fixture.commit("src/lib.rs", contents, "Add value\\n\\nExplain value");
+            if failed_check == "project-check" {
+                let hooks = fixture.project.path().join(".fluent/hooks");
+                fs::create_dir_all(&hooks).unwrap();
+                let hook = hooks.join("check-pre-merge");
+                fs::write(
+                    &hook,
+                    "#!/bin/sh\nprintf 'dependency cycle: app -> render -> app\\n'\nexit 9\n",
+                )
+                .unwrap();
+                fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
+
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, None, None, &artifact)).unwrap();
+
+            assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+            assert_eq!(
+                check(&evidence, "commit-metadata").status,
+                CandidateCheckStatus::Passed
+            );
+            assert_eq!(
+                check(&evidence, failed_check).status,
+                CandidateCheckStatus::Failed
+            );
+            if failed_check == "project-check" {
+                assert!(
+                    fs::read_to_string(check(&evidence, failed_check).log_path.as_ref().unwrap())
+                        .unwrap()
+                        .contains("dependency cycle")
+                );
+            }
+            let parsed: CandidateGateEvidence =
+                serde_json::from_slice(&fs::read(artifact).unwrap()).unwrap();
+            assert_eq!(parsed, evidence);
+        }
     }
 
     #[test]
@@ -2693,7 +2812,14 @@ mod tests {
         .unwrap();
         crate::git::run(
             merge_fixture.root.path(),
-            &["merge", "--no-ff", "-q", "-m", "Merge side branch", "side"],
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                "Merge side branch\\nExplain merge",
+                "side",
+            ],
             "create merge candidate",
         )
         .unwrap();
@@ -2749,11 +2875,23 @@ mod tests {
     #[test]
     fn rejects_an_invalid_append_only_ancestor() {
         let fixture = Fixture::new();
+        crate::git::run(
+            fixture.root.path(),
+            &["config", "user.email", "writer@example.invalid"],
+            "set invalid ancestor identity",
+        )
+        .unwrap();
         fixture.commit(
             "src/lib.rs",
             "pub fn value() {}\n",
             "Add value\\n\\nExplain value",
         );
+        crate::git::run(
+            fixture.root.path(),
+            &["config", "user.email", "test@example.com"],
+            "restore valid identity",
+        )
+        .unwrap();
         let corrected = fixture.commit(
             "src/lib.rs",
             "pub fn value() { println!(\"fixed\"); }\n",
@@ -2779,8 +2917,7 @@ mod tests {
             "Add value\\n\\nExplain value",
         );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
-        let prior =
-            run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        let prior = fixture.legacy_literal_newline_gate(&rejected, &prior_artifact);
         assert_eq!(prior.disposition, CandidateGateDisposition::Rejected);
         assert_eq!(
             prior
@@ -2853,7 +2990,7 @@ mod tests {
             "Add value\\n\\nExplain value",
         );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
-        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        fixture.legacy_literal_newline_gate(&rejected, &prior_artifact);
         fs::write(
             fixture.root.path().join("src/lib.rs"),
             "pub fn value() { 1 }\n",
@@ -2903,7 +3040,7 @@ mod tests {
             "Add value\\n\\nExplain value",
         );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
-        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        fixture.legacy_literal_newline_gate(&rejected, &prior_artifact);
 
         crate::git::run(
             fixture.root.path(),
@@ -2952,7 +3089,7 @@ mod tests {
             "Add value\\n\\nExplain value",
         );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
-        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        fixture.legacy_literal_newline_gate(&rejected, &prior_artifact);
 
         crate::git::run(
             fixture.root.path(),
@@ -3020,7 +3157,7 @@ mod tests {
             "Add value\\n\\nExplain value",
         );
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
-        run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
+        fixture.legacy_literal_newline_gate(&rejected, &prior_artifact);
         crate::git::run(
             fixture.root.path(),
             &[
@@ -3360,11 +3497,23 @@ mod tests {
     #[test]
     fn appended_commit_cannot_hide_prior_metadata_failure() {
         let fixture = Fixture::new();
+        crate::git::run(
+            fixture.root.path(),
+            &["config", "user.email", "writer@example.invalid"],
+            "set invalid ancestor identity",
+        )
+        .unwrap();
         let rejected = fixture.commit(
             "src/lib.rs",
             "pub fn value() {}\n",
             "Add value\\n\\nExplain value",
         );
+        crate::git::run(
+            fixture.root.path(),
+            &["config", "user.email", "test@example.com"],
+            "restore valid identity",
+        )
+        .unwrap();
         let prior_artifact = fixture.artifacts.path().join("prior-gate.json");
         run_candidate_gate(fixture.request(&rejected, None, None, &prior_artifact)).unwrap();
         let replacement = fixture.commit("src/extra.rs", "pub fn extra() {}\n", "Add extra");

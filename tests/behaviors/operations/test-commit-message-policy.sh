@@ -58,6 +58,20 @@ LONG_LINE="- $(printf '%073d' 0)"
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n'"$LONG_LINE"
 assert_advised "advice: commit-message body line exceeds 72 characters"
 
+# literal backslash-n text is advisory
+for message in 'Add candidate\n\nExplain the candidate' $'Add candidate\n\n- Explain literal \\n text'; do
+  git -C "$FIXTURE" commit --amend -q -m "$message"
+  assert_advised 'advice: commit-message contains literal \n text'
+done
+
+# literal backslash-n advice does not mask provenance failure
+git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n- Explain literal \\n text\n\nCo-Authored-By: Bot <bot@example.com>'
+assert_rejected "prohibited Co-Authored-By trailer"
+if ! grep -Fq 'advice: commit-message contains literal \n text' <<<"$output"; then
+  echo "commit-message policy omitted literal backslash-n advice" >&2
+  exit 1
+fi
+
 # provenance and non-presentation failures remain blocking
 git -C "$FIXTURE" commit --amend -q -m $'Add candidate\n\n- Explain the candidate\n\nCo-Authored-By: Bot <bot@example.com>'
 assert_rejected "prohibited Co-Authored-By trailer"
