@@ -1576,8 +1576,8 @@ fn ensure_registered_worktree(project_root: &Path, workspace: &Path) -> Result<(
 mod tests {
     use super::*;
     use crate::candidate_gate::{
-        CandidateGateDisposition, CandidateGatePhase, CandidateGateRequest, run_candidate_gate,
-        run_candidate_gate_with_prior,
+        CandidateCheckStatus, CandidateGateDisposition, CandidateGatePhase, CandidateGateRequest,
+        run_candidate_gate, run_candidate_gate_with_prior,
     };
     use crate::work_model::{TaskOutput, WorkItem};
     use std::path::PathBuf;
@@ -1672,9 +1672,9 @@ mod tests {
                     "-m",
                     "Correct candidate",
                     "-m",
-                    "Use literal \\n metadata that the candidate gate rejects.",
+                    "Use literal \\n text rejected by older Fluent versions.",
                 ],
-                "commit malformed correction",
+                "commit historical correction",
             )
             .unwrap();
             let rejected = crate::git::run_stdout(
@@ -1689,7 +1689,7 @@ mod tests {
                 "candidate-gates/attempt-1-write-2/candidate-gate.json",
             );
             let prior_gate_path = project.join(&prior_gate_relative);
-            let prior = run_candidate_gate(CandidateGateRequest {
+            let mut prior = run_candidate_gate(CandidateGateRequest {
                 project_root: &project,
                 workspace: &workspace,
                 work_item_id: "work-1",
@@ -1706,7 +1706,21 @@ mod tests {
                 artifact_path: &prior_gate_path,
             })
             .unwrap();
-            assert_eq!(prior.disposition, CandidateGateDisposition::Rejected);
+            assert_eq!(prior.disposition, CandidateGateDisposition::Passed);
+
+            // Reconstruct the historical failure that authorized the rewrite.
+            // Current admission accepts this text and cannot create this evidence.
+            let metadata = prior
+                .checks
+                .iter_mut()
+                .find(|check| check.name == "commit-metadata")
+                .unwrap();
+            metadata.status = CandidateCheckStatus::Failed;
+            metadata.diagnostics = vec![format!(
+                "commit {rejected} contains literal \\n text instead of line breaks"
+            )];
+            prior.disposition = CandidateGateDisposition::Rejected;
+            fs::write(&prior_gate_path, serde_json::to_vec_pretty(&prior).unwrap()).unwrap();
 
             let protected_tree = crate::git::run_stdout(
                 &workspace,
