@@ -22681,7 +22681,9 @@ fn assert_legacy_gate_index_public_recovery_rejected_through(
     let queue_before =
         serde_json::to_value(fluent::queue::read_ledger(&fixture.project_root, "work-1").unwrap())
             .unwrap();
-    let gate_before = fs::read(&fixture.gate_path).unwrap();
+    let gate_exists_before = fixture.gate_path.exists();
+    let gate_is_file_before = fixture.gate_path.is_file();
+    let gate_before = fs::read(&fixture.gate_path).ok();
     let log_before = fs::read(&fixture.log_path).unwrap();
     let head_before = git::run_stdout(
         &fixture.workspace,
@@ -22718,7 +22720,9 @@ fn assert_legacy_gate_index_public_recovery_rejected_through(
         serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap(),
         item_before
     );
-    assert_eq!(fs::read(&fixture.gate_path).unwrap(), gate_before);
+    assert_eq!(fixture.gate_path.exists(), gate_exists_before);
+    assert_eq!(fixture.gate_path.is_file(), gate_is_file_before);
+    assert_eq!(fs::read(&fixture.gate_path).ok(), gate_before);
     assert_eq!(fs::read(&fixture.log_path).unwrap(), log_before);
     assert_eq!(
         git::run_stdout(
@@ -23386,6 +23390,32 @@ fn retired_commit_style_missing_gate_input_rejects_public_resume_without_mutatio
             queued,
             "does not name a candidate gate",
         );
+    }
+}
+
+#[test]
+fn retired_commit_style_missing_input_and_gate_evidence_rejects_public_resume() {
+    for gate_path_is_directory in [false, true] {
+        for queued in [false, true] {
+            let fixture = make_legacy_omitted_gate_index_binary_fixture();
+            WorkModelStore::new(&fixture.project_root)
+                .mutate_work_item("work-1", |item| {
+                    item.attempts[0].tasks[1]
+                        .input_artifacts
+                        .retain(|artifact| !artifact.path.ends_with("/candidate-gate.json"));
+                    Ok(())
+                })
+                .unwrap();
+            fs::remove_file(&fixture.gate_path).unwrap();
+            if gate_path_is_directory {
+                fs::create_dir(&fixture.gate_path).unwrap();
+            }
+            assert_legacy_gate_index_public_recovery_rejected_through(
+                &fixture,
+                queued,
+                "does not name a candidate gate",
+            );
+        }
     }
 }
 

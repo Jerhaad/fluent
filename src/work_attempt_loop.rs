@@ -18385,7 +18385,7 @@ mod tests {
         candidate_head: String,
         candidate_tree: String,
         candidate_status: String,
-        gate: Vec<u8>,
+        gate: Option<Vec<u8>>,
         hook_log: Vec<u8>,
     }
 
@@ -18413,7 +18413,7 @@ mod tests {
                 "snapshot retired-style candidate status",
             )
             .unwrap(),
-            gate: fs::read(&fixture.gate_path).unwrap(),
+            gate: fs::read(&fixture.gate_path).ok(),
             hook_log: fs::read(&fixture.log_path).unwrap(),
         }
     }
@@ -19335,6 +19335,20 @@ mod tests {
             .unwrap();
         assert_legacy_gate_index_recovery_rejected(
             &missing,
+            Some("does not name a candidate gate"),
+        );
+
+        let missing_evidence = make_legacy_omitted_gate_index_fixture();
+        missing_evidence
+            .store
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1].input_artifacts.clear();
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_file(&missing_evidence.gate_path).unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &missing_evidence,
             Some("does not name a candidate gate"),
         );
 

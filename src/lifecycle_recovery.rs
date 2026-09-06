@@ -152,28 +152,10 @@ pub(crate) fn inspect_retired_commit_style_recovery(
         anyhow::bail!("retired commit-style Writer has no preceding candidate Writer");
     }
     let source = &attempt.tasks[correction_index - 1];
-    let expected_gate = ArtifactRef {
-        producer_id: source.id.clone(),
-        path: format!(
-            "{}/{}/{}",
-            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
-            source.id,
-            crate::candidate_gate::CANDIDATE_GATE_FILE
-        ),
-    };
-    let missing_gate_is_candidate_shaped = gate_inputs.is_empty()
-        && (project_root.join(&expected_gate.path).is_file()
-            || attempt.artifacts.iter().any(|artifact| {
-                artifact == &expected_gate
-                    || (artifact.producer_id == source.id
-                        && artifact
-                            .path
-                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE))
-            }));
-    if gate_inputs.is_empty() && !missing_gate_is_candidate_shaped {
-        return Ok(None);
-    }
     if source.kind != TaskKind::Write || source.status != TaskStatus::Complete {
+        if gate_inputs.is_empty() {
+            return Ok(None);
+        }
         anyhow::bail!(
             "retired commit-style correction does not immediately follow a completed Writer"
         );
@@ -184,14 +166,18 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         anyhow::bail!("retired commit-style Attempt contains another unresolved Task");
     }
-    let output = source
-        .output
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no candidate"))?;
-    let base_commit = output
-        .base_commit
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("retired commit-style source Writer has no base commit"))?;
+    let Some(output) = source.output.as_ref() else {
+        if gate_inputs.is_empty() {
+            return Ok(None);
+        }
+        anyhow::bail!("retired commit-style source Writer has no candidate");
+    };
+    let Some(base_commit) = output.base_commit.as_ref() else {
+        if gate_inputs.is_empty() {
+            return Ok(None);
+        }
+        anyhow::bail!("retired commit-style source Writer has no base commit");
+    };
     let source_policy_spec = format!("{base_commit}:scripts/check-commit-message-policy.sh");
     let source_policy = crate::git::run_raw(project_root, &["show", &source_policy_spec])?;
     if source_policy.status.success()
@@ -201,13 +187,10 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         return Ok(None);
     }
-    if gate_inputs.is_empty() {
-        anyhow::bail!("retired commit-style Writer does not name a candidate gate");
-    }
-    if gate_inputs.len() != 1 {
-        anyhow::bail!("retired commit-style Writer names multiple candidate gates");
-    }
     if correction.status != TaskStatus::NeedsUser || correction.output.is_some() {
+        if gate_inputs.is_empty() {
+            return Ok(None);
+        }
         anyhow::bail!("retired commit-style Writer is live or produced output");
     }
     if crate::lease::is_leased(&crate::lease::task_lock_path(
@@ -228,6 +211,21 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         anyhow::bail!("a Merge Candidate already owns the retired commit-style candidate");
     }
+    if gate_inputs.is_empty() {
+        anyhow::bail!("retired commit-style Writer does not name a candidate gate");
+    }
+    if gate_inputs.len() != 1 {
+        anyhow::bail!("retired commit-style Writer names multiple candidate gates");
+    }
+    let expected_gate = ArtifactRef {
+        producer_id: source.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
+            source.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
     let gate_artifact = gate_inputs[0].clone();
     if gate_artifact != expected_gate {
         anyhow::bail!("retired commit-style gate is not bound to the source Writer");
