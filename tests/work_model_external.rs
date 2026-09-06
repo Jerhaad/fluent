@@ -638,7 +638,7 @@ fn work_model_store_writes_deterministic_pretty_json() {
     assert_eq!(
         content,
         r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": "0.3.0"
@@ -668,7 +668,7 @@ fn work_model_store_writes_deterministic_pretty_json() {
 #[test]
 fn capture_mode_preserves_minimal_work_item_json() {
     // The default `capture` Learner mode is omitted from the split record while
-    // every successful write stamps the current model writer version.
+    // every successful write stamps the record schema and model writer versions.
     let temp = tempfile::tempdir().unwrap();
     let store = WorkModelStore::new(temp.path());
 
@@ -685,7 +685,7 @@ fn capture_mode_preserves_minimal_work_item_json() {
     assert_eq!(
         content,
         r#"{
-  "schema_version": 1,
+  "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": "0.3.0"

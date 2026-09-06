@@ -1585,10 +1585,11 @@ write retryable without allowing a stale snapshot to overwrite its successor.
 Storage-revision exhaustion fails closed.
 
 A Work Item's Learner mode selects how its pre-land Learner runs. The mode is a
-serde-defaulted `LearnerMode` on the Work Item — `capture` or `no-expertise`,
-defaulting to `capture` and omitted from the minimal split record so legacy JSON
-stays byte-stable — set once through `fluent work-item create --learner-mode` and
-read by every Attempt, retry, and the host-side Fargate preflight. The
+serde-defaulted `LearnerMode` on the Work Item — `capture` or `no-expertise`.
+The default `capture` value is omitted from the split record; writes still stamp
+`schema_version` and `model_writer_version`. The command
+`fluent work-item create --learner-mode` sets the policy once, and every Attempt,
+retry, and host-side Fargate preflight reads it. The
 orchestration resolves a crate-private execution mode from the stored policy and
 the candidate's merge state: an unmerged `capture` policy runs the capture path
 below, an unmerged `no-expertise` policy runs the isolated no-expertise path, and
