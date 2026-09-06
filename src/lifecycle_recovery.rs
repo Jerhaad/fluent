@@ -145,13 +145,34 @@ pub(crate) fn inspect_retired_commit_style_recovery(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if gate_inputs.is_empty() {
-        return Ok(None);
-    }
     if correction_index == 0 {
+        if gate_inputs.is_empty() {
+            return Ok(None);
+        }
         anyhow::bail!("retired commit-style Writer has no preceding candidate Writer");
     }
     let source = &attempt.tasks[correction_index - 1];
+    let expected_gate = ArtifactRef {
+        producer_id: source.id.clone(),
+        path: format!(
+            "{}/{}/{}",
+            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
+            source.id,
+            crate::candidate_gate::CANDIDATE_GATE_FILE
+        ),
+    };
+    let missing_gate_is_candidate_shaped = gate_inputs.is_empty()
+        && (project_root.join(&expected_gate.path).is_file()
+            || attempt.artifacts.iter().any(|artifact| {
+                artifact == &expected_gate
+                    || (artifact.producer_id == source.id
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE))
+            }));
+    if gate_inputs.is_empty() && !missing_gate_is_candidate_shaped {
+        return Ok(None);
+    }
     if source.kind != TaskKind::Write || source.status != TaskStatus::Complete {
         anyhow::bail!(
             "retired commit-style correction does not immediately follow a completed Writer"
@@ -180,6 +201,9 @@ pub(crate) fn inspect_retired_commit_style_recovery(
     {
         return Ok(None);
     }
+    if gate_inputs.is_empty() {
+        anyhow::bail!("retired commit-style Writer does not name a candidate gate");
+    }
     if gate_inputs.len() != 1 {
         anyhow::bail!("retired commit-style Writer names multiple candidate gates");
     }
@@ -205,15 +229,6 @@ pub(crate) fn inspect_retired_commit_style_recovery(
         anyhow::bail!("a Merge Candidate already owns the retired commit-style candidate");
     }
     let gate_artifact = gate_inputs[0].clone();
-    let expected_gate = ArtifactRef {
-        producer_id: source.id.clone(),
-        path: format!(
-            "{}/{}/{}",
-            work_artifact_path(&item.id, attempt_id, "candidate-gates"),
-            source.id,
-            crate::candidate_gate::CANDIDATE_GATE_FILE
-        ),
-    };
     if gate_artifact != expected_gate {
         anyhow::bail!("retired commit-style gate is not bound to the source Writer");
     }
@@ -223,10 +238,14 @@ pub(crate) fn inspect_retired_commit_style_recovery(
         .filter(|artifact| **artifact == expected_gate)
         .count();
     if indexed_gate_count > 1
-        || attempt
-            .artifacts
-            .iter()
-            .any(|artifact| artifact.path == expected_gate.path && *artifact != expected_gate)
+        || attempt.artifacts.iter().any(|artifact| {
+            *artifact != expected_gate
+                && (artifact.path == expected_gate.path
+                    || (artifact.producer_id == source.id
+                        && artifact
+                            .path
+                            .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)))
+        })
     {
         anyhow::bail!("retired commit-style gate index is ambiguous");
     }

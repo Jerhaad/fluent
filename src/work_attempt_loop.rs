@@ -19333,7 +19333,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_legacy_gate_index_recovery_rejected(&missing, None);
+        assert_legacy_gate_index_recovery_rejected(
+            &missing,
+            Some("does not name a candidate gate"),
+        );
 
         let duplicated = make_legacy_omitted_gate_index_fixture();
         duplicated
@@ -19381,6 +19384,41 @@ mod tests {
             })
             .unwrap();
         assert_legacy_gate_index_recovery_rejected(&ambiguous_index, Some("index is ambiguous"));
+
+        let mismatched_source_index = make_legacy_omitted_gate_index_fixture();
+        mismatched_source_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.path = gate.path.replace(
+                    "/attempt-1-write-1/candidate-gate.json",
+                    "/attempt-1-write-other/candidate-gate.json",
+                );
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &mismatched_source_index,
+            Some("index is ambiguous"),
+        );
+
+        let noncanonical_source_index = make_legacy_omitted_gate_index_fixture();
+        noncanonical_source_index
+            .store
+            .mutate_work_item("work-1", |item| {
+                let mut gate = item.attempts[0].tasks[1].input_artifacts[0].clone();
+                gate.path = gate
+                    .path
+                    .replace("/candidate-gate.json", "/nested/../candidate-gate.json");
+                item.attempts[0].artifacts.push(gate);
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_recovery_rejected(
+            &noncanonical_source_index,
+            Some("index is ambiguous"),
+        );
 
         let extra = make_legacy_omitted_gate_index_fixture();
         extra

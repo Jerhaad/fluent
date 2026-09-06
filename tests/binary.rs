@@ -22668,8 +22668,19 @@ fn assert_legacy_gate_index_public_recovery_rejected(
     fixture: &RetiredCommitStyleBinaryFixture,
     expected_error: &str,
 ) {
+    assert_legacy_gate_index_public_recovery_rejected_through(fixture, false, expected_error);
+}
+
+fn assert_legacy_gate_index_public_recovery_rejected_through(
+    fixture: &RetiredCommitStyleBinaryFixture,
+    queued: bool,
+    expected_error: &str,
+) {
     let store = WorkModelStore::new(&fixture.project_root);
     let item_before = serde_json::to_value(store.read_work_item("work-1").unwrap()).unwrap();
+    let queue_before =
+        serde_json::to_value(fluent::queue::read_ledger(&fixture.project_root, "work-1").unwrap())
+            .unwrap();
     let gate_before = fs::read(&fixture.gate_path).unwrap();
     let log_before = fs::read(&fixture.log_path).unwrap();
     let head_before = git::run_stdout(
@@ -22691,9 +22702,14 @@ fn assert_legacy_gate_index_public_recovery_rejected(
     )
     .unwrap();
 
-    fluent_cmd()
-        .current_dir(&fixture.project_root)
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+    let mut command = fluent_cmd();
+    command.current_dir(&fixture.project_root);
+    if queued {
+        command.args(["queue", "resume", "work-1", "--attempt", "attempt-1"]);
+    } else {
+        command.args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"]);
+    }
+    command
         .assert()
         .failure()
         .stderr(predicate::str::contains(expected_error));
@@ -22730,6 +22746,11 @@ fn assert_legacy_gate_index_public_recovery_rejected(
         )
         .unwrap(),
         status_before
+    );
+    assert_eq!(
+        serde_json::to_value(fluent::queue::read_ledger(&fixture.project_root, "work-1").unwrap())
+            .unwrap(),
+        queue_before
     );
 }
 
@@ -23345,6 +23366,26 @@ fn retired_commit_style_resume_rejects_extra_correction_inputs() {
                 "queue rejection must not create a dispatch ledger"
             );
         }
+    }
+}
+
+#[test]
+fn retired_commit_style_missing_gate_input_rejects_public_resume_without_mutation() {
+    for queued in [false, true] {
+        let fixture = make_legacy_omitted_gate_index_binary_fixture();
+        WorkModelStore::new(&fixture.project_root)
+            .mutate_work_item("work-1", |item| {
+                item.attempts[0].tasks[1]
+                    .input_artifacts
+                    .retain(|artifact| !artifact.path.ends_with("/candidate-gate.json"));
+                Ok(())
+            })
+            .unwrap();
+        assert_legacy_gate_index_public_recovery_rejected_through(
+            &fixture,
+            queued,
+            "does not name a candidate gate",
+        );
     }
 }
 
