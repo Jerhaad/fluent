@@ -13887,6 +13887,226 @@ fn work_merge_candidate_rebased_tester_harness_error_leaves_target_unchanged() {
 }
 
 #[test]
+fn work_merge_candidate_reuses_exact_tester_evidence_before_land() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, events) = setup_rebased_tester_candidate(&tmp, ":");
+    let before = fs::read_to_string(&events).unwrap();
+    let target = git_head(&project);
+    let candidate = git_head(&project.join("../work-6-work-1-attempt-1"));
+    land_work_1(&project, &bin, false);
+    let after = fs::read_to_string(&events).unwrap();
+    assert_eq!(
+        &after[before.len()..],
+        format!("{target} {target}\n"),
+        "only the uncached target baseline runs; exact final Tester evidence must be reused"
+    );
+    assert_eq!(git_head(&project), candidate);
+    let item = read_work_show_json(&project, "work-1");
+    let results = merge_tester_results(&project, &item["merge_candidates"][0]);
+    assert_eq!(results["candidate_commit"], candidate);
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_pass_continues_to_land() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, events) =
+        setup_rebased_tester_candidate(&tmp, "printf 'not ok known-target-failure\\n'; exit 1");
+    let before = fs::read_to_string(&events).unwrap();
+    let target = advance_tester_target(&project);
+    land_work_1(&project, &bin, false);
+    let landed = git_head(&project);
+    assert_ne!(landed, target);
+    let after = fs::read_to_string(&events).unwrap();
+    assert_eq!(
+        &after[before.len()..],
+        format!("{target} {target}\n{landed} {target}\n"),
+        "the exact target baseline and rebased candidate run once, then evidence is promoted"
+    );
+    let item = read_work_show_json(&project, "work-1");
+    let candidate = &item["merge_candidates"][0];
+    assert_eq!(candidate["merge_state"]["status"], "merged");
+    assert_eq!(
+        merge_tester_results(&project, candidate)["summary"]["fail"],
+        1,
+        "a failure introduced by newer main is accepted despite the passing Attempt-start baseline"
+    );
+    let manifests = fs::read_dir(project.join(".fluent/work/baselines/landed"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("manifest.json"))
+        .filter(|path| path.is_file())
+        .map(|path| read_json_path(&path))
+        .collect::<Vec<_>>();
+    assert!(
+        manifests
+            .iter()
+            .any(|manifest| manifest["identity"]["source-commit"] == landed)
+    );
+    land_work_1(&project, &bin, false);
+    assert_eq!(
+        fs::read_to_string(&events).unwrap(),
+        after,
+        "already-merged recovery must reuse the promoted baseline"
+    );
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_retry_reuses_target_baseline() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, events) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then printf 'not ok integrated\\n'; exit 1; fi",
+    );
+    let target = advance_tester_target(&project);
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .failure();
+    }
+    let runs = fs::read_to_string(&events).unwrap();
+    assert_eq!(
+        runs.lines()
+            .filter(|line| *line == format!("{target} {target}"))
+            .count(),
+        1,
+        "the second land reuses the exact target baseline"
+    );
+    let merge_dir =
+        project.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-merge-candidate/merge");
+    let failures = fs::read_dir(merge_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("tester/tester-results.json"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 2, "retry preserves both failure artifacts");
+    assert_eq!(git_head(&project), target);
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_restores_tracked_changes() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then printf 'test residue' > README.md; git add README.md; fi",
+    );
+    advance_tester_target(&project);
+    land_work_1(&project, &bin, false);
+    assert_eq!(
+        fs::read_to_string(project.join("README.md")).unwrap(),
+        "test"
+    );
+    let item = read_work_show_json(&project, "work-1");
+    let artifact = item["merge_candidates"][0]["merge_state"]["check_artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| artifact["producer_id"] == "merge-tester")
+        .unwrap();
+    let path = project.join(artifact["path"].as_str().unwrap());
+    let mutation = read_json_path(&path.parent().unwrap().join("candidate-mutation.json"));
+    assert_eq!(mutation["restored"], true);
+    assert_eq!(mutation["candidate_commit"], git_head(&project));
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_verifies_fix_pre_merge_tip() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, events) = setup_rebased_tester_candidate(&tmp, ":");
+    advance_tester_target(&project);
+    write_executable_hook(
+        &project,
+        "check-pre-merge",
+        "#!/bin/sh\ntest -f conformed.txt\n",
+    );
+    write_executable_hook(
+        &project,
+        "fix-pre-merge",
+        "#!/bin/sh\necho fixed > conformed.txt\n",
+    );
+    let target = git_head(&project);
+    land_work_1(&project, &bin, false);
+    let landed = git_head(&project);
+    let item = read_work_show_json(&project, "work-1");
+    assert_eq!(
+        merge_tester_results(&project, &item["merge_candidates"][0])["candidate_commit"],
+        landed
+    );
+    assert!(project.join("conformed.txt").is_file());
+    assert!(
+        fs::read_to_string(events)
+            .unwrap()
+            .lines()
+            .any(|line| line == format!("{landed} {target}"))
+    );
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_rejects_target_movement() {
+    let tmp = TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    let mutation = format!(
+        "if [ -f loop-output.txt ]; then git -C '{}' commit --allow-empty -m 'Move target during Tester'; fi",
+        main.display()
+    );
+    let (project, bin, _) = setup_rebased_tester_candidate(&tmp, &mutation);
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Target branch main moved"));
+    let item = read_work_show_json(&project, "work-1");
+    let candidate = &item["merge_candidates"][0];
+    let moved = git_head(&project);
+    assert_ne!(moved, target);
+    assert_ne!(candidate["candidate_commit"], moved);
+    assert_eq!(candidate["merge_state"]["status"], "failed");
+    assert_eq!(
+        merge_tester_results(&project, candidate)["candidate_commit"],
+        candidate["candidate_commit"]
+    );
+}
+
+#[test]
+fn work_merge_candidate_rebased_tester_rejects_candidate_head_change() {
+    let tmp = TempDir::new().unwrap();
+    let (project, bin, _) = setup_rebased_tester_candidate(
+        &tmp,
+        "if [ -f loop-output.txt ]; then git commit --allow-empty -m 'Move candidate during Tester'; fi",
+    );
+    let target = advance_tester_target(&project);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["merge-candidate", "land", "work-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Tester candidate HEAD changed"));
+    assert_eq!(git_head(&project), target);
+    let item = read_work_show_json(&project, "work-1");
+    let candidate = &item["merge_candidates"][0];
+    let results = merge_tester_results(&project, candidate);
+    assert_eq!(results["candidate_commit"], candidate["candidate_commit"]);
+    assert_eq!(results["commands"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        results["summary"]["total"], 2,
+        "preserve extracted tests when the host guard rejects HEAD"
+    );
+    assert!(!results["error"].is_null());
+    assert_ne!(
+        git_head(&project.join("../work-6-work-1-attempt-1")),
+        candidate["candidate_commit"],
+        "do not rewind a HEAD change attributed to an untrusted command"
+    );
+}
+
+#[test]
 fn work_merge_candidate_failed_check_leaves_target_unchanged() {
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);

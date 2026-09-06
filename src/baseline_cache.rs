@@ -337,31 +337,61 @@ pub(crate) fn promote_final_tester(
     merged_commit: &str,
     no_sandbox: bool,
 ) -> Result<Option<LandedSeedDisposition>> {
+    let Some(seed) =
+        validated_final_tester_seed(merged_workspace, artifact_dir, merged_commit, no_sandbox)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(publish_existing_artifact(
+        project_root,
+        artifact_dir,
+        seed.identity,
+    )?))
+}
+
+/// Validate exact final evidence without publishing a baseline before land.
+pub(crate) fn reusable_final_tester(
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+    no_sandbox: bool,
+) -> Result<bool> {
+    Ok(validated_final_tester_seed(
+        candidate_workspace,
+        artifact_dir,
+        candidate_commit,
+        no_sandbox,
+    )?
+    .is_some())
+}
+
+fn validated_final_tester_seed(
+    candidate_workspace: &Path,
+    artifact_dir: &Path,
+    candidate_commit: &str,
+    no_sandbox: bool,
+) -> Result<Option<FinalTesterSeed>> {
     let seed_path = artifact_dir.join(FINAL_TESTER_SEED_FILE);
     if !seed_path.is_file() {
         return Ok(None);
     }
     let seed: FinalTesterSeed = serde_json::from_slice(&fs::read(&seed_path)?)?;
-    let expected = resolve_identity(merged_workspace, no_sandbox, None)?;
-    if expected.source_commit != merged_commit || seed.identity != expected {
+    let expected = resolve_identity(candidate_workspace, no_sandbox, None)?;
+    if expected.source_commit != candidate_commit || seed.identity != expected {
         return Ok(None);
     }
 
     let results_bytes = fs::read(artifact_dir.join(RESULTS_FILE))?;
     let results: TesterResults = serde_json::from_slice(&results_bytes)?;
     if results.error.is_some()
-        || results.candidate_commit.as_deref() != Some(merged_commit)
+        || results.candidate_commit.as_deref() != Some(candidate_commit)
         || digest_bytes(&results_bytes) != seed.results_digest
         || digest_tree_without_seed(artifact_dir)? != seed.artifact_digest
     {
         bail!("final Tester seed evidence is not trustworthy");
     }
 
-    Ok(Some(publish_existing_artifact(
-        project_root,
-        artifact_dir,
-        seed.identity,
-    )?))
+    Ok(Some(seed))
 }
 
 fn publish_existing_artifact(
@@ -710,6 +740,20 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn exact_final_tester_validation_does_not_publish_before_land() {
+        let root = tempfile::tempdir().unwrap();
+        let commit = initialized_project(root.path());
+        let artifact = root.path().join("final-tester");
+        write_bound_artifact(&artifact, &commit);
+        record_final_tester_seed(root.path(), &artifact, true).unwrap();
+        assert!(reusable_final_tester(root.path(), &artifact, &commit, true).unwrap());
+        assert!(!root.path().join(CACHE_ROOT).exists());
+        assert!(!reusable_final_tester(root.path(), &artifact, "another-tip", true).unwrap());
+        fs::write(artifact.join("commands/0-stdout.log"), "tampered").unwrap();
+        assert!(reusable_final_tester(root.path(), &artifact, &commit, true).is_err());
     }
 
     #[test]

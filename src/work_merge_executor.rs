@@ -435,7 +435,39 @@ fn prepare_landed_baseline(
     outcome: &WorkMergeOutcome,
 ) -> Result<crate::baseline_cache::LandedSeedDisposition> {
     let item = read_work_item_or_not_found(config.store, config.work_item_id)?;
-    let final_tester = latest_final_tester_artifact_dir(config.project_root, &item, candidate)?;
+    let merge_tester = item
+        .merge_candidates
+        .iter()
+        .find(|stored| stored.id == candidate.id)
+        .and_then(|stored| {
+            stored
+                .merge_state
+                .check_artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.producer_id == "merge-tester")
+        })
+        .map(|artifact| {
+            let path = Path::new(&artifact.path);
+            anyhow::ensure!(
+                path.file_name()
+                    .is_some_and(|name| name == "tester-results.json"),
+                "merge Tester artifact must name tester-results.json"
+            );
+            crate::work_task_executor::resolve_managed_artifact_area_path(
+                config.project_root,
+                &path
+                    .parent()
+                    .context("merge Tester artifact has no parent")?
+                    .to_string_lossy(),
+            )
+        })
+        .transpose()?;
+    let final_tester = merge_tester.or(latest_final_tester_artifact_dir(
+        config.project_root,
+        &item,
+        candidate,
+    )?);
     let target_workspace =
         resolve_workspace_path(config.project_root, &candidate.target_workspace.path);
 
@@ -1631,32 +1663,62 @@ fn execute_merge_with_coder(
         &target_head_before,
         &candidate_commit,
     )?;
-    let tester_dir = verification_dir.join("tester");
+    let final_tester = latest_final_tester_artifact_dir(config.project_root, item, candidate)?;
+    let reusable = final_tester.as_deref().is_some_and(|artifact| {
+        match crate::baseline_cache::reusable_final_tester(
+            source_workspace,
+            artifact,
+            &candidate_commit,
+            config.no_sandbox,
+        ) {
+            Ok(exact) => exact,
+            Err(error) => {
+                eprintln!(
+                    "  Final Tester evidence cannot be reused; verifying candidate: {error:#}"
+                );
+                false
+            }
+        }
+    });
+    let tester_dir = if reusable {
+        final_tester.expect("reusable final Tester has an artifact directory")
+    } else {
+        verification_dir.join("tester")
+    };
     let results_path = tester_dir.join("tester-results.json");
     check_artifacts.push(baseline_artifact);
     check_artifacts.push(ArtifactRef {
         producer_id: "merge-tester".to_string(),
         path: path_for_model(config.project_root, &results_path),
     });
-    let verification = (|| {
-        run_merge_tester(
-            config,
-            candidate,
-            source_workspace,
-            &tester_dir,
-            &candidate_commit,
-        )?;
+    let verification: Result<()> = (|| {
+        if !reusable {
+            run_merge_tester(
+                config,
+                candidate,
+                source_workspace,
+                &tester_dir,
+                &candidate_commit,
+            )?;
+        }
         compare_merge_tester(
             &results_path,
             &baseline_dir.join("tester-results.json"),
             &candidate_commit,
         )?;
+        if !reusable {
+            crate::baseline_cache::record_final_tester_seed(
+                source_workspace,
+                &tester_dir,
+                config.no_sandbox,
+            )?;
+        }
         ensure_clean_worktree(source_workspace)?;
         ensure_clean_worktree(target_workspace)?;
-        anyhow::ensure!(
-            head_commit(source_workspace)? == candidate_commit,
-            "candidate HEAD changed after post-rebase Tester verification"
-        );
+        crate::work_task_executor::TesterCandidateGuard::begin(
+            source_workspace.to_path_buf(),
+            &candidate_commit,
+        )?;
         Ok(())
     })();
     if let Err(error) = verification {
@@ -1681,6 +1743,7 @@ fn execute_merge_with_coder(
         source_workspace,
         target_workspace,
         &target_head_before,
+        &candidate_commit,
         check_artifacts.clone(),
         Vec::new(),
     );
@@ -1735,19 +1798,30 @@ fn run_merge_tester(
         crate::work_task_executor::run_tester_with_candidate_guard(&guard, artifact_dir, &sandbox)
     })();
     if let Err(error) = &result {
-        // Keep completed command records if restoration or a later host check failed.
-        let commands = fs::read(artifact_dir.join("tester-results.json"))
+        // Retain both command and extracted test evidence when the host guard fails.
+        let results_path = artifact_dir.join("tester-results.json");
+        let existing = fs::read(&results_path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
-            .map(|results| results.commands)
-            .unwrap_or_default();
-        crate::tester::persist_harness_error(
-            artifact_dir,
-            "merge_tester_boundary",
-            "Landing Tester could not verify the candidate".to_string(),
-            format!("{error:#}"),
-            commands,
-        )?;
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok());
+        if let Some(mut results) = existing {
+            results.error = Some(crate::tester::TesterError {
+                kind: "merge_tester_boundary".to_string(),
+                message: "Landing Tester could not verify the candidate".to_string(),
+                details: format!("{error:#}"),
+            });
+            crate::atomic_write::atomic_write(
+                &results_path,
+                &serde_json::to_vec_pretty(&results)?,
+            )?;
+        } else {
+            crate::tester::persist_harness_error(
+                artifact_dir,
+                "merge_tester_boundary",
+                "Landing Tester could not verify the candidate".to_string(),
+                format!("{error:#}"),
+                Vec::new(),
+            )?;
+        }
     }
     crate::tester::bind_candidate_commit(artifact_dir, candidate_commit)?;
     result
@@ -1853,10 +1927,15 @@ fn finalize_merge(
     source_workspace: &Path,
     target_workspace: &Path,
     target_head_before: &str,
+    verified_commit: &str,
     check_artifacts: Vec<ArtifactRef>,
     review_artifacts: Vec<ArtifactRef>,
 ) -> Result<WorkMergeOutcome> {
-    let merged_commit = head_commit(source_workspace)?;
+    let merged_commit = verified_commit.to_string();
+    anyhow::ensure!(
+        head_commit(source_workspace)? == merged_commit,
+        "candidate HEAD changed after post-rebase Tester verification"
+    );
     let target_head_now = git::run_stdout(
         target_workspace,
         &["rev-parse", &candidate.target_branch],
@@ -4496,12 +4575,24 @@ mod tests {
         // Nest the project so any managed sibling resolves inside this TempDir.
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        );
+
         let git = |args: &[&str]| {
             crate::git::run(&project_root, args, "merge route test setup").unwrap();
         };
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t.co"]);
         git(&["config", "user.name", "t"]);
+        git(&["add", ".fluent"]);
         git(&["commit", "-q", "--allow-empty", "-m", "baseline"]);
 
         // A registered source worktree for the candidate; the clean main checkout is
@@ -7370,6 +7461,17 @@ exit 0
         let tmp = tempfile::TempDir::new().unwrap();
         let project_root = tmp.path().join("project");
         fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(project_root.join(".fluent")).unwrap();
+        fs::write(
+            project_root.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        write_executable(
+            &project_root.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        );
+
         let git = |cwd: &Path, args: &[&str]| {
             git::run(cwd, args, "capture land fixture setup").unwrap();
         };
