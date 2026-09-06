@@ -733,14 +733,22 @@ commit lands under the same boundary, Fluent atomically promotes the final
 Tester artifact into the project's durable landed-baseline cache. Known test
 failures remain useful baseline evidence; a harness error does not.
 
-Rebase, Learner, or merge-time repair can make the landed commit differ from the
-commit tested before land. A mismatched or unavailable seed is never relabeled.
-Fluent creates a detached worktree at the merged commit, runs one fresh baseline
-there, publishes only trustworthy evidence, and removes the worktree before the
-land command returns. Because the Git fast-forward is already durable, a
-capture or cleanup error warns rather than reporting that the merge failed. A
-repeated land invocation retries preparation, and the next Attempt retains its
-ordinary capture fallback.
+Capture-mode landing verifies the exact candidate after rebase and any
+`fix-pre-merge` commit, before fast-forward. It validates the final Tester seed
+without publishing it; if the seed does not match, it runs the guarded Tester
+against the final candidate tip. It compares those results with a trusted
+baseline for the target commit captured at the start of landing. A missing
+target baseline requires a run in an exact detached checkout; a cached baseline
+avoids that run. Harness errors, process leaks, unexplained failed commands,
+and newly failing test IDs block landing. Unchanged target failures remain
+accepted even when the Attempt-start baseline passed.
+
+After fast-forward, Fluent promotes the exact pre-land artifact into the durable
+landed-baseline cache. It does not immediately repeat a successful verification.
+Legacy landed candidates and the identity-only `no-expertise` route retain the
+post-land fallback: when no exact seed is available, a detached checkout captures
+the merged commit's baseline. A failure after durable fast-forward warns and
+remains retryable; it never undoes the merge.
 
 Direct and scheduler-launched Attempts first check the durable cache using the
 same immutable identity. A file lease serializes publication; consumers validate
@@ -1250,12 +1258,13 @@ Fluent does not append them as additional prompt text.
 `fluent merge-candidate show <work-item-id> <merge-candidate-id>` prints
 one stored Merge Candidate as pretty JSON. This command only reads the
 boundary object. `fluent merge-candidate land <work-item-id> <merge-candidate-id>`
-executes a Merge Candidate that still needs to land: it invokes an agent
-to rebase the candidate workspace against the target branch, regenerates
-post-rebase provenance, runs configured pre-merge checks in the candidate
-workspace, runs the required reviewer set with merge-time context, then
-fast-forwards the target branch to the updated candidate head. This
-rebase-and-check path is the capture route; not every candidate rebases and not
+executes a Merge Candidate that still needs to land: it locks landing and
+resolves a trusted baseline for the exact current target, invokes an agent to
+rebase the candidate, regenerates provenance, and runs configured pre-merge
+checks. After any `fix-pre-merge` commit, it updates provenance to that final tip
+and reuses exact final Tester evidence or runs the guarded Tester. Only accepted
+results may reach the target-head recheck and fast-forward to the verified SHA.
+This rebase-and-check path is the capture route; not every candidate rebases and not
 every failed check runs `fix-pre-merge`. A fresh `no-expertise` `Succeeded`
 candidate instead lands through the identity-preserving exact-SHA route described
 in the no-expertise section below, which never rebases, never regenerates
@@ -1280,42 +1289,23 @@ continues to own post-rebase cleanup. Re-running `fluent merge-candidate land`
 after a failed rebase creates a new rebase Task (with an incremented
 suffix) and operates on the candidate workspace in its current state.
 
-Merge-time review prepares one detached reviewer
-worktree per role at the post-rebase candidate commit and runs those
-roles in parallel. Each reviewer worktree lives at a sibling path
-`../review-<work-item-id-bytelen>-<work-item-id>-<attempt-id>-<reviewer>`
-relative to the project root, not nested under `.fluent/work/artifacts/`.
-Each reviewer sees its dedicated reviewer worktree as
-the candidate workspace and receives only its own writable artifact
-directory. Merge-time reviewers receive the exact
-`.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/reviews/<role>/review.md`
-artifact path for their output and the absolute filesystem path the
-reviewer must write. They also receive a shell-quoted `git -C
-<workspace> diff <target-commit>..<candidate-commit>` command and a
-merge-check status note; Fluent does not ask them to inspect
-merge-check artifact paths from the reviewer sandbox. When Fluent
-builds the Work merge reviewer system prompt, it uses the prompt's
-`[work-system]` section when one exists and falls back to the raw
-`[system]` section otherwise.
-Fluent then points the reviewer at the absolute candidate
-workspace skill path when that skill exists; if the candidate does not
-contain that skill file, the prompt tells the reviewer to apply the
-reviewer role directly. If the candidate workspace contains
-`.fluent/expertise/decisions.md`, the prompt names that absolute path so
-reviewers do not resolve decisions relative to their artifact directory.
-Reviewers treat the candidate workspace as read-only and write only merge
-review artifacts; suggested patches and proposed documentation edits belong
-in those artifacts, not in the candidate workspace. Review artifacts do not
-receive private build caches; executable suite evidence comes from the
-host-owned Tester boundary. The reviewer sandbox grants read access to
-the whole `.fluent/work/artifacts/<work-item-id>/<attempt-id>/` subtree
-so merge-check and prior-review artifacts are readable. After reviewers exit, merge execution checks each reviewer
-worktree for staged, unstaged, untracked, and ignored file changes,
-including changes under `.fluent`, and fails before merging if any
-reviewer dirtied its isolated candidate. It writes one combined review
-state after all reviewer jobs finish and cleans up reviewer worktrees
-after successful merge or failed review handling. After it records the
-merged state, it removes the managed candidate worktree — unless the
+Landing creates no Reviewer or Attempt Tester Tasks. Its host-owned verification
+uses the existing Tester sandbox, Attempt dependency cache, candidate guard, and
+failure comparison rules. The guard restores tracked index and worktree changes
+after preserving test evidence; it rejects HEAD changes or failed restoration.
+The executor rechecks candidate cleanliness and the target head before merging.
+A failed verification records merge status `failed`, the exact Tester artifact,
+and a repair instruction while retaining the candidate workspace.
+
+Each landing verification uses a separate directory under
+`.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/verification-*/`.
+The `target-baseline` and `tester` directories contain their Tester results and
+command logs. `merge_state.check_artifacts` references these results, or the
+original final Tester artifact when reused. Retries preserve earlier evidence.
+The completed Attempt's review, Tester, and Learning records remain intact;
+landing only adds its existing Rebase Task and updates candidate provenance.
+
+After recording the merged state, Fluent removes the managed candidate worktree — unless the
 Attempt's Learner run failed and is still retryable, in which case it
 retains the workspace so a post-land handoff-only Learner retry has a
 chance to run against the merged candidate. If cleanup
@@ -1324,8 +1314,9 @@ warning and leaves the merged Merge Candidate state intact. Running the
 command again
 for a Merge Candidate that already has merge status `merged` and a stored
 `merged_commit` succeeds idempotently and reports the stored commit
-without resolving workspaces, rerunning checks, rerunning reviewers, or
-moving the target branch. Merge artifacts live under
+without rebasing, rerunning pre-merge checks, or moving the target branch.
+It may finish pending baseline preparation and follow-up recovery.
+Merge artifacts live under
 `.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/`,
 and the stored Merge Candidate records whether execution is pending,
 executing, failed, needs-user, or merged.
@@ -1859,21 +1850,10 @@ non-corrective follow-up, which materializes as an Observation only. The
 recovered handoff is then materialized immediately under the same
 land-gated, idempotent rules the land hook uses.
 
-Merge execution auto-continues through failed merge-time review
-rounds within a same-invocation budget. The merge loop iterates
-rebase → checks → reviews. If reviewers return fail (and not a
-reviewer launch panic), Fluent invokes the same Coder used at
-Attempt time against the candidate workspace, passing the failed
-merge review artifact paths as input, asking the coder to address
-the findings and commit. After the follow-up writer commits, the
-loop restarts at rebase. One `fluent merge-candidate land` invocation may
-advance at most `MAX_MERGE_FOLLOWUP_WRITES_PER_INVOCATION = 2`
-follow-up write cycles. If a third round would be needed, Fluent
-marks the Merge Candidate `needs-user`, writes a handoff under
-`.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/needs-user.md`
-naming the failed review artifact paths, and bails. Reviewer launch
-panics or non-verdict errors are never retried — they fail the
-merge immediately.
+Landing follows one deterministic verification sequence after rebase. A failed
+check or Tester run stops before fast-forward and leaves evidence on the Merge
+Candidate. After repair, a later land invocation starts from the retained
+candidate. It does not run a merge-time Writer or Reviewer loop.
 
 Coder runs whose transcript contains a session-limit or rate-limit
 marker are not treated as Task failures. The Coder wrapper parses
@@ -2444,8 +2424,8 @@ A sibling executable at `.fluent/hooks/fix-pre-merge` (optional)
 is invoked when `check-pre-merge` fails. Fluent requires the
 worktree to be clean before running the fix hook, commits any
 changes the fix produces outside `.fluent/`, reruns
-`check-pre-merge`, reruns reviewers after the fix commit, and
-continues only when the required checks and reviews pass. The
+`check-pre-merge`, and verifies the final commit through the Tester. Landing
+continues only when the checks and exact Tester comparison pass. The
 project decides what each script invokes — `cargo fmt`,
 `make ci`, `pre-commit run --all-files`, anything else.
 
@@ -3326,9 +3306,9 @@ against the candidate worktree and proceeds with merging only
 after the hook exits 0. If `check-pre-merge` fails and a
 `fix-pre-merge` hook is also present, the executor requires a
 clean worktree outside `.fluent/`, runs the fix hook, commits
-any changes outside `.fluent/`, reruns reviewers, reruns
-`check-pre-merge`, and lands only when the recheck and reviewers
-pass.
+any changes outside `.fluent/`, and reruns `check-pre-merge`. It then verifies
+the final candidate tip against the exact target baseline with the Tester before
+fast-forward. Successful exact evidence is promoted after the merge.
 
 `worktree.rs` provides git worktree helpers: disabling commit
 signing in a worktree, detecting git repositories, and resolving
@@ -3347,9 +3327,8 @@ The watcher selects a candidate as merge-ready when the latest Attempt has
 `status == complete`, `review_state == passed`, and Learning in the `Succeeded`
 state, the candidate has `merge_state.status == pending`, and
 `merge_state.auto_merge_skipped` is not `true`. Selection does not require the
-Merge Candidate's merge-time `review_state` to have passed; the land command
-owns pre-merge checks and merge-time review after the watcher selects the
-candidate.
+Merge Candidate's `merge_review_state` to have passed; the land command owns
+pre-merge checks and exact candidate Tester verification after selection.
 
 The `auto_merge_skipped` field on `MergeCandidateMergeState` is an
 `Option<bool>` that persists skip state across watcher restarts.

@@ -2469,75 +2469,14 @@ Test: tests/binary.rs (work_merge_candidate_missing_item_or_candidate_reports_er
 ### B120
 
 WHEN `fluent merge-candidate land <work-item-id> <merge-candidate-id>` is invoked
-for a stored Merge Candidate that still needs to land,
-THE SYSTEM SHALL update the candidate workspace against the target
-branch, run configured pre-merge checks, run the full merge-time reviewer
-set, and fast-forward the target branch only after those steps pass.
-Test: tests/binary.rs (work_merge_candidate_lands_after_merge_time_reviews)
+for a capture-mode Merge Candidate that still needs to land,
+THE SYSTEM SHALL resolve the exact current-target baseline, rebase the candidate,
+run configured pre-merge checks, verify the exact final candidate with the Tester,
+and fast-forward only after those deterministic checks pass.
+Test: tests/binary.rs (work_merge_candidate_runs_tester_for_rebased_tip_before_land)
 
-### B121
-
-WHEN `fluent merge-candidate land <work-item-id> <merge-candidate-id>` launches a
-merge-time reviewer for a Work Merge Candidate,
-THE SYSTEM SHALL name the exact
-`.fluent/work/artifacts/<work-item-id>/<attempt-id>/<candidate-id>/merge/reviews/<role>/review.md`
-artifact as the review output and provide the absolute filesystem path the
-reviewer must write.
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge lands after update, checks, and reviewers)
-
-### B122
-
-WHEN Fluent runs a merge-time behavior reviewer for a Merge Candidate
-whose Work Item includes a behavior increment,
-THE SYSTEM SHALL include the behavior increment explicitly in the merge
-review prompt.
-Test: tests/binary.rs (work_merge_candidate_lands_after_merge_time_reviews)
-
-### B123
-
-WHEN Fluent runs a merge-time behavior reviewer for a Merge Candidate
-whose Work Item does not include a behavior increment,
-THE SYSTEM SHALL state in the merge review prompt that no Work behavior
-increment was provided.
-Test: tests/binary.rs (work_merge_behavior_review_prompt_states_missing_behavior_increment)
-
-### B124
-
-WHEN `fluent merge-candidate land <work-item-id> <merge-candidate-id>` builds the
-system prompt for a Work merge-time reviewer,
-THE SYSTEM SHALL use the reviewer prompt's `[work-system]` section when
-one exists, fall back to the raw `[system]` section otherwise, then tell
-the reviewer to follow the candidate workspace's absolute
-materialized `review-<role>/SKILL.md` path (written from the bundled
-binary to `.fluent/work/skills/`). If the candidate workspace
-contains `.fluent/expertise/decisions.md`, the system shall name that
-absolute path as the recorded-decisions file.
-Test: src/work_merge_executor.rs (merge_reviewer_system_prompt_uses_work_section_without_legacy_filtering)
-Test: tests/binary.rs (work_merge_candidate_lands_after_merge_time_reviews)
-
-### B125
-
-WHEN a merge-time reviewer receives a candidate workspace,
-THE SYSTEM SHALL tell the reviewer that the candidate workspace is
-read-only for review purposes and that scratch tests, suggested patches,
-or proposed documentation edits belong in merge review artifacts rather
-than in the candidate workspace.
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge lands after update, checks, and reviewers)
-
-### B126
-
-WHEN Fluent launches a merge-time Work reviewer,
-THE SYSTEM SHALL include a `git -C <candidate-workspace> diff <range>`
-review diff command that shell-quotes the candidate workspace path and
-the exact target-to-candidate commit range.
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge lands after update, checks, and reviewers)
-
-### B127
-
-WHEN merge checks have already run before merge-time reviewers,
-THE SYSTEM SHALL tell reviewers that checks ran before reviewers without
-presenting merge-check artifact paths as required reviewer inputs.
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge lands after update, checks, and reviewers)
+The former B121–B127 merge-time reviewer requirements are retired. Landing does
+not launch reviewers; Attempt reviews precede its final Tester and Learning.
 
 ### B128
 
@@ -2626,10 +2565,11 @@ Untestable: Requires LLM rebase agent resolving real conflicts to verify no hook
 ### B137
 
 WHEN the rebase step completes successfully,
-THE SYSTEM SHALL proceed to `check-pre-merge` and `fix-pre-merge`
-unchanged from current behavior, and SHALL NOT run any review Tasks
-between the rebase Task and the fast-forward.
-Test: tests/binary.rs (work_merge_candidate_rebases_when_target_advanced)
+THE SYSTEM SHALL run `check-pre-merge` and any applicable `fix-pre-merge`,
+verify the resulting exact candidate through the host-owned Tester boundary,
+and SHALL NOT create review or Attempt Tester Tasks before fast-forward.
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_failure_records_retry_evidence)
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_verifies_fix_pre_merge_tip)
 
 ### B138
 
@@ -2644,71 +2584,26 @@ Test: src/work_merge_executor.rs (next_rebase_task_id_increments)
 
 ### B139
 
-IF the target branch moves after merge checks and reviewers run but
+IF the target branch moves while merge checks or exact Tester verification run but
 before the fast-forward merge,
 THEN THE SYSTEM SHALL reject the merge, preserve the moved target branch,
 and record merge status `failed` with a failure reason on the stored
 Merge Candidate.
-Test: tests/binary.rs (work_merge_candidate_rejects_target_moved_during_review)
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_rejects_target_movement)
 
 ### B140
 
 WHEN `fluent merge-candidate land <work-item-id> <merge-candidate-id>` lands a
 Merge Candidate,
 THE SYSTEM SHALL record merge status `merged`, the merged commit, and
-merge-time review artifacts on the stored Merge Candidate, then remove the
+pre-merge check and exact Tester artifacts on the stored Merge Candidate, then remove the
 managed candidate worktree. If worktree cleanup fails after merging, the
 system shall warn without changing the merged merge state.
-Test: tests/binary.rs (work_merge_candidate_lands_after_merge_time_reviews)
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_pass_continues_to_land)
 
-### B141
-
-IF merge-time reviewers fail while `fluent merge-candidate land <work-item-id>
-<merge-candidate-id>` executes and the same-invocation follow-up
-write budget (`MAX_MERGE_FOLLOWUP_WRITES_PER_INVOCATION = 2`) is
-exhausted,
-THEN THE SYSTEM SHALL leave the target branch unchanged, record merge
-status `needs-user`, review state `failed`, a failure reason naming
-the exhausted budget, and review artifacts on the stored Merge
-Candidate, and write a `needs-user.md` handoff under the merge
-artifact directory naming the failed review artifact paths.
-Test: src/work_merge_executor.rs (failed_review_paths_picks_only_fail_and_uncertain_verdicts)
-Test: src/work_merge_executor.rs (write_merge_needs_user_handoff_lists_failed_review_paths)
-
-### B142
-
-WHEN merge-time reviewers return any fail or uncertain verdict and the
-same-invocation write-round budget permits another cycle,
-THE SYSTEM SHALL invoke the configured Coder against the candidate
-workspace with the failed merge-time review artifact paths as input
-artifacts, ask the coder to address the findings and commit, verify
-the workspace is clean and new commits were produced, then restart
-the merge loop from rebase, checks, and merge-time review.
-Untestable: Requires end-to-end merge with LLM reviewer verdicts and follow-up write cycle
-
-### B143
-
-IF merge-time reviewer execution panics, launch-fails, or returns a
-non-verdict error,
-THEN THE SYSTEM SHALL leave the target branch unchanged, record merge
-status `failed`, review state `failed`, the underlying error as the
-failure reason, and the partial review artifacts on the stored Merge
-Candidate. The merge loop SHALL NOT retry these non-verdict failures.
-Untestable: Requires reviewer panic or launch failure during live merge execution
-
-### B144
-
-IF a merge-time reviewer modifies, stages, unstages, or creates files in
-the candidate workspace while `fluent merge-candidate land <work-item-id>
-<merge-candidate-id>` executes,
-THEN THE SYSTEM SHALL stop before merging, leave the target branch
-unchanged, record the reviewer as non-passing, and expose an error that
-names the reviewer and dirty candidate workspace. This includes ignored
-files such as files under the candidate workspace's `.fluent` tree.
-Test: tests/binary.rs (work_merge_candidate_dirty_reviewer_fails_before_merging)
-Test: tests/binary.rs (work_merge_candidate_dirty_ignored_reviewer_fails_before_merging)
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge dirty reviewer leaves target unchanged)
-Test: tests/behaviors/operations/test-work-merge-candidate.sh (work merge dirty Fluent state reviewer leaves target unchanged)
+The former B141–B144 merge-time review and corrective Writer requirements are
+retired. Failed deterministic landing verification retains the candidate and
+its evidence for repair and a later land invocation.
 
 ### B145
 
@@ -6361,7 +6256,8 @@ Test: src/baseline_cache.rs (changed_landed_commit_refuses_final_tester_promotio
 
 ### B38
 
-WHEN no exact final Tester evidence is reusable after a successful land,
+WHEN neither exact final Tester nor exact merge-local Tester evidence is reusable
+after a successful land,
 THE SYSTEM SHALL run one fresh baseline against the exact merged commit without
 changing the target checkout.
 Test: src/work_merge_executor.rs (landed_baseline_checkout_uses_exact_commit_and_is_removed)
@@ -9787,3 +9683,50 @@ eligible, THE SYSTEM SHALL retain the recorded Task and dispatch identities,
 rechecking candidate and evidence bindings through foreground and queued paths.
 Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent)
 Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent_recheck_changed_evidence)
+
+## Rebased landing verification
+
+Exact Tester evidence means complete host-owned results bound to the candidate
+commit under consideration. The applicable accepted baseline is trusted Tester
+evidence for the exact target commit captured when landing starts.
+
+### B1
+
+WHEN capture-mode landing finishes rebasing a Merge Candidate and no reusable
+exact Tester evidence names the post-rebase candidate commit,
+THE SYSTEM SHALL run every configured Tester command against that candidate and
+bind the resulting evidence to its exact commit before fast-forward.
+Test: tests/binary.rs (work_merge_candidate_runs_tester_for_rebased_tip_before_land)
+
+### B2
+
+WHEN complete passing Tester evidence already names the exact post-rebase
+candidate commit,
+THE SYSTEM SHALL reuse that evidence without rerunning its Tester commands
+during landing.
+Test: tests/binary.rs (work_merge_candidate_reuses_exact_tester_evidence_before_land)
+
+### B3
+
+IF exact post-rebase Tester evidence contains a harness error or a test failure
+beyond the applicable accepted baseline,
+THEN THE SYSTEM SHALL stop landing before fast-forward and leave the target
+branch unchanged.
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_failure_leaves_target_unchanged)
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_harness_error_leaves_target_unchanged)
+
+### B4
+
+WHEN exact post-rebase Tester verification blocks landing,
+THE SYSTEM SHALL record merge status `failed`, an actionable failure reason,
+and the exact Tester artifact on the Merge Candidate so the retained candidate
+can be repaired and retried.
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_failure_records_retry_evidence)
+
+### B5
+
+WHEN exact post-rebase Tester evidence contains no harness error and no test
+failure beyond the applicable accepted baseline,
+THE SYSTEM SHALL continue through the remaining deterministic landing checks and
+fast-forward boundary.
+Test: tests/binary.rs (work_merge_candidate_rebased_tester_pass_continues_to_land)

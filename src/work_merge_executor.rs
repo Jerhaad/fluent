@@ -2007,14 +2007,6 @@ fn finalize_merge(
     })
 }
 
-/// Extract artifact paths for failed/uncertain reviewers so the
-/// follow-up writer can read concrete findings.
-
-/// Invoke the configured coder against the candidate workspace with
-/// the failed merge-time review artifacts as input, asking the
-/// coder to address the findings and commit. Errors if no new
-/// commits result or the worktree is left dirty.
-
 /// Run the `check-pre-merge` hook against the rebased candidate
 /// workspace. If it fails and a `fix-pre-merge` hook exists, run that,
 /// commit any changes it produced, and re-run `check-pre-merge`.

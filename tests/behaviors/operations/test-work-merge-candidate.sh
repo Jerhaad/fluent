@@ -262,9 +262,11 @@ EOF
   [ "$(cat target.txt)" = "target update" ] || RESULT=1
   [ "$(cat "$TEST_DIR/check-pwd")" = "$CANDIDATE_PWD" ] || RESULT=1
   [ "$(json_value '.merge_candidates[0].merge_state.status')" = "merged" ] || RESULT=1
-  [ "$(json_value '.merge_candidates[0].merge_state.check_artifacts | length')" = "1" ] || RESULT=1
-  # Merge-time reviewers are gone in slice 3 — no review_artifacts on the
-  # candidate, the post-merge review fires asynchronously instead.
+  [ "$(json_value '.merge_candidates[0].merge_state.check_artifacts | map(.producer_id) | sort | join(",")')" = \
+    "merge-hook-check-pre-merge,merge-target-baseline,merge-tester" ] || RESULT=1
+  TESTER_ARTIFACT="$(json_value '.merge_candidates[0].merge_state.check_artifacts[] | select(.producer_id == "merge-tester") | .path')"
+  [ "$(jq -r '.candidate_commit' "$TESTER_ARTIFACT")" = "$LANDED_COMMIT" ] || RESULT=1
+  # Attempt reviews are complete; landing runs deterministic checks only.
   [ "$(json_value '.merge_candidates[0].merge_state.review_artifacts | length')" = "0" ] || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "Merged Merge Candidate attempt-1-merge-candidate" || RESULT=1
   "$FLUENT_BIN" merge-candidate show work-1 attempt-1-merge-candidate \
