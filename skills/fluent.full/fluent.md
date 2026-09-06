@@ -160,8 +160,7 @@ stops at a Learner failure, or pauses at `needs-user`. Each round:
    `writer-completion.json` matrix with implementation evidence and focused
    harness-native verification. External rows remain pending with empty evidence;
    Fluent projects Writer completion into the required progress section.
-   Fluent gives every Writer
-   round in the exact Attempt the same confined Cargo dependency cache, seeded
+   Every Writer round in the Attempt shares a confined Cargo cache, seeded
    only with the host's admitted `registry/` and `git/` stores; Writers do not
    use or modify the operator's global Cargo home.
 2. Fluent reconciles Writer-owned progress, matrix rows, and applicable findings.
@@ -433,8 +432,6 @@ A human must run `fluent scheduler run`; a ready candidate still needs inspectio
 
 ## Writer testing contract
 
-The writer produces tests alongside code. When committing a candidate:
-
 - `.fluent/tester.yaml` declares the project's test commands (one entry per harness, e.g., Rust nextest + shell).
 - Each EARS statement has either a `Test:` reference pointing at a real test or an `Untestable:` marker with a one-line reason.
 - Run focused harness-native selections before committing and report the exact
@@ -446,35 +443,24 @@ The writer produces tests alongside code. When committing a candidate:
   pending with empty evidence arrays. Do not defer a known implementation
   boundary, cleanup path, or navigation requirement to reviewers.
 
-Ordinary reviewer Tasks run after a completed Writer satisfies its required
-progress, Writer-owned rows, and applicable findings, and any required host
-check has passing candidate-bound evidence accepted by targeted Tests Review. Fluent
-generates immutable rows from the approved behaviors and their existing
-`Test:`/`Untestable:` markers, applicable Approach decisions, structural
-boundaries, and execution guidance, required Plan rows and Verification cells,
-and the current round's open review findings. This references harness-native
-commands; it does not introduce
-another selector vocabulary. For Writer-owned rows, the Writer fills concrete
-implementation evidence and passing focused commands. Each finding also names
-an applicable Behavior, Approach, or required Plan constraint (or a specific
-reason none applies). Incomplete Writer work follows the continuation or pause
-rules above. Required host checks use the candidate-bound evidence handoff;
-review, final Tester, and Learner obligations use their existing stage gates.
-Domain reviewers inspect
-the candidate and use the matrix and reported focused checks as advisory evidence
-instead of rerunning the full suite. Only the tests reviewer may run one named
-missing check, using the candidate-keyed shared cache.
+Fluent generates immutable rows from approved Behaviors and `Test:`/`Untestable:`
+markers, Approach decisions, boundaries and guidance, required Plan rows and
+Verification cells, and open findings. Use harness-native commands. Each finding
+names an applicable Behavior, Approach, or required Plan constraint, or explains
+why none applies. Incomplete Writer work follows the continuation or pause rules
+above. Ordinary reviews require completed Writer work and any required host
+evidence accepted by targeted Tests Review. Reviewers treat the matrix and focused
+checks as advisory; only the Tests Reviewer may run one named missing check with
+the candidate-keyed cache. Host, review, Tester, and Learner gates remain required.
 
-The host then writes `candidate-gate.json` for the exact Writer commit. It uses
-the existing harness-native `Test:` references, not aliases, and runs the
-project-owned `check-pre-merge` hook read-only. Writers receive this artifact for
-one focused correction when the gate rejects their candidate; reviewers receive
-it only after it passes.
+Before ordinary review, the host writes `candidate-gate.json` for the exact Writer
+commit using harness-native `Test:` references and the read-only `check-pre-merge`
+hook. A rejection returns this artifact to the Writer for one focused correction;
+reviewers receive it only after it passes.
 
-After every reviewer passes, one final Tester produces `tester-results.json`,
-which the host binds to the exact reviewed commit. This is the authoritative
-complete-suite gate before Learning. A failed review therefore returns to the
-Writer without spending a full Tester run; a final Tester regression returns its
+After reviewers pass, one final Tester produces `tester-results.json`, bound to
+the exact reviewed commit, as the complete-suite gate before Learning. Failed
+reviews return to the Writer before this gate; Tester failures return their
 artifact to a corrective Writer.
 
 `fluent status` and `fluent work-item show <work-item-id>` also report cycle-cost
