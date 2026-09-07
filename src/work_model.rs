@@ -2194,7 +2194,8 @@ impl WorkItem {
     /// The shared advancement-readiness gate for one Attempt: delegates to
     /// [`Attempt::learning_advancement_readiness`] so Attempt readiness, Merge
     /// Candidate validation, and landing consume one contract and reject a
-    /// non-succeeded Learner with the same durable reason.
+    /// non-succeeded Learner with the same durable reason. An active cancellation
+    /// blocks advancement even when the Learner previously succeeded.
     pub fn attempt_learning_advancement(&self, attempt_id: &str) -> Result<(), WorkModelError> {
         let attempt = self
             .attempts
@@ -2203,6 +2204,7 @@ impl WorkItem {
             .ok_or_else(|| WorkModelError::AttemptNotFound {
                 id: attempt_id.to_string(),
             })?;
+        attempt.ensure_not_canceled()?;
         attempt.learning_advancement_readiness()
     }
 }
@@ -8063,15 +8065,18 @@ impl MergeCandidate {
                 field: "candidate_commit",
             });
         }
-        // A pending candidate normally requires its Attempt to be Complete with
-        // Passed reviews. A host-sandbox recovery pause relaxes only the completed
-        // status — the reviewed candidate persists across the pause — but the
-        // reviews must still have passed, so a `needs-user`/`host-sandbox` pause
-        // with absent, uncertain, or failed reviews stays invalid. An already
-        // failed merge is exempt entirely.
+        // Preserve reviewed candidates across host-sandbox recovery and preserve
+        // a pending candidate when its Attempt records a durable cancellation.
+        // These pauses relax only the completed status, never review provenance
+        // or readiness. An already failed merge is exempt entirely.
         let host_sandbox_paused = attempt.status == AttemptStatus::NeedsUser
             && attempt.pause_kind == Some(PauseKind::HostSandbox);
-        let status_ok = attempt.status == AttemptStatus::Complete || host_sandbox_paused;
+        let cancellation_paused = self.merge_state.status == MergeCandidateMergeStatus::Pending
+            && attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind == Some(PauseKind::Interrupted)
+            && attempt.cancellation_requested();
+        let status_ok =
+            attempt.status == AttemptStatus::Complete || host_sandbox_paused || cancellation_paused;
         let reviews_passed = attempt.review_state == Some(AttemptReviewState::Passed);
         if self.merge_state.status != MergeCandidateMergeStatus::Failed
             && !(status_ok && reviews_passed)
@@ -15850,6 +15855,76 @@ random banner prose that must be ignored
             .expect("a reviewed attempt creates its candidate");
         suspend_attempt(&mut work_item.attempts[0], PauseKind::HostSandbox);
         work_item
+    }
+
+    #[test]
+    fn canceled_pending_candidate_stays_valid_but_cannot_advance() {
+        let mut item = host_sandbox_paused_candidate_work_item();
+        let attempt = &mut item.attempts[0];
+        attempt.pause_kind = Some(PauseKind::Interrupted);
+        attempt.cancellation = Some(AttemptCancellation {
+            requested_at: now_iso8601(),
+            settled_at: None,
+            resumed_at: None,
+        });
+        let candidate = item.merge_candidates[0].clone();
+        for learning in [
+            None,
+            Some(AttemptLearning::in_progress(1)),
+            Some(AttemptLearning::failed(1, "canceled")),
+            Some(AttemptLearning::succeeded(
+                1,
+                crate::follow_up::ArtifactRef {
+                    path: "handoff.json".into(),
+                    digest: "sha256:x".into(),
+                },
+            )),
+        ] {
+            item.attempts[0].learning = learning;
+            item.validate()
+                .expect("a durable stop must preserve its pending reviewed candidate");
+            assert!(
+                candidate.validate_advancement(&item).is_err(),
+                "even a succeeded Learner cannot advance during cancellation"
+            );
+        }
+        for pause in [PauseKind::CandidateGate, PauseKind::Auth] {
+            let mut invalid = item.clone();
+            invalid.attempts[0].pause_kind = Some(pause);
+            assert!(candidate.validate(&invalid).is_err());
+        }
+        for status in [
+            MergeCandidateMergeStatus::Executing,
+            MergeCandidateMergeStatus::NeedsUser,
+            MergeCandidateMergeStatus::Merged,
+        ] {
+            let mut invalid = candidate.clone();
+            invalid.merge_state.status = status;
+            assert!(
+                invalid.validate(&item).is_err(),
+                "only a pending candidate gains the cancellation exception"
+            );
+        }
+        for review in [
+            None,
+            Some(AttemptReviewState::Failed),
+            Some(AttemptReviewState::Uncertain),
+        ] {
+            let mut invalid = item.clone();
+            invalid.attempts[0].review_state = review;
+            assert!(candidate.validate(&invalid).is_err());
+        }
+        let mut invalid = item.clone();
+        invalid.attempts[0].cancellation = None;
+        assert!(
+            candidate.validate(&invalid).is_err(),
+            "an untyped Interrupted pause is not sufficient"
+        );
+        item.attempts[0].cancellation.as_mut().unwrap().resumed_at = Some(now_iso8601());
+        assert!(
+            candidate.validate(&item).is_err(),
+            "resumed history cannot authorize a paused candidate"
+        );
     }
 
     #[test]

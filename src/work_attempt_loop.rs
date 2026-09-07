@@ -4816,6 +4816,14 @@ fn resume_canceled_attempt(
     authorized_stop: Option<&str>,
 ) -> Result<()> {
     mutate_attempt_work_item(store, work, |item| {
+        let pending_candidate_ready_at = item
+            .merge_candidates
+            .iter()
+            .find(|candidate| {
+                candidate.attempt_id == id
+                    && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+            })
+            .map(|candidate| candidate.ready_at.clone());
         let attempt = item
             .attempts
             .iter_mut()
@@ -4866,14 +4874,19 @@ fn resume_canceled_attempt(
         }
         attempt.cancellation.as_mut().unwrap().resumed_at = Some(crate::work_model::now_iso8601());
         crate::work_model::reopen_attempt(attempt);
-        if attempt.learning.is_some()
-            && attempt.review_state == Some(AttemptReviewState::Passed)
-            && attempt
-                .tasks
-                .iter()
-                .all(|task| task.status == TaskStatus::Complete)
+        if attempt.review_state == Some(AttemptReviewState::Passed)
+            && (pending_candidate_ready_at.is_some()
+                || (attempt.learning.is_some()
+                    && attempt
+                        .tasks
+                        .iter()
+                        .all(|task| task.status == TaskStatus::Complete)))
         {
+            // Reviews already selected this candidate, including before Learner
+            // reservation. Resume Learning without reopening the Writer round or
+            // changing the first readiness timestamp of a previously ready candidate.
             attempt.status = AttemptStatus::Complete;
+            attempt.completed_at = pending_candidate_ready_at.flatten();
         }
         Ok(())
     })?;
@@ -10107,6 +10120,88 @@ mod tests {
         let resumed = store.read_work_item("work-1").unwrap();
         assert!(!resumed.attempts[0].cancellation_requested());
         assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
+    }
+
+    #[test]
+    fn canceled_pending_candidate_resumes_reviewed_state() {
+        use crate::work_model::{AttemptLearning, TaskOutput, WorkspaceRef};
+
+        for learning in [
+            None,
+            Some(AttemptLearning::in_progress(1)),
+            Some(AttemptLearning::succeeded(
+                1,
+                crate::follow_up::ArtifactRef {
+                    path: "handoff.json".into(),
+                    digest: "sha256:x".into(),
+                },
+            )),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(tmp.path());
+            let mut writer = write_task("attempt-1-write-1", Vec::new());
+            writer.workspace_access.writes.push(WorkspaceRef {
+                id: "candidate".into(),
+                path: "../candidate".into(),
+            });
+            writer.output = Some(TaskOutput {
+                workspace_id: "candidate".into(),
+                workspace_path: "../candidate".into(),
+                source_branch: "main".into(),
+                base_commit: None,
+                commit: "reviewed".into(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            let mut item = WorkItem {
+                id: "work-1".into(),
+                title: "Resume the reviewed candidate".into(),
+                attempts: vec![attempt_with_tasks(vec![writer])],
+                ..Default::default()
+            };
+            item.attempts[0].status = AttemptStatus::Complete;
+            item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+            item.attempts[0].learning = learning;
+            item.create_or_get_merge_candidate("attempt-1").unwrap();
+            if item.attempts[0].learning_advancement_readiness().is_ok() {
+                item.mark_merge_candidate_ready("attempt-1").unwrap();
+            }
+            store.create_work_item(&item).unwrap();
+            cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+            let stopped = store.read_work_item("work-1").unwrap();
+            assert_eq!(stopped.merge_candidates, item.merge_candidates);
+            assert!(
+                stopped.merge_candidates[0]
+                    .validate_advancement(&stopped)
+                    .is_err()
+            );
+            assert_eq!(
+                cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap(),
+                0
+            );
+            assert_eq!(store.read_work_item("work-1").unwrap(), stopped);
+            let stop = &stopped.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .requested_at;
+            resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
+            let resumed = store.read_work_item("work-1").unwrap();
+            assert_eq!(resumed.merge_candidates, item.merge_candidates);
+            assert_eq!(resumed.attempts[0].status, AttemptStatus::Complete);
+            assert_eq!(
+                resumed.attempts[0].completed_at,
+                item.merge_candidates[0].ready_at
+            );
+            assert!(!resumed.attempts[0].cancellation_requested());
+            assert_eq!(
+                resumed.merge_candidates[0]
+                    .validate_advancement(&resumed)
+                    .is_ok(),
+                item.merge_candidates[0].ready_at.is_some(),
+                "resume preserves existing readiness only"
+            );
+        }
     }
 
     #[test]

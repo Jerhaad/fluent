@@ -974,6 +974,12 @@ admission. A delayed launch cannot authorize a newer stop during startup;
 completed Tasks remain complete, and canceled verification retries use new
 artifact directories. Historical Attempts without a cancellation record keep
 their existing semantics.
+A reviewed pending Merge Candidate survives the `needs-user` / `interrupted`
+pause only with an active durable cancellation record and Passed reviews. The
+advancement gate rejects that stop even if Learner previously succeeded. Explicit
+resume restores the reviewed Attempt to Complete, preserves the candidate and
+any original readiness timestamp, and resumes Learning when it remains unfinished.
+Other pause, review, and provenance constraints remain enforced.
 Natural completion observes the leader without reaping it, sweeps its process
 group, and then reaps exactly once. On macOS, `killpg` returns `EPERM` when an
 exited, still-waitable leader is the group's only remaining member; Fluent maps

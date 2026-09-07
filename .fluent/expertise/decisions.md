@@ -156,11 +156,34 @@ The aggregate invariant `MergeCandidate.candidate_commit == latest completed Wri
 
 ---
 
-## A pending Merge Candidate stays structurally valid only across a typed host-sandbox pause
+## Preserve reviewed candidates across typed recovery pauses
 
-`MergeCandidate::validate` normally requires a pending candidate's Attempt to be `Complete` with reviews `Passed` (a `Failed` merge status is separately exempt so a failed land keeps its record). It carries exactly one cross-object recovery exception: a pending candidate also validates when its Attempt is `NeedsUser` with `pause_kind: HostSandbox`. This is deliberate, not an oversight. The Learner's host-sandbox preflight runs *after* reviews have passed and the candidate already identifies the reviewed Writer commit; when Fluent cannot apply its Seatbelt boundary, the Attempt suspends to that typed pause before the Learner reserves a run. Admitting this one state lets the same Attempt persist and reload the reviewed candidate and resume once the host recovers, without discarding review evidence or consuming another Writer round. The exception is narrow by construction — every other pause kind, including `CandidateGate`, and every non-`Passed` review state keeps a pending candidate structurally invalid.
+`MergeCandidate::validate` normally requires a candidate's Attempt to be
+`Complete` with reviews `Passed`; a `Failed` merge remains separately exempt.
+A `NeedsUser` / `HostSandbox` Attempt remains structurally valid because the
+Learner's sandbox preflight runs after Fluent persists the reviewed candidate.
+Terminal cancellation adds one narrow exception: a **pending** candidate also
+survives `NeedsUser` / `Interrupted` when the Attempt carries an active durable
+cancellation record (`resumed_at` is absent). Cancellation must save this stop
+before signaling the Learner. Requiring Complete at that point would reject the
+aggregate before Fluent could stop its worker.
 
-Structural validity is not landing readiness, and the two gates are kept apart on purpose. `MergeCandidate::validate` decides only whether the persisted aggregate is well-formed; `MergeCandidate::validate_advancement` remains the landing gate and still fails closed on a non-succeeded Learner through the shared `Attempt::learning_advancement_readiness()` reason. A host-sandbox pause precedes the Learner, so a preserved candidate is structurally valid yet cannot land until the recovered Learner succeeds. Do not widen the structural exception to other pauses, and do not move the host-sandbox check into the advancement gate — a paused candidate must be storable without becoming landable. See [[advancement-requires-a-succeeded-learner]].
+The cancellation exception preserves the reviewed commit and Passed reviews;
+it accepts neither an untyped Interrupted pause, a resumed cancellation record,
+a different pause, nor an executing or merged candidate. Explicit resume after
+settlement restores the reviewed Attempt to Complete, including when canceled
+before Learner reservation. It retains the candidate and its first readiness
+timestamp instead of reopening a Writer round.
+
+Structural validity remains separate from advancement. The aggregate can store
+and reload the stopped candidate, but `WorkItem::attempt_learning_advancement`
+rejects an active cancellation even if Learning previously succeeded. After
+explicit resume, the shared Learner gate still requires succeeded Learning.
+Keep `Attempt::learning_advancement_readiness` as the proof of prior Learning
+when validating an existing readiness timestamp; a durable stop must not make
+that history unreadable. Do not broaden either recovery exception to unrelated
+pauses or weaken review, provenance, or readiness checks. See
+[[advancement-requires-a-succeeded-learner]].
 
 ---
 

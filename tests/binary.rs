@@ -38799,6 +38799,14 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
         } else {
             None
         };
+        if stage == "learner" {
+            store
+                .mutate_work_item(&id, |item| {
+                    item.create_or_get_merge_candidate("attempt-1")?;
+                    Ok(())
+                })
+                .unwrap();
+        }
         if stage == "verification" {
             fluent_cmd()
                 .current_dir(&project)
@@ -39014,6 +39022,66 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
                 .all(|candidate| candidate.ready_at.is_none()),
             "{stage}"
         );
+        if stage == "learner" {
+            assert_eq!(
+                before.merge_candidates.len(),
+                1,
+                "exercise the persisted pre-land candidate"
+            );
+            assert_eq!(after.merge_candidates, before.merge_candidates);
+            assert!(
+                after.merge_candidates[0]
+                    .validate_advancement(&after)
+                    .is_err()
+            );
+            let resumed_marker = tmp.path().join("learner-resumed");
+            write_mock_claude(
+                &bin,
+                &format!(
+                    "#!/bin/bash\ntouch '{}'\nexit 1\n",
+                    resumed_marker.display()
+                ),
+            );
+            let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+            command
+                .current_dir(&project)
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+                .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+                .env("PATH", mock_path(&bin))
+                .args(["attempt", "run", &id, "attempt-1", "--no-sandbox"])
+                .stdout(std::process::Stdio::null())
+                .stderr(fs::File::create(tmp.path().join("resumed-learner.log")).unwrap());
+            let mut resumed_worker = OwnedFixtureProcess::spawn(&mut command);
+            assert!(
+                poll_until(std::time::Duration::from_secs(8), || resumed_worker
+                    .try_wait()
+                    .unwrap()
+                    .is_some()),
+                "explicit Learner resume must settle"
+            );
+            let resumed = store.read_work_item(&id).unwrap();
+            assert!(
+                resumed_marker.exists(),
+                "resume must relaunch Learner: {}",
+                fs::read_to_string(tmp.path().join("resumed-learner.log")).unwrap()
+            );
+            assert!(
+                resumed.attempts[0]
+                    .cancellation
+                    .as_ref()
+                    .unwrap()
+                    .resumed_at
+                    .is_some()
+            );
+            assert_eq!(resumed.merge_candidates, before.merge_candidates);
+            assert!(
+                resumed.merge_candidates[0]
+                    .validate_advancement(&resumed)
+                    .is_err(),
+                "a resumed but failed Learner cannot make the preserved candidate ready"
+            );
+        }
     }
 }
 
