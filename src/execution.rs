@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -57,10 +57,11 @@ fn identity_lock_path(path: &Path) -> PathBuf {
 }
 
 fn identity_is_held(path: &Path) -> Result<bool> {
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(identity_lock_path(path))?;
+    let file = match File::open(identity_lock_path(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("opening execution identity lock"),
+    };
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {
             let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
@@ -324,6 +325,66 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn liveness_probe_does_not_create_identity_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("execution.json");
+        let record = ExecutionRecord {
+            schema_version: 1,
+            state: ExecutionState::Running,
+            owner_pid: std::process::id(),
+            leader_pid: std::process::id(),
+            process_group_id: std::process::id(),
+            started_at: "started".into(),
+            heartbeat_at: "heartbeat".into(),
+            settled_at: None,
+        };
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!execution_is_live(&path).unwrap());
+        assert!(!identity_lock_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let missing = dir.path().join("missing/execution.json");
+        assert!(!identity_is_held(&missing).unwrap());
+        assert!(!execution_is_live(&missing).unwrap());
+        assert!(!missing.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn liveness_probe_observes_existing_held_identity_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let path = record_path_for_transcript(&transcript);
+        let lock = identity_lock_path(&path);
+        std::fs::write(&lock, b"preserve identity bytes").unwrap();
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0);
+        configure_identity_lock(&mut command, &transcript).unwrap();
+        let mut child = command.spawn().unwrap();
+        let record = ExecutionRecord {
+            schema_version: 1,
+            state: ExecutionState::Running,
+            owner_pid: std::process::id(),
+            leader_pid: child.id(),
+            process_group_id: child.id(),
+            started_at: "started".into(),
+            heartbeat_at: "heartbeat".into(),
+            settled_at: None,
+        };
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let live = execution_is_live(&path);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(live.unwrap());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"preserve identity bytes");
+        assert!(!execution_is_live(&path).unwrap());
+    }
 
     #[test]
     fn cancel_terminates_owned_process_group() {
