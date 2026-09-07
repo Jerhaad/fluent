@@ -19951,6 +19951,7 @@ fn tester_harness_repair_public_workflow_is_audited_and_idempotent() {
             candidate_commit: candidate.clone(),
             base_commit: None,
         }),
+        verification_context: None,
         evidence_review_context: None,
         input_artifacts: Vec::new(),
         depends_on: None,
@@ -25730,6 +25731,95 @@ fn setup_focused_evidence_fixture(
     (project, candidate, review_path)
 }
 
+fn accept_focused_verification(project: &Path, work: &str) -> anyhow::Result<()> {
+    let store = fluent::work_model::WorkModelStore::new(project);
+    let item = store.read_work_item(work)?;
+    let task = item.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Verification)
+        .unwrap();
+    fluent::verification::accept(
+        project,
+        &store,
+        task,
+        &fluent::content::ContentResolver::new(Some(project)),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn focused_evidence_run_schedules_candidate_bound_verification_task() {
+    let tmp = TempDir::new().unwrap();
+    let (project, candidate, review_path) = setup_focused_evidence_fixture(
+        &tmp,
+        "scheduled-evidence",
+        "tests",
+        "Verdict: fail\nEvidence-Command: printf scheduled\nEvidence-Working-Directory: .\n",
+    );
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "run",
+                "scheduled-evidence",
+                "attempt-1",
+                "--review-artifact",
+                &review_path,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Scheduled verification Task"));
+    }
+    let shown = work_item_value(&project, "scheduled-evidence");
+    let attempt = &shown["attempts"][0];
+    let tasks = attempt["tasks"].as_array().unwrap();
+    let verification = tasks
+        .iter()
+        .filter(|task| task["kind"] == "verification")
+        .collect::<Vec<_>>();
+    assert_eq!(verification.len(), 1);
+    let task = verification[0];
+    assert_eq!(task["status"].as_str().unwrap_or("planned"), "planned");
+    assert_eq!(task["work_item_id"], "scheduled-evidence");
+    assert_eq!(task["attempt_id"], "attempt-1");
+    assert_eq!(task["verification_context"]["candidate_commit"], candidate);
+    assert_eq!(
+        task["verification_context"]["checker"]["command"],
+        "printf scheduled"
+    );
+    assert_eq!(
+        task["verification_context"]["checker"]["working_directory"],
+        "."
+    );
+    assert!(
+        task["verification_context"]["checker_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        task["workspace_access"]["writes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        attempt["evidence_recoveries"]
+            .as_array()
+            .is_none_or(|entries| entries.is_empty())
+    );
+    assert!(
+        !project
+            .join(task["artifact_area"]["path"].as_str().unwrap())
+            .join("stdout.log")
+            .exists()
+    );
+    assert_eq!(git_head(&project), candidate);
+}
+
 #[test]
 fn attempt_evidence_run_plans_only_targeted_tests_review() {
     let tmp = TempDir::new().unwrap();
@@ -25760,7 +25850,25 @@ fn attempt_evidence_run_plans_only_targeted_tests_review() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Focused evidence passed"));
+        .stdout(predicate::str::contains("Scheduled verification Task"));
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "focused-evidence-run",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "focused-evidence-run").unwrap();
 
     let shown = work_item_value(&project, "focused-evidence-run");
     let attempt = &shown["attempts"][0];
@@ -25790,16 +25898,12 @@ fn attempt_evidence_run_plans_only_targeted_tests_review() {
     let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
     assert_eq!(evidence["result"], "pass");
     assert_eq!(evidence["check"], "printf focused-pass");
-    assert_eq!(
-        evidence["working_directory"],
-        project.canonicalize().unwrap().display().to_string()
-    );
-    assert!(
-        evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("focused-pass")
-    );
+    assert_eq!(evidence["working_directory"], ".");
+    let output = fs::read_to_string(project.join(
+        ".fluent/work/artifacts/focused-evidence-run/attempt-1/attempt-1-verification-1/stdout.log",
+    ))
+    .unwrap();
+    assert!(output.contains("focused-pass"));
     assert_eq!(
         attempt["evidence_recoveries"][0]["candidate_commit"],
         candidate
@@ -25808,7 +25912,7 @@ fn attempt_evidence_run_plans_only_targeted_tests_review() {
 }
 
 #[test]
-fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
+fn scheduled_verification_task_runs_in_confined_worker() {
     let tmp = TempDir::new().unwrap();
     let (project, candidate, review_path) = setup_focused_evidence_fixture(
         &tmp,
@@ -25848,6 +25952,27 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
         .assert()
         .success();
 
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("OPENAI_API_KEY", "must-not-reach-focused-check")
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "focused-evidence-profile",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "focused-evidence-profile").unwrap();
+
     let profile = fs::read_to_string(profile_log).unwrap();
     let canonical_project = project.canonicalize().unwrap();
     assert!(profile.contains(&format!(
@@ -25862,7 +25987,7 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
         "(deny file-write* (subpath \"{}\"))",
         canonical_project.display()
     )));
-    assert!(profile.contains("focused-evidence-runs/run-1"));
+    assert!(profile.contains("attempt-1-verification-1/scratch"));
     assert!(profile.contains(&format!(
         "(allow file-read*  (subpath \"{}\"))",
         rustup_home.canonicalize().unwrap().display()
@@ -25889,35 +26014,17 @@ fn attempt_evidence_run_confines_candidate_writes_to_private_scratch() {
             .unwrap(),
     );
     let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
-    assert!(
-        !evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("must-not-reach-focused-check")
-    );
-    assert!(
-        evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("FLUENT_EVIDENCE_SCRATCH=")
-    );
-    assert!(
-        evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("CFFIXED_USER_HOME=")
-    );
-    assert!(evidence["output"].as_str().unwrap().contains(&format!(
+    assert_eq!(evidence["result"], "pass");
+    let output = fs::read_to_string(project.join(".fluent/work/artifacts/focused-evidence-profile/attempt-1/attempt-1-verification-1/stdout.log")).unwrap();
+    assert!(!output.contains("must-not-reach-focused-check"));
+    assert!(output.contains("FLUENT_EVIDENCE_SCRATCH="));
+    assert!(output.contains("CFFIXED_USER_HOME="));
+    assert!(output.contains(&format!(
         "RUSTUP_HOME={}",
         rustup_home.canonicalize().unwrap().display()
     )));
-    assert!(
-        evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("RUSTUP_TOOLCHAIN=stable-test-toolchain")
-    );
-    assert!(evidence["output"].as_str().unwrap().contains("CARGO_HOME="));
+    assert!(output.contains("RUSTUP_TOOLCHAIN=stable-test-toolchain"));
+    assert!(output.contains("CARGO_HOME="));
     assert_eq!(git_head(&project), candidate);
     assert!(
         git::run_stdout(&project, &["status", "--porcelain"], "inspect candidate")
@@ -25966,7 +26073,7 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
             "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
             bin.join("sandbox-exec"),
         )
-        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("PATH", std::env::join_paths(&paths).unwrap())
         .env("RUSTUP_HOME", &rustup_home)
         .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
         .env("CARGO_HOME", &canonical_cargo_home)
@@ -25982,7 +26089,30 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Focused evidence passed"));
+        .stdout(predicate::str::contains("Scheduled verification Task"));
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .env("PATH", std::env::join_paths(&paths).unwrap())
+        .env("RUSTUP_HOME", &rustup_home)
+        .env("RUSTUP_TOOLCHAIN", "stable-test-toolchain")
+        .env("CARGO_HOME", &canonical_cargo_home)
+        .env("FLUENT_TEST_CANONICAL_CARGO_HOME", &canonical_cargo_home)
+        .args([
+            "task",
+            "run",
+            "focused-evidence-rustup",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "focused-evidence-rustup").unwrap();
 
     let shown = work_item_value(&project, "focused-evidence-rustup");
     let snapshot = project.join(
@@ -25991,12 +26121,9 @@ fn attempt_evidence_run_preserves_rustup_with_isolated_cargo() {
             .unwrap(),
     );
     let evidence: serde_json::Value = serde_json::from_slice(&fs::read(snapshot).unwrap()).unwrap();
-    assert!(
-        evidence["output"]
-            .as_str()
-            .unwrap()
-            .contains("toolchain-and-dependencies-preserved")
-    );
+    assert_eq!(evidence["result"], "pass");
+    let output = fs::read_to_string(project.join(".fluent/work/artifacts/focused-evidence-rustup/attempt-1/attempt-1-verification-1/stdout.log")).unwrap();
+    assert!(output.contains("toolchain-and-dependencies-preserved"));
     assert_eq!(git_head(&project), candidate);
 }
 
@@ -26112,6 +26239,23 @@ fn attempt_evidence_run_accepts_explicit_legacy_request() {
         .assert()
         .success();
 
+    fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "focused-evidence-legacy",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "focused-evidence-legacy").unwrap();
+
     let shown = work_item_value(&project, "focused-evidence-legacy");
     assert_eq!(shown["attempts"][0]["status"], "reviewing");
     assert_eq!(git_head(&project), candidate);
@@ -26148,7 +26292,24 @@ fn attempt_evidence_run_records_timeout_as_failed_evidence() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Focused evidence failed"));
+        .stdout(predicate::str::contains("Scheduled verification Task"));
+
+    fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "focused-evidence-timeout",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "focused-evidence-timeout").unwrap();
 
     let shown = work_item_value(&project, "focused-evidence-timeout");
     let snapshot = project.join(
@@ -38086,4 +38247,157 @@ fn interrupted_plan_host_evidence_rejects_changed_repair_provenance() {
             .failure();
         assert_eq!(work_item_value(&project, id), before, "{drift}");
     }
+}
+
+fn scheduled_verification_fixture(
+    tmp: &TempDir,
+    work: &str,
+    command: &str,
+) -> (PathBuf, PathBuf, String) {
+    let (project, candidate, review) = setup_focused_evidence_fixture(
+        tmp,
+        work,
+        "tests",
+        &format!("Verdict: fail\nEvidence-Command: {command}\nEvidence-Working-Directory: .\n"),
+    );
+    let bin = tmp.path().join("verification-bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            work,
+            "attempt-1",
+            "--review-artifact",
+            &review,
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args(["task", "run", work, "attempt-1", "attempt-1-verification-1"])
+        .assert()
+        .success();
+    let area = project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/attempt-1-verification-1"
+    ));
+    (project, area, candidate)
+}
+
+#[test]
+fn verification_receipt_is_compact_immutable_and_candidate_bound() {
+    let tmp = TempDir::new().unwrap();
+    let work = "verification-receipt";
+    let (project, area, candidate) = scheduled_verification_fixture(
+        &tmp,
+        work,
+        "python3 -c 'import sys; sys.stdout.write(\"x\"*1000000); sys.stderr.write(\"y\"*1000000)'",
+    );
+    let bytes = fs::read(area.join("receipt.json")).unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(bytes.len() < 16 * 1024);
+    assert_eq!(receipt["candidate_commit"], candidate);
+    assert_eq!(receipt["result"], "pass");
+    assert_eq!(receipt["exit_status"], 0);
+    assert!(receipt["started_at"].is_string());
+    assert!(receipt["completed_at"].is_string());
+    for (index, name) in ["stdout.log", "stderr.log"].iter().enumerate() {
+        let output = fs::read(area.join(name)).unwrap();
+        assert_eq!(output.len(), 384 * 1024);
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            receipt["artifacts"][index]["digest"],
+            format!("sha256:{:x}", Sha256::digest(output))
+        );
+    }
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["task", "run", work, "attempt-1", "attempt-1-verification-1"])
+        .assert()
+        .failure();
+    assert_eq!(fs::read(area.join("receipt.json")).unwrap(), bytes);
+    accept_focused_verification(&project, work).unwrap();
+    let shown = work_item_value(&project, work);
+    assert_eq!(
+        shown["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(fs::metadata(area.join("evidence.json")).unwrap().len() < 2048);
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
+fn invalid_verification_receipt_blocks_then_corrected_receipt_advances() {
+    let tmp = TempDir::new().unwrap();
+    let work = "verification-invalid";
+    let (project, area, candidate) =
+        scheduled_verification_fixture(&tmp, work, "printf valid-output");
+    let receipt_path = area.join("receipt.json");
+    let bytes = fs::read(&receipt_path).unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let before = work_item_value(&project, work);
+    for field in [
+        "candidate_commit",
+        "command",
+        "working_directory",
+        "checker_digest",
+        "task_id",
+        "started_at",
+        "completed_at",
+    ] {
+        let mut bad = original.clone();
+        bad[field] = serde_json::json!("stale");
+        fs::write(&receipt_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(
+            accept_focused_verification(&project, work).is_err(),
+            "{field}"
+        );
+        assert_eq!(work_item_value(&project, work), before);
+    }
+    fs::write(&receipt_path, b"{").unwrap();
+    assert!(accept_focused_verification(&project, work).is_err());
+    fs::remove_file(&receipt_path).unwrap();
+    assert!(accept_focused_verification(&project, work).is_err());
+    fs::write(&receipt_path, &bytes).unwrap();
+    let stdout = fs::read(area.join("stdout.log")).unwrap();
+    fs::write(area.join("stdout.log"), b"changed artifact").unwrap();
+    assert!(accept_focused_verification(&project, work).is_err());
+    fs::write(area.join("stdout.log"), stdout).unwrap();
+    let task = &before["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["kind"] == "verification")
+        .unwrap();
+    let review_path = project.join(
+        task["verification_context"]["review_artifact"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    let review = fs::read(&review_path).unwrap();
+    fs::write(&review_path, b"invalid fixture").unwrap();
+    assert!(accept_focused_verification(&project, work).is_err());
+    fs::write(&review_path, review).unwrap();
+    assert_eq!(work_item_value(&project, work), before);
+    assert_eq!(git_head(&project), candidate);
+    accept_focused_verification(&project, work).unwrap();
+    let after = work_item_value(&project, work);
+    let reviews = after["attempts"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|task| task["evidence_review_context"].is_object())
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0]["review_context"]["candidate_commit"], candidate);
 }

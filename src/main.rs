@@ -691,18 +691,12 @@ fn cmd_attempt(
                 resolver,
             )?;
             println!(
-                "Focused evidence {} for Attempt {}; targeted reviews: {}",
-                match run.result {
-                    fluent::host_evidence::EvidenceResult::Pass => "passed",
-                    fluent::host_evidence::EvidenceResult::Fail => "failed",
-                },
-                attempt_id,
-                run.recovery
-                    .targets
-                    .iter()
-                    .map(|target| target.role.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "Scheduled verification Task {} for Attempt {attempt_id}",
+                run.task_id
+            );
+            println!(
+                "Next: fluent task run {work_item_id} {attempt_id} {}",
+                run.task_id
             );
         }
         AttemptCommands::Evidence {
@@ -3066,6 +3060,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,

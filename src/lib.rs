@@ -80,3 +80,5 @@ pub mod update;
 pub mod usage;
 
 pub mod ownership_recovery;
+
+pub mod verification;

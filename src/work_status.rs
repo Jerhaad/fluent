@@ -1831,6 +1831,7 @@ mod tests {
                     path: ".fluent/work/artifacts/work-1/attempt-1/evidence-review".to_string(),
                 }),
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: Some(crate::work_model::EvidenceReviewContext {
                     recovery_id: recovery_id.to_string(),
                     candidate_commit: candidate_commit.to_string(),

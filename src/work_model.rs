@@ -1007,6 +1007,7 @@ impl WorkItem {
                     path: artifact_path,
                 }),
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts,
                 depends_on: None,
@@ -1124,6 +1125,7 @@ impl WorkItem {
                     candidate_commit: source_commit.clone(),
                     base_commit: None,
                 }),
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: preserved_inputs.clone(),
                 depends_on: None,
@@ -1204,6 +1206,7 @@ impl WorkItem {
                 candidate_commit: source_commit.clone(),
                 base_commit: base_commit.clone(),
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -1244,6 +1247,7 @@ impl WorkItem {
                     candidate_commit: source_commit.clone(),
                     base_commit: base_commit.clone(),
                 }),
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: {
                     let mut inputs = preserved_inputs.clone();
@@ -1474,6 +1478,7 @@ impl WorkItem {
                     candidate_commit: write_output.commit.clone(),
                     base_commit: None,
                 }),
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: task_input_artifacts,
                 depends_on: None,
@@ -1562,6 +1567,7 @@ impl WorkItem {
                 candidate_commit: write_output.commit,
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -1640,6 +1646,7 @@ impl WorkItem {
                 candidate_commit: write_output.commit,
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: vec![source_results.clone()],
             depends_on: Some(source_results.producer_id),
@@ -1716,6 +1723,7 @@ impl WorkItem {
                 path: work_artifact_path(&self.id, attempt_id, &task_id),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts,
             depends_on: None,
@@ -1792,6 +1800,7 @@ impl WorkItem {
                 path: work_artifact_path(&self.id, attempt_id, &task_id),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: preserved_recovery,
             depends_on: None,
@@ -7204,6 +7213,8 @@ pub struct Task {
     /// candidate change. Ordinary reviews deliberately omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_review_context: Option<EvidenceReviewContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_context: Option<VerificationContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7216,6 +7227,27 @@ pub struct Task {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+/// The authorized public check. Hash the complete definition to bind its policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationChecker {
+    pub schema_version: u32,
+    pub command: String,
+    pub working_directory: String,
+    pub timeout_seconds: u64,
+    pub sandbox_digest: String,
+}
+
+/// Immutable inputs for a deterministic verification worker; no coder is involved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationContext {
+    pub candidate_commit: String,
+    pub checker: VerificationChecker,
+    pub checker_digest: String,
+    pub(crate) review_artifact: BoundRecheckArtifact,
 }
 
 /// Immutable inputs and identity for an evidence-targeted reviewer.
@@ -7546,6 +7578,7 @@ pub enum TaskKind {
     Learn,
     Probe,
     Tester,
+    Verification,
 }
 
 impl TaskKind {
@@ -7559,6 +7592,7 @@ impl TaskKind {
             Self::Learn => "learn",
             Self::Probe => "probe",
             Self::Tester => "tester",
+            Self::Verification => "verification",
         }
     }
 }
@@ -7576,6 +7610,7 @@ impl FromStr for TaskKind {
             "learn" => Ok(Self::Learn),
             "probe" => Ok(Self::Probe),
             "tester" => Ok(Self::Tester),
+            "verification" => Ok(Self::Verification),
             other => Err(ParseTaskKindError(other.to_string())),
         }
     }
@@ -13088,6 +13123,7 @@ random banner prose that must be ignored
                 path: ".fluent/tasks/task-1".to_string(),
             }),
             review_context,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13951,6 +13987,7 @@ random banner prose that must be ignored
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: Some("attempt-1-review-tests".to_string()),
@@ -13982,6 +14019,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -14423,6 +14461,7 @@ random banner prose that must be ignored
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -15193,6 +15232,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
                         depends_on: None,
@@ -15221,6 +15261,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
                         depends_on: None,
@@ -16106,6 +16147,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
                         depends_on: None,
@@ -16166,6 +16208,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17129,6 +17172,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17159,6 +17203,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17308,6 +17353,7 @@ random banner prose that must be ignored
                 path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2".to_string(),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17707,6 +17753,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17737,6 +17784,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17769,6 +17817,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -17929,6 +17978,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -19738,6 +19788,7 @@ random banner prose that must be ignored
                 candidate_commit: "commit-initial".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -19985,6 +20036,7 @@ random banner prose that must be ignored
                 candidate_commit: "commit-initial".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,

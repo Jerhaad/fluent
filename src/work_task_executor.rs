@@ -346,6 +346,28 @@ fn reserve_task_start(
     active_status: AttemptStatus,
     expected_coder: CoderKind,
 ) -> Result<TaskStartReservation> {
+    reserve_task_start_with_coder(
+        project_root,
+        store,
+        work_item_id,
+        attempt_id,
+        task_id,
+        expected_kind,
+        active_status,
+        Some(expected_coder),
+    )
+}
+
+fn reserve_task_start_with_coder(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    task_id: &str,
+    expected_kind: TaskKind,
+    active_status: AttemptStatus,
+    expected_coder: Option<CoderKind>,
+) -> Result<TaskStartReservation> {
     enum Decision {
         Reserved(Box<TaskStartReservation>),
         Rejected,
@@ -400,20 +422,20 @@ fn reserve_task_start(
         if attempt.tasks[task_index].status != TaskStatus::Planned {
             return Ok(Decision::Rejected);
         }
-        let mapping = attempt.coder_mapping.for_task_kind(expected_kind);
-        let coder = mapping.coder;
-        // The Codex boundary was prepared for this exact mapping before the
-        // reservation. A concurrent provider change must replan instead of
-        // launching an un-preflighted coder.
-        if coder != expected_coder {
-            return Ok(Decision::Rejected);
-        }
-        let model = if mapping.model.is_empty() {
-            None
+        let (coder, model, effort) = if let Some(expected_coder) = expected_coder {
+            let mapping = attempt.coder_mapping.for_task_kind(expected_kind);
+            if mapping.coder != expected_coder {
+                return Ok(Decision::Rejected);
+            }
+            (
+                mapping.coder,
+                (!mapping.model.is_empty()).then(|| mapping.model.clone()),
+                mapping.effort.clone(),
+            )
         } else {
-            Some(mapping.model.clone())
+            // Deterministic Tasks carry no provider authority and never use this field.
+            (CoderKind::Codex, None, None)
         };
-        let effort = mapping.effort.clone();
         let attempt_kind = attempt.kind.clone();
         let is_first_write = !attempt.tasks[..task_index]
             .iter()
@@ -648,6 +670,7 @@ pub fn run_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         TaskKind::Write => run_write_task(config),
         TaskKind::Review => run_review_task(config),
         TaskKind::Tester => run_tester_task(config),
+        TaskKind::Verification => run_verification_task(config),
         kind => bail!(
             "Task {:?} is kind {kind}; unsupported by task run",
             config.task_id
@@ -1959,6 +1982,57 @@ fn capture_baseline_tester(
             eprintln!("  Baseline tester: run failed: {e:#}");
         }
     }
+}
+
+fn run_verification_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
+    let _lease = crate::lease::acquire(&crate::lease::task_lock_path(
+        config.project_root,
+        config.work_item_id,
+        config.task_id,
+    ))?;
+    let plan = plan_task_start(
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        config.task_id,
+        TaskKind::Verification,
+        |task| crate::verification::validate_context(config.project_root, task, config.resolver),
+    )?;
+    let reservation = reserve_task_start_with_coder(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+        config.task_id,
+        TaskKind::Verification,
+        AttemptStatus::Reviewing,
+        None,
+    )?;
+    let result =
+        crate::verification::execute(config.project_root, &reservation.task, config.resolver);
+    mutate_task_work_item(config.store, config.work_item_id, |item| {
+        let (a, t) = find_attempt_task_indexes(item, config.attempt_id, config.task_id)
+            .ok_or_else(|| WorkModelError::TaskNotFound {
+                id: config.task_id.into(),
+            })?;
+        let task = &mut item.attempts[a].tasks[t];
+        if task.status == TaskStatus::Executing {
+            crate::work_model::set_task_terminal(
+                task,
+                if result.is_ok() {
+                    TaskStatus::Complete
+                } else {
+                    TaskStatus::NeedsUser
+                },
+            );
+        }
+        Ok(())
+    })?;
+    result?;
+    Ok(WorkTaskRunResult {
+        task_id: plan.task.id,
+        output: "verification receipt published".into(),
+    })
 }
 
 fn run_tester_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
@@ -11229,6 +11303,7 @@ mod tests {
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13385,6 +13460,7 @@ mod tests {
                 path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-1".to_string(),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13514,6 +13590,7 @@ mod tests {
                 candidate_commit: baseline.clone(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13767,6 +13844,7 @@ mod tests {
                 candidate_commit: candidate.clone(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13936,6 +14014,7 @@ mod tests {
                 path: area.to_string(),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -13996,6 +14075,7 @@ mod tests {
                 path: area.to_string(),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -15021,6 +15101,7 @@ mod tests {
             },
             artifact_area: Some(crate::work_model::TaskArtifactArea { path: area.clone() }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -21285,6 +21366,7 @@ mod tests {
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,

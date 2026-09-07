@@ -629,13 +629,13 @@ Test: tests/binary.rs (attempt_evidence_run_plans_only_targeted_tests_review)
 
 WHILE a focused evidence check runs, THE SYSTEM SHALL keep candidate source
 read-only.
-Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+Test: tests/binary.rs (scheduled_verification_task_runs_in_confined_worker)
 
 ### B11e
 
 WHILE a focused evidence check runs, THE SYSTEM SHALL provide a private writable
 scratch path for build and cache state.
-Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+Test: tests/binary.rs (scheduled_verification_task_runs_in_confined_worker)
 
 ### B11h
 
@@ -654,7 +654,7 @@ Test: src/host_evidence.rs (focused_evidence_includes_linked_git_metadata_in_rea
 WHILE a focused evidence check runs, THE SYSTEM SHALL withhold provider
 credential environment variables and files under the caller's Claude, Codex,
 and agent state directories from the child command.
-Test: tests/binary.rs (attempt_evidence_run_confines_candidate_writes_to_private_scratch)
+Test: tests/binary.rs (scheduled_verification_task_runs_in_confined_worker)
 
 ### B11g
 

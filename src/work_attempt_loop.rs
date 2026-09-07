@@ -408,6 +408,24 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .iter()
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        if let Some(task) = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Verification)
+        {
+            if task.status == TaskStatus::Complete
+                && !crate::verification::is_accepted(config.project_root, attempt, task)?
+            {
+                crate::verification::accept(
+                    config.project_root,
+                    config.store,
+                    task,
+                    config.resolver,
+                )?;
+                continue;
+            }
+        }
         let candidate_gate_pause = attempt.is_candidate_gate_pause();
         let uncertain_review_pause = attempt.is_uncertain_review_pause();
 
@@ -10374,6 +10392,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -10396,6 +10415,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -10426,6 +10446,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -10450,6 +10471,7 @@ mod tests {
                     path: "../outside-review-artifacts".to_string(),
                 }),
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -10945,6 +10967,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts,
             depends_on: None,
@@ -11078,6 +11101,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -11126,6 +11150,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -11170,6 +11195,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -11197,6 +11223,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -11225,6 +11252,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -11252,6 +11280,7 @@ mod tests {
                 path: artifact_path.to_string(),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
@@ -23080,6 +23109,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -23102,6 +23132,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -23208,6 +23239,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -23238,6 +23270,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -24138,6 +24171,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -24188,6 +24222,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
                 depends_on: None,
@@ -24230,6 +24265,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -24252,6 +24288,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -24318,6 +24355,7 @@ mod tests {
                         candidate_commit: "abc123".to_string(),
                         base_commit: None,
                     }),
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
                     depends_on: None,
@@ -24352,6 +24390,7 @@ mod tests {
                         candidate_commit: "abc123".to_string(),
                         base_commit: None,
                     }),
+                    verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: vec![
                         ArtifactRef {
@@ -24434,6 +24473,7 @@ mod tests {
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: vec![
                 ArtifactRef {
@@ -24496,6 +24536,7 @@ mod tests {
             },
             artifact_area: None,
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,

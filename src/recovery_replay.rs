@@ -340,6 +340,7 @@ fn replay_attempt_case(
                 ),
             }),
             review_context: None,
+            verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
             depends_on: None,
