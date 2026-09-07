@@ -297,3 +297,31 @@ execution and attachment primitives in `host_evidence`; `host_evidence` must not
 depend back on `verification`. Both continue to use the shared `execution`
 supervisor for process ownership and cancellation. This keeps policy consistent
 without making admission and worker orchestration depend on each other.
+
+---
+
+## Keep nested commands under their Task's execution owner
+
+`work_task_executor::run_task` installs the scoped `execution::TaskOwner` guard
+for the Task's managed transcript. The guard stores that path in thread-local
+state, restores the previous scope on drop, and makes nested synchronous
+commands use the Task's execution record even when they supply another
+transcript path. Baseline checks, Tester commands, and extractors therefore
+retain the reserved Attempt owner and cannot escape its durable stop between
+children. Heartbeats and command transitions preserve that owner binding.
+
+Synchronous execution on the owning thread is part of this contract. A newly
+spawned thread does **not** inherit `TaskOwner`. Any future move of nested command
+execution to another thread must explicitly propagate the owning transcript and
+install its scope there before launch. Keep each guard on the thread where it
+was entered; retain the single-record launch and settlement discipline rather
+than assigning concurrent children to the same record without an ownership
+protocol. Passing a different transcript without that scope loses attribution.
+
+Acquire the Work model lock **before** the execution lock. Check the shared
+Attempt cancellation while holding the model lock, then retain both locks
+through child creation and identity publication. Release both before waiting
+for the child or cleaning up a failed launch. This order serializes reservation,
+launch, and cancellation without making cancellation wait for worker completion;
+a reserved peer observes the shared stop even before cancellation visits its
+own execution record. Preserve it when adding nested or parallel work.

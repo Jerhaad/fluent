@@ -952,7 +952,10 @@ worker, even if its own execution record has not yet been marked `canceled`.
 The process tree holds an inherited `execution-owner.lock`; `execution.json`
 records the owner, leader, process group, heartbeat, and terminal state. Nested
 Tester commands belong to their Task, and Learner executions register their
-identities before entering `in-progress`.
+identities before entering `in-progress`. `run_task` installs a scoped,
+thread-local `TaskOwner` so synchronous nested commands use the Task's transcript
+and reserved identity. New threads do not inherit that scope: moving a nested
+command to another thread requires explicit owner propagation before launch.
 Command transitions and heartbeat updates preserve the Attempt binding. Legacy
 records without it remain readable; new Task and Learner reservations always
 publish it before execution.
