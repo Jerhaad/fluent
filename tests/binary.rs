@@ -25694,12 +25694,21 @@ fn setup_focused_evidence_fixture(
     role: &str,
     review_body: &str,
 ) -> (PathBuf, String, String) {
+    let project = setup_git_project(tmp);
+    create_focused_evidence_item(project, work_item_id, role, review_body)
+}
+
+fn create_focused_evidence_item(
+    project: PathBuf,
+    work_item_id: &str,
+    role: &str,
+    review_body: &str,
+) -> (PathBuf, String, String) {
     use fluent::work_model::{
         AttemptReviewState, AttemptStatus, PauseKind, TaskOutput, TaskStatus, WorkItem,
         WorkModelStore,
     };
 
-    let project = setup_git_project(tmp);
     let candidate = git_head(&project);
     let store = WorkModelStore::new(&project);
     let mut item = WorkItem::planned(work_item_id, "Run focused reviewer evidence");
@@ -38400,4 +38409,116 @@ fn invalid_verification_receipt_blocks_then_corrected_receipt_advances() {
         .collect::<Vec<_>>();
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0]["review_context"]["candidate_commit"], candidate);
+}
+
+#[test]
+fn verification_worker_does_not_block_unrelated_attempt_progress() {
+    let tmp = TempDir::new().unwrap();
+    let (project, _, review) = setup_focused_evidence_fixture(
+        &tmp,
+        "verification-slow",
+        "tests",
+        "Verdict: fail\nEvidence-Command: python3 -c 'import os,time; p=os.environ[\"FLUENT_EVIDENCE_SCRATCH\"]; open(p+\"/started\",\"w\").close(); [time.sleep(.02) for _ in range(750) if not os.path.exists(p+\"/release\")]'\nEvidence-Working-Directory: .\n",
+    );
+    let (_, _, peer_review) = create_focused_evidence_item(
+        project.clone(),
+        "verification-peer",
+        "tests",
+        "Verdict: fail\nEvidence-Command: printf peer-progress\nEvidence-Working-Directory: .\n",
+    );
+    let bin = tmp.path().join("verification-bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "verification-slow",
+            "attempt-1",
+            "--review-artifact",
+            &review,
+        ])
+        .assert()
+        .success();
+    let mut worker = Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "verification-slow",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let scratch = project.join(
+        ".fluent/work/artifacts/verification-slow/attempt-1/attempt-1-verification-1/scratch",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !scratch.join("started").exists() && std::time::Instant::now() < deadline {
+        assert!(
+            worker.try_wait().unwrap().is_none(),
+            "verification exited before reaching the barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(scratch.join("started").exists());
+    // Scheduling takes the real project landing lock; command timeout catches a regression.
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .current_dir(&project)
+        .timeout(std::time::Duration::from_secs(3))
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            "verification-peer",
+            "attempt-1",
+            "--review-artifact",
+            &peer_review,
+        ])
+        .assert()
+        .success();
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .current_dir(&project)
+        .timeout(std::time::Duration::from_secs(3))
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args([
+            "task",
+            "run",
+            "verification-peer",
+            "attempt-1",
+            "attempt-1-verification-1",
+        ])
+        .assert()
+        .success();
+    accept_focused_verification(&project, "verification-peer").unwrap();
+    assert_eq!(
+        work_item_value(&project, "verification-peer")["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        worker.try_wait().unwrap().is_none(),
+        "peer progressed before the slow verification finished"
+    );
+    fs::write(scratch.join("release"), "release").unwrap();
+    assert!(worker.wait().unwrap().success());
 }
