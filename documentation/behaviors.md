@@ -30,36 +30,100 @@ WHEN the dashboard receives navigation, view, help, copy, or refresh input,
 THE SYSTEM SHALL not modify stored Work state.
 Test: src/dashboard/tests.rs (dashboard_controls_leave_work_state_unchanged)
 
-## Read-only Work observation
+## Read-only Work snapshots
 
 ### B1
 
-WHEN status or dashboard loads Work, THE SYSTEM SHALL preserve all Work files
-and directory entries, including legacy artifact references and execution
-identity locks. An absent identity lock SHALL mean the Task is not live.
+WHEN `fluent status` or `fluent dashboard` loads stored Work,
+THE SYSTEM SHALL leave all files and directories under `.fluent/work`
+byte-for-byte and entry-for-entry unchanged.
 Test: tests/work_model_external.rs (status_snapshot_is_nonmutating)
 Test: src/dashboard/tests.rs (dashboard_snapshot_is_nonmutating)
-Test: src/execution.rs (liveness_probe_does_not_create_identity_lock)
-Test: src/execution.rs (liveness_probe_observes_existing_held_identity_lock)
 
 ### B2
 
-WHEN a transaction is pending, THE SYSTEM SHALL display the readable published
-Work Item and report pending host-owned recovery without applying the journal.
-Failures in another item, split record, or journal SHALL leave valid items visible.
+WHEN a pending Work transaction exists during a status or dashboard load,
+THE SYSTEM SHALL display the last published Work Item when it can be read
+consistently and report pending host-owned recovery without applying or deleting
+the journal.
 Test: tests/work_model_external.rs (snapshot_reports_pending_transaction_without_recovery)
-Test: tests/work_model_external.rs (snapshot_isolates_item_and_transaction_errors)
+Test: src/work_model.rs (snapshot_reads_unchanged_children_with_pending_transaction)
+Test: src/work_model.rs (snapshot_rejects_interrupted_child_publication)
 
 ### B3
 
-WHEN Fluent writes a Work Item, THE SYSTEM SHALL encode a validated writer
-envelope that the published v0.3.0 reader rejects before mutation. Current Fluent
-SHALL continue to read legacy writer strings without rewriting them during
-observation and preserve current fields and revision checks on mutation.
+WHEN a legacy artifact path is present during a status or dashboard load,
+THE SYSTEM SHALL resolve status from the stored path without moving the artifact
+or rewriting the record.
+Test: tests/work_model_external.rs (snapshot_does_not_migrate_legacy_artifacts)
+
+### B4
+
+IF one Work Item, split record, or pending transaction cannot be read safely,
+THEN THE SYSTEM SHALL keep other valid Work Items visible and include a bounded
+diagnostic for the unreadable item.
+Test: tests/work_model_external.rs (snapshot_isolates_item_and_transaction_errors)
+Test: src/work_model.rs (snapshot_retries_publication_between_root_and_children)
+Test: src/work_model.rs (snapshot_defers_legacy_journal_without_base_proof)
+
+## Read-only execution liveness
+
+### B1
+
+WHEN status or dashboard checks a running Task whose execution identity lock is absent,
+THE SYSTEM SHALL report the execution as not live without creating the lock or
+its parent directory.
+Test: src/execution.rs (liveness_probe_does_not_create_identity_lock)
+
+### B2
+
+WHEN an existing execution identity lock is held by the recorded process tree,
+THE SYSTEM SHALL report the execution as live using a read-only open of that lock.
+Test: src/execution.rs (liveness_probe_observes_existing_held_identity_lock)
+
+## Explicit maintenance ownership
+
+### B1
+
+WHEN an authorized lifecycle mutation begins for a Work Item with a valid pending transaction,
+THE SYSTEM SHALL recover that transaction under the Work Item model lock before
+applying the new mutation.
+Test: src/work_model.rs (mutating_boundary_recovers_pending_transaction)
+
+### B2
+
+WHEN the operator runs `fluent work-item upgrade` for a legacy artifact path,
+THE SYSTEM SHALL perform and audit the required format and artifact migration.
+Test: src/work_model.rs (explicit_upgrade_owns_legacy_artifact_migration)
+
+## Published-reader compatibility fence
+
+### B1
+
+WHEN current Fluent writes a Work Item split record,
+THE SYSTEM SHALL encode a validated writer envelope that the published v0.3.0
+Work Item deserializer cannot accept.
 Test: tests/work_model_external.rs (current_record_has_old_reader_wire_fence)
+
+### B2
+
+WHEN current Fluent reads a legacy v0.3.0 Work Item with the original writer-version string,
+THE SYSTEM SHALL preserve that Work Item without rewriting it during read-only observation.
 Test: tests/work_model_external.rs (current_reader_accepts_legacy_writer_string_without_rewrite)
-Test: tests/work_model_external.rs (current_reader_round_trips_fenced_record)
+
+### B3
+
+WHEN the published v0.3.0 binary attempts a mutating command on a Work Item written by current Fluent,
+THE SYSTEM SHALL make the older command fail before changing any Work Item,
+Attempt, Task, Merge Candidate, journal, or artifact.
 Test: tests/behaviors/operations/test-work-model-old-reader-fence.sh
+
+### B4
+
+WHEN current Fluent mutates its own fenced record,
+THE SYSTEM SHALL preserve current fields and normal optimistic revision and
+transaction behavior.
+Test: tests/work_model_external.rs (current_reader_round_trips_fenced_record)
 
 ## Local execution recovery
 
@@ -3475,10 +3539,7 @@ THE SYSTEM SHALL expose those references under
 `.fluent/work/artifacts/<work-item-id>/<attempt-id>/...` and move
 existing older artifacts into that namespace when no namespaced artifact
 already exists.
-Status and dashboard preserve the stored references without moving artifacts.
-The explicit upgrade records each converted path in its audit.
 Test: src/work_model.rs (explicit_upgrade_owns_legacy_artifact_migration)
-Test: tests/work_model_external.rs (snapshot_does_not_migrate_legacy_artifacts)
 
 ### B5
 

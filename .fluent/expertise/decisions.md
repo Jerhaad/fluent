@@ -229,3 +229,16 @@ No ordinary resume command makes that recovery eligible again. At classified
 recovery terminal completion, the host may supersede exactly one historical
 failed output-free Writer that the classification replaced; it preserves that
 Writer as immutable history and never grants a second Writer through replay.
+
+---
+
+## Dashboard observation owns no durable transition cursor
+
+Status and dashboard must leave the Work tree unchanged. Dashboard refresh
+therefore derives its latest-transition view in memory from the same verified
+published Work snapshot as its rows. The Work transition ledger owns the durable
+history; dashboard observation owns no cursor, acknowledgement, or persisted
+projection. Restarting the dashboard reconstructs this view from that ledger.
+Do not restore writes to `transition-projection.json` during observation. Other
+consumers that deliver durable effects, such as Slack, keep their own cursor
+ownership independently of the dashboard.
