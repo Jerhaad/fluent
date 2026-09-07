@@ -242,3 +242,22 @@ projection. Restarting the dashboard reconstructs this view from that ledger.
 Do not restore writes to `transition-projection.json` during observation. Other
 consumers that deliver durable effects, such as Slack, keep their own cursor
 ownership independently of the dashboard.
+
+---
+
+## Verify pending Work snapshots before observation
+
+New Work transaction journals persist `base_children_digest` to prove that stored
+Attempts, Tasks, and Merge Candidates still belong to the published base root.
+Read-only observation checks stable root and journal values around child assembly.
+While a journal remains, the stored children must match that base digest or, once
+the target root publishes, the target children. An unreadable journal or child
+collection cannot establish absence or consistency.
+
+Keep the digest optional when decoding legacy journals so lifecycle mutations
+can still recover them under the model lock. Observation withholds a legacy
+pending aggregate when it lacks the required proof, reports a bounded diagnostic,
+and leaves recovery to its owner. It must neither recover the journal nor use its
+contents as a replacement snapshot. Preserve this compatibility distinction when
+changing journal writers or readers; see
+[Serialize aggregate Work writes](work-model/patterns/serialize-aggregate-work-writes.md).
