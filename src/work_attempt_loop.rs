@@ -3253,7 +3253,8 @@ fn acquire_learner_provider_capacity(
             .iter()
             .find(|attempt| attempt.id == attempt_id)
             .is_some_and(|attempt| {
-                attempt.status == AttemptStatus::Complete
+                !attempt.cancellation_requested()
+                    && attempt.status == AttemptStatus::Complete
                     && attempt.review_state == Some(AttemptReviewState::Passed)
                     && attempt.coder_mapping.for_task_kind(TaskKind::Write).coder == coder
                     && attempt.learning.as_ref().is_none_or(|learning| {

@@ -42,6 +42,17 @@ until the runner exits. Require both runner and cancellation to exit within a
 bounded wait, and assert that neither the next command nor the extractor wrote
 its launch marker. This barrier exercises the gap without production test hooks.
 
+To cancel during Learner provider-capacity waiting, persist a reviewed pending
+candidate and occupy every configured provider slot using the same advisory
+leases as admission. Keep shared slot files under the project's hermetic
+`test-user-provider-admission` root; do not contend with the operator's pool.
+Wait for the real capacity-wait diagnostic and verify the Learner lease is held
+before issuing one CLI cancellation. Observe both CLI exits and Learner lease
+release while every provider lease is still held. Assert settled cancellation,
+no Learning reservation or child launch, and unchanged candidate bytes before
+releasing the fixture's capacity. This proves that the wait itself observes the
+stop; releasing slots or dropping cleanup guards cannot satisfy the test.
+
 To cancel before the first Task reservation, implement an `AttemptRunner` fixture
 that signals readiness and waits on a bounded channel before invoking the real
 Attempt CLI with its dispatch ID. Drive it through `scheduler::dispatch_one`;
@@ -77,3 +88,7 @@ barrier and a real CLI child to check startup and fresh recovery authority.
 
 `src/work_task_executor.rs::attempt_stop_blocks_reserved_peer_while_another_worker_settles`
 covers the interval before cancellation visits the reserved peer's own record.
+
+`attempt_cancel_settles_learner_waiting_for_provider_capacity` holds all provider
+slots through the cancellation assertions and checks the Complete-state stop
+before any Learner execution identity or Learning run can be reserved.

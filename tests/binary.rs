@@ -39128,6 +39128,164 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
 }
 
 #[test]
+fn attempt_cancel_settles_learner_waiting_for_provider_capacity() {
+    use fluent::{lease, work_model::*};
+
+    let tmp = TempDir::new().unwrap();
+    let work = format!(
+        "cancel-capacity-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    let (project, candidate, _) =
+        create_focused_evidence_item(setup_git_project(&tmp), &work, "tests", "Verdict: pass\n");
+    fs::write(
+        project.join(".fluent/config.yaml"),
+        "providers:\n  project-concurrency:\n    claude: 1\n",
+    )
+    .unwrap();
+    let store = WorkModelStore::new(&project);
+    let _workspace = bind_candidate_to_managed_sibling(&project, &work, &candidate);
+    let before = store
+        .mutate_work_item(&work, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::Complete;
+            attempt.review_state = Some(AttemptReviewState::Passed);
+            attempt.pause_kind = None;
+            attempt.coder_mapping.write.coder = fluent::coder::CoderKind::Claude;
+            item.create_or_get_merge_candidate("attempt-1")?;
+            Ok(item.clone())
+        })
+        .unwrap();
+    let candidate_path = store
+        .work_merge_candidate_path(&work, &before.merge_candidates[0].id)
+        .unwrap();
+    let candidate_bytes = fs::read(&candidate_path).unwrap();
+    let writer_area = project.join(
+        &before.attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    fs::create_dir_all(&writer_area).unwrap();
+    fs::write(
+        writer_area.join("transcript.jsonl"),
+        "completed Writer fixture",
+    )
+    .unwrap();
+
+    // Exhaust this project's configured capacity. The child uses this same
+    // isolated user root through FLUENT_TEST_HERMETIC_PROVIDERS.
+    let user_root = project.join(".fluent/work/test-user-provider-admission");
+    let limits = fluent::config::resolve_provider_admission_config(&project, "claude").unwrap();
+    assert_eq!(limits.project_concurrency.value, 1);
+    let mut capacity_paths = (0..limits.shared_concurrency.value)
+        .map(|slot| {
+            user_root
+                .join("provider-admission/claude")
+                .join(format!("{slot}.lock"))
+        })
+        .collect::<Vec<_>>();
+    capacity_paths.push(project.join(".fluent/work/provider-admission/claude/0.lock"));
+    let held = capacity_paths
+        .iter()
+        .map(|path| lease::acquire(path).unwrap())
+        .collect::<Vec<_>>();
+    let bin = tmp.path().join("bin");
+    let launched = tmp.path().join("learner-launched");
+    write_mock_claude(
+        &bin,
+        &format!("#!/bin/bash\ntouch '{}'\nexit 1\n", launched.display()),
+    );
+    let diagnostics = tmp.path().join("learner.log");
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+    command
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", &work, "attempt-1", "--no-sandbox"])
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&diagnostics).unwrap());
+    let mut runner = OwnedFixtureProcess::spawn(&mut command);
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || {
+            assert!(
+                runner.try_wait().unwrap().is_none(),
+                "Learner exited before its capacity wait: {}",
+                fs::read_to_string(&diagnostics).unwrap()
+            );
+            fs::read_to_string(&diagnostics)
+                .unwrap()
+                .contains("Learner waiting for claude provider capacity")
+        }),
+        "Learner must reach the capacity wait: {}",
+        fs::read_to_string(&diagnostics).unwrap()
+    );
+    let learner_lock = fluent::lease::learner_lock_path(&project, &work, "attempt-1");
+    assert!(fluent::lease::is_leased(&learner_lock));
+    assert!(!launched.exists());
+
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+    command
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["attempt", "cancel", &work, "attempt-1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(tmp.path().join("cancel.log")).unwrap());
+    let mut cancel = OwnedFixtureProcess::spawn(&mut command);
+    // Observe both CLI exits and lease release before any guard or provider slot
+    // can be dropped. Releasing capacity must never be what settles cancellation.
+    assert!(
+        poll_until(std::time::Duration::from_secs(5), || {
+            let cancel_done = cancel.try_wait().unwrap().is_some_and(|status| {
+                assert!(
+                    status.success(),
+                    "cancellation must succeed: {}",
+                    fs::read_to_string(tmp.path().join("cancel.log")).unwrap()
+                );
+                true
+            });
+            let runner_done = runner.try_wait().unwrap().is_some();
+            cancel_done && runner_done && !fluent::lease::is_leased(&learner_lock)
+        }),
+        "cancellation and Learner must settle while provider capacity remains occupied"
+    );
+    assert!(
+        capacity_paths.iter().all(|path| lease::is_leased(path)),
+        "all configured provider slots remain held after cancellation settles"
+    );
+    let stopped = store.read_work_item(&work).unwrap();
+    let attempt = &stopped.attempts[0];
+    assert_eq!(attempt.status, AttemptStatus::Complete);
+    assert_eq!(attempt.pause_kind, None);
+    let stop = attempt.cancellation.as_ref().unwrap();
+    assert!(stop.settled_at.is_some());
+    assert!(stop.resumed_at.is_none());
+    assert!(
+        attempt.learning.is_none(),
+        "capacity waiting must not reserve Learning"
+    );
+    assert!(
+        attempt
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.producer_id != "local-execution")
+    );
+    assert_eq!(attempt.tasks, before.attempts[0].tasks);
+    assert_eq!(stopped.merge_candidates, before.merge_candidates);
+    assert_eq!(fs::read(&candidate_path).unwrap(), candidate_bytes);
+    assert!(
+        stopped.merge_candidates[0]
+            .validate_advancement(&stopped)
+            .is_err()
+    );
+    assert!(!launched.exists(), "no Learner child may launch");
+    drop(held);
+}
+
+#[test]
 fn attempt_cancel_between_tester_commands_blocks_next_child() {
     cancel_tester_at_settled_command_boundary(true);
 }

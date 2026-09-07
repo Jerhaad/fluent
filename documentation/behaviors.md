@@ -112,6 +112,7 @@ succeeded Learning before advancement.
 Test: src/work_model.rs (canceled_pending_candidate_stays_valid_but_cannot_advance)
 Test: src/work_attempt_loop.rs (canceled_pending_candidate_resumes_reviewed_state)
 Test: tests/binary.rs (attempt_cancel_stops_each_stage_without_downstream_launch)
+Test: tests/binary.rs (attempt_cancel_settles_learner_waiting_for_provider_capacity)
 Test: tests/binary.rs (attempt_cancel_between_tester_commands_blocks_next_child, attempt_cancel_between_tester_command_and_extractor_blocks_next_child)
 
 ### B4

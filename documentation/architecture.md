@@ -890,8 +890,10 @@ checkout. Before a Writer or reviewer reserves its Task, and before a Learner
 records an in-progress run, it acquires one provider-scoped user lease and one
 project lease. The user lease bounds all Fluent processes and projects that use
 the same provider; the project lease can impose a lower local ceiling. Waiting
-leaves the Task planned or the Learner unreserved. The lease spans the complete
-logical role run, including provider recovery, generic Task retries, and Learner
+leaves the Task planned or the Learner unreserved. Learner capacity waiting
+rechecks active cancellation even while its reviewed Attempt stays Complete;
+it exits and releases the Learner lease so cancellation can settle while provider
+slots remain occupied. The provider lease spans the complete logical role run, including provider recovery, generic Task retries, and Learner
 schema repairs, and drops on success, failure, cancellation, or process exit.
 Different providers use independent pools, so unavailable Claude capacity does
 not serialize Codex work.
