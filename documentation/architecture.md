@@ -3247,6 +3247,7 @@ fluent/main/
     update.rs                ← Self-update and update-check nudge
     usage.rs                 ← Per-turn usage row logging and summary cache
     verification.rs          ← Execute approved verification Tasks and validate receipts
+    verification_policy.rs   ← Share checker identity and bounded-log policy
     version.rs               ← Version command output format
     work_attempt_loop.rs     ← Advance one Work model Attempt
     work_merge_executor.rs   ← Execute Work Merge Candidates
@@ -3337,7 +3338,10 @@ the CLI, Work model, and git helpers.
 
 `host_evidence.rs` validates operator authorization and persists verification
 Tasks. `verification.rs` executes their confined checks and validates immutable
-receipts. `work_task_executor.rs` owns reservation and Task settlement;
+receipts using the execution and attachment primitives in `host_evidence.rs`.
+Both modules consume checker hashing, sandbox identity, and log-size limits from
+`verification_policy.rs`; that shared contract depends on neither caller.
+`work_task_executor.rs` owns reservation and Task settlement;
 `work_attempt_loop.rs` accepts the receipt and advances targeted evidence review.
 `execution.rs` serializes child launch with cancellation across coder and
 non-coder workers. These modules reuse Work model, lease, sandbox, and evidence

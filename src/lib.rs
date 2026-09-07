@@ -82,3 +82,4 @@ pub mod usage;
 pub mod ownership_recovery;
 
 pub mod verification;
+pub(crate) mod verification_policy;

@@ -284,3 +284,16 @@ and leaves recovery to its owner. It must neither recover the journal nor use it
 contents as a replacement snapshot. Preserve this compatibility distinction when
 changing journal writers or readers; see
 [Serialize aggregate Work writes](work-model/patterns/serialize-aggregate-work-writes.md).
+
+---
+
+## Share verification policy below admission and execution
+
+`verification_policy` owns checker digests, sandbox-content identity, and the
+bounded-log limit shared by `host_evidence` admission and `verification` workers.
+It depends only on content resolution and hashing. Neither admission nor worker
+execution belongs in this neutral contract. `verification` may reuse confined
+execution and attachment primitives in `host_evidence`; `host_evidence` must not
+depend back on `verification`. Both continue to use the shared `execution`
+supervisor for process ownership and cancellation. This keeps policy consistent
+without making admission and worker orchestration depend on each other.

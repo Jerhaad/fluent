@@ -2,27 +2,16 @@
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{fs, path::Path, time::Duration};
 
-use crate::{content::ContentResolver, host_evidence, work_model::*};
+use crate::{
+    content::ContentResolver,
+    host_evidence,
+    verification_policy::{MAX_LOG_BYTES, digest, sandbox_digest},
+    work_model::*,
+};
 
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
-pub(crate) const MAX_LOG_BYTES: u64 = 384 * 1024;
-
-pub(crate) fn digest(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
-}
-
-pub(crate) fn sandbox_digest(resolver: &ContentResolver) -> Result<String> {
-    Ok(digest(
-        resolver
-            .resolve_content("sandbox/common.sb")
-            .context("verification checker requires common sandbox definition")?
-            .as_bytes(),
-    ))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationReceipt {

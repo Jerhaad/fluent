@@ -802,15 +802,15 @@ pub fn run_focused(
         command: command.clone(),
         working_directory: working_directory.clone(),
         timeout_seconds,
-        sandbox_digest: crate::verification::sandbox_digest(resolver)?,
+        sandbox_digest: crate::verification_policy::sandbox_digest(resolver)?,
     };
     let context = work_model::VerificationContext {
         candidate_commit: candidate_commit.clone(),
-        checker_digest: crate::verification::digest(&serde_json::to_vec(&checker)?),
+        checker_digest: crate::verification_policy::digest(&serde_json::to_vec(&checker)?),
         checker,
         review_artifact: BoundRecheckArtifact {
             path: review_artifact.to_string(),
-            digest: crate::verification::digest(review_content.as_bytes()),
+            digest: crate::verification_policy::digest(review_content.as_bytes()),
         },
     };
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
@@ -1749,7 +1749,7 @@ fn capture_focused_log(mut source: impl Read, mut target: fs::File) -> Result<()
         if length == 0 {
             break;
         }
-        let keep = length.min((crate::verification::MAX_LOG_BYTES - retained) as usize);
+        let keep = length.min((crate::verification_policy::MAX_LOG_BYTES - retained) as usize);
         target.write_all(&buffer[..keep])?;
         retained += keep as u64;
     }
