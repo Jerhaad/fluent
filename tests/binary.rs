@@ -38526,7 +38526,6 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
 #[test]
 fn attempt_cancel_persists_stop_before_settling_active_execution() {
     use fluent::{execution, work_model::*};
-    use std::os::unix::process::CommandExt;
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let store = WorkModelStore::new(&project);
@@ -38539,50 +38538,67 @@ fn attempt_cancel_persists_stop_before_settling_active_execution() {
     let transcript = area.join("transcript.jsonl");
     item.attempts[0].status = AttemptStatus::Executing;
     store.create_work_item(&item).unwrap();
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "trap '' TERM; printf ready; sleep 30"])
-        .stdout(std::process::Stdio::piped())
-        .process_group(0);
+    let ready = tmp.path().join("ready");
+    let observed = tmp.path().join("signal-observation.json");
+    let release = tmp.path().join("release");
+    let mut command = Command::new("python3");
+    command.args([
+        "-c",
+        r#"
+import json, os, signal, sys, time
+from pathlib import Path
+attempt, ready, observed, release = map(Path, sys.argv[1:])
+
+def on_term(signum, frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    # Read the persisted Attempt when the first signal arrives, before allowing
+    # this worker to exit and release its inherited execution ownership.
+    state = json.loads(attempt.read_text())
+    temporary = observed.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state.get('cancellation')))
+    temporary.replace(observed)
+    deadline = time.monotonic() + 120
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, on_term)
+ready.touch()
+time.sleep(120)
+"#,
+    ])
+        .arg(store.work_attempt_path("cancel-stop", "attempt-1").unwrap())
+        .arg(&ready)
+        .arg(&observed)
+        .arg(&release);
     execution::configure_identity_lock(&mut command, &transcript).unwrap();
-    let mut child = command.spawn().unwrap();
+    let mut child = OwnedFixtureProcess::spawn(&mut command);
     let _heartbeat = execution::ExecutionHeartbeat::start(&transcript, child.id()).unwrap();
-    use std::io::Read;
-    let mut ready = [0; 5];
-    child
-        .stdout
-        .as_mut()
-        .unwrap()
-        .read_exact(&mut ready)
-        .unwrap();
-    let mut cancel = Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+    assert!(poll_until(std::time::Duration::from_secs(3), || ready.is_file()));
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+    command
         .current_dir(&project)
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .args(["attempt", "cancel", "cancel-stop", "attempt-1"])
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut observed = false;
-    for _ in 0..1000 {
-        let shown = store.read_work_item("cancel-stop").unwrap();
-        let value = serde_json::to_value(&shown.attempts[0]).unwrap();
-        if value["cancellation"]["requested_at"].is_string() {
-            observed = true;
-            assert!(
-                cancel.try_wait().unwrap().is_none(),
-                "stop intent precedes settlement"
-            );
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let cancel_result = cancel.wait().unwrap();
-    let _ = child.wait();
-    assert!(
-        observed,
-        "cancellation must be durable before signaling the worker"
-    );
-    assert!(cancel_result.success());
+        .stdout(std::process::Stdio::null());
+    let mut cancel = OwnedFixtureProcess::spawn(&mut command);
+    assert!(poll_until(std::time::Duration::from_secs(8), || observed.is_file()),
+        "worker must observe the first cancellation signal");
+    let at_signal: serde_json::Value =
+        serde_json::from_slice(&fs::read(&observed).unwrap()).unwrap();
+    assert!(at_signal["requested_at"].is_string(),
+        "durable stop must exist when the worker receives its first signal: {at_signal}");
+    assert!(at_signal["settled_at"].is_null());
+    assert!(child.try_wait().unwrap().is_none(), "worker waits at the signal barrier");
+    assert!(cancel.try_wait().unwrap().is_none(), "cancel waits for worker settlement");
+    fs::write(&release, "settle").unwrap();
+    assert!(poll_until(std::time::Duration::from_secs(8), || {
+        cancel.try_wait().unwrap().is_some_and(|status| {
+            assert!(status.success());
+            true
+        })
+    }), "cancel must finish before the fixture's natural lifetime");
+    assert!(poll_until(std::time::Duration::from_secs(2), || child.try_wait().unwrap().is_some()));
     let after = work_item_value(&project, "cancel-stop");
     assert_eq!(after["attempts"][0]["status"], "needs-user");
     assert!(after["attempts"][0]["cancellation"]["settled_at"].is_string());
