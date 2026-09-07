@@ -708,8 +708,31 @@ impl OwnedFixtureProcess {
             .expect("fixture process group must terminate and be reaped");
     }
 
+    // macOS may report EPERM for an exited fixture leader's empty group.
+    // Accept that only after observing the owned child exit; a live same-user
+    // descendant keeps its group signalable and still needs the normal sweep.
+    fn signal_owned_group(&mut self, signal: i32) -> std::io::Result<bool> {
+        let leader_exited = match self.child.as_mut() {
+            Some(child) => child.try_wait()?.is_some(),
+            None => true, // wait_with_output already reaped this owned child.
+        };
+        match signal_fixture_group(self.group, signal) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if cfg!(target_os = "macos")
+                    && leader_exited
+                    && error.raw_os_error() == Some(libc::EPERM) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn terminate_and_wait_result(&mut self) -> std::io::Result<()> {
-        signal_fixture_group(self.group, libc::SIGTERM)?;
+        if !self.signal_owned_group(libc::SIGTERM)? {
+            return Ok(());
+        }
         if let Some(child) = self.child.as_mut() {
             wait_for_fixture_child(child, std::time::Duration::from_secs(2))?;
         }
@@ -720,7 +743,9 @@ impl OwnedFixtureProcess {
             return Ok(());
         }
 
-        signal_fixture_group(self.group, libc::SIGKILL)?;
+        if !self.signal_owned_group(libc::SIGKILL)? {
+            return Ok(());
+        }
         if let Some(child) = self.child.as_mut() {
             child.wait()?;
         }
@@ -38542,9 +38567,10 @@ fn attempt_cancel_persists_stop_before_settling_active_execution() {
     let observed = tmp.path().join("signal-observation.json");
     let release = tmp.path().join("release");
     let mut command = Command::new("python3");
-    command.args([
-        "-c",
-        r#"
+    command
+        .args([
+            "-c",
+            r#"
 import json, os, signal, sys, time
 from pathlib import Path
 attempt, ready, observed, release = map(Path, sys.argv[1:])
@@ -38566,7 +38592,7 @@ signal.signal(signal.SIGTERM, on_term)
 ready.touch()
 time.sleep(120)
 "#,
-    ])
+        ])
         .arg(store.work_attempt_path("cancel-stop", "attempt-1").unwrap())
         .arg(&ready)
         .arg(&observed)
@@ -38582,23 +38608,39 @@ time.sleep(120)
         .args(["attempt", "cancel", "cancel-stop", "attempt-1"])
         .stdout(std::process::Stdio::null());
     let mut cancel = OwnedFixtureProcess::spawn(&mut command);
-    assert!(poll_until(std::time::Duration::from_secs(8), || observed.is_file()),
-        "worker must observe the first cancellation signal");
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || observed.is_file()),
+        "worker must observe the first cancellation signal"
+    );
     let at_signal: serde_json::Value =
         serde_json::from_slice(&fs::read(&observed).unwrap()).unwrap();
-    assert!(at_signal["requested_at"].is_string(),
-        "durable stop must exist when the worker receives its first signal: {at_signal}");
+    assert!(
+        at_signal["requested_at"].is_string(),
+        "durable stop must exist when the worker receives its first signal: {at_signal}"
+    );
     assert!(at_signal["settled_at"].is_null());
-    assert!(child.try_wait().unwrap().is_none(), "worker waits at the signal barrier");
-    assert!(cancel.try_wait().unwrap().is_none(), "cancel waits for worker settlement");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "worker waits at the signal barrier"
+    );
+    assert!(
+        cancel.try_wait().unwrap().is_none(),
+        "cancel waits for worker settlement"
+    );
     fs::write(&release, "settle").unwrap();
-    assert!(poll_until(std::time::Duration::from_secs(8), || {
-        cancel.try_wait().unwrap().is_some_and(|status| {
-            assert!(status.success());
-            true
-        })
-    }), "cancel must finish before the fixture's natural lifetime");
-    assert!(poll_until(std::time::Duration::from_secs(2), || child.try_wait().unwrap().is_some()));
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || {
+            cancel.try_wait().unwrap().is_some_and(|status| {
+                assert!(status.success());
+                true
+            })
+        }),
+        "cancel must finish before the fixture's natural lifetime"
+    );
+    assert!(poll_until(std::time::Duration::from_secs(2), || child
+        .try_wait()
+        .unwrap()
+        .is_some()));
     let after = work_item_value(&project, "cancel-stop");
     assert_eq!(after["attempts"][0]["status"], "needs-user");
     assert!(after["attempts"][0]["cancellation"]["settled_at"].is_string());
@@ -38639,6 +38681,45 @@ fn attempt_cancel_is_idempotent_after_settlement() {
     assert_eq!(store.read_work_item("cancel-idempotent").unwrap(), before);
 }
 
+// Inspect the inherited lock directly: terminal execution metadata cannot prove
+// that the original worker and its descendants released their ownership.
+fn cancellation_fixture_owns_execution(record: &Path) -> bool {
+    use rustix::fs::{FlockOperation, flock};
+    let file = fs::File::open(record.with_file_name("execution-owner.lock")).unwrap();
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            flock(&file, FlockOperation::Unlock).unwrap();
+            false
+        }
+        Err(error) if std::io::Error::from(error).kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(error) => panic!("inspect fixture execution ownership: {error}"),
+    }
+}
+
+// Fluent workers create groups separate from their CLI owner. Keep a guard for
+// the captured group so a failing assertion also cleans up those workers. All
+// settlement assertions run before this guard can signal anything.
+struct CancellationFixtureExecution {
+    record_path: PathBuf,
+    group: i32,
+}
+
+impl Drop for CancellationFixtureExecution {
+    fn drop(&mut self) {
+        if cancellation_fixture_owns_execution(&self.record_path) {
+            signal_fixture_group(self.group, libc::SIGKILL).unwrap();
+            assert!(
+                poll_until(std::time::Duration::from_secs(2), || {
+                    !cancellation_fixture_owns_execution(&self.record_path)
+                }),
+                "fixture group {} must release ownership at {} during cleanup",
+                self.group,
+                self.record_path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn attempt_cancel_stops_each_stage_without_downstream_launch() {
     use fluent::work_model::*;
@@ -38651,8 +38732,11 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
                 &project,
                 ".fluent/tester.yaml",
                 &format!(
-                    "commands:\n  - command: \"touch {}; sleep 30\"\n    test_harness: shell-harness\n",
-                    started.display()
+                    "commands:\n  - command: {}\n    test_harness: shell-harness\n",
+                    serde_json::to_string(&format!(
+                        "sleep 120 & printf '%s %s' \"$$\" \"$!\" > '{}.tmp'; mv '{}.tmp' '{}'; wait",
+                        started.display(), started.display(), started.display()
+                    )).unwrap()
                 ),
                 "Add blocking Tester fixture",
             );
@@ -38665,7 +38749,7 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
             project,
             &id,
             "tests",
-            "Verdict: fail\nEvidence-Command: sh -c 'touch \"$FLUENT_EVIDENCE_SCRATCH/started\"; sleep 30'\nEvidence-Working-Directory: .\n",
+            "Verdict: fail\nEvidence-Command: sh -c 'sleep 120 & printf \"%s %s\" \"$$\" \"$!\" > \"$FLUENT_EVIDENCE_SCRATCH/started.tmp\"; mv \"$FLUENT_EVIDENCE_SCRATCH/started.tmp\" \"$FLUENT_EVIDENCE_SCRATCH/started\"; wait'\nEvidence-Working-Directory: .\n",
         );
         let store = WorkModelStore::new(&project);
         let mut item = store.read_work_item(&id).unwrap();
@@ -38734,7 +38818,9 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
         write_mock_claude(
             &bin,
             &format!(
-                "#!/bin/bash\ntouch {}\nsleep 30 &\nwait\n",
+                "#!/bin/bash\nsleep 120 &\nprintf '%s %s' \"$$\" \"$!\" > '{}.tmp'\nmv '{}.tmp' '{}'\nwait\n",
+                started.display(),
+                started.display(),
                 started.display()
             ),
         );
@@ -38757,6 +38843,7 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
             .stderr(fs::File::create(&diagnostics).unwrap());
         let mut worker = OwnedFixtureProcess::spawn(&mut command);
         let mut record_path = None;
+        let mut execution_cleanup = None;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
         while std::time::Instant::now() < deadline {
             let current = store.read_work_item(&id).unwrap();
@@ -38787,6 +38874,19 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
             record_path = paths
                 .into_iter()
                 .find(|path| fluent::execution::execution_is_live(path).unwrap_or(false));
+            if let Some(path) = &record_path {
+                let record: fluent::execution::ExecutionRecord =
+                    serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                // Baseline/setup commands may precede the target worker in the
+                // same Task artifact area. Track the latest registered group.
+                let cleanup =
+                    execution_cleanup.get_or_insert_with(|| CancellationFixtureExecution {
+                        record_path: path.clone(),
+                        group: record.process_group_id.try_into().unwrap(),
+                    });
+                cleanup.record_path = path.clone();
+                cleanup.group = record.process_group_id.try_into().unwrap();
+            }
             let stage_started = if stage == "verification" {
                 record_path
                     .as_ref()
@@ -38808,13 +38908,81 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
             "{stage} did not publish a live identity: {}",
             fs::read_to_string(&diagnostics).unwrap()
         );
+        let record_path = record_path.unwrap();
+        let record: fluent::execution::ExecutionRecord =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        let marker = if stage == "verification" {
+            record_path.parent().unwrap().join("scratch/started")
+        } else {
+            started
+        };
+        let fixture_pids = fs::read_to_string(marker)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fixture_pids.len(),
+            2,
+            "{stage}: worker and descendant identities"
+        );
+        assert_ne!(
+            fixture_pids[0], fixture_pids[1],
+            "{stage}: separate descendant"
+        );
+        let captured_pids = [record.leader_pid as i32, fixture_pids[0], fixture_pids[1]];
+        for pid in captured_pids {
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                0,
+                "{stage}: process {pid} starts live"
+            );
+            assert_eq!(
+                unsafe { libc::getpgid(pid) },
+                record.process_group_id as i32,
+                "{stage}: process {pid} belongs to the owned execution"
+            );
+        }
+        assert!(cancellation_fixture_owns_execution(&record_path), "{stage}");
         let before = store.read_work_item(&id).unwrap();
-        fluent_cmd()
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+        command
             .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
             .args(["attempt", "cancel", &id, "attempt-1"])
-            .assert()
-            .success();
-        let _ = worker.wait().unwrap();
+            .stdout(std::process::Stdio::null());
+        let mut cancel = OwnedFixtureProcess::spawn(&mut command);
+        assert!(
+            poll_until(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                || {
+                    cancel.try_wait().unwrap().is_some_and(|status| {
+                        assert!(status.success(), "{stage}: cancellation succeeds");
+                        true
+                    })
+                }
+            ),
+            "{stage}: cancellation must settle before the fixture's 120-second lifetime"
+        );
+        assert!(
+            poll_until(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                || { worker.try_wait().unwrap().is_some() }
+            ),
+            "{stage}: Attempt runner must exit within the cancellation deadline"
+        );
+        // These checks precede both fixture guards' cleanup and do not consult
+        // execution state: merely writing Canceled cannot satisfy them.
+        assert!(
+            poll_until(std::time::Duration::from_secs(2), || {
+                captured_pids.iter().all(|pid| {
+                    (unsafe { libc::kill(*pid, 0) }) == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                }) && !cancellation_fixture_owns_execution(&record_path)
+            }),
+            "{stage}: captured processes must be gone and inherited ownership released"
+        );
         let after = store.read_work_item(&id).unwrap();
         assert_eq!(
             after.attempts[0].status,
@@ -38830,10 +38998,6 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
             after.attempts[0].tasks.len(),
             before.attempts[0].tasks.len(),
             "{stage}: no downstream Task"
-        );
-        assert!(
-            !fluent::execution::execution_is_live(&record_path.unwrap()).unwrap(),
-            "{stage}"
         );
         assert!(
             after.attempts[0]

@@ -73,3 +73,5 @@ real profile-enforcement tests on the explicit host probe.
 - [observe-sandboxed-learner-via-transcript](testing/patterns/observe-sandboxed-learner-via-transcript.md) — read when a binary test drives a sandboxed handoff-only Learner and needs to observe its run count, prompt, or commit, which it cannot record in shared-temp files.
 - [reproduce-console-pipe-pressure](testing/patterns/reproduce-console-pipe-pressure.md) — read when a binary test must prove an unread or saturated writer console cannot stall transcript capture.
 - [stateful-fake-cli-for-orchestration-tests](testing/patterns/stateful-fake-cli-for-orchestration-tests.md) — read when testing an operator shell script that sequences `fluent` commands and must be verified without a model, network, or the real home.
+
+- [verify-cancellation-before-fixture-cleanup](testing/patterns/verify-cancellation-before-fixture-cleanup.md) — read when proving that cancellation stops worker processes before fixture cleanup.
