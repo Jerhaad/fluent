@@ -74,4 +74,4 @@ real profile-enforcement tests on the explicit host probe.
 - [reproduce-console-pipe-pressure](testing/patterns/reproduce-console-pipe-pressure.md) — read when a binary test must prove an unread or saturated writer console cannot stall transcript capture.
 - [stateful-fake-cli-for-orchestration-tests](testing/patterns/stateful-fake-cli-for-orchestration-tests.md) — read when testing an operator shell script that sequences `fluent` commands and must be verified without a model, network, or the real home.
 
-- [verify-cancellation-before-fixture-cleanup](testing/patterns/verify-cancellation-before-fixture-cleanup.md) — read when proving that cancellation stops workers before fixture cleanup or blocks launches during scheduler startup or between Tester children.
+- [verify-cancellation-before-fixture-cleanup](testing/patterns/verify-cancellation-before-fixture-cleanup.md) — read when verifying cancellation during setup, child launch, or process settlement.

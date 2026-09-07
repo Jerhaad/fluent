@@ -50,6 +50,16 @@ stop with all Tasks still planned. Release the channel and require the exact sto
 to remain, no worker launch marker, and a `needs-user` dispatch. Follow with a new
 public queue resume and require its worker marker as a positive control.
 
+To verify the shared Attempt stop during parallel setup, reserve two reviewers
+through the real Task reservation boundary and retain both Task leases. Start A
+with a SIGTERM handler that announces termination and waits for release; hold B
+on a channel immediately before `execution::output`. Cancel the Attempt, wait
+for A's handler, and confirm durable intent while B's record still says
+`launching`. Release B and require a rejected launch and no marker while A still
+holds its execution identity. Only then release A and observe final settlement.
+Bound the worker's natural lifetime and channel waits so failed assertions also
+unwind without leaking a worker.
+
 ## Example
 
 `tests/binary.rs::attempt_cancel_stops_each_stage_without_downstream_launch`
@@ -64,3 +74,6 @@ FIFO barrier to verify both transitions after a naturally settled Tester child.
 
 `attempt_cancel_during_scheduler_startup_blocks_delayed_launch` uses the channel
 barrier and a real CLI child to check startup and fresh recovery authority.
+
+`src/work_task_executor.rs::attempt_stop_blocks_reserved_peer_while_another_worker_settles`
+covers the interval before cancellation visits the reserved peer's own record.

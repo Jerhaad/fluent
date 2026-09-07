@@ -942,12 +942,20 @@ the managed `needs-user.md` atomically and reports recovery only after that writ
 succeeds. The loop reloads stored state before deciding the next transition.
 
 `execution.rs` publishes a `launching` execution identity beside the Task
-transcript before the Task becomes `executing`. Its shared spawn boundary checks
-for cancellation and publishes the child identity under the same execution lock.
+transcript before the Task becomes `executing`. Task and Learner reservations
+bind that record to the owning project, Work Item, and Attempt. The shared spawn
+boundary takes the Work model lock before the execution lock, checks the durable
+Attempt stop, and holds both through child creation and identity publication.
+It releases both before waiting for the worker or settling a failed launch.
+Thus a reserved peer cannot start while cancellation is still settling another
+worker, even if its own execution record has not yet been marked `canceled`.
 The process tree holds an inherited `execution-owner.lock`; `execution.json`
 records the owner, leader, process group, heartbeat, and terminal state. Nested
 Tester commands belong to their Task, and Learner executions register their
 identities before entering `in-progress`.
+Command transitions and heartbeat updates preserve the Attempt binding. Legacy
+records without it remain readable; new Task and Learner reservations always
+publish it before execution.
 Cancellation marks even a naturally `settled` child record as `canceled`, so the
 next command or extractor in the same Task cannot launch. Only a new reservation
 admitted by the Work model after explicit resume can clear that stop.

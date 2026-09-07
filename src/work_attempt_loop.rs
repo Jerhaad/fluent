@@ -3140,11 +3140,17 @@ fn run_learner_step(
         {
             let record =
                 crate::execution::record_path_for_transcript(&directory.join("transcript.jsonl"));
-            crate::execution::prepare_launch(&record).map_err(|error| {
-                WorkModelError::AttemptResumeIneligible {
+            crate::execution::prepare_launch(
+                &record,
+                Some(crate::execution::AttemptExecutionOwner {
+                    project_root: project_root.to_path_buf(),
+                    work_item_id: work_item_id.clone(),
                     attempt_id: attempt_id.clone(),
-                    reason: format!("publish Learner execution identity: {error:#}"),
-                }
+                }),
+            )
+            .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.clone(),
+                reason: format!("publish Learner execution identity: {error:#}"),
             })?;
             let relative = record.strip_prefix(project_root).map_err(|error| {
                 WorkModelError::AttemptResumeIneligible {

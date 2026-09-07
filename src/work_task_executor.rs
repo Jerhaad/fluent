@@ -471,8 +471,17 @@ fn reserve_task_start_with_coder(
             return Ok(Decision::Rejected);
         }
         if let Some(area) = &item.attempts[attempt_index].tasks[task_index].artifact_area {
-            let path = resolve_managed_artifact_area_path(project_root, &area.path)
-                .and_then(|area| crate::execution::prepare_launch(&area.join("transcript.jsonl")));
+            let path =
+                resolve_managed_artifact_area_path(project_root, &area.path).and_then(|area| {
+                    crate::execution::prepare_launch(
+                        &area.join("transcript.jsonl"),
+                        Some(crate::execution::AttemptExecutionOwner {
+                            project_root: project_root.to_path_buf(),
+                            work_item_id: work_item_id.into(),
+                            attempt_id: attempt_id.into(),
+                        }),
+                    )
+                });
             path.map_err(|error| WorkModelError::AttemptResumeIneligible {
                 attempt_id: attempt_id.into(),
                 reason: format!("publish local execution identity: {error:#}"),
@@ -15594,6 +15603,153 @@ mod tests {
                 .unwrap()
                 .status,
             TaskStatus::NeedsUser
+        );
+    }
+
+    #[test]
+    fn attempt_stop_blocks_reserved_peer_while_another_worker_settles() {
+        use crate::execution::{self, ExecutionRecord, ExecutionState};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let store = WorkModelStore::new(root);
+        let mut item = review_item();
+        item.add_review_tasks("attempt-1", &["behaviors"]).unwrap();
+        store.create_work_item(&item).unwrap();
+        let reserve = |task: &str| {
+            reserve_task_start(
+                root,
+                &store,
+                "work-1",
+                "attempt-1",
+                task,
+                TaskKind::Review,
+                AttemptStatus::Reviewing,
+                CoderKind::Claude,
+            )
+            .unwrap()
+        };
+        let a = reserve("attempt-1-review-tests");
+        let b = reserve("attempt-1-review-behaviors");
+        let a_transcript = root
+            .join(&a.task.artifact_area.unwrap().path)
+            .join("transcript.jsonl");
+        let b_transcript = root
+            .join(&b.task.artifact_area.unwrap().path)
+            .join("transcript.jsonl");
+        let a_record = execution::record_path_for_transcript(&a_transcript);
+        let b_record = execution::record_path_for_transcript(&b_transcript);
+        let a_ready = root.join("a-ready");
+        let a_stopping = root.join("a-stopping");
+        let a_release = root.join("a-release");
+        let b_marker = root.join("b-started");
+        let wait_for = |path: &Path, timeout: Duration| {
+            let deadline = Instant::now() + timeout;
+            while !path.is_file() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(path.is_file(), "fixture barrier {}", path.display());
+        };
+        let a_lease =
+            crate::lease::acquire(&crate::lease::task_lock_path(root, "work-1", &a.task.id))
+                .unwrap();
+        let b_lease =
+            crate::lease::acquire(&crate::lease::task_lock_path(root, "work-1", &b.task.id))
+                .unwrap();
+        std::thread::scope(|scope| {
+            let a_worker = scope.spawn(|| {
+                let _lease = a_lease;
+                let mut command = std::process::Command::new("python3");
+                command
+                    .args([
+                        "-c",
+                        r#"
+import pathlib, signal, sys, time
+ready, stopping, release = map(pathlib.Path, sys.argv[1:])
+deadline = time.monotonic() + 10
+def stop(*_):
+    stopping.touch()
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(.005)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+ready.touch()
+while time.monotonic() < deadline:
+    time.sleep(.005)
+"#,
+                    ])
+                    .arg(&a_ready)
+                    .arg(&a_stopping)
+                    .arg(&a_release);
+                execution::output(&mut command, &a_transcript)
+            });
+            let (release_b, wait_b) = mpsc::channel();
+            let b_worker = scope.spawn({
+                let b_marker = &b_marker;
+                let b_transcript = &b_transcript;
+                move || {
+                    let _lease = b_lease;
+                    wait_b.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let mut command = std::process::Command::new("touch");
+                    command.arg(&b_marker);
+                    execution::output(&mut command, &b_transcript)
+                }
+            });
+            wait_for(&a_ready, Duration::from_secs(5));
+            let cancel = scope.spawn(|| {
+                crate::work_attempt_loop::cancel_local_attempt(root, &store, "work-1", "attempt-1")
+            });
+            wait_for(&a_stopping, Duration::from_secs(1));
+            let stopped = store.read_work_item("work-1").unwrap();
+            assert!(stopped.attempts[0].cancellation_requested());
+            assert!(
+                stopped.attempts[0]
+                    .cancellation
+                    .as_ref()
+                    .unwrap()
+                    .settled_at
+                    .is_none()
+            );
+            assert_eq!(
+                serde_json::from_slice::<ExecutionRecord>(&fs::read(&b_record).unwrap())
+                    .unwrap()
+                    .state,
+                ExecutionState::Launching,
+                "cancellation has not visited B yet"
+            );
+            release_b.send(()).unwrap();
+            let result = b_worker.join().unwrap();
+            assert!(
+                execution::execution_is_live(&a_record).unwrap(),
+                "A must still hold its execution identity at the termination barrier"
+            );
+            assert!(
+                result.is_err(),
+                "the shared stop must reject B before cancellation visits its record"
+            );
+            assert!(
+                !b_marker.exists(),
+                "B must never start after the Attempt stop commits"
+            );
+            fs::write(&a_release, b"release").unwrap();
+            a_worker.join().unwrap().unwrap();
+            cancel.join().unwrap().unwrap();
+        });
+        assert!(!execution::execution_is_live(&a_record).unwrap());
+        let stopped = store.read_work_item("work-1").unwrap();
+        assert!(
+            stopped.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .settled_at
+                .is_some()
+        );
+        assert_eq!(
+            stopped.attempts[0].pause_kind,
+            Some(crate::work_model::PauseKind::Interrupted)
         );
     }
 

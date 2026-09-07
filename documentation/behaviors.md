@@ -83,6 +83,7 @@ new Task, review phase, Tester, verification, or Learner launch for that Attempt
 then stop and settle every already-owned local execution.
 Test: tests/binary.rs (attempt_cancel_persists_stop_before_settling_active_execution)
 Test: tests/binary.rs (attempt_cancel_during_scheduler_startup_blocks_delayed_launch)
+Test: src/work_task_executor.rs (attempt_stop_blocks_reserved_peer_while_another_worker_settles)
 
 ### B2
 
@@ -94,6 +95,7 @@ Test: src/work_task_executor.rs (task_execution_identity_precedes_executing_stat
 Test: src/execution.rs (cancel_settled_execution_blocks_later_children_until_reservation)
 Test: src/work_attempt_loop.rs (canceled_attempt_startup_requires_resume_authorization, cancellation_resume_authority_rejects_a_later_stop)
 Test: src/queue.rs (resume_records_exact_cancellation_authority)
+Test: src/execution.rs (attempt_owner_survives_commands_and_heartbeat, owned_launch_rejects_a_missing_attempt)
 
 ### B3
 

@@ -31,6 +31,16 @@ pub struct ExecutionRecord {
     pub heartbeat_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_owner: Option<AttemptExecutionOwner>,
+}
+
+/// Bind every child in this execution to the Attempt's durable stop boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptExecutionOwner {
+    pub project_root: PathBuf,
+    pub work_item_id: String,
+    pub attempt_id: String,
 }
 
 fn lock_path(path: &Path) -> PathBuf {
@@ -210,7 +220,10 @@ pub fn configure_identity_lock(_command: &mut Command, _transcript: &Path) -> Re
 
 /// Publish a cancellable owner before the Task becomes visibly executing.
 /// The caller holds its Work Item mutation boundary through reservation.
-pub(crate) fn prepare_launch(transcript: &Path) -> Result<()> {
+pub(crate) fn prepare_launch(
+    transcript: &Path,
+    attempt_owner: Option<AttemptExecutionOwner>,
+) -> Result<()> {
     let path = record_path_for_transcript(transcript);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -230,6 +243,7 @@ pub(crate) fn prepare_launch(transcript: &Path) -> Result<()> {
         started_at: now.clone(),
         heartbeat_at: now,
         settled_at: None,
+        attempt_owner,
     };
     crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
@@ -266,20 +280,58 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
     command.process_group(0);
     configure_identity_lock(command, transcript)?;
     let path = record_path_for_transcript(transcript);
+    let attempt_owner = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<ExecutionRecord>(&bytes)?.attempt_owner,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let store = attempt_owner
+        .as_ref()
+        .map(|owner| crate::work_model::WorkModelStore::new(&owner.project_root));
+    // Follow reservation's lock order: Work model, then execution. Hold both
+    // through spawn and identity publication so cancellation cannot commit its
+    // shared stop between the check and this child becoming registered.
+    let model_lock = match (&store, &attempt_owner) {
+        (Some(store), Some(owner)) => {
+            let lock = store.lock_work_item_model(&owner.work_item_id)?;
+            let item = store.read_work_item_under_model_lock(&owner.work_item_id)?;
+            let attempt = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == owner.attempt_id)
+                .ok_or_else(|| anyhow::anyhow!("execution's owning Attempt is missing"))?;
+            attempt.ensure_not_canceled()?;
+            Some(lock)
+        }
+        _ => None,
+    };
     let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
     match std::fs::read(&path) {
         Ok(bytes) => {
             let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
+                record.attempt_owner == attempt_owner,
+                "execution ownership changed before launch"
+            );
+            anyhow::ensure!(
                 record.state != ExecutionState::Canceled,
                 "local execution was canceled before launch"
             );
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::ensure!(
+                attempt_owner.is_none(),
+                "owned execution record disappeared before launch"
+            );
+        }
         Err(error) => return Err(error.into()),
     }
     let child = command.spawn()?;
-    if let Err(error) = write_running_record(&path, child.id()) {
+    let publication = write_running_record(&path, child.id());
+    // Worker execution and failed-launch settlement must not hold the model lock.
+    drop(_lock);
+    drop(model_lock);
+    if let Err(error) = publication {
         return match settle_failed_launch(child, transcript) {
             Ok(()) => Err(error),
             Err(cleanup) => Err(error.context(format!("launch cleanup failed: {cleanup:#}"))),
@@ -331,6 +383,11 @@ pub(crate) fn output(command: &mut Command, transcript: &Path) -> Result<std::pr
 }
 
 fn write_running_record(path: &Path, leader_pid: u32) -> Result<()> {
+    let attempt_owner = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<ExecutionRecord>(&bytes)?.attempt_owner,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let now = crate::work_model::now_iso8601();
     let record = ExecutionRecord {
         schema_version: 1,
@@ -341,6 +398,7 @@ fn write_running_record(path: &Path, leader_pid: u32) -> Result<()> {
         started_at: now.clone(),
         heartbeat_at: now,
         settled_at: None,
+        attempt_owner,
     };
     crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(&record)?)?;
     Ok(())
@@ -464,11 +522,112 @@ mod tests {
     use std::os::unix::process::CommandExt;
 
     #[test]
+    fn attempt_owner_survives_commands_and_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::work_model::WorkModelStore::new(dir.path());
+        let mut item = crate::work_model::WorkItem::planned("work-1", "Preserve launch ownership");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let path = record_path_for_transcript(&transcript);
+        let owner = AttemptExecutionOwner {
+            project_root: dir.path().into(),
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+        };
+        prepare_launch(&transcript, Some(owner.clone())).unwrap();
+        let mut first = Command::new("true");
+        // Observe the model lock from the forked child before exec. Merely
+        // reading the stop and dropping its lock before spawn leaves a race.
+        use std::os::unix::ffi::OsStrExt;
+        let model_lock = std::ffi::CString::new(
+            dir.path()
+                .join(".fluent/work/locks/work-1/model.lock")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .unwrap();
+        unsafe {
+            first.pre_exec(move || {
+                let fd = libc::open(model_lock.as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let locked = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB);
+                let error = std::io::Error::last_os_error();
+                libc::close(fd);
+                if locked < 0 && error.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            });
+        }
+        assert!(output(&mut first, &transcript).unwrap().status.success());
+        let mut second = Command::new("/bin/cat");
+        second
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        let mut child = spawn(&mut second, &transcript).unwrap();
+        let heartbeat = ExecutionHeartbeat::start(&transcript, child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        heartbeat.unwrap().settle().unwrap();
+        let record: ExecutionRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(record.attempt_owner, Some(owner));
+        assert_eq!(record.state, ExecutionState::Settled);
+        // Persist only the shared intent, before cancellation visits this record.
+        store
+            .mutate_work_item("work-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.cancellation = Some(crate::work_model::AttemptCancellation {
+                    requested_at: crate::work_model::now_iso8601(),
+                    settled_at: None,
+                    resumed_at: None,
+                });
+                attempt.status = crate::work_model::AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(crate::work_model::PauseKind::Interrupted);
+                Ok(())
+            })
+            .unwrap();
+        let marker = dir.path().join("later-child");
+        let mut later = Command::new("touch");
+        later.arg(&marker);
+        assert!(output(&mut later, &transcript).is_err());
+        assert!(!marker.exists());
+        assert_eq!(
+            serde_json::from_slice::<ExecutionRecord>(&std::fs::read(&path).unwrap()).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn owned_launch_rejects_a_missing_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        prepare_launch(
+            &transcript,
+            Some(AttemptExecutionOwner {
+                project_root: dir.path().into(),
+                work_item_id: "missing".into(),
+                attempt_id: "attempt-1".into(),
+            }),
+        )
+        .unwrap();
+        let marker = dir.path().join("launched");
+        let mut command = Command::new("touch");
+        command.arg(&marker);
+        assert!(spawn(&mut command, &transcript).is_err());
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn cancel_settled_execution_blocks_later_children_until_reservation() {
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("transcript.jsonl");
         let path = record_path_for_transcript(&transcript);
-        prepare_launch(&transcript).unwrap();
+        prepare_launch(&transcript, None).unwrap();
         let mut first = Command::new("/bin/sh");
         first.args(["-c", "exit 0"]);
         assert!(output(&mut first, &transcript).unwrap().status.success());
@@ -498,7 +657,7 @@ mod tests {
 
         // Task reservation calls prepare_launch only after the Work model admits
         // explicit resume; completed commands within one reservation do not.
-        prepare_launch(&transcript).unwrap();
+        prepare_launch(&transcript, None).unwrap();
         let mut resumed = Command::new("touch");
         resumed.arg(&marker);
         assert!(output(&mut resumed, &transcript).unwrap().status.success());
@@ -510,7 +669,7 @@ mod tests {
         use std::io::BufRead;
         let dir = tempfile::tempdir().unwrap();
         let transcript = dir.path().join("stdout.log");
-        prepare_launch(&transcript).unwrap();
+        prepare_launch(&transcript, None).unwrap();
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", "sleep 30 & echo ready; wait"])
@@ -548,8 +707,21 @@ mod tests {
             started_at: "started".into(),
             heartbeat_at: "heartbeat".into(),
             settled_at: None,
+            attempt_owner: None,
         };
         let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap()
+                .get("attempt_owner")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_slice::<ExecutionRecord>(&bytes)
+                .unwrap()
+                .attempt_owner,
+            None
+        );
         std::fs::write(&path, &bytes).unwrap();
         assert!(!execution_is_live(&path).unwrap());
         assert!(!identity_lock_path(&path).exists());
@@ -584,6 +756,7 @@ mod tests {
             started_at: "started".into(),
             heartbeat_at: "heartbeat".into(),
             settled_at: None,
+            attempt_owner: None,
         };
         std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
         std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
