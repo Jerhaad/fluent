@@ -73,6 +73,11 @@ impl AttemptRunner for CliAttemptRunner {
         tester_no_sandbox: bool,
     ) -> Result<AttemptOutcome> {
         let fluent_bin = std::env::current_exe()?;
+        let ledger = queue::read_ledger(project_root, work_item_id)?
+            .ok_or_else(|| anyhow::anyhow!("scheduler dispatch ledger is missing"))?;
+        let dispatch = ledger
+            .active()
+            .ok_or_else(|| anyhow::anyhow!("scheduler dispatch is no longer active"))?;
         if tester_no_sandbox {
             eprintln!(
                 "[scheduler] approving one unsandboxed retry of the paused Tester for {attempt_id}"
@@ -83,6 +88,7 @@ impl AttemptRunner for CliAttemptRunner {
             project_root,
             work_item_id,
             attempt_id,
+            &dispatch.dispatch_id,
             scheduler_baseline_session(),
             tester_no_sandbox,
         );
@@ -138,13 +144,14 @@ fn attempt_run_command(
     project_root: &Path,
     work_item_id: &str,
     attempt_id: &str,
+    dispatch_id: &str,
     baseline_session: &str,
     tester_no_sandbox: bool,
 ) -> Command {
     let mut command = Command::new(fluent_bin);
     command
         .current_dir(project_root)
-        .args(["attempt", "run"])
+        .args(["attempt", "run", "--dispatch-id", dispatch_id])
         .env(
             crate::baseline_cache::BASELINE_SESSION_ENV,
             baseline_session,
@@ -1393,6 +1400,7 @@ mod tests {
             Path::new("/tmp/project"),
             "work-1",
             "attempt-1",
+            "dispatch-1",
             "scheduler-session-1",
             false,
         );
@@ -1405,7 +1413,14 @@ mod tests {
         assert_eq!(session, Some("scheduler-session-1"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["attempt", "run", "work-1", "attempt-1"]
+            [
+                "attempt",
+                "run",
+                "--dispatch-id",
+                "dispatch-1",
+                "work-1",
+                "attempt-1"
+            ]
         );
     }
 
@@ -1416,6 +1431,7 @@ mod tests {
             Path::new("/tmp/project"),
             "work-1",
             "attempt-1",
+            "dispatch-1",
             "scheduler-session-1",
             true,
         );
@@ -1424,6 +1440,8 @@ mod tests {
             [
                 "attempt",
                 "run",
+                "--dispatch-id",
+                "dispatch-1",
                 "--tester-no-sandbox",
                 "work-1",
                 "attempt-1"

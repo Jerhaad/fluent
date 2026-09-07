@@ -1106,6 +1106,7 @@ fn cmd_attempt(
             attempt_id,
             no_sandbox,
             tester_no_sandbox,
+            dispatch_id,
             coder,
             model,
             effort,
@@ -1122,33 +1123,44 @@ fn cmd_attempt(
             // Reject execution while the Work Item is proposed, before resolving
             // an Attempt to run, so proposed Work reports that human
             // authorization is required rather than that it has no Attempts.
-            match store.read_work_item(&work_item_id) {
-                Ok(item) => item.ensure_execution_ready()?,
+            let initial_item = match store.read_work_item(&work_item_id) {
+                Ok(item) => {
+                    item.ensure_execution_ready()?;
+                    item
+                }
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
                 {
                     bail!("Work Item {work_item_id:?} not found");
                 }
                 Err(error) => return Err(error.into()),
-            }
+            };
             let attempt_id = match attempt_id {
                 Some(id) => id,
                 None => {
-                    let item = match store.read_work_item(&work_item_id) {
-                        Ok(item) => item,
-                        Err(WorkModelStorageError::ReadFile { source, .. })
-                            if source.kind() == ErrorKind::NotFound =>
-                        {
-                            bail!("Work Item {work_item_id:?} not found");
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    item.latest_attempt_id()
+                    initial_item.latest_attempt_id()
                         .ok_or_else(|| anyhow::anyhow!(
                             "Work Item {work_item_id:?} has no Attempts; create one first with: fluent attempt create {work_item_id}"
                         ))?
                         .to_string()
                 }
+            };
+            // Capture direct recovery authority before initialization can race
+            // with cancellation. Scheduler children use their earlier admission.
+            let resume_cancellation_requested_at = match dispatch_id.as_deref() {
+                Some(dispatch_id) => fluent::queue::cancellation_resume_for_dispatch(
+                    project_root,
+                    &work_item_id,
+                    &attempt_id,
+                    dispatch_id,
+                )?,
+                None => initial_item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
+                    .filter(|attempt| attempt.cancellation_requested())
+                    .and_then(|attempt| attempt.cancellation.as_ref())
+                    .map(|stop| stop.requested_at.clone()),
             };
             let cli_inputs = work_model::CoderMappingInputs::default().merge_cli(
                 write_coder,
@@ -1218,6 +1230,7 @@ fn cmd_attempt(
                 extra_args: &extra_args,
                 no_sandbox: no_sandbox || global_no_sandbox,
                 tester_no_sandbox,
+                resume_cancellation_requested_at: resume_cancellation_requested_at.as_deref(),
                 coder_mapping_inputs: cli_inputs.has_run_overrides().then_some(&cli_inputs),
             })?;
             // A foreground Attempt does not claim a scheduler dispatch. If it

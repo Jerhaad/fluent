@@ -82,6 +82,7 @@ THE SYSTEM SHALL first persist one durable cancellation intent that prevents any
 new Task, review phase, Tester, verification, or Learner launch for that Attempt,
 then stop and settle every already-owned local execution.
 Test: tests/binary.rs (attempt_cancel_persists_stop_before_settling_active_execution)
+Test: tests/binary.rs (attempt_cancel_during_scheduler_startup_blocks_delayed_launch)
 
 ### B2
 
@@ -91,6 +92,8 @@ executing and SHALL make the launcher recheck the durable stop boundary before
 starting the child process.
 Test: src/work_task_executor.rs (task_execution_identity_precedes_executing_state_and_honors_stop)
 Test: src/execution.rs (cancel_settled_execution_blocks_later_children_until_reservation)
+Test: src/work_attempt_loop.rs (canceled_attempt_startup_requires_resume_authorization, cancellation_resume_authority_rejects_a_later_stop)
+Test: src/queue.rs (resume_records_exact_cancellation_authority)
 
 ### B3
 

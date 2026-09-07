@@ -42,6 +42,14 @@ until the runner exits. Require both runner and cancellation to exit within a
 bounded wait, and assert that neither the next command nor the extractor wrote
 its launch marker. This barrier exercises the gap without production test hooks.
 
+To cancel before the first Task reservation, implement an `AttemptRunner` fixture
+that signals readiness and waits on a bounded channel before invoking the real
+Attempt CLI with its dispatch ID. Drive it through `scheduler::dispatch_one`;
+confirm the dispatch is running and owns its lease, cancel, and observe a settled
+stop with all Tasks still planned. Release the channel and require the exact stop
+to remain, no worker launch marker, and a `needs-user` dispatch. Follow with a new
+public queue resume and require its worker marker as a positive control.
+
 ## Example
 
 `tests/binary.rs::attempt_cancel_stops_each_stage_without_downstream_launch`
@@ -53,3 +61,6 @@ ownership before either fixture guard can clean up.
 `attempt_cancel_between_tester_commands_blocks_next_child` and
 `attempt_cancel_between_tester_command_and_extractor_blocks_next_child` use the
 FIFO barrier to verify both transitions after a naturally settled Tester child.
+
+`attempt_cancel_during_scheduler_startup_blocks_delayed_launch` uses the channel
+barrier and a real CLI child to check startup and fresh recovery authority.

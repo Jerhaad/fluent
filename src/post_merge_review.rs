@@ -498,6 +498,7 @@ fn review_one(project_root: &Path, entry: &QueueEntry, fix_depth: u64) -> Result
         extra_args: &[],
         no_sandbox: true,
         tester_no_sandbox: false,
+        resume_cancellation_requested_at: None,
         coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,
@@ -618,6 +619,7 @@ fn auto_run_post_merge_review_fix(
         extra_args: &[],
         no_sandbox: false,
         tester_no_sandbox: false,
+        resume_cancellation_requested_at: None,
         coder_mapping_inputs: None,
         #[cfg(test)]
         learner_run_coder: None,

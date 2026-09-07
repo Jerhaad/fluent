@@ -958,7 +958,11 @@ Task reservation, follow-up creation, completion, Learner capture, and readiness
 reject advancement while that stop is active. Cancellation then validates each
 owned identity before signaling, waits for process trees and execution leases to
 settle, and records settlement. Repeating the same settled cancellation changes
-no history. Explicit `attempt run` records resume and replans unfinished work;
+no history. Explicit `attempt run` captures the current cancellation before
+initialization, then validates that same request under the Work model lock before
+recording resume and replanning unfinished work. Scheduler children carry their
+dispatch ID and use only the cancellation authorized by that dispatch's queue
+admission. A delayed launch cannot authorize a newer stop during startup;
 completed Tasks remain complete, and canceled verification retries use new
 artifact directories. Historical Attempts without a cancellation record keep
 their existing semantics.
@@ -3669,6 +3673,11 @@ An earlier canceled dispatch remains terminal history and does not authorize or
 block a new explicit resume. The new dispatch binds the exact currently eligible
 Attempt without linking itself to the canceled dispatch, whose binding may name
 an older Attempt.
+For a canceled Attempt, admission records `resume_cancellation_requested_at`
+without clearing the stop. The Attempt loop compares it with the current
+cancellation under the Work model lock before reopening. Ordinary and legacy
+dispatches without this field cannot resume a cancellation; repeating an active
+resume cannot update its authority to cover a later stop.
 For an uncertain-review pause, queue admission calls the same read-only
 `lifecycle_recovery` inspection as foreground execution before it appends the
 resume dispatch. The scheduler later launches the bound Attempt through the

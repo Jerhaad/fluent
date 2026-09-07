@@ -571,6 +571,10 @@ pub enum AttemptCommands {
         #[arg(long, hide = true)]
         tester_no_sandbox: bool,
 
+        /// Scheduler dispatch that admitted this launch
+        #[arg(long, hide = true)]
+        dispatch_id: Option<String>,
+
         /// Coding agent to launch: claude, codex, or pi
         #[arg(long)]
         coder: Option<String>,

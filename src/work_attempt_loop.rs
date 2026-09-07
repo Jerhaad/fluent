@@ -276,6 +276,9 @@ pub struct WorkAttemptRunConfig<'a> {
     /// Attempt currently paused at `tester-harness` and applies only to that
     /// exact `NeedsUser` Tester Task.
     pub tester_no_sandbox: bool,
+    /// Cancellation observed by an explicit run or recorded at queue resume
+    /// admission. Startup must never infer fresh recovery authorization.
+    pub resume_cancellation_requested_at: Option<&'a str>,
     /// Explicit CLI mapping fields for this invocation. Overlay them on the
     /// freshly locked Attempt mapping under the land lock.
     pub coder_mapping_inputs: Option<&'a CoderMappingInputs>,
@@ -362,6 +365,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
         config.store,
         config.work_item_id,
         config.attempt_id,
+        config.resume_cancellation_requested_at,
     )?;
     let tester_no_sandbox_task_id = if config.tester_no_sandbox {
         let attempt = initial_item
@@ -4803,6 +4807,7 @@ fn resume_canceled_attempt(
     store: &WorkModelStore,
     work: &str,
     id: &str,
+    authorized_stop: Option<&str>,
 ) -> Result<()> {
     mutate_attempt_work_item(store, work, |item| {
         let attempt = item
@@ -4812,6 +4817,17 @@ fn resume_canceled_attempt(
             .ok_or_else(|| WorkModelError::AttemptNotFound { id: id.into() })?;
         if !attempt.cancellation_requested() {
             return Ok(());
+        }
+        if authorized_stop
+            != attempt
+                .cancellation
+                .as_ref()
+                .map(|stop| stop.requested_at.as_str())
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: id.into(),
+                reason: "this launch was not authorized to resume the current cancellation; explicitly resume the interrupted Attempt".into(),
+            });
         }
         let active_task = attempt.tasks.iter().any(|task| {
             crate::lease::is_leased(&crate::lease::task_lock_path(project, work, &task.id))
@@ -10016,6 +10032,78 @@ mod tests {
     }
 
     #[test]
+    fn canceled_attempt_startup_requires_resume_authorization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Cancel before startup");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let stopped = store.read_work_item("work-1").unwrap();
+        let resolver = ContentResolver::new(Some(tmp.path()));
+        let result = run_attempt(WorkAttemptRunConfig {
+            project_root: tmp.path(),
+            store: &store,
+            work_item_id: "work-1",
+            attempt_id: "attempt-1",
+            resolver: &resolver,
+            extra_args: &[],
+            no_sandbox: true,
+            tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
+            coder_mapping_inputs: None,
+            learner_run_coder: None,
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("this launch was not authorized to resume the current cancellation")
+        );
+        assert_eq!(
+            store.read_work_item("work-1").unwrap(),
+            stopped,
+            "startup must not authorize resuming a cancellation it did not observe at admission"
+        );
+    }
+
+    #[test]
+    fn cancellation_resume_authority_rejects_a_later_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Require current cancellation authority");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let first = store.read_work_item("work-1").unwrap();
+        let first_stop = &first.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(first_stop))
+            .unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let second = store.read_work_item("work-1").unwrap();
+        let second_stop = &second.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        assert_ne!(first_stop, second_stop);
+        assert!(
+            resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(first_stop))
+                .is_err()
+        );
+        assert_eq!(store.read_work_item("work-1").unwrap(), second);
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(second_stop))
+            .unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
+        assert!(!resumed.attempts[0].cancellation_requested());
+        assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
+    }
+
+    #[test]
     fn canceled_verification_resume_preserves_prior_artifacts() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkModelStore::new(tmp.path());
@@ -10030,7 +10118,13 @@ mod tests {
         item.attempts[0].status = AttemptStatus::Reviewing;
         store.create_work_item(&item).unwrap();
         cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
-        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let stopped = store.read_work_item("work-1").unwrap();
+        let stop = &stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
         let resumed = store.read_work_item("work-1").unwrap();
         let retry_area = tmp.path().join(
             &resumed.attempts[0].tasks[0]
@@ -10101,7 +10195,13 @@ mod tests {
             "repeated cancellation must be idempotent"
         );
 
-        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let stopped = store.read_work_item("work-1").unwrap();
+        let stop = &stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at;
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
         let resumed = store.read_work_item("work-1").unwrap();
         assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
         assert_eq!(resumed.attempts[0].pause_kind, None);
@@ -10543,6 +10643,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         }) {
@@ -16579,6 +16680,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: Some(&run_coder),
         })
@@ -23516,6 +23618,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -23591,6 +23694,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -23818,6 +23922,7 @@ mod tests {
                 extra_args: &[],
                 no_sandbox: true,
                 tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
                 coder_mapping_inputs: None,
                 learner_run_coder: None,
             })
@@ -23966,6 +24071,7 @@ mod tests {
                 extra_args: &[],
                 no_sandbox: true,
                 tester_no_sandbox: false,
+                resume_cancellation_requested_at: None,
                 coder_mapping_inputs: None,
                 learner_run_coder: None,
             })
@@ -24172,6 +24278,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -24217,6 +24324,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -24252,6 +24360,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -24282,6 +24391,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -24315,6 +24425,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })
@@ -24799,6 +24910,7 @@ mod tests {
             extra_args: &[],
             no_sandbox: true,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
             coder_mapping_inputs: None,
             learner_run_coder: None,
         })

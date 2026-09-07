@@ -39193,3 +39193,174 @@ fn cancel_tester_at_settled_command_boundary(next_command: bool) {
     );
     assert_eq!(after.attempts[0].tasks.len(), task_count);
 }
+
+#[test]
+fn attempt_cancel_during_scheduler_startup_blocks_delayed_launch() {
+    use fluent::{queue, scheduler, work_model::*};
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+
+    struct DelayedRunner {
+        ready: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        bin: PathBuf,
+        diagnostics: PathBuf,
+    }
+    impl scheduler::AttemptRunner for DelayedRunner {
+        fn run(
+            &self,
+            project: &Path,
+            work: &str,
+            attempt: &str,
+            _: bool,
+        ) -> anyhow::Result<scheduler::AttemptOutcome> {
+            self.ready.send(())?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(8))?;
+            let ledger = queue::read_ledger(project, work)?.unwrap();
+            let dispatch = ledger.active().unwrap();
+            let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+            command
+                .current_dir(project)
+                .args(["attempt", "run", work, attempt, "--no-sandbox"])
+                .args(["--dispatch-id", &dispatch.dispatch_id])
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+                .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+                .env("PATH", mock_path(&self.bin))
+                .stdout(std::process::Stdio::null())
+                .stderr(fs::File::create(&self.diagnostics)?);
+            let mut child = OwnedFixtureProcess::spawn(&mut command);
+            anyhow::ensure!(
+                poll_until(Duration::from_secs(8), || child
+                    .try_wait()
+                    .unwrap()
+                    .is_some()),
+                "delayed Attempt child must exit: {}",
+                fs::read_to_string(&self.diagnostics)?
+            );
+            scheduler::classify_attempt_outcome(project, work, attempt)
+        }
+    }
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let id = format!(
+        "cancel-startup-{}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    let (project, _, _) = create_focused_evidence_item(project, &id, "tests", "Verdict: fail\n");
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(&id, |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::Planned;
+            attempt.pause_kind = None;
+            attempt.tasks.truncate(1);
+            attempt.tasks[0].status = TaskStatus::Planned;
+            attempt.tasks[0].output = None;
+            Ok(())
+        })
+        .unwrap();
+    let marker = tmp.path().join("writer-started");
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    );
+    queue::add(&project, &id, None).unwrap();
+    let dispatch = scheduler::pick_next_queued(&project).unwrap().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let runner = DelayedRunner {
+        ready: ready_tx,
+        release: Mutex::new(release_rx),
+        bin,
+        diagnostics: tmp.path().join("delayed-run.log"),
+    };
+    std::thread::scope(|scope| {
+        let dispatch_thread = scope.spawn(|| scheduler::dispatch_one(&project, &dispatch, &runner));
+        ready_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        let ledger = queue::read_ledger(&project, &id).unwrap().unwrap();
+        assert_eq!(
+            ledger.active().unwrap().status,
+            queue::DispatchStatus::Running
+        );
+        assert!(fluent::lease::is_leased(&queue::dispatch_lease_path(
+            &project, &id
+        )));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "cancel", &id, "attempt-1"])
+            .assert()
+            .success();
+        let stopped = store.read_work_item(&id).unwrap();
+        assert!(
+            stopped.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .settled_at
+                .is_some()
+        );
+        assert!(
+            stopped.attempts[0]
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Planned)
+        );
+        assert!(!marker.exists());
+        release_tx.send(()).unwrap();
+        dispatch_thread.join().unwrap().unwrap();
+        let after = store.read_work_item(&id).unwrap();
+        assert_eq!(
+            after.attempts[0], stopped.attempts[0],
+            "an already-admitted dispatch must preserve the settled cancellation"
+        );
+        assert!(
+            !marker.exists(),
+            "the delayed dispatch must not start the Writer"
+        );
+        assert!(
+            fs::read_to_string(&runner.diagnostics)
+                .unwrap()
+                .contains("this launch was not authorized to resume the current cancellation")
+        );
+        let ledger = queue::read_ledger(&project, &id).unwrap().unwrap();
+        assert_eq!(
+            ledger.latest().unwrap().status,
+            queue::DispatchStatus::NeedsUser
+        );
+    });
+    // A fresh operator recovery binds the stopped request and may launch the
+    // same Writer. This also proves that the delayed command was executable.
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", &id, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let recovery = scheduler::pick_next_queued(&project).unwrap().unwrap();
+    assert_ne!(recovery.dispatch_id, dispatch.dispatch_id);
+    std::thread::scope(|scope| {
+        let dispatch_thread = scope.spawn(|| scheduler::dispatch_one(&project, &recovery, &runner));
+        ready_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        release_tx.send(()).unwrap();
+        dispatch_thread.join().unwrap().unwrap();
+    });
+    let resumed = store.read_work_item(&id).unwrap();
+    assert_eq!(resumed.attempts.len(), 1);
+    assert!(
+        resumed.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_some()
+    );
+    assert!(
+        marker.exists(),
+        "explicit recovery must launch the Writer: {}",
+        fs::read_to_string(&runner.diagnostics).unwrap()
+    );
+}

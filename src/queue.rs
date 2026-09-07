@@ -151,6 +151,9 @@ pub struct Dispatch {
     /// Fluent Tester sandbox. Only explicit resume admission may set this.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tester_no_sandbox: bool,
+    /// Exact cancellation an operator authorized this dispatch to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_cancellation_requested_at: Option<String>,
 }
 
 impl Dispatch {
@@ -174,6 +177,7 @@ impl Dispatch {
             resume_of_dispatch_id: None,
             blocked_reason: None,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
         }
     }
 
@@ -183,6 +187,7 @@ impl Dispatch {
         priority: i64,
         resume_of_dispatch_id: Option<String>,
         tester_no_sandbox: bool,
+        resume_cancellation_requested_at: Option<String>,
         sequence: u64,
     ) -> Self {
         Self {
@@ -199,6 +204,7 @@ impl Dispatch {
             resume_of_dispatch_id,
             blocked_reason: None,
             tester_no_sandbox,
+            resume_cancellation_requested_at,
         }
     }
 }
@@ -375,6 +381,7 @@ fn parse_ledger(content: &str) -> Result<DispatchLedger> {
             resume_of_dispatch_id: None,
             blocked_reason: None,
             tester_no_sandbox: false,
+            resume_cancellation_requested_at: None,
         };
         Ok(DispatchLedger {
             work_item_id: legacy.work_item_id,
@@ -768,6 +775,17 @@ pub fn resume_with_tester_no_sandbox(
                 .find(|attempt| attempt.id == attempt_id)
             {
                 crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+                if attempt.cancellation_requested()
+                    && active.resume_cancellation_requested_at.as_deref()
+                        != attempt
+                            .cancellation
+                            .as_ref()
+                            .map(|stop| stop.requested_at.as_str())
+                {
+                    bail!(
+                        "active dispatch was admitted before the current cancellation; wait for it to settle or remove it before authorizing a new resume"
+                    );
+                }
             }
             if active.tester_no_sandbox != tester_no_sandbox {
                 bail!(
@@ -860,10 +878,43 @@ pub fn resume_with_tester_no_sandbox(
         priority.unwrap_or(0),
         resume_of_dispatch_id,
         tester_no_sandbox,
+        item.attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .filter(|attempt| attempt.cancellation_requested())
+            .and_then(|attempt| attempt.cancellation.as_ref())
+            .map(|stop| stop.requested_at.clone()),
         sequence,
     ));
     write_ledger(project_root, &ledger)?;
     Ok(ResumeDispatchOutcome::Created)
+}
+
+/// Read the recovery authority captured by the exact running scheduler dispatch.
+/// A delayed child must not infer authorization from a newer Attempt stop.
+pub fn cancellation_resume_for_dispatch(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    dispatch_id: &str,
+) -> Result<Option<String>> {
+    let ledger = read_ledger(project_root, work_item_id)?
+        .ok_or_else(|| anyhow::anyhow!("scheduler dispatch ledger is missing"))?;
+    let dispatch = ledger
+        .active()
+        .filter(|dispatch| {
+            dispatch.dispatch_id == dispatch_id
+                && dispatch.status == DispatchStatus::Running
+                && dispatch.bound_attempt_id.as_deref() == Some(attempt_id)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("scheduler launch does not match the running dispatch and Attempt")
+        })?;
+    Ok(if dispatch.intent == DispatchIntent::ResumeAttempt {
+        dispatch.resume_cancellation_requested_at.clone()
+    } else {
+        None
+    })
 }
 
 /// Idempotently enqueue an execution-ready Work Item on behalf of automatic
@@ -2102,11 +2153,13 @@ mod tests {
         assert!(value.get("intent").is_none());
         assert!(value.get("resume_of_dispatch_id").is_none());
         assert!(value.get("tester_no_sandbox").is_none());
+        assert!(value.get("resume_cancellation_requested_at").is_none());
 
         let decoded: Dispatch = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.intent, DispatchIntent::Run);
         assert_eq!(decoded.resume_of_dispatch_id, None);
         assert!(!decoded.tester_no_sandbox);
+        assert_eq!(decoded.resume_cancellation_requested_at, None);
     }
 
     #[test]
@@ -2219,6 +2272,68 @@ mod tests {
                 .unwrap()
                 .status,
             DispatchStatus::Queued
+        );
+    }
+
+    #[test]
+    fn resume_records_exact_cancellation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-1", "attempt-1");
+        let store = WorkModelStore::new(dir.path());
+        crate::work_attempt_loop::cancel_local_attempt(dir.path(), &store, "wi-1", "attempt-1")
+            .unwrap();
+        let stopped = store.read_work_item("wi-1").unwrap();
+        let stop = stopped.attempts[0].cancellation.as_ref().unwrap();
+        resume(dir.path(), "wi-1", "attempt-1", None).unwrap();
+        let ledger = read_ledger(dir.path(), "wi-1").unwrap().unwrap();
+        let dispatch = serde_json::to_value(ledger.active().unwrap()).unwrap();
+        assert_eq!(
+            dispatch["resume_cancellation_requested_at"],
+            stop.requested_at
+        );
+        assert_eq!(
+            store.read_work_item("wi-1").unwrap(),
+            stopped,
+            "admission records authorization without reopening the Attempt"
+        );
+        let dispatch_id = ledger.active().unwrap().dispatch_id.clone();
+        assert!(
+            cancellation_resume_for_dispatch(dir.path(), "wi-1", "attempt-1", &dispatch_id)
+                .is_err()
+        );
+        let token = claim(dir.path(), "wi-1", "attempt-1").unwrap().unwrap();
+        mark_running(dir.path(), &token).unwrap();
+        assert_eq!(
+            cancellation_resume_for_dispatch(dir.path(), "wi-1", "attempt-1", &dispatch_id)
+                .unwrap(),
+            Some(stop.requested_at.clone())
+        );
+        assert!(
+            cancellation_resume_for_dispatch(dir.path(), "wi-1", "attempt-2", &dispatch_id)
+                .is_err()
+        );
+        assert!(
+            cancellation_resume_for_dispatch(dir.path(), "wi-1", "attempt-1", "dispatch-1")
+                .is_err()
+        );
+        store
+            .mutate_work_item("wi-1", |item| {
+                let attempt = &mut item.attempts[0];
+                attempt.cancellation.as_mut().unwrap().resumed_at =
+                    Some(crate::work_model::now_iso8601());
+                crate::work_model::reopen_attempt(attempt);
+                Ok(())
+            })
+            .unwrap();
+        crate::work_attempt_loop::cancel_local_attempt(dir.path(), &store, "wi-1", "attempt-1")
+            .unwrap();
+        let before = read_ledger(dir.path(), "wi-1").unwrap();
+        assert!(resume(dir.path(), "wi-1", "attempt-1", None).is_err());
+        assert_eq!(
+            read_ledger(dir.path(), "wi-1").unwrap(),
+            before,
+            "repeating resume cannot refresh an existing dispatch's authority"
         );
     }
 
@@ -2581,7 +2696,7 @@ mod tests {
         setup_project(dir.path());
         write_planned_attempt(dir.path(), "wi-1", "attempt-2");
         suspend_attempt(dir.path(), "wi-1", "attempt-2", PauseKind::WriterCompletion);
-        let mut canceled = Dispatch::new_resume("wi-1", "attempt-1", 0, None, false, 1);
+        let mut canceled = Dispatch::new_resume("wi-1", "attempt-1", 0, None, false, None, 1);
         canceled.status = DispatchStatus::Canceled;
         put_ledger(
             dir.path(),
