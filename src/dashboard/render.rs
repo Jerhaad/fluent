@@ -35,6 +35,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     header(frame, chunks[0], app);
     if app.help {
         help(frame, chunks[1], app);
+    } else if app.errors {
+        errors(frame, chunks[1], app);
     } else if area.width >= 100 {
         let panes = Layout::default()
             .direction(Direction::Horizontal)
@@ -165,24 +167,43 @@ fn detail_lines(row: &DashboardRow) -> Vec<Line<'static>> {
     );
     lines
 }
+fn errors(frame: &mut Frame, area: Rect, app: &App) {
+    let lines = layout::error_lines(&app.snapshot, area.width)
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines).scroll((app.error_scroll, 0)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Work Item read errors "),
+        ),
+        area,
+    );
+}
+
 fn help(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.size.0 >= 100 {
-        "j/k or arrows select; PgUp/PgDn list; a Current/All; r refresh; c copy; ? close; q quit"
+        "j/k or arrows select; PgUp/PgDn list; a Current/All; e errors; r refresh; c copy; ? close; q quit"
     } else {
-        "Enter detail; Esc list; j/k select or scroll; PgUp/PgDn list; a Current/All; r refresh; ? close; q quit"
+        "Enter detail; Esc list; j/k select or scroll; PgUp/PgDn list; a Current/All; e errors; r refresh; ? close; q quit"
     };
     frame.render_widget(
-        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Help ")),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Help ")),
         area,
     );
 }
 fn bar(frame: &mut Frame, area: Rect, app: &App) {
     let text = if app.help {
         "? or Esc close help"
+    } else if app.errors {
+        "j/k scroll  PgUp/PgDn page  e or Esc return  ? help  q quit"
     } else if app.size.0 < 100 && app.pane == Pane::Detail {
         "Esc list  j/k scroll  ? help  q quit"
     } else {
-        "j/k select  PgUp/PgDn list  a all  r refresh  ? help  c copy  q quit"
+        "j/k select  PgUp/PgDn list  a all  e errors  r refresh  ? help  c copy  q quit"
     };
     frame.render_widget(Paragraph::new(text), area);
 }

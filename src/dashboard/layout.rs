@@ -114,3 +114,36 @@ fn wrapped_detail_line_count(row: &DashboardRow, width: u16) -> u16 {
         })
         .sum::<usize>() as u16
 }
+
+/// Wrap diagnostics at display-cell boundaries so scrolling and drawing agree.
+pub fn error_lines(snapshot: &DashboardSnapshot, width: u16) -> Vec<String> {
+    let width = width.saturating_sub(2).max(1) as usize;
+    let mut lines = Vec::new();
+    for error in &snapshot.errors {
+        for paragraph in error.lines() {
+            let mut line = String::new();
+            let mut used = 0;
+            for character in paragraph.chars() {
+                let columns = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                if used + columns > width && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push(character);
+                used += columns;
+            }
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push("No Work Item read errors".into());
+    }
+    lines
+}
+
+pub fn error_max_scroll(snapshot: &DashboardSnapshot, size: (u16, u16)) -> u16 {
+    error_lines(snapshot, size.0)
+        .len()
+        .saturating_sub(size.1.saturating_sub(6) as usize)
+        .min(u16::MAX as usize) as u16
+}

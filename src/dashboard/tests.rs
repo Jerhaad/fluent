@@ -544,3 +544,30 @@ fn scheduled_poll_waits_for_its_deadline() {
     assert!(!poll_due(now, now + DATA_POLL_INTERVAL));
     assert!(poll_due(now + DATA_POLL_INTERVAL, now + DATA_POLL_INTERVAL));
 }
+
+#[test]
+fn error_view_exposes_overflow_and_returns_to_selection() {
+    let mut app = app_with_errors(
+        (0..24)
+            .map(|n| row(&format!("work-{n}"), "planned"))
+            .collect(),
+        (0..30)
+            .map(|n| format!("unreadable Work file {n:02}"))
+            .collect(),
+    );
+    app.resize(80, 15);
+    let selected = app.selected_id().map(str::to_string);
+    assert!(!text(&app, 80, 15).contains("unreadable Work file 00"));
+    app.handle_key(KeyCode::Char('e'), KeyModifiers::NONE);
+    let opened = text(&app, 80, 15);
+    assert!(opened.contains("Work Item read errors"));
+    assert!(opened.contains("unreadable Work file 00"));
+    assert!(opened.contains("Esc return"));
+    for _ in 0..10 {
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+    }
+    assert!(text(&app, 80, 15).contains("unreadable Work file 29"));
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(text(&app, 80, 15).contains("Work Items"));
+    assert_eq!(app.selected_id(), selected.as_deref());
+}

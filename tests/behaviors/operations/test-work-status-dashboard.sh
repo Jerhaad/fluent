@@ -378,6 +378,31 @@ test_dashboard_shows_empty_work_view() {
   return $RESULT
 }
 
+test_dashboard_help_journey() {
+  setup_test_project
+  trap cleanup_test_project RETURN
+  create_planned_work_item
+  python3 "$PROJECT_DIR/tests/fixtures/dashboard-journey.py" "$FLUENT_BIN" "$TEST_DIR/project" help
+}
+
+test_dashboard_overflow_error_journey() {
+  setup_test_project
+  trap cleanup_test_project RETURN
+  create_planned_work_item
+  for index in $(seq 0 29); do
+    printf '{ invalid json\n' > "$(printf '.fluent/work/items/broken-%02d.json' "$index")"
+  done
+  python3 "$PROJECT_DIR/tests/fixtures/dashboard-journey.py" "$FLUENT_BIN" "$TEST_DIR/project" errors
+}
+
+# Select only the two public interaction journeys during focused verification.
+if [ "${1:-}" = "--verification-journeys" ]; then
+  run_test "dashboard help journey" test_dashboard_help_journey
+  run_test "dashboard overflow error journey" test_dashboard_overflow_error_journey
+  summarize_and_exit
+  exit 0
+fi
+
 printf 'test-work-status-dashboard\n\n'
 
 run_test "status prints Work Items" test_status_prints_work_items
@@ -392,5 +417,8 @@ run_test "dashboard surfaces actionable Work" test_dashboard_surfaces_actionable
 run_test "dashboard surfaces needs-user Work" test_dashboard_surfaces_needs_user_work
 run_test "dashboard reports Work read errors" test_dashboard_reports_work_read_errors
 run_test "dashboard shows empty Work view" test_dashboard_shows_empty_work_view
+
+run_test "dashboard help journey" test_dashboard_help_journey
+run_test "dashboard overflow error journey" test_dashboard_overflow_error_journey
 
 summarize_and_exit

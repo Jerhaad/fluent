@@ -20,6 +20,8 @@ pub struct App {
     selected_index: usize,
     pub pane: Pane,
     pub help: bool,
+    pub errors: bool,
+    pub error_scroll: u16,
     pub copy_mode: bool,
     pub list_scroll: u16,
     pub detail_scroll: u16,
@@ -37,6 +39,8 @@ impl App {
             selected_index: 0,
             pane: Pane::List,
             help: false,
+            errors: false,
+            error_scroll: 0,
             copy_mode: false,
             list_scroll: 0,
             detail_scroll: 0,
@@ -126,6 +130,25 @@ impl App {
         if self.help {
             return Effect::None;
         }
+        if key == KeyCode::Char('e') || key == KeyCode::Esc && self.errors {
+            self.errors = !self.errors;
+            self.dirty = true;
+            return Effect::None;
+        }
+        if self.errors {
+            let page = self.size.1.saturating_sub(6).max(1);
+            let max = layout::error_max_scroll(&self.snapshot, self.size);
+            self.error_scroll = match key {
+                KeyCode::Up | KeyCode::Char('k') => self.error_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => self.error_scroll.saturating_add(1).min(max),
+                KeyCode::PageUp => self.error_scroll.saturating_sub(page),
+                KeyCode::PageDown => self.error_scroll.saturating_add(page).min(max),
+                KeyCode::Char('r') => return Effect::Refresh,
+                _ => self.error_scroll,
+            };
+            self.dirty = true;
+            return Effect::None;
+        }
         match key {
             KeyCode::Char('a') => {
                 self.all_work = !self.all_work;
@@ -201,6 +224,9 @@ impl App {
     }
 
     fn clamp_scrolls(&mut self) {
+        self.error_scroll = self
+            .error_scroll
+            .min(layout::error_max_scroll(&self.snapshot, self.size));
         let bounds = self.scroll_bounds();
         self.list_scroll = self.list_scroll.min(bounds.list_max_scroll);
         self.detail_scroll = self.detail_scroll.min(bounds.detail_max_scroll);
