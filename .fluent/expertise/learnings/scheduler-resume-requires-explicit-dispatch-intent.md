@@ -1,6 +1,6 @@
 ---
 name: scheduler-resume-requires-explicit-dispatch-intent
-description: Scheduler recovery of NeedsUser work requires a new explicit resume dispatch; an Attempt binding alone is not user authorization
+description: Scheduler recovery requires explicit resume intent bound to the exact Attempt and cancellation observed at admission
 metadata:
   type: convention
 ---
@@ -25,6 +25,17 @@ current exact Attempt independently passes the recovery predicate. Do not link
 the new dispatch to the canceled entry or require its binding to match; it may
 belong to an older Attempt. Preserve the canceled record unchanged, and bind
 the new resume before claim.
+
+An Attempt cancellation has its own identity. Queue resume records the exact
+`requested_at` it authorizes without clearing the stop, and the scheduler child
+carries its dispatch ID to recover that persisted authority. The Attempt loop
+compares it with the current cancellation under the Work model lock and requires
+settlement before recording resume. A generic resume intent cannot authorize a
+later cancellation, and replaying an active dispatch cannot refresh its authority.
+Ordinary and legacy dispatches with no cancellation authority cannot clear an
+active stop.
+Foreground execution captures its authority before initialization for the same
+reason: a launch that began before cancellation is not a fresh resume.
 
 This shape makes command retries idempotent while the matching dispatch is
 active, survives coordinator restart, and prevents ordinary queue replay or a
