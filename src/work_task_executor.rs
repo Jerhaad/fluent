@@ -5062,7 +5062,7 @@ fn write_execution_context_with_finding_policy(
         execution_context_evidence(input_artifacts, candidate_commit);
     let historical_artifacts = input_artifacts
         .iter()
-        .map(|path| truncate_utf8(&path.display().to_string(), 240))
+        .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
     let (changed_files, omitted_changed_files) =
         bounded_vec(changed_files, EXECUTION_CONTEXT_MAX_CHANGED_FILES);
@@ -18428,6 +18428,43 @@ mod tests {
 
         assert!(error.to_string().contains("execution context core exceeds"));
         assert!(!project.path().join("execution-context.json").exists());
+    }
+
+    #[test]
+    fn execution_context_preserves_long_historical_artifact_path() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["init", "-q"],
+            "initialize long artifact fixture",
+        )
+        .unwrap();
+        let artifact = project
+            .path()
+            .join("historical-évidence/".repeat(16))
+            .join("input.json");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "{}").unwrap();
+        let expected = artifact.display().to_string();
+        assert!(expected.len() > 240);
+
+        let context_path = write_execution_context(
+            project.path(),
+            workspace.path(),
+            "candidate",
+            None,
+            &[],
+            std::slice::from_ref(&artifact),
+            None,
+        )
+        .unwrap();
+        let serialized = fs::read_to_string(context_path).unwrap();
+        assert!(serialized.len() <= EXECUTION_CONTEXT_MAX_BYTES);
+        let context: ExecutionContextV1 = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(context.historical_artifacts, [expected]);
+        assert_eq!(context.omitted.historical_artifacts, 0);
     }
 
     #[test]
