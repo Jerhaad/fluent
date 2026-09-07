@@ -584,8 +584,11 @@ steps, current findings deduplicated by role and stable identity, passing Tester
 evidence, executed commands, and historical artifact paths. Its collections and
 serialized size are bounded. Fluent may omit advisory commands, evidence
 summaries, or changed-file rows and records those counts, but it never silently
-omits an unresolved step, current finding, or input-artifact path; an
-authoritative core that cannot fit fails before Writer launch.
+omits an unresolved step, current finding, or input-artifact path. Fluent
+preserves historical artifact paths exactly, including paths longer than the
+240-byte prose truncation threshold, because they identify evidence. If the
+authoritative core cannot fit within the 128 KiB context limit, Fluent rejects
+it before writing `execution-context.json` or launching the Writer.
 Reviewed-correction prompts are capped at 32 KiB. Full historical artifacts
 remain unchanged for audit and are opened by path only when needed. Review
 prompts use the same generated context instead of reinjecting prior review

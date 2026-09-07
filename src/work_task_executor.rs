@@ -16605,47 +16605,52 @@ mod tests {
     #[test]
     fn tester_harness_repair_execution_context_keeps_artifact_without_tester_findings() {
         let tmp = tempfile::tempdir().unwrap();
-        let workspace = tmp.path().join("workspace");
-        let artifact = tmp.path().join("repair-writer-artifact");
-        let tester_dir = tmp.path().join("attempt-1-tester-8");
-        let tester_results = tester_dir.join("tester-results.json");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&tester_dir).unwrap();
-        fs::write(
-            &tester_results,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "candidate_commit": "abc123",
-                "commands": [
-                    {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
-                ],
-                "tests": [],
-                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
-                "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let deep_root = tmp.path().join("landing-settlement/".repeat(16));
+        assert!(deep_root.to_str().unwrap().len() > 240);
 
-        let context_path = write_execution_context_with_finding_policy(
-            &artifact,
-            &workspace,
-            "abc123",
-            Some("base123"),
-            &[],
-            std::slice::from_ref(&tester_results),
-            None,
-            false,
-        )
-        .unwrap();
-        let context: ExecutionContextV1 =
-            serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+        for root in [tmp.path(), deep_root.as_path()] {
+            let workspace = root.join("workspace");
+            let artifact = root.join("repair-writer-artifact");
+            let tester_dir = root.join("attempt-1-tester-8");
+            let tester_results = tester_dir.join("tester-results.json");
+            fs::create_dir_all(&workspace).unwrap();
+            fs::create_dir_all(&tester_dir).unwrap();
+            fs::write(
+                &tester_results,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "candidate_commit": "abc123",
+                    "commands": [
+                        {"command": "cargo test --lib", "test_harness": "cargo", "exit_code": 101, "duration_ms": 2, "stdout_log": "commands/0-stdout.log", "stderr_log": "commands/0-stderr.log"}
+                    ],
+                    "tests": [],
+                    "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                    "error": {"kind": "duplicate_test_ids", "message": "duplicate", "details": ""}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
 
-        assert!(context.current_findings.is_empty());
-        assert_eq!(context.executed_commands, ["cargo test --lib"]);
-        assert_eq!(
-            context.historical_artifacts,
-            [tester_results.display().to_string()]
-        );
+            let context_path = write_execution_context_with_finding_policy(
+                &artifact,
+                &workspace,
+                "abc123",
+                Some("base123"),
+                &[],
+                std::slice::from_ref(&tester_results),
+                None,
+                false,
+            )
+            .unwrap();
+            let context: ExecutionContextV1 =
+                serde_json::from_str(&fs::read_to_string(context_path).unwrap()).unwrap();
+
+            assert!(context.current_findings.is_empty());
+            assert_eq!(context.executed_commands, ["cargo test --lib"]);
+            assert_eq!(
+                context.historical_artifacts,
+                [tester_results.display().to_string()]
+            );
+        }
     }
 
     #[test]
