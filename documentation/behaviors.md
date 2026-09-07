@@ -104,7 +104,9 @@ or Learner execution,
 THE SYSTEM SHALL stop that owned worker, settle its process tree, suspend the
 same Attempt for explicit resume, and launch no downstream stage.
 A pending reviewed Merge Candidate SHALL remain storable across that durable
-stop but SHALL NOT advance while cancellation is active. Explicit resume SHALL
+stop but SHALL NOT advance while cancellation is active. Its Attempt SHALL stay
+`Complete` with no `Interrupted` pause kind; the typed cancellation record SHALL
+block new execution and readiness advancement. Explicit resume SHALL
 preserve its reviewed identity and prior readiness timestamp and SHALL require
 succeeded Learning before advancement.
 Test: src/work_model.rs (canceled_pending_candidate_stays_valid_but_cannot_advance)

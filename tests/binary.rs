@@ -38822,11 +38822,21 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
                 .assert()
                 .success();
         }
+        let at_signal = tmp.path().join("learner-at-first-signal.json");
+        let signal_handler = if stage == "learner" {
+            format!(
+                "trap 'cp \"{}\" \"{}\"; exit 0' TERM\n",
+                store.work_attempt_path(&id, "attempt-1").unwrap().display(),
+                at_signal.display()
+            )
+        } else {
+            String::new()
+        };
         let bin = tmp.path().join("bin-cancel");
         write_mock_claude(
             &bin,
             &format!(
-                "#!/bin/bash\nsleep 120 &\nprintf '%s %s' \"$$\" \"$!\" > '{}.tmp'\nmv '{}.tmp' '{}'\nwait\n",
+                "#!/bin/bash\n{signal_handler}sleep 120 &\nprintf '%s %s' \"$$\" \"$!\" > '{}.tmp'\nmv '{}.tmp' '{}'\nwait\n",
                 started.display(),
                 started.display(),
                 started.display()
@@ -38953,6 +38963,11 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
         }
         assert!(cancellation_fixture_owns_execution(&record_path), "{stage}");
         let before = store.read_work_item(&id).unwrap();
+        let candidate_snapshot = before.merge_candidates.first().map(|candidate| {
+            let path = store.work_merge_candidate_path(&id, &candidate.id).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
         command
@@ -38994,12 +39009,20 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
         let after = store.read_work_item(&id).unwrap();
         assert_eq!(
             after.attempts[0].status,
-            AttemptStatus::NeedsUser,
+            if stage == "learner" {
+                AttemptStatus::Complete
+            } else {
+                AttemptStatus::NeedsUser
+            },
             "{stage}"
         );
         assert_eq!(
             after.attempts[0].pause_kind,
-            Some(PauseKind::Interrupted),
+            if stage == "learner" {
+                None
+            } else {
+                Some(PauseKind::Interrupted)
+            },
             "{stage}"
         );
         assert_eq!(
@@ -39028,6 +39051,23 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
                 1,
                 "exercise the persisted pre-land candidate"
             );
+            let observed: serde_json::Value =
+                serde_json::from_slice(&fs::read(&at_signal).unwrap()).unwrap();
+            assert_eq!(observed["status"], "complete");
+            assert!(observed["pause_kind"].is_null());
+            assert!(observed["cancellation"]["requested_at"].is_string());
+            assert!(
+                observed["cancellation"]["settled_at"].is_null(),
+                "first signal precedes settlement"
+            );
+            assert!(observed["cancellation"]["resumed_at"].is_null());
+            assert_eq!(after.attempts[0].tasks, before.attempts[0].tasks);
+            assert_eq!(
+                after.merge_candidates[0].merge_state.status,
+                MergeCandidateMergeStatus::Pending
+            );
+            let (candidate_path, candidate_bytes) = candidate_snapshot.as_ref().unwrap();
+            assert_eq!(fs::read(candidate_path).unwrap(), *candidate_bytes);
             assert_eq!(after.merge_candidates, before.merge_candidates);
             assert!(
                 after.merge_candidates[0]
@@ -39075,6 +39115,8 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
                     .is_some()
             );
             assert_eq!(resumed.merge_candidates, before.merge_candidates);
+            assert_eq!(resumed.attempts[0].tasks, before.attempts[0].tasks);
+            assert_eq!(fs::read(candidate_path).unwrap(), *candidate_bytes);
             assert!(
                 resumed.merge_candidates[0]
                     .validate_advancement(&resumed)

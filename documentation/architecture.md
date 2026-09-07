@@ -964,7 +964,8 @@ next command or extractor in the same Task cannot launch. Only a new reservation
 admitted by the Work model after explicit resume can clear that stop.
 
 `fluent attempt cancel <work-item-id> <attempt-id>` first persists an optional
-Attempt cancellation record and an `interrupted` pause under the Work model lock.
+Attempt cancellation record under the Work model lock. It also records an
+`interrupted` pause unless the Attempt owns a persisted pending Merge Candidate.
 Task reservation, follow-up creation, completion, Learner capture, and readiness
 reject advancement while that stop is active. Cancellation then validates each
 owned identity before signaling, waits for process trees and execution leases to
@@ -977,12 +978,14 @@ admission. A delayed launch cannot authorize a newer stop during startup;
 completed Tasks remain complete, and canceled verification retries use new
 artifact directories. Historical Attempts without a cancellation record keep
 their existing semantics.
-A reviewed pending Merge Candidate survives the `needs-user` / `interrupted`
-pause only with an active durable cancellation record and Passed reviews. The
-advancement gate rejects that stop even if Learner previously succeeded. Explicit
-resume restores the reviewed Attempt to Complete, preserves the candidate and
-any original readiness timestamp, and resumes Learning when it remains unfinished.
-Other pause, review, and provenance constraints remain enforced.
+An Attempt with a reviewed pending Merge Candidate stays `complete`, with no
+`interrupted` pause kind. Its active typed cancellation record blocks execution
+and advancement, even if Learner previously succeeded. The structural candidate
+invariant retains only its existing host-sandbox pause exception. Matching
+explicit resume consumes the stop after settlement, preserves Tasks, the
+candidate, and its original readiness timestamp, and resumes unfinished Learning.
+The storage guard admits the Complete-state stop only while preserving that
+pending candidate exactly; Task, Learning, and readiness advancement stay blocked.
 Natural completion observes the leader without reaping it, sweeps its process
 group, and then reaps exactly once. On macOS, `killpg` returns `EPERM` when an
 exited, still-waitable leader is the group's only remaining member; Fluent maps

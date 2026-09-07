@@ -4816,14 +4816,10 @@ fn resume_canceled_attempt(
     authorized_stop: Option<&str>,
 ) -> Result<()> {
     mutate_attempt_work_item(store, work, |item| {
-        let pending_candidate_ready_at = item
-            .merge_candidates
-            .iter()
-            .find(|candidate| {
-                candidate.attempt_id == id
-                    && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
-            })
-            .map(|candidate| candidate.ready_at.clone());
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
         let attempt = item
             .attempts
             .iter_mut()
@@ -4855,6 +4851,12 @@ fn resume_canceled_attempt(
                 reason: "canceled local execution has not settled".into(),
             });
         }
+        attempt.cancellation.as_mut().unwrap().resumed_at = Some(crate::work_model::now_iso8601());
+        if has_pending_candidate {
+            // This reviewed Attempt stayed Complete while its typed stop was
+            // active. Resume Learning without changing Tasks or readiness history.
+            return Ok(());
+        }
         let stopped_at = attempt
             .cancellation
             .as_ref()
@@ -4872,21 +4874,15 @@ fn resume_canceled_attempt(
                 }
             }
         }
-        attempt.cancellation.as_mut().unwrap().resumed_at = Some(crate::work_model::now_iso8601());
         crate::work_model::reopen_attempt(attempt);
-        if attempt.review_state == Some(AttemptReviewState::Passed)
-            && (pending_candidate_ready_at.is_some()
-                || (attempt.learning.is_some()
-                    && attempt
-                        .tasks
-                        .iter()
-                        .all(|task| task.status == TaskStatus::Complete)))
+        if attempt.learning.is_some()
+            && attempt.review_state == Some(AttemptReviewState::Passed)
+            && attempt
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete)
         {
-            // Reviews already selected this candidate, including before Learner
-            // reservation. Resume Learning without reopening the Writer round or
-            // changing the first readiness timestamp of a previously ready candidate.
             attempt.status = AttemptStatus::Complete;
-            attempt.completed_at = pending_candidate_ready_at.flatten();
         }
         Ok(())
     })?;
@@ -4904,6 +4900,10 @@ pub fn cancel_local_attempt(
 ) -> Result<usize> {
     let attempt = mutate_attempt_work_item(store, work_item_id, |item| {
         item.ensure_not_abandoned()?;
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
         let attempt = item
             .attempts
             .iter_mut()
@@ -4917,12 +4917,19 @@ pub fn cancel_local_attempt(
                 settled_at: None,
                 resumed_at: None,
             });
-            attempt.status = AttemptStatus::NeedsUser;
-            attempt.pause_kind = Some(PauseKind::Interrupted);
+            if has_pending_candidate {
+                // Preserve the reviewed candidate invariant. The cancellation
+                // record itself pauses Learning and blocks all advancement.
+                attempt.status = AttemptStatus::Complete;
+                attempt.pause_kind = None;
+            } else {
+                attempt.status = AttemptStatus::NeedsUser;
+                attempt.pause_kind = Some(PauseKind::Interrupted);
+                attempt
+                    .completed_at
+                    .get_or_insert_with(crate::work_model::now_iso8601);
+            }
             attempt.pause_recovery = None;
-            attempt
-                .completed_at
-                .get_or_insert_with(crate::work_model::now_iso8601);
         }
         Ok(attempt.clone())
     })?;
@@ -4987,6 +4994,10 @@ pub fn cancel_local_attempt(
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let canceled = mutate_attempt_work_item(store, work_item_id, |item| {
+        let has_pending_candidate = item.merge_candidates.iter().any(|candidate| {
+            candidate.attempt_id == attempt_id
+                && candidate.merge_state.status == MergeCandidateMergeStatus::Pending
+        });
         let attempt = item
             .attempts
             .iter_mut()
@@ -5009,8 +5020,10 @@ pub fn cancel_local_attempt(
                 ));
             }
         }
-        attempt.status = AttemptStatus::NeedsUser;
-        attempt.pause_kind = Some(PauseKind::Interrupted);
+        if !has_pending_candidate {
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::Interrupted);
+        }
         attempt.cancellation.as_mut().unwrap().settled_at = Some(crate::work_model::now_iso8601());
         Ok(executing.len())
     })?;
@@ -10167,9 +10180,27 @@ mod tests {
                 item.mark_merge_candidate_ready("attempt-1").unwrap();
             }
             store.create_work_item(&item).unwrap();
+            let candidate_path = store
+                .work_merge_candidate_path("work-1", &item.merge_candidates[0].id)
+                .unwrap();
+            let candidate_bytes = fs::read(&candidate_path).unwrap();
             cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
             let stopped = store.read_work_item("work-1").unwrap();
+            assert_eq!(stopped.attempts[0].status, AttemptStatus::Complete);
+            assert_eq!(stopped.attempts[0].pause_kind, None);
+            assert_eq!(
+                stopped.attempts[0].completed_at,
+                item.attempts[0].completed_at
+            );
+            assert_eq!(fs::read(&candidate_path).unwrap(), candidate_bytes);
             assert_eq!(stopped.merge_candidates, item.merge_candidates);
+            let mut stale = stopped.clone();
+            stale.attempts[0].completed_at = Some("later".into());
+            stale.merge_candidates[0].ready_at = Some("later".into());
+            assert!(
+                store.write_work_item(&stale).is_err(),
+                "active stop rejects a stale readiness write"
+            );
             assert!(
                 stopped.merge_candidates[0]
                     .validate_advancement(&stopped)
@@ -10185,9 +10216,18 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .requested_at;
+            for authority in [None, Some("older-cancellation")] {
+                assert!(
+                    resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", authority)
+                        .is_err()
+                );
+                assert_eq!(store.read_work_item("work-1").unwrap(), stopped);
+            }
             resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1", Some(stop)).unwrap();
             let resumed = store.read_work_item("work-1").unwrap();
             assert_eq!(resumed.merge_candidates, item.merge_candidates);
+            assert_eq!(resumed.attempts[0].tasks, item.attempts[0].tasks);
+            assert_eq!(fs::read(&candidate_path).unwrap(), candidate_bytes);
             assert_eq!(resumed.attempts[0].status, AttemptStatus::Complete);
             assert_eq!(
                 resumed.attempts[0].completed_at,

@@ -156,34 +156,34 @@ The aggregate invariant `MergeCandidate.candidate_commit == latest completed Wri
 
 ---
 
-## Preserve reviewed candidates across typed recovery pauses
+## Keep the host-sandbox-only candidate exception during cancellation
 
-`MergeCandidate::validate` normally requires a candidate's Attempt to be
-`Complete` with reviews `Passed`; a `Failed` merge remains separately exempt.
-A `NeedsUser` / `HostSandbox` Attempt remains structurally valid because the
-Learner's sandbox preflight runs after Fluent persists the reviewed candidate.
-Terminal cancellation adds one narrow exception: a **pending** candidate also
-survives `NeedsUser` / `Interrupted` when the Attempt carries an active durable
-cancellation record (`resumed_at` is absent). Cancellation must save this stop
-before signaling the Learner. Requiring Complete at that point would reject the
-aggregate before Fluent could stop its worker.
+`MergeCandidate::validate` requires a candidate's Attempt to be `Complete` with
+reviews `Passed`; a `Failed` merge remains separately exempt. Its only recovery
+exception permits `NeedsUser` / `HostSandbox`, because the Learner's sandbox
+preflight runs after Fluent persists the reviewed candidate. Do not broaden
+this structural exception to `Interrupted` or other pauses.
 
-The cancellation exception preserves the reviewed commit and Passed reviews;
-it accepts neither an untyped Interrupted pause, a resumed cancellation record,
-a different pause, nor an executing or merged candidate. Explicit resume after
-settlement restores the reviewed Attempt to Complete, including when canceled
-before Learner reservation. It retains the candidate and its first readiness
-timestamp instead of reopening a Writer round.
+When canceling an Attempt with a persisted pending Merge Candidate, retain
+`Complete`, Passed reviews, the candidate, and its original readiness timestamp.
+Write an active typed `AttemptCancellation` (`resumed_at` is absent) before
+signaling the registered Learner execution. That record is the scheduling pause;
+do not attach an `Interrupted` pause kind to this structurally complete Attempt.
+Other local Attempts continue to use `NeedsUser` / `Interrupted` with their stop.
 
-Structural validity remains separate from advancement. The aggregate can store
-and reload the stopped candidate, but `WorkItem::attempt_learning_advancement`
-rejects an active cancellation even if Learning previously succeeded. After
-explicit resume, the shared Learner gate still requires succeeded Learning.
-Keep `Attempt::learning_advancement_readiness` as the proof of prior Learning
-when validating an existing readiness timestamp; a durable stop must not make
-that history unreadable. Do not broaden either recovery exception to unrelated
-pauses or weaken review, provenance, or readiness checks. See
-[[advancement-requires-a-succeeded-learner]].
+Structural validity remains separate from advancement. Both readiness stamping
+and `WorkItem::attempt_learning_advancement` reject active cancellation even if
+Learning previously succeeded. The storage guard permits the Complete-state stop
+only when the existing pending candidate remains unchanged, while rejecting
+new Task launches, Learning advancement, and stale candidate-readiness writes.
+
+Explicit resume must match the current cancellation authority and wait for
+settlement. It consumes the stop without reopening completed review or Writer
+work or changing readiness history, then may relaunch unfinished Learning.
+After resume the shared Learner gate still requires succeeded Learning. Keep
+`Attempt::learning_advancement_readiness` as the proof of prior Learning when
+validating an existing readiness timestamp; a stop must not make that history
+unreadable. See [[advancement-requires-a-succeeded-learner]].
 
 ---
 
