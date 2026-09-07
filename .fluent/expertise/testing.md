@@ -30,13 +30,14 @@ harness invocation and place explicit build/cache arguments under
 `$FLUENT_EVIDENCE_SCRATCH`.
 
 `fluent attempt evidence run` is the human authorization boundary for that
-model-proposed command. The host creates private scratch before applying the
-sandbox, keeps candidate source read-only, removes provider credentials from the
-child environment, redirects both shell and Core Foundation user-home caches,
-captures the exact result, and uses the existing candidate-bound evidence
-attachment to rerun only the Tests Reviewer. Do not execute these requests
-implicitly from the scheduler, and do not turn them into named project-specific
-subset registries.
+model-proposed command. It persists a typed verification Task. The Task worker
+creates private scratch before applying the sandbox, keeps candidate source
+read-only, removes provider credentials from the child environment, and redirects
+both shell and Core Foundation user-home caches. It retains bounded logs and
+publishes a compact candidate-bound receipt. The Attempt loop validates the
+receipt before using evidence attachment to rerun only the Tests Reviewer.
+Scheduling must never authorize an unapproved model-proposed request implicitly.
+Keep selectors harness-native instead of adding project-specific subset registries.
 
 ## Where failure logs live
 

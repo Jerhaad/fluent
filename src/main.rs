@@ -698,6 +698,7 @@ fn cmd_attempt(
                 "Next: fluent task run {work_item_id} {attempt_id} {}",
                 run.task_id
             );
+            println!("Then: fluent attempt run {work_item_id} {attempt_id}");
         }
         AttemptCommands::Evidence {
             command:

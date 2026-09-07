@@ -100,9 +100,34 @@ fluent attempt evidence run <work-item-id> <attempt-id> \
   --review-artifact .fluent/work/artifacts/.../review.md
 ```
 
-Fluent runs that single review-requested command in its host-only scratch
-environment, records its schema-version-1 result, and routes the result through
-the ordinary attachment path. For a legacy review without structured request
+This invocation authorizes the exact command and persists one candidate-bound
+verification Task. It returns before execution. Follow its printed commands:
+
+```sh
+fluent task run <work-item-id> <attempt-id> <verification-task-id>
+fluent attempt run <work-item-id> <attempt-id>
+```
+
+The worker reads the candidate, writes only private scratch, and keeps bounded
+`stdout.log` and `stderr.log` in its Task artifact directory. It exclusively
+publishes `receipt.json`, binding the candidate, command, working directory,
+checker digest, result, timestamps, exit status, and log digests. The Attempt
+loop validates the receipt and uses the ordinary evidence attachment path to
+start only the targeted Tests Reviewer. It does not hold a project-wide lock
+while the check runs.
+
+If validation fails, inspect the named fixture, receipt, or digest mismatch and
+restore the exact authorized inputs or worker-produced bytes before repeating
+`fluent attempt run`. A changed candidate or checker requires a fresh
+authorization against the current failed review. Do not edit a result to claim
+a pass. A canceled verification requires explicit Attempt resume and writes its
+retry artifacts separately. Automatic receipt ingestion cannot clear a durable
+stop. Validated manual `attach` remains an explicit recovery action for a
+settled interrupted Attempt; an invalid attachment leaves it stopped.
+
+Existing schema-version-1 manual evidence documents remain accepted. Historical
+Tasks omit the optional verification context; historical Attempts omit the
+optional cancellation record. For a legacy review without structured request
 lines, also provide its exact `--command` and `--working-directory`. Use `run`
 when Fluent must perform the focused check; use `attach` when an authorized host
 has already produced the JSON evidence document. Use `classify` only after a

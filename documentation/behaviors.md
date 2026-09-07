@@ -30,6 +30,100 @@ WHEN the dashboard receives navigation, view, help, copy, or refresh input,
 THE SYSTEM SHALL not modify stored Work state.
 Test: src/dashboard/tests.rs (dashboard_controls_leave_work_state_unchanged)
 
+## Scheduled public verification
+
+### B1
+
+WHEN a candidate requires an approved public verification command,
+THE SYSTEM SHALL persist one schedulable verification Task bound to the exact
+Work Item, Attempt, candidate commit, command identity, working directory, and
+checker definition before reporting that verification as executing.
+Test: tests/binary.rs (focused_evidence_run_schedules_candidate_bound_verification_task)
+
+### B2
+
+WHEN the scheduler runs a verification Task,
+THE SYSTEM SHALL execute the command in a worker with read-only candidate access,
+a private writable scratch area, bounded logs, the existing credential-denial
+policy, and the ordinary Task lease and process-settlement lifecycle.
+Test: tests/binary.rs (scheduled_verification_task_runs_in_confined_worker)
+
+### B3
+
+WHEN a verification worker finishes,
+THE SYSTEM SHALL retain detailed stdout and stderr in the Task artifact area and
+publish a compact immutable receipt that binds the candidate commit, command,
+working directory, checker digest, result, timestamps, exit status, and artifact
+digests; only a valid receipt may advance evidence review.
+Test: tests/binary.rs (verification_receipt_is_compact_immutable_and_candidate_bound)
+
+### B4
+
+IF a verification fixture, receipt, candidate identity, checker digest, or
+artifact digest is missing, malformed, stale, or inconsistent,
+THEN THE SYSTEM SHALL reject it before readiness without changing the candidate
+or claiming the check passed; a corrected worker result for the same authorized
+frontier may subsequently be accepted.
+Test: tests/binary.rs (invalid_verification_receipt_blocks_then_corrected_receipt_advances)
+
+### B5
+
+WHILE a verification worker is running for one Attempt,
+THE SYSTEM SHALL release project-global coordination locks so an unrelated
+Attempt can be scheduled and make durable progress.
+Test: tests/binary.rs (verification_worker_does_not_block_unrelated_attempt_progress)
+
+## Terminal cancellation ownership
+
+### B1
+
+WHEN an operator cancels a local Attempt,
+THE SYSTEM SHALL first persist one durable cancellation intent that prevents any
+new Task, review phase, Tester, verification, or Learner launch for that Attempt,
+then stop and settle every already-owned local execution.
+Test: tests/binary.rs (attempt_cancel_persists_stop_before_settling_active_execution)
+
+### B2
+
+WHEN cancellation races with setup or launch,
+THE SYSTEM SHALL expose a cancellable execution identity before any Task appears
+executing and SHALL make the launcher recheck the durable stop boundary before
+starting the child process.
+Test: src/work_task_executor.rs (task_execution_identity_precedes_executing_state_and_honors_stop)
+
+### B3
+
+WHEN cancellation occurs during Writer, scheduled verification, Tester, review,
+or Learner execution,
+THE SYSTEM SHALL stop that owned worker, settle its process tree, suspend the
+same Attempt for explicit resume, and launch no downstream stage.
+Test: tests/binary.rs (attempt_cancel_stops_each_stage_without_downstream_launch)
+
+### B4
+
+WHEN the same cancellation is requested again after the Attempt is suspended,
+THE SYSTEM SHALL return the already-settled result without requiring another
+active process and without mutating history a second time.
+Test: tests/binary.rs (attempt_cancel_is_idempotent_after_settlement)
+
+## Dashboard verification journeys
+
+### B1
+
+WHEN a user opens dashboard help in a populated terminal,
+THE SYSTEM SHALL show usable navigation guidance and close help through its
+documented control; verification SHALL assert these state transitions and
+controls rather than require one incidental prose word.
+Test: tests/behaviors/operations/test-work-status-dashboard.sh (test_dashboard_help_journey)
+
+### B2
+
+WHEN Work-item read errors overflow the visible dashboard region and the user
+presses `e`,
+THE SYSTEM SHALL expose the error view or error content, allow return to normal
+navigation, and leave every stored Work file byte-for-byte unchanged.
+Test: tests/behaviors/operations/test-work-status-dashboard.sh (test_dashboard_overflow_error_journey)
+
 ## Read-only Work snapshots
 
 ### B1

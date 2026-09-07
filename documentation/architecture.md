@@ -941,12 +941,24 @@ context. When that Task owns the Attempt's current pause, Fluent also replaces
 the managed `needs-user.md` atomically and reports recovery only after that write
 succeeds. The loop reloads stored state before deciding the next transition.
 
-Each local coder launch also writes `execution.json` beside its transcript and
-holds an inherited `execution-owner.lock` across the process tree. The record
-contains the owner, leader, process group, heartbeat, and terminal state. `fluent
-attempt cancel <work-item-id> <attempt-id>` validates both the identity lock and
-process group before signaling, confirms the group has stopped, and records an
-`interrupted` pause. Resuming replans only canceled `NeedsUser` Tasks.
+`execution.rs` publishes a `launching` execution identity beside the Task
+transcript before the Task becomes `executing`. Its shared spawn boundary checks
+for cancellation and publishes the child identity under the same execution lock.
+The process tree holds an inherited `execution-owner.lock`; `execution.json`
+records the owner, leader, process group, heartbeat, and terminal state. Nested
+Tester commands belong to their Task, and Learner executions register their
+identities before entering `in-progress`.
+
+`fluent attempt cancel <work-item-id> <attempt-id>` first persists an optional
+Attempt cancellation record and an `interrupted` pause under the Work model lock.
+Task reservation, follow-up creation, completion, Learner capture, and readiness
+reject advancement while that stop is active. Cancellation then validates each
+owned identity before signaling, waits for process trees and execution leases to
+settle, and records settlement. Repeating the same settled cancellation changes
+no history. Explicit `attempt run` records resume and replans unfinished work;
+completed Tasks remain complete, and canceled verification retries use new
+artifact directories. Historical Attempts without a cancellation record keep
+their existing semantics.
 Natural completion observes the leader without reaping it, sweeps its process
 group, and then reaps exactly once. On macOS, `killpg` returns `EPERM` when an
 exited, still-waitable leader is the group's only remaining member; Fluent maps
@@ -1060,8 +1072,15 @@ fluent attempt evidence run <work-item> <attempt> \
 
 The operator invocation authorizes that exact model-proposed command. Fluent
 accepts one direct, single-line harness invocation, binds it to the latest
-failed Tests Review and unchanged Writer commit, and runs it under a host-owned
-Seatbelt profile. Candidate source is read-only. `HOME`, Core Foundation's
+failed Tests Review and unchanged Writer commit, and persists one idempotent
+`verification` Task with an optional typed `verification_context`. The context
+binds the command, candidate-relative working directory, timeout, sandbox and
+checker digests, and failed review digest. Historical Tasks omit this field.
+The CLI reports `fluent task run <work-item> <attempt> <task>` followed by
+`fluent attempt run <work-item> <attempt>`. Task execution uses the ordinary
+reservation, Task lease, process ownership, and settlement boundaries, under a
+host-owned Seatbelt profile. Planning and receipt attachment hold only short
+coordination locks; command execution holds no project-global lock. Candidate source is read-only. `HOME`, Core Foundation's
 fixed user home, `TMPDIR`, Cargo, Clang, and Swift build/cache paths point into
 an already-created private run directory available as
 `$FLUENT_EVIDENCE_SCRATCH`; this keeps Foundation-backed macOS caches private
@@ -1074,8 +1093,17 @@ environment is rebuilt from a small toolchain
 allowlist, so provider credentials and enclosing-agent variables do not reach
 the check. Each run owns a process group and a
 bounded deadline; timeout advances only after Fluent confirms cleanup. Fluent
-captures stdout and stderr, writes one schema-version-1 evidence document with
-exclusive creation, and passes that document to the ordinary attachment path.
+drains stdout and stderr into separate logs capped at 384 KiB each, retaining
+those files in the Task artifact directory. `verification.rs` exclusively
+publishes `receipt.json`, binding Work Item, Attempt, Task, candidate, command,
+working directory, checker digest, result, timestamps, exit status, and artifact
+digests. The Attempt loop accepts receipts up to 16 KiB, validates every binding
+and log digest, then attaches a compact schema-version-1 evidence summary with
+the receipt reference and digest. Detailed logs stay outside the summary.
+Missing, malformed, stale, or inconsistent inputs block acceptance; restoring
+the authorized inputs and exact worker-produced result permits another validation
+attempt without changing the candidate. Automatic ingestion cannot resume a
+canceled Attempt.
 Legacy reviews without structured request lines require the operator to supply
 both `--command` and `--working-directory`; a structured request cannot be
 overridden with different values.
@@ -1095,7 +1123,10 @@ schema-version-1 JSON document containing `producer`, `check`,
 `output`. Fluent validates and snapshots its exact bytes under the Attempt's
 managed artifacts, binds its digest to the named candidate commit, and plans
 only the named failed reviewer roles. Attachment never changes the candidate or
-approved planning inputs, and it cannot make a candidate landable. Passing
+approved planning inputs, and it cannot make a candidate landable. Existing
+schema-version-1 manual documents remain compatible. Validated manual attachment
+can explicitly resume a settled interrupted Attempt; invalid input leaves the
+stop intact. Passing
 evidence follows the ordinary host-only attachment path and cannot authorize a
 source correction.
 
@@ -1255,7 +1286,11 @@ retains and labels the last successful snapshot after a read failure, and draws
 only when visible state changes. `dashboard.rs` owns terminal setup and the
 event loop; `dashboard/snapshot.rs`, `dashboard/app.rs`, and
 `dashboard/render.rs` respectively own projection, interaction state, and pure
-Ratatui rendering.
+Ratatui rendering. `dashboard/layout.rs` computes shared wrapping and scroll
+bounds without depending on interaction state or rendering. The `e` control
+opens a scrollable view of all Work read errors, including errors that overflow
+the list. `e` or Esc returns to the preserved selection. Help wraps navigation
+instructions and closes with `?` or Esc. Both controls leave Work files unchanged.
 Next-action guidance consumes these rows directly. A `merge-ready` row renders
 `merge-candidate show` and `merge-candidate land` with both its Work Item ID and
 Merge Candidate ID. A ready `attempt run` outcome uses the command's Work Item
@@ -3164,7 +3199,8 @@ fluent/main/
     content.rs               ← Runtime content resolution (project → user → bundled)
     credential.rs            ← Keychain credential injection
     dashboard.rs             ← Operator-console entry point and terminal session
-    dashboard/               ← Snapshot projection, interaction state, rendering
+    dashboard/               ← Snapshot projection, interaction state, layout, rendering
+    execution.rs             ← Register, supervise, and cancel local process ownership
     fargate.rs               ← Fargate launch, watch, stop, and pull for Work execution
     fargate_bootstrap.rs     ← JIT Fargate setup (CFN, base + project image builds)
     follow_up.rs             ← Land-gated follow-up materialization: pending operation, journal, corrective host gate, derived Work intake
@@ -3189,6 +3225,7 @@ fluent/main/
     transcript.rs            ← Parse stream-json transcripts incrementally
     update.rs                ← Self-update and update-check nudge
     usage.rs                 ← Per-turn usage row logging and summary cache
+    verification.rs          ← Execute approved verification Tasks and validate receipts
     version.rs               ← Version command output format
     work_attempt_loop.rs     ← Advance one Work model Attempt
     work_merge_executor.rs   ← Execute Work Merge Candidates
@@ -3274,6 +3311,16 @@ bypass log writing.
 
 Several modules own operational policy that would otherwise blur across
 the CLI, Work model, and git helpers.
+
+### Public verification
+
+`host_evidence.rs` validates operator authorization and persists verification
+Tasks. `verification.rs` executes their confined checks and validates immutable
+receipts. `work_task_executor.rs` owns reservation and Task settlement;
+`work_attempt_loop.rs` accepts the receipt and advances targeted evidence review.
+`execution.rs` serializes child launch with cancellation across coder and
+non-coder workers. These modules reuse Work model, lease, sandbox, and evidence
+attachment boundaries; they introduce no second execution ledger.
 
 ### Project hooks
 

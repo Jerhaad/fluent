@@ -633,7 +633,8 @@ pub enum AttemptCommands {
         attempt_id: String,
     },
 
-    /// Stop owned local coder processes and suspend the same Attempt for recovery.
+    /// Persist a stop, settle all owned local workers, and suspend for explicit resume.
+    /// Repeating cancellation after settlement leaves history unchanged.
     Cancel {
         /// Work Item ID
         work_item_id: String,
@@ -694,7 +695,8 @@ pub enum AttemptEvidenceCommands {
         #[arg(long)]
         resolution: String,
     },
-    /// Run one failed Tests Review's focused check and attach its result
+    /// Schedule one failed Tests Review's approved check as a verification Task.
+    /// Run the printed Task command, then resume the Attempt to validate its receipt.
     Run {
         /// Work Item ID
         work_item_id: String,

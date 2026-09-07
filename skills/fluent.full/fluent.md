@@ -251,11 +251,14 @@ When the pause is `provider-unavailable`, read the needs-user handoff first.
 If it identifies invalid pass-through provider arguments, remove or correct those
 arguments, then run `fluent attempt run <work-item-id> [attempt-id]` to retry the
 same Task. If it identifies exhausted provider capacity, wait for capacity, then
-run that same command without new input. For a hung or interrupted local coder,
-run `fluent attempt cancel <work-item-id> <attempt-id>`;
-after Fluent confirms its owned process group stopped, the same `attempt run`
-command replans only the canceled Task. Fluent keeps completed peer Tasks and
-prior transcripts.
+run that same command without new input. To stop a local Attempt, run
+`fluent attempt cancel <work-item-id> <attempt-id>`. Fluent persists the stop
+before settling owned Writer, verification, Tester, review, and Learner workers.
+No downstream stage starts until explicit resume. Repeating cancellation after
+settlement returns the settled result without changing history. Run
+`fluent attempt run <work-item-id> <attempt-id>` after settlement to retry
+unfinished work. Fluent preserves completed Tasks and prior artifacts; canceled
+verification retries use a new artifact directory.
 
 When an uncertain Architecture review has a ratified replacement design, save the
 complete replacement Approach and run:
@@ -281,7 +284,9 @@ operator authorizes a source correction (or for a legacy paused recovery with an
 unqualified marker). A single malformed `Disposition: evidence-needed` marker
 follows the ordinary Writer path; missing, duplicate, or unknown disposition
 markers remain an uncertain pause. Use the public `fluent attempt evidence run`
-path when Fluent must execute one focused Tests Review command, `attach` when
+path to authorize and schedule one focused Tests Review command. Run the printed
+`fluent task run` command, then `fluent attempt run` to validate the worker's
+receipt and start targeted evidence review. Use `attach` when
 the host already has the schema-version-1 JSON result, and `classify` only when
 a failed result authorizes a source correction.
 
