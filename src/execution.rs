@@ -422,13 +422,12 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
         .with_context(|| format!("reading local execution record {}", path.display()))?;
     let mut record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
-    if !matches!(
-        record.state,
-        ExecutionState::Launching | ExecutionState::Running
-    ) {
+    if record.state == ExecutionState::Canceled {
         return Ok(CancelOutcome::AlreadyStopped);
     }
 
+    // A settled child may be followed by another command in the same Task.
+    // Preserve the stop so that command cannot launch without a new reservation.
     if !identity_is_held(path)? {
         record.state = ExecutionState::Canceled;
         record.settled_at = Some(crate::work_model::now_iso8601());
@@ -463,6 +462,48 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn cancel_settled_execution_blocks_later_children_until_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("transcript.jsonl");
+        let path = record_path_for_transcript(&transcript);
+        prepare_launch(&transcript).unwrap();
+        let mut first = Command::new("/bin/sh");
+        first.args(["-c", "exit 0"]);
+        assert!(output(&mut first, &transcript).unwrap().status.success());
+        let settled: ExecutionRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settled.state, ExecutionState::Settled);
+
+        assert_eq!(cancel(&path).unwrap(), CancelOutcome::AlreadyStopped);
+        let marker = dir.path().join("next-started");
+        let mut next = Command::new("touch");
+        next.arg(&marker);
+        let launched = output(&mut next, &transcript);
+        assert!(
+            launched.is_err(),
+            "canceling a settled child must block the next launch"
+        );
+        assert!(!marker.exists());
+        let stopped = std::fs::read(&path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ExecutionRecord>(&stopped)
+                .unwrap()
+                .state,
+            ExecutionState::Canceled
+        );
+        assert_eq!(cancel(&path).unwrap(), CancelOutcome::AlreadyStopped);
+        assert_eq!(std::fs::read(&path).unwrap(), stopped);
+
+        // Task reservation calls prepare_launch only after the Work model admits
+        // explicit resume; completed commands within one reservation do not.
+        prepare_launch(&transcript).unwrap();
+        let mut resumed = Command::new("touch");
+        resumed.arg(&marker);
+        assert!(output(&mut resumed, &transcript).unwrap().status.success());
+        assert!(marker.exists());
+    }
 
     #[test]
     fn failed_launch_settles_owned_process_tree() {

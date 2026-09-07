@@ -39016,3 +39016,180 @@ fn attempt_cancel_stops_each_stage_without_downstream_launch() {
         );
     }
 }
+
+#[test]
+fn attempt_cancel_between_tester_commands_blocks_next_child() {
+    cancel_tester_at_settled_command_boundary(true);
+}
+
+#[test]
+fn attempt_cancel_between_tester_command_and_extractor_blocks_next_child() {
+    cancel_tester_at_settled_command_boundary(false);
+}
+
+fn cancel_tester_at_settled_command_boundary(next_command: bool) {
+    use fluent::{
+        execution::{ExecutionRecord, ExecutionState},
+        work_model::*,
+    };
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let first_started = tmp.path().join("first-started");
+    let next_started = tmp.path().join("next-started");
+    let extractor_started = tmp.path().join("extractor-started");
+    let first = format!("touch '{}'; printf first-output", first_started.display());
+    let mut commands = vec![serde_json::json!({"command":first,"test_harness":"shell-harness"})];
+    if next_command {
+        commands.push(serde_json::json!({
+            "command":format!("touch '{}'", next_started.display()),
+            "test_harness":"shell-harness"
+        }));
+    }
+    commit_file(
+        &project,
+        ".fluent/tester.yaml",
+        &serde_json::to_string(&serde_json::json!({"commands":commands})).unwrap(),
+        "Add Tester boundary fixture",
+    );
+    commit_file(
+        &project,
+        ".fluent/extract-tester-results",
+        &format!(
+            "#!/bin/sh\nif [ -f \"$1/commands/0-stderr.log\" ]; then touch '{}'; fi\nprintf '[]\\n'\n",
+            extractor_started.display()
+        ),
+        "Record final extractor launch",
+    );
+    let id = format!(
+        "cancel-gap-{}-{next_command}",
+        tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    let (project, candidate, _) =
+        create_focused_evidence_item(project, &id, "tests", "Verdict: fail\n");
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item(&id).unwrap();
+    let task_id = item.add_final_tester_task("attempt-1").unwrap();
+    item.attempts[0].status = AttemptStatus::Reviewing;
+    item.attempts[0].pause_kind = None;
+    let area = project.join(
+        &item.attempts[0]
+            .tasks
+            .last()
+            .unwrap()
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+    );
+    store.write_work_item(&item).unwrap();
+    let _workspace = bind_candidate_to_managed_sibling(&project, &id, &candidate);
+    fs::create_dir_all(area.join("commands")).unwrap();
+    let fifo = area.join("commands/0-stdout.log");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let record_path = area.join("execution.json");
+    let diagnostics = tmp.path().join("tester.log");
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+    command
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+        .args(["task", "run", &id, "attempt-1", &task_id, "--no-sandbox"])
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&diagnostics).unwrap());
+    let mut runner = OwnedFixtureProcess::spawn(&mut command);
+    // run_command writes stdout after execution::output has settled the child.
+    // With no FIFO reader, that write cannot finish or start another command.
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || {
+            first_started.is_file()
+                && fs::read(&record_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<ExecutionRecord>(&bytes).ok())
+                    .is_some_and(|record| record.state == ExecutionState::Settled)
+        }),
+        "Tester must reach the settled-child barrier: {}",
+        fs::read_to_string(&diagnostics).unwrap()
+    );
+    assert!(
+        !area.join("commands/0-stderr.log").exists(),
+        "stdout publication holds the barrier"
+    );
+    assert!(!cancellation_fixture_owns_execution(&record_path));
+    assert_eq!(
+        store.read_work_item(&id).unwrap().attempts[0]
+            .tasks
+            .last()
+            .unwrap()
+            .status,
+        TaskStatus::Executing
+    );
+    assert!(fluent::lease::is_leased(&fluent::lease::task_lock_path(
+        &project, &id, &task_id
+    )));
+    assert!(!next_started.exists() && !extractor_started.exists());
+    let task_count = store.read_work_item(&id).unwrap().attempts[0].tasks.len();
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+    command
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["attempt", "cancel", &id, "attempt-1"])
+        .stdout(std::process::Stdio::null());
+    let mut cancel = OwnedFixtureProcess::spawn(&mut command);
+    let stopped_between_children = poll_until(std::time::Duration::from_secs(3), || {
+        fs::read(&record_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ExecutionRecord>(&bytes).ok())
+            .is_some_and(|record| record.state == ExecutionState::Canceled)
+    });
+    // Open the reader without blocking even on failure, and keep it open until
+    // the runner exits. This releases the existing writer, not a new child.
+    let _release = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || runner
+            .try_wait()
+            .unwrap()
+            .is_some()),
+        "Tester runner must settle after one cancellation"
+    );
+    assert!(
+        poll_until(std::time::Duration::from_secs(8), || {
+            cancel.try_wait().unwrap().is_some_and(|status| {
+                assert!(status.success());
+                true
+            })
+        }),
+        "one cancellation must settle without another request"
+    );
+    assert!(
+        !next_started.exists(),
+        "cancellation must prevent the next Tester command"
+    );
+    assert!(
+        !extractor_started.exists(),
+        "cancellation must prevent the Tester extractor"
+    );
+    assert!(
+        stopped_between_children,
+        "the stop must persist across the settled interval"
+    );
+    assert!(!cancellation_fixture_owns_execution(&record_path));
+    let after = store.read_work_item(&id).unwrap();
+    assert_eq!(after.attempts[0].status, AttemptStatus::NeedsUser);
+    assert_eq!(after.attempts[0].pause_kind, Some(PauseKind::Interrupted));
+    assert!(
+        after.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .settled_at
+            .is_some()
+    );
+    assert_eq!(after.attempts[0].tasks.len(), task_count);
+}

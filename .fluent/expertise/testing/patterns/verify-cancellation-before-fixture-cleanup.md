@@ -33,6 +33,15 @@ snapshot before releasing the worker. Mutation-check these assertions by moving
 signaling before intent or writing terminal metadata without signaling, restore
 the source, then rerun the ordinary focused command.
 
+To cancel between Tester children, precreate `commands/0-stdout.log` as a FIFO
+without a reader. Tester blocks while publishing stdout after the first child
+settles, retaining its Task lease. Confirm the settled record, released inherited
+ownership, and held Task lease; issue one cancellation and wait for the record to
+become canceled. Open the FIFO read-only with `O_NONBLOCK` and retain that reader
+until the runner exits. Require both runner and cancellation to exit within a
+bounded wait, and assert that neither the next command nor the extractor wrote
+its launch marker. This barrier exercises the gap without production test hooks.
+
 ## Example
 
 `tests/binary.rs::attempt_cancel_stops_each_stage_without_downstream_launch`
@@ -40,3 +49,7 @@ captures worker and descendant identities for Writer, verification, Tester,
 review, and Learner. Its eight-second cancellation deadline is shorter than the
 fixtures' 120-second lifetime, and it checks OS process exit and inherited
 ownership before either fixture guard can clean up.
+
+`attempt_cancel_between_tester_commands_blocks_next_child` and
+`attempt_cancel_between_tester_command_and_extractor_blocks_next_child` use the
+FIFO barrier to verify both transitions after a naturally settled Tester child.

@@ -90,6 +90,7 @@ THE SYSTEM SHALL expose a cancellable execution identity before any Task appears
 executing and SHALL make the launcher recheck the durable stop boundary before
 starting the child process.
 Test: src/work_task_executor.rs (task_execution_identity_precedes_executing_state_and_honors_stop)
+Test: src/execution.rs (cancel_settled_execution_blocks_later_children_until_reservation)
 
 ### B3
 
@@ -98,6 +99,7 @@ or Learner execution,
 THE SYSTEM SHALL stop that owned worker, settle its process tree, suspend the
 same Attempt for explicit resume, and launch no downstream stage.
 Test: tests/binary.rs (attempt_cancel_stops_each_stage_without_downstream_launch)
+Test: tests/binary.rs (attempt_cancel_between_tester_commands_blocks_next_child, attempt_cancel_between_tester_command_and_extractor_blocks_next_child)
 
 ### B4
 

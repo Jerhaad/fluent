@@ -948,6 +948,9 @@ The process tree holds an inherited `execution-owner.lock`; `execution.json`
 records the owner, leader, process group, heartbeat, and terminal state. Nested
 Tester commands belong to their Task, and Learner executions register their
 identities before entering `in-progress`.
+Cancellation marks even a naturally `settled` child record as `canceled`, so the
+next command or extractor in the same Task cannot launch. Only a new reservation
+admitted by the Work model after explicit resume can clear that stop.
 
 `fluent attempt cancel <work-item-id> <attempt-id>` first persists an optional
 Attempt cancellation record and an `interrupted` pause under the Work model lock.
