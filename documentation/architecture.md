@@ -3287,6 +3287,13 @@ Three files form the Tester contract:
   inventory. Tester reports unavailable collection as a harness error and
   records any surviving scoped Fluent, Claude, Codex, or Pi process with its
   PID, kind, and directory in the command's settlement evidence.
+  `src/process_settlement.rs` resolves selected processes with `lsof`. Only
+  exit 1 with empty stdout and stderr triggers a PID-specific `ps` state
+  check. Exited processes and zombies are omitted; a live process gets at
+  most three immediate cwd probes. Permission errors, malformed output,
+  and persistent live processes without a cwd make the inventory unavailable.
+  This keeps transient process rows from discarding usable baseline results
+  while preserving the pre/post leak comparison.
 - `.fluent/extract-tester-results` — project's executable that
   normalizes raw command output into a per-test JSON array on stdout.
   Receives the artifact directory as its single argument, reads
