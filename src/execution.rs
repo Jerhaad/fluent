@@ -278,13 +278,32 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
     if let Err(error) = write_running_record(&path, child.id()) {
-        let _ = signal_process_group(child.id(), libc::SIGKILL);
-        let _ = child.wait();
-        return Err(error);
+        return match settle_failed_launch(child, transcript) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!("launch cleanup failed: {cleanup:#}"))),
+        };
     }
     Ok(child)
+}
+
+/// Sweep and reap a spawned child when setup fails before normal supervision.
+pub(crate) fn settle_failed_launch(child: std::process::Child, transcript: &Path) -> Result<()> {
+    let (_, _, disposition) =
+        crate::coder::wait_owned_process_tree(child, Duration::ZERO).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        disposition.is_verified_swept(),
+        "failed launch process cleanup was not confirmed: {disposition:?}"
+    );
+    anyhow::ensure!(
+        wait_for_identity_release(
+            &record_path_for_transcript(&owned_transcript(transcript)),
+            TERMINATION_GRACE,
+        )?,
+        "failed launch still owns its execution identity"
+    );
+    Ok(())
 }
 
 /// Capture a deterministic Task command under the same cancellation identity.
@@ -444,6 +463,36 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn failed_launch_settles_owned_process_tree() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("stdout.log");
+        prepare_launch(&transcript).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30 & echo ready; wait"])
+            .stdout(std::process::Stdio::piped());
+        let mut child = spawn(&mut command, &transcript).unwrap();
+        let pid = child.id();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        assert!(identity_is_held(&record_path_for_transcript(&transcript)).unwrap());
+        settle_failed_launch(child, &transcript).unwrap();
+        assert!(!identity_is_held(&record_path_for_transcript(&transcript)).unwrap());
+        assert_eq!(
+            unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
 
     #[test]
     fn liveness_probe_does_not_create_identity_lock() {

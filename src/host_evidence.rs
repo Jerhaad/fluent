@@ -1704,12 +1704,32 @@ pub(crate) fn execute_focused_command(
     let transcript = run_dir.join("stdout.log");
     let mut child = crate::execution::spawn(&mut process, &transcript)
         .with_context(|| format!("spawn focused evidence command: {command}"))?;
-    let mut execution = crate::execution::ExecutionHeartbeat::start(&transcript, child.id())?;
-    let stdout_pipe = child.stdout.take().context("missing verification stdout")?;
-    let stderr_pipe = child.stderr.take().context("missing verification stderr")?;
+    let setup = (|| -> Result<_> {
+        Ok((
+            crate::execution::ExecutionHeartbeat::start(&transcript, child.id())?,
+            child.stdout.take().context("missing verification stdout")?,
+            child.stderr.take().context("missing verification stderr")?,
+        ))
+    })();
+    let (mut execution, stdout_pipe, stderr_pipe) = match setup {
+        Ok(setup) => setup,
+        Err(error) => {
+            return match crate::execution::settle_failed_launch(child, &transcript) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("launch cleanup failed: {cleanup:#}"))),
+            };
+        }
+    };
     let stdout_capture = std::thread::spawn(move || capture_focused_log(stdout_pipe, stdout));
     let stderr_capture = std::thread::spawn(move || capture_focused_log(stderr_pipe, stderr));
-    let waited = crate::coder::wait_owned_process_tree(child, timeout);
+    let (natural_exit_code, timed_out, disposition) =
+        crate::coder::wait_owned_process_tree(child, timeout).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        disposition.is_verified_swept(),
+        "focused evidence process cleanup was not confirmed: {disposition:?}"
+    );
+    // Join readers only after the shared supervisor confirms that descendants
+    // cannot keep their pipes open, and never claim settlement before that check.
     execution.settle()?;
     stdout_capture
         .join()
@@ -1717,12 +1737,6 @@ pub(crate) fn execute_focused_command(
     stderr_capture
         .join()
         .map_err(|_| anyhow::anyhow!("verification stderr capture panicked"))??;
-    let (natural_exit_code, timed_out, disposition) =
-        waited.map_err(|error| anyhow::anyhow!(error))?;
-    anyhow::ensure!(
-        disposition.is_verified_swept(),
-        "focused evidence process cleanup was not confirmed: {disposition:?}"
-    );
     let exit_code = if timed_out { 124 } else { natural_exit_code };
     Ok(FocusedExecution { exit_code })
 }
