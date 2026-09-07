@@ -37052,20 +37052,35 @@ fn legacy_ownership_old_reader_refuses_mutation() {
     ownership_approve(&project, "old-reader-ownership", &preview)
         .assert()
         .success();
-    let before = work_item_value(&project, "old-reader-ownership");
-    let output = Command::new(binary)
-        .current_dir(&project)
-        .env("FLUENT_NO_UPDATE_CHECK", "1")
-        .args(["work-item", "upgrade", "old-reader-ownership"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("schema"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(work_item_value(&project, "old-reader-ownership"), before);
+    let work_root = project.join(".fluent/work");
+    let record_path = work_root.join("items/old-reader-ownership.json");
+    let current_record = read_json_path(&record_path);
+    let legacy_version = current_record["model_writer_version"]["version"]
+        .as_str()
+        .expect("current records must carry a writer envelope");
+    for (legacy_writer, expected_error) in [
+        (false, "invalid type: map, expected a string"),
+        (true, "schema"),
+    ] {
+        let mut record = current_record.clone();
+        if legacy_writer {
+            // Restore only the old writer representation so this fixture also
+            // reaches the ownership schema fence behind the envelope fence.
+            record["model_writer_version"] = serde_json::json!(legacy_version);
+            write_json_path(&record_path, &record);
+        }
+        let before = snapshot_tree(&work_root);
+        let output = Command::new(&binary)
+            .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args(["work-item", "upgrade", "old-reader-ownership"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{stderr}");
+        assert_eq!(snapshot_tree(&work_root), before);
+    }
 }
 
 #[test]

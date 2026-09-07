@@ -20,6 +20,12 @@ Keep this preparation in the declared Tester command so the test cannot silently
 skip compatibility verification when the executable is absent. Never substitute
 an installed binary or the integration branch's target directory.
 
+When a new record envelope rejects the reader before a previously tested schema
+fence, keep the current-format refusal case and add a fixture that restores only
+the older envelope representation. Preserve the protected schema fields so that
+fixture still proves the inner fence rejects mutation. Compare stored bytes and
+directory entries after both refusals.
+
 ## Example
 
 `tests/fixtures/build-ownership-old-reader.sh` prepares the source pinned in that
