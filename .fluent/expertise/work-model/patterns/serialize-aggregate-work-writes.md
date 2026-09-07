@@ -55,3 +55,6 @@ the target revision publishes, compare with the target children instead. Keep
 that digest in new journals and accept its absence when recovering legacy
 journals. Without proof, observation reports the item unavailable while keeping
 unrelated Work visible. Never assemble a replacement row from journal contents.
+Treat only a not-found error as an absent journal or optional collection. Preserve
+other lookup, read, and metadata errors so observation cannot silently omit a
+pending transaction or stored child.

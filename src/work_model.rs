@@ -10395,10 +10395,15 @@ impl WorkModelStore {
         id: &str,
     ) -> Result<Option<WorkItemTransaction>, WorkModelStorageError> {
         let path = self.work_transaction_path(id)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let transaction: WorkItemTransaction = read_json_file(&path)?;
+        let transaction: WorkItemTransaction = match read_json_file(&path) {
+            Ok(transaction) => transaction,
+            Err(WorkModelStorageError::ReadFile { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let expected_target = match transaction.base_revision {
             Some(base) => base.checked_add(1),
             None => Some(0),
@@ -10592,12 +10597,8 @@ impl WorkModelStore {
         work_item_id: &str,
     ) -> Result<Vec<Attempt>, WorkModelStorageError> {
         let attempts_dir = self.work_attempts_dir().join(work_item_id);
-        if !attempts_dir.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut attempts = Vec::new();
-        for path in list_json_paths(&attempts_dir)? {
+        for path in list_optional_json_paths(&attempts_dir)? {
             let record = read_json_file::<AttemptRecord>(&path)?;
             ensure_supported_record_schema(&path, "Attempt", record.schema_version)?;
             let order = record.order;
@@ -10639,13 +10640,9 @@ impl WorkModelStore {
         attempt_id: &str,
     ) -> Result<Vec<Task>, WorkModelStorageError> {
         let tasks_dir = self.work_tasks_dir().join(work_item_id).join(attempt_id);
-        if !tasks_dir.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut tasks = Vec::new();
         let mut task_orders = HashSet::new();
-        for path in list_json_paths(&tasks_dir)? {
+        for path in list_optional_json_paths(&tasks_dir)? {
             let record: TaskRecord = read_json_file(&path)?;
             let order_key = record.order_key(attempt_id);
             let task = record.task;
@@ -10708,25 +10705,30 @@ impl WorkModelStore {
         attempts: &[Attempt],
     ) -> Result<(), WorkModelStorageError> {
         let tasks_item_dir = self.work_tasks_dir().join(work_item_id);
-        if !tasks_item_dir.exists() {
-            return Ok(());
-        }
-
         let attempt_ids: HashSet<&str> =
             attempts.iter().map(|attempt| attempt.id.as_str()).collect();
-        let entries = fs::read_dir(&tasks_item_dir).map_err(|source| {
-            WorkModelStorageError::ReadDirectory {
-                path: tasks_item_dir.clone(),
-                source,
+        let entries = match fs::read_dir(&tasks_item_dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(WorkModelStorageError::ReadDirectory {
+                    path: tasks_item_dir,
+                    source,
+                });
             }
-        })?;
+        };
         for entry in entries {
             let entry = entry.map_err(|source| WorkModelStorageError::ReadDirectory {
                 path: tasks_item_dir.clone(),
                 source,
             })?;
             let path = entry.path();
-            if !path.is_dir() || !self.collection_has_json_records(&path)? {
+            let metadata =
+                fs::metadata(&path).map_err(|source| WorkModelStorageError::ReadDirectory {
+                    path: path.clone(),
+                    source,
+                })?;
+            if !metadata.is_dir() || !self.collection_has_json_records(&path)? {
                 continue;
             }
             let attempt_id = path
@@ -10748,20 +10750,28 @@ impl WorkModelStore {
     }
 
     fn collection_has_json_records(&self, dir: &Path) -> Result<bool, WorkModelStorageError> {
-        if !dir.exists() {
-            return Ok(false);
-        }
-        let entries = fs::read_dir(dir).map_err(|source| WorkModelStorageError::ReadDirectory {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(WorkModelStorageError::ReadDirectory {
+                    path: dir.to_path_buf(),
+                    source,
+                });
+            }
+        };
         for entry in entries {
             let entry = entry.map_err(|source| WorkModelStorageError::ReadDirectory {
                 path: dir.to_path_buf(),
                 source,
             })?;
             let path = entry.path();
-            if path.is_dir() {
+            let metadata =
+                fs::metadata(&path).map_err(|source| WorkModelStorageError::ReadDirectory {
+                    path: path.clone(),
+                    source,
+                })?;
+            if metadata.is_dir() {
                 if self.collection_has_json_records(&path)? {
                     return Ok(true);
                 }
@@ -10782,12 +10792,8 @@ impl WorkModelStore {
         validate: bool,
     ) -> Result<Vec<MergeCandidate>, WorkModelStorageError> {
         let candidates_dir = self.work_merge_candidates_dir().join(work_item_id);
-        if !candidates_dir.exists() {
-            return Ok(Vec::new());
-        }
-
         let mut candidates = Vec::new();
-        for path in list_json_paths(&candidates_dir)? {
+        for path in list_optional_json_paths(&candidates_dir)? {
             let candidate: MergeCandidate = read_json_file(&path)?;
             let expected = file_stem_id(&path)?;
             if candidate.id != expected {
@@ -11174,6 +11180,17 @@ fn file_stem_id(path: &Path) -> Result<String, WorkModelStorageError> {
         });
     };
     object_dir_name(id)
+}
+
+fn list_optional_json_paths(dir: &Path) -> Result<Vec<PathBuf>, WorkModelStorageError> {
+    match list_json_paths(dir) {
+        Err(WorkModelStorageError::ReadDirectory { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            Ok(Vec::new())
+        }
+        result => result,
+    }
 }
 
 fn list_json_paths(dir: &Path) -> Result<Vec<PathBuf>, WorkModelStorageError> {
@@ -16454,6 +16471,162 @@ random banner prose that must be ignored
                 .storage_revision,
             0
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_rejects_inaccessible_journal_after_child_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        store
+            .create_work_item(&work_item_with_completed_write("work-1"))
+            .unwrap();
+        let mut update = store.read_work_item_snapshot("work-1").unwrap();
+        update.title = "Not yet published".into();
+        update.attempts[0].tasks[0].instructions = Some("Unpublished child".into());
+        let _fault = persist_fault::arm_split_write("work-1");
+        assert!(store.write_work_item(&update).is_err());
+        let before = snapshot_dir(root.path());
+
+        let transactions = store.work_transactions_dir();
+        let permissions = fs::metadata(&transactions).unwrap().permissions();
+        fs::set_permissions(&transactions, fs::Permissions::from_mode(0o600)).unwrap();
+        let lookup = fs::read(store.work_transaction_path("work-1").unwrap());
+        let item = store.read_work_item_snapshot("work-1");
+        let collection = store.snapshot_work_items();
+        // Restore access before assertions so failure cannot strand the fixture.
+        fs::set_permissions(&transactions, permissions).unwrap();
+
+        assert_eq!(lookup.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            item,
+            Err(WorkModelStorageError::SnapshotUnavailable { .. })
+        ));
+        let snapshot = collection.unwrap();
+        assert!(snapshot.items.is_empty());
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|error| error.contains("work-1"))
+        );
+        assert!(snapshot.diagnostics.iter().all(|error| error.len() <= 512));
+        assert_eq!(snapshot_dir(root.path()), before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_rejects_split_collection_lookup_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for collection in ["attempts", "tasks", "attempt-tasks", "merge-candidates"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(root.path());
+            let item = if collection == "attempt-tasks" {
+                work_item_with_completed_write("work-1")
+            } else {
+                WorkItem::planned("work-1", "Published")
+            };
+            store.create_work_item(&item).unwrap();
+            let parent = match collection {
+                "attempts" => store.work_attempts_dir(),
+                "tasks" => store.work_tasks_dir(),
+                "attempt-tasks" => store.work_tasks_dir().join("work-1"),
+                "merge-candidates" => store.work_merge_candidates_dir(),
+                _ => unreachable!(),
+            };
+            let before = snapshot_dir(root.path());
+            let permissions = fs::metadata(&parent).unwrap().permissions();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o600)).unwrap();
+            let item = store.read_work_item_snapshot("work-1");
+            let snapshot = store.snapshot_work_items();
+            fs::set_permissions(&parent, permissions).unwrap();
+
+            assert!(
+                matches!(
+                    item,
+                    Err(WorkModelStorageError::ReadDirectory { source, .. })
+                        if source.kind() == io::ErrorKind::PermissionDenied
+                ),
+                "{collection} must report a lookup error"
+            );
+            let snapshot = snapshot.unwrap();
+            assert!(snapshot.items.is_empty(), "{collection}");
+            assert!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|error| error.contains("work-1"))
+            );
+            assert!(snapshot.diagnostics.iter().all(|error| error.len() <= 512));
+            assert_eq!(snapshot_dir(root.path()), before, "{collection}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_rejects_orphan_task_metadata_errors() {
+        for nested in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(root.path());
+            store
+                .create_work_item(&WorkItem::planned("work-1", "Published"))
+                .unwrap();
+            store
+                .create_work_item(&WorkItem::planned("unrelated", "Still visible"))
+                .unwrap();
+            let orphan = store.work_tasks_dir().join("work-1").join("orphan");
+            let link = if nested {
+                fs::create_dir(&orphan).unwrap();
+                orphan.join("unreadable")
+            } else {
+                orphan
+            };
+            // A symlink loop reliably fails metadata lookup even as root.
+            std::os::unix::fs::symlink(&link, &link).unwrap();
+            let before = snapshot_dir(root.path());
+
+            assert!(matches!(
+                store.read_work_item_snapshot("work-1"),
+                Err(WorkModelStorageError::ReadDirectory { .. })
+            ));
+            let snapshot = store.snapshot_work_items().unwrap();
+            assert_eq!(snapshot.items.len(), 1);
+            assert_eq!(snapshot.items[0].id, "unrelated");
+            assert!(
+                snapshot
+                    .diagnostics
+                    .iter()
+                    .any(|error| error.contains("work-1"))
+            );
+            assert!(snapshot.diagnostics.iter().all(|error| error.len() <= 512));
+            assert_eq!(snapshot_dir(root.path()), before);
+            assert_eq!(fs::read_link(&link).unwrap(), link);
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_absent_split_collections_and_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        let item = WorkItem::planned("work-1", "Published");
+        store.create_work_item(&item).unwrap();
+        for dir in [
+            store.work_attempts_dir(),
+            store.work_tasks_dir(),
+            store.work_merge_candidates_dir(),
+            store.work_transactions_dir(),
+        ] {
+            fs::remove_dir_all(dir).unwrap();
+        }
+        let before = snapshot_dir(root.path());
+        assert_eq!(store.read_work_item_snapshot("work-1").unwrap(), item);
+        let snapshot = store.snapshot_work_items().unwrap();
+        assert_eq!(snapshot.items, vec![item]);
+        assert!(snapshot.diagnostics.is_empty());
+        assert_eq!(snapshot_dir(root.path()), before);
     }
 
     #[test]

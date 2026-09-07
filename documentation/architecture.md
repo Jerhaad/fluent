@@ -1593,7 +1593,9 @@ transaction, a reader compares stored children with that base digest or, after
 the target root has published, with the journal's target children. It never
 substitutes journal contents for stored records. An interrupted child update or
 a legacy pending journal without enough proof produces an item-local unavailable
-diagnostic until host-owned recovery completes. Dashboard
+diagnostic until host-owned recovery completes. Only a missing journal or child
+collection counts as absent; lookup, read, and metadata errors make that item
+unavailable instead of producing a partial aggregate. Dashboard
 derives its latest transition in memory from that same published snapshot;
 it does not persist a cursor. This prevents mixed-generation reads and makes a failed or crashed
 write retryable without allowing a stale snapshot to overwrite its successor.
