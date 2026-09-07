@@ -275,20 +275,14 @@ settled review artifacts for the current candidate.
 
 ### Recover a host-evidence finding
 
-This recovery has two paths. Read the applicable section in
-[`references/host-evidence-recovery.md`](references/host-evidence-recovery.md):
-host-only evidence attachment when the candidate needs no source change and a concrete
-external condition needs another host run; use candidate-bound source correction
-classification for a paused actionable `evidence-needed` recovery when the
-operator authorizes a source correction (or for a legacy paused recovery with an
-unqualified marker). A single malformed `Disposition: evidence-needed` marker
-follows the ordinary Writer path; missing, duplicate, or unknown disposition
-markers remain an uncertain pause. Use the public `fluent attempt evidence run`
-path to authorize and schedule one focused Tests Review command. Run the printed
-`fluent task run` command, then `fluent attempt run` to validate the worker's
-receipt and start targeted evidence review. Use `attach` when
-the host already has the schema-version-1 JSON result, and `classify` only when
-a failed result authorizes a source correction.
+Read [host-evidence recovery](references/host-evidence-recovery.md) for
+host-only evidence attachment, candidate-bound source correction, and legacy rules.
+Use `fluent attempt evidence run` to schedule an approved check, `attach` for an
+existing schema-version-1 result, and `classify` when failed evidence authorizes
+source correction. Follow the printed `fluent task run` and `fluent attempt run`
+commands to execute the check, validate its receipt, and start targeted review.
+A single malformed `Disposition: evidence-needed` marker follows the Writer path;
+missing, duplicate, or unknown disposition markers remain an uncertain pause.
 
 ### Codex authentication pauses
 
