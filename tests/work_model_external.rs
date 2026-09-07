@@ -641,7 +641,11 @@ fn work_model_store_writes_deterministic_pretty_json() {
   "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
-  "model_writer_version": "0.3.0"
+  "model_writer_version": {
+    "format": "fluent-work-item-writer",
+    "schema_version": 1,
+    "version": "0.3.0"
+  }
 }
 "#
     );
@@ -688,7 +692,11 @@ fn capture_mode_preserves_minimal_work_item_json() {
   "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
-  "model_writer_version": "0.3.0"
+  "model_writer_version": {
+    "format": "fluent-work-item-writer",
+    "schema_version": 1,
+    "version": "0.3.0"
+  }
 }
 "#
     );
@@ -1433,6 +1441,27 @@ fn status_snapshot_is_nonmutating() {
     let temp = tempfile::tempdir().unwrap();
     let store = WorkModelStore::new(temp.path());
     store.create_work_item(&work_item()).unwrap();
+    let mut running = WorkItem::planned("running", "Observe running Task");
+    running.add_initial_attempt("attempt-1").unwrap();
+    running.attempts[0].status = AttemptStatus::Executing;
+    running.attempts[0].tasks[0].status = TaskStatus::Executing;
+    store.create_work_item(&running).unwrap();
+    let area = &running.attempts[0].tasks[0]
+        .artifact_area
+        .as_ref()
+        .unwrap()
+        .path;
+    fs::create_dir_all(temp.path().join(area)).unwrap();
+    fs::write(
+        temp.path().join(area).join("execution.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "state": "running", "owner_pid": std::process::id(),
+            "leader_pid": std::process::id(), "process_group_id": std::process::id(),
+            "started_at": "2026-09-06T00:00:00Z", "heartbeat_at": "2026-09-06T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     pending_transaction(temp.path(), work_item(), true);
     fs::remove_dir_all(temp.path().join(".fluent/work/locks")).unwrap();
     let before = work_tree(temp.path());
@@ -1443,7 +1472,15 @@ fn status_snapshot_is_nonmutating() {
         .assert()
         .success();
     assert_eq!(work_tree(temp.path()), before);
-    assert_eq!(status.rows[0].title, "Add durable model storage");
+    assert_eq!(
+        status
+            .rows
+            .iter()
+            .find(|row| row.id == "work-1")
+            .unwrap()
+            .title,
+        "Add durable model storage"
+    );
 }
 
 #[test]
@@ -1559,4 +1596,133 @@ fn snapshot_isolates_item_and_transaction_errors() {
     }
     assert!(snapshot.diagnostics.iter().all(|d| d.len() <= 512));
     assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn current_record_has_old_reader_wire_fence() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(store.work_item_path("work-1").unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(
+        record["model_writer_version"],
+        serde_json::json!({
+            "format": "fluent-work-item-writer", "schema_version": 1, "version": "0.3.0"
+        })
+    );
+    // The actual release executable is exercised by test-work-model-old-reader-fence.sh.
+    assert_eq!(
+        store
+            .read_work_item_snapshot("work-1")
+            .unwrap()
+            .model_writer_version
+            .as_deref(),
+        Some("0.3.0")
+    );
+}
+
+#[test]
+fn current_reader_accepts_legacy_writer_string_without_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    for path in [
+        store.work_item_path("work-1").unwrap(),
+        store.work_attempt_path("work-1", "attempt-1").unwrap(),
+    ] {
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("schema_version");
+        if record.get("model_writer_version").is_some() {
+            record["model_writer_version"] = "0.3.0".into();
+        }
+        fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    }
+    let before = work_tree(temp.path());
+    let item = store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(item.model_writer_version.as_deref(), Some("0.3.0"));
+    assert_eq!(item.attempts, work_item().attempts);
+    let status = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert!(status.errors.is_empty());
+    assert_eq!(status.rows.len(), 1);
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn current_reader_round_trips_fenced_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    let mut initial = work_item();
+    initial.learner_mode = LearnerMode::NoExpertise;
+    initial.post_merge_review_fix_depth = Some(2);
+    initial.merge_candidates.push(merge_candidate());
+    store.create_work_item(&initial).unwrap();
+    let stale = store.read_work_item_snapshot("work-1").unwrap();
+    store
+        .mutate_work_item("work-1", |item| {
+            item.title = "Updated fenced record".into();
+            Ok(())
+        })
+        .unwrap();
+    let mut expected = stale.clone();
+    expected.title = "stale update".into();
+    assert_stale_write(store.write_work_item(&expected).unwrap_err());
+    let current = store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(current.title, "Updated fenced record");
+    assert_eq!(current.attempts, initial.attempts);
+    assert_eq!(current.merge_candidates, initial.merge_candidates);
+    assert_eq!(current.learner_mode, initial.learner_mode);
+    assert_eq!(
+        current.post_merge_review_fix_depth,
+        initial.post_merge_review_fix_depth
+    );
+    let before = work_tree(temp.path());
+    store.write_work_item(&current).unwrap();
+    assert_eq!(work_tree(temp.path()), before);
+    assert!(
+        !temp
+            .path()
+            .join(".fluent/work/transactions/work-1.json")
+            .exists()
+    );
+}
+
+#[test]
+fn writer_envelope_rejects_unknown_or_malformed_values() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let path = store.work_item_path("work-1").unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for envelope in [
+        serde_json::json!({"format": "other", "schema_version": 1, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 2, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 0, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1, "version": "invalid"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1}),
+    ] {
+        record["model_writer_version"] = envelope;
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let before = work_tree(temp.path());
+        assert!(store.read_work_item_snapshot("work-1").is_err());
+        assert!(store.mutate_work_item("work-1", |_| Ok(())).is_err());
+        assert_eq!(work_tree(temp.path()), before);
+    }
+}
+
+#[test]
+fn explicit_upgrade_replaces_current_version_legacy_string() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let path = store.work_item_path("work-1").unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    record["model_writer_version"] = "0.3.0".into();
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    assert!(!store.upgrade_work_item("work-1").unwrap().already_current);
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(record["model_writer_version"].is_object());
+    assert!(store.upgrade_work_item("work-1").unwrap().already_current);
 }

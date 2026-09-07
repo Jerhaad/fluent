@@ -209,7 +209,11 @@ fn reviewer_storage_writes_documented_deterministic_json() {
   "schema_version": 2,
   "id": "work-review",
   "title": "Review durable storage",
-  "model_writer_version": "0.3.0"
+  "model_writer_version": {
+    "format": "fluent-work-item-writer",
+    "schema_version": 1,
+    "version": "0.3.0"
+  }
 }
 "#
     );

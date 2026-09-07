@@ -9074,14 +9074,59 @@ pub struct WorkModelSnapshot {
     pub diagnostics: Vec<String>,
 }
 
+const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+
+/// Fence readers that deserialize the existing writer field as Option<String>.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredModelWriterVersion {
+    Legacy(String),
+    Envelope {
+        format: String,
+        schema_version: u32,
+        version: String,
+    },
+}
+
+fn deserialize_model_writer_version<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<StoredModelWriterVersion>, D::Error> {
+    let writer = Option::<StoredModelWriterVersion>::deserialize(deserializer)?;
+    if let Some(StoredModelWriterVersion::Envelope {
+        format,
+        schema_version,
+        version,
+    }) = &writer
+    {
+        if format != WORK_MODEL_WRITER_ENVELOPE_FORMAT
+            || *schema_version != WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION
+        {
+            return Err(serde::de::Error::custom(
+                "unsupported Work Item writer envelope format/schema",
+            ));
+        }
+        if version_triplet(version).is_none() {
+            return Err(serde::de::Error::custom(
+                "invalid Work Item writer envelope version",
+            ));
+        }
+    }
+    Ok(writer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkItemRecord {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     schema_version: u32,
     id: String,
     title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model_writer_version: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_model_writer_version"
+    )]
+    model_writer_version: Option<StoredModelWriterVersion>,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     storage_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9208,7 +9253,11 @@ impl From<&WorkItem> for WorkItemRecord {
             schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
             id: work_item.id.clone(),
             title: work_item.title.clone(),
-            model_writer_version: Some(WORK_MODEL_WRITER_VERSION.to_string()),
+            model_writer_version: Some(StoredModelWriterVersion::Envelope {
+                format: WORK_MODEL_WRITER_ENVELOPE_FORMAT.to_string(),
+                schema_version: WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION,
+                version: WORK_MODEL_WRITER_VERSION.to_string(),
+            }),
             storage_revision: work_item.storage_revision.get().unwrap_or(0),
             planning_context: work_item.planning_context.clone(),
             planning_scope: work_item.planning_scope.clone(),
@@ -9234,7 +9283,10 @@ impl From<WorkItemRecord> for WorkItem {
         Self {
             id: record.id,
             title: record.title,
-            model_writer_version: record.model_writer_version,
+            model_writer_version: record.model_writer_version.map(|writer| match writer {
+                StoredModelWriterVersion::Legacy(version)
+                | StoredModelWriterVersion::Envelope { version, .. } => version,
+            }),
             storage_revision: StorageRevision::persisted(record.storage_revision),
             planning_context: record.planning_context,
             planning_scope: record.planning_scope,
@@ -9575,6 +9627,10 @@ impl WorkModelStore {
             })
             .collect::<Vec<_>>();
         let needs_upgrade = stored.schema_version != WORK_MODEL_RECORD_SCHEMA_VERSION
+            || !matches!(
+                stored.model_writer_version,
+                Some(StoredModelWriterVersion::Envelope { .. })
+            )
             || !artifact_migrations.is_empty()
             || !legacy_attempts.is_empty()
             || item.model_writer_version.as_deref() != Some(WORK_MODEL_WRITER_VERSION);

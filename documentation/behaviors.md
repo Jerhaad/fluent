@@ -9,26 +9,57 @@ the system does, not how. EARS format.
 
 WHEN `fluent dashboard` opens, THE SYSTEM SHALL show grouped Current Work and
 select the first Work Item that needs attention, is running, or is ready.
-Test: src/dashboard.rs (dashboard_opens_on_current_work)
+Test: src/dashboard/tests.rs (dashboard_opens_on_current_work)
 
 ### B2
 
 WHEN an operator navigates, filters, refreshes, or resizes the dashboard, THE
 SYSTEM SHALL preserve its selected Work Item when it remains visible and select
 the nearest remaining row when it does not.
-Test: src/dashboard.rs (selection_survives_refresh_reorder_and_filter)
+Test: src/dashboard/tests.rs (selection_survives_refresh_reorder_and_filter)
 
 ### B3
 
 WHEN the dashboard refresh fails after a successful load, THE SYSTEM SHALL keep
 the displayed snapshot and label it stale until a later successful refresh.
-Test: src/dashboard.rs (failed_poll_keeps_snapshot_and_marks_it_stale)
+Test: src/dashboard/tests.rs (failed_poll_keeps_snapshot_and_marks_it_stale)
 
 ### B4
 
 WHEN the dashboard receives navigation, view, help, copy, or refresh input,
 THE SYSTEM SHALL not modify stored Work state.
-Test: src/dashboard.rs (dashboard_controls_leave_work_state_unchanged)
+Test: src/dashboard/tests.rs (dashboard_controls_leave_work_state_unchanged)
+
+## Read-only Work observation
+
+### B1
+
+WHEN status or dashboard loads Work, THE SYSTEM SHALL preserve all Work files
+and directory entries, including legacy artifact references and execution
+identity locks. An absent identity lock SHALL mean the Task is not live.
+Test: tests/work_model_external.rs (status_snapshot_is_nonmutating)
+Test: src/dashboard/tests.rs (dashboard_snapshot_is_nonmutating)
+Test: src/execution.rs (liveness_probe_does_not_create_identity_lock)
+Test: src/execution.rs (liveness_probe_observes_existing_held_identity_lock)
+
+### B2
+
+WHEN a transaction is pending, THE SYSTEM SHALL display the readable published
+Work Item and report pending host-owned recovery without applying the journal.
+Failures in another item, split record, or journal SHALL leave valid items visible.
+Test: tests/work_model_external.rs (snapshot_reports_pending_transaction_without_recovery)
+Test: tests/work_model_external.rs (snapshot_isolates_item_and_transaction_errors)
+
+### B3
+
+WHEN Fluent writes a Work Item, THE SYSTEM SHALL encode a validated writer
+envelope that the published v0.3.0 reader rejects before mutation. Current Fluent
+SHALL continue to read legacy writer strings without rewriting them during
+observation and preserve current fields and revision checks on mutation.
+Test: tests/work_model_external.rs (current_record_has_old_reader_wire_fence)
+Test: tests/work_model_external.rs (current_reader_accepts_legacy_writer_string_without_rewrite)
+Test: tests/work_model_external.rs (current_reader_round_trips_fenced_record)
+Test: tests/behaviors/operations/test-work-model-old-reader-fence.sh
 
 ## Local execution recovery
 

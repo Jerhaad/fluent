@@ -2299,8 +2299,18 @@ references remain relative to the source root, for example
 prefix, Work Item ID, and Attempt ID so valid hyphenated IDs remain
 globally distinct.
 
-Each Work Item root record stores `model_writer_version`, the Fluent package
-version that last wrote the split aggregate. `PauseKind` uses a string-preserving
+Each Work Item root record stores `model_writer_version` as a validated writer
+envelope: `{"format":"fluent-work-item-writer","schema_version":1,"version":"0.3.0"}`.
+The public in-memory value remains an optional package-version string. Current
+Fluent also accepts legacy strings without rewriting them during observation.
+The envelope occupies an existing field that published v0.3.0 reads as
+`Option<String>`, so that executable rejects current records before it can
+rewrite split records or recover their journals. Adding an unknown top-level
+schema field alone cannot fence a deserializer that ignores unknown fields.
+The offline check in `tests/behaviors/operations/test-work-model-old-reader-fence.sh`
+builds the pinned v0.3.0 release source, checks its source and executable hashes,
+and compares the entire Work tree before and after attempted mutation, with and
+without a pending journal. `PauseKind` uses a string-preserving
 decoder: known values become typed variants, while an unrecognized value remains
 an `Unknown(String)` and serializes back to the exact same string. Assembly and
 validation therefore remain available to read-only status, list, and show
