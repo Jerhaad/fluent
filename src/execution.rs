@@ -1,4 +1,4 @@
-//! Persist and control the host-owned process identity for a local coder Task.
+//! Persist and control process ownership for local workers.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

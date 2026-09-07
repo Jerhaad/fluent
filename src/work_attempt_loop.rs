@@ -4889,8 +4889,8 @@ fn resume_canceled_attempt(
     Ok(())
 }
 
-/// Stop every locally owned coder group for one Attempt, then suspend its captured
-/// Tasks for an explicit same-Attempt resume. Persist the stop boundary before
+/// Stop every owned local worker for one Attempt, then pause unfinished work
+/// for an explicit same-Attempt resume. Persist the stop boundary before
 /// signaling and verify every registered execution before recording settlement.
 pub fn cancel_local_attempt(
     project_root: &Path,
