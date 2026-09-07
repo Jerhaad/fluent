@@ -1842,6 +1842,141 @@ mod tests {
     }
 
     #[test]
+    fn transient_process_inventory_does_not_discard_baseline_results() {
+        use crate::tester_evidence::{
+            introduced_tester_failures, unexplained_failed_tester_commands,
+        };
+        use std::os::unix::process::ExitStatusExt;
+
+        struct TransientCollector {
+            snapshots: Mutex<usize>,
+            after_command_only: bool,
+        }
+
+        impl ProcessInventoryCollector for TransientCollector {
+            fn collect(&self, directory: &Path) -> Result<Vec<ProcessEntry>> {
+                let mut snapshots = self.snapshots.lock().unwrap();
+                let transient = !self.after_command_only || *snapshots > 0;
+                *snapshots += 1;
+                HostProcessInventoryCollector::collect_with_probe(
+                    directory,
+                    &mut |command, args| {
+                        let (code, stdout) = match (command, args) {
+                            ("ps", ["-axo", "pid=,command="]) if transient => {
+                                (0, "101 codex exec\n102 fluent scheduler\n")
+                            }
+                            ("ps", ["-axo", "pid=,command="]) => (0, "999 unrelated\n"),
+                            ("lsof", ["-a", "-p", "101" | "102", "-d", "cwd", "-Fn"])
+                            | ("ps", ["-p", "101", "-o", "stat="]) => (1, ""),
+                            ("ps", ["-p", "102", "-o", "stat="]) => (0, "Z+\n"),
+                            _ => panic!("unexpected probe: {command} {args:?}"),
+                        };
+                        Ok(std::process::Output {
+                            status: std::process::ExitStatus::from_raw(code << 8),
+                            stdout: stdout.as_bytes().to_vec(),
+                            stderr: vec![],
+                        })
+                    },
+                )
+            }
+        }
+
+        // Exercise both baseline admission and the inventory after a completed
+        // command, where the original race discarded otherwise usable results.
+        for after_command_only in [true, false] {
+            let workspace = TempDir::new().unwrap();
+            let baseline_dir = TempDir::new().unwrap();
+            let candidate_dir = TempDir::new().unwrap();
+            let regression_dir = TempDir::new().unwrap();
+            make_workspace(workspace.path());
+            write_tester_yaml(
+                workspace.path(),
+                "commands:\n  - command: 'echo ambient-failure; exit 1'\n    test_harness: shell-harness\n    reject_process_leaks: true\n",
+            );
+            let ambient = r#"{"id":"ambient","test_harness":"shell-harness","status":"fail","duration_ms":null,"failure_excerpt":"ambient-failure"}"#;
+            write_extractor(
+                workspace.path(),
+                &format!("#!/bin/sh\necho '[{ambient}]'\n"),
+            );
+            let collector = TransientCollector {
+                snapshots: Mutex::new(0),
+                after_command_only,
+            };
+
+            let outcome = run_with_sandbox_profile_and_collector(
+                workspace.path(),
+                baseline_dir.path(),
+                None,
+                None,
+                &collector,
+            )
+            .unwrap();
+
+            assert_eq!(outcome, TesterOutcome::TestFailures);
+            assert_eq!(*collector.snapshots.lock().unwrap(), 2);
+            let baseline = read_results(baseline_dir.path());
+            assert!(baseline.error.is_none());
+            assert_eq!(baseline.commands.len(), 1);
+            assert_eq!(baseline.commands[0].exit_code, 1);
+            assert_eq!(
+                fs::read_to_string(baseline_dir.path().join(&baseline.commands[0].stdout_log))
+                    .unwrap(),
+                "ambient-failure\n"
+            );
+            assert!(
+                baseline.commands[0]
+                    .process_settlement
+                    .as_ref()
+                    .unwrap()
+                    .leaks
+                    .is_empty()
+            );
+            assert_eq!(baseline.summary.fail, 1);
+            assert_eq!(baseline.tests[0].id, "ambient");
+            assert_eq!(
+                baseline.tests[0].failure_excerpt.as_deref(),
+                Some("ambient-failure")
+            );
+            let baseline_path = baseline_dir.path().join("tester-results.json");
+            let baseline_bytes = fs::read(&baseline_path).unwrap();
+
+            for (artifact, introduces_failure) in
+                [(candidate_dir.path(), false), (regression_dir.path(), true)]
+            {
+                if introduces_failure {
+                    let regression = r#"{"id":"regression","test_harness":"shell-harness","status":"fail","duration_ms":null,"failure_excerpt":"new failure"}"#;
+                    write_extractor(
+                        workspace.path(),
+                        &format!("#!/bin/sh\necho '[{ambient},{regression}]'\n"),
+                    );
+                }
+                let outcome = run_with_sandbox_profile_and_collector(
+                    workspace.path(),
+                    artifact,
+                    None,
+                    None,
+                    &ScriptedCollector::new(vec![
+                        ScriptedInventory::Empty,
+                        ScriptedInventory::Empty,
+                    ]),
+                )
+                .unwrap();
+                assert_eq!(outcome, TesterOutcome::TestFailures);
+                let candidate_path = artifact.join("tester-results.json");
+                assert_eq!(
+                    introduced_tester_failures(&candidate_path, Some(&baseline_path)),
+                    usize::from(introduces_failure),
+                );
+                assert_eq!(
+                    unexplained_failed_tester_commands(&candidate_path, Some(&baseline_path)),
+                    usize::from(introduces_failure),
+                );
+            }
+            assert_eq!(fs::read(baseline_path).unwrap(), baseline_bytes);
+        }
+    }
+
+    #[test]
     fn unavailable_settlement_baseline_prevents_command_launch() {
         let workspace = TempDir::new().unwrap();
         let artifact_dir = TempDir::new().unwrap();
