@@ -1427,12 +1427,21 @@ fn work_tree(
 }
 
 fn pending_transaction(root: &std::path::Path, mut item: WorkItem, published: bool) {
+    use sha2::Digest;
+    let base_children_digest = published.then(|| {
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                serde_json::to_vec(&(&item.attempts, &item.merge_candidates)).unwrap()
+            )
+        )
+    });
     item.title = "Unpublished title".into();
     let dir = root.join(".fluent/work/transactions");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join(format!("{}.json", item.id)), serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1, "id": item.id, "base_revision": if published { Some(0) } else { None },
-        "target_revision": if published { 1 } else { 0 }, "work_item": item
+        "target_revision": if published { 1 } else { 0 }, "base_children_digest": base_children_digest, "work_item": item
     })).unwrap()).unwrap();
 }
 

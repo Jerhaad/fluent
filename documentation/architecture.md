@@ -1585,7 +1585,15 @@ new top-level storage revision last. Lifecycle preparation recovers interrupted
 transactions, including creations. Status and dashboard instead use
 `WorkModelStore::snapshot_work_items` to assemble published records without
 model locks, recovery, or artifact migration. They keep readable items visible
-and report pending host-owned recovery and item-local failures. Dashboard
+and report pending host-owned recovery and item-local failures. Each snapshot
+checks the root revision and journal before and after assembling children,
+retrying changed publication markers at most three times. New journals record
+a digest of the base Attempt, Task, and Merge Candidate values. During a pending
+transaction, a reader compares stored children with that base digest or, after
+the target root has published, with the journal's target children. It never
+substitutes journal contents for stored records. An interrupted child update or
+a legacy pending journal without enough proof produces an item-local unavailable
+diagnostic until host-owned recovery completes. Dashboard
 derives its latest transition in memory from that same published snapshot;
 it does not persist a cursor. This prevents mixed-generation reads and makes a failed or crashed
 write retryable without allowing a stale snapshot to overwrite its successor.

@@ -8852,6 +8852,10 @@ pub enum WorkModelStorageError {
         path: PathBuf,
         id: String,
     },
+    SnapshotUnavailable {
+        path: PathBuf,
+        id: String,
+    },
     ParseFile {
         path: PathBuf,
         source: serde_json::Error,
@@ -8878,6 +8882,7 @@ impl WorkModelStorageError {
             | Self::WorkItemAlreadyExists { path, .. }
             | Self::StaleWorkItem { path, .. }
             | Self::StorageRevisionExhausted { path, .. }
+            | Self::SnapshotUnavailable { path, .. }
             | Self::ParseFile { path, .. }
             | Self::WorkItemIdMismatch { path, .. }
             | Self::InvalidModel { path, .. } => Some(path),
@@ -8924,6 +8929,10 @@ impl fmt::Display for WorkModelStorageError {
                     "Work Item {id:?} exhausted its storage revision; refusing to disable stale-write detection"
                 )
             }
+            Self::SnapshotUnavailable { id, .. } => write!(
+                f,
+                "Work Item {id:?} snapshot is unavailable: publication changed or host-owned recovery is pending"
+            ),
             Self::ParseFile { path, source } => {
                 write!(f, "failed to parse {}: {source}", path.display())
             }
@@ -8956,6 +8965,7 @@ impl Error for WorkModelStorageError {
             Self::WorkItemAlreadyExists { .. } => None,
             Self::StaleWorkItem { .. } => None,
             Self::StorageRevisionExhausted { .. } => None,
+            Self::SnapshotUnavailable { .. } => None,
             Self::ParseFile { source, .. } => Some(source),
             Self::WorkItemIdMismatch { .. } => None,
             Self::InvalidModel { source, .. } => Some(source),
@@ -8978,6 +8988,37 @@ pub(crate) mod persist_fault {
         static FOLLOW_UP_WRITE_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
         static CREATION_AFTER_PUBLISH_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
         static SPLIT_WRITE_FAULT: RefCell<Option<String>> = const { RefCell::new(None) };
+        static AFTER_ROOT_READ: RefCell<Option<(String, Box<dyn FnOnce()>)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct RootReadGuard;
+
+    pub(crate) fn after_next_root_read(id: &str, action: impl FnOnce() + 'static) -> RootReadGuard {
+        AFTER_ROOT_READ.with(|slot| *slot.borrow_mut() = Some((id.to_string(), Box::new(action))));
+        RootReadGuard
+    }
+
+    pub(crate) fn after_root_read(id: &str) {
+        let action = AFTER_ROOT_READ.with(|slot| {
+            if slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|(expected, _)| expected == id)
+            {
+                slot.borrow_mut().take().map(|(_, action)| action)
+            } else {
+                None
+            }
+        });
+        if let Some(action) = action {
+            action();
+        }
+    }
+
+    impl Drop for RootReadGuard {
+        fn drop(&mut self) {
+            AFTER_ROOT_READ.with(|slot| *slot.borrow_mut() = None);
+        }
     }
 
     /// RAII guard: arm the persistence leaf to fail the next write that persists a
@@ -9170,6 +9211,10 @@ struct WorkItemTransaction {
     id: String,
     base_revision: Option<u64>,
     target_revision: u64,
+    /// Prove that stored children still belong to the base revision during an
+    /// interrupted publication. Legacy journals cannot supply this proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_children_digest: Option<String>,
     work_item: WorkItem,
 }
 
@@ -9487,7 +9532,7 @@ impl WorkModelStore {
             };
             for path in paths {
                 if dir == self.work_items_dir() {
-                    match self.read_published_work_item_file(&path, true) {
+                    match self.read_work_item_snapshot_file(&path) {
                         Ok(item) => snapshot.items.push(item),
                         Err(error) => snapshot
                             .diagnostics
@@ -9515,7 +9560,49 @@ impl WorkModelStore {
 
     /// Read one published aggregate without performing host-owned maintenance.
     pub fn read_work_item_snapshot(&self, id: &str) -> Result<WorkItem, WorkModelStorageError> {
-        self.read_published_work_item_file(&self.work_item_path(id)?, true)
+        self.read_work_item_snapshot_file(&self.work_item_path(id)?)
+    }
+
+    fn read_work_item_snapshot_file(&self, path: &Path) -> Result<WorkItem, WorkModelStorageError> {
+        let id = file_stem_id(path)?;
+        let unavailable = || WorkModelStorageError::SnapshotUnavailable {
+            path: path.to_path_buf(),
+            id: id.clone(),
+        };
+        // A completed transaction may disappear between child reads and the
+        // journal scan. Check both publication markers around every assembly.
+        for _ in 0..3 {
+            let before: WorkItemRecord = read_json_file(path)?;
+            let transaction_before = self
+                .read_work_item_transaction(&id)
+                .map_err(|_| unavailable())?;
+            let assembled = self.read_published_work_item_file(path, true);
+            let after: WorkItemRecord = match read_json_file(path) {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+            let transaction_after = self
+                .read_work_item_transaction(&id)
+                .map_err(|_| unavailable())?;
+            if before != after || transaction_before != transaction_after {
+                continue;
+            }
+            let item = assembled?;
+            if let Some(transaction) = transaction_after {
+                let expected_digest = if Some(after.storage_revision) == transaction.base_revision {
+                    transaction.base_children_digest
+                } else if after.storage_revision == transaction.target_revision {
+                    Some(work_item_children_digest(&transaction.work_item)?)
+                } else {
+                    None
+                };
+                if expected_digest.as_deref() != Some(work_item_children_digest(&item)?.as_str()) {
+                    return Err(unavailable());
+                }
+            }
+            return Ok(item);
+        }
+        Err(unavailable())
     }
 
     pub fn list_work_items(&self) -> Result<Vec<WorkItem>, WorkModelStorageError> {
@@ -10155,6 +10242,7 @@ impl WorkModelStore {
         }
 
         let expected_revision = work_item.storage_revision.get();
+        let mut base_children_digest = None;
         let base_revision = if path.exists() {
             let current: WorkItemRecord = read_json_file(&path)?;
             ensure_supported_record_schema(&path, "Work Item", current.schema_version)?;
@@ -10177,6 +10265,7 @@ impl WorkModelStore {
                     work_item.storage_revision.set(current.storage_revision);
                     return Ok(());
                 }
+                base_children_digest = Some(work_item_children_digest(&current_item)?);
                 reject_intake_contract_change(&current_item, work_item).map_err(|source| {
                     WorkModelStorageError::InvalidModel {
                         path: path.clone(),
@@ -10211,6 +10300,7 @@ impl WorkModelStore {
             id: work_item.id.clone(),
             base_revision,
             target_revision,
+            base_children_digest,
             work_item: work_item.clone(),
         };
         let transaction_path = self.work_transaction_path(&work_item.id)?;
@@ -10286,6 +10376,8 @@ impl WorkModelStore {
                 });
             }
         }
+        #[cfg(test)]
+        persist_fault::after_root_read(&record.id);
         let work_item = self.assemble_split_work_item(record, validate)?;
         if validate {
             work_item
@@ -11458,6 +11550,17 @@ fn reject_frozen_no_expertise_identity_change(
         }
     }
     Ok(())
+}
+
+fn work_item_children_digest(item: &WorkItem) -> Result<String, WorkModelStorageError> {
+    let bytes =
+        serde_json::to_vec(&(&item.attempts, &item.merge_candidates)).map_err(|source| {
+            WorkModelStorageError::ParseFile {
+                path: PathBuf::from("<work-item-transaction>"),
+                source,
+            }
+        })?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn aggregate_snapshot_matches(
@@ -16282,6 +16385,156 @@ random banner prose that must be ignored
     }
 
     #[test]
+    fn snapshot_retries_publication_between_root_and_children() {
+        for listing in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(root.path());
+            store
+                .create_work_item(&work_item_with_completed_write("work-1"))
+                .unwrap();
+            let writer = store.clone();
+            let _interleave = persist_fault::after_next_root_read("work-1", move || {
+                writer
+                    .mutate_work_item("work-1", |item| {
+                        item.title = "Published next revision".into();
+                        item.attempts[0].tasks[0].instructions =
+                            Some("Published next child".into());
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            let read = if listing {
+                store.snapshot_work_items().unwrap().items.remove(0)
+            } else {
+                store.read_work_item_snapshot("work-1").unwrap()
+            };
+            assert_eq!(read.title, "Published next revision");
+            assert_eq!(
+                read.attempts[0].tasks[0].instructions.as_deref(),
+                Some("Published next child")
+            );
+            assert_eq!(read.storage_revision.get(), Some(1));
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_interrupted_child_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        store
+            .create_work_item(&work_item_with_completed_write("work-1"))
+            .unwrap();
+        store
+            .create_work_item(&WorkItem::planned("unrelated", "Still visible"))
+            .unwrap();
+        let mut update = store.read_work_item_snapshot("work-1").unwrap();
+        update.title = "Not yet published".into();
+        update.attempts[0].tasks[0].instructions = Some("New child under the old root".into());
+        let _fault = persist_fault::arm_split_write("work-1");
+        assert!(store.write_work_item(&update).is_err());
+        let journal = store.work_transaction_path("work-1").unwrap();
+        let before = fs::read(&journal).unwrap();
+
+        assert!(store.read_work_item_snapshot("work-1").is_err());
+        let snapshot = store.snapshot_work_items().unwrap();
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].id, "unrelated");
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|error| error.contains("work-1")
+                    && error.contains("host-owned recovery is pending"))
+        );
+        assert!(snapshot.diagnostics.iter().all(|error| error.len() <= 512));
+        assert_eq!(fs::read(journal).unwrap(), before);
+        assert_eq!(
+            read_json_file::<WorkItemRecord>(&store.work_item_path("work-1").unwrap())
+                .unwrap()
+                .storage_revision,
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_reads_unchanged_children_with_pending_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        store
+            .create_work_item(&work_item_with_completed_write("work-1"))
+            .unwrap();
+        let published = store.read_work_item_snapshot("work-1").unwrap();
+        let mut update = published.clone();
+        update.title = "Not yet published".into();
+        let _fault = persist_fault::arm_split_write("work-1");
+        assert!(store.write_work_item(&update).is_err());
+        let journal = store.work_transaction_path("work-1").unwrap();
+        let before = fs::read(&journal).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        assert!(value["base_children_digest"].is_string());
+        assert_eq!(store.read_work_item_snapshot("work-1").unwrap(), published);
+        assert_eq!(store.snapshot_work_items().unwrap().items[0], published);
+        assert_eq!(fs::read(journal).unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_defers_legacy_journal_without_base_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        store
+            .create_work_item(&work_item_with_completed_write("work-1"))
+            .unwrap();
+        let mut update = store.read_work_item_snapshot("work-1").unwrap();
+        update.title = "Legacy pending update".into();
+        let _fault = persist_fault::arm_split_write("work-1");
+        assert!(store.write_work_item(&update).is_err());
+        let journal = store.work_transaction_path("work-1").unwrap();
+        let mut value: serde_json::Value = read_json_file(&journal).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("base_children_digest");
+        write_json_file(&journal, &value).unwrap();
+        let before = fs::read(&journal).unwrap();
+        assert!(
+            store
+                .read_work_item_snapshot("work-1")
+                .unwrap_err()
+                .to_string()
+                .contains("host-owned recovery is pending")
+        );
+        assert!(store.snapshot_work_items().unwrap().items.is_empty());
+        assert_eq!(fs::read(journal).unwrap(), before);
+        // Legacy journals remain recoverable at the existing mutation boundary.
+        store.mutate_work_item("work-1", |_| Ok(())).unwrap();
+        assert_eq!(
+            store.read_work_item_snapshot("work-1").unwrap().title,
+            "Legacy pending update"
+        );
+    }
+
+    #[test]
+    fn snapshot_reads_published_target_with_pending_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(root.path());
+        store
+            .create_work_item(&work_item_with_completed_write("work-1"))
+            .unwrap();
+        let mut update = store.read_work_item_snapshot("work-1").unwrap();
+        update.title = "Fully published".into();
+        update.attempts[0].tasks[0].instructions = Some("Published child".into());
+        let _fault = persist_fault::arm_creation_after_publish("work-1");
+        assert!(store.write_work_item(&update).is_err());
+        let journal = store.work_transaction_path("work-1").unwrap();
+        let before = fs::read(&journal).unwrap();
+        let read = store.read_work_item_snapshot("work-1").unwrap();
+        assert_eq!(read.title, "Fully published");
+        assert_eq!(read.attempts, update.attempts);
+        assert_eq!(read.storage_revision.get(), Some(1));
+        assert_eq!(fs::read(journal).unwrap(), before);
+    }
+
+    #[test]
     fn mutating_boundary_recovers_pending_transaction() {
         let tmp = tempfile::tempdir().unwrap();
         let store = WorkModelStore::new(tmp.path());
@@ -16298,6 +16551,7 @@ random banner prose that must be ignored
                 id: "work-1".into(),
                 base_revision: Some(0),
                 target_revision: 1,
+                base_children_digest: Some(work_item_children_digest(&target).unwrap()),
                 work_item: target,
             },
         )

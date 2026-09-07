@@ -64,7 +64,8 @@ fn dashboard_snapshot_is_nonmutating() {
         )
         .unwrap();
     std::fs::write(
-        root.path().join(".fluent/work/transactions/visible.json"),
+        root.path()
+            .join(".fluent/work/transactions/unpublished.json"),
         "unfinished journal",
     )
     .unwrap();

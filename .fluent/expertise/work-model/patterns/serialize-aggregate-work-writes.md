@@ -47,3 +47,11 @@ journals and per-item failures alongside valid aggregates. Do not use
 `read_work_item_snapshot` provides the same nonmutating assembly for one item.
 Artifact migration belongs to lifecycle writes and explicit upgrade; upgrade
 authors an audit with source and destination paths before moving artifacts.
+
+To verify a read-only aggregate, compare its root record and transaction before
+and after child assembly with bounded retry. A pending transaction's base child
+digest proves whether the stored children still belong to the old root; once
+the target revision publishes, compare with the target children instead. Keep
+that digest in new journals and accept its absence when recovering legacy
+journals. Without proof, observation reports the item unavailable while keeping
+unrelated Work visible. Never assemble a replacement row from journal contents.
