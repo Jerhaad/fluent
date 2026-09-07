@@ -2411,13 +2411,16 @@ Helper functions `mark_task_started`, `set_task_terminal`,
 assignment so every transition site uses the same format. Existing
 JSON files that lack the fields deserialize with `None` values; keys
 with `None` values are omitted on write.
-When `WorkModelStore` reads stored Work state, it normalizes older
-artifact references that still use
-`.fluent/work/artifacts/<attempt-id>/...` into the current
-`.fluent/work/artifacts/<work-item-id>/<attempt-id>/...` form before it
-validates the assembled Work Item. If the older path exists on disk and
-the namespaced path does not, the store moves that artifact directory or
-file into the Work Item namespace during the read.
+When `WorkModelStore` reads stored Work state, it retains older artifact
+references such as `.fluent/work/artifacts/<attempt-id>/...`. Status and
+dashboard resolve these stored references at their legacy locations.
+Lifecycle writes and explicit `fluent work-item upgrade` normalize the
+references into the current
+`.fluent/work/artifacts/<work-item-id>/<attempt-id>/...` form. If the older
+path exists on disk and the namespaced path does not, these mutating
+boundaries move that artifact directory or file into the Work Item
+namespace. Explicit upgrade records the source and destination paths in
+its audit before moving artifacts.
 
 Tasks store their workspace access under `workspace_access.reads` and
 `workspace_access.writes`. Workspace references stay inside task
