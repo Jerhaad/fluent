@@ -1763,12 +1763,7 @@ fn run_with_transcript_reported(
             };
             cmd.stdout(Stdio::piped());
             cmd.stderr(Stdio::from(stderr));
-            if let Err(error) = crate::execution::configure_identity_lock(&mut cmd, path) {
-                return CoderRunCompletion::terminal_only(Err(
-                    error.context("preparing local execution identity")
-                ));
-            }
-            let child = match cmd.spawn() {
+            let child = match crate::execution::spawn(&mut cmd, path) {
                 Ok(child) => child,
                 Err(err) => return CoderRunCompletion::terminal_only(Err(err.into())),
             };

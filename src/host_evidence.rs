@@ -366,7 +366,8 @@ pub fn classify_for_code_change(
         {
             return Err(rejected_for("Attempt is not the current paused failed-review frontier"));
         }
-        let selected = validate_evidence_frontier(
+        attempt.ensure_not_canceled()?;
+    let selected = validate_evidence_frontier(
             project_root,
             item,
             attempt_id,
@@ -814,6 +815,11 @@ pub fn run_focused(
     };
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
     let task_id = store.mutate_work_item(work_item_id, |item| {
+        item.attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .unwrap()
+            .ensure_not_canceled()?;
         let prior = item
             .attempts
             .iter()
@@ -1696,9 +1702,7 @@ pub(crate) fn execute_focused_command(
         process.process_group(0);
     }
     let transcript = run_dir.join("stdout.log");
-    crate::execution::configure_identity_lock(&mut process, &transcript)?;
-    let mut child = process
-        .spawn()
+    let mut child = crate::execution::spawn(&mut process, &transcript)
         .with_context(|| format!("spawn focused evidence command: {command}"))?;
     let mut execution = crate::execution::ExecutionHeartbeat::start(&transcript, child.id())?;
     let stdout_pipe = child.stdout.take().context("missing verification stdout")?;
@@ -1764,6 +1768,30 @@ pub fn attach(
     review_artifacts: &[String],
     recheck_artifact: Option<&str>,
 ) -> Result<EvidenceRecovery> {
+    attach_with_cancellation_policy(
+        project_root,
+        store,
+        work_item_id,
+        attempt_id,
+        candidate_commit,
+        evidence_file,
+        review_artifacts,
+        recheck_artifact,
+        true,
+    )
+}
+
+pub(crate) fn attach_with_cancellation_policy(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    candidate_commit: &str,
+    evidence_file: &Path,
+    review_artifacts: &[String],
+    recheck_artifact: Option<&str>,
+    operator_recovery: bool,
+) -> Result<EvidenceRecovery> {
     anyhow::ensure!(
         (recheck_artifact.is_some() && review_artifacts.is_empty())
             || (recheck_artifact.is_none() && !review_artifacts.is_empty()),
@@ -1812,6 +1840,18 @@ pub fn attach(
         .context("acquire land lock before attaching host evidence")?;
 
     let recovery = store.mutate_work_item(work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.into(),
+            })?;
+        if operator_recovery {
+            attempt.resume_cancellation()?;
+        } else {
+            attempt.ensure_not_canceled()?;
+        }
         let _ = item.validate_recovery_operation(project_root, &operation)?;
         let existing = item
             .attempts
@@ -2439,6 +2479,7 @@ pub fn attach_plan_row(
                     .find(|task| task.id == task_id).expect("validated stopped Writer");
                 work_model::set_task_terminal(writer, TaskStatus::Superseded);
             }
+            item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id).unwrap().resume_cancellation()?;
             let recovery = item
                 .attempts
                 .iter_mut()

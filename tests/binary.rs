@@ -38522,3 +38522,317 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
     fs::write(scratch.join("release"), "release").unwrap();
     assert!(worker.wait().unwrap().success());
 }
+
+#[test]
+fn attempt_cancel_persists_stop_before_settling_active_execution() {
+    use fluent::{execution, work_model::*};
+    use std::os::unix::process::CommandExt;
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut item = WorkItem::planned("cancel-stop", "Cancel an active worker");
+    item.add_initial_attempt("attempt-1").unwrap();
+    let task = &mut item.attempts[0].tasks[0];
+    task.status = TaskStatus::Executing;
+    let area = project.join(&task.artifact_area.as_ref().unwrap().path);
+    fs::create_dir_all(&area).unwrap();
+    let transcript = area.join("transcript.jsonl");
+    item.attempts[0].status = AttemptStatus::Executing;
+    store.create_work_item(&item).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "trap '' TERM; printf ready; sleep 30"])
+        .stdout(std::process::Stdio::piped())
+        .process_group(0);
+    execution::configure_identity_lock(&mut command, &transcript).unwrap();
+    let mut child = command.spawn().unwrap();
+    let _heartbeat = execution::ExecutionHeartbeat::start(&transcript, child.id()).unwrap();
+    use std::io::Read;
+    let mut ready = [0; 5];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    let mut cancel = Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .current_dir(&project)
+        .env("FLUENT_NO_UPDATE_CHECK", "1")
+        .args(["attempt", "cancel", "cancel-stop", "attempt-1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut observed = false;
+    for _ in 0..1000 {
+        let shown = store.read_work_item("cancel-stop").unwrap();
+        let value = serde_json::to_value(&shown.attempts[0]).unwrap();
+        if value["cancellation"]["requested_at"].is_string() {
+            observed = true;
+            assert!(
+                cancel.try_wait().unwrap().is_none(),
+                "stop intent precedes settlement"
+            );
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let cancel_result = cancel.wait().unwrap();
+    let _ = child.wait();
+    assert!(
+        observed,
+        "cancellation must be durable before signaling the worker"
+    );
+    assert!(cancel_result.success());
+    let after = work_item_value(&project, "cancel-stop");
+    assert_eq!(after["attempts"][0]["status"], "needs-user");
+    assert!(after["attempts"][0]["cancellation"]["settled_at"].is_string());
+}
+
+#[test]
+fn attempt_cancel_is_idempotent_after_settlement() {
+    let tmp = TempDir::new().unwrap();
+    let project = setup_git_project(&tmp);
+    let store = WorkModelStore::new(&project);
+    let mut item =
+        fluent::work_model::WorkItem::planned("cancel-idempotent", "Cancel between stages");
+    item.add_initial_attempt("attempt-1").unwrap();
+    store.create_work_item(&item).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", "cancel-idempotent", "attempt-1"])
+        .assert()
+        .success();
+    let before = store.read_work_item("cancel-idempotent").unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", "cancel-idempotent", "attempt-1"])
+        .assert()
+        .success();
+    assert_eq!(store.read_work_item("cancel-idempotent").unwrap(), before);
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "task",
+            "run",
+            "cancel-idempotent",
+            "attempt-1",
+            "attempt-1-write-1",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(store.read_work_item("cancel-idempotent").unwrap(), before);
+}
+
+#[test]
+fn attempt_cancel_stops_each_stage_without_downstream_launch() {
+    use fluent::work_model::*;
+    for stage in ["writer", "verification", "tester", "review", "learner"] {
+        let tmp = TempDir::new().unwrap();
+        let project = setup_git_project(&tmp);
+        let started = tmp.path().join("stage-started");
+        if stage == "tester" {
+            commit_file(
+                &project,
+                ".fluent/tester.yaml",
+                &format!(
+                    "commands:\n  - command: \"touch {}; sleep 30\"\n    test_harness: shell-harness\n",
+                    started.display()
+                ),
+                "Add blocking Tester fixture",
+            );
+        }
+        let id = format!(
+            "cancel-{}-{stage}",
+            tmp.path().file_name().unwrap().to_string_lossy()
+        );
+        let (project, candidate, review_path) = create_focused_evidence_item(
+            project,
+            &id,
+            "tests",
+            "Verdict: fail\nEvidence-Command: sh -c 'touch \"$FLUENT_EVIDENCE_SCRATCH/started\"; sleep 30'\nEvidence-Working-Directory: .\n",
+        );
+        let store = WorkModelStore::new(&project);
+        let mut item = store.read_work_item(&id).unwrap();
+        let writer_area = project.join(
+            &item.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        fs::create_dir_all(&writer_area).unwrap();
+        fs::write(
+            writer_area.join("transcript.jsonl"),
+            "writer completed fixture",
+        )
+        .unwrap();
+        let task_id = match stage {
+            "writer" => {
+                item.attempts[0].tasks.truncate(1);
+                let writer = &mut item.attempts[0].tasks[0];
+                writer.status = TaskStatus::Planned;
+                writer.output = None;
+                writer.id.clone()
+            }
+            "review" => {
+                let reviewer = item.attempts[0].tasks.last_mut().unwrap();
+                reviewer.status = TaskStatus::Planned;
+                reviewer.id.clone()
+            }
+            "tester" => item.add_final_tester_task("attempt-1").unwrap(),
+            "learner" => {
+                fs::write(project.join(&review_path), "Verdict: pass\n").unwrap();
+                item.attempts[0].status = AttemptStatus::Complete;
+                item.attempts[0].review_state = Some(AttemptReviewState::Passed);
+                item.attempts[0].pause_kind = None;
+                String::new()
+            }
+            _ => "attempt-1-verification-1".into(),
+        };
+        if !matches!(stage, "verification" | "learner") {
+            item.attempts[0].status = AttemptStatus::Reviewing;
+            item.attempts[0].pause_kind = None;
+        }
+        store.write_work_item(&item).unwrap();
+        let _workspace = if stage != "writer" {
+            Some(bind_candidate_to_managed_sibling(&project, &id, &candidate))
+        } else {
+            None
+        };
+        if stage == "verification" {
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "evidence",
+                    "run",
+                    &id,
+                    "attempt-1",
+                    "--review-artifact",
+                    &review_path,
+                ])
+                .assert()
+                .success();
+        }
+        let bin = tmp.path().join("bin-cancel");
+        write_mock_claude(
+            &bin,
+            &format!(
+                "#!/bin/bash\ntouch {}\nsleep 30 &\nwait\n",
+                started.display()
+            ),
+        );
+        write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+        command
+            .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
+            .env(
+                "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+                bin.join("sandbox-exec"),
+            )
+            .env("PATH", mock_path(&bin));
+        command.args(["attempt", "run", &id, "attempt-1", "--no-sandbox"]);
+        let diagnostics = tmp.path().join("worker.log");
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(fs::File::create(&diagnostics).unwrap());
+        let mut worker = OwnedFixtureProcess::spawn(&mut command);
+        let mut record_path = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        while std::time::Instant::now() < deadline {
+            let current = store.read_work_item(&id).unwrap();
+            let paths = if stage == "learner" {
+                current.attempts[0]
+                    .artifacts
+                    .iter()
+                    .filter(|artifact| artifact.producer_id == "local-execution")
+                    .map(|artifact| project.join(&artifact.path))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![
+                    project
+                        .join(
+                            &current.attempts[0]
+                                .tasks
+                                .iter()
+                                .find(|task| task.id == task_id)
+                                .unwrap()
+                                .artifact_area
+                                .as_ref()
+                                .unwrap()
+                                .path,
+                        )
+                        .join("execution.json"),
+                ]
+            };
+            record_path = paths
+                .into_iter()
+                .find(|path| fluent::execution::execution_is_live(path).unwrap_or(false));
+            let stage_started = if stage == "verification" {
+                record_path
+                    .as_ref()
+                    .is_some_and(|path| path.parent().unwrap().join("scratch/started").is_file())
+            } else {
+                started.is_file()
+            };
+            if record_path.is_some() && stage_started {
+                break;
+            }
+            record_path = None;
+            if worker.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            record_path.is_some(),
+            "{stage} did not publish a live identity: {}",
+            fs::read_to_string(&diagnostics).unwrap()
+        );
+        let before = store.read_work_item(&id).unwrap();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "cancel", &id, "attempt-1"])
+            .assert()
+            .success();
+        let _ = worker.wait().unwrap();
+        let after = store.read_work_item(&id).unwrap();
+        assert_eq!(
+            after.attempts[0].status,
+            AttemptStatus::NeedsUser,
+            "{stage}"
+        );
+        assert_eq!(
+            after.attempts[0].pause_kind,
+            Some(PauseKind::Interrupted),
+            "{stage}"
+        );
+        assert_eq!(
+            after.attempts[0].tasks.len(),
+            before.attempts[0].tasks.len(),
+            "{stage}: no downstream Task"
+        );
+        assert!(
+            !fluent::execution::execution_is_live(&record_path.unwrap()).unwrap(),
+            "{stage}"
+        );
+        assert!(
+            after.attempts[0]
+                .cancellation
+                .as_ref()
+                .unwrap()
+                .settled_at
+                .is_some()
+        );
+        assert!(
+            after
+                .merge_candidates
+                .iter()
+                .all(|candidate| candidate.ready_at.is_none()),
+            "{stage}"
+        );
+    }
+}

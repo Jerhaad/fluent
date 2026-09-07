@@ -14,6 +14,7 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionState {
+    Launching,
     Running,
     Settled,
     Canceled,
@@ -207,25 +208,140 @@ pub fn configure_identity_lock(_command: &mut Command, _transcript: &Path) -> Re
     bail!("local execution identity requires Unix process groups")
 }
 
+/// Publish a cancellable owner before the Task becomes visibly executing.
+/// The caller holds its Work Item mutation boundary through reservation.
+pub(crate) fn prepare_launch(transcript: &Path) -> Result<()> {
+    let path = record_path_for_transcript(transcript);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
+    anyhow::ensure!(
+        !identity_is_held(&path)?,
+        "prior local execution still owns its identity"
+    );
+    let now = crate::work_model::now_iso8601();
+    let record = ExecutionRecord {
+        schema_version: 1,
+        state: ExecutionState::Launching,
+        owner_pid: std::process::id(),
+        leader_pid: 0,
+        process_group_id: 0,
+        started_at: now.clone(),
+        heartbeat_at: now,
+        settled_at: None,
+    };
+    crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
+    Ok(())
+}
+
+thread_local! {
+    static TASK_OWNER: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Attribute nested deterministic commands, including baseline checks, to their Task.
+pub(crate) struct TaskOwner(Option<PathBuf>);
+impl TaskOwner {
+    pub(crate) fn enter(transcript: PathBuf) -> Self {
+        Self(TASK_OWNER.with(|owner| owner.replace(Some(transcript))))
+    }
+}
+impl Drop for TaskOwner {
+    fn drop(&mut self) {
+        TASK_OWNER.with(|owner| owner.replace(self.0.take()));
+    }
+}
+fn owned_transcript(transcript: &Path) -> PathBuf {
+    TASK_OWNER
+        .with(|owner| owner.borrow().clone())
+        .unwrap_or_else(|| transcript.to_path_buf())
+}
+
+/// Serialize the stop check, child creation, and child identity publication.
+/// Cancellation observes either a stopped launch or the fully registered child.
+pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    let owned = owned_transcript(transcript);
+    let transcript = owned.as_path();
+    command.process_group(0);
+    configure_identity_lock(command, transcript)?;
+    let path = record_path_for_transcript(transcript);
+    let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let record: ExecutionRecord = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                record.state != ExecutionState::Canceled,
+                "local execution was canceled before launch"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut child = command.spawn()?;
+    if let Err(error) = write_running_record(&path, child.id()) {
+        let _ = signal_process_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
+}
+
+/// Capture a deterministic Task command under the same cancellation identity.
+/// Keep ordinary Tester leak detection authoritative after a natural exit.
+pub(crate) fn output(command: &mut Command, transcript: &Path) -> Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = spawn(command, transcript)?;
+    let result = child.wait_with_output();
+    let path = record_path_for_transcript(&owned_transcript(transcript));
+    if result.is_err() {
+        cancel(&path)?;
+    }
+    if !identity_is_held(&path)? {
+        mutate_record(&path, |record| {
+            if record.state == ExecutionState::Running {
+                record.state = ExecutionState::Settled;
+                record.settled_at = Some(crate::work_model::now_iso8601());
+            }
+            Ok(())
+        })?;
+    }
+    result.context("capture local Task command")
+}
+
+fn write_running_record(path: &Path, leader_pid: u32) -> Result<()> {
+    let now = crate::work_model::now_iso8601();
+    let record = ExecutionRecord {
+        schema_version: 1,
+        state: ExecutionState::Running,
+        owner_pid: std::process::id(),
+        leader_pid,
+        process_group_id: leader_pid,
+        started_at: now.clone(),
+        heartbeat_at: now,
+        settled_at: None,
+    };
+    crate::atomic_write::atomic_write(path, &serde_json::to_vec_pretty(&record)?)?;
+    Ok(())
+}
+
 impl ExecutionHeartbeat {
     pub fn start(transcript: &Path, leader_pid: u32) -> Result<Self> {
         let path = record_path_for_transcript(transcript);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let now = crate::work_model::now_iso8601();
-        let record = ExecutionRecord {
-            schema_version: 1,
-            state: ExecutionState::Running,
-            owner_pid: std::process::id(),
-            leader_pid,
-            process_group_id: leader_pid,
-            started_at: now.clone(),
-            heartbeat_at: now,
-            settled_at: None,
-        };
         let _lock = crate::lease::acquire_blocking(&lock_path(&path))?;
-        crate::atomic_write::atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
+        if path.exists() {
+            let record: ExecutionRecord = serde_json::from_slice(&std::fs::read(&path)?)?;
+            anyhow::ensure!(
+                record.state != ExecutionState::Canceled,
+                "local execution was canceled after launch"
+            );
+        }
+        write_running_record(&path, leader_pid)?;
         Ok(Self {
             path,
             last_write: Instant::now(),
@@ -287,7 +403,10 @@ pub fn cancel(path: &Path) -> Result<CancelOutcome> {
         .with_context(|| format!("reading local execution record {}", path.display()))?;
     let mut record: ExecutionRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing local execution record {}", path.display()))?;
-    if record.state != ExecutionState::Running {
+    if !matches!(
+        record.state,
+        ExecutionState::Launching | ExecutionState::Running
+    ) {
         return Ok(CancelOutcome::AlreadyStopped);
     }
 

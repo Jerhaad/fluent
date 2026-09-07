@@ -1326,6 +1326,13 @@ impl WorkItem {
         round: Option<usize>,
     ) -> Result<Vec<String>, WorkModelError> {
         self.ensure_not_abandoned()?;
+        if let Some(attempt) = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.ensure_not_canceled()?;
+        }
         let preserved_inputs = self.preserved_input_refs();
         let Some(attempt) = self
             .attempts
@@ -1501,6 +1508,13 @@ impl WorkItem {
     /// this method.
     pub fn add_final_tester_task(&mut self, attempt_id: &str) -> Result<String, WorkModelError> {
         self.ensure_not_abandoned()?;
+        if let Some(attempt) = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.ensure_not_canceled()?;
+        }
         let tester_instructions = self.write_task_instructions();
         let Some(attempt) = self
             .attempts
@@ -1591,6 +1605,13 @@ impl WorkItem {
         source_results: ArtifactRef,
     ) -> Result<String, WorkModelError> {
         self.ensure_not_abandoned()?;
+        if let Some(attempt) = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.ensure_not_canceled()?;
+        }
         let Some(attempt) = self
             .attempts
             .iter_mut()
@@ -1667,6 +1688,13 @@ impl WorkItem {
         input_artifacts: Vec<ArtifactRef>,
     ) -> Result<String, WorkModelError> {
         self.ensure_not_abandoned()?;
+        if let Some(attempt) = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.ensure_not_canceled()?;
+        }
         let write_task_instructions = self.write_task_instructions();
         let input_artifacts = self.with_preserved_inputs(input_artifacts);
         let Some(attempt) = self
@@ -1830,6 +1858,13 @@ impl WorkItem {
         attempt_id: &str,
     ) -> Result<String, WorkModelError> {
         self.ensure_not_abandoned()?;
+        if let Some(attempt) = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            attempt.ensure_not_canceled()?;
+        }
         let candidate_id = format!("{attempt_id}-merge-candidate");
         validate_id("merge candidate", &candidate_id)?;
         if let Some(candidate) = self
@@ -5251,6 +5286,8 @@ pub struct Attempt {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub writer_runs: Vec<WriterRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<AttemptCancellation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
@@ -5271,6 +5308,16 @@ pub struct Attempt {
     /// Explicit approvals for legitimate write-round-cap pauses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub round_cap_extensions: Vec<RoundCapExtension>,
+}
+
+/// Persist the operator's stop request before settling any local execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptCancellation {
+    pub requested_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<String>,
 }
 
 /// Bind one preserved failed Reviewer launch to its audited Approach revision.
@@ -5300,6 +5347,7 @@ impl Default for Attempt {
             evidence_recoveries: Vec::new(),
             recovery_operations: Vec::new(),
             approach_revision_superseded_tasks: Vec::new(),
+            cancellation: None,
             writer_runs: Vec::new(),
             created_at: None,
             completed_at: None,
@@ -5312,6 +5360,40 @@ impl Default for Attempt {
 }
 
 impl Attempt {
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|stop| stop.resumed_at.is_none())
+    }
+
+    /// A fresh operator recovery may resume a fully settled stop. Workers never
+    /// call this while ingesting scheduled verification results.
+    pub(crate) fn resume_cancellation(&mut self) -> Result<(), WorkModelError> {
+        if self.cancellation_requested() {
+            let stop = self.cancellation.as_mut().unwrap();
+            if stop.settled_at.is_none() {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: self.id.clone(),
+                    reason: "local cancellation has not settled".into(),
+                });
+            }
+            stop.resumed_at = Some(now_iso8601());
+        }
+        Ok(())
+    }
+
+    pub fn ensure_not_canceled(&self) -> Result<(), WorkModelError> {
+        if self.cancellation_requested() {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: self.id.clone(),
+                reason:
+                    "Attempt has a durable cancellation request; explicitly resume after settlement"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Return the latest completed Writer commit that this Attempt currently
     /// treats as its candidate.
     pub fn current_candidate_commit(&self) -> Option<&str> {
@@ -8180,6 +8262,9 @@ pub fn transition_attempt(
     status: AttemptStatus,
     pause: Option<PauseKind>,
 ) -> bool {
+    if attempt.cancellation_requested() {
+        return false;
+    }
     let current = attempt_state_rank(&attempt.status, &attempt.pause_kind);
     let incoming = attempt_state_rank(&status, &pause);
     // A terminal current state (rank >= 2) yields only to a strictly dominating
@@ -8213,6 +8298,9 @@ pub fn transition_attempt(
 /// never discards a completed peer, silently retries a hard failure, or replans a
 /// Task that is still running.
 pub fn reopen_attempt(attempt: &mut Attempt) {
+    if attempt.cancellation_requested() {
+        return;
+    }
     attempt.status = AttemptStatus::Planned;
     attempt.pause_kind = None;
     attempt.pause_recovery = None;
@@ -9306,6 +9394,8 @@ struct AttemptRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     writer_runs: Vec<WriterRun>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancellation: Option<AttemptCancellation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_at: Option<String>,
@@ -9407,6 +9497,7 @@ impl AttemptRecord {
             artifacts: attempt.artifacts.clone(),
             evidence_recoveries: attempt.evidence_recoveries.clone(),
             approach_revision_superseded_tasks: attempt.approach_revision_superseded_tasks.clone(),
+            cancellation: attempt.cancellation.clone(),
             writer_runs: attempt.writer_runs.clone(),
             created_at: attempt.created_at.clone(),
             completed_at: attempt.completed_at.clone(),
@@ -9435,6 +9526,7 @@ impl From<AttemptRecord> for Attempt {
             artifacts: record.artifacts,
             evidence_recoveries: record.evidence_recoveries,
             approach_revision_superseded_tasks: record.approach_revision_superseded_tasks,
+            cancellation: record.cancellation,
             writer_runs: record.writer_runs,
             created_at: record.created_at,
             completed_at: record.completed_at,
@@ -9462,6 +9554,61 @@ impl TaskRecord {
                 (1, group, role_order, id)
             })
     }
+}
+
+fn reject_canceled_attempt_launches(
+    prior: &WorkItem,
+    target: &WorkItem,
+    path: &Path,
+) -> Result<(), WorkModelStorageError> {
+    for next in &target.attempts {
+        let Some(previous) = prior.attempts.iter().find(|attempt| attempt.id == next.id) else {
+            continue;
+        };
+        let lost_stop = previous.cancellation_requested()
+            && next.cancellation.as_ref().is_none_or(|stop| {
+                stop.requested_at != previous.cancellation.as_ref().unwrap().requested_at
+                    || (stop.resumed_at.is_some()
+                        && previous.cancellation.as_ref().unwrap().settled_at.is_none())
+            });
+        let starts_task = next.tasks.iter().any(|task| {
+            previous
+                .tasks
+                .iter()
+                .find(|prior| prior.id == task.id)
+                .is_none_or(|prior| {
+                    task.status != prior.status
+                        && matches!(task.status, TaskStatus::Executing | TaskStatus::Complete)
+                })
+        });
+        let advances_learning = next.learning != previous.learning
+            && next.learning.as_ref().is_some_and(|learning| {
+                matches!(
+                    learning.status,
+                    LearningStatus::InProgress
+                        | LearningStatus::HandoffPending
+                        | LearningStatus::Succeeded
+                )
+            });
+        if lost_stop
+            || (next.cancellation_requested()
+                && (next.status != AttemptStatus::NeedsUser
+                    || next.pause_kind != Some(PauseKind::Interrupted)
+                    || starts_task
+                    || advances_learning))
+        {
+            return Err(WorkModelStorageError::InvalidModel {
+                path: path.to_path_buf(),
+                source: WorkModelError::AttemptResumeIneligible {
+                    attempt_id: next.id.clone(),
+                    reason:
+                        "durable cancellation prevents downstream execution until explicit resume"
+                            .into(),
+                },
+            });
+        }
+    }
+    Ok(())
 }
 
 impl WorkModelStore {
@@ -10124,6 +10271,7 @@ impl WorkModelStore {
         self.normalize_work_artifact_paths(&mut work_item)?;
         work_item.synchronize_pause_records(&self.project_root);
         reject_transition_history_change(&prior, &work_item, &path)?;
+        reject_canceled_attempt_launches(&prior, &work_item, &path)?;
         if work_item != prior {
             append_transition_ledger(&prior, &mut work_item, metadata);
         }
@@ -10174,6 +10322,7 @@ impl WorkModelStore {
         let mut target = work_item.clone();
         if let Some(prior) = prior.as_ref() {
             preserve_transition_history(prior, &mut target, &path)?;
+            reject_canceled_attempt_launches(prior, &target, &path)?;
             if recovered_transaction
                 && target == *prior
                 && let Some(revision) = prior.storage_revision.get()

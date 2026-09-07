@@ -350,6 +350,19 @@ pub fn run_attempt(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunRes
 fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunResult> {
     let initial_item = read_work_item_or_not_found(config.store, config.work_item_id)?;
     initial_item.ensure_mutation_compatible()?;
+    if let Some(attempt) = initial_item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == config.attempt_id)
+    {
+        crate::host_evidence::ensure_owned_host_resume_ready(config.project_root, attempt)?;
+    }
+    resume_canceled_attempt(
+        config.project_root,
+        config.store,
+        config.work_item_id,
+        config.attempt_id,
+    )?;
     let tester_no_sandbox_task_id = if config.tester_no_sandbox {
         let attempt = initial_item
             .attempts
@@ -408,6 +421,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .iter()
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
+        attempt.ensure_not_canceled()?;
         if let Some(task) = attempt
             .tasks
             .iter()
@@ -2981,7 +2995,8 @@ fn reserve_learner_run(
         // Landing validation: only a Complete, review-Passed Attempt is a target for
         // a Learner run. A peer that paused or otherwise took the Attempt off this
         // path is honored rather than revived.
-        let landing_eligible = attempt.status == AttemptStatus::Complete
+        let landing_eligible = !attempt.cancellation_requested()
+            && attempt.status == AttemptStatus::Complete
             && attempt.review_state == Some(AttemptReviewState::Passed);
         if !landing_eligible {
             return Ok(LearnerReservation::Skip);
@@ -3109,6 +3124,40 @@ fn run_learner_step(
     // reservation, not this stale snapshot, is authoritative. A crash after it
     // reserves the in-progress state leaves a retryable record rather than an orphan
     // handoff with no durable learning state.
+    mutate_attempt_work_item(store, &work_item_id, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .unwrap();
+        attempt.ensure_not_canceled()?;
+        for directory in std::iter::once(&prepared_run.run_dir)
+            .chain(prepared_run.repairs.iter().map(|repair| &repair.run_dir))
+        {
+            let record =
+                crate::execution::record_path_for_transcript(&directory.join("transcript.jsonl"));
+            crate::execution::prepare_launch(&record).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.clone(),
+                    reason: format!("publish Learner execution identity: {error:#}"),
+                }
+            })?;
+            let relative = record.strip_prefix(project_root).map_err(|error| {
+                WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.clone(),
+                    reason: format!("bind Learner execution: {error}"),
+                }
+            })?;
+            let reference = crate::work_model::ArtifactRef {
+                producer_id: "local-execution".into(),
+                path: relative.display().to_string(),
+            };
+            if !attempt.artifacts.contains(&reference) {
+                attempt.artifacts.push(reference);
+            }
+        }
+        Ok(())
+    })?;
     let runs = match reserve_learner_run(store, &work_item_id, &attempt_id, learner_coder)? {
         LearnerReservation::Skip => {
             *item = store.read_work_item(&work_item_id)?;
@@ -3162,6 +3211,13 @@ fn run_learner_step(
         &config,
         &prepared_run,
     );
+    store
+        .read_work_item(&work_item_id)?
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .unwrap()
+        .ensure_not_canceled()?;
     finalize_learning(store, item, attempt_index, runs, learned, |handoff| {
         crate::learner::write_handoff(project_root, &work_item_id, &attempt_id, handoff)
     })
@@ -3588,10 +3644,11 @@ fn learning_frontier_is(
     runs: u32,
     status: crate::work_model::LearningStatus,
 ) -> bool {
-    matches!(
-        item.attempts[idx].learning.as_ref(),
-        Some(learning) if learning.status == status && learning.runs == runs
-    )
+    !item.attempts[idx].cancellation_requested()
+        && matches!(
+            item.attempts[idx].learning.as_ref(),
+            Some(learning) if learning.status == status && learning.runs == runs
+        )
 }
 
 /// Settle a pre-land no-expertise Learning to a terminal, typed `Failed` record
@@ -4741,96 +4798,186 @@ fn executing_task_is_live(
     crate::execution::execution_is_live(&execution).unwrap_or(true)
 }
 
+fn resume_canceled_attempt(
+    project: &Path,
+    store: &WorkModelStore,
+    work: &str,
+    id: &str,
+) -> Result<()> {
+    mutate_attempt_work_item(store, work, |item| {
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound { id: id.into() })?;
+        if !attempt.cancellation_requested() {
+            return Ok(());
+        }
+        let active_task = attempt.tasks.iter().any(|task| {
+            crate::lease::is_leased(&crate::lease::task_lock_path(project, work, &task.id))
+        });
+        if attempt.cancellation.as_ref().unwrap().settled_at.is_none()
+            || active_task
+            || crate::lease::is_leased(&crate::lease::learner_lock_path(project, work, id))
+        {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: id.into(),
+                reason: "canceled local execution has not settled".into(),
+            });
+        }
+        let stopped_at = attempt
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at
+            .replace(':', "-");
+        for task in &mut attempt.tasks {
+            if task.kind == TaskKind::Verification && task.status == TaskStatus::NeedsUser {
+                if let Some(area) = &mut task.artifact_area {
+                    // Keep every canceled run's logs and any published receipt intact.
+                    area.path = format!(
+                        "{}/retries/{stopped_at}",
+                        work_artifact_path(work, id, &task.id)
+                    );
+                }
+            }
+        }
+        attempt.cancellation.as_mut().unwrap().resumed_at = Some(crate::work_model::now_iso8601());
+        crate::work_model::reopen_attempt(attempt);
+        if attempt.learning.is_some()
+            && attempt.review_state == Some(AttemptReviewState::Passed)
+            && attempt
+                .tasks
+                .iter()
+                .all(|task| task.status == TaskStatus::Complete)
+        {
+            attempt.status = AttemptStatus::Complete;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Stop every locally owned coder group for one Attempt, then suspend its captured
-/// Tasks for an explicit same-Attempt resume. Process identity is verified before a
-/// signal is sent, and the Work model changes only after every group is confirmed gone.
+/// Tasks for an explicit same-Attempt resume. Persist the stop boundary before
+/// signaling and verify every registered execution before recording settlement.
 pub fn cancel_local_attempt(
     project_root: &Path,
     store: &WorkModelStore,
     work_item_id: &str,
     attempt_id: &str,
 ) -> Result<usize> {
-    let item = store.read_work_item(work_item_id)?;
-    item.ensure_not_abandoned()?;
-    let attempt = item
-        .attempts
-        .iter()
-        .find(|attempt| attempt.id == attempt_id)
-        .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
-    if attempt.status == AttemptStatus::NeedsUser
-        && attempt.pause_kind == Some(crate::work_model::PauseKind::Interrupted)
-    {
+    let attempt = mutate_attempt_work_item(store, work_item_id, |item| {
+        item.ensure_not_abandoned()?;
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|attempt| attempt.id == attempt_id)
+            .ok_or_else(|| WorkModelError::AttemptNotFound {
+                id: attempt_id.into(),
+            })?;
+        if !attempt.cancellation_requested() {
+            attempt.cancellation = Some(crate::work_model::AttemptCancellation {
+                requested_at: crate::work_model::now_iso8601(),
+                settled_at: None,
+                resumed_at: None,
+            });
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::Interrupted);
+            attempt.pause_recovery = None;
+            attempt
+                .completed_at
+                .get_or_insert_with(crate::work_model::now_iso8601);
+        }
+        Ok(attempt.clone())
+    })?;
+    if attempt.cancellation.as_ref().unwrap().settled_at.is_some() {
         return Ok(0);
     }
     let executing = attempt
         .tasks
         .iter()
         .filter(|task| task.status == TaskStatus::Executing)
-        .cloned()
-        .collect::<Vec<_>>();
-    if executing.is_empty() {
-        bail!("Attempt {attempt_id:?} has no executing local Task to cancel");
-    }
-
-    for task in &executing {
-        let lock_path = crate::lease::task_lock_path(project_root, work_item_id, &task.id);
-        let Some(artifact_area) = task.artifact_area.as_ref() else {
-            if crate::lease::is_leased(&lock_path) {
-                bail!(
-                    "Task {:?} is live but has no artifact area for its execution identity",
-                    task.id
-                );
-            }
-            continue;
-        };
-        let execution =
-            crate::execution::record_path_for_artifact(project_root, &artifact_area.path);
-        if !execution.exists() {
-            if crate::lease::is_leased(&lock_path) {
-                bail!(
-                    "Task {:?} has not published its local execution identity yet; retry cancellation",
-                    task.id
-                );
-            }
-            continue;
-        }
-        crate::execution::cancel(&execution)
-            .with_context(|| format!("canceling local execution for Task {:?}", task.id))?;
-    }
-
-    let captured_ids = executing
-        .iter()
-        .map(|task| task.id.as_str())
+        .map(|task| task.id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    let mut records = attempt
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.artifact_area
+                .as_ref()
+                .map(|area| crate::execution::record_path_for_artifact(project_root, &area.path))
+        })
+        .collect::<Vec<_>>();
+    records.extend(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "local-execution")
+            .map(|artifact| project_root.join(&artifact.path)),
+    );
+    for execution in records {
+        match fs::symlink_metadata(&execution) {
+            Ok(_) => {
+                crate::execution::cancel(&execution)
+                    .with_context(|| format!("cancel local execution {}", execution.display()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Setup owns the Task lease before it has a child. Let that owner observe the
+    // durable gate and unwind before recording settled cancellation.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let tasks_live = executing.iter().any(|id| {
+            crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                work_item_id,
+                id,
+            ))
+        });
+        let learner_live = crate::lease::is_leased(&crate::lease::learner_lock_path(
+            project_root,
+            work_item_id,
+            attempt_id,
+        ));
+        if !tasks_live && !learner_live {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "cancellation is durable; local setup has not settled yet"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let canceled = mutate_attempt_work_item(store, work_item_id, |item| {
         let attempt = item
             .attempts
             .iter_mut()
             .find(|attempt| attempt.id == attempt_id)
-            .ok_or_else(|| crate::work_model::WorkModelError::AttemptNotFound {
-                id: attempt_id.to_string(),
-            })?;
-        let mut canceled = 0;
+            .unwrap();
+        let stop = attempt.cancellation.as_ref().unwrap();
+        if stop.settled_at.is_some() {
+            return Ok(0);
+        }
         for task in &mut attempt.tasks {
-            if captured_ids.contains(task.id.as_str())
-                && matches!(task.status, TaskStatus::Executing | TaskStatus::Failed)
-                && task.output.is_none()
-            {
+            if executing.contains(&task.id) && task.output.is_none() {
                 crate::work_model::set_task_terminal(task, TaskStatus::NeedsUser);
-                canceled += 1;
             }
         }
-        if canceled > 0 {
-            // Cancellation intentionally supersedes a generic failure concurrently
-            // reported by the owner after the signal. The verified dead process group
-            // makes this a safe, resumable operator transition.
-            attempt.status = AttemptStatus::NeedsUser;
-            attempt.pause_kind = Some(crate::work_model::PauseKind::Interrupted);
-            attempt
-                .completed_at
-                .get_or_insert_with(crate::work_model::now_iso8601);
+        if let Some(learning) = &attempt.learning {
+            if !learning.is_succeeded() {
+                attempt.learning = Some(crate::work_model::AttemptLearning::failed(
+                    learning.runs,
+                    "operator canceled local execution",
+                ));
+            }
         }
-        Ok(canceled)
+        attempt.status = AttemptStatus::NeedsUser;
+        attempt.pause_kind = Some(PauseKind::Interrupted);
+        attempt.cancellation.as_mut().unwrap().settled_at = Some(crate::work_model::now_iso8601());
+        Ok(executing.len())
     })?;
     Ok(canceled)
 }
@@ -9868,6 +10015,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canceled_verification_resume_preserves_prior_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Retry a canceled check");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &mut item.attempts[0].tasks[0];
+        task.kind = TaskKind::Verification;
+        task.status = TaskStatus::Executing;
+        let area = tmp.path().join(&task.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        fs::write(area.join("stdout.log"), b"interrupted output").unwrap();
+        item.attempts[0].status = AttemptStatus::Reviewing;
+        store.create_work_item(&item).unwrap();
+        cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        let resumed = store.read_work_item("work-1").unwrap();
+        let retry_area = tmp.path().join(
+            &resumed.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        );
+        assert_ne!(
+            retry_area, area,
+            "a resumed worker must not overwrite an immutable prior run"
+        );
+        assert_eq!(
+            fs::read(area.join("stdout.log")).unwrap(),
+            b"interrupted output"
+        );
+        assert_eq!(resumed.attempts[0].tasks[0].status, TaskStatus::Planned);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancel_local_attempt_stops_owned_group_and_replans_once() {
@@ -9919,7 +10101,7 @@ mod tests {
             "repeated cancellation must be idempotent"
         );
 
-        reopen_resumable_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
+        resume_canceled_attempt(tmp.path(), &store, "work-1", "attempt-1").unwrap();
         let resumed = store.read_work_item("work-1").unwrap();
         assert_eq!(resumed.attempts[0].status, AttemptStatus::Planned);
         assert_eq!(resumed.attempts[0].pause_kind, None);

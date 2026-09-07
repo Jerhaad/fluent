@@ -994,8 +994,11 @@ fn run_command(
             .env("TMPDIR", directory)
             .env("FLUENT_RELEASE_TEST_ROOTS", directory);
     }
-    let output = process
-        .output()
+    let transcript = commands_dir
+        .parent()
+        .context("Tester command has no artifact area")?
+        .join("transcript.jsonl");
+    let output = crate::execution::output(&mut process, &transcript)
         .with_context(|| format!("spawning Tester command: {command}"))?;
     let duration = start.elapsed();
 
@@ -1058,8 +1061,7 @@ fn run_extractor(
     for (key, value) in launch_env {
         command.env(key, value);
     }
-    let output = command
-        .output()
+    let output = crate::execution::output(&mut command, &artifact_dir.join("transcript.jsonl"))
         .with_context(|| format!("running {}", extractor_path.display()))?;
 
     if !output.status.success() {

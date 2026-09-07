@@ -71,7 +71,21 @@ fn mutate_task_work_item<T>(
     id: &str,
     reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
 ) -> Result<T, WorkModelStorageError> {
-    store.mutate_work_item_with_transition(id, &task_executor_transition(), reducer)
+    store.mutate_work_item_with_transition(id, &task_executor_transition(), |item| {
+        let stopped = item
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.cancellation_requested())
+            .cloned()
+            .collect::<Vec<_>>();
+        let result = reducer(item)?;
+        for prior in stopped {
+            if item.attempts.iter().find(|attempt| attempt.id == prior.id) != Some(&prior) {
+                prior.ensure_not_canceled()?;
+            }
+        }
+        Ok(result)
+    })
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -296,6 +310,7 @@ fn plan_task_start(
     let (attempt_index, task_index) = find_attempt_task_indexes(&item, attempt_id, task_id)
         .ok_or_else(|| anyhow::anyhow!("Task {task_id:?} not found"))?;
     let attempt = &item.attempts[attempt_index];
+    attempt.ensure_not_canceled()?;
     let task = &attempt.tasks[task_index];
     if task.kind != expected_kind {
         bail!(
@@ -403,6 +418,7 @@ fn reserve_task_start_with_coder(
             )?;
         }
         let attempt = &item.attempts[attempt_index];
+        attempt.ensure_not_canceled()?;
         if expected_kind == TaskKind::Review {
             crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
                 .map_err(
@@ -453,6 +469,14 @@ fn reserve_task_start_with_coder(
             None,
         ) {
             return Ok(Decision::Rejected);
+        }
+        if let Some(area) = &item.attempts[attempt_index].tasks[task_index].artifact_area {
+            let path = resolve_managed_artifact_area_path(project_root, &area.path)
+                .and_then(|area| crate::execution::prepare_launch(&area.join("transcript.jsonl")));
+            path.map_err(|error| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("publish local execution identity: {error:#}"),
+            })?;
         }
         let task = &mut item.attempts[attempt_index].tasks[task_index];
         task.status = TaskStatus::Executing;
@@ -663,6 +687,14 @@ pub fn run_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
             .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
 
+    let _owner = item.attempts[attempt_index].tasks[task_index]
+        .artifact_area
+        .as_ref()
+        .map(|area| {
+            resolve_managed_artifact_area_path(project_root, &area.path)
+                .map(|path| crate::execution::TaskOwner::enter(path.join("transcript.jsonl")))
+        })
+        .transpose()?;
     // Route by kind only; the coder mapping is resolved fresh under the model
     // lock when the atomic start reserves the Task, not from this early read.
     let task_kind = item.attempts[attempt_index].tasks[task_index].kind;
@@ -15563,6 +15595,45 @@ mod tests {
                 .status,
             TaskStatus::NeedsUser
         );
+    }
+
+    #[test]
+    fn task_execution_identity_precedes_executing_state_and_honors_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let mut item = WorkItem::planned("work-1", "Guard child launch");
+        item.add_initial_attempt("attempt-1").unwrap();
+        store.create_work_item(&item).unwrap();
+        let reserved = reserve_task_start(
+            tmp.path(),
+            &store,
+            "work-1",
+            "attempt-1",
+            "attempt-1-write-1",
+            TaskKind::Write,
+            AttemptStatus::Executing,
+            CoderKind::Claude,
+        )
+        .unwrap();
+        let path = crate::execution::record_path_for_artifact(
+            tmp.path(),
+            &reserved.task.artifact_area.unwrap().path,
+        );
+        assert!(
+            path.is_file(),
+            "executing Task must already have a cancellable identity"
+        );
+        crate::work_attempt_loop::cancel_local_attempt(tmp.path(), &store, "work-1", "attempt-1")
+            .unwrap();
+        let marker = tmp.path().join("launched");
+        let mut command = std::process::Command::new("touch");
+        command.arg(&marker);
+        // All production launchers cross this same guarded boundary.
+        assert!(
+            crate::execution::spawn(&mut command, &path.with_file_name("transcript.jsonl"))
+                .is_err()
+        );
+        assert!(!marker.exists());
     }
 
     #[test]

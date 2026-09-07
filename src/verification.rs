@@ -276,7 +276,7 @@ pub fn accept(
     } else {
         host_evidence::write_exclusive(&document_path, &document_bytes)?;
     }
-    host_evidence::attach(
+    host_evidence::attach_with_cancellation_policy(
         project,
         store,
         &task.work_item_id,
@@ -285,6 +285,7 @@ pub fn accept(
         &document_path,
         &[context.review_artifact.path.clone()],
         None,
+        false,
     )
 }
 
