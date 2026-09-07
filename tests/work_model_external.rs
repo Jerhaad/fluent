@@ -1495,7 +1495,7 @@ fn snapshot_reports_pending_transaction_without_recovery() {
         false,
     );
     let before = work_tree(temp.path());
-    let snapshot = store.snapshot_work_items();
+    let snapshot = store.snapshot_work_items().unwrap();
     assert_eq!(snapshot.items.len(), 1);
     assert_eq!(snapshot.items[0].title, "Add durable model storage");
     assert_eq!(snapshot.diagnostics.len(), 2);
@@ -1531,7 +1531,7 @@ fn snapshot_does_not_migrate_legacy_artifacts() {
     )
     .unwrap();
     let before = work_tree(temp.path());
-    let snapshot = store.snapshot_work_items();
+    let snapshot = store.snapshot_work_items().unwrap();
     assert_eq!(
         store.read_work_item_snapshot("work-1").unwrap(),
         snapshot.items[0]
@@ -1579,7 +1579,7 @@ fn snapshot_isolates_item_and_transaction_errors() {
     fs::write(dir.join("bad name.json"), "bad filename").unwrap();
     fs::write(dir.join("broken-journal.json"), "bad journal").unwrap();
     let before = work_tree(temp.path());
-    let snapshot = store.snapshot_work_items();
+    let snapshot = store.snapshot_work_items().unwrap();
     assert_eq!(snapshot.items.len(), 1);
     assert_eq!(snapshot.items[0].id, "valid");
     for name in [

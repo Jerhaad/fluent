@@ -106,7 +106,7 @@ fn persisted_metrics_path(project_root: &Path, work_item_id: &str) -> std::path:
 
 pub fn load_work_status(project_root: &Path) -> Result<WorkStatus, anyhow::Error> {
     Ok(summarize_work_snapshot(
-        WorkModelStore::new(project_root).snapshot_work_items(),
+        WorkModelStore::new(project_root).snapshot_work_items()?,
         project_root,
     ))
 }

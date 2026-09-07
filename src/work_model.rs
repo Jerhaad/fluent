@@ -9467,7 +9467,7 @@ impl WorkModelStore {
 
     /// Read published records without locks, transaction recovery, or migration.
     /// A journal describes unfinished host work, never a replacement snapshot.
-    pub fn snapshot_work_items(&self) -> WorkModelSnapshot {
+    pub fn snapshot_work_items(&self) -> Result<WorkModelSnapshot, WorkModelStorageError> {
         let mut snapshot = WorkModelSnapshot::default();
         for dir in [self.work_items_dir(), self.work_transactions_dir()] {
             let paths = match list_json_paths(&dir) {
@@ -9477,6 +9477,7 @@ impl WorkModelStore {
                 {
                     continue;
                 }
+                Err(error) if dir == self.work_items_dir() => return Err(error),
                 Err(error) => {
                     snapshot
                         .diagnostics
@@ -9509,7 +9510,7 @@ impl WorkModelStore {
                 }
             }
         }
-        snapshot
+        Ok(snapshot)
     }
 
     /// Read one published aggregate without performing host-owned maintenance.

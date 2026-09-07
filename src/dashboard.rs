@@ -155,7 +155,7 @@ fn refresh(root: &Path, app: &mut App) {
 }
 
 fn load_snapshot(root: &Path) -> Result<snapshot::DashboardSnapshot> {
-    let work = crate::work_model::WorkModelStore::new(root).snapshot_work_items();
+    let work = crate::work_model::WorkModelStore::new(root).snapshot_work_items()?;
     let transitions = transitions::latest_transitions(&work.items);
     let status = work_status::summarize_work_snapshot(work, root);
     Ok(snapshot::DashboardSnapshot::from_status_and_transitions(

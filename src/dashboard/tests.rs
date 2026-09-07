@@ -321,19 +321,44 @@ fn refresh_key_requests_immediate_poll() {
 }
 #[test]
 fn failed_poll_keeps_snapshot_and_marks_it_stale() {
-    let mut app = app(vec![row("work", "planned")]);
-    app.refresh_failed("cannot read Work model".into());
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::work_model::WorkModelStore::new(root.path());
+    store
+        .create_work_item(&crate::work_model::WorkItem::planned(
+            "work",
+            "Keep this Work visible",
+        ))
+        .unwrap();
+    let mut app = App::new(load_snapshot(root.path()).unwrap());
+    let original = app.snapshot.clone();
+    let items = root.path().join(".fluent/work/items");
+    let saved = root.path().join(".fluent/work/saved-items");
+    std::fs::rename(&items, &saved).unwrap();
+    std::fs::write(&items, "cannot enumerate a file as a directory").unwrap();
+
+    refresh(root.path(), &mut app);
+
+    assert_eq!(app.snapshot, original);
     let rendered = text(&app, 100, 24);
-    assert!(rendered.contains("STALE: cannot read Work model"));
-    assert!(rendered.contains("work title"));
-    app.refresh(snapshot::DashboardSnapshot::from_status(
-        crate::work_status::WorkStatus {
-            rows: vec![row("fresh", "planned")],
-            errors: vec![],
-        },
-    ));
-    assert!(!text(&app, 100, 24).contains("STALE:"));
+    assert!(rendered.contains("STALE:"));
+    assert!(rendered.contains("Keep this Work visible"));
+    assert!(crate::work_status::load_work_status(root.path()).is_err());
+
+    std::fs::remove_file(&items).unwrap();
+    std::fs::rename(&saved, &items).unwrap();
+    // Item-local failure is a successful partial refresh and clears staleness.
+    std::fs::write(items.join("broken.json"), "invalid item").unwrap();
+    refresh(root.path(), &mut app);
+    assert!(app.stale_error.is_none());
+    assert_eq!(app.snapshot.rows, original.rows);
+    assert!(
+        app.snapshot
+            .errors
+            .iter()
+            .any(|error| error.contains("broken.json"))
+    );
 }
+
 #[test]
 fn help_lists_contextual_controls_and_closes() {
     let mut app = app(vec![row("work", "planned")]);
