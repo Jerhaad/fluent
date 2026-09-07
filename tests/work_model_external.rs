@@ -1523,9 +1523,15 @@ fn snapshot_reports_pending_transaction_without_recovery() {
 
 #[test]
 fn snapshot_does_not_migrate_legacy_artifacts() {
+    use std::os::unix::process::CommandExt;
     let temp = tempfile::tempdir().unwrap();
     let store = WorkModelStore::new(temp.path());
-    store.create_work_item(&work_item()).unwrap();
+    let mut running = work_item();
+    running.attempts[0].status = AttemptStatus::Executing;
+    running.attempts[0].review_state = None;
+    running.attempts[0].tasks[0].status = TaskStatus::Executing;
+    running.attempts[0].tasks[0].output = None;
+    store.create_work_item(&running).unwrap();
     let path = store
         .work_task_path("work-1", "attempt-1", "write-code")
         .unwrap();
@@ -1533,18 +1539,54 @@ fn snapshot_does_not_migrate_legacy_artifacts() {
     let legacy = ".fluent/work/artifacts/attempt-1/write-code";
     record["artifact_area"]["path"] = legacy.into();
     fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-    fs::create_dir_all(temp.path().join(legacy)).unwrap();
+    let area = temp.path().join(legacy);
+    fs::create_dir_all(&area).unwrap();
+    let transcript = area.join("transcript.jsonl");
+    fs::write(&transcript, "stored transcript").unwrap();
+    assert!(
+        !temp
+            .path()
+            .join(".fluent/work/artifacts/work-1/attempt-1/write-code")
+            .exists()
+    );
+    assert!(!fluent::lease::task_lock_path(temp.path(), "work-1", "write-code").exists());
+
+    // Keep a real execution identity only in the stored legacy artifact area.
+    // Piped stdin holds cat open without spawning descendants or a heartbeat.
+    let mut command = std::process::Command::new("/bin/cat");
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0);
+    fluent::execution::configure_identity_lock(&mut command, &transcript).unwrap();
+    let mut child = command.spawn().unwrap();
+    let execution = fluent::execution::ExecutionRecord {
+        schema_version: 1,
+        state: fluent::execution::ExecutionState::Running,
+        owner_pid: std::process::id(),
+        leader_pid: child.id(),
+        process_group_id: child.id(),
+        started_at: "2026-09-06T00:00:00Z".into(),
+        heartbeat_at: "2026-09-06T00:00:00Z".into(),
+        settled_at: None,
+    };
     fs::write(
-        temp.path().join(legacy).join("transcript.jsonl"),
-        "stored transcript",
+        area.join("execution.json"),
+        serde_json::to_vec(&execution).unwrap(),
     )
     .unwrap();
     let before = work_tree(temp.path());
-    let snapshot = store.snapshot_work_items().unwrap();
-    assert_eq!(
-        store.read_work_item_snapshot("work-1").unwrap(),
-        snapshot.items[0]
-    );
+    let status = fluent::work_status::load_work_status(temp.path());
+    let snapshot = store.snapshot_work_items();
+    let after = work_tree(temp.path());
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let status = status.unwrap();
+    assert!(status.errors.is_empty(), "{:?}", status.errors);
+    assert_eq!(status.rows[0].task, "write:write-code [executing]");
+    assert_eq!(status.rows[0].action, "executing");
+    let snapshot = snapshot.unwrap();
     assert!(
         snapshot.diagnostics.is_empty(),
         "{:?}",
@@ -1558,13 +1600,10 @@ fn snapshot_does_not_migrate_legacy_artifacts() {
             .path,
         legacy
     );
-    assert_eq!(
-        fluent::work_status::load_work_status(temp.path())
-            .unwrap()
-            .rows
-            .len(),
-        1
-    );
+    assert_eq!(after, before);
+    // Releasing the same legacy identity must change status without changing files.
+    let stopped = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert_eq!(stopped.rows[0].task, "write:write-code [interrupted]");
     assert_eq!(work_tree(temp.path()), before);
 }
 
