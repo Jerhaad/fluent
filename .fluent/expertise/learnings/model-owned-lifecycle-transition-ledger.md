@@ -1,6 +1,6 @@
 ---
 name: model-owned-lifecycle-transition-ledger
-description: Record lifecycle transitions inside the Work model transaction, preserve typed owner attribution and object-specific reasons, and give each projection its own durable cursor
+description: Record lifecycle transitions inside the Work model transaction, preserve typed owner attribution and object-specific reasons, and separate in-memory dashboard views from durable delivery cursors
 metadata:
   type: architecture
 ---
@@ -25,11 +25,17 @@ supported mutation, snapshot every existing durable object state with origin
 transaction. New Work creation records its initial state in the creation
 transaction.
 
-Consumers never share acknowledgement state. Slack Slice projection and the
-dashboard keep independent durable per-Work cursors over the model-owned ledger.
-For an external delivery, schedule the stable transition identity through the
-idempotent outbox before advancing the consumer cursor. A read-only projection
-may advance only when its cursor and projected state persist together.
+Consumers that deliver durable effects, such as Slack Slice projection, keep
+independent durable per-Work cursors over the model-owned ledger. For an external
+delivery, schedule the stable transition identity through the idempotent outbox
+before advancing that consumer's cursor. Consumers never share acknowledgement
+state.
+
+Dashboard observation derives its latest-transition view in memory from verified
+published Work snapshots. Refresh and restart reconstruct the view from the
+ledger without persisting a cursor, acknowledgement, or projection. Preserve the
+[dashboard ownership decision](../decisions.md#dashboard-observation-owns-no-durable-transition-cursor)
+when adding consumers or changing how they project transitions.
 
 Related: [[recovery-cursors-advance-after-durable-ingest]],
 [[durable-external-effects-use-reconcilable-identities]],
