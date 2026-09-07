@@ -1578,12 +1578,16 @@ without an identifier. Cleanup remains a dry run unless the operator passes
 `--apply`.
 
 Fluent stores each Work Item as a top-level record plus split Attempt, Task, and
-Merge Candidate records. Aggregate reads and writes share one per-Work-Item
+Merge Candidate records. Lifecycle preparation and writes share one per-Work-Item
 model lock. Before changing split records, a writer records the complete target
 snapshot in a durable transaction; it publishes child records first and the
-new top-level storage revision last. Readers recover any interrupted transaction
-before assembling the aggregate, and listing also recovers interrupted
-creations. This prevents mixed-generation reads and makes a failed or crashed
+new top-level storage revision last. Lifecycle preparation recovers interrupted
+transactions, including creations. Status and dashboard instead use
+`WorkModelStore::snapshot_work_items` to assemble published records without
+model locks, recovery, or artifact migration. They keep readable items visible
+and report pending host-owned recovery and item-local failures. Dashboard
+derives its latest transition in memory from that same published snapshot;
+it does not persist a cursor. This prevents mixed-generation reads and makes a failed or crashed
 write retryable without allowing a stale snapshot to overwrite its successor.
 Storage-revision exhaustion fails closed.
 

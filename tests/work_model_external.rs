@@ -1388,3 +1388,175 @@ fn work_model_store_reports_file_for_split_merge_candidate_attempt_mismatch() {
         other => panic!("unexpected error: {other}"),
     }
 }
+
+// Include directories as well as bytes so observation cannot hide lock creation.
+fn work_tree(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        tree: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        let bytes = if path.is_dir() {
+            None
+        } else {
+            Some(fs::read(path).unwrap())
+        };
+        tree.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), tree);
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    visit(root, &root.join(".fluent/work"), &mut tree);
+    tree
+}
+
+fn pending_transaction(root: &std::path::Path, mut item: WorkItem, published: bool) {
+    item.title = "Unpublished title".into();
+    let dir = root.join(".fluent/work/transactions");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{}.json", item.id)), serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1, "id": item.id, "base_revision": if published { Some(0) } else { None },
+        "target_revision": if published { 1 } else { 0 }, "work_item": item
+    })).unwrap()).unwrap();
+}
+
+#[test]
+fn status_snapshot_is_nonmutating() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    pending_transaction(temp.path(), work_item(), true);
+    fs::remove_dir_all(temp.path().join(".fluent/work/locks")).unwrap();
+    let before = work_tree(temp.path());
+    let status = fluent::work_status::load_work_status(temp.path()).unwrap();
+    assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
+        .current_dir(temp.path())
+        .arg("status")
+        .assert()
+        .success();
+    assert_eq!(work_tree(temp.path()), before);
+    assert_eq!(status.rows[0].title, "Add durable model storage");
+}
+
+#[test]
+fn snapshot_reports_pending_transaction_without_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    pending_transaction(temp.path(), work_item(), true);
+    pending_transaction(
+        temp.path(),
+        WorkItem::planned("unpublished", "Pending creation"),
+        false,
+    );
+    let before = work_tree(temp.path());
+    let snapshot = store.snapshot_work_items();
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(snapshot.items[0].title, "Add durable model storage");
+    assert_eq!(snapshot.diagnostics.len(), 2);
+    for id in ["work-1", "unpublished"] {
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|d| d.contains(id) && d.contains("host-owned recovery is pending")),
+            "{:?}",
+            snapshot.diagnostics
+        );
+    }
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn snapshot_does_not_migrate_legacy_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store.create_work_item(&work_item()).unwrap();
+    let path = store
+        .work_task_path("work-1", "attempt-1", "write-code")
+        .unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let legacy = ".fluent/work/artifacts/attempt-1/write-code";
+    record["artifact_area"]["path"] = legacy.into();
+    fs::write(path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    fs::create_dir_all(temp.path().join(legacy)).unwrap();
+    fs::write(
+        temp.path().join(legacy).join("transcript.jsonl"),
+        "stored transcript",
+    )
+    .unwrap();
+    let before = work_tree(temp.path());
+    let snapshot = store.snapshot_work_items();
+    assert_eq!(
+        store.read_work_item_snapshot("work-1").unwrap(),
+        snapshot.items[0]
+    );
+    assert!(
+        snapshot.diagnostics.is_empty(),
+        "{:?}",
+        snapshot.diagnostics
+    );
+    assert_eq!(
+        snapshot.items[0].attempts[0].tasks[0]
+            .artifact_area
+            .as_ref()
+            .unwrap()
+            .path,
+        legacy
+    );
+    assert_eq!(
+        fluent::work_status::load_work_status(temp.path())
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(work_tree(temp.path()), before);
+}
+
+#[test]
+fn snapshot_isolates_item_and_transaction_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = WorkModelStore::new(temp.path());
+    store
+        .create_work_item(&WorkItem::planned("valid", "Visible"))
+        .unwrap();
+    store.create_work_item(&work_item()).unwrap();
+    fs::write(
+        store
+            .work_task_path("work-1", "attempt-1", "write-code")
+            .unwrap(),
+        "bad task",
+    )
+    .unwrap();
+    fs::write(store.work_item_path("broken").unwrap(), "bad item").unwrap();
+    let dir = temp.path().join(".fluent/work/transactions");
+    fs::write(dir.join("bad name.json"), "bad filename").unwrap();
+    fs::write(dir.join("broken-journal.json"), "bad journal").unwrap();
+    let before = work_tree(temp.path());
+    let snapshot = store.snapshot_work_items();
+    assert_eq!(snapshot.items.len(), 1);
+    assert_eq!(snapshot.items[0].id, "valid");
+    for name in [
+        "write-code.json",
+        "broken.json",
+        "bad name",
+        "broken-journal",
+    ] {
+        assert!(
+            snapshot.diagnostics.iter().any(|d| d.contains(name)),
+            "{:?}",
+            snapshot.diagnostics
+        );
+    }
+    assert!(snapshot.diagnostics.iter().all(|d| d.len() <= 512));
+    assert_eq!(work_tree(temp.path()), before);
+}

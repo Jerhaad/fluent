@@ -155,10 +155,9 @@ fn refresh(root: &Path, app: &mut App) {
 }
 
 fn load_snapshot(root: &Path) -> Result<snapshot::DashboardSnapshot> {
-    let status = work_status::load_work_status(root)?;
-    let transitions = transitions::DashboardTransitionProjection::new(root.to_path_buf())
-        .refresh()?
-        .latest;
+    let work = crate::work_model::WorkModelStore::new(root).snapshot_work_items();
+    let transitions = transitions::latest_transitions(&work.items);
+    let status = work_status::summarize_work_snapshot(work, root);
     Ok(snapshot::DashboardSnapshot::from_status_and_transitions(
         status,
         transitions,
@@ -171,6 +170,63 @@ mod tests {
     use crate::work_status::WorkItemStatus;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+
+    #[test]
+    fn dashboard_snapshot_is_nonmutating() {
+        fn tree(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                out: &mut std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>,
+            ) {
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    if path.is_dir() {
+                        None
+                    } else {
+                        Some(std::fs::read(path).unwrap())
+                    },
+                );
+                if path.is_dir() {
+                    for entry in std::fs::read_dir(path).unwrap() {
+                        visit(root, &entry.unwrap().path(), out);
+                    }
+                }
+            }
+            let mut out = Default::default();
+            visit(root, &root.join(".fluent/work"), &mut out);
+            out
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::work_model::WorkModelStore::new(root.path());
+        store
+            .create_work_item_with_transition(
+                &crate::work_model::WorkItem::planned("visible", "Published"),
+                &crate::work_model::DurableTransitionMetadata {
+                    origin: crate::work_model::DurableTransitionOrigin::Fluent,
+                    reason: None,
+                    evidence_ref: None,
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            root.path().join(".fluent/work/transactions/visible.json"),
+            "unfinished journal",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root.path().join(".fluent/work/locks")).unwrap();
+        let before = tree(root.path());
+        let snapshot = load_snapshot(root.path()).unwrap();
+        assert_eq!(tree(root.path()), before);
+        assert_eq!(snapshot.rows[0].status.title, "Published");
+        assert!(snapshot.rows[0].latest_transition.is_some());
+        assert!(
+            snapshot
+                .errors
+                .iter()
+                .any(|d| d.contains("host-owned recovery is pending"))
+        );
+    }
 
     fn row(id: &str, action: &str) -> WorkItemStatus {
         WorkItemStatus {
@@ -226,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_replays_work_transitions_with_its_own_durable_cursor() {
+    fn dashboard_projects_latest_published_transition_on_every_load() {
         let root = tempfile::tempdir().unwrap();
         let store = crate::work_model::WorkModelStore::new(root.path());
         let metadata = crate::work_model::DurableTransitionMetadata {
@@ -246,22 +302,13 @@ mod tests {
             )
             .unwrap();
 
-        let projection = transitions::DashboardTransitionProjection::new(root.path().to_path_buf());
-        let first = projection.refresh().unwrap();
-        assert_eq!(first.applied.len(), 1);
-        assert_eq!(first.applied[0].work_item_id, "work-dashboard");
-        assert_eq!(first.applied[0].transition.new_state, "planned");
-        assert_eq!(first.latest["work-dashboard"].transition.sequence, 1);
-
-        let restarted = transitions::DashboardTransitionProjection::new(root.path().to_path_buf());
-        let replay = restarted.refresh().unwrap();
-        assert!(replay.applied.is_empty());
-        assert_eq!(replay.latest["work-dashboard"].transition.sequence, 1);
-        assert!(
-            root.path()
-                .join(".fluent/work/dashboard/transition-projection.json")
-                .is_file()
-        );
+        let first = load_snapshot(root.path()).unwrap();
+        let transition = first.rows[0].latest_transition.as_ref().unwrap();
+        assert_eq!(transition.work_item_id, "work-dashboard");
+        assert_eq!(transition.transition.new_state, "planned");
+        assert_eq!(transition.transition.sequence, 1);
+        assert_eq!(load_snapshot(root.path()).unwrap(), first);
+        assert!(!root.path().join(".fluent/work/dashboard").exists());
         assert!(!root.path().join(".fluent/slack").exists());
 
         store
@@ -272,11 +319,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let advanced = restarted.refresh().unwrap();
-        assert_eq!(advanced.applied.len(), 1);
-        assert_eq!(advanced.applied[0].transition.sequence, 2);
-        assert_eq!(advanced.applied[0].transition.new_state, "authorized");
-        assert!(restarted.refresh().unwrap().applied.is_empty());
+        let advanced = load_snapshot(root.path()).unwrap();
+        let transition = advanced.rows[0].latest_transition.as_ref().unwrap();
+        assert_eq!(transition.transition.sequence, 2);
+        assert_eq!(transition.transition.new_state, "authorized");
 
         let snapshot = load_snapshot(root.path()).unwrap();
         let row = snapshot

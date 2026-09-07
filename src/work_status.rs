@@ -105,18 +105,24 @@ fn persisted_metrics_path(project_root: &Path, work_item_id: &str) -> std::path:
 }
 
 pub fn load_work_status(project_root: &Path) -> Result<WorkStatus, anyhow::Error> {
-    let store = WorkModelStore::new(project_root);
-    let mut rows = Vec::new();
-    let mut errors = Vec::new();
+    Ok(summarize_work_snapshot(
+        WorkModelStore::new(project_root).snapshot_work_items(),
+        project_root,
+    ))
+}
 
-    for result in store.list_work_item_results()? {
-        match result {
-            Ok(item) => rows.push(summarize_work_item(&item, Some(project_root))),
-            Err(error) => errors.push(error.to_string()),
-        }
+pub(crate) fn summarize_work_snapshot(
+    snapshot: crate::work_model::WorkModelSnapshot,
+    project_root: &Path,
+) -> WorkStatus {
+    WorkStatus {
+        rows: snapshot
+            .items
+            .iter()
+            .map(|item| summarize_work_item(item, Some(project_root)))
+            .collect(),
+        errors: snapshot.diagnostics,
     }
-
-    Ok(WorkStatus { rows, errors })
 }
 
 pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> WorkItemStatus {

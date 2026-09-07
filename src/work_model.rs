@@ -9057,6 +9057,13 @@ pub struct WorkModelStore {
     project_root: PathBuf,
 }
 
+/// Published Work records and bounded diagnostics, observed without maintenance.
+#[derive(Debug, Default)]
+pub struct WorkModelSnapshot {
+    pub items: Vec<WorkItem>,
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkItemRecord {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -9394,6 +9401,58 @@ impl WorkModelStore {
             .work_merge_candidates_dir()
             .join(work_item_dir)
             .join(candidate_file))
+    }
+
+    /// Read published records without locks, transaction recovery, or migration.
+    /// A journal describes unfinished host work, never a replacement snapshot.
+    pub fn snapshot_work_items(&self) -> WorkModelSnapshot {
+        let mut snapshot = WorkModelSnapshot::default();
+        for dir in [self.work_items_dir(), self.work_transactions_dir()] {
+            let paths = match list_json_paths(&dir) {
+                Ok(paths) => paths,
+                Err(WorkModelStorageError::ReadDirectory { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    snapshot
+                        .diagnostics
+                        .push(bounded_transition_text(&error.to_string(), 512));
+                    continue;
+                }
+            };
+            for path in paths {
+                if dir == self.work_items_dir() {
+                    match self.read_published_work_item_file(&path, true) {
+                        Ok(item) => snapshot.items.push(item),
+                        Err(error) => snapshot
+                            .diagnostics
+                            .push(bounded_transition_text(&error.to_string(), 512)),
+                    }
+                } else {
+                    let result =
+                        file_stem_id(&path).and_then(|id| self.read_work_item_transaction(&id));
+                    let detail = match result {
+                        Ok(_) => String::new(),
+                        Err(error) => format!(": {error}"),
+                    };
+                    snapshot.diagnostics.push(bounded_transition_text(
+                        &format!(
+                            "Work transaction {}: host-owned recovery is pending{detail}",
+                            path.display()
+                        ),
+                        512,
+                    ));
+                }
+            }
+        }
+        snapshot
+    }
+
+    /// Read one published aggregate without performing host-owned maintenance.
+    pub fn read_work_item_snapshot(&self, id: &str) -> Result<WorkItem, WorkModelStorageError> {
+        self.read_published_work_item_file(&self.work_item_path(id)?, true)
     }
 
     pub fn list_work_items(&self) -> Result<Vec<WorkItem>, WorkModelStorageError> {
@@ -10122,6 +10181,16 @@ impl WorkModelStore {
         path: &Path,
         validate: bool,
     ) -> Result<WorkItem, WorkModelStorageError> {
+        let mut item = self.read_published_work_item_file(path, validate)?;
+        self.normalize_work_artifact_paths(&mut item)?;
+        Ok(item)
+    }
+
+    fn read_published_work_item_file(
+        &self,
+        path: &Path,
+        validate: bool,
+    ) -> Result<WorkItem, WorkModelStorageError> {
         let content =
             fs::read_to_string(path).map_err(|source| WorkModelStorageError::ReadFile {
                 path: path.to_path_buf(),
@@ -10143,8 +10212,7 @@ impl WorkModelStore {
                 });
             }
         }
-        let mut work_item = self.assemble_split_work_item(record, validate)?;
-        self.normalize_work_artifact_paths(&mut work_item)?;
+        let work_item = self.assemble_split_work_item(record, validate)?;
         if validate {
             work_item
                 .validate()
