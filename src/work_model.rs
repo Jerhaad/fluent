@@ -521,7 +521,17 @@ pub struct WorkModelUpgradeRecord {
     pub to_record_schema_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<WorkModelAttemptUpgrade>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_migrations: Vec<WorkModelArtifactMigration>,
     pub upgraded_at: String,
+}
+
+/// The stored artifact reference converted by an explicit upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct WorkModelArtifactMigration {
+    pub from_path: String,
+    pub to_path: String,
 }
 
 /// The format conversion applied to one split Attempt record.
@@ -9552,6 +9562,8 @@ impl WorkModelStore {
             });
         }
 
+        let mut upgraded = item.clone();
+        let artifact_migrations = Self::plan_work_artifact_migrations(&mut upgraded);
         let legacy_attempts = versions
             .attempts
             .iter()
@@ -9563,6 +9575,7 @@ impl WorkModelStore {
             })
             .collect::<Vec<_>>();
         let needs_upgrade = stored.schema_version != WORK_MODEL_RECORD_SCHEMA_VERSION
+            || !artifact_migrations.is_empty()
             || !legacy_attempts.is_empty()
             || item.model_writer_version.as_deref() != Some(WORK_MODEL_WRITER_VERSION);
         if !needs_upgrade {
@@ -9594,6 +9607,7 @@ impl WorkModelStore {
             from_record_schema_version: stored.schema_version,
             to_record_schema_version: WORK_MODEL_RECORD_SCHEMA_VERSION,
             attempts: legacy_attempts.clone(),
+            artifact_migrations: artifact_migrations.clone(),
             upgraded_at: now_iso8601(),
         };
         if audit_path.exists() {
@@ -9606,6 +9620,7 @@ impl WorkModelStore {
                 || existing.from_record_schema_version != audit.from_record_schema_version
                 || existing.to_record_schema_version != audit.to_record_schema_version
                 || existing.attempts != audit.attempts
+                || existing.artifact_migrations != audit.artifact_migrations
             {
                 return Err(WorkModelStorageError::InvalidModel {
                     path: audit_path,
@@ -9619,7 +9634,9 @@ impl WorkModelStore {
             write_json_file(&audit_path, &audit)?;
         }
 
-        let mut upgraded = item.clone();
+        for migration in &artifact_migrations {
+            self.migrate_artifact_path(&migration.from_path, &migration.to_path)?;
+        }
         upgraded.model_writer_version = Some(WORK_MODEL_WRITER_VERSION.to_string());
         upgraded.synchronize_pause_records(&self.project_root);
         upgraded
@@ -9925,6 +9942,7 @@ impl WorkModelStore {
                 path: path.clone(),
                 source,
             })?;
+        self.normalize_work_artifact_paths(&mut work_item)?;
         work_item.synchronize_pause_records(&self.project_root);
         reject_transition_history_change(&prior, &work_item, &path)?;
         if work_item != prior {
@@ -9993,6 +10011,7 @@ impl WorkModelStore {
                 _ => {}
             }
         }
+        self.normalize_work_artifact_paths(&mut target)?;
         target.synchronize_pause_records(&self.project_root);
         target
             .validate()
@@ -10181,9 +10200,7 @@ impl WorkModelStore {
         path: &Path,
         validate: bool,
     ) -> Result<WorkItem, WorkModelStorageError> {
-        let mut item = self.read_published_work_item_file(path, validate)?;
-        self.normalize_work_artifact_paths(&mut item)?;
-        Ok(item)
+        self.read_published_work_item_file(path, validate)
     }
 
     fn read_published_work_item_file(
@@ -10647,21 +10664,38 @@ impl WorkModelStore {
         &self,
         work_item: &mut WorkItem,
     ) -> Result<(), WorkModelStorageError> {
+        for migration in Self::plan_work_artifact_migrations(work_item) {
+            self.migrate_artifact_path(&migration.from_path, &migration.to_path)?;
+        }
+        Ok(())
+    }
+
+    fn plan_work_artifact_migrations(work_item: &mut WorkItem) -> Vec<WorkModelArtifactMigration> {
+        let mut migrations = Vec::new();
+        let mut normalize = |work_item_id: &str, attempt_id: &str, path: &mut String| {
+            if let Some(normalized) = namespace_legacy_artifact_path(work_item_id, attempt_id, path)
+            {
+                let migration = WorkModelArtifactMigration {
+                    from_path: path.clone(),
+                    to_path: normalized.clone(),
+                };
+                if !migrations.contains(&migration) {
+                    migrations.push(migration);
+                }
+                *path = normalized;
+            }
+        };
         for attempt in &mut work_item.attempts {
             for task in &mut attempt.tasks {
                 if let Some(area) = &mut task.artifact_area {
-                    self.normalize_artifact_path_value(&work_item.id, &attempt.id, &mut area.path)?;
+                    normalize(&work_item.id, &attempt.id, &mut area.path);
                 }
                 for artifact in &mut task.input_artifacts {
-                    self.normalize_artifact_path_value(
-                        &work_item.id,
-                        &attempt.id,
-                        &mut artifact.path,
-                    )?;
+                    normalize(&work_item.id, &attempt.id, &mut artifact.path);
                 }
             }
             for artifact in &mut attempt.artifacts {
-                self.normalize_artifact_path_value(&work_item.id, &attempt.id, &mut artifact.path)?;
+                normalize(&work_item.id, &attempt.id, &mut artifact.path);
             }
         }
         for candidate in &mut work_item.merge_candidates {
@@ -10671,29 +10705,10 @@ impl WorkModelStore {
                 .iter_mut()
                 .chain(candidate.merge_state.review_artifacts.iter_mut())
             {
-                self.normalize_artifact_path_value(
-                    &work_item.id,
-                    &candidate.attempt_id,
-                    &mut artifact.path,
-                )?;
+                normalize(&work_item.id, &candidate.attempt_id, &mut artifact.path);
             }
         }
-        Ok(())
-    }
-
-    fn normalize_artifact_path_value(
-        &self,
-        work_item_id: &str,
-        attempt_id: &str,
-        path: &mut String,
-    ) -> Result<(), WorkModelStorageError> {
-        let Some(normalized) = namespace_legacy_artifact_path(work_item_id, attempt_id, path)
-        else {
-            return Ok(());
-        };
-        self.migrate_artifact_path(path, &normalized)?;
-        *path = normalized;
-        Ok(())
+        migrations
     }
 
     fn migrate_artifact_path(
@@ -14790,7 +14805,7 @@ random banner prose that must be ignored
     }
 
     #[test]
-    fn store_migrates_legacy_work_artifact_paths_on_read() {
+    fn explicit_upgrade_owns_legacy_artifact_migration() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = WorkModelStore::new(tmp.path());
         let mut work_item = work_item_with_completed_write("work-1");
@@ -14906,6 +14921,23 @@ random banner prose that must be ignored
         fs::create_dir_all(&legacy_dir).unwrap();
         fs::write(legacy_dir.join("review.md"), "Verdict: pass\n").unwrap();
 
+        let snapshot = store.read_work_item_snapshot("work-1").unwrap();
+        assert!(
+            snapshot.attempts[0].artifacts[0]
+                .path
+                .starts_with(".fluent/work/artifacts/attempt-1/")
+        );
+        assert!(legacy_dir.exists());
+        let report = store.upgrade_work_item("work-1").unwrap();
+        assert!(
+            !report.already_current,
+            "an artifact-only migration still needs an audited upgrade"
+        );
+        let audit: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join(report.audit_path.unwrap())).unwrap())
+                .unwrap();
+        assert!(!audit["artifact-migrations"].as_array().unwrap().is_empty());
+        assert!(store.upgrade_work_item("work-1").unwrap().already_current);
         let read = store.read_work_item("work-1").unwrap();
 
         let review_tests_task = read.attempts[0]
@@ -16190,6 +16222,53 @@ random banner prose that must be ignored
             .unwrap_err();
         assert!(matches!(error, WorkModelStorageError::InvalidModel { .. }));
         assert_eq!(store.read_work_item("work-1").unwrap().title, "Reduced");
+    }
+
+    #[test]
+    fn mutating_boundary_recovers_pending_transaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        store
+            .create_work_item(&WorkItem::planned("work-1", "Published"))
+            .unwrap();
+        let mut target = store.read_work_item_snapshot("work-1").unwrap();
+        target.title = "Recovered".into();
+        let journal = store.work_transaction_path("work-1").unwrap();
+        write_json_file(
+            &journal,
+            &WorkItemTransaction {
+                schema_version: WorkItemTransaction::SCHEMA_VERSION,
+                id: "work-1".into(),
+                base_revision: Some(0),
+                target_revision: 1,
+                work_item: target,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            store.read_work_item_snapshot("work-1").unwrap().title,
+            "Published"
+        );
+        store
+            .mutate_work_item("work-1", |item| {
+                assert_eq!(item.title, "Recovered");
+                assert!(!journal.exists());
+                let lock =
+                    File::open(tmp.path().join(".fluent/work/locks/work-1/model.lock")).unwrap();
+                assert_eq!(
+                    io::Error::from(
+                        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap_err()
+                    )
+                    .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                item.title.push_str(" then mutated");
+                Ok(())
+            })
+            .unwrap();
+        let published = store.read_work_item_snapshot("work-1").unwrap();
+        assert_eq!(published.title, "Recovered then mutated");
+        assert_eq!(published.storage_revision.get(), Some(2));
     }
 
     #[test]

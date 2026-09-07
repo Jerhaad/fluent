@@ -3438,13 +3438,16 @@ Test: tests/behaviors/operations/test-cleanup.sh (cleanup skips abandoned Work w
 
 ### B4
 
-WHEN Fluent reads stored Work state with older artifact references
-under `.fluent/work/artifacts/<attempt-id>/...`,
+WHEN a lifecycle mutation or `fluent work-item upgrade` processes stored Work
+with older artifact references under `.fluent/work/artifacts/<attempt-id>/...`,
 THE SYSTEM SHALL expose those references under
 `.fluent/work/artifacts/<work-item-id>/<attempt-id>/...` and move
 existing older artifacts into that namespace when no namespaced artifact
 already exists.
-Test: src/work_model.rs (store_migrates_legacy_work_artifact_paths_on_read)
+Status and dashboard preserve the stored references without moving artifacts.
+The explicit upgrade records each converted path in its audit.
+Test: src/work_model.rs (explicit_upgrade_owns_legacy_artifact_migration)
+Test: tests/work_model_external.rs (snapshot_does_not_migrate_legacy_artifacts)
 
 ### B5
 

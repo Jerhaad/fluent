@@ -1589,7 +1589,10 @@ and report pending host-owned recovery and item-local failures. Dashboard
 derives its latest transition in memory from that same published snapshot;
 it does not persist a cursor. This prevents mixed-generation reads and makes a failed or crashed
 write retryable without allowing a stale snapshot to overwrite its successor.
-Storage-revision exhaustion fails closed.
+Storage-revision exhaustion fails closed. Artifact migration runs only at lifecycle writes
+and explicit upgrade. `fluent work-item upgrade` records converted source and
+destination paths before moving artifacts and publishes the rewritten references
+through the aggregate transaction, including when no record schema changes.
 
 A Work Item's Learner mode selects how its pre-land Learner runs. The mode is a
 serde-defaulted `LearnerMode` on the Work Item — `capture` or `no-expertise`.

@@ -19,8 +19,8 @@ last, then removes the transaction. A mismatch returns `StaleWorkItem` before
 pruning. Reload the Work Item, reapply the intended field-level change, and
 retry through the same boundary.
 
-If a child write, process failure, or crash interrupts publication, readers and
-later writers finish the durable transaction while holding the same model lock
+If a child write, process failure, or crash interrupts publication, maintenance
+reads and later writers finish the durable transaction while holding the same model lock
 before they assemble or mutate the Work Item. Listing Work Items first recovers
 transactions too, including a creation whose top-level record was not yet
 published. Code that already holds `model.lock` must call
@@ -39,3 +39,11 @@ A Learner retry and land may both read the same candidate. If land writes
 write then returns `StaleWorkItem` before it can replace the candidate record
 with its old `Ready` snapshot. The retry reloads and observes that it must use
 the post-land handoff-only path.
+
+Status and dashboard use `snapshot_work_items`, which reads published records
+without a model lock, recovery, or artifact migration. It reports pending
+journals and per-item failures alongside valid aggregates. Do not use
+`read_work_item` or the maintenance listing APIs on an observation path.
+`read_work_item_snapshot` provides the same nonmutating assembly for one item.
+Artifact migration belongs to lifecycle writes and explicit upgrade; upgrade
+authors an audit with source and destination paths before moving artifacts.
