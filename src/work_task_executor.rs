@@ -17196,11 +17196,13 @@ while time.monotonic() < deadline:
 
     #[test]
     fn execution_context_is_bounded_and_preserves_authoritative_core() {
-        // Keep repeated artifact paths independent of the checkout's path length.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in("target").unwrap();
         let workspace = tmp.path().join("workspace");
         let artifact = tmp.path().join("artifact");
-        let review = tmp.path().join("attempt-review-tests/review.md");
+        // Keep the real review path short when each finding repeats it.
+        let review = Path::new("target")
+            .join(tmp.path().file_name().unwrap())
+            .join("attempt-review-tests/review.md");
         fs::create_dir_all(&workspace).unwrap();
         fs::create_dir_all(review.parent().unwrap()).unwrap();
         let findings = (0..100)
@@ -17214,7 +17216,8 @@ while time.monotonic() < deadline:
             .join("\n");
         fs::write(&review, format!("Verdict: fail\n\n{findings}\n")).unwrap();
         let mut inputs = vec![review];
-        inputs.extend((0..75).map(|index| tmp.path().join(format!("history-{index}.json"))));
+        // Synthetic identifiers must not inherit the checkout or TMPDIR prefix.
+        inputs.extend((0..75).map(|index| PathBuf::from(format!("history-{index}.json"))));
         let unresolved = (0..100)
             .map(|index| format!("step {index}: {}", "large unresolved detail ".repeat(100)))
             .collect::<Vec<_>>();
