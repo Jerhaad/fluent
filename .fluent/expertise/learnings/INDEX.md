@@ -61,7 +61,7 @@
 - [init-guidance-reads-resulting-git-state](init-guidance-reads-resulting-git-state.md) — After instruction seeding, init derives commit-or-revert guidance from resulting Git state even when a later managed-file write failed
 - [inject-side-effects-for-testability](inject-side-effects-for-testability.md) — Side-effect functions like notify() must be injected via &dyn Fn parameters so tests can capture and assert
 - [json-manifest-paths-via-jq-arg](json-manifest-paths-via-jq-arg.md) — External values written into JSON manifests must use jq --arg, not string interpolation
-- [keep-architecture-doc-in-sync](keep-architecture-doc-in-sync.md) — documentation/architecture.md is a living present-tense doc; subsystem changes must update its file map and subsystem sections in the same change
+- [keep-architecture-doc-in-sync](keep-architecture-doc-in-sync.md) — Keep the architecture file map, subsystem prose, and shell documentation checks aligned with the implementation
 - [lease-acquire-types-contention-vs-infrastructure](lease-acquire-types-contention-vs-infrastructure.md) — Lock/lease acquisition must return a typed result — only a non-blocking flock WouldBlock is a live peer (fail open); every other lock-path IO error propagates as a real failure
 - [legacy-evidence-compatibility-stays-isolated](legacy-evidence-compatibility-stays-isolated.md) — Recover historical evidence through a separate exact compatibility classifier that cannot weaken current execution rules
 - [legacy-recovery-rechecks-active-blockers](legacy-recovery-rechecks-active-blockers.md) — Historical hook output can authorize retired findings only; recheck active blockers across the complete candidate range
