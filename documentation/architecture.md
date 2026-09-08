@@ -2145,7 +2145,7 @@ managed sibling path and are registered git worktrees.
 |---|---|
 | Work Item | Planned Fluent work. Planning operates on work items. |
 | Attempt | One execution history branch under a work item. Attempts are visible state and history, but they are usually not their own queue. |
-| Task | Schedulable unit of work. Task kinds stay generic: `write`, `review`, `merge`, `report`, `learn`, `probe`, and `tester`. Roles carry prompt and domain behavior. |
+| Task | Schedulable unit of work. Task kinds stay generic: `write`, `review`, `merge`, `report`, `learn`, `probe`, `tester`, and `verification`. Roles carry prompt and domain behavior. |
 | Workspace | Fluent-managed filesystem/git context. A task may read many workspaces and write at most one. |
 | Merge Candidate | Candidate result prepared for merge. Its review state is separate from attempt review state. |
 
