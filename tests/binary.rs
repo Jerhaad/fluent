@@ -333,7 +333,10 @@ esac
                 "every Cargo child must receive the exported reader path"
             );
         } else {
-            assert!(stderr.contains("historical reader build failed"), "{stderr}");
+            assert!(
+                stderr.contains("historical reader build failed"),
+                "{stderr}"
+            );
             assert!(!cargo_calls.exists(), "setup failure launched Cargo");
             assert!(!reader_paths.exists(), "setup failure reached a Rust child");
         }
