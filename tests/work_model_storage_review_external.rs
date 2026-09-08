@@ -206,17 +206,20 @@ fn reviewer_storage_writes_documented_deterministic_json() {
     let path = temp.path().join(".fluent/work/items/work-review.json");
     assert_eq!(
         fs::read_to_string(path).unwrap(),
-        r#"{
+        format!(
+            r#"{{
   "schema_version": 2,
   "id": "work-review",
   "title": "Review durable storage",
-  "model_writer_version": {
+  "model_writer_version": {{
     "format": "fluent-work-item-writer",
     "schema_version": 1,
-    "version": "0.3.0"
-  }
-}
-"#
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     let attempt = fs::read_to_string(
         temp.path()

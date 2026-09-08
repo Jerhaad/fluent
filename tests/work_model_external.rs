@@ -638,17 +638,20 @@ fn work_model_store_writes_deterministic_pretty_json() {
     let content = fs::read_to_string(path).unwrap();
     assert_eq!(
         content,
-        r#"{
+        format!(
+            r#"{{
   "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
-  "model_writer_version": {
+  "model_writer_version": {{
     "format": "fluent-work-item-writer",
     "schema_version": 1,
-    "version": "0.3.0"
-  }
-}
-"#
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     let attempt = fs::read_to_string(
         temp.path()
@@ -689,17 +692,20 @@ fn capture_mode_preserves_minimal_work_item_json() {
     let content = fs::read_to_string(path).unwrap();
     assert_eq!(
         content,
-        r#"{
+        format!(
+            r#"{{
   "schema_version": 2,
   "id": "work-1",
   "title": "Add durable model storage",
-  "model_writer_version": {
+  "model_writer_version": {{
     "format": "fluent-work-item-writer",
     "schema_version": 1,
-    "version": "0.3.0"
-  }
-}
-"#
+    "version": "{version}"
+  }}
+}}
+"#,
+            version = env!("CARGO_PKG_VERSION")
+        )
     );
     assert!(!content.contains("learner_mode"));
 }
@@ -1659,7 +1665,8 @@ fn current_record_has_old_reader_wire_fence() {
     assert_eq!(
         record["model_writer_version"],
         serde_json::json!({
-            "format": "fluent-work-item-writer", "schema_version": 1, "version": "0.3.0"
+            "format": "fluent-work-item-writer", "schema_version": 1,
+            "version": env!("CARGO_PKG_VERSION")
         })
     );
     // The actual release executable is exercised by test-work-model-old-reader-fence.sh.
@@ -1669,7 +1676,7 @@ fn current_record_has_old_reader_wire_fence() {
             .unwrap()
             .model_writer_version
             .as_deref(),
-        Some("0.3.0")
+        Some(env!("CARGO_PKG_VERSION"))
     );
 }
 
@@ -1769,7 +1776,7 @@ fn explicit_upgrade_replaces_current_version_legacy_string() {
     store.create_work_item(&work_item()).unwrap();
     let path = store.work_item_path("work-1").unwrap();
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    record["model_writer_version"] = "0.3.0".into();
+    record["model_writer_version"] = env!("CARGO_PKG_VERSION").into();
     fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
     assert!(!store.upgrade_work_item("work-1").unwrap().already_current);
     let record: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
