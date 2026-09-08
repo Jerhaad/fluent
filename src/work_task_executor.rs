@@ -17196,7 +17196,8 @@ while time.monotonic() < deadline:
 
     #[test]
     fn execution_context_is_bounded_and_preserves_authoritative_core() {
-        let tmp = tempfile::tempdir_in("target").unwrap();
+        // Keep repeated artifact paths independent of the checkout's path length.
+        let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         let artifact = tmp.path().join("artifact");
         let review = tmp.path().join("attempt-review-tests/review.md");
@@ -17234,7 +17235,13 @@ while time.monotonic() < deadline:
         assert!(source.len() <= EXECUTION_CONTEXT_MAX_BYTES);
         assert_eq!(context.unresolved_steps.len(), 100);
         assert_eq!(context.current_findings.len(), 100);
-        assert_eq!(context.historical_artifacts.len(), inputs.len());
+        assert_eq!(
+            context.historical_artifacts,
+            inputs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(context.omitted.unresolved_steps, 0);
         assert_eq!(context.omitted.current_findings, 0);
         assert_eq!(context.omitted.historical_artifacts, 0);
