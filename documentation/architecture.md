@@ -490,17 +490,36 @@ identifier; two qualified names must agree in full, as must any paths or
 binaries supplied on both sides. The cheap pre-review source check looks for
 the function identifier because Rust declares modules separately. The final
 evidence check retains the full reference; it does not rewrite references or
-Tester artifacts or maintain an alias registry. For `.sh` references, the exact
+Tester artifacts or maintain an alias registry.
+
+Python references support `path.py::Class.test_method` and
+`path.py (Class.test_method)`, as well as a short `test_method` selector.
+Selector components use ASCII identifier syntax. The pre-review gate scans
+committed text for a direct `def` or `async def` in the named top-level class.
+It masks comments and strings, respects indentation, and handles decorated and
+multiline declarations. It does not resolve inherited or dynamically assigned
+methods, nested or conditional class definitions, or duplicate declarations of
+the referenced class or method. This check never imports or executes candidate
+Python; the final Tester must still report passing evidence.
+
+Python evidence accepts `Class.test_method`, `module.Class.test_method`,
+`test_method (module.Class)`, and `test_method (module.Class.test_method)`,
+plus `path.py::Class.test_method` and `path.py (Class.test_method)` wrappers.
+Short method identities remain supported when unambiguous. The gate retains
+every supplied path, module, and class qualifier, so a result from another
+supplied class cannot satisfy the reference through its method name alone.
+
+For `.sh` references, the exact
 committed script path identifies the test at both gates. A parenthetical such as
 `tests/lifecycle.sh (help documents drain lifecycle)` describes coverage; it
 need not appear in source or result text. The structured result may use a
 project-specific harness display label, but must still name the exact path and
 pass. Applicable reviewers assess whether the script covers the stated behavior.
 
-The gate builds its Rust evidence view before selecting a passing result.
+The gate builds its Rust and Python evidence views before selecting a passing result.
 Failed and skipped tests still count when resolving a short name. Matching
 representations must agree on supplied qualifiers and all report a pass;
-an underspecified result cannot bridge conflicting paths, binaries, or modules.
+an underspecified result cannot bridge conflicting paths, binaries, modules, or classes.
 An explicit reference can distinguish otherwise colliding identities. Missing,
 unrelated, ambiguous, or non-passing evidence leaves the reference unsatisfied,
 and stale or unbound evidence blocks the gate. Diagnostics retain the unresolved
