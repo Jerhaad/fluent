@@ -71,7 +71,7 @@ the ID to process all stored Work Items). Fluent records the source and target
 format in an audit file, rewrites the records transactionally, and treats a
 repeat as a no-op. Unknown future formats are rejected rather than guessed.
 
-See the [v0.3.0 release notes](documentation/releases/v0.3.0.md) for behavior
+See the [v0.4.0 release notes](documentation/releases/v0.4.0.md) for behavior
 changes and recovery commands.
 
 ## How Fluent works

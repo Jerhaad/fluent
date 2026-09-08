@@ -2396,7 +2396,7 @@ prefix, Work Item ID, and Attempt ID so valid hyphenated IDs remain
 globally distinct.
 
 Each Work Item root record stores `model_writer_version` as a validated writer
-envelope: `{"format":"fluent-work-item-writer","schema_version":1,"version":"0.3.0"}`.
+envelope: `{"format":"fluent-work-item-writer","schema_version":1,"version":"0.4.0"}`.
 The public in-memory value remains an optional package-version string. Current
 Fluent also accepts legacy strings without rewriting them during observation.
 The envelope occupies an existing field that published v0.3.0 reads as
