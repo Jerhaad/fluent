@@ -1827,7 +1827,7 @@ impl<'a> PythonTestIdentity<'a> {
                 scopes.pop();
             }
             let statement = statement.trim();
-            let class = statement.strip_prefix("class ").and_then(|rest| {
+            let class = strip_python_keyword(statement, "class").and_then(|rest| {
                 let end = rest.find(['(', ':'])?;
                 let name = rest[..end].trim();
                 is_python_identifier(name).then_some(name)
@@ -1835,15 +1835,12 @@ impl<'a> PythonTestIdentity<'a> {
             if scopes.is_empty() && class.is_some() && class == self.class {
                 classes += 1;
             }
-            let method = statement
-                .strip_prefix("async ")
-                .unwrap_or(statement)
-                .strip_prefix("def ")
-                .and_then(|rest| {
-                    let (name, _) = rest.split_once('(')?;
-                    let name = name.trim();
-                    is_python_identifier(name).then_some(name)
-                });
+            let method = strip_python_keyword(statement, "async").unwrap_or(statement);
+            let method = strip_python_keyword(method, "def").and_then(|rest| {
+                let (name, _) = rest.split_once('(')?;
+                let name = name.trim();
+                is_python_identifier(name).then_some(name)
+            });
             let owner = scopes.last().and_then(|(_, class)| *class);
             if method == Some(self.method) && (self.class.is_none() || owner == self.class) {
                 methods += 1;
@@ -1855,6 +1852,13 @@ impl<'a> PythonTestIdentity<'a> {
         }
         methods > 0 && (self.class.is_none() || (classes == 1 && methods == 1))
     }
+}
+
+fn strip_python_keyword<'a>(statement: &'a str, keyword: &str) -> Option<&'a str> {
+    statement
+        .strip_prefix(keyword)?
+        .strip_prefix([' ', '\t'])
+        .map(|rest| rest.trim_start_matches([' ', '\t']))
 }
 
 fn is_python_identifier(name: &str) -> bool {
@@ -3878,33 +3882,62 @@ mod tests {
         );
     }
 
+    const PYTHON_DECLARATION_WHITESPACE_SOURCES: &[&str] = &[
+        "class\tTicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n",
+        "class TicketQueueTests:\n    def\ttest_recovery_is_idempotent(self): pass\n",
+        "class TicketQueueTests:\n    async\tdef test_recovery_is_idempotent(self): pass\n",
+        "class TicketQueueTests:\n    async  def test_recovery_is_idempotent(self): pass\n",
+        "class  TicketQueueTests:\n    def  test_recovery_is_idempotent(self): pass\n",
+        "class \t TicketQueueTests:\n\tasync\t\tdef \t test_recovery_is_idempotent(self): pass\n",
+    ];
+
+    const PYTHON_DECLARATION_LOOKALIKES: &[&str] = &[
+        "classTicketQueueTests:\n    def\ttest_recovery_is_idempotent(self): pass\n",
+        "classes\tTicketQueueTests:\n    def\ttest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    deftest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    define\ttest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    asyncdef\ttest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    asynchronous\tdef\ttest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    async\tdeftest_recovery_is_idempotent(self): pass\n",
+        "class\tTicketQueueTests:\n    async  def\ttest_recovery_is_idempotent_suffix(self): pass\n",
+        "class\tTicketQueueTestsSuffix:\n    async  def\ttest_recovery_is_idempotent(self): pass\n",
+    ];
+
     #[test]
     fn accepts_class_qualified_python_unittest_reference() {
-        let fixture = Fixture::new();
-        let candidate = fixture.commit(
-            "tests/test_ticket_queue.py",
+        for source in [
             "import unittest\n\nclass TicketQueueTests(unittest.TestCase):\n    def test_recovery_is_idempotent(self):\n        pass\n",
-            "Add queue test\n\n- Cover recovery",
-        );
-        let artifact = fixture.artifacts.path().join("candidate-gate.json");
-        for reference in [
-            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
-            "tests/test_ticket_queue.py (TicketQueueTests.test_recovery_is_idempotent)",
-            "tests/test_ticket_queue.py::test_recovery_is_idempotent",
-        ] {
-            let contract = behavior_contract(reference);
-            let evidence =
-                run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
-                    .unwrap();
-            assert_eq!(
-                evidence.disposition,
-                CandidateGateDisposition::Passed,
-                "{reference}: {evidence:#?}"
+        ]
+        .into_iter()
+        .chain(PYTHON_DECLARATION_WHITESPACE_SOURCES.iter().copied())
+        {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                "tests/test_ticket_queue.py",
+                source,
+                "Add queue test\n\n- Cover recovery",
             );
-            assert_eq!(
-                check(&evidence, "tester-reference-evidence").status,
-                CandidateCheckStatus::Skipped
-            );
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
+            for reference in [
+                "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+                "tests/test_ticket_queue.py (TicketQueueTests.test_recovery_is_idempotent)",
+                "tests/test_ticket_queue.py::test_recovery_is_idempotent",
+            ] {
+                let contract = behavior_contract(reference);
+                let evidence =
+                    run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                        .unwrap();
+                assert_eq!(
+                    check(&evidence, "behavior-references").status,
+                    CandidateCheckStatus::Passed,
+                    "{source:?}, {reference}: {evidence:#?}"
+                );
+                assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+                assert_eq!(
+                    check(&evidence, "tester-reference-evidence").status,
+                    CandidateCheckStatus::Skipped
+                );
+            }
         }
     }
 
@@ -3919,7 +3952,10 @@ mod tests {
             "@decorate('class Fake:')\nclass TicketQueueTests(\n    unittest.TestCase,\n):\n    @decorate(\n        'def fake():',\n    )\n    def test_recovery_is_idempotent(\n        self,\n    ):\n        pass\n",
             "class TicketQueueTests:\r\n\tasync def test_recovery_is_idempotent(self): pass\r\n",
             "class TicketQueueTests:\n    def helper(self):\n        pass\n\n    # ignore a comment with unmatched delimiters: [ '\n    def test_recovery_is_idempotent(self):\n        text = '\\\"'\n",
-        ] {
+        ]
+        .into_iter()
+        .chain(PYTHON_DECLARATION_WHITESPACE_SOURCES.iter().copied())
+        {
             assert!(reference.source_contains_selector(source), "{source}");
         }
         for source in [
@@ -3929,7 +3965,10 @@ mod tests {
             "class TicketQueueTests:\n    text = '''unterminated\n    def test_recovery_is_idempotent(self): pass\n",
             "class TicketQueueTests:\n    text = [)\n    def test_recovery_is_idempotent(self): pass\n",
             "text = (\n    '''class TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n'''\n)\n",
-        ] {
+        ]
+        .into_iter()
+        .chain(PYTHON_DECLARATION_LOOKALIKES.iter().copied())
+        {
             assert!(!reference.source_contains_selector(source), "{source}");
         }
         for selector in [
@@ -3948,11 +3987,39 @@ mod tests {
     }
 
     #[test]
+    fn rejects_python_declaration_lookalikes() {
+        for source in PYTHON_DECLARATION_LOOKALIKES {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                "tests/test_ticket_queue.py",
+                source,
+                "Add queue fixture\n\n- Cover declaration boundaries",
+            );
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
+            let contract = behavior_contract(
+                "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+            );
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                    .unwrap();
+            assert_eq!(
+                check(&evidence, "behavior-references").status,
+                CandidateCheckStatus::Failed,
+                "{source:?}: {evidence:#?}"
+            );
+            assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        }
+    }
+
+    #[test]
     fn rejects_python_method_outside_referenced_class() {
         for source in [
             "class TicketQueueTests:\n    pass\n\nclass OtherTests:\n    def test_recovery_is_idempotent(self): pass\n",
+            "class\tTicketQueueTests:\n    pass\n\nclass  OtherTests:\n    async  def\ttest_recovery_is_idempotent(self): pass\n",
             "class TicketQueueTests:\n    pass\n\ndef test_recovery_is_idempotent(): pass\n",
+            "class\tTicketQueueTests:\n    pass\n\nasync\tdef\ttest_recovery_is_idempotent(): pass\n",
             "class TicketQueueTests:\n    def helper(self):\n        def test_recovery_is_idempotent(): pass\n",
+            "class\tTicketQueueTests:\n    def\thelper(self):\n        async  def\ttest_recovery_is_idempotent(): pass\n",
             "class TicketQueueTests:\n    class Nested:\n        def test_recovery_is_idempotent(self): pass\n",
             "# TicketQueueTests.test_recovery_is_idempotent\nclass TicketQueueTests:\n    pass\n",
             "text = '''\nclass TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n'''\n",
