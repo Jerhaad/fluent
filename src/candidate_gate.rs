@@ -1694,6 +1694,20 @@ struct TestReference {
 }
 
 impl TestReference {
+    fn python_identity(&self) -> Option<PythonTestIdentity<'_>> {
+        if !self.path.ends_with(".py") {
+            return None;
+        }
+        let mut identity = PythonTestIdentity::parse_name(self.selector.as_deref()?)?;
+        // Source selectors name a class and method in this file, not an import
+        // alias whose module would require executing candidate Python to resolve.
+        if identity.module.is_some() {
+            return None;
+        }
+        identity.path = Some(&self.path);
+        Some(identity)
+    }
+
     fn rust_identity(&self) -> Option<RustTestIdentity<'_>> {
         if !self.path.ends_with(".rs") {
             return None;
@@ -1716,12 +1730,215 @@ impl TestReference {
             // final evidence check resolves its full native qualification.
             self.rust_identity()
                 .is_some_and(|identity| source.contains(identity.short_name()))
+        } else if self.path.ends_with(".py") && self.selector.is_some() {
+            self.python_identity()
+                .is_some_and(|identity| identity.is_defined_in(source))
         } else {
             self.selector
                 .as_deref()
                 .is_none_or(|selector| source.contains(selector))
         }
     }
+}
+
+#[derive(Debug)]
+struct PythonTestIdentity<'a> {
+    path: Option<&'a str>,
+    module: Option<&'a str>,
+    class: Option<&'a str>,
+    method: &'a str,
+}
+
+impl<'a> PythonTestIdentity<'a> {
+    fn parse_name(name: &'a str) -> Option<Self> {
+        if !name.split('.').all(is_python_identifier) {
+            return None;
+        }
+        let (qualification, method) = name
+            .rsplit_once('.')
+            .map_or((None, name), |(prefix, method)| (Some(prefix), method));
+        let (module, class) = qualification.map_or((None, None), |qualification| {
+            qualification
+                .rsplit_once('.')
+                .map_or((None, Some(qualification)), |(module, class)| {
+                    (Some(module), Some(class))
+                })
+        });
+        Some(Self {
+            path: None,
+            module,
+            class,
+            method,
+        })
+    }
+
+    fn parse(identity: &'a str) -> Option<Self> {
+        if let Some((prefix, wrapped)) = identity.split_once(" (") {
+            let wrapped = wrapped.strip_suffix(')')?;
+            if prefix.ends_with(".py") {
+                validate_test_path(prefix).ok()?;
+                let mut parsed = Self::parse_name(wrapped)?;
+                parsed.path = Some(prefix);
+                return Some(parsed);
+            }
+            // unittest displays either `method (module.Class)` or
+            // `method (module.Class.method)`. Preserve the supplied class.
+            if !is_python_identifier(prefix) {
+                return None;
+            }
+            let mut parsed = Self::parse_name(wrapped)?;
+            if parsed.method == prefix && parsed.class.is_some() {
+                return Some(parsed);
+            }
+            let (module, class) = wrapped
+                .rsplit_once('.')
+                .map_or((None, wrapped), |(module, class)| (Some(module), class));
+            parsed.module = module;
+            parsed.class = Some(class);
+            parsed.method = prefix;
+            return Some(parsed);
+        }
+        if let Some((prefix, name)) = identity.split_once(".py::") {
+            let path = &identity[..prefix.len() + 3];
+            validate_test_path(path).ok()?;
+            let mut parsed = Self::parse_name(name)?;
+            parsed.path = Some(path);
+            return Some(parsed);
+        }
+        Self::parse_name(identity)
+    }
+
+    fn compatible_with(&self, other: &Self) -> bool {
+        self.method == other.method
+            && !matches!((self.path, other.path), (Some(a), Some(b)) if a != b)
+            && !matches!((self.module, other.module), (Some(a), Some(b)) if a != b)
+            && !matches!((self.class, other.class), (Some(a), Some(b)) if a != b)
+    }
+
+    fn is_defined_in(&self, source: &str) -> bool {
+        let Some(statements) = python_source_statements(source) else {
+            return false;
+        };
+        let mut scopes: Vec<(usize, Option<&str>)> = Vec::new();
+        let mut classes = 0;
+        let mut methods = 0;
+        for (indent, statement) in &statements {
+            while scopes.last().is_some_and(|(parent, _)| parent >= indent) {
+                scopes.pop();
+            }
+            let statement = statement.trim();
+            let class = statement.strip_prefix("class ").and_then(|rest| {
+                let end = rest.find(['(', ':'])?;
+                let name = rest[..end].trim();
+                is_python_identifier(name).then_some(name)
+            });
+            if scopes.is_empty() && class.is_some() && class == self.class {
+                classes += 1;
+            }
+            let method = statement
+                .strip_prefix("async ")
+                .unwrap_or(statement)
+                .strip_prefix("def ")
+                .and_then(|rest| {
+                    let (name, _) = rest.split_once('(')?;
+                    let name = name.trim();
+                    is_python_identifier(name).then_some(name)
+                });
+            let owner = scopes.last().and_then(|(_, class)| *class);
+            if method == Some(self.method) && (self.class.is_none() || owner == self.class) {
+                methods += 1;
+            }
+            if statement.ends_with(':') {
+                // Only direct methods of a top-level class establish ownership.
+                scopes.push((*indent, if scopes.is_empty() { class } else { None }));
+            }
+        }
+        methods > 0 && (self.class.is_none() || (classes == 1 && methods == 1))
+    }
+}
+
+fn is_python_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+// Scan logical statements without importing Python or evaluating its strings.
+// Mask string contents and comments before using indentation to resolve scopes.
+fn python_source_statements(source: &str) -> Option<Vec<(usize, String)>> {
+    let mut statements = Vec::new();
+    let mut current = Vec::new();
+    let mut indent = 0;
+    let mut quote: Option<(u8, bool)> = None;
+    let mut brackets = Vec::new();
+    for line in source.lines() {
+        if current.is_empty() {
+            indent = line
+                .bytes()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .fold(0, |column, b| {
+                    if b == b'\t' {
+                        (column / 8 + 1) * 8
+                    } else {
+                        column + 1
+                    }
+                });
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        let mut continued = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some((delimiter, triple)) = quote {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == delimiter && (!triple || bytes.get(i..i + 3) == Some(&[delimiter; 3])) {
+                    quote = None;
+                    i += if triple { 3 } else { 1 };
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            match b {
+                b'#' => break,
+                b'\'' | b'"' => {
+                    let triple = bytes.get(i..i + 3) == Some(&[b; 3]);
+                    quote = Some((b, triple));
+                    current.push(b'?');
+                    i += if triple { 3 } else { 1 };
+                    continue;
+                }
+                b'(' | b'[' | b'{' => brackets.push(b),
+                b')' | b']' | b'}' => {
+                    let opening = brackets.pop()?;
+                    if !matches!((opening, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) {
+                        return None;
+                    }
+                }
+                b'\\' if i + 1 == bytes.len() => {
+                    continued = true;
+                    break;
+                }
+                _ => {}
+            }
+            current.push(b);
+            i += 1;
+        }
+        if quote.is_none() && brackets.is_empty() && !continued {
+            let statement = String::from_utf8(std::mem::take(&mut current)).ok()?;
+            if !statement.trim().is_empty() {
+                statements.push((indent, statement));
+            }
+        } else {
+            current.push(b' ');
+        }
+    }
+    (quote.is_none() && brackets.is_empty() && current.is_empty()).then_some(statements)
 }
 
 #[derive(Debug)]
@@ -2044,6 +2261,11 @@ fn check_tester_evidence(
         .iter()
         .filter_map(|test| RustTestIdentity::parse(&test.id).map(|identity| (identity, test)))
         .collect::<Vec<_>>();
+    let python_tests = results
+        .tests
+        .iter()
+        .filter_map(|test| PythonTestIdentity::parse(&test.id).map(|identity| (identity, test)))
+        .collect::<Vec<_>>();
     let mut missing_references = Vec::new();
     for reference in references {
         let matched = if let Some(expected_command) = reference.command.as_deref() {
@@ -2058,6 +2280,10 @@ fn check_tester_evidence(
             reference
                 .rust_identity()
                 .is_some_and(|expected| rust_evidence_matches_reference(&expected, &rust_tests))
+        } else if reference.path.ends_with(".py") && reference.selector.is_some() {
+            reference
+                .python_identity()
+                .is_some_and(|expected| python_evidence_matches_reference(&expected, &python_tests))
         } else {
             let mut matching = results
                 .tests
@@ -2154,6 +2380,26 @@ fn rust_evidence_matches_reference(
                 && matching.iter().all(|(other, _)| identity.compatible_with(other))
                 // A result that omitted qualifiers cannot stand in for this
                 // reference if it could instead name a conflicting identity.
+                && tests.iter().all(|(other, _)| {
+                    !identity.compatible_with(other) || expected.compatible_with(other)
+                })
+        })
+}
+
+fn python_evidence_matches_reference(
+    expected: &PythonTestIdentity<'_>,
+    tests: &[(PythonTestIdentity<'_>, &crate::tester::TestResult)],
+) -> bool {
+    let matching = tests
+        .iter()
+        .filter(|(identity, _)| expected.compatible_with(identity))
+        .collect::<Vec<_>>();
+    !matching.is_empty()
+        && matching.iter().all(|(identity, test)| {
+            test.status == "pass"
+                && matching
+                    .iter()
+                    .all(|(other, _)| identity.compatible_with(other))
                 && tests.iter().all(|(other, _)| {
                     !identity.compatible_with(other) || expected.compatible_with(other)
                 })
@@ -3663,6 +3909,45 @@ mod tests {
     }
 
     #[test]
+    fn resolves_python_declarations_without_executing_source() {
+        let reference = parse_test_reference(
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+        )
+        .unwrap();
+        for source in [
+            "raise RuntimeError('do not execute candidate code')\nclass TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n",
+            "@decorate('class Fake:')\nclass TicketQueueTests(\n    unittest.TestCase,\n):\n    @decorate(\n        'def fake():',\n    )\n    def test_recovery_is_idempotent(\n        self,\n    ):\n        pass\n",
+            "class TicketQueueTests:\r\n\tasync def test_recovery_is_idempotent(self): pass\r\n",
+            "class TicketQueueTests:\n    def helper(self):\n        pass\n\n    # ignore a comment with unmatched delimiters: [ '\n    def test_recovery_is_idempotent(self):\n        text = '\\\"'\n",
+        ] {
+            assert!(reference.source_contains_selector(source), "{source}");
+        }
+        for source in [
+            "class TicketQueueTests:\n    def test_recovery_is_idempotent_suffix(self): pass\n",
+            "class TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\nclass TicketQueueTests:\n    pass\n",
+            "class TicketQueueTests:\n    if False:\n        def test_recovery_is_idempotent(self): pass\n",
+            "class TicketQueueTests:\n    text = '''unterminated\n    def test_recovery_is_idempotent(self): pass\n",
+            "class TicketQueueTests:\n    text = [)\n    def test_recovery_is_idempotent(self): pass\n",
+            "text = (\n    '''class TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n'''\n)\n",
+        ] {
+            assert!(!reference.source_contains_selector(source), "{source}");
+        }
+        for selector in [
+            "TicketQueueTests..test_recovery_is_idempotent",
+            "TicketQueueTests.test_recovery_is_idempotent()",
+            "1Class.test_recovery_is_idempotent",
+            "TicketQueueTests::test_recovery_is_idempotent",
+        ] {
+            let reference =
+                parse_test_reference(&format!("tests/test_ticket_queue.py ({selector})")).unwrap();
+            assert!(
+                !reference.source_contains_selector(&format!("# {selector}\n")),
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_python_method_outside_referenced_class() {
         for source in [
             "class TicketQueueTests:\n    pass\n\nclass OtherTests:\n    def test_recovery_is_idempotent(self): pass\n",
@@ -3734,6 +4019,91 @@ mod tests {
             let preserved: serde_json::Value =
                 serde_json::from_slice(&fs::read(&tester).unwrap()).unwrap();
             assert_eq!(preserved, results);
+        }
+    }
+
+    #[test]
+    fn resolves_short_python_evidence_without_bridging_classes() {
+        let reference =
+            parse_test_reference("tests/test_ticket_queue.py::test_recovery_is_idempotent")
+                .unwrap();
+        let qualified_reference = parse_test_reference(
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+        )
+        .unwrap();
+        let cases: &[(&[(&str, &str)], bool, bool)] = &[
+            (&[("test_recovery_is_idempotent", "pass")], true, true),
+            (
+                &[("TicketQueueTests.test_recovery_is_idempotent", "pass")],
+                true,
+                true,
+            ),
+            (
+                &[
+                    ("TicketQueueTests.test_recovery_is_idempotent", "pass"),
+                    ("OtherTests.test_recovery_is_idempotent", "fail"),
+                ],
+                false,
+                true,
+            ),
+            (
+                &[
+                    ("TicketQueueTests.test_recovery_is_idempotent", "pass"),
+                    ("OtherTests.test_recovery_is_idempotent", "pass"),
+                ],
+                false,
+                true,
+            ),
+            (
+                &[
+                    ("test_recovery_is_idempotent", "pass"),
+                    ("OtherTests.test_recovery_is_idempotent", "pass"),
+                ],
+                true,
+                false,
+            ),
+            (
+                &[
+                    ("test_recovery_is_idempotent", "pass"),
+                    ("OtherTests.test_recovery_is_idempotent", "skipped"),
+                ],
+                false,
+                false,
+            ),
+        ];
+        for (identities, short_passes, qualified_passes) in cases {
+            let mut tests = identities
+                .iter()
+                .map(|(id, status)| {
+                    serde_json::from_value::<crate::tester::TestResult>(
+                        serde_json::json!({"id": id, "test_harness": "unittest", "status": status}),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..2 {
+                let parsed = tests
+                    .iter()
+                    .map(|test| (PythonTestIdentity::parse(&test.id).unwrap(), test))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    python_evidence_matches_reference(
+                        &reference.python_identity().unwrap(),
+                        &parsed
+                    ),
+                    *short_passes,
+                    "{identities:?}"
+                );
+                assert_eq!(
+                    python_evidence_matches_reference(
+                        &qualified_reference.python_identity().unwrap(),
+                        &parsed
+                    ),
+                    *qualified_passes,
+                    "{identities:?}"
+                );
+                tests.reverse();
+            }
         }
     }
 
