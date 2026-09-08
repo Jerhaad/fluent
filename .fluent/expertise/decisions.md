@@ -325,3 +325,16 @@ for the child or cleaning up a failed launch. This order serializes reservation,
 launch, and cancellation without making cancellation wait for worker completion;
 a reserved peer observes the shared stop even before cancellation visits its
 own execution record. Preserve it when adding nested or parallel work.
+
+---
+
+## Resolve Python source selectors without execution
+
+The candidate gate intentionally uses a limited Rust text scanner to resolve
+class-qualified Python selectors from committed declarations. It does not import
+candidate Python or resolve inherited or dynamically assigned methods. Keep
+this cheap source check separate from the final Tester's required passing
+evidence. See [[python-test-selectors-use-static-class-ownership]] for the
+supported declaration boundary and
+[the architecture documentation](../../documentation/architecture.md)
+for source and evidence matching.

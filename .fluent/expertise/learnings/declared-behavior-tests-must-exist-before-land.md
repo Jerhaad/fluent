@@ -17,7 +17,8 @@ committed project-relative path and native test identifier. The behaviors
 reviewer then checks that the named test directly exercises the behavior; code
 reviewers run before the final Tester and treat Writer-focused verification as
 advisory. After the final Tester, the host gate requires every reference to match
-a passing structured Rust-test or shell-script identity for the exact candidate.
+a passing structured Rust-test, Python-test, or shell-script identity for the
+exact candidate.
 A declared reference with no backing definition therefore blocks before review,
 and a defined reference without passing final evidence blocks before Learning,
 even when many unrelated tests are green.
