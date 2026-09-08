@@ -1,6 +1,6 @@
 ---
 name: python-test-selectors-use-static-class-ownership
-description: Resolve class-qualified Python selectors from committed declarations without importing candidate code
+description: Resolve Python selectors from committed declarations with exact class ownership and space/tab keyword boundaries
 metadata:
   type: architecture
 ---
@@ -12,6 +12,20 @@ matching class and method declaration. Selector components use ASCII identifier
 syntax. The scanner masks comments and strings, joins logical statements, and
 tracks indentation so text mentions and methods in unrelated scopes cannot
 establish class ownership.
+
+Recognize `class`, `def`, and `async` only when the keyword is followed by at
+least one ASCII space or tab, then consume the whole run of spaces and tabs.
+Tabs, repeated spaces, and mixtures preserve declaration identity. Matching one
+literal keyword-plus-space spelling rejects supported declarations; accepting a
+bare keyword prefix can mistake a longer identifier for a declaration.
+Whitespace tolerance must preserve exact class and method names and their
+ownership checks.
+
+When extending accepted syntax, exercise positive and lookalike fixtures through
+both the scanner and the candidate gate using committed source. Assert the
+`behavior-references` check and the overall gate disposition. Include methods
+outside the referenced class using the newly accepted syntax so broader lexical
+acceptance cannot silently weaken scope checks.
 
 Keep the supported boundary explicit when extending this resolver. It does not
 resolve inheritance, dynamically assigned methods, or nested or conditional
