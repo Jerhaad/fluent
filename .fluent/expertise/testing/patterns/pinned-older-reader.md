@@ -22,6 +22,10 @@ Keep this preparation in the declared Tester command so the test cannot silently
 skip compatibility verification when the executable is absent. Never substitute
 an installed binary or the integration branch's target directory.
 
+Start the Tester command with `set -eu`. Capture the helper's output in a normal
+assignment, then export the variable only after that assignment succeeds. An
+`export NAME="$(helper)"` assignment masks the helper's failed exit status.
+
 When a new record envelope rejects the reader before a previously tested schema
 fence, keep the current-format refusal case and add a fixture that restores only
 the older envelope representation. Preserve the protected schema fields so that

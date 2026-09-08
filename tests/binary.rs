@@ -252,6 +252,94 @@ print('built historical reader with locked dependencies', file=sys.stderr)
     );
 }
 
+#[test]
+fn fluent_release_tester_historical_reader_setup_fails_closed() {
+    let tester_yaml =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".fluent/tester.yaml"))
+            .unwrap();
+    let config: serde_yaml::Value = serde_yaml::from_str(&tester_yaml).unwrap();
+    let command = config["commands"][0]["command"].as_str().unwrap();
+
+    // A successful setup is the control. Failures must stop even if the helper
+    // has already printed a path, and must preserve its diagnostic and status.
+    for (setup_status, prints_path) in [(0, true), (37, false), (37, true)] {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("tester project");
+        let fixtures = project.join("tests/fixtures");
+        let bin_dir = tmp.path().join("bin");
+        write_mock_executable(
+            &fixtures,
+            "build-ownership-old-reader.sh",
+            r#"#!/bin/sh
+printf '%s' "$FLUENT_TEST_READER_OUTPUT"
+if [ "$FLUENT_TEST_READER_STATUS" -ne 0 ]; then
+    echo 'historical reader build failed' >&2
+fi
+exit "$FLUENT_TEST_READER_STATUS"
+"#,
+        );
+        write_mock_executable(&bin_dir, "old reader", "#!/bin/sh\nexit 0\n");
+        write_mock_executable(
+            &bin_dir,
+            "cargo",
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$FLUENT_TEST_CARGO_CALLS"
+printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
+case "$1" in
+    build) mkdir -p target/debug; touch target/debug/fluent ;;
+    nextest) exit 0 ;;
+    *) exit 91 ;;
+esac
+"#,
+        );
+        let reader = bin_dir.join("old reader");
+        let cargo_calls = tmp.path().join("cargo-calls");
+        let reader_paths = tmp.path().join("reader-paths");
+        // Tester executes each configured command through sh -c.
+        let output = Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&project)
+            .env_remove("FLUENT_OWNERSHIP_OLD_BIN")
+            .env("FLUENT_TEST_READER_STATUS", setup_status.to_string())
+            .env(
+                "FLUENT_TEST_READER_OUTPUT",
+                if prints_path {
+                    reader.to_str().unwrap()
+                } else {
+                    ""
+                },
+            )
+            .env("FLUENT_TEST_CARGO_CALLS", &cargo_calls)
+            .env("FLUENT_TEST_READER_PATHS", &reader_paths)
+            .env(
+                "PATH",
+                format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(setup_status), "{stderr}");
+        if setup_status == 0 {
+            let calls = fs::read_to_string(&cargo_calls).unwrap();
+            let calls: Vec<_> = calls.lines().collect();
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert_eq!(calls[0], "build");
+            assert_eq!(calls[1], "build --features test-support");
+            assert!(calls[2].starts_with("nextest run "), "{calls:?}");
+            assert_eq!(
+                fs::read_to_string(reader_paths).unwrap(),
+                format!("{}\n", reader.display()).repeat(3),
+                "every Cargo child must receive the exported reader path"
+            );
+        } else {
+            assert!(stderr.contains("historical reader build failed"), "{stderr}");
+            assert!(!cargo_calls.exists(), "setup failure launched Cargo");
+            assert!(!reader_paths.exists(), "setup failure reached a Rust child");
+        }
+    }
+}
+
 fn provider_double_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-doubles")
 }

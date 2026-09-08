@@ -1,6 +1,8 @@
 commands:
   - command: |
-      export FLUENT_OWNERSHIP_OLD_BIN="$(bash tests/fixtures/build-ownership-old-reader.sh)"
+      set -eu
+      FLUENT_OWNERSHIP_OLD_BIN="$(bash tests/fixtures/build-ownership-old-reader.sh)"
+      export FLUENT_OWNERSHIP_OLD_BIN
       cargo build
       production_bin="$(pwd)/target/debug/fluent-production"
       cp target/debug/fluent "$production_bin"
