@@ -38436,72 +38436,151 @@ fn invalid_verification_receipt_blocks_then_corrected_receipt_advances() {
     assert_eq!(reviews[0]["review_context"]["candidate_commit"], candidate);
 }
 
+struct VerificationConcurrencyFixture {
+    project: PathBuf,
+    bin: PathBuf,
+    peer_review: String,
+    scratch: PathBuf,
+    // Drop the CLI owner before reading the last execution identity so no new
+    // setup command can replace the worker group during cleanup.
+    worker: OwnedFixtureProcess,
+    execution: VerificationConcurrencyExecution,
+}
+
+impl VerificationConcurrencyFixture {
+    fn new(tmp: &TempDir) -> Self {
+        let (project, _, review) = setup_focused_evidence_fixture(
+            tmp,
+            "verification-slow",
+            "tests",
+            concat!(
+                "Verdict: fail\nEvidence-Command: python3 -c '",
+                "import os,subprocess,time; ",
+                "p=os.environ[\"FLUENT_EVIDENCE_SCRATCH\"]; ",
+                "child=subprocess.Popen([\"sleep\",\"120\"]); ",
+                "open(p+\"/started.tmp\",\"w\").write(str(os.getpid())+\" \"+str(child.pid)); ",
+                "os.rename(p+\"/started.tmp\",p+\"/started\"); ",
+                "[time.sleep(.02) for _ in range(6000) if not os.path.isfile(p+\"/release\")]; ",
+                "child.terminate(); child.wait()'\nEvidence-Working-Directory: .\n",
+            ),
+        );
+        let (_, _, peer_review) = create_focused_evidence_item(
+            project.clone(),
+            "verification-peer",
+            "tests",
+            "Verdict: fail\nEvidence-Command: printf peer-progress\nEvidence-Working-Directory: .\n",
+        );
+        let bin = tmp.path().join("verification-bin");
+        write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "run",
+                "verification-slow",
+                "attempt-1",
+                "--review-artifact",
+                &review,
+            ])
+            .assert()
+            .success();
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("fluent"));
+        command
+            .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .env(
+                "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+                bin.join("sandbox-exec"),
+            )
+            .args([
+                "task",
+                "run",
+                "verification-slow",
+                "attempt-1",
+                "attempt-1-verification-1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let scratch = project.join(
+            ".fluent/work/artifacts/verification-slow/attempt-1/attempt-1-verification-1/scratch",
+        );
+        let execution = VerificationConcurrencyExecution {
+            record_path: scratch.parent().unwrap().join("execution.json"),
+        };
+        let worker = OwnedFixtureProcess::spawn(&mut command);
+        Self {
+            project,
+            bin,
+            peer_review,
+            scratch,
+            worker,
+            execution,
+        }
+    }
+
+    fn wait_until_blocked(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.scratch.join("started").exists() && std::time::Instant::now() < deadline {
+            assert!(
+                self.worker.try_wait().unwrap().is_none(),
+                "verification exited before reaching the barrier"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(self.scratch.join("started").exists());
+    }
+}
+
+impl Drop for VerificationConcurrencyFixture {
+    fn drop(&mut self) {
+        // Arm release even if an assertion fails before scratch is created.
+        // If release fails or the CLI stalls, the field guards stop and reap
+        // the CLI and its separately grouped execution before project teardown.
+        let _ = fs::create_dir_all(&self.scratch)
+            .and_then(|()| fs::write(self.scratch.join("release"), "release"));
+        poll_until(std::time::Duration::from_secs(3), || {
+            self.worker.try_wait().is_ok_and(|status| status.is_some())
+        });
+    }
+}
+
+struct VerificationConcurrencyExecution {
+    record_path: PathBuf,
+}
+
+impl Drop for VerificationConcurrencyExecution {
+    fn drop(&mut self) {
+        if let Ok(bytes) = fs::read(&self.record_path) {
+            let record: fluent::execution::ExecutionRecord =
+                serde_json::from_slice(&bytes).unwrap();
+            if record.process_group_id > 0 && cancellation_fixture_owns_execution(&self.record_path)
+            {
+                let group = record.process_group_id.try_into().unwrap();
+                drop(CancellationFixtureExecution {
+                    record_path: self.record_path.clone(),
+                    group,
+                });
+                assert!(
+                    fixture_group_is_gone(group, std::time::Duration::from_secs(2)),
+                    "verification fixture group must be gone before project teardown"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn verification_worker_does_not_block_unrelated_attempt_progress() {
     let tmp = TempDir::new().unwrap();
-    let (project, _, review) = setup_focused_evidence_fixture(
-        &tmp,
-        "verification-slow",
-        "tests",
-        "Verdict: fail\nEvidence-Command: python3 -c 'import os,time; p=os.environ[\"FLUENT_EVIDENCE_SCRATCH\"]; open(p+\"/started\",\"w\").close(); [time.sleep(.02) for _ in range(750) if not os.path.exists(p+\"/release\")]'\nEvidence-Working-Directory: .\n",
-    );
-    let (_, _, peer_review) = create_focused_evidence_item(
-        project.clone(),
-        "verification-peer",
-        "tests",
-        "Verdict: fail\nEvidence-Command: printf peer-progress\nEvidence-Working-Directory: .\n",
-    );
-    let bin = tmp.path().join("verification-bin");
-    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
-    fluent_cmd()
-        .current_dir(&project)
-        .args([
-            "attempt",
-            "evidence",
-            "run",
-            "verification-slow",
-            "attempt-1",
-            "--review-artifact",
-            &review,
-        ])
-        .assert()
-        .success();
-    let mut worker = Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
-        .current_dir(&project)
-        .env("FLUENT_NO_UPDATE_CHECK", "1")
-        .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
-        .env(
-            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
-            bin.join("sandbox-exec"),
-        )
-        .args([
-            "task",
-            "run",
-            "verification-slow",
-            "attempt-1",
-            "attempt-1-verification-1",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let scratch = project.join(
-        ".fluent/work/artifacts/verification-slow/attempt-1/attempt-1-verification-1/scratch",
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !scratch.join("started").exists() && std::time::Instant::now() < deadline {
-        assert!(
-            worker.try_wait().unwrap().is_none(),
-            "verification exited before reaching the barrier"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert!(scratch.join("started").exists());
+    let mut fixture = VerificationConcurrencyFixture::new(&tmp);
+    fixture.wait_until_blocked();
     // Scheduling takes the real project landing lock; command timeout catches a regression.
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
-        .current_dir(&project)
+        .current_dir(&fixture.project)
         .timeout(std::time::Duration::from_secs(3))
         .args([
             "attempt",
@@ -38510,18 +38589,18 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
             "verification-peer",
             "attempt-1",
             "--review-artifact",
-            &peer_review,
+            &fixture.peer_review,
         ])
         .assert()
         .success();
     assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("fluent"))
         .env("FLUENT_NO_UPDATE_CHECK", "1")
         .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
-        .current_dir(&project)
+        .current_dir(&fixture.project)
         .timeout(std::time::Duration::from_secs(3))
         .env(
             "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
-            bin.join("sandbox-exec"),
+            fixture.bin.join("sandbox-exec"),
         )
         .args([
             "task",
@@ -38532,20 +38611,127 @@ fn verification_worker_does_not_block_unrelated_attempt_progress() {
         ])
         .assert()
         .success();
-    accept_focused_verification(&project, "verification-peer").unwrap();
+    accept_focused_verification(&fixture.project, "verification-peer").unwrap();
     assert_eq!(
-        work_item_value(&project, "verification-peer")["attempts"][0]["evidence_recoveries"]
+        work_item_value(&fixture.project, "verification-peer")["attempts"][0]["evidence_recoveries"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
     assert!(
-        worker.try_wait().unwrap().is_none(),
+        fixture.worker.try_wait().unwrap().is_none(),
         "peer progressed before the slow verification finished"
     );
-    fs::write(scratch.join("release"), "release").unwrap();
-    assert!(worker.wait().unwrap().success());
+    fs::write(fixture.scratch.join("release"), "release").unwrap();
+    assert!(
+        poll_until(std::time::Duration::from_secs(3), || {
+            fixture.worker.try_wait().unwrap().is_some()
+        }),
+        "released verification must settle within the deadline"
+    );
+    assert!(fixture.worker.wait().unwrap().success());
+}
+
+// Contain a failed cleanup regression only after its observations have run.
+struct VerificationConcurrencyFallback {
+    cli_pid: i32,
+    record_path: PathBuf,
+}
+
+impl Drop for VerificationConcurrencyFallback {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let _ = signal_fixture_group(self.cli_pid, libc::SIGKILL);
+        unsafe { libc::waitpid(self.cli_pid, std::ptr::null_mut(), 0) };
+        drop(VerificationConcurrencyExecution {
+            record_path: self.record_path.clone(),
+        });
+    }
+}
+
+#[test]
+fn verification_concurrency_fixture_cleans_up_on_failure() {
+    for block_release in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let fixture = VerificationConcurrencyFixture::new(&tmp);
+        let cli_pid = fixture.worker.id() as i32;
+        let record_path = fixture.execution.record_path.clone();
+        let fallback = VerificationConcurrencyFallback {
+            cli_pid,
+            record_path: record_path.clone(),
+        };
+        let mut captured_pids = Vec::new();
+        let mut deadline = None;
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut fixture = fixture;
+            fixture.wait_until_blocked();
+            let record: fluent::execution::ExecutionRecord =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            captured_pids = fs::read_to_string(fixture.scratch.join("started"))
+                .unwrap()
+                .split_whitespace()
+                .map(|pid| pid.parse::<i32>().unwrap())
+                .collect();
+            assert_eq!(captured_pids.len(), 2, "worker and long-lived descendant");
+            assert_ne!(captured_pids[0], captured_pids[1]);
+            captured_pids.push(record.leader_pid as i32);
+            assert_ne!(record.process_group_id as i32, cli_pid);
+            for pid in &captured_pids {
+                assert_eq!(
+                    unsafe { libc::kill(*pid, 0) },
+                    0,
+                    "process {pid} starts live"
+                );
+                assert_eq!(
+                    unsafe { libc::getpgid(*pid) },
+                    record.process_group_id as i32
+                );
+            }
+            assert!(cancellation_fixture_owns_execution(&record_path));
+            if block_release {
+                // A directory obstructs the release write without opening the
+                // worker's file barrier, so cleanup must stop its separate group.
+                fs::create_dir(fixture.scratch.join("release")).unwrap();
+            }
+            // Include unwinding in the deadline, well below the 120-second lifetime.
+            deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(8));
+            assert!(
+                false,
+                "intentional verification concurrency fixture failure"
+            );
+        }));
+        assert_eq!(
+            failure.unwrap_err().downcast_ref::<&str>().copied(),
+            Some("intentional verification concurrency fixture failure")
+        );
+        let deadline = deadline.unwrap();
+        // The temporary project and fallback stay alive through every observation.
+        assert!(
+            poll_until(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+                || captured_pids.iter().all(|pid| {
+                    (unsafe { libc::kill(*pid, 0) }) == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                }) && !cancellation_fixture_owns_execution(&record_path)
+            ),
+            "unwinding must remove workers and release execution ownership"
+        );
+        let waited = unsafe { libc::waitpid(cli_pid, std::ptr::null_mut(), libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error();
+        assert_eq!(
+            waited, -1,
+            "fixture cleanup must already have reaped the CLI"
+        );
+        assert_eq!(wait_error.raw_os_error(), Some(libc::ECHILD));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cleanup exceeded its deadline"
+        );
+        drop(fallback);
+    }
 }
 
 #[test]
