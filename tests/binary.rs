@@ -173,6 +173,85 @@ fn fluent_release_tester_uses_host_owned_process_settlement() {
     assert!(!tester_yaml.contains("mktemp -d"));
 }
 
+#[test]
+fn fluent_release_tester_historical_reader_setup_is_cold_cache_safe() {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source_commit = "f71d20bb11f241c9ab9ba38b401f22e692d9e19f";
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("historical reader");
+    git::run(
+        &repository,
+        &[
+            "clone",
+            "--shared",
+            "--no-checkout",
+            ".",
+            project.to_str().unwrap(),
+        ],
+        "clone historical reader fixture",
+    )
+    .unwrap();
+    let bin_dir = tmp.path().join("bin");
+    // Keep dependency admission deterministic without touching any Cargo home.
+    // The real helper still archives Git source and writes the binary identity.
+    write_mock_executable(
+        &bin_dir,
+        "cargo",
+        r#"#!/usr/bin/env python3
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+if '--offline' in args or '--frozen' in args:
+    sys.exit('historical reader dependencies are absent from the cold cache')
+assert args[0] == 'build', args
+assert '--locked' in args, 'historical reader must preserve its committed lockfile'
+root = Path(args[args.index('--manifest-path') + 1]).parent
+assert (root / 'Cargo.lock').is_file(), 'archive must include the committed lockfile'
+binary = root / 'target/debug/fluent'
+binary.parent.mkdir(parents=True)
+binary.write_text('#!/bin/sh\nexit 0\n')
+binary.chmod(0o755)
+print('built historical reader with locked dependencies', file=sys.stderr)
+"#,
+    );
+    let output = Command::new("bash")
+        .arg(repository.join("tests/fixtures/build-ownership-old-reader.sh"))
+        .current_dir(&project)
+        .env(
+            "PATH",
+            format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "cold-cache setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reader_root = project.join(".scratch/ownership-old-reader");
+    let binary = reader_root.join("target/debug/fluent");
+    assert_eq!(
+        fs::canonicalize(String::from_utf8(output.stdout).unwrap().trim()).unwrap(),
+        fs::canonicalize(&binary).unwrap(),
+        "helper stdout must contain only the reader path"
+    );
+    for file in ["Cargo.toml", "Cargo.lock", "src/main.rs"] {
+        let archived = Command::new("git")
+            .current_dir(&repository)
+            .args(["show", &format!("{source_commit}:{file}")])
+            .output()
+            .unwrap();
+        assert!(archived.status.success());
+        assert_eq!(fs::read(reader_root.join(file)).unwrap(), archived.stdout);
+    }
+    let identity = read_json_path(&reader_root.join("identity.json"));
+    assert_eq!(identity["source_commit"], source_commit);
+    assert_eq!(
+        identity["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(binary).unwrap()))
+    );
+}
+
 fn provider_double_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-doubles")
 }

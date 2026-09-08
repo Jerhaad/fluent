@@ -9,9 +9,11 @@ test does not exercise the older executable's command routing and storage path.
 ## Mechanism
 
 Build the identified older source before the measured fixture, using the
-Attempt's private Cargo cache offline and a separate target directory. Record
-both its full source commit and executable SHA-256. Pass the resulting path to
-the test through an explicit environment variable. The test checks that identity
+Attempt's private Cargo cache and a separate target directory. Use
+`cargo build --locked` so a cold cache can fetch missing dependencies while
+preserving the archived source's committed lockfile. Record both its full source
+commit and executable SHA-256. Pass the resulting path to the test through an
+explicit environment variable. The test checks that identity
 before running the older public command against an isolated copy of the new
 record, then compares the stored model after refusal. Use byte comparisons for
 artifacts whose exact bytes or digests form part of the contract.

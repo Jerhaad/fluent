@@ -9,7 +9,8 @@ if [[ ! -f "$reader_root/source-commit" ]] || [[ "$(cat "$reader_root/source-com
     git -C "$repository" archive "$source_commit" | tar -x -C "$reader_root"
     echo "$source_commit" > "$reader_root/source-commit"
 fi
-cargo build --offline --manifest-path "$reader_root/Cargo.toml" >&2
+# Fetch missing dependencies without changing the archived lockfile.
+cargo build --locked --manifest-path "$reader_root/Cargo.toml" >&2
 python3 - "$reader_root" "$source_commit" <<'PY'
 import hashlib,json,sys
 from pathlib import Path
