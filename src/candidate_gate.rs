@@ -3633,6 +3633,178 @@ mod tests {
     }
 
     #[test]
+    fn accepts_class_qualified_python_unittest_reference() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/test_ticket_queue.py",
+            "import unittest\n\nclass TicketQueueTests(unittest.TestCase):\n    def test_recovery_is_idempotent(self):\n        pass\n",
+            "Add queue test\n\n- Cover recovery",
+        );
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        for reference in [
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+            "tests/test_ticket_queue.py (TicketQueueTests.test_recovery_is_idempotent)",
+            "tests/test_ticket_queue.py::test_recovery_is_idempotent",
+        ] {
+            let contract = behavior_contract(reference);
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                    .unwrap();
+            assert_eq!(
+                evidence.disposition,
+                CandidateGateDisposition::Passed,
+                "{reference}: {evidence:#?}"
+            );
+            assert_eq!(
+                check(&evidence, "tester-reference-evidence").status,
+                CandidateCheckStatus::Skipped
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_python_method_outside_referenced_class() {
+        for source in [
+            "class TicketQueueTests:\n    pass\n\nclass OtherTests:\n    def test_recovery_is_idempotent(self): pass\n",
+            "class TicketQueueTests:\n    pass\n\ndef test_recovery_is_idempotent(): pass\n",
+            "class TicketQueueTests:\n    def helper(self):\n        def test_recovery_is_idempotent(): pass\n",
+            "class TicketQueueTests:\n    class Nested:\n        def test_recovery_is_idempotent(self): pass\n",
+            "# TicketQueueTests.test_recovery_is_idempotent\nclass TicketQueueTests:\n    pass\n",
+            "text = '''\nclass TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n'''\n",
+            "class TicketQueueTests:\n    text = '''\n    def test_recovery_is_idempotent(self): pass\n    '''\n",
+        ] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                "tests/test_ticket_queue.py",
+                source,
+                "Add queue fixture\n\n- Cover source ownership",
+            );
+            let artifact = fixture.artifacts.path().join("candidate-gate.json");
+            let contract = behavior_contract(
+                "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+            );
+            let evidence =
+                run_candidate_gate(fixture.request(&candidate, Some(&contract), None, &artifact))
+                    .unwrap();
+            assert_eq!(
+                check(&evidence, "behavior-references").status,
+                CandidateCheckStatus::Failed,
+                "{source}: {evidence:#?}"
+            );
+            assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        }
+    }
+
+    #[test]
+    fn accepts_class_qualified_python_unittest_evidence() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/test_ticket_queue.py",
+            "class TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n",
+            "Add queue test\n\n- Cover recovery",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract(
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+        );
+        for identity in [
+            "TicketQueueTests.test_recovery_is_idempotent",
+            "tests.test_ticket_queue.TicketQueueTests.test_recovery_is_idempotent",
+            "test_recovery_is_idempotent (tests.test_ticket_queue.TicketQueueTests)",
+            "test_recovery_is_idempotent (tests.test_ticket_queue.TicketQueueTests.test_recovery_is_idempotent)",
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+            "tests/test_ticket_queue.py (TicketQueueTests.test_recovery_is_idempotent)",
+        ] {
+            let results = serde_json::json!({
+                "candidate_commit": candidate, "commands": [],
+                "tests": [{"id": identity, "test_harness": "unittest", "status": "pass"}],
+                "summary": {"total": 1, "pass": 1, "fail": 0, "skipped": 0}, "error": null
+            });
+            fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+            let mut request =
+                fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+            request.phase = CandidateGatePhase::FinalTester;
+            let evidence = run_candidate_gate(request).unwrap();
+            assert_eq!(
+                evidence.disposition,
+                CandidateGateDisposition::Passed,
+                "{identity}: {evidence:#?}"
+            );
+            let preserved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&tester).unwrap()).unwrap();
+            assert_eq!(preserved, results);
+        }
+    }
+
+    #[test]
+    fn rejects_conflicting_class_qualified_python_evidence() {
+        let fixture = Fixture::new();
+        let candidate = fixture.commit(
+            "tests/test_ticket_queue.py",
+            "class TicketQueueTests:\n    def test_recovery_is_idempotent(self): pass\n",
+            "Add queue test\n\n- Cover recovery",
+        );
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let artifact = fixture.artifacts.path().join("candidate-gate.json");
+        let contract = behavior_contract(
+            "tests/test_ticket_queue.py::TicketQueueTests.test_recovery_is_idempotent",
+        );
+        let cases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("OtherTests.test_recovery_is_idempotent", "pass")],
+            &[("TicketQueueTests.test_missing", "pass")],
+            &[("TicketQueueTests.test_recovery_is_idempotent", "fail")],
+            &[("TicketQueueTests.test_recovery_is_idempotent", "skipped")],
+            &[(
+                "tests/other.py::TicketQueueTests.test_recovery_is_idempotent",
+                "pass",
+            )],
+            &[
+                ("test_recovery_is_idempotent", "pass"),
+                ("OtherTests.test_recovery_is_idempotent", "fail"),
+            ],
+            &[
+                ("TicketQueueTests.test_recovery_is_idempotent", "pass"),
+                (
+                    "test_recovery_is_idempotent (tests.test_ticket_queue.TicketQueueTests)",
+                    "skipped",
+                ),
+            ],
+            &[
+                ("one.TicketQueueTests.test_recovery_is_idempotent", "pass"),
+                ("two.TicketQueueTests.test_recovery_is_idempotent", "pass"),
+            ],
+            &[(
+                "arbitrary text TicketQueueTests.test_recovery_is_idempotent",
+                "pass",
+            )],
+            &[(
+                "test_other (tests.test_ticket_queue.TicketQueueTests.test_recovery_is_idempotent)",
+                "pass",
+            )],
+        ];
+        for identities in cases {
+            let tests = identities.iter().map(|(id, status)| serde_json::json!({"id": id, "test_harness": "unittest", "status": status})).collect::<Vec<_>>();
+            let results = serde_json::json!({
+                "candidate_commit": candidate, "commands": [], "tests": tests,
+                "summary": {"total": tests.len(), "pass": identities.iter().filter(|(_, status)| *status == "pass").count(), "fail": identities.iter().filter(|(_, status)| *status == "fail").count(), "skipped": identities.iter().filter(|(_, status)| *status == "skipped").count()}, "error": null
+            });
+            fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+            let mut request =
+                fixture.request(&candidate, Some(&contract), Some(&tester), &artifact);
+            request.phase = CandidateGatePhase::FinalTester;
+            let evidence = run_candidate_gate(request).unwrap();
+            assert_eq!(
+                check(&evidence, "tester-reference-evidence").status,
+                CandidateCheckStatus::Failed,
+                "{identities:?}: {evidence:#?}"
+            );
+            assert_eq!(evidence.disposition, CandidateGateDisposition::Rejected);
+        }
+    }
+
+    #[test]
     fn accepts_equivalent_native_rust_identities() {
         let fixture = Fixture::new();
         let candidate = fixture.commit(
