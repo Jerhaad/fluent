@@ -40994,3 +40994,116 @@ fn ambiguous_check_failure_pauses_without_source_correction() {
         "{handoff}"
     );
 }
+
+#[test]
+fn legacy_evidence_reuses_proven_bindings_without_host_rerun() {
+    let tmp = TempDir::new().unwrap();
+    let work = "legacy-canonical-proof";
+    let marker = tmp.path().join("already-passed");
+    let passing = format!("echo passed >> '{}'", marker.display());
+    let (project, candidate, results) =
+        canonical_evidence_fixture(&tmp, work, &[&passing, "false"]);
+    // Preserve the supported pre-manifest shape before any recovery begins.
+    // Candidate-bound complete Task history, results and logs are the sources.
+    fs::remove_file(results.parent().unwrap().join("canonical-run.json")).unwrap();
+    let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&results).unwrap()).unwrap();
+    for command in old["commands"].as_array_mut().unwrap() {
+        command.as_object_mut().unwrap().remove("failure_cause");
+    }
+    fs::write(&results, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+    let original = fs::read(&results).unwrap();
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", work])
+        .assert()
+        .success();
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+    let evidence = tmp.path().join("old-host.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"preserved host result","check":"false","working_directory":".","result":"pass","run_at":"1999-01-01T00:00:00Z","output":"passed"})).unwrap()).unwrap();
+    let old_document = fs::read(&evidence).unwrap();
+    // Interrupt after the reconstructed proof becomes durable but before the
+    // attachment can reserve its review. Remove only this test obstruction.
+    let blocked = project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/host-evidence"
+    ));
+    fs::write(&blocked, "controlled publication obstruction").unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure();
+    let audit = project.join(format!(".fluent/work/artifacts/{work}/attempt-1/evidence-reconstructions/attempt-1-tester/audit.json"));
+    let audit_bytes =
+        fs::read(&audit).expect("reconstruction is durable before attachment publication");
+    let interrupted = work_item_value(&project, work);
+    assert!(
+        interrupted["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .is_none_or(|r| r.is_empty())
+    );
+    fs::remove_file(blocked).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    let attached = work_item_value(&project, work);
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    assert_eq!(work_item_value(&project, work), attached);
+    let source = &attached["attempts"][0]["evidence_recoveries"][0]["required_check"]["source"];
+    assert!(
+        source["reconstruction"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("audit.json")
+    );
+    let snapshot =
+        &attached["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"];
+    assert_eq!(
+        fs::read(project.join(snapshot.as_str().unwrap())).unwrap(),
+        old_document
+    );
+    assert_eq!(fs::read(&audit).unwrap(), audit_bytes);
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready"));
+    assert_eq!(fs::read(&results).unwrap(), original);
+    assert!(
+        !results
+            .parent()
+            .unwrap()
+            .join("canonical-run.json")
+            .exists()
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "passed\n");
+    assert_eq!(fs::read(audit).unwrap(), audit_bytes);
+}
+
+#[test]
+fn legacy_evidence_requires_historical_comparison_proof() {
+    let tmp = TempDir::new().unwrap();
+    let work = "missing-historical-proof";
+    let (project, candidate, results) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["true", "false"],
+        serde_json::json!({"comparison_refs":["main"]}),
+    );
+    fs::remove_file(results.parent().unwrap().join("canonical-run.json")).unwrap();
+    let evidence = tmp.path().join("missing-proof.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":"2026-09-09T12:00:00Z","output":"passed","comparison_commits":{"main":candidate}})).unwrap()).unwrap();
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("historical applicability"));
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+}

@@ -5658,6 +5658,15 @@ pub fn attach_required_check(
                     "Attempt is not eligible for evidence recovery".into(),
                 ));
             }
+            if let Some(proof) = &assessment.reconstruction {
+                for (artifact, bytes) in [
+                    (&proof.manifest, &proof.manifest_bytes),
+                    (&proof.audit, &proof.audit_bytes),
+                ] {
+                    publish_snapshot(project_root, &artifact.path, bytes)
+                        .map_err(|error| reject(format!("{error:#}")))?;
+                }
+            }
             let recovery_id = format!(
                 "required-check-{:x}",
                 Sha256::digest(format!("{binding_digest}\0{digest}").as_bytes())
@@ -5671,6 +5680,17 @@ pub fn attach_required_check(
                 .iter_mut()
                 .find(|attempt| attempt.id == attempt_id)
                 .unwrap();
+            if let Some(proof) = &assessment.reconstruction {
+                for artifact in [&proof.manifest, &proof.audit] {
+                    let reference = ArtifactRef {
+                        producer_id: "evidence-reconstruction".into(),
+                        path: artifact.path.clone(),
+                    };
+                    if !attempt.artifacts.contains(&reference) {
+                        attempt.artifacts.push(reference);
+                    }
+                }
+            }
             attempt.resume_cancellation()?;
             attempt.attach_evidence_recovery(EvidenceRecovery {
                 required_check: Some(check),

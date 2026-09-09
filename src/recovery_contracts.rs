@@ -2449,6 +2449,29 @@ mod tests {
     }
 
     #[test]
+    fn legacy_manifest_requires_complete_default_commands() {
+        let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
+            "commands":[{"command":"false","test_harness":"shell-harness","exit_code":1,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}],
+            "tests":[],"summary":{"total":0,"pass":0,"fail":0,"skipped":0},"error":null
+        })).unwrap();
+        let config = b"commands:\n  - command: 'false'\n    test_harness: shell-harness\n";
+        let manifest = super::reconstruct_legacy_manifest(config, b"extractor", &results).unwrap();
+        assert!(manifest.full_run);
+        assert!(manifest.run_at.is_none());
+        assert!(manifest.environment.is_empty());
+        let declared = b"commands:\n  - command: 'false'\n    test_harness: shell-harness\n    applicability: {comparison_refs: [main]}\n";
+        assert!(
+            super::reconstruct_legacy_manifest(declared, b"extractor", &results)
+                .unwrap_err()
+                .to_string()
+                .contains("historical applicability")
+        );
+        let mut missing = results.clone();
+        missing.commands.clear();
+        assert!(super::reconstruct_legacy_manifest(config, b"extractor", &missing).is_err());
+    }
+
+    #[test]
     fn failed_evidence_snapshot_rejects_pass_result() {
         let passing = br#"{"schema_version":1,"producer":"host","check":"cargo test","working_directory":".","result":"pass","run_at":"2026-09-02T00:00:00Z","output":"ok"}"#;
 
@@ -2655,6 +2678,14 @@ pub(crate) struct CanonicalCheckAssessment {
     pub accepted: Vec<usize>,
     pub blockers: Vec<String>,
     pub diagnoses: Vec<String>,
+    pub reconstruction: Option<CanonicalReconstruction>,
+}
+
+pub(crate) struct CanonicalReconstruction {
+    pub manifest: work_model::BoundRecheckArtifact,
+    pub manifest_bytes: Vec<u8>,
+    pub audit: work_model::BoundRecheckArtifact,
+    pub audit_bytes: Vec<u8>,
 }
 
 impl CanonicalCheckAssessment {
@@ -2725,18 +2756,8 @@ pub(crate) fn assess_canonical_checks(
         results.candidate_commit.as_deref() == Some(output.commit.as_str()),
         "canonical Tester result has a different or missing candidate binding"
     );
-    let (manifest_ref, manifest_bytes) =
-        bound_recovery_artifact(project_root, &format!("{area}/canonical-run.json"))?;
-    let manifest: crate::tester::CanonicalRunManifest = serde_json::from_slice(&manifest_bytes)?;
-    anyhow::ensure!(
-        manifest.schema_version == 1 && manifest.full_run,
-        "Tester manifest does not prove a complete canonical run"
-    );
     let workspace = candidate_workspace_path(project_root, output);
-    for (path, expected) in [
-        (".fluent/tester.yaml", &manifest.config_digest),
-        (".fluent/extract-tester-results", &manifest.extractor_digest),
-    ] {
+    let committed_bytes = |path: &str| -> Result<Vec<u8>> {
         let committed = std::process::Command::new("git")
             .current_dir(&workspace)
             .args(["show", &format!("{}:{path}", output.commit)])
@@ -2745,12 +2766,92 @@ pub(crate) fn assess_canonical_checks(
             committed.status.success(),
             "cannot read committed checker configuration: {path}"
         );
+        Ok(committed.stdout)
+    };
+    let config_bytes = committed_bytes(".fluent/tester.yaml")?;
+    let extractor_bytes = committed_bytes(".fluent/extract-tester-results")?;
+    let original_manifest_path = format!("{area}/canonical-run.json");
+    let mut reconstruction = None;
+    let (manifest_ref, manifest_bytes) = match fs::symlink_metadata(
+        project_root.join(&original_manifest_path),
+    ) {
+        Ok(_) => bound_recovery_artifact(project_root, &original_manifest_path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Support one older shape: an exact candidate-bound completed full
+            // Tester whose complete ordered commands prove default code checks.
+            let manifest = reconstruct_legacy_manifest(&config_bytes, &extractor_bytes, &results)?;
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+            let directory = work_model::work_artifact_path(
+                &attempt.work_item_id,
+                &attempt.id,
+                &format!("evidence-reconstructions/{}", tester.id),
+            );
+            let manifest_ref = work_model::BoundRecheckArtifact {
+                path: format!("{directory}/canonical-run.json"),
+                digest: format!("sha256:{:x}", Sha256::digest(&manifest_bytes)),
+            };
+            let audit_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1, "work_item_id": attempt.work_item_id, "attempt_id": attempt.id,
+                "candidate_commit": output.commit, "source_task_id": tester.id,
+                "source_task_kind": tester.kind, "source_task_role": tester.role,
+                "source_task_context": context, "source_results": results_ref,
+                "configuration": {"git_object":format!("{}:.fluent/tester.yaml", output.commit), "digest":manifest.config_digest},
+                "extractor": {"git_object":format!("{}:.fluent/extract-tester-results", output.commit), "digest":manifest.extractor_digest},
+                "derived_manifest": manifest_ref,
+                "basis": "Completed canonical Tester and exact ordered command coverage; default candidate-code applicability only"
+            }))?;
+            anyhow::ensure!(
+                audit_bytes.len() <= MAX_EVIDENCE_BYTES,
+                "legacy reconstruction audit exceeds its bound"
+            );
+            let audit = work_model::BoundRecheckArtifact {
+                path: format!("{directory}/audit.json"),
+                digest: format!("sha256:{:x}", Sha256::digest(&audit_bytes)),
+            };
+            for (artifact, expected) in [(&manifest_ref, &manifest_bytes), (&audit, &audit_bytes)] {
+                match fs::symlink_metadata(project_root.join(&artifact.path)) {
+                    Ok(_) => anyhow::ensure!(
+                        bound_recovery_artifact(project_root, &artifact.path)?.1 == *expected,
+                        "preserved legacy reconstruction bytes changed: {}",
+                        artifact.path
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            reconstruction = Some(CanonicalReconstruction {
+                manifest: manifest_ref.clone(),
+                manifest_bytes: manifest_bytes.clone(),
+                audit,
+                audit_bytes,
+            });
+            (manifest_ref, manifest_bytes)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let manifest: crate::tester::CanonicalRunManifest = serde_json::from_slice(&manifest_bytes)?;
+    anyhow::ensure!(
+        manifest.schema_version == 1 && manifest.full_run,
+        "Tester manifest does not prove a complete canonical run"
+    );
+    for (path, bytes, expected) in [
+        (
+            ".fluent/tester.yaml",
+            &config_bytes,
+            &manifest.config_digest,
+        ),
+        (
+            ".fluent/extract-tester-results",
+            &extractor_bytes,
+            &manifest.extractor_digest,
+        ),
+    ] {
         anyhow::ensure!(
-            &format!("sha256:{:x}", Sha256::digest(&committed.stdout)) == expected,
+            &format!("sha256:{:x}", Sha256::digest(bytes)) == expected,
             "canonical check configuration changed: {path}"
         );
         if path == ".fluent/tester.yaml" {
-            let config: crate::tester::TesterConfig = serde_yaml::from_slice(&committed.stdout)?;
+            let config: crate::tester::TesterConfig = serde_yaml::from_slice(bytes)?;
             anyhow::ensure!(
                 config.commands == manifest.commands,
                 "canonical manifest differs from configured commands"
@@ -2843,6 +2944,7 @@ pub(crate) fn assess_canonical_checks(
             command: definition.command.clone(),
             working_directory: ".".into(),
             source: work_model::RequiredCheckSource::CanonicalTester {
+                reconstruction: reconstruction.as_ref().map(|proof| proof.audit.clone()),
                 task_id: tester.id.clone(),
                 command_index: index,
                 results: results_ref.clone(),
@@ -2912,6 +3014,7 @@ pub(crate) fn assess_canonical_checks(
         checks.push(check);
     }
     Ok(CanonicalCheckAssessment {
+        reconstruction,
         diagnoses,
         results_path: project_root.join(results_ref.path),
         checks,
@@ -2978,10 +3081,32 @@ pub(crate) fn required_check_is_accepted(
         );
         let (_, binding) = bound_recovery_artifact(project_root, &target.prior_review_artifact)?;
         match &check.source {
-            work_model::RequiredCheckSource::CanonicalTester { .. } => anyhow::ensure!(
-                serde_json::from_slice::<work_model::RequiredCheck>(&binding)? == *check,
-                "required check snapshot changed"
-            ),
+            work_model::RequiredCheckSource::CanonicalTester {
+                results,
+                manifest,
+                logs,
+                reconstruction,
+                ..
+            } => {
+                anyhow::ensure!(
+                    serde_json::from_slice::<work_model::RequiredCheck>(&binding)? == *check,
+                    "required check snapshot changed"
+                );
+                for source in std::iter::once(results)
+                    .chain(std::iter::once(manifest))
+                    .chain(logs)
+                    .chain(reconstruction)
+                {
+                    anyhow::ensure!(
+                        bound_recovery_artifact(project_root, &source.path)?
+                            .0
+                            .digest
+                            == source.digest,
+                        "required source proof is missing or changed: {}",
+                        source.path
+                    );
+                }
+            }
             work_model::RequiredCheckSource::ReviewRequested { request, .. } => anyhow::ensure!(
                 request.path == target.prior_review_artifact
                     && request.digest == format!("sha256:{:x}", Sha256::digest(&binding)),
@@ -3189,4 +3314,43 @@ pub(crate) fn validate_required_check_binding(
         }
     }
     Ok(())
+}
+
+/// Reconstruct only inputs proved by the completed producer and committed code.
+fn reconstruct_legacy_manifest(
+    config_bytes: &[u8],
+    extractor_bytes: &[u8],
+    results: &crate::tester::TesterResults,
+) -> Result<crate::tester::CanonicalRunManifest> {
+    anyhow::ensure!(
+        config_bytes.len() <= MAX_EVIDENCE_BYTES && extractor_bytes.len() <= 4 * MAX_EVIDENCE_BYTES,
+        "legacy checker source exceeds the supported bound"
+    );
+    let config: crate::tester::TesterConfig = serde_yaml::from_slice(config_bytes)?;
+    anyhow::ensure!(
+        !config.commands.is_empty()
+            && config.commands.len() <= 1024
+            && config.commands.len() == results.commands.len(),
+        "legacy Tester lacks complete ordered command coverage"
+    );
+    for (definition, result) in config.commands.iter().zip(&results.commands) {
+        anyhow::ensure!(
+            definition.applicability.is_default(),
+            "legacy Tester lacks historical applicability proof; current environment facts or comparison refs cannot establish an older run's inputs"
+        );
+        anyhow::ensure!(
+            definition.command == result.command && definition.test_harness == result.test_harness,
+            "legacy Tester command or harness differs from its committed configuration"
+        );
+    }
+    Ok(crate::tester::CanonicalRunManifest {
+        schema_version: 1,
+        config_digest: format!("sha256:{:x}", Sha256::digest(config_bytes)),
+        extractor_digest: format!("sha256:{:x}", Sha256::digest(extractor_bytes)),
+        commands: config.commands,
+        full_run: true,
+        run_at: None,
+        environment: vec![],
+        applicability: vec![],
+    })
 }

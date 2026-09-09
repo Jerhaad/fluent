@@ -116,6 +116,15 @@ cause needs diagnosis before source correction. Text mentioning Docker or anothe
 dependency does not establish why execution failed. Other declared commands still
 finish, and their valid passing results remain available for recovery.
 
+A preserved pre-manifest canonical Tester can use the same attachment command
+when its completed Task, exact candidate, full ordered results, and committed
+checker files prove a default code check. Fluent saves a separate reconstruction
+audit during attachment and preserves all original bytes. An identical retry
+continues a partial publication without new review or operation identities.
+Missing historical environment, freshness, or comparison proof remains a blocker;
+current values cannot supply facts about a past run. Status never publishes a
+reconstruction or changes the saved evidence.
+
 ## Declare when a command result applies
 
 Keep applicability beside its command. A required host Plan row can add an

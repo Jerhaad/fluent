@@ -8016,6 +8016,8 @@ pub enum RequiredCheckSource {
         comparison_commit: Option<String>,
     },
     CanonicalTester {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reconstruction: Option<BoundRecheckArtifact>,
         task_id: String,
         command_index: usize,
         results: BoundRecheckArtifact,

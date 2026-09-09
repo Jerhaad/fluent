@@ -1152,6 +1152,20 @@ manifest before explaining an environment handoff. Unexplained nonzero exits
 pause for diagnosis; structured test failures and identified harness errors keep
 their existing correction routes. Log phrases alone grant no correction authority.
 
+The bounded legacy adapter supports a completed, exact-candidate canonical
+Tester without `canonical-run.json` when its ordered result commands account
+for the committed configuration and every command uses default candidate-code
+applicability. It does not infer historical environment observations, expiry,
+or mutable comparison refs. Read-only assessment derives that view in memory.
+Authorized attachment publishes a derived manifest and `audit.json` beneath
+`evidence-reconstructions/<tester-task>/`, then indexes their immutable references
+in the existing Attempt. The audit names the original result, Task context,
+candidate, and committed configuration and extractor digests. Original result,
+Review, matrix, and host-document bytes remain untouched. Publication retries
+reuse the same paths and require identical bytes, including a partial publication
+that stopped before review reservation. Acceptance checks the referenced proof
+as well as the passing targeted Review.
+
 Work and Attempt record schema 3 and transaction schema 2 fence executables
 that predate this authority. Current readers accept earlier supported records
 and schema-1 journals. The compatibility test invokes the pinned pre-change

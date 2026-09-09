@@ -621,6 +621,15 @@ eligible Attempt and exact candidate commit, THE SYSTEM SHALL retain immutable
 bytes, producer, check, result, timestamp, and digest.
 Test: tests/binary.rs (attempt_evidence_attach_preserves_exact_evidence_and_identity)
 
+WHEN preserved artifacts prove every required binding for a supported older
+result, THE SYSTEM SHALL apply the same validation and targeted review rules
+without requiring a rerun solely because its format is older. Authorized
+attachment may publish a deterministic reconstruction audit; observation SHALL
+leave the original documents, model, and artifact tree unchanged. Missing
+historical applicability facts SHALL remain explicit blockers.
+Test: tests/binary.rs (legacy_evidence_reuses_proven_bindings_without_host_rerun)
+Test: tests/binary.rs (legacy_evidence_requires_historical_comparison_proof)
+
 ### B2
 
 WHEN an operator attaches valid host evidence to an eligible Attempt, THE SYSTEM
