@@ -128,8 +128,15 @@ pub fn after_attempt_run(
         WorkAttemptRunOutcome::PlannedWriteRound { .. } => Some(
             "\n→ Next: a follow-up Writer round is ready; fluent attempt run <work-item-id> to continue the candidate".to_string(),
         ),
-        WorkAttemptRunOutcome::NeedsUser { .. } if ctx.evidence_action.is_some() => {
-            Some(format!("\n→ Next: {}", ctx.evidence_action.unwrap()))
+        WorkAttemptRunOutcome::NeedsUser { handoff_path } if ctx.evidence_action.is_some() => {
+            let action = ctx.evidence_action.unwrap();
+            // Legacy outcomes can name an evidence JSON file instead of a handoff.
+            // Keep the operator-facing handoff when a saved action takes priority.
+            if handoff_path.ends_with(".md") {
+                Some(format!("\n→ Next: read the handoff {handoff_path}, then {action}"))
+            } else {
+                Some(format!("\n→ Next: {action}"))
+            }
         }
         WorkAttemptRunOutcome::NeedsUser { handoff_path } => match ctx.pause_kind {
             Some(PauseKind::Auth) => Some(format!(
@@ -348,6 +355,23 @@ mod tests {
         assert!(hint.contains("handoff"));
         assert!(hint.contains("needs-user.md"));
         assert!(hint.contains("attempt run"));
+    }
+
+    #[test]
+    fn after_attempt_run_recorded_action_keeps_handoff() {
+        let handoff_path = ".fluent/work/artifacts/work-1/attempt-1/needs-user.md";
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: handoff_path.to_string(),
+        };
+        let action = "fluent queue resume work-1 --attempt attempt-1";
+        let ctx = AttemptRunContext {
+            pause_kind: Some(&PauseKind::Uncertain),
+            evidence_action: Some(action),
+            ..AttemptRunContext::default()
+        };
+        let hint = after_attempt_run(&outcome, "work-1", &ctx).unwrap();
+        assert!(hint.contains(handoff_path), "{hint}");
+        assert!(hint.contains(action), "{hint}");
     }
 
     #[test]

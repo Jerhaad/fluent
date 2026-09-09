@@ -34081,8 +34081,8 @@ fn needs_user_generic_output_names_handoff_file() {
         "generic needs-user next-action should name the handoff file; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("attempt run"),
-        "generic needs-user next-action should still name attempt run; got:\n{stderr}"
+        stderr.contains("fluent queue resume work-1 --attempt attempt-1"),
+        "generic needs-user next-action should name the current recovery action; got:\n{stderr}"
     );
 }
 
