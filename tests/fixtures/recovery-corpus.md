@@ -24,6 +24,26 @@ in `tests/binary.rs`: `legacy_ownership_*` drives preview and approval, and
 attachment, foreground resume, queue resume, and scheduler execution against
 isolated Git repositories with controlled external providers.
 
+`combined-evidence-recovery.json` preserves a sanitized historical shape: Plan
+proof and Review, a failed complete canonical run, a no-change Writer, and a
+later passing targeted Plan Review without a failed-command recheck. The binary
+fixture hydrates the historical Writer into an isolated candidate and uses real
+attachment, Tester and Review commands to bind machine-local identities. Once
+recovery starts, it changes no model or artifact bytes to remove blockers.
+`combined_evidence_recovery_resumes_to_ready_candidate_from_saved_history`
+asserts that the later Review cannot hide the original canonical run.
+
+`combined_evidence_recovery_resumes_to_ready_candidate` generates its Work Item,
+initial Writer, host attachment, canonical failure, reviewed correction and
+no-change Writer through public commands. Current behavior retains the accepted
+Plan proof, so it needs no redundant Plan attachment or second Plan Review.
+Both sequences finish through production targeted Review and Learning. The
+current sequence cancels after Review settlement, repeats queue resume, and
+uses isolated production dispatch to finish the same Attempt. Assertions retain
+candidate identity and exact result, matrix and Review bytes, and compare run
+markers to exclude repeated canonical commands. Provider doubles supply external
+coder output; they do not replace admission, acceptance or readiness decisions.
+
 Workflow cases document public reconciliation commands whose state lives outside
 an Attempt, such as an already-landed Merge Candidate. Their command and history
 are still checked for safe, machine-independent shape.

@@ -124,6 +124,31 @@
       "input-digest": "sha256:replay-writer-completion",
       "authorization": "Retry the Writer while preserving its incomplete result.",
       "preserved-history": ["incomplete-writer", "missing-no-change", "writer-retry"]
+    },
+    {
+      "id": "combined-plan-and-canonical-evidence",
+      "incident": "A no-change Writer and later passing Plan Review hid an unresolved canonical Tester command.",
+      "scope": "attempt",
+      "work-item-id": "replay-combined-evidence",
+      "attempt-id": "attempt-1",
+      "pause-kind": "host-evidence",
+      "operation-kind": "host-evidence-required-check-attachment",
+      "public-command": "fluent attempt evidence attach replay-combined-evidence attempt-1 --candidate 1313131313131313131313131313131313131313 --required-check tester:fixture:1 --evidence-file <path>",
+      "candidate-commit": "1313131313131313131313131313131313131313",
+      "stale-candidate-commit": "1414141414141414141414141414141414141414",
+      "task-id": "attempt-1-tester",
+      "evidence-digest": "sha256:replay-combined-evidence",
+      "input-digest": "sha256:replay-combined-check",
+      "authorization": "Attach the exact canonical command result for targeted Tests Review.",
+      "preserved-history": [
+        "accepted-plan-host-evidence",
+        "complete-canonical-run",
+        "no-change-writer",
+        "later-passing-plan-review",
+        "no-failed-command-recheck",
+        "interrupted-targeted-review",
+        "same-attempt-readiness"
+      ]
     }
   ]
 }

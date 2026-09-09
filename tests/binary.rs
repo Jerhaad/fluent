@@ -38285,24 +38285,15 @@ else
 fi
 "#,
     );
-    let scheduler = run_scheduler_until_dispatch_status(&project, &id, &bin, "candidate-ready");
-    fs::write(
-        log::test_log_dir_path().join("owned-host-scheduler.stdout.log"),
-        &scheduler.stdout,
-    )
-    .unwrap();
-    fs::write(
-        log::test_log_dir_path().join("owned-host-scheduler.stderr.log"),
-        &scheduler.stderr,
-    )
-    .unwrap();
+    let dispatch = fluent::scheduler::pick_next_queued(&project)
+        .unwrap()
+        .unwrap();
+    // This regression checks recovery and dispatch identity. Drive the public
+    // Attempt CLI explicitly without requiring nested Seatbelt installation.
+    fluent::scheduler::dispatch_one(&project, &dispatch, &EvidenceCliRunner { bin }).unwrap();
+    assert_eq!(latest_dispatch_status(&project, &id), "candidate-ready");
     let reviewed = work_item_value(&project, &id);
-    assert_eq!(
-        reviewed["attempts"][0]["tasks"][4]["status"],
-        "complete",
-        "scheduler: {}",
-        String::from_utf8_lossy(&scheduler.stderr)
-    );
+    assert_eq!(reviewed["attempts"][0]["tasks"][4]["status"], "complete");
     assert!(reviewed["attempts"][0]["tasks"].as_array().unwrap().len() > 5);
     assert_eq!(
         reviewed["attempts"][0]["tasks"]
@@ -41484,4 +41475,590 @@ fn canonical_attachment_resumes_settled_stop_and_rejects_live_owner() {
             .is_some()
     );
     assert_eq!(resumed.attempts[0].evidence_recoveries.len(), 1);
+}
+
+fn combined_evidence_provider(project: &Path, control: &Path) -> String {
+    let script = r####"#!/bin/bash
+python3 - "$@" <<'PY'
+import json, os, re, subprocess, sys
+from pathlib import Path
+if '-p' not in sys.argv: sys.exit(0)
+prompt = sys.argv[sys.argv.index('-p') + 1]
+project = Path(__PROJECT__)
+control = Path(__CONTROL__)
+area = project / '.fluent/work/artifacts/combined-current/attempt-1'
+if 'You are the Learner' in prompt:
+    path = re.search(r'/[^\s`]+follow-up-draft.json', prompt).group(0)
+    Path(path).write_text(json.dumps({'schema_version':1,'observations':[],'work_items':[]}))
+elif Path.cwd().name.startswith('work-'):
+    matrices = list(area.glob('attempt-1-write-*/writer-completion.json'))
+    path = max(matrices, key=lambda p: int(p.parent.name.rsplit('-',1)[1]))
+    matrix = json.loads(path.read_text())
+    Path('README.md').read_text()
+    subprocess.run(['true'], check=True)
+    for row in matrix['rows']:
+        if row.get('responsibility') in (None, 'writer') or row['kind'] == 'review-finding':
+            row.update(state='complete', **{'implementation-evidence':['README.md: inspected unchanged candidate'],
+                'verification':[{'command':'true','result':'pass'}]})
+            if row['kind'] == 'review-finding': row['applicable-constraints'] = ['plan:step-1']
+    path.write_text(json.dumps(matrix))
+    if path.parent.name.endswith('-1'):
+        Path('README.md').write_text('Verified candidate source\n')
+        subprocess.run(['git','add','README.md'], check=True)
+        subprocess.run(['git','commit','-m','Update candidate source','-m','- Keep the source verifiable'], check=True, stdout=subprocess.DEVNULL)
+    else:
+        (path.parent / 'no-change.json').write_text(json.dumps({'schema_version':1,
+            'reason':'Inspection confirms the source already meets the requested behavior.',
+            'verification':[{'command':'true','result':'pass'}]}))
+else:
+    if control.exists() and control.read_text() == 'request-correction':
+        Path('review.md').write_text('Verdict: fail\nDisposition: code-change\n\n## Findings\n\n### Inspect source assertion\n\nThe host failure warrants inspecting the unchanged source assertion.\n')
+        control.write_text('pass')
+    else:
+        Path('review.md').write_text('Verdict: pass\n\n## Findings\n\nThe exact attached check and candidate are verified.\n')
+PY
+"####;
+    script
+        .replace(
+            "__PROJECT__",
+            &serde_json::to_string(project.to_str().unwrap()).unwrap(),
+        )
+        .replace(
+            "__CONTROL__",
+            &serde_json::to_string(control.to_str().unwrap()).unwrap(),
+        )
+}
+
+#[test]
+fn combined_evidence_recovery_resumes_to_ready_candidate() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let work = "combined-current";
+    let project = setup_git_project(&tmp);
+    // The marker lives in ignored runtime state, so it records executions
+    // without changing candidate cleanliness or depending on an external host.
+    let commands = [
+        "mkdir -p .fluent/check-count; printf x >> .fluent/check-count/passing",
+        "false",
+    ];
+    fs::write(project.join(".fluent/tester.yaml"), serde_json::to_vec(&serde_json::json!({"commands":commands.iter().map(|command|serde_json::json!({"command":command,"test_harness":"shell-harness"})).collect::<Vec<_>>()})).unwrap()).unwrap();
+    git::run(
+        &project,
+        &["add", ".fluent/tester.yaml"],
+        "stage combined commands",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add combined checks"],
+        "commit combined checks",
+    )
+    .unwrap();
+    let plan = tmp.path().join("plan.md");
+    fs::write(&plan, "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Inspect source. | | `true` | writer | Yes |\n| 2 | Verify host code. | | `bash tests/host.sh` | host | Yes |\n").unwrap();
+    let bin = tmp.path().join("bin");
+    let control = tmp.path().join("review-control");
+    write_mock_claude(&bin, &combined_evidence_provider(&project, &control));
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "work-item",
+            "create",
+            work,
+            "--title",
+            "Recover combined evidence",
+            "--plan-file",
+            plan.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "create", work, "attempt-1"])
+        .assert()
+        .success();
+    let run = || {
+        let mut command = fluent_cmd();
+        command
+            .current_dir(&project)
+            .env("PATH", mock_path(&bin))
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"]);
+        command
+    };
+    run()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let store = WorkModelStore::new(&project);
+    let initial = store.read_work_item(work).unwrap();
+    let candidate = initial.attempts[0].tasks[0]
+        .output
+        .as_ref()
+        .unwrap()
+        .commit
+        .clone();
+    let workspace = project.join(
+        &initial.attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .workspace_path,
+    );
+    let source_matrix = project
+        .join(
+            &initial.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    let original_matrix = fs::read(&source_matrix).unwrap();
+    let host_doc = |name: &str, result: &str| {
+        let path = tmp.path().join(name);
+        fs::write(&path,serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":result,"run_at":"2026-09-09T12:00:00Z","output":name})).unwrap()).unwrap();
+        path
+    };
+    let attach_plan = |evidence: &Path| {
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--plan-row",
+                "plan:step-2",
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    };
+    let original_host = host_doc("first-host-pass.json", "pass");
+    attach_plan(&original_host);
+    run()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let failed = store.read_work_item(work).unwrap();
+    assert_eq!(
+        failed.attempts[0].evidence_recoveries[0].state,
+        EvidenceRecoveryState::Complete
+    );
+    let tester = failed.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.kind == TaskKind::Tester)
+        .unwrap();
+    let results = project
+        .join(&tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    let results_bytes = fs::read(&results).unwrap();
+    let passing_runs = fs::read(workspace.join(".fluent/check-count/passing")).unwrap();
+    assert!(!passing_runs.is_empty());
+    // A failed canonical host result receives an explicit code-change Review.
+    // The provider inspects it and produces a real no-change declaration. The
+    // already accepted Plan proof must survive this public Writer transition.
+    fs::write(&control, "request-correction").unwrap();
+    let failed_host = tmp.path().join("canonical-host-fail.json");
+    fs::write(&failed_host, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"isolated host","check":"false","working_directory":".","result":"fail","run_at":"2026-09-09T12:00:00Z","output":"assertion failed; review requested source inspection"})).unwrap()).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &failed_host)
+        .assert()
+        .success();
+    run()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--required-check"));
+    let unchanged = store.read_work_item(work).unwrap();
+    let writers = unchanged.attempts[0]
+        .tasks
+        .iter()
+        .filter(|task| task.kind == TaskKind::Write)
+        .collect::<Vec<_>>();
+    assert_eq!(writers.len(), 2);
+    assert!(writers[1].output.as_ref().unwrap().no_change.is_some());
+    assert_eq!(writers[1].output.as_ref().unwrap().commit, candidate);
+    assert!(
+        unchanged.attempts[0]
+            .tasks
+            .iter()
+            .all(|task| !task.is_failed_command_recheck())
+    );
+    assert_eq!(
+        unchanged.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1
+    );
+    assert_eq!(
+        unchanged.attempts[0].evidence_recoveries[0],
+        failed.attempts[0].evidence_recoveries[0]
+    );
+    let prior = store.read_work_item(work).unwrap();
+    let host_recovery = &prior.attempts[0].evidence_recoveries[0];
+    assert_eq!(host_recovery.state, EvidenceRecoveryState::Complete);
+    let plan_review = prior.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| Some(&task.id) == host_recovery.targets[0].review_task_id.as_ref())
+        .unwrap();
+    let review_path = project
+        .join(&plan_review.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    let review_bytes = fs::read(&review_path).unwrap();
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    let attached = store.read_work_item(work).unwrap();
+    let recovery = attached.attempts[0].evidence_recoveries.last().unwrap();
+    let target = recovery.targets[0].review_task_id.as_ref().unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", work, "attempt-1"])
+        .assert()
+        .success();
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", work, "--attempt", "attempt-1"])
+            .assert()
+            .success();
+    }
+    let dispatch = fluent::scheduler::pick_next_queued(&project)
+        .unwrap()
+        .unwrap();
+    fluent::scheduler::dispatch_one(&project, &dispatch, &EvidenceCliRunner { bin }).unwrap();
+    let final_item = store.read_work_item(work).unwrap();
+    let attempt = &final_item.attempts[0];
+    assert!(final_item.merge_candidates[0].ready_at.is_some());
+    assert_eq!(final_item.merge_candidates[0].candidate_commit, candidate);
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(attempt.evidence_recoveries.last().unwrap().id, recovery.id);
+    assert_eq!(fs::read(&results).unwrap(), results_bytes);
+    assert_eq!(fs::read(&review_path).unwrap(), review_bytes);
+    assert_eq!(fs::read(&source_matrix).unwrap(), original_matrix);
+    assert_eq!(
+        fs::read(workspace.join(".fluent/check-count/passing")).unwrap(),
+        passing_runs
+    );
+    for task in &attempt.tasks {
+        assert!(!fluent::lease::is_leased(&fluent::lease::task_lock_path(
+            &project, work, &task.id
+        )));
+        assert!(
+            !fluent::execution::execution_is_live(&fluent::execution::record_path_for_artifact(
+                &project,
+                &task.artifact_area.as_ref().unwrap().path
+            ))
+            .unwrap()
+        );
+    }
+}
+
+#[test]
+fn combined_evidence_recovery_resumes_to_ready_candidate_from_saved_history() {
+    use fluent::work_model::*;
+    let saved: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/combined-evidence-recovery.json")).unwrap();
+    assert_eq!(saved["schema-version"], 1);
+    let tmp = TempDir::new().unwrap();
+    let work = saved["work-item-id"].as_str().unwrap();
+    let (project, _, _) = setup_ownership_fixture(&tmp, work, true);
+    fs::write(project.join(".fluent/tester.yaml"),serde_json::to_vec(&serde_json::json!({"commands":saved["commands"].as_array().unwrap().iter().map(|command|serde_json::json!({"command":command,"test_harness":"shell-harness"})).collect::<Vec<_>>()})).unwrap()).unwrap();
+    git::run(
+        &project,
+        &["add", ".fluent/tester.yaml"],
+        "stage saved checks",
+    )
+    .unwrap();
+    git::run(
+        &project,
+        &["commit", "-m", "Add saved check configuration"],
+        "commit saved checks",
+    )
+    .unwrap();
+    let candidate = git_head(&project);
+    let store = WorkModelStore::new(&project);
+    store
+        .mutate_work_item(work, |item| {
+            item.attempts[0].tasks[0].output.as_mut().unwrap().commit = candidate.clone();
+            Ok(())
+        })
+        .unwrap();
+    let writer = store.read_work_item(work).unwrap().attempts[0].tasks[0].clone();
+    fs::write(
+        project
+            .join(&writer.artifact_area.as_ref().unwrap().path)
+            .join("transcript.jsonl"),
+        "{}\n",
+    )
+    .unwrap();
+    let managed = bind_candidate_to_managed_sibling(&project, work, &candidate);
+    let bin = tmp.path().join("bin");
+    let provider = learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#)
+        .replace(
+            "printf 'Verdict: pass\\n\\nLoop review.\\n' > review.md",
+            &format!(
+                "cat > review.md <<'SAVED_REVIEW'\n{}SAVED_REVIEW",
+                saved["later-plan-review"].as_str().unwrap()
+            ),
+        );
+    write_mock_claude(&bin, &provider);
+    let evidence = tmp.path().join("saved-host.json");
+    fs::write(
+        &evidence,
+        serde_json::to_vec(&saved["host-evidence"]).unwrap(),
+    )
+    .unwrap();
+    let attach_plan = || {
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--plan-row",
+                saved["plan-row"].as_str().unwrap(),
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+    };
+    attach_plan();
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let mut history = store.read_work_item(work).unwrap();
+    assert_eq!(
+        history.attempts[0].evidence_recoveries[0].state,
+        EvidenceRecoveryState::Complete
+    );
+    let source_tester = history.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.kind == TaskKind::Tester)
+        .unwrap();
+    let results = project
+        .join(&source_tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    let original_results = fs::read(&results).unwrap();
+    let original_source = project
+        .join(
+            &history.attempts[0].tasks[0]
+                .artifact_area
+                .as_ref()
+                .unwrap()
+                .path,
+        )
+        .join("writer-completion.json");
+    let original_matrix = fs::read(&original_source).unwrap();
+    // Hydrate only the saved historical Writer. Candidate, source results,
+    // evidence bindings and targeted Review artifacts stay production outputs.
+    let mut writer = history.attempts[0].tasks[0].clone();
+    writer.id = saved["no-change-writer"]["id"].as_str().unwrap().into();
+    writer.artifact_area.as_mut().unwrap().path = work_artifact_path(work, "attempt-1", &writer.id);
+    let area = project.join(&writer.artifact_area.as_ref().unwrap().path);
+    fs::create_dir_all(&area).unwrap();
+    let declaration_path = format!(
+        "{}/no-change.json",
+        writer.artifact_area.as_ref().unwrap().path
+    );
+    fs::write(
+        project.join(&declaration_path),
+        serde_json::to_vec(&saved["no-change-writer"]["declaration"]).unwrap(),
+    )
+    .unwrap();
+    writer.output.as_mut().unwrap().base_commit = Some(candidate.clone());
+    writer.output.as_mut().unwrap().no_change = Some(NoChangeOutput {
+        schema_version: 1,
+        declaration_path,
+        reason: saved["no-change-writer"]["declaration"]["reason"]
+            .as_str()
+            .unwrap()
+            .into(),
+        verification: vec![NoChangeVerification {
+            command: "true".into(),
+            result: NoChangeVerificationResult::Pass,
+        }],
+    });
+    let mut matrix: WriterCompletionMatrix = serde_json::from_slice(&original_matrix).unwrap();
+    matrix.task_id = writer.id.clone();
+    fs::write(
+        area.join("writer-completion.json"),
+        serde_json::to_vec(&matrix).unwrap(),
+    )
+    .unwrap();
+    fs::write(area.join("transcript.jsonl"), "{}\n").unwrap();
+    history.attempts[0].tasks.push(writer);
+    history.attempts[0].status = AttemptStatus::NeedsUser;
+    history.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
+    history.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+    store.write_work_item(&history).unwrap();
+    // Older histories reattached the same Plan proof after a no-change Writer.
+    attach_plan();
+    let attached = store.read_work_item(work).unwrap();
+    let target = attached.attempts[0]
+        .evidence_recoveries
+        .last()
+        .unwrap()
+        .targets[0]
+        .review_task_id
+        .as_ref()
+        .unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+        .assert()
+        .success();
+    let saved_state = store.read_work_item(work).unwrap();
+    let task = saved_state.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| &task.id == target)
+        .unwrap();
+    let review_path = project
+        .join(&task.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    let original_review = fs::read(&review_path).unwrap();
+    assert_eq!(
+        original_review,
+        saved["later-plan-review"].as_str().unwrap().as_bytes()
+    );
+    let passing_runs = fs::read(managed.workspace.join(".fluent/check-count/passing")).unwrap();
+    assert!(
+        saved_state.attempts[0]
+            .tasks
+            .iter()
+            .all(|task| !task.is_failed_command_recheck())
+    );
+    // Recovery begins here. No subsequent model or artifact edits repair it.
+    let resume = fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&resume.stdout).contains("is ready"));
+    let blocked = store.read_work_item(work).unwrap();
+    assert!(blocked.merge_candidates.is_empty());
+    assert_eq!(
+        blocked.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1,
+        "a later Review must not hide the original canonical run"
+    );
+    assert_eq!(
+        fs::read(managed.workspace.join(".fluent/check-count/passing")).unwrap(),
+        passing_runs
+    );
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    let recovering = store.read_work_item(work).unwrap();
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    assert_eq!(store.read_work_item(work).unwrap(), recovering);
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready"));
+    let final_item = store.read_work_item(work).unwrap();
+    assert_eq!(final_item.merge_candidates[0].candidate_commit, candidate);
+    assert!(final_item.merge_candidates[0].ready_at.is_some());
+    assert_eq!(
+        final_item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(results).unwrap(), original_results);
+    assert_eq!(fs::read(review_path).unwrap(), original_review);
+    assert_eq!(fs::read(original_source).unwrap(), original_matrix);
+    assert_eq!(
+        fs::read(managed.workspace.join(".fluent/check-count/passing")).unwrap(),
+        passing_runs
+    );
+}
+
+#[test]
+fn evidence_recovery_receipt_cannot_clear_intervening_stop() {
+    let tmp = TempDir::new().unwrap();
+    let work = "stopped-receipt";
+    let (project, area, candidate) = scheduled_verification_fixture(&tmp, work, "true");
+    let original = fs::read(area.join("receipt.json")).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", work, "attempt-1"])
+        .assert()
+        .success();
+    let store = WorkModelStore::new(&project);
+    let stopped = store.read_work_item(work).unwrap();
+    for _ in 0..2 {
+        let error = accept_focused_verification(&project, work).unwrap_err();
+        assert!(format!("{error:#}").contains("cancel"));
+        assert_eq!(store.read_work_item(work).unwrap(), stopped);
+    }
+    assert!(stopped.attempts[0].evidence_recoveries.is_empty());
+    assert_eq!(fs::read(area.join("receipt.json")).unwrap(), original);
+    assert_eq!(git_head(&project), candidate);
+    assert!(!fluent::lease::is_leased(&fluent::lease::task_lock_path(
+        &project,
+        work,
+        "attempt-1-verification-1"
+    )));
+    assert!(
+        !fluent::execution::execution_is_live(&fluent::execution::record_path_for_artifact(
+            &project,
+            area.strip_prefix(&project).unwrap().to_str().unwrap()
+        ))
+        .unwrap()
+    );
 }

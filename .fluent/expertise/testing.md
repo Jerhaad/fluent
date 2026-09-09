@@ -66,6 +66,8 @@ real profile-enforcement tests on the explicit host probe.
 
 ## Patterns
 
+- [dispatch-recovery-through-public-cli](testing/patterns/dispatch-recovery-through-public-cli.md) — read when queue recovery must use real claim and Attempt execution without requiring nested Seatbelt.
+
 - [pinned-older-reader](testing/patterns/pinned-older-reader.md) — read when a schema change requires proof that an older executable refuses mutation.
 - [flock-lease-tests-under-libtest](testing/patterns/flock-lease-tests-under-libtest.md) — read when writing unit tests for `lease`-based singletons that must also pass under `cargo test` (libtest threads), not just nextest.
 - [unique-ids-for-attempt-worktrees](testing/patterns/unique-ids-for-attempt-worktrees.md) — read when a binary test drives a real Attempt or `fluent scheduler run`, so its sibling worktrees in the shared temp root do not collide across runs.

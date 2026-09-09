@@ -955,7 +955,8 @@ Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and
 Test: src/host_evidence.rs (plan_row_host_evidence_rejects_wrong_command_without_mutation)
 
 A later no-change Writer or unrelated Task SHALL NOT invalidate accepted proof
-when the candidate and all check bindings still match. Original Writer, matrix,
+when the candidate and all check bindings still match and no newer conflicting
+result remains unresolved. Original Writer, matrix,
 result, and targeted Review identities remain provenance. Candidate-code checks
 SHALL NOT expire solely because of age; live-state checks require an explicit
 valid expiry and become inapplicable at that boundary.
@@ -9982,6 +9983,13 @@ Test: tests/binary.rs (interrupted_plan_host_evidence_rejects_changed_repair_pro
 Unrelated interrupted Writers retain ordinary foreground and queued retry rules.
 Test: tests/binary.rs (interrupted_owned_plan_writers_keep_ordinary_resume)
 
+WHEN valid Plan host proof, a complete canonical run, a no-change Writer and
+later targeted Review remain bound to the same candidate, THE SYSTEM SHALL
+resume only outstanding requirements in the same Attempt. A later Review SHALL
+NOT hide an unresolved canonical command or trigger a duplicate complete run.
+Test: tests/binary.rs (combined_evidence_recovery_resumes_to_ready_candidate)
+Test: tests/binary.rs (combined_evidence_recovery_resumes_to_ready_candidate_from_saved_history)
+
 ### B3
 
 WHEN identical attachment or resume commands repeat while recovery remains
@@ -9994,6 +10002,7 @@ evidence publication or targeted Review settlement. Repeated active queue resume
 SHALL retain the dispatch; a later stop requires fresh explicit authorization.
 Test: tests/binary.rs (evidence_recovery_retries_preserve_task_and_dispatch_identity)
 Test: tests/binary.rs (canonical_attachment_resumes_settled_stop_and_rejects_live_owner)
+Test: tests/binary.rs (evidence_recovery_receipt_cannot_clear_intervening_stop)
 
 ## Rebased landing verification
 

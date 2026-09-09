@@ -1152,6 +1152,13 @@ manifest before explaining an environment handoff. Unexplained nonzero exits
 pause for diagnosis; structured test failures and identified harness errors keep
 their existing correction routes. Log phrases alone grant no correction authority.
 
+Plan evidence retains its original Writer and matrix as provenance. Its newest
+admitted result governs the row: unresolved or malformed later proof cannot
+revive an older pass. During combined recovery, the loop validates the existing
+complete canonical run against the unchanged candidate and committed checker
+inputs before considering a new Tester. This includes a Plan Review that settled
+after a historical no-change Writer.
+
 Required-check admission and status use `recovery_contracts` to revalidate the
 same source digests, candidate, policy and targeted Review bindings. Foreground
 resume, queue admission, scheduler claim and direct Review Task launch each use
@@ -1180,7 +1187,8 @@ as well as the passing targeted Review.
 Work and Attempt record schema 3 and transaction schema 2 fence executables
 that predate this authority. Current readers accept earlier supported records
 and schema-1 journals. The compatibility test invokes the pinned pre-change
-executable against both published and pending state and checks exact bytes. The pinned-reader
+executable against both published and pending state and checks exact bytes. The
+pinned-reader
 regression preserves required-check policy, source and reconstruction references,
 and accepted Review digests through public current writes. It makes a Task
 record directory unwritable to interrupt a real public mutation after journal

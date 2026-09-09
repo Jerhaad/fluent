@@ -1199,6 +1199,45 @@ fn plan_command_binding_matches(
     resolved.command == command && source.is_none_or(|source| source == resolved.source)
 }
 
+/// Select the newest admitted result for each Plan obligation, including
+/// unresolved failures. A malformed indexed binding cannot revive older proof.
+fn latest_plan_host_binding_paths(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    candidate: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut latest = std::collections::BTreeMap::new();
+    for recovery in &attempt.evidence_recoveries {
+        if recovery.candidate_commit != candidate {
+            continue;
+        }
+        for target in &recovery.targets {
+            if !attempt.artifacts.iter().any(|artifact| {
+                artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
+                    && artifact.path == target.prior_review_artifact
+                    && artifact.path.ends_with("/binding.json")
+            }) {
+                continue;
+            }
+            let (_, bytes) = crate::recovery_contracts::bound_recovery_artifact(
+                project_root,
+                &target.prior_review_artifact,
+            )
+            .ok()?;
+            let binding: PlanHostEvidenceBinding = serde_json::from_slice(&bytes).ok()?;
+            if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
+                || binding.work_item_id != attempt.work_item_id
+                || binding.attempt_id != attempt.id
+                || binding.candidate_commit != candidate
+            {
+                return None;
+            }
+            latest.insert(binding.plan_row, target.prior_review_artifact.clone());
+        }
+    }
+    Some(latest)
+}
+
 /// Return a host-materialized completion matrix only after the evidence review
 /// that accepted it has passed. Before that review, the artifact remains an
 /// input to the reviewer but cannot satisfy the Writer completion gate.
@@ -1221,6 +1260,8 @@ pub(crate) fn completed_plan_host_matrix_ref(
     {
         return None;
     }
+    let latest =
+        latest_plan_host_binding_paths(project_root, attempt, &writer.output.as_ref()?.commit)?;
     attempt.artifacts.iter().rev().find_map(|artifact| {
         if artifact.producer_id != PLAN_HOST_EVIDENCE_PRODUCER
             || !artifact.path.ends_with("/writer-completion.json")
@@ -1230,7 +1271,8 @@ pub(crate) fn completed_plan_host_matrix_ref(
         let binding_path = Path::new(&artifact.path).parent()?.join("binding.json");
         let binding_bytes = fs::read(project_root.join(&binding_path)).ok()?;
         let binding: PlanHostEvidenceBinding = serde_json::from_slice(&binding_bytes).ok()?;
-        if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
+        if latest.get(&binding.plan_row).map(String::as_str) != binding_path.to_str()
+            || binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
             || binding.work_item_id != attempt.work_item_id
             || binding.attempt_id != attempt.id
             || binding.writer_task_id != writer.id
@@ -1344,6 +1386,9 @@ pub(crate) fn apply_completed_plan_host_evidence(
     if writer_completion_matrix_ref(project_root, attempt, writer).as_ref() != Some(source_matrix) {
         return false;
     }
+    let Some(latest) = latest_plan_host_binding_paths(project_root, attempt, &output.commit) else {
+        return false;
+    };
     let mut changed = false;
     for artifact in attempt.artifacts.iter().filter(|artifact| {
         artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
@@ -1355,7 +1400,8 @@ pub(crate) fn apply_completed_plan_host_evidence(
         let Ok(binding) = serde_json::from_slice::<PlanHostEvidenceBinding>(&binding_bytes) else {
             continue;
         };
-        if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
+        if latest.get(&binding.plan_row) != Some(&artifact.path)
+            || binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
             || binding.work_item_id != attempt.work_item_id
             || binding.attempt_id != attempt.id
             || binding.candidate_commit != output.commit
@@ -4647,6 +4693,63 @@ mod tests {
             fs::read(project.path().join(&source.path)).unwrap(),
             source_bytes
         );
+
+        // A newer result for this same obligation conflicts with the old pass.
+        // Preserve both artifacts, but do not silently credit the older result.
+        let original_binding_path = &recovery.targets[0].prior_review_artifact;
+        let mut conflict: PlanHostEvidenceBinding =
+            serde_json::from_slice(&fs::read(project.path().join(original_binding_path)).unwrap())
+                .unwrap();
+        conflict.result = EvidenceResult::Fail;
+        let mut failed_document =
+            parse_evidence_document(&fs::read(&evidence_path).unwrap()).unwrap();
+        failed_document.result = EvidenceResult::Fail;
+        let failed_bytes = serde_json::to_vec(&failed_document).unwrap();
+        let failed_digest = format!("sha256:{:x}", Sha256::digest(&failed_bytes));
+        let failed_path = snapshot_path("work-1", "attempt-1", &failed_digest).unwrap();
+        publish_snapshot(project.path(), &failed_path, &failed_bytes).unwrap();
+        conflict.evidence = BoundRecheckArtifact {
+            path: failed_path.clone(),
+            digest: failed_digest.clone(),
+        };
+        let conflict_path = work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "plan-host-evidence/conflicting/binding.json",
+        );
+        fs::create_dir_all(project.path().join(&conflict_path).parent().unwrap()).unwrap();
+        fs::write(
+            project.path().join(&conflict_path),
+            serde_json::to_vec(&conflict).unwrap(),
+        )
+        .unwrap();
+        later_history.artifacts.push(ArtifactRef {
+            producer_id: PLAN_HOST_EVIDENCE_PRODUCER.into(),
+            path: conflict_path.clone(),
+        });
+        let mut conflicting_recovery = recovery.clone();
+        conflicting_recovery.id = "host-evidence-conflict".into();
+        conflicting_recovery.attachment = EvidenceAttachment {
+            snapshot_path: failed_path,
+            digest: failed_digest,
+        };
+        conflicting_recovery.targets[0].prior_review_artifact = conflict_path;
+        conflicting_recovery.targets[0].review_task_id = None;
+        conflicting_recovery.state = EvidenceRecoveryState::NeedsEvidence;
+        later_history.evidence_recoveries.push(conflicting_recovery);
+        let mut pending: WriterCompletionMatrix =
+            serde_json::from_slice(&fs::read(&later_path).unwrap()).unwrap();
+        assert!(
+            !apply_completed_plan_host_evidence(
+                project.path(),
+                &later_history,
+                &later_writer,
+                &later_source,
+                &mut pending
+            ),
+            "an unresolved newer result must prevent reuse of an older pass"
+        );
+        assert!(completed_plan_host_matrix_ref(project.path(), &later_history, writer).is_none());
 
         assert_eq!(
             fs::read(project.path().join(&source.path)).unwrap(),

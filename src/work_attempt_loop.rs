@@ -6187,10 +6187,13 @@ fn tester_errored(tester_results_path: &Path) -> bool {
 }
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    if attempt
+    if (attempt
         .evidence_recoveries
         .iter()
         .any(|recovery| recovery.required_check.as_ref().is_some())
+        || attempt.artifacts.iter().any(|artifact| {
+            artifact.producer_id == "plan-host-evidence" && artifact.path.ends_with("/binding.json")
+        }))
         && let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
     {
         return Some(view.results_path);
@@ -9152,6 +9155,17 @@ fn interpret_reviews(
         })
         .then_some(())
         .or((canonical_has_policy || needs_diagnosis).then_some(()))
+        .or_else(|| {
+            (assessed_checks.is_ok()
+                && item.attempts[attempt_index]
+                    .artifacts
+                    .iter()
+                    .any(|artifact| {
+                        artifact.producer_id == "plan-host-evidence"
+                            && artifact.path.ends_with("/binding.json")
+                    }))
+            .then_some(())
+        })
         .map(|_| assessed_checks);
     if tester_gate_applicable
         && canonical_assessment.as_ref().is_some_and(|assessment| {
