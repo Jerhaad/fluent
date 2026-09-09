@@ -1992,35 +1992,40 @@ pub(crate) fn attach_with_cancellation_policy(
             }) {
                 // Replay the same typed attachment without treating its preserved
                 // evidence Reviews as a newer ordinary request.
-                crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
-                    .and_then(|_| {
-                        crate::recovery_contracts::validate_pending_evidence_owners(
-                            project_root,
-                            attempt,
-                            prior,
-                        )
-                    })
-                    .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                crate::recovery_contracts::validate_owned_plan_evidence_review(
+                    project_root,
+                    attempt,
+                )
+                .and_then(|_| {
+                    crate::recovery_contracts::validate_pending_evidence_owners(
+                        project_root,
+                        attempt,
+                        prior,
+                    )
+                })
+                .map_err(|error| {
+                    WorkModelError::HostEvidenceRecoveryIneligible {
                         attempt_id: attempt_id.into(),
                         reason: format!("{error:#}"),
-                    })?;
+                    }
+                })?;
                 return Ok(prior.clone());
             }
         }
-        let expired = if operator_recovery && recheck_artifact.is_none() && review_artifacts.len() == 1
-        {
-            retire_expired_pending_evidence(
-                project_root,
-                attempt,
-                candidate_commit,
-                &crate::recovery_contracts::EvidenceSelector::ReviewArtifact(
-                    review_artifacts[0].clone(),
-                ),
-                &document,
-            )?
-        } else {
-            None
-        };
+        let expired =
+            if operator_recovery && recheck_artifact.is_none() && review_artifacts.len() == 1 {
+                retire_expired_pending_evidence(
+                    project_root,
+                    attempt,
+                    candidate_commit,
+                    &crate::recovery_contracts::EvidenceSelector::ReviewArtifact(
+                        review_artifacts[0].clone(),
+                    ),
+                    &document,
+                )?
+            } else {
+                None
+            };
         let existing = item
             .attempts
             .iter()

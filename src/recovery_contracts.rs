@@ -2683,7 +2683,9 @@ mod tests {
             settled_at: None,
             resumed_at: None,
         });
-        assert!(super::validate_pending_evidence_owners(project.path(), &attempt, &recovery).is_err());
+        assert!(
+            super::validate_pending_evidence_owners(project.path(), &attempt, &recovery).is_err()
+        );
         attempt.cancellation.as_mut().unwrap().settled_at = Some(now_iso8601());
         super::validate_pending_evidence_owners(project.path(), &attempt, &recovery).unwrap();
         assert!(
