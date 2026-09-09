@@ -431,7 +431,7 @@ Test: src/candidate_gate.rs (missing_test_reference_reports_failed_tester_comman
 IF final Tester evidence returns to a corrective Writer, THEN THE SYSTEM SHALL
 grant read-only access to the exact gate, structured Tester result, and failed
 command logs while leaving sibling Tester artifacts inaccessible.
-Test: src/work_attempt_loop.rs (failed_final_tester_logs_are_exact_writer_correction_inputs)
+Test: src/work_attempt_loop.rs (unclassified_final_tester_logs_remain_diagnosis_inputs)
 Test: src/work_attempt_loop.rs (final_tester_correction_rejects_noncanonical_log_path)
 Test: src/work_task_executor.rs (writer_launch_names_and_confines_preserved_work_item_input)
 
@@ -462,18 +462,20 @@ Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
 
 ### B5
 
-IF a failed-command recheck reports another command, structured-test, or process
-settlement failure, THEN THE SYSTEM SHALL return its durable result and relevant
-command logs directly to a corrective Writer or the existing round-cap pause.
-Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
-Test: src/work_attempt_loop.rs (failed_recheck_is_a_round_cap_extension_frontier)
+WHEN a required command or failed-command recheck fails, THE SYSTEM SHALL keep
+its result separate from its diagnosed cause. A verified prerequisite that
+prevented execution SHALL produce an environment-recovery handoff. An unexplained
+failure SHALL pause for diagnosis without scheduling a source correction.
+Established code and harness defects SHALL retain their correction workflows.
+Test: tests/binary.rs (ambiguous_check_failure_pauses_without_source_correction)
+Test: tests/binary.rs (unavailable_check_environment_does_not_schedule_writer)
 Test: src/work_attempt_loop.rs (structured_failure_in_recheck_returns_to_writer)
 
 ### B6
 
 IF a failed-command recheck fails, THEN THE SYSTEM SHALL NOT launch a
 Reviewer or any unselected Tester command.
-Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
+Test: src/work_attempt_loop.rs (repeated_unclassified_command_pauses_without_writer)
 Test: src/work_task_executor.rs (failed_command_recheck_executes_only_the_bound_subset)
 
 This does not prohibit a separately authorized evidence-targeted Tests Review
@@ -499,11 +501,11 @@ Test: tests/binary.rs (canonical_tester_recovery_reuses_other_passing_results)
 
 ### B9
 
-IF a configured final Tester command fails, THEN THE SYSTEM SHALL present each
-failed command as a current correction finding with its exit code and durable
-stdout and stderr log paths.
+IF a configured final Tester command fails, THEN THE SYSTEM SHALL retain its
+exit code and durable stdout and stderr logs. Verified unmet prerequisites and
+ambiguous failures SHALL remain unresolved checks, not established source defects.
 Test: src/work_task_executor.rs (execution_context_surfaces_each_failed_tester_command)
-Test: src/work_attempt_loop.rs (failed_configured_tester_command_returns_exact_evidence_to_writer)
+Test: src/work_attempt_loop.rs (unclassified_configured_tester_command_preserves_evidence_without_writer)
 IF a later no-change Writer preserves that Tester's candidate, THEN THE SYSTEM
 SHALL continue to use the exact candidate-bound source Tester as the correction
 frontier instead of requiring a new Tester after the no-change Writer.

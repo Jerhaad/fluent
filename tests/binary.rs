@@ -40087,9 +40087,10 @@ fn canonical_evidence_fixture_with_applicability(
     let project = setup_git_project(tmp);
     let definitions = commands
         .iter()
-        .map(|command| {
+        .enumerate()
+        .map(|(index, command)| {
             serde_json::json!({
-                "command": command, "test_harness": "shell-harness", "applicability": applicability
+                "command": command, "test_harness": "shell-harness", "applicability": if applicability.is_array() { &applicability[index] } else { &applicability }
             })
         })
         .collect::<Vec<_>>();
@@ -40668,6 +40669,25 @@ fn review_requested_evidence_obeys_declared_applicability() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("environment"));
+    fs::write(project.join(&review), "Verdict: fail\nEvidence-Command: true\nEvidence-Working-Directory: .\nEvidence-Applicability: invalid\n").unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            work,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &review,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("applicability"));
 }
 
 #[test]
@@ -40870,5 +40890,107 @@ fn canonical_gate_requires_declared_environment_proof() {
             .filter(|t| t["kind"] == "write")
             .count(),
         1
+    );
+}
+
+#[test]
+fn unavailable_check_environment_does_not_schedule_writer() {
+    let tmp = TempDir::new().unwrap();
+    let work = "unmet-prerequisite";
+    let required = if std::env::consts::OS == "linux" {
+        "macos"
+    } else {
+        "linux"
+    };
+    let (project, _, path) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["touch must-not-run", "touch remaining-command-ran"],
+        serde_json::json!([{"environment":{"os":required}}, {}]),
+    );
+    let item = work_item_value(&project, work);
+    let workspace = &item["attempts"][0]["tasks"][0]["output"]["workspace_path"];
+    let workspace = project.join(workspace.as_str().unwrap());
+    assert!(!workspace.join("must-not-run").exists());
+    assert!(workspace.join("remaining-command-ran").exists());
+    fs::remove_file(workspace.join("remaining-command-ran")).unwrap();
+    let results: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        results["commands"][0]["failure_cause"]["kind"],
+        "unmet-prerequisite"
+    );
+    assert_eq!(
+        results["commands"][0]["failure_cause"]["observed"],
+        std::env::consts::OS
+    );
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+    let item = work_item_value(&project, work);
+    assert_eq!(item["attempts"][0]["pause_kind"], "host-evidence");
+    assert_eq!(
+        item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1
+    );
+    let handoff = fs::read_to_string(project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/required-check-needs-user.md"
+    )))
+    .unwrap();
+    assert!(
+        handoff.contains("prevented execution") && handoff.contains("os"),
+        "{handoff}"
+    );
+}
+
+#[test]
+fn ambiguous_check_failure_pauses_without_source_correction() {
+    let tmp = TempDir::new().unwrap();
+    let work = "ambiguous-prerequisite";
+    // Mentioning Docker in output does not verify a missing prerequisite.
+    let (project, _, _) =
+        canonical_evidence_fixture(&tmp, work, &["echo Docker unavailable >&2; false", "true"]);
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let item = work_item_value(&project, work);
+    assert_eq!(item["attempts"][0]["pause_kind"], "host-evidence");
+    assert_eq!(
+        item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| task["kind"] == "write")
+            .count(),
+        1
+    );
+    let handoff = fs::read_to_string(project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/required-check-needs-user.md"
+    )))
+    .unwrap();
+    assert!(
+        handoff.contains("diagnosis") && !handoff.contains("prevented execution"),
+        "{handoff}"
     );
 }

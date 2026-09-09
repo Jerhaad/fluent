@@ -5346,7 +5346,7 @@ fn execution_context_findings(
             let stdout = artifact_dir.join(&command.stdout_log);
             let stderr = artifact_dir.join(&command.stderr_log);
             let title = format!(
-                "Configured Tester command {index} `{}` failed with exit code {}; stdout: {}; stderr: {}",
+                "Configured Tester command {index} `{}` failed with exit code {}; stdout: {}; stderr: {}. Preserve this result; a command exit alone does not establish a source defect",
                 command.command,
                 command.exit_code,
                 stdout.display(),

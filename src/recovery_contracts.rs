@@ -2654,6 +2654,7 @@ pub(crate) struct CanonicalCheckAssessment {
     pub outstanding: Vec<usize>,
     pub accepted: Vec<usize>,
     pub blockers: Vec<String>,
+    pub diagnoses: Vec<String>,
 }
 
 impl CanonicalCheckAssessment {
@@ -2812,6 +2813,7 @@ pub(crate) fn assess_canonical_checks(
     let mut checks = Vec::new();
     let mut outstanding = Vec::new();
     let mut accepted = Vec::new();
+    let mut diagnoses = Vec::new();
     for (index, definition) in manifest.commands.iter().enumerate() {
         let applicability = match manifest.applicability.get(index) {
             Some(binding) => binding.clone(),
@@ -2858,7 +2860,17 @@ pub(crate) fn assess_canonical_checks(
                 "command {index} does not match the canonical manifest"
             ));
         }
+        let unmet_prerequisite = result.and_then(|command| match &command.failure_cause {
+            Some(crate::tester::CommandFailureCause::UnmetPrerequisite { fact, required, observed })
+                if matches && command.exit_code != 0 && command.duration_ms == 0
+                    && matches!(fact.as_str(), "os" | "architecture")
+                    && definition.applicability.environment.get(fact) == Some(required)
+                    && manifest.environment.get(index).and_then(|facts| facts.get(fact)) == Some(observed)
+                    && observed != required => Some(format!("{fact}: required {required}, observed {observed}; prerequisite prevented execution")),
+            _ => None,
+        });
         if definition.reject_process_leaks
+            && unmet_prerequisite.is_none()
             && result.is_none_or(|command| command.process_settlement.is_none())
         {
             blockers.push(format!(
@@ -2887,11 +2899,20 @@ pub(crate) fn assess_canonical_checks(
                 accepted.push(index);
             } else {
                 outstanding.push(index);
+                if let Some(reason) = unmet_prerequisite {
+                    diagnoses.push(format!("Required check {}: {reason}. Repair the declared environment or submit authorized host proof.", check.id));
+                } else if results.error.is_none()
+                    && !results.tests.iter().any(|test| test.status == "fail")
+                    && result.is_some_and(|command| command.exit_code != 0)
+                {
+                    diagnoses.push(format!("Required check {} needs diagnosis: a nonzero exit does not establish an environment, source, or harness cause. Preserve the logs and establish the missing cause or submit exact authorized host proof.", check.id));
+                }
             }
         }
         checks.push(check);
     }
     Ok(CanonicalCheckAssessment {
+        diagnoses,
         results_path: project_root.join(results_ref.path),
         checks,
         outstanding,

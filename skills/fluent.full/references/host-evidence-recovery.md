@@ -109,6 +109,13 @@ Fluent snapshots the exact document, binds it to that candidate, and reruns only
 the named reviewers. Do not edit the candidate or invent a commit. Inspect the
 Work Item again for the next action.
 
+A command that Fluent could not launch because its declared platform prerequisite
+did not match remains unresolved. Repair that environment or submit exact proof
+from an authorized host. A command that ran and exited nonzero without a proven
+cause needs diagnosis before source correction. Text mentioning Docker or another
+dependency does not establish why execution failed. Other declared commands still
+finish, and their valid passing results remain available for recovery.
+
 ## Declare when a command result applies
 
 Keep applicability beside its command. A required host Plan row can add an

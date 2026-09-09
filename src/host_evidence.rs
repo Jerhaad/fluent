@@ -2004,9 +2004,22 @@ pub(crate) fn attach_with_cancellation_policy(
                         reason: format!("{error:#}"),
                     },
                 )?;
-            if let Some(request) =
-                review::extract_focused_evidence_request(&String::from_utf8_lossy(&request_bytes))
+            let request_text = String::from_utf8_lossy(&request_bytes);
+            let request = review::extract_focused_evidence_request(&request_text);
+            if request.is_none()
+                && request_text.lines().any(|line| {
+                    let line = line.trim().strip_prefix("- ").unwrap_or(line.trim());
+                    line.split_once(':').is_some_and(|(label, _)| {
+                        label.trim().eq_ignore_ascii_case("Evidence-Applicability")
+                    })
+                })
             {
+                return Err(WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.into(),
+                    reason: "review applicability declaration is malformed or duplicated".into(),
+                });
+            }
+            if let Some(request) = request {
                 let context = prior
                     .review_context
                     .as_ref()

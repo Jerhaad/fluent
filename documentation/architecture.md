@@ -1143,6 +1143,15 @@ the declared environment. Plan proof overlays the current completion matrix only
 when its row identity, command, requirements, and candidate match the preserved
 source. A no-change Writer does not alter that original source or Review.
 
+Tester command results keep `failure_cause` separate from exit status. An observed
+mismatch in a declared `os` or `architecture` prerequisite prevents launch and
+records the required and observed values with the failed result. The executor
+continues the other commands. Unknown environment facts do not imply such a
+cause. The shared assessment validates the recorded observation against the
+manifest before explaining an environment handoff. Unexplained nonzero exits
+pause for diagnosis; structured test failures and identified harness errors keep
+their existing correction routes. Log phrases alone grant no correction authority.
+
 Work and Attempt record schema 3 and transaction schema 2 fence executables
 that predate this authority. Current readers accept earlier supported records
 and schema-1 journals. The compatibility test invokes the pinned pre-change

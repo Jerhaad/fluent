@@ -25,6 +25,14 @@ pub struct TesterResults {
     pub error: Option<TesterError>,
 }
 
+impl TesterResults {
+    pub(crate) fn needs_failure_diagnosis(&self) -> bool {
+        self.error.is_none()
+            && !self.tests.iter().any(|test| test.status == "fail")
+            && self.commands.iter().any(|command| command.exit_code != 0)
+    }
+}
+
 pub const FAILED_COMMAND_RECHECK_SCHEMA_VERSION: u32 = 1;
 
 /// Host-owned identity that maps one subset run back to the failed commands in
@@ -39,6 +47,8 @@ pub struct FailedCommandRecheckManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_cause: Option<CommandFailureCause>,
     pub command: String,
     pub test_harness: String,
     pub exit_code: i32,
@@ -47,6 +57,19 @@ pub struct CommandResult {
     pub stderr_log: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_settlement: Option<ProcessSettlementEvidence>,
+}
+
+/// Preserve diagnosed cause separately from the command's failed result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CommandFailureCause {
+    Unclassified,
+    /// The executor observed a platform mismatch and did not launch the command.
+    UnmetPrerequisite {
+        fact: String,
+        required: String,
+        observed: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,6 +749,41 @@ fn run_with_prepared_sandbox_profile_and_collector(
 
     let mut command_results = Vec::new();
     for (index, cmd) in commands.iter().enumerate() {
+        if let Some((fact, required, observed)) =
+            cmd.applicability
+                .environment
+                .iter()
+                .find_map(|(fact, required)| {
+                    let observed = manifest.environment.get(index)?.get(fact)?;
+                    (observed != required)
+                        .then(|| (fact.clone(), required.clone(), observed.clone()))
+                })
+        {
+            let stdout_log = format!("commands/{index}-stdout.log");
+            let stderr_log = format!("commands/{index}-stderr.log");
+            fs::write(artifact_dir.join(&stdout_log), b"")?;
+            fs::write(
+                artifact_dir.join(&stderr_log),
+                format!(
+                    "Required {fact}={required}, observed {observed}; prerequisite prevented execution.\n"
+                ),
+            )?;
+            command_results.push(CommandResult {
+                failure_cause: Some(CommandFailureCause::UnmetPrerequisite {
+                    fact,
+                    required,
+                    observed,
+                }),
+                command: cmd.command.clone(),
+                test_harness: cmd.test_harness.clone(),
+                exit_code: 125,
+                duration_ms: 0,
+                stdout_log,
+                stderr_log,
+                process_settlement: None,
+            });
+            continue;
+        }
         eprintln!("  Running command {}: {}", index, cmd.command);
         let settlement = if cmd.reject_process_leaks {
             let prepared_directory = settlement_directories
@@ -1077,6 +1135,7 @@ fn run_command(
     let stderr_log = format!("commands/{index}-stderr.log");
 
     Ok(CommandResult {
+        failure_cause: (exit_code != 0).then_some(CommandFailureCause::Unclassified),
         command: command.to_string(),
         test_harness: test_harness.to_string(),
         exit_code,
@@ -1816,6 +1875,7 @@ mod tests {
 
     fn command_result(command: &str, harness: &str, exit_code: i32) -> CommandResult {
         CommandResult {
+            failure_cause: None,
             command: command.to_string(),
             test_harness: harness.to_string(),
             exit_code,
@@ -2743,6 +2803,63 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
         assert_eq!(results.tests[0].id, "my_test");
         assert_eq!(results.summary.total, 1);
         assert_eq!(results.summary.pass, 1);
+    }
+
+    #[test]
+    fn diagnosed_test_and_harness_defects_are_not_ambiguous() {
+        let mut results = TesterResults {
+            candidate_commit: None,
+            commands: vec![command_result("false", "shell-harness", 1)],
+            tests: vec![],
+            summary: Summary {
+                total: 0,
+                pass: 0,
+                fail: 0,
+                skipped: 0,
+            },
+            error: None,
+        };
+        assert!(results.needs_failure_diagnosis());
+        results.tests.push(TestResult {
+            id: "assertion".into(),
+            test_harness: "shell-harness".into(),
+            status: "fail".into(),
+            duration_ms: None,
+            failure_excerpt: Some("actual != expected".into()),
+        });
+        assert!(!results.needs_failure_diagnosis());
+        results.tests.clear();
+        results.error = Some(TesterError {
+            kind: "extractor_missing".into(),
+            message: "missing executable".into(),
+            details: String::new(),
+        });
+        assert!(!results.needs_failure_diagnosis());
+    }
+
+    #[test]
+    fn tester_records_prerequisite_that_prevented_execution() {
+        let workspace = TempDir::new().unwrap();
+        let artifact_dir = TempDir::new().unwrap();
+        make_workspace(workspace.path());
+        let required = if std::env::consts::OS == "linux" {
+            "macos"
+        } else {
+            "linux"
+        };
+        write_tester_yaml(
+            workspace.path(),
+            &format!(
+                "commands:\n  - command: touch not-run\n    test_harness: shell-harness\n    applicability:\n      environment: {{os: {required}}}\n  - command: touch ran\n    test_harness: shell-harness\n"
+            ),
+        );
+        write_extractor(workspace.path(), "#!/bin/sh\necho '[]'\n");
+        run(workspace.path(), artifact_dir.path(), true, &resolver()).unwrap();
+        assert!(!workspace.path().join("not-run").exists());
+        assert!(workspace.path().join("ran").exists());
+        let results = read_results(artifact_dir.path());
+        assert_ne!(results.commands[0].exit_code, 0);
+        assert_eq!(results.commands[1].exit_code, 0);
     }
 
     #[test]

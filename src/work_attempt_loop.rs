@@ -7008,6 +7008,32 @@ fn advance_failed_command_recheck(
     }) {
         return Ok(None);
     }
+    if recheck_results_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
+        .is_some_and(|results| results.needs_failure_diagnosis())
+    {
+        return Ok(Some(settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            PauseKind::HostEvidence,
+            &correction,
+            |root, work, attempt, _| {
+                let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
+                let reason = format!(
+                    "The failed-command recheck {} needs diagnosis. A nonzero exit does not establish a candidate defect. Preserve its result and logs; establish the missing prerequisite or code/harness cause before requesting source correction. Exact canonical host proof remains subject to its preserved check bindings and targeted Tests Review.\n",
+                    recheck.id
+                );
+                crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
+                Ok(handoff)
+            },
+            &|_| {},
+        )?));
+    }
     if correction.is_empty() {
         return Ok(None);
     }
@@ -9098,6 +9124,25 @@ fn interpret_reviews(
                         .any(|command| !command.applicability.is_default())
                 })
         });
+    let assessed_checks = crate::recovery_contracts::assess_canonical_checks(
+        project_root,
+        &item.attempts[attempt_index],
+    );
+    let needs_diagnosis = !tester_recheck_is_recovered
+        && !tester_review_evidence_is_recovered
+        && tester_result_path.as_ref().is_some_and(|path| {
+            unexplained_failed_tester_commands(path, baseline_path.as_deref()) > 0
+        })
+        && (assessed_checks
+            .as_ref()
+            .is_ok_and(|view| !view.diagnoses.is_empty())
+            || tester_result_path
+                .as_ref()
+                .and_then(|path| fs::read(path).ok())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok()
+                })
+                .is_some_and(|results| results.needs_failure_diagnosis()));
     let canonical_assessment = item.attempts[attempt_index]
         .evidence_recoveries
         .iter()
@@ -9108,13 +9153,8 @@ fn interpret_reviews(
                 .is_some_and(|check| check.source.is_canonical_tester())
         })
         .then_some(())
-        .or(canonical_has_policy.then_some(()))
-        .map(|_| {
-            crate::recovery_contracts::assess_canonical_checks(
-                project_root,
-                &item.attempts[attempt_index],
-            )
-        });
+        .or((canonical_has_policy || needs_diagnosis).then_some(()))
+        .map(|_| assessed_checks);
     if tester_gate_applicable
         && canonical_assessment.as_ref().is_some_and(|assessment| {
             assessment
@@ -9123,19 +9163,27 @@ fn interpret_reviews(
         })
     {
         let reason = match canonical_assessment.as_ref().unwrap() {
-            Ok(view) => view.blockers.iter().cloned().chain(view.outstanding.iter().map(|index| {
+            Ok(view) => view.blockers.iter().chain(view.diagnoses.iter()).cloned().chain(view.outstanding.iter().map(|index| {
                 let check = &view.checks[*index];
                 format!("Required check {} remains unresolved: `{}`. Attach exact host proof with `fluent attempt evidence attach {} {} --candidate {} --required-check {} --evidence-file <path>`.", check.id, check.command, item.id, attempt_id, check.candidate_commit, check.id)
             })).collect::<Vec<_>>().join("\n\n"),
-            Err(error) => format!("Required canonical check bindings cannot be verified: {error:#}. Restore the named immutable proof before retrying."),
+            Err(error) => format!("Required canonical check needs diagnosis; its bindings cannot be verified: {error:#}. Restore the named immutable proof before retrying."),
         };
-        let handoff_path = work_artifact_path(&item.id, attempt_id, "required-check-needs-user.md");
-        crate::atomic_write::atomic_write(&project_root.join(&handoff_path), reason.as_bytes())?;
-        item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
-        item.attempts[attempt_index].pause_kind = Some(PauseKind::HostEvidence);
-        item.attempts[attempt_index].review_state = Some(AttemptReviewState::Failed);
-        write_attempt_work_item(store, &item)?;
-        return Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path });
+        return settle_review_pause(
+            store,
+            project_root,
+            &item.id,
+            attempt_id,
+            AttemptReviewState::Failed,
+            PauseKind::HostEvidence,
+            &[],
+            |root, work, attempt, _| {
+                let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
+                crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
+                Ok(handoff)
+            },
+            &|_| {},
+        );
     }
     let tester_external_evidence_is_recovered = tester_recheck_is_recovered
         || tester_review_evidence_is_recovered
@@ -12362,7 +12410,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_configured_tester_command_returns_exact_evidence_to_writer() {
+    fn unclassified_configured_tester_command_preserves_evidence_without_writer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tester_json = r#"{
             "candidate_commit": "abc123",
@@ -12404,36 +12452,25 @@ mod tests {
         )
         .unwrap();
 
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("a failed configured Tester command must return to the Writer")
-        };
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
         let stored = store.read_work_item("work-1").unwrap();
         assert!(stored.merge_candidates.is_empty());
-        let writer = stored.attempts[0]
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .unwrap();
-        let paths = writer
-            .input_artifacts
-            .iter()
-            .map(|artifact| artifact.path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 3);
-        assert!(
-            paths
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
                 .iter()
-                .any(|path| path.ends_with("/tester-results.json"))
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
         );
-        assert!(
-            paths
-                .iter()
-                .any(|path| path.ends_with("/commands/0-stdout.log"))
+        assert_eq!(
+            fs::read_to_string(tester_dir.join("tester-results.json")).unwrap(),
+            tester_json
         );
-        assert!(
-            paths
-                .iter()
-                .any(|path| path.ends_with("/commands/0-stderr.log"))
+        assert_eq!(
+            fs::read_to_string(tester_dir.join("commands/0-stderr.log")).unwrap(),
+            "test host missing"
         );
     }
 
@@ -12705,7 +12742,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_final_tester_logs_are_exact_writer_correction_inputs() {
+    fn unclassified_final_tester_logs_remain_diagnosis_inputs() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
@@ -12720,42 +12757,26 @@ mod tests {
         )
         .unwrap();
 
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("missing behavior evidence must plan a corrective Writer")
-        };
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
         let stored = store.read_work_item("work-1").unwrap();
-        let writer = stored.attempts[0]
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .unwrap();
-        let paths = writer
-            .input_artifacts
-            .iter()
-            .map(|artifact| artifact.path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths.len(), 4);
-        assert!(
-            paths
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
                 .iter()
-                .any(|path| path.ends_with("/candidate-gate.json"))
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            1
         );
+        let results = latest_tester_results_path(project.path(), &stored.attempts[0]).unwrap();
+        let evidence =
+            failed_tester_command_artifacts(project.path(), &stored.attempts[0], &results).unwrap();
+        assert_eq!(evidence.len(), 3);
         assert!(
-            paths
+            evidence
                 .iter()
-                .any(|path| path.ends_with("/tester-results.json"))
+                .all(|artifact| project.path().join(&artifact.path).is_file())
         );
-        assert!(
-            paths
-                .iter()
-                .any(|path| path.ends_with("/commands/0-stdout.log"))
-        );
-        assert!(
-            paths
-                .iter()
-                .any(|path| path.ends_with("/commands/0-stderr.log"))
-        );
-        assert!(!paths.iter().any(|path| path.ends_with("/commands.json")));
     }
 
     fn complete_failed_tester_no_change_writer(
@@ -12763,18 +12784,23 @@ mod tests {
         store: &WorkModelStore,
         candidate: &str,
     ) -> String {
-        let outcome = interpret_reviews(
-            project_root,
-            store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-            true,
-            None,
-        )
-        .unwrap();
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("failed final evidence must plan a corrective Writer")
+        // Preserve an older, explicitly authorized correction history. Current
+        // admission no longer treats an unexplained exit as a source defect.
+        let mut item = store.read_work_item("work-1").unwrap();
+        let results = latest_tester_results_path(project_root, &item.attempts[0]).unwrap();
+        let gate = if introduced_tester_failures(&results, None) == 0 && !tester_errored(&results) {
+            gate_candidate_after_final_tester(project_root, &mut item, 0, Some(&results)).unwrap()
+        } else {
+            None
         };
+        let findings = if let Some((gate, _)) = gate {
+            final_tester_correction_artifacts(project_root, &item.attempts[0], &gate, &results)
+                .unwrap()
+        } else {
+            failed_tester_command_artifacts(project_root, &item.attempts[0], &results).unwrap()
+        };
+        let task_id = item.add_next_write_round("attempt-1", findings).unwrap();
+        store.write_work_item(&item).unwrap();
         complete_planned_no_change_writer(project_root, store, candidate, &task_id);
         task_id
     }
@@ -13211,6 +13237,66 @@ mod tests {
             stored.attempts[0].tasks[prior_writer_index + 1..new_writer_index]
                 .iter()
                 .all(|task| task.kind != TaskKind::Review)
+        );
+    }
+
+    #[test]
+    fn repeated_unclassified_command_pauses_without_writer() {
+        let project = tempfile::TempDir::new().unwrap();
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
+        add_failed_final_tester_command(project.path(), &store);
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
+        plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+        let mut item = store.read_work_item("work-1").unwrap();
+        let recheck = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == crate::work_model::FAILED_COMMAND_RECHECK_ROLE)
+            .unwrap();
+        crate::work_model::set_task_terminal(recheck, TaskStatus::Complete);
+        write_recheck_result(project.path(), recheck, &candidate, 65);
+        let path = project
+            .path()
+            .join(&recheck.artifact_area.as_ref().unwrap().path)
+            .join("tester-results.json");
+        let mut unclassified: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        unclassified["tests"] = serde_json::json!([]);
+        unclassified["summary"] = serde_json::json!({"total":0,"pass":0,"fail":0,"skipped":0});
+        fs::write(&path, serde_json::to_vec(&unclassified).unwrap()).unwrap();
+        store.write_work_item(&item).unwrap();
+
+        let outcome = plan_after_completed_writer(
+            project.path(),
+            &store,
+            store.read_work_item("work-1").unwrap(),
+            "attempt-1",
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(stored.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+        assert_eq!(
+            stored.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert!(
+            stored.attempts[0]
+                .tasks
+                .last()
+                .unwrap()
+                .is_failed_command_recheck()
         );
     }
 
