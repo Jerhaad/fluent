@@ -3975,8 +3975,8 @@ mod pump_supervision_tests {
     #[cfg(unix)]
     #[test]
     fn pump_failure_terminates_and_reaps_live_coder() {
-        // The pump cannot open its transcript because the path is a directory, so
-        // it fails immediately while the coder is still alive. A pump failure must
+        // Once both processes are ready, start a pump whose transcript path is a
+        // directory, so it fails while the coder is still alive. A pump failure must
         // terminate and reap the coder's WHOLE process group — the leader and a
         // backgrounded descendant that never touches stdout, so neither can be
         // killed incidentally by SIGPIPE. Both must be gone and neither's delayed
@@ -3986,21 +3986,53 @@ mod pump_supervision_tests {
         std::fs::create_dir(&transcript).unwrap();
         let d = dir.path().display();
 
-        // The leader records its and the descendant's pids, then both sleep and
-        // touch a side-effect file. Nothing reads or writes stdout.
+        // Delay startup to exercise the readiness barrier. The leader records
+        // both PIDs; each process waits for the test before its delayed side effect.
+        // Nothing reads or writes stdout, so neither dies incidentally from SIGPIPE.
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!(
-            "echo $$ > {d}/leader.pid; \
-             ( sleep 1; : > {d}/descendant-ran ) & echo $! > {d}/descendant.pid; \
+            "sleep 0.1; echo $$ > {d}/leader.pid; \
+             ( while [ ! -f {d}/ready ]; do sleep 0.01; done; \
+               sleep 1; : > {d}/descendant-ran ) & echo $! > {d}/descendant.pid; \
+             while [ ! -f {d}/ready ]; do sleep 0.01; done; \
              sleep 1; : > {d}/leader-ran"
         ));
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.stdout(Stdio::piped()).spawn().unwrap();
+        let child_id = child.id();
+        let mut supervisor = CoderSupervisor::new(child, child_id);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let pids = ["leader.pid", "descendant.pid"].map(|pidfile| {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(dir.path().join(pidfile)) {
+                    if pid.trim().parse::<u32>().is_ok() {
+                        break pid;
+                    }
+                }
+                assert!(
+                    Instant::now() < ready_deadline,
+                    "{pidfile} was not recorded"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
 
         let started = Instant::now();
-        let result = run_with_transcript(
-            cmd,
-            Some(&transcript),
-            &crate::transcript_pump::TranscriptPumpConfig::default(),
-        );
+        std::fs::write(dir.path().join("ready"), "").unwrap();
+        let pump = crate::transcript_pump::spawn_pump(
+            supervisor.take_stdout().unwrap(),
+            transcript.clone(),
+            Some(crate::transcript_pump::status_path_for(&transcript)),
+            crate::transcript_pump::console_preview_sink(),
+            crate::transcript_pump::TranscriptPumpConfig::default(),
+        )
+        .unwrap();
+        supervisor.attach_pump(pump);
+        let result = supervisor.supervise(None);
+        drop(supervisor);
         let elapsed = started.elapsed();
 
         let err = result.expect_err("a pump failure must surface as an error");
@@ -4023,13 +4055,8 @@ mod pump_supervision_tests {
                 .map(|s| s.success())
                 .unwrap_or(false)
         };
-        for pidfile in ["leader.pid", "descendant.pid"] {
-            let pid = std::fs::read_to_string(dir.path().join(pidfile))
-                .unwrap_or_else(|_| panic!("{pidfile} must have been recorded"));
-            assert!(
-                !is_alive(&pid),
-                "{pidfile} process survived the pump failure"
-            );
+        for pid in pids {
+            assert!(!is_alive(&pid), "process {pid} survived the pump failure");
         }
 
         // Wait past the 1s side-effect delay: neither the leader nor the reaped
