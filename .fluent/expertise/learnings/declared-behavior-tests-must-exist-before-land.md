@@ -23,9 +23,10 @@ A declared reference with no backing definition therefore blocks before review,
 and a defined reference without passing final evidence blocks before Learning,
 even when many unrelated tests are green.
 
-If the missing identity coincides with a nonzero Tester command, the next Writer
-needs the harness failure, not just the missing selector. Attach the rejected
-gate, the exact `tester-results.json`, and only that command's deterministic
+When an established failure returns to a corrective Writer and a missing test
+identity coincides with a nonzero Tester command, include the command failure
+alongside the missing selector. Attach the rejected gate, the exact
+`tester-results.json`, and only that command's deterministic
 `commands/<index>-stdout.log` and `commands/<index>-stderr.log` files. Grant
 those files individually as read-only sandbox inputs and bind all of their bytes
 to any round-cap approval. Never trust a persisted result to choose a sandbox
@@ -43,13 +44,19 @@ Never fall back to this ungated evidence when a candidate gate exists; the gate
 owns that frontier. Reject failed-command rechecks and passing, stale, missing,
 malformed, or candidate-mismatched Tester evidence rather than approving a
 mutable or unrelated correction.
-That digest proves inspection, not recovery. If the Writer preserves the
-candidate, rerun only the previously nonzero commands through the host-owned
-Tester boundary before reviewers. Bind the subset to the source result, current
+That digest proves inspection, not recovery. In the failed-command recheck
+route, if the Writer preserves the candidate, rerun only the previously nonzero
+commands through the host-owned Tester boundary before reviewers. Bind the
+subset to the source result, current
 candidate, and unchanged command indexes, strings, and harnesses. Persist the
-recheck manifest, result, and logs. Route another command, structured-test, or
-process-settlement failure straight back to correction; a passing subset may
-admit review but never substitutes for the complete final Tester.
+recheck manifest, result, and logs. Established defects retain correction;
+verified unmet prerequisites need environment recovery, and unexplained exits
+pause for diagnosis. A passing subset may admit review but never substitutes for
+the complete final Tester. Separately, exact host proof accepted by targeted
+Tests Review can satisfy a canonical command when the preserved complete run
+and all applicable replacements satisfy every requirement. See
+[[tester-failure-routing-requires-proven-cause]] and
+[[required-checks-outlive-individual-results]].
 
 When you declare a `Test:` reference, either land the backing test passing in the
 same candidate, or — if the test is intentionally dropped — remove/replace the

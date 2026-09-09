@@ -12,12 +12,19 @@ candidate, source matrix, Plan row, command, evidence digest, and targeted Revie
 Resolving its source through the latest Writer instead can reject valid history
 and prevent fresh evidence from replacing the still-active receipt.
 
-Keep historical settlement separate from current-candidate admission. Once all
-targeted Plan reviews pass, the Attempt loop revalidates inside a fresh Work-model
-mutation and settles the receipt. Queue admission checks the same facts without
-rewriting history; attachment revalidates within its transaction. Preserve the
-original evidence and Tasks, and reject changed bound bytes even when a saved
-review says pass. A corrected candidate still requires its own host evidence.
+Keep historical settlement separate from current-candidate admission. Ordinary
+Attempt resume and queue admission require the receipt's candidate and Plan
+requirement to match the current Writer and completion matrix. Only fresh
+explicit Plan attachment may settle a completed older-candidate Review as
+history, after validating its original Writer, source, evidence, and Review.
+That settlement cannot credit the current candidate, which still needs fresh
+host proof. Reject changed evidence or previously recorded Review bytes even
+when the saved verdict still says pass.
+
+For a matching current candidate, the Attempt loop settles passing Plan Reviews
+inside a fresh Work-model mutation and records their digests. Queue admission
+checks the same facts without rewriting history; attachment revalidates within
+its transaction. Preserve original evidence and Tasks throughout both routes.
 
 Recovery tests must complete the corrective Writer, reach the fresh host handoff,
 attach evidence, and resume. Stopping at Writer materialization misses the active

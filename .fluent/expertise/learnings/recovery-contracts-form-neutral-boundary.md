@@ -21,6 +21,11 @@ Keep the surface crate-private unless an external API is required. When a new ro
 can admit or launch a recovery-bound Writer, extend the shared contract and
 invoke it from that route rather than adding a caller-specific exception.
 
+Tester produces contracts that recovery consumes. Resolve their shared declared
+comparison inputs in `check_applicability`, below both Tester and recovery,
+rather than making Tester call back into `recovery_contracts`. Keep shared value
+types in `work_model` and include both consumers in dependency-boundary checks.
+
 Recognize the specialized recovery before imposing its additional prerequisites.
 A Plan containing host work does not make every interrupted Writer a host-only
 recovery: an initial Writer or an unfinished continuation retains ordinary

@@ -370,3 +370,24 @@ Compatibility must use the pinned pre-change executable, including an interrupte
 real transaction, rather than model round trips alone.
 See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
 and `tests/behaviors/operations/test-evidence-recovery-old-reader.sh`.
+
+## Settle older Plan Reviews only during fresh attachment
+
+Only fresh explicit Plan evidence attachment may settle a completed Review for
+an older candidate as history. Validate its original Writer, matrix, evidence,
+and Review, including any saved Review digest. Ordinary resume and current
+completion still require the current candidate and matching Plan requirement;
+historical settlement cannot supply that candidate's fresh proof. See
+[[host-evidence-settles-against-bound-writer]] and
+[host evidence recovery](../../documentation/architecture.md#host-evidence-recovery).
+
+## Limit legacy Plan Review fallback to default applicability
+
+A preserved Plan receipt with default applicability may lack a saved Review
+digest. Acceptance still requires the completed Tests Review's matching context
+and passing verdict. Receipts with declared applicability require the saved
+digest, and any present digest must match the Review bytes. Keep this compatibility
+fallback bounded when changing Plan evidence overlays; do not extend it to
+environment, comparison, or live-state policies. See
+[host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
+and `plan_evidence_review_is_accepted` in `src/recovery_contracts.rs`.
