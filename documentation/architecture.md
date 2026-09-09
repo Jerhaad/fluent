@@ -1135,6 +1135,14 @@ expires at that boundary. Unsupported or missing required facts block acceptance
 Mutable comparison names resolve when execution or authorized host attachment
 captures the binding; current ref values cannot establish historical values.
 
+The shared pending-evidence assessment checks canonical, Plan, and
+reviewer-requested proof for expiry while revalidating its original source and
+candidate. Read-only status reports the original selector for fresh proof only
+after execution owners settle. Explicit attachment retires the expired recovery
+and idle review reservation under the land and model locks, preserving snapshots
+and completed Reviews. A completed Review whose proof expired before consumption
+cannot credit the check; fresh proof requires a new targeted Tests Review.
+
 Canonical manifests and managed verification receipts record only declared facts
 the executor can observe (`os` and `architecture`) and resolved comparison commits.
 Unknown environment facts remain unproven until applicable host evidence supplies

@@ -689,6 +689,8 @@ Test: tests/binary.rs (plan_completed_acceptance_revalidates_bindings)
 Test: tests/binary.rs (changed_candidate_recovery_runs_fresh_checks)
 Test: tests/binary.rs (live_state_evidence_obeys_declared_freshness)
 Test: tests/binary.rs (expired_pending_evidence_accepts_fresh_proof)
+Test: tests/binary.rs (expired_pending_plan_evidence_accepts_fresh_proof)
+Test: tests/binary.rs (expired_pending_requested_evidence_accepts_fresh_proof)
 Test: tests/binary.rs (canonical_evidence_rejects_changed_comparison_ref)
 
 ### B9

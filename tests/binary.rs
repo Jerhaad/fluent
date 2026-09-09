@@ -42348,25 +42348,108 @@ fn changed_candidate_recovery_runs_fresh_checks() {
 
 #[test]
 fn expired_pending_evidence_accepts_fresh_proof() {
+    expired_pending_evidence_recovery("canonical");
+}
+
+#[test]
+fn expired_pending_plan_evidence_accepts_fresh_proof() {
+    expired_pending_evidence_recovery("plan");
+}
+
+#[test]
+fn expired_pending_requested_evidence_accepts_fresh_proof() {
+    expired_pending_evidence_recovery("requested");
+}
+
+fn expired_pending_evidence_recovery(source: &str) {
     use fluent::work_model::*;
     for review_completed in [false, true] {
         let tmp = TempDir::new().unwrap();
         let work = "expired-pending";
-        let (project, candidate, results) = canonical_evidence_fixture_with_applicability(
-            &tmp,
-            work,
-            &["true", "false"],
-            serde_json::json!([{}, {"freshness":{"kind":"live-state","max_age_seconds":600}}]),
-        );
+        let policy = serde_json::json!({"freshness":{"kind":"live-state","max_age_seconds":600}});
+        let (project, candidate, results, _managed, option, selector, check) = if source == "plan" {
+            let plan = format!(
+                "| # | State reached | Behaviors | Verification | Applicability | Responsibility | Req? |\n| 1 | Fix source. | | `cargo test fix` | {{}} | writer | Yes |\n| 2 | Check host. | | `bash tests/host.sh` | {policy} | host | Yes |\n"
+            );
+            let (project, candidate, _) =
+                setup_ownership_fixture_with_plan(&tmp, work, true, Some(plan));
+            let writer = WorkModelStore::new(&project)
+                .read_work_item(work)
+                .unwrap()
+                .attempts[0]
+                .tasks[0]
+                .clone();
+            let results = project
+                .join(&writer.artifact_area.as_ref().unwrap().path)
+                .join("writer-completion.json");
+            fs::write(results.parent().unwrap().join("transcript.jsonl"), "{}\n").unwrap();
+            let managed = bind_candidate_to_managed_sibling(&project, work, &candidate);
+            (
+                project,
+                candidate,
+                results,
+                Some(managed),
+                "--plan-row",
+                "plan:step-2".to_string(),
+                "bash tests/host.sh",
+            )
+        } else {
+            let (project, candidate, results) = canonical_evidence_fixture_with_applicability(
+                &tmp,
+                work,
+                &["true", "false"],
+                serde_json::json!([{}, policy]),
+            );
+            let (option, selector) = if source == "requested" {
+                let store = WorkModelStore::new(&project);
+                let mut item = store.read_work_item(work).unwrap();
+                item.attempts[0].status = AttemptStatus::NeedsUser;
+                item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+                item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+                let review = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review)
+                    .unwrap();
+                let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+                fs::write(project.join(&path), format!("Verdict: fail\nEvidence-Command: false\nEvidence-Working-Directory: .\nEvidence-Applicability: {policy}\n")).unwrap();
+                store.write_work_item(&item).unwrap();
+                ("--review-artifact", path)
+            } else {
+                (
+                    "--required-check",
+                    format!(
+                        "tester:{:x}:1",
+                        Sha256::digest(fs::read(project.join(".fluent/tester.yaml")).unwrap())
+                    ),
+                )
+            };
+            (project, candidate, results, None, option, selector, "false")
+        };
+        let attach = |evidence: &Path| {
+            let mut command = fluent_cmd();
+            command.current_dir(&project).args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                option,
+                &selector,
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ]);
+            command
+        };
         let original = fs::read(&results).unwrap();
         let issued = chrono::Utc::now();
         let expired = (issued + chrono::TimeDelta::seconds(600)).to_rfc3339();
         let evidence = tmp.path().join("host.json");
-        let mut document = serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"passed"});
+        let mut document = serde_json::json!({"schema_version":1,"producer":"host","check":check,"working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"passed"});
         fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
-        canonical_attachment_command(&project, work, &candidate, &evidence)
-            .assert()
-            .success();
+        attach(&evidence).assert().success();
         let store = WorkModelStore::new(&project);
         let attached = store.read_work_item(work).unwrap();
         let first = attached.attempts[0].evidence_recoveries[0].clone();
@@ -42385,6 +42468,21 @@ fn expired_pending_evidence_accepts_fresh_proof() {
                 .assert()
                 .success();
         }
+        let review_path = project
+            .join(
+                attached.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == *target)
+                    .unwrap()
+                    .artifact_area
+                    .as_ref()
+                    .unwrap()
+                    .path
+                    .clone(),
+            )
+            .join("review.md");
+        let completed_review_bytes = fs::read(&review_path).ok();
         let before = snapshot_tree(&project.join(".fluent/work"));
         fluent_cmd()
             .current_dir(&project)
@@ -42401,12 +42499,16 @@ fn expired_pending_evidence_accepts_fresh_proof() {
             .assert()
             .failure();
         let before_status = snapshot_tree(&project.join(".fluent/work"));
-        fluent_cmd()
+        let status = fluent_cmd()
             .current_dir(&project)
             .args(["work-item", "show", work])
             .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
-            .assert()
-            .success();
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status = String::from_utf8_lossy(&status.stdout);
+        assert!(status.contains(&format!("{option} {selector}")), "{status}");
+        assert!(status.contains("expired"), "{status}");
         assert!(
             snapshot_tree(&project.join(".fluent/work")) == before_status,
             "status must remain read-only"
@@ -42415,14 +42517,108 @@ fn expired_pending_evidence_accepts_fresh_proof() {
             before.iter().all(|entry| before_status.contains(entry)),
             "rejected resume must preserve existing history"
         );
+        // Expiry does not grant authority to launch the reserved reviewer or
+        // accept the same old proof, even if its Review already completed.
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        attach(&evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        if review_completed {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["attempt", "cancel", work, "attempt-1"])
+                .assert()
+                .success();
+            assert!(store.read_work_item(work).unwrap().attempts[0].cancellation_requested());
+        }
         document["run_at"] = serde_json::json!(expired);
         document["output"] = serde_json::json!("fresh execution passed");
         fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
-        canonical_attachment_command(&project, work, &candidate, &evidence)
+        let unchanged = store.read_work_item(work).unwrap();
+        let owner =
+            fluent::lease::acquire(&fluent::lease::task_lock_path(&project, work, target)).unwrap();
+        attach(&evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        assert_eq!(store.read_work_item(work).unwrap(), unchanged);
+        drop(owner);
+        let source_path = if source == "requested" {
+            project.join(&selector)
+        } else {
+            results.clone()
+        };
+        let source_bytes = fs::read(&source_path).unwrap();
+        fs::write(&source_path, [&source_bytes[..], b"\n"].concat()).unwrap();
+        let changed_source = snapshot_tree(&project.join(".fluent/work"));
+        attach(&evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        assert!(
+            snapshot_tree(&project.join(".fluent/work")) == changed_source,
+            "changed sources must not publish replacement evidence"
+        );
+        fs::write(&source_path, &source_bytes).unwrap();
+        let writer = unchanged.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        let dirt = project
+            .join(&writer.output.as_ref().unwrap().workspace_path)
+            .join("untracked-expiry-blocker");
+        fs::write(&dirt, "dirty candidate").unwrap();
+        let status = fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert!(
+            status["next-action"].is_null(),
+            "dirty candidates cannot advertise fresh attachment: {status}"
+        );
+        attach(&evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        fs::remove_file(&dirt).unwrap();
+        let pristine = snapshot_tree(&project.join(".fluent/work"));
+        document["working_directory"] = serde_json::json!("wrong-directory");
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        attach(&evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        assert!(
+            snapshot_tree(&project.join(".fluent/work")) == pristine,
+            "invalid proof must not publish artifacts or resume a stop"
+        );
+        document["working_directory"] = serde_json::json!(".");
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(store.read_work_item(work).unwrap(), unchanged);
+        attach(&evidence)
             .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
             .assert()
             .success();
         let fresh = store.read_work_item(work).unwrap();
+        assert!(
+            !fresh.attempts[0].cancellation_requested(),
+            "only explicit fresh attachment resumes the settled stop"
+        );
+        if review_completed {
+            assert_eq!(fs::read(&review_path).ok(), completed_review_bytes);
+        }
         assert_eq!(fresh.attempts[0].evidence_recoveries.len(), 2);
         assert_eq!(
             fresh.attempts[0].evidence_recoveries[0].state,
@@ -42445,7 +42641,7 @@ fn expired_pending_evidence_accepts_fresh_proof() {
                 TaskStatus::Superseded
             }
         );
-        canonical_attachment_command(&project, work, &candidate, &evidence)
+        attach(&evidence)
             .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
             .assert()
             .success();
@@ -42454,11 +42650,61 @@ fn expired_pending_evidence_accepts_fresh_proof() {
             fresh,
             "retry must preserve fresh identities"
         );
+        let mut ready_at = expired.clone();
+        if review_completed {
+            // Repeated expiry keeps the original source selector usable even
+            // with multiple completed evidence Reviews in its history.
+            let target = fresh.attempts[0].evidence_recoveries[1].targets[0]
+                .review_task_id
+                .as_ref()
+                .unwrap();
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+                .env("PATH", mock_path(&bin))
+                .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+                .assert()
+                .success();
+            let review = project
+                .join(
+                    &fresh.attempts[0]
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == *target)
+                        .unwrap()
+                        .artifact_area
+                        .as_ref()
+                        .unwrap()
+                        .path,
+                )
+                .join("review.md");
+            let reviewed_bytes = fs::read(&review).unwrap();
+            ready_at = (issued + chrono::TimeDelta::seconds(1200)).to_rfc3339();
+            document["run_at"] = serde_json::json!(ready_at);
+            document["output"] = serde_json::json!("another fresh execution passed");
+            fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+            attach(&evidence)
+                .env("FLUENT_TEST_EVIDENCE_NOW", &ready_at)
+                .assert()
+                .success();
+            let replaced = store.read_work_item(work).unwrap();
+            assert_eq!(replaced.attempts[0].evidence_recoveries.len(), 3);
+            assert_eq!(
+                replaced.attempts[0].evidence_recoveries[1].state,
+                EvidenceRecoveryState::NeedsEvidence
+            );
+            attach(&evidence)
+                .env("FLUENT_TEST_EVIDENCE_NOW", &ready_at)
+                .assert()
+                .success();
+            assert_eq!(store.read_work_item(work).unwrap(), replaced);
+            assert_eq!(fs::read(review).unwrap(), reviewed_bytes);
+        }
         fluent_cmd()
             .current_dir(&project)
             .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
             .env("PATH", mock_path(&bin))
-            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &ready_at)
             .assert()
             .success()
             .stdout(predicate::str::contains("is ready"));

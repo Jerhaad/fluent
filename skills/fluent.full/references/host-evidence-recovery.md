@@ -345,8 +345,15 @@ evidence; a changed attachment, source matrix, or dirty candidate requires
 inspection before recovery can continue. Scheduler claim and Review launch
 repeat those checks, including when a queue entry predates the changed evidence.
 
-If live-state proof for a canonical check expires while its targeted Review is
-pending, submit fresh proof with the same `--required-check` selector after
-execution owners settle. Fluent preserves the expired attachment and completed
-Review artifacts, supersedes any idle review reservation, and creates a new
-targeted Tests Review. Repeating the fresh attachment reuses that recovery.
+If live-state proof expires before Fluent consumes its targeted Review, submit
+fresh proof after execution owners settle. Use the same candidate and original
+selector: `--required-check` for a canonical check, `--plan-row` for a host Plan
+row, or `--review-artifact` for a reviewer-requested check. Status reports that
+exact attachment command when the original bindings remain valid. This also
+applies when the targeted Review completed before the proof expired.
+
+Fluent preserves the expired attachment and completed Review artifacts,
+supersedes any idle review reservation, and creates a new targeted Tests Review.
+Repeating the fresh attachment reuses that recovery. An explicit fresh attachment
+can resume a settled cancellation; changed sources, dirty candidates, live owners,
+or invalid fresh proof cannot replace the pending recovery.

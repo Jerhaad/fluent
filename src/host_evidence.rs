@@ -1973,6 +1973,54 @@ pub(crate) fn attach_with_cancellation_policy(
             attempt.ensure_not_canceled()?;
         }
         let _ = item.validate_recovery_operation(project_root, &operation)?;
+        let attempt = item
+            .attempts
+            .iter_mut()
+            .find(|a| a.id == attempt_id)
+            .unwrap();
+        if recheck_artifact.is_none() && review_artifacts.len() == 1 {
+            if let Some(prior) = attempt.active_evidence_recovery().filter(|prior| {
+                prior.state == EvidenceRecoveryState::Reviewing
+                    && prior.candidate_commit == candidate_commit
+                    && prior.attachment.digest == digest
+                    && prior.attachment.snapshot_path == snapshot_path
+                    && prior.required_check.as_ref().is_some_and(|check| {
+                        matches!(
+                    &check.source, work_model::RequiredCheckSource::ReviewRequested { request, .. }
+                    if request.path == review_artifacts[0])
+                    })
+            }) {
+                // Replay the same typed attachment without treating its preserved
+                // evidence Reviews as a newer ordinary request.
+                crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)
+                    .and_then(|_| {
+                        crate::recovery_contracts::validate_pending_evidence_owners(
+                            project_root,
+                            attempt,
+                            prior,
+                        )
+                    })
+                    .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: attempt_id.into(),
+                        reason: format!("{error:#}"),
+                    })?;
+                return Ok(prior.clone());
+            }
+        }
+        let expired = if operator_recovery && recheck_artifact.is_none() && review_artifacts.len() == 1
+        {
+            retire_expired_pending_evidence(
+                project_root,
+                attempt,
+                candidate_commit,
+                &crate::recovery_contracts::EvidenceSelector::ReviewArtifact(
+                    review_artifacts[0].clone(),
+                ),
+                &document,
+            )?
+        } else {
+            None
+        };
         let existing = item
             .attempts
             .iter()
@@ -2036,12 +2084,13 @@ pub(crate) fn attach_with_cancellation_policy(
         let prior_reviews = match (&recheck_frontier, &candidate_gate_frontier) {
             (Some(frontier), _) => vec![frontier.prior_tests_review.clone()],
             (None, Some(frontier)) => vec![frontier.prior_tests_review.clone()],
-            (None, None) => validate_evidence_frontier(
+            (None, None) => validate_evidence_frontier_with_expired(
                 project_root,
                 item,
                 attempt_id,
                 candidate_commit,
                 review_artifacts,
+                expired.as_ref(),
             )?,
         };
         let required_check = if recheck_frontier.is_none()
@@ -2343,6 +2392,71 @@ pub(crate) fn attach_with_cancellation_policy(
     Ok(recovery)
 }
 
+/// Replace only intact expired proof after its owners settle. The caller holds
+/// the land and model locks; any later rejection rolls this transition back.
+fn retire_expired_pending_evidence(
+    project_root: &Path,
+    attempt: &mut work_model::Attempt,
+    candidate_commit: &str,
+    selector: &crate::recovery_contracts::EvidenceSelector,
+    document: &EvidenceDocument,
+) -> Result<Option<EvidenceRecovery>, WorkModelError> {
+    let reject = |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+        attempt_id: attempt.id.clone(),
+        reason,
+    };
+    let Some(expired) =
+        crate::recovery_contracts::inspect_expired_pending_evidence(project_root, attempt)
+            .map_err(|error| reject(format!("{error:#}")))?
+    else {
+        return Ok(None);
+    };
+    if expired.selector != *selector || expired.recovery.candidate_commit != candidate_commit {
+        return Err(reject(
+            "fresh proof must use the expired recovery's original selector and candidate".into(),
+        ));
+    }
+    if document.check != expired.command || document.working_directory != expired.working_directory
+    {
+        return Err(reject(
+            "fresh evidence must match the expired command and working directory".into(),
+        ));
+    }
+    crate::recovery_contracts::validate_check_applicability_at(
+        &expired.applicability,
+        document,
+        crate::check_applicability::evaluation_time(),
+    )
+    .and_then(|()| {
+        crate::recovery_contracts::validate_pending_evidence_owners(
+            project_root,
+            attempt,
+            &expired.recovery,
+        )
+    })
+    .map_err(|error| reject(format!("{error:#}")))?;
+    // Preserve snapshots and completed Reviews. Retire only idle reservations
+    // and the expired recovery's authority to consume a passing Review.
+    for task in &mut attempt.tasks {
+        if expired
+            .recovery
+            .targets
+            .iter()
+            .any(|target| target.review_task_id.as_deref() == Some(task.id.as_str()))
+            && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
+        {
+            work_model::set_task_terminal(task, TaskStatus::Superseded);
+        }
+    }
+    attempt
+        .evidence_recoveries
+        .iter_mut()
+        .find(|entry| entry.id == expired.recovery.id)
+        .unwrap()
+        .state = EvidenceRecoveryState::NeedsEvidence;
+    Ok(Some(expired.recovery))
+}
+
 /// Attach evidence for a required Plan row whose verification must run on an
 /// authorized host. Unlike ordinary focused evidence, this frontier has no
 /// failed Review artifact yet: the completed Writer is paused before review
@@ -2400,6 +2514,8 @@ pub fn attach_plan_row(
         |item| {
             let historical = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id)
                 .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
+            let expired = retire_expired_pending_evidence(project_root, historical, candidate_commit,
+                &crate::recovery_contracts::EvidenceSelector::PlanRow(plan_row.clone()), &document)?;
             crate::recovery_contracts::complete_owned_plan_evidence_review(project_root, historical)
                 .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible { attempt_id: attempt_id.to_string(), reason: format!("{error:#}") })?;
             let attempt = item
@@ -2455,9 +2571,13 @@ pub fn attach_plan_row(
             }
             crate::recovery_contracts::owned_host_completion_matrix(project_root, attempt)
                 .map_err(|error| ineligible(&format!("{error:#}")))?;
-            let interrupted_writer = crate::lifecycle_recovery::inspect_interrupted_plan_host_recovery(
-                project_root, attempt, &plan_row,
-            ).map_err(|error| ineligible(&format!("{error:#}")))?;
+            let interrupted_writer = if expired.is_some() {
+                None
+            } else {
+                crate::lifecycle_recovery::inspect_interrupted_plan_host_recovery(
+                    project_root, attempt, &plan_row,
+                ).map_err(|error| ineligible(&format!("{error:#}")))?
+            };
             let writer = attempt
                 .tasks
                 .iter()
@@ -2626,7 +2746,7 @@ pub fn attach_plan_row(
             // different attachment or Plan row must still begin at the original
             // Writer-completion pause, so it cannot silently hijack a live
             // recovery frontier.
-            if interrupted_writer.is_none()
+            if expired.is_none() && interrupted_writer.is_none()
                 && !(attempt.status == work_model::AttemptStatus::NeedsUser
                     && attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
                     && attempt.review_state == Some(work_model::AttemptReviewState::NotReviewed))
@@ -2993,6 +3113,24 @@ pub(crate) fn validate_evidence_frontier(
     candidate_commit: &str,
     review_artifacts: &[String],
 ) -> Result<Vec<Task>, WorkModelError> {
+    validate_evidence_frontier_with_expired(
+        project_root,
+        item,
+        attempt_id,
+        candidate_commit,
+        review_artifacts,
+        None,
+    )
+}
+
+fn validate_evidence_frontier_with_expired(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+    candidate_commit: &str,
+    review_artifacts: &[String],
+    expired: Option<&EvidenceRecovery>,
+) -> Result<Vec<Task>, WorkModelError> {
     let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
         attempt_id: attempt_id.to_string(),
         reason: "the supplied evidence does not match an eligible failed-review frontier"
@@ -3070,7 +3208,8 @@ pub(crate) fn validate_evidence_frontier(
         || is_failed_review_pause
         || is_legacy
         || is_paused_evidence_recovery
-        || interrupted_correction.is_some())
+        || interrupted_correction.is_some()
+        || expired.is_some())
     {
         return Err(rejected());
     }
@@ -3095,9 +3234,30 @@ pub(crate) fn validate_evidence_frontier(
                 later.kind == TaskKind::Review
                     && later.role == task.role
                     && later.status == TaskStatus::Complete
+                    && !expired.is_some_and(|expired| {
+                        attempt.evidence_recoveries.iter().any(|prior| {
+                            prior.state == EvidenceRecoveryState::NeedsEvidence
+                                && prior.candidate_commit == expired.candidate_commit
+                                && prior.required_check == expired.required_check
+                                && prior.targets.iter().any(|target| {
+                                    target.review_task_id.as_deref() == Some(later.id.as_str())
+                                        && later.evidence_review_context.as_ref().is_some_and(
+                                            |context| {
+                                                context.recovery_id == prior.id
+                                                    && context.candidate_commit
+                                                        == prior.candidate_commit
+                                                    && context.attachment == prior.attachment
+                                                    && context.prior_review_artifact
+                                                        == target.prior_review_artifact
+                                            },
+                                        )
+                                })
+                        })
+                    })
             })
             || selected.iter().any(|prior: &Task| prior.role == task.role)
             || (is_paused_evidence_recovery
+                && expired.is_none()
                 && !task
                     .evidence_review_context
                     .as_ref()
@@ -5591,7 +5751,7 @@ pub fn attach_required_check(
             item.validate_recovery_operation(project_root, &operation)?;
             let attempt = item
                 .attempts
-                .iter()
+                .iter_mut()
                 .find(|attempt| attempt.id == attempt_id)
                 .ok_or_else(|| reject("Attempt is missing".into()))?;
             if attempt.cancellation != observed_stop {
@@ -5668,6 +5828,8 @@ pub fn attach_required_check(
                     "evidence must name the exact required command and working directory".into(),
                 ));
             }
+            retire_expired_pending_evidence(project_root, attempt, candidate_commit,
+                &crate::recovery_contracts::EvidenceSelector::RequiredCheck(check.id.clone()), &document)?;
             let binding_bytes =
                 serde_json::to_vec_pretty(&check).map_err(|error| reject(error.to_string()))?;
             let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
@@ -5698,15 +5860,10 @@ pub fn attach_required_check(
                     "required check has no outstanding failed command".into(),
                 ));
             }
-            let expired = crate::recovery_contracts::expired_required_check_recovery(project_root, attempt, &check)
-                .map_err(|error| reject(format!("{error:#}")))?.cloned();
-            if (attempt.active_evidence_recovery().is_some() && expired.is_none())
-                || attempt.tasks.iter().any(|task| task.status == TaskStatus::Planned
-                    && expired.as_ref().is_none_or(|recovery| !recovery.targets.iter().any(|target| target.review_task_id.as_deref() == Some(task.id.as_str()))))
+            if attempt.active_evidence_recovery().is_some()
+                || attempt.tasks.iter().any(|task| task.status == TaskStatus::Planned)
             {
-                return Err(reject(
-                    "another reserved Task or evidence review must settle first".into(),
-                ));
+                return Err(reject("another reserved Task or evidence review must settle first".into()));
             }
             if !matches!(
                 attempt.status,
@@ -5752,17 +5909,6 @@ pub fn attach_required_check(
                         attempt.artifacts.push(reference);
                     }
                 }
-            }
-            if let Some(expired) = expired {
-                // Preserve evidence bytes and completed Reviews. Only an idle,
-                // unconsumed review reservation loses authority to run.
-                for task in &mut attempt.tasks {
-                    if expired.targets.iter().any(|target| target.review_task_id.as_deref() == Some(task.id.as_str()))
-                        && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded) {
-                        work_model::set_task_terminal(task, TaskStatus::Superseded);
-                    }
-                }
-                attempt.evidence_recoveries.iter_mut().find(|entry| entry.id == expired.id).unwrap().state = EvidenceRecoveryState::NeedsEvidence;
             }
             attempt.resume_cancellation()?;
             attempt.attach_evidence_recovery(EvidenceRecovery {
