@@ -3019,10 +3019,8 @@ pub(crate) fn assess_canonical_checks(
     );
     let workspace = candidate_workspace_path(project_root, output);
     let committed_bytes = |path: &str| -> Result<Vec<u8>> {
-        let committed = std::process::Command::new("git")
-            .current_dir(&workspace)
-            .args(["show", &format!("{}:{path}", output.commit)])
-            .output()?;
+        let committed =
+            crate::git::run_raw(&workspace, &["show", &format!("{}:{path}", output.commit)])?;
         anyhow::ensure!(
             committed.status.success(),
             "cannot read committed checker configuration: {path}"
