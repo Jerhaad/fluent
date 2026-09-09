@@ -2026,6 +2026,45 @@ pub(crate) fn attach_with_cancellation_policy(
             } else {
                 None
             };
+        let replacement = if expired.is_none()
+            && operator_recovery
+            && recheck_artifact.is_none()
+            && review_artifacts.len() == 1
+            && attempt.active_evidence_recovery().is_none()
+        {
+            let prior = crate::recovery_contracts::expired_completed_review_recovery(
+                project_root,
+                attempt,
+                &review_artifacts[0],
+            )
+            .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("{error:#}"),
+            })?;
+            if let Some(prior) = prior {
+                crate::recovery_contracts::validate_pending_evidence_owners(
+                    project_root,
+                    attempt,
+                    prior,
+                )
+                .and_then(|()| {
+                    crate::recovery_contracts::validate_check_applicability_at(
+                        &prior.required_check.as_ref().unwrap().applicability,
+                        &document,
+                        crate::check_applicability::evaluation_time(),
+                    )
+                })
+                .map_err(|error| {
+                    WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: attempt_id.into(),
+                        reason: format!("{error:#}"),
+                    }
+                })?;
+            }
+            prior.cloned()
+        } else {
+            expired
+        };
         let existing = item
             .attempts
             .iter()
@@ -2089,13 +2128,13 @@ pub(crate) fn attach_with_cancellation_policy(
         let prior_reviews = match (&recheck_frontier, &candidate_gate_frontier) {
             (Some(frontier), _) => vec![frontier.prior_tests_review.clone()],
             (None, Some(frontier)) => vec![frontier.prior_tests_review.clone()],
-            (None, None) => validate_evidence_frontier_with_expired(
+            (None, None) => validate_evidence_frontier_with_replacement(
                 project_root,
                 item,
                 attempt_id,
                 candidate_commit,
                 review_artifacts,
-                expired.as_ref(),
+                replacement.as_ref(),
             )?,
         };
         let required_check = if recheck_frontier.is_none()
@@ -3118,7 +3157,7 @@ pub(crate) fn validate_evidence_frontier(
     candidate_commit: &str,
     review_artifacts: &[String],
 ) -> Result<Vec<Task>, WorkModelError> {
-    validate_evidence_frontier_with_expired(
+    validate_evidence_frontier_with_replacement(
         project_root,
         item,
         attempt_id,
@@ -3128,13 +3167,13 @@ pub(crate) fn validate_evidence_frontier(
     )
 }
 
-fn validate_evidence_frontier_with_expired(
+fn validate_evidence_frontier_with_replacement(
     project_root: &Path,
     item: &work_model::WorkItem,
     attempt_id: &str,
     candidate_commit: &str,
     review_artifacts: &[String],
-    expired: Option<&EvidenceRecovery>,
+    replacement: Option<&EvidenceRecovery>,
 ) -> Result<Vec<Task>, WorkModelError> {
     let rejected = || WorkModelError::HostEvidenceRecoveryIneligible {
         attempt_id: attempt_id.to_string(),
@@ -3214,10 +3253,15 @@ fn validate_evidence_frontier_with_expired(
         || is_legacy
         || is_paused_evidence_recovery
         || interrupted_correction.is_some()
-        || expired.is_some())
+        || replacement.is_some())
     {
         return Err(rejected());
     }
+    // Renew a still-required completed check independently of intervening
+    // no-change Writers and passing Reviews. The neutral assessment already
+    // verified its original proof and the latest passing Tests Review.
+    let renews_completed_check =
+        replacement.is_some_and(|recovery| recovery.state == EvidenceRecoveryState::Complete);
     let mut selected = Vec::new();
     for path in review_artifacts {
         let (index, task) = attempt
@@ -3234,35 +3278,36 @@ fn validate_evidence_frontier_with_expired(
                 .map(|context| context.candidate_commit.as_str())
                 != Some(candidate_commit)
             || !matches!(read_verdict(project_root, task), Some(Verdict::Fail))
-            || index <= completed_writer.0
-            || attempt.tasks.iter().skip(index + 1).any(|later| {
-                later.kind == TaskKind::Review
-                    && later.role == task.role
-                    && later.status == TaskStatus::Complete
-                    && !expired.is_some_and(|expired| {
-                        attempt.evidence_recoveries.iter().any(|prior| {
-                            prior.state == EvidenceRecoveryState::NeedsEvidence
-                                && prior.candidate_commit == expired.candidate_commit
-                                && prior.required_check == expired.required_check
-                                && prior.targets.iter().any(|target| {
-                                    target.review_task_id.as_deref() == Some(later.id.as_str())
-                                        && later.evidence_review_context.as_ref().is_some_and(
-                                            |context| {
-                                                context.recovery_id == prior.id
-                                                    && context.candidate_commit
-                                                        == prior.candidate_commit
-                                                    && context.attachment == prior.attachment
-                                                    && context.prior_review_artifact
-                                                        == target.prior_review_artifact
-                                            },
-                                        )
-                                })
+            || (!renews_completed_check && index <= completed_writer.0)
+            || (!renews_completed_check
+                && attempt.tasks.iter().skip(index + 1).any(|later| {
+                    later.kind == TaskKind::Review
+                        && later.role == task.role
+                        && later.status == TaskStatus::Complete
+                        && !replacement.is_some_and(|replacement| {
+                            attempt.evidence_recoveries.iter().any(|prior| {
+                                prior.state == EvidenceRecoveryState::NeedsEvidence
+                                    && prior.required_check == replacement.required_check
+                                    && prior.candidate_commit == replacement.candidate_commit
+                                    && prior.targets.iter().any(|target| {
+                                        target.review_task_id.as_deref() == Some(later.id.as_str())
+                                            && later.evidence_review_context.as_ref().is_some_and(
+                                                |context| {
+                                                    context.recovery_id == prior.id
+                                                        && context.candidate_commit
+                                                            == prior.candidate_commit
+                                                        && context.attachment == prior.attachment
+                                                        && context.prior_review_artifact
+                                                            == target.prior_review_artifact
+                                                },
+                                            )
+                                    })
+                            })
                         })
-                    })
-            })
+                }))
             || selected.iter().any(|prior: &Task| prior.role == task.role)
             || (is_paused_evidence_recovery
-                && expired.is_none()
+                && replacement.is_none()
                 && !task
                     .evidence_review_context
                     .as_ref()

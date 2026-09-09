@@ -685,6 +685,7 @@ Test: tests/binary.rs (attempt_evidence_attach_revalidates_after_landing_owner_r
 Test: tests/binary.rs (evidence_reuse_rejects_changed_missing_or_expired_bindings)
 Test: tests/binary.rs (canonical_completed_acceptance_revalidates_bindings)
 Test: tests/binary.rs (requested_completed_acceptance_revalidates_bindings)
+Test: tests/binary.rs (independent_review_check_remains_required_after_expiry)
 Test: tests/binary.rs (plan_completed_acceptance_revalidates_bindings)
 Test: tests/binary.rs (changed_candidate_recovery_runs_fresh_checks)
 Test: tests/binary.rs (live_state_evidence_obeys_declared_freshness)

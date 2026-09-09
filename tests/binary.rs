@@ -42717,6 +42717,250 @@ fn expired_pending_evidence_recovery(source: &str) {
 }
 
 #[test]
+fn independent_review_check_remains_required_after_expiry() {
+    use fluent::work_model::*;
+    for changed_source in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let work = "independent-review-check";
+        let (project, candidate, results) =
+            canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+        let store = WorkModelStore::new(&project);
+        let mut item = store.read_work_item(work).unwrap();
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        let source = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap();
+        let source_path = format!("{}/review.md", source.artifact_area.as_ref().unwrap().path);
+        let independent = "bash tests/independent-host-check.sh";
+        fs::write(project.join(&source_path), format!("Verdict: fail\nEvidence-Command: {independent}\nEvidence-Working-Directory: .\nEvidence-Applicability: {{\"freshness\":{{\"kind\":\"live-state\",\"max_age_seconds\":600}}}}\n")).unwrap();
+        store.write_work_item(&item).unwrap();
+        // Imported history ends here. All subsequent transitions use the CLI.
+        let original_source = fs::read(project.join(&source_path)).unwrap();
+        let original_results = fs::read(&results).unwrap();
+        let issued = chrono::Utc::now();
+        let expired = (issued + chrono::TimeDelta::seconds(600)).to_rfc3339();
+        let blocked_at = if changed_source {
+            issued.to_rfc3339()
+        } else {
+            expired.clone()
+        };
+        let evidence = tmp.path().join("independent.json");
+        let mut document = serde_json::json!({"schema_version":1,"producer":"host","check":independent,"working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"independent check passed"});
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        let attach = || {
+            let mut command = fluent_cmd();
+            command.current_dir(&project).args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--review-artifact",
+                &source_path,
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ]);
+            command
+        };
+        attach().assert().success();
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success();
+        let accepted = store.read_work_item(work).unwrap();
+        let first = accepted.attempts[0].evidence_recoveries[0].clone();
+        assert_eq!(first.state, EvidenceRecoveryState::Complete);
+        assert!(accepted.merge_candidates.is_empty());
+        let first_bytes = fs::read(project.join(&first.attachment.snapshot_path)).unwrap();
+        let review = accepted.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| Some(task.id.as_str()) == first.targets[0].review_task_id.as_deref())
+            .unwrap();
+        let review_path = project
+            .join(&review.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        let reviewed_bytes = fs::read(&review_path).unwrap();
+        if changed_source {
+            fs::write(
+                project.join(&source_path),
+                [&original_source[..], b"\n"].concat(),
+            )
+            .unwrap();
+        }
+        let canonical = tmp.path().join("canonical.json");
+        fs::write(&canonical, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":blocked_at,"output":"canonical check passed"})).unwrap()).unwrap();
+        canonical_attachment_command(&project, work, &candidate, &canonical)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &blocked_at)
+            .assert()
+            .success();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &blocked_at)
+            .assert()
+            .success();
+        let unresolved = store.read_work_item(work).unwrap();
+        assert!(
+            unresolved.merge_candidates.is_empty(),
+            "an independent expired requirement must prevent readiness"
+        );
+        assert_eq!(
+            unresolved.attempts[0].evidence_recoveries[1].state,
+            EvidenceRecoveryState::Complete
+        );
+        let before_status = snapshot_tree(&project.join(".fluent/work"));
+        let status = fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &blocked_at)
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["evidence-recovery"]["can-resume"], false, "{status}");
+        assert!(
+            status["evidence-recovery"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(independent),
+            "{status}"
+        );
+        if changed_source {
+            assert!(
+                status["next-action"].is_null(),
+                "changed source must require repair: {status}"
+            );
+        } else {
+            assert!(
+                status["next-action"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("--review-artifact {source_path}")),
+                "{status}"
+            );
+        }
+        assert!(snapshot_tree(&project.join(".fluent/work")) == before_status);
+        for args in [
+            vec!["attempt", "run", work, "attempt-1", "--no-sandbox"],
+            vec!["queue", "resume", work, "--attempt", "attempt-1"],
+        ] {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(args)
+                .env("PATH", mock_path(&bin))
+                .env("FLUENT_TEST_EVIDENCE_NOW", &blocked_at)
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(independent));
+        }
+        document["run_at"] = serde_json::json!(expired);
+        document["output"] = serde_json::json!("fresh independent check passed");
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        if changed_source {
+            let before = snapshot_tree(&project.join(".fluent/work"));
+            attach()
+                .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+                .assert()
+                .failure();
+            assert!(snapshot_tree(&project.join(".fluent/work")) == before);
+            fs::write(project.join(&source_path), &original_source).unwrap();
+        }
+        if !changed_source {
+            let canonical_review = unresolved.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| {
+                    Some(task.id.as_str())
+                        == unresolved.attempts[0].evidence_recoveries[1].targets[0]
+                            .review_task_id
+                            .as_deref()
+                })
+                .unwrap();
+            let path = project
+                .join(&canonical_review.artifact_area.as_ref().unwrap().path)
+                .join("review.md");
+            let original = fs::read(&path).unwrap();
+            fs::write(
+                &path,
+                "Verdict: fail\nA later review still needs correction.\n",
+            )
+            .unwrap();
+            let before = snapshot_tree(&project.join(".fluent/work"));
+            attach()
+                .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+                .assert()
+                .failure();
+            assert!(
+                snapshot_tree(&project.join(".fluent/work")) == before,
+                "renewal cannot bypass a later failing review"
+            );
+            fs::write(path, original).unwrap();
+        }
+        attach()
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success();
+        let renewed = store.read_work_item(work).unwrap();
+        attach()
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success();
+        assert_eq!(store.read_work_item(work).unwrap(), renewed);
+        assert_eq!(
+            renewed.attempts[0].evidence_recoveries[0], first,
+            "completed history must remain intact"
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready"));
+        let ready = store.read_work_item(work).unwrap();
+        assert_eq!(ready.attempts.len(), 1);
+        assert_eq!(
+            ready.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            accepted.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count()
+        );
+        assert_eq!(fs::read(&results).unwrap(), original_results);
+        assert_eq!(
+            fs::read(project.join(&source_path)).unwrap(),
+            original_source
+        );
+        assert_eq!(
+            fs::read(project.join(&first.attachment.snapshot_path)).unwrap(),
+            first_bytes
+        );
+        assert_eq!(fs::read(review_path).unwrap(), reviewed_bytes);
+    }
+}
+
+#[test]
 fn canonical_completed_acceptance_revalidates_bindings() {
     completed_required_acceptance_revalidates_bindings(false);
 }

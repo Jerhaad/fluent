@@ -357,3 +357,9 @@ supersedes any idle review reservation, and creates a new targeted Tests Review.
 Repeating the fresh attachment reuses that recovery. An explicit fresh attachment
 can resume a settled cancellation; changed sources, dirty candidates, live owners,
 or invalid fresh proof cannot replace the pending recovery.
+
+Reviewer-requested checks remain required even when their commands are absent
+from the canonical Tester. If completed proof expires before readiness, renew
+it through the original `--review-artifact` selector; a later passing Review
+does not erase the request. Changed source bindings require repair before Fluent
+can accept fresh proof.
