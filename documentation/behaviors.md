@@ -456,6 +456,10 @@ prior exit codes were nonzero before launching another Reviewer.
 Test: src/work_attempt_loop.rs (unchanged_failed_tester_correction_plans_recheck_before_reviews)
 Test: src/work_task_executor.rs (failed_command_recheck_executes_only_the_bound_subset)
 
+An operator MAY submit exact bound host proof to targeted Tests Review before
+the local recheck through `attempt evidence attach --required-check`.
+Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
+
 ### B5
 
 IF a failed-command recheck reports another command, structured-test, or process
@@ -472,6 +476,10 @@ Reviewer or any unselected Tester command.
 Test: src/work_attempt_loop.rs (repeated_failed_command_skips_reviews_and_returns_to_writer)
 Test: src/work_task_executor.rs (failed_command_recheck_executes_only_the_bound_subset)
 
+This does not prohibit a separately authorized evidence-targeted Tests Review
+of the exact bound canonical failure.
+Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
+
 ### B7
 
 WHEN every selected failed-command recheck passes, THE SYSTEM SHALL continue to
@@ -483,6 +491,11 @@ Test: src/work_attempt_loop.rs (passing_failed_command_recheck_allows_normal_rev
 WHEN Reviewers pass after a failed-command recheck, THE SYSTEM SHALL run the
 complete configured final Tester before Learning.
 Test: src/work_attempt_loop.rs (reviews_after_passing_recheck_still_plan_full_final_tester)
+
+WHEN the existing complete canonical run plus reviewed replacements already
+satisfies every requirement on the unchanged candidate, THE SYSTEM SHALL reuse
+that evidence without another complete run.
+Test: tests/binary.rs (canonical_tester_recovery_reuses_other_passing_results)
 
 ### B9
 
@@ -611,6 +624,10 @@ Test: tests/binary.rs (attempt_evidence_attach_preserves_exact_evidence_and_iden
 WHEN an operator attaches valid host evidence to an eligible Attempt, THE SYSTEM
 SHALL plan the explicitly named failed reviewer roles and no other reviewer roles.
 Test: tests/binary.rs (attempt_evidence_attach_plans_targeted_reviews_without_writer)
+
+For a bound canonical Tester failure, THE SYSTEM SHALL instead plan one
+targeted Tests Review without a failed ordinary Review artifact.
+Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
 
 ### B3
 
@@ -833,12 +850,22 @@ Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_
 Test: src/work_attempt_loop.rs (failed_recheck_host_evidence_can_request_corrective_writer)
 Test: src/work_attempt_loop.rs (failed_related_host_diagnostic_preserves_recheck_identity)
 
+A bound canonical Tester failure SHALL admit the same exact-command evidence
+path before a recheck or exhausted Writer cap, including when later targeted
+Plan review already passed.
+Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
+
 ### B19
 
 WHEN a targeted Tests Review accepts passing evidence for the unchanged
 candidate and exact failed command, THE SYSTEM SHALL continue to Learning
 without rerunning that command.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+
+Advancement SHALL require the complete canonical run and accepted replacements
+to satisfy every outstanding Tester check and retain the other existing gates.
+Test: tests/binary.rs (canonical_tester_recovery_reuses_other_passing_results)
+Test: tests/binary.rs (canonical_tester_recovery_preserves_aggregate_blockers)
 
 ### B19a
 
@@ -852,13 +879,14 @@ Test: src/work_attempt_loop.rs (failed_related_host_diagnostic_preserves_recheck
 
 ### B20
 
-IF attached evidence names another candidate or recheck, any bound evidence or
-failure bytes change, a passing document names a different command than the
-recheck, or the Tester result contains another failure, THEN THE SYSTEM SHALL
-reject command-only recovery without making the candidate ready. A failing
-document may name a related direct command only as the diagnostic path
-described above.
-Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
+IF attached proof is stale, mismatched, unverifiable, or contradictory, THEN THE
+SYSTEM SHALL exclude it from satisfying the current check. Reviewed proof for
+one exact canonical command SHALL credit only that occurrence while independent
+failures remain blockers. A related diagnostic command SHALL NOT substitute for
+the required command; the existing failing-diagnostic recheck path remains
+available to request a correction.
+Test: tests/binary.rs (reviewed_host_result_satisfies_only_bound_check)
+Test: tests/binary.rs (canonical_tester_rejects_diagnostic_command_without_mutation)
 Test: src/work_attempt_loop.rs (passing_related_host_diagnostic_is_rejected_with_exact_command_guidance)
 
 ### B21
@@ -5989,6 +6017,11 @@ the first), bound to that exact reviewed candidate commit, before Learning or
 Merge Candidate readiness.
 Test: src/work_model.rs (final_tester_is_bound_to_the_reviewed_candidate_after_review)
 Test: src/work_attempt_loop.rs (passing_code_reviews_plan_one_final_tester_before_candidate_creation)
+
+Evidence-targeted review after a complete canonical run SHALL NOT create a
+duplicate Tester when the run and reviewed replacements satisfy every required
+check for the candidate.
+Test: tests/binary.rs (canonical_tester_recovery_reuses_other_passing_results)
 
 ### B2
 

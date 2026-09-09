@@ -126,16 +126,26 @@ pub fn harness_error_requires_project_repair(artifact_dir: &Path) -> bool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TesterConfig {
-    commands: Vec<TesterCommand>,
+pub(crate) struct TesterConfig {
+    pub(crate) commands: Vec<TesterCommand>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct TesterCommand {
-    command: String,
-    test_harness: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TesterCommand {
+    pub(crate) command: String,
+    pub(crate) test_harness: String,
     #[serde(default)]
-    reject_process_leaks: bool,
+    pub(crate) reject_process_leaks: bool,
+}
+
+/// Capture the complete configured command list before a canonical execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CanonicalRunManifest {
+    pub schema_version: u32,
+    pub config_digest: String,
+    pub extractor_digest: String,
+    pub commands: Vec<TesterCommand>,
+    pub full_run: bool,
 }
 
 /// Read-only Tester configuration used to defer filesystem setup until a Task
@@ -650,6 +660,23 @@ fn run_with_prepared_sandbox_profile_and_collector(
             Vec::new(),
         );
     }
+
+    use sha2::{Digest, Sha256};
+    let configured = read_tester_config(&candidate_workspace.join(TESTER_YAML_PATH))?;
+    let manifest = CanonicalRunManifest {
+        schema_version: 1,
+        config_digest: format!(
+            "sha256:{:x}",
+            Sha256::digest(fs::read(candidate_workspace.join(TESTER_YAML_PATH))?)
+        ),
+        extractor_digest: format!("sha256:{:x}", Sha256::digest(fs::read(&extractor_path)?)),
+        full_run: configured.commands == commands,
+        commands: commands.to_vec(),
+    };
+    fs::write(
+        artifact_dir.join("canonical-run.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
 
     let commands_dir = artifact_dir.join("commands");
     fs::create_dir_all(&commands_dir)?;

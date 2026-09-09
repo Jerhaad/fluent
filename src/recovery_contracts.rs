@@ -2646,3 +2646,302 @@ pub(crate) fn writer_completion_matrix_ref(
         ),
     })
 }
+
+/// Evaluate canonical checks without publishing state or scheduling work.
+pub(crate) struct CanonicalCheckAssessment {
+    pub results_path: PathBuf,
+    pub checks: Vec<work_model::RequiredCheck>,
+    pub outstanding: Vec<usize>,
+    pub accepted: Vec<usize>,
+    pub blockers: Vec<String>,
+}
+
+impl CanonicalCheckAssessment {
+    pub fn is_satisfied(&self) -> bool {
+        self.outstanding.is_empty() && self.blockers.is_empty()
+    }
+}
+
+pub(crate) fn bound_recovery_artifact(
+    project_root: &Path,
+    path: &str,
+) -> Result<(work_model::BoundRecheckArtifact, Vec<u8>)> {
+    let resolved = validate_managed_file_path(project_root, path)?;
+    let bytes = fs::read(resolved)?;
+    Ok((
+        work_model::BoundRecheckArtifact {
+            path: path.to_string(),
+            digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        },
+        bytes,
+    ))
+}
+
+/// Select by candidate and configured command position; Task identities only
+/// locate the immutable execution that supplies the complete-run evidence.
+pub(crate) fn assess_canonical_checks(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<CanonicalCheckAssessment> {
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .context("no completed Writer candidate")?;
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == output.commit)
+        })
+        .context("no complete canonical Tester for the current candidate")?;
+    let context = tester
+        .review_context
+        .as_ref()
+        .context("Tester comparison context is missing")?;
+    let area = &tester
+        .artifact_area
+        .as_ref()
+        .context("Tester artifact area is missing")?
+        .path;
+    anyhow::ensure!(
+        *area == work_model::work_artifact_path(&attempt.work_item_id, &attempt.id, &tester.id),
+        "Tester artifact area is not canonical"
+    );
+    let (results_ref, result_bytes) =
+        bound_recovery_artifact(project_root, &format!("{area}/tester-results.json"))?;
+    let results: crate::tester::TesterResults = serde_json::from_slice(&result_bytes)?;
+    anyhow::ensure!(
+        results.candidate_commit.as_deref() == Some(output.commit.as_str()),
+        "canonical Tester result has a different or missing candidate binding"
+    );
+    let (manifest_ref, manifest_bytes) =
+        bound_recovery_artifact(project_root, &format!("{area}/canonical-run.json"))?;
+    let manifest: crate::tester::CanonicalRunManifest = serde_json::from_slice(&manifest_bytes)?;
+    anyhow::ensure!(
+        manifest.schema_version == 1 && manifest.full_run,
+        "Tester manifest does not prove a complete canonical run"
+    );
+    let workspace = candidate_workspace_path(project_root, output);
+    for (path, expected) in [
+        (".fluent/tester.yaml", &manifest.config_digest),
+        (".fluent/extract-tester-results", &manifest.extractor_digest),
+    ] {
+        let committed = std::process::Command::new("git")
+            .current_dir(&workspace)
+            .args(["show", &format!("{}:{path}", output.commit)])
+            .output()?;
+        anyhow::ensure!(
+            committed.status.success(),
+            "cannot read committed checker configuration: {path}"
+        );
+        anyhow::ensure!(
+            &format!("sha256:{:x}", Sha256::digest(&committed.stdout)) == expected,
+            "canonical check configuration changed: {path}"
+        );
+        if path == ".fluent/tester.yaml" {
+            let config: crate::tester::TesterConfig = serde_yaml::from_slice(&committed.stdout)?;
+            anyhow::ensure!(
+                config.commands == manifest.commands,
+                "canonical manifest differs from configured commands"
+            );
+        }
+    }
+    let mut blockers = Vec::new();
+    if results.commands.len() != manifest.commands.len() {
+        blockers.push("canonical Tester is missing configured command results".into());
+    }
+    if results.error.is_some() {
+        blockers.push("canonical Tester has an unresolved extractor or harness error".into());
+    }
+    if results.summary.total != results.tests.len()
+        || results.summary.pass
+            != results
+                .tests
+                .iter()
+                .filter(|test| test.status == "pass")
+                .count()
+        || results.summary.fail
+            != results
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+        || results.summary.skipped
+            != results
+                .tests
+                .iter()
+                .filter(|test| matches!(test.status.as_str(), "skipped" | "not_run"))
+                .count()
+    {
+        blockers
+            .push("canonical Tester summary does not account for its structured results".into());
+    }
+    if results.tests.iter().any(|test| test.status == "fail") {
+        blockers.push("canonical Tester has unattributed structured failures".into());
+    }
+    let mut logs = Vec::new();
+    for (index, command) in results.commands.iter().enumerate() {
+        for (actual, expected) in [
+            (&command.stdout_log, format!("commands/{index}-stdout.log")),
+            (&command.stderr_log, format!("commands/{index}-stderr.log")),
+        ] {
+            anyhow::ensure!(
+                actual == &expected,
+                "canonical command log path does not match command {index}"
+            );
+            logs.push(bound_recovery_artifact(project_root, &format!("{area}/{expected}"))?.0);
+        }
+        if command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        {
+            blockers.push(format!("command {index} has unresolved process leaks"));
+        }
+    }
+    let mut checks = Vec::new();
+    let mut outstanding = Vec::new();
+    let mut accepted = Vec::new();
+    for (index, definition) in manifest.commands.iter().enumerate() {
+        let check = work_model::RequiredCheck {
+            id: format!(
+                "tester:{}:{index}",
+                manifest
+                    .config_digest
+                    .strip_prefix("sha256:")
+                    .context("invalid Tester configuration digest")?
+            ),
+            work_item_id: attempt.work_item_id.clone(),
+            attempt_id: attempt.id.clone(),
+            candidate_commit: output.commit.clone(),
+            command: definition.command.clone(),
+            working_directory: ".".into(),
+            source: work_model::RequiredCheckSource::CanonicalTester {
+                task_id: tester.id.clone(),
+                command_index: index,
+                results: results_ref.clone(),
+                manifest: manifest_ref.clone(),
+                logs: logs.clone(),
+                comparison_commit: context.base_commit.clone(),
+            },
+        };
+        let result = results.commands.get(index);
+        let matches = result.is_some_and(|command| {
+            command.command == definition.command && command.test_harness == definition.test_harness
+        });
+        if !matches {
+            blockers.push(format!(
+                "command {index} does not match the canonical manifest"
+            ));
+        }
+        if definition.reject_process_leaks
+            && result.is_none_or(|command| command.process_settlement.is_none())
+        {
+            blockers.push(format!(
+                "command {index} has no required process-settlement proof"
+            ));
+        }
+        if !matches || result.is_none_or(|command| command.exit_code != 0) {
+            if matches && canonical_check_is_accepted(project_root, attempt, &check) {
+                accepted.push(index);
+            } else {
+                outstanding.push(index);
+            }
+        }
+        checks.push(check);
+    }
+    Ok(CanonicalCheckAssessment {
+        results_path: project_root.join(results_ref.path),
+        checks,
+        outstanding,
+        accepted,
+        blockers,
+    })
+}
+
+fn canonical_check_is_accepted(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    check: &work_model::RequiredCheck,
+) -> bool {
+    // A newer conflicting result must receive its own review; the older pass
+    // cannot silently defeat the operator's subsequently submitted evidence.
+    let Some(recovery) = attempt.evidence_recoveries.iter().rev().find(|recovery| {
+        recovery.required_check.as_ref().is_some_and(|bound| {
+            bound.id == check.id && bound.candidate_commit == check.candidate_commit
+        })
+    }) else {
+        return false;
+    };
+    if recovery.required_check.as_ref() != Some(check)
+        || recovery.state != EvidenceRecoveryState::Complete
+        || recovery.targets.len() != 1
+    {
+        return false;
+    }
+    let validate = || -> Result<()> {
+        let (attachment, bytes) =
+            bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path)?;
+        anyhow::ensure!(
+            attachment.digest == recovery.attachment.digest,
+            "host evidence bytes changed"
+        );
+        let document = parse_evidence_document(&bytes)?;
+        anyhow::ensure!(
+            document.result == EvidenceResult::Pass
+                && document.check == check.command
+                && document.working_directory == check.working_directory,
+            "host evidence does not pass this exact check"
+        );
+        let target = &recovery.targets[0];
+        let task = attempt
+            .tasks
+            .iter()
+            .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+            .context("missing targeted review")?;
+        let context = task
+            .evidence_review_context
+            .as_ref()
+            .context("missing evidence review context")?;
+        anyhow::ensure!(
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && context.recovery_id == recovery.id
+                && context.candidate_commit == check.candidate_commit
+                && context.attachment == recovery.attachment
+                && context.prior_review_artifact == target.prior_review_artifact,
+            "targeted review binding changed"
+        );
+        let (_, binding) = bound_recovery_artifact(project_root, &target.prior_review_artifact)?;
+        anyhow::ensure!(
+            serde_json::from_slice::<work_model::RequiredCheck>(&binding)? == *check,
+            "required check snapshot changed"
+        );
+        let path = format!(
+            "{}/review.md",
+            task.artifact_area
+                .as_ref()
+                .context("missing review artifacts")?
+                .path
+        );
+        let (artifact, bytes) = bound_recovery_artifact(project_root, &path)?;
+        anyhow::ensure!(
+            target.review_digest.as_deref() == Some(artifact.digest.as_str())
+                && review::extract_verdict(std::str::from_utf8(&bytes)?) == review::Verdict::Pass,
+            "targeted review has no accepted passing result"
+        );
+        Ok(())
+    };
+    validate().is_ok()
+}

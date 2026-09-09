@@ -6187,6 +6187,14 @@ fn tester_errored(tester_results_path: &Path) -> bool {
 }
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
+    if attempt
+        .evidence_recoveries
+        .iter()
+        .any(|recovery| recovery.required_check.is_some())
+        && let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+    {
+        return Some(view.results_path);
+    }
     if let Some(source) =
         crate::host_evidence::completed_recheck_evidence_source(project_root, attempt)
     {
@@ -6239,6 +6247,20 @@ fn accepted_external_tester_commands(project_root: &Path, attempt: &Attempt) -> 
     commands.extend(
         crate::host_evidence::completed_candidate_gate_evidence_commands(project_root, attempt),
     );
+    if let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt) {
+        for index in &view.accepted {
+            let command = &view.checks[*index].command;
+            // The legacy gate accepts text selectors. Export a text selector
+            // only when every occurrence is satisfied by its own exact check.
+            if !view
+                .outstanding
+                .iter()
+                .any(|other| view.checks[*other].command == *command)
+            {
+                commands.push(command.clone());
+            }
+        }
+    }
     commands.sort();
     commands.dedup();
     commands
@@ -8836,12 +8858,88 @@ fn interpret_reviews(
                     }
                 }
             }
-            item.attempts[attempt_index]
-                .evidence_recoveries
-                .iter_mut()
-                .find(|entry| entry.id == recovery.id)
-                .unwrap()
-                .state = EvidenceRecoveryState::Complete;
+            if recovery.required_check.is_some()
+                && targeted.iter().all(|task| {
+                    task.artifact_area.as_ref().is_some_and(|area| {
+                        fs::read_to_string(project_root.join(&area.path).join("review.md"))
+                            .is_ok_and(|source| review::extract_verdict(&source) == Verdict::Pass)
+                    })
+                })
+            {
+                // Persist acceptance before any later pause or advancement. A
+                // fresh mutation cannot lose a peer's stop or Task settlement.
+                store.mutate_work_item(&item.id, |fresh| {
+                    let attempt = fresh
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == attempt_id)
+                        .ok_or_else(|| WorkModelError::AttemptNotFound {
+                            id: attempt_id.into(),
+                        })?;
+                    attempt.ensure_not_canceled()?;
+                    let rejected =
+                        |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+                            attempt_id: attempt_id.into(),
+                            reason,
+                        };
+                    let assessment =
+                        crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+                            .map_err(|error| rejected(format!("{error:#}")))?;
+                    if !assessment
+                        .checks
+                        .iter()
+                        .any(|check| Some(check) == recovery.required_check.as_ref())
+                    {
+                        return Err(rejected(
+                            "required check changed before review acceptance".into(),
+                        ));
+                    }
+                    for expected in &targeted {
+                        if !attempt.tasks.iter().any(|task| task == expected) {
+                            return Err(rejected(
+                                "targeted review changed before acceptance".into(),
+                            ));
+                        }
+                    }
+                    let current = attempt
+                        .evidence_recoveries
+                        .iter_mut()
+                        .find(|entry| entry.id == recovery.id)
+                        .ok_or_else(|| rejected("evidence recovery disappeared".into()))?;
+                    if *current != recovery {
+                        return Err(rejected(
+                            "evidence recovery changed before acceptance".into(),
+                        ));
+                    }
+                    for target in &mut current.targets {
+                        let task = targeted
+                            .iter()
+                            .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+                            .unwrap();
+                        let path =
+                            format!("{}/review.md", task.artifact_area.as_ref().unwrap().path);
+                        let (artifact, bytes) =
+                            crate::recovery_contracts::bound_recovery_artifact(project_root, &path)
+                                .map_err(|error| rejected(format!("{error:#}")))?;
+                        if review::extract_verdict(&String::from_utf8_lossy(&bytes))
+                            != Verdict::Pass
+                        {
+                            return Err(rejected("targeted review no longer passes".into()));
+                        }
+                        target.review_digest = Some(artifact.digest);
+                    }
+                    current.state = EvidenceRecoveryState::Complete;
+                    Ok(())
+                })?;
+                item = store.read_work_item(&item.id)?;
+            } else {
+                item.attempts[attempt_index]
+                    .evidence_recoveries
+                    .iter_mut()
+                    .find(|entry| entry.id == recovery.id)
+                    .unwrap()
+                    .state = EvidenceRecoveryState::Complete;
+            }
         }
     }
     if !item.attempts[attempt_index].kind.is_review_only_like() {
@@ -8975,8 +9073,43 @@ fn interpret_reviews(
             baseline_path.as_deref(),
         )
     });
-    let tester_external_evidence_is_recovered =
-        tester_recheck_is_recovered || tester_review_evidence_is_recovered;
+    let canonical_assessment = item.attempts[attempt_index]
+        .evidence_recoveries
+        .iter()
+        .any(|recovery| recovery.required_check.is_some())
+        .then(|| {
+            crate::recovery_contracts::assess_canonical_checks(
+                project_root,
+                &item.attempts[attempt_index],
+            )
+        });
+    if tester_gate_applicable
+        && canonical_assessment.as_ref().is_some_and(|assessment| {
+            assessment
+                .as_ref()
+                .map_or(true, |view| !view.is_satisfied())
+        })
+    {
+        let reason = match canonical_assessment.as_ref().unwrap() {
+            Ok(view) => view.blockers.iter().cloned().chain(view.outstanding.iter().map(|index| {
+                let check = &view.checks[*index];
+                format!("Required check {} remains unresolved: `{}`. Attach exact host proof with `fluent attempt evidence attach {} {} --candidate {} --required-check {} --evidence-file <path>`.", check.id, check.command, item.id, attempt_id, check.candidate_commit, check.id)
+            })).collect::<Vec<_>>().join("\n\n"),
+            Err(error) => format!("Required canonical check bindings cannot be verified: {error:#}. Restore the named immutable proof before retrying."),
+        };
+        let handoff_path = work_artifact_path(&item.id, attempt_id, "required-check-needs-user.md");
+        crate::atomic_write::atomic_write(&project_root.join(&handoff_path), reason.as_bytes())?;
+        item.attempts[attempt_index].status = AttemptStatus::NeedsUser;
+        item.attempts[attempt_index].pause_kind = Some(PauseKind::HostEvidence);
+        item.attempts[attempt_index].review_state = Some(AttemptReviewState::Failed);
+        write_attempt_work_item(store, &item)?;
+        return Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path });
+    }
+    let tester_external_evidence_is_recovered = tester_recheck_is_recovered
+        || tester_review_evidence_is_recovered
+        || canonical_assessment
+            .as_ref()
+            .is_some_and(|assessment| assessment.as_ref().is_ok_and(|view| view.is_satisfied()));
     let tester_fail_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
@@ -13511,6 +13644,7 @@ mod tests {
                 attempt
                     .evidence_recoveries
                     .push(crate::work_model::EvidenceRecovery {
+                        required_check: None,
                         id: format!("host-evidence-{}", &digest[7..19]),
                         candidate_commit: candidate.clone(),
                         attachment: crate::work_model::EvidenceAttachment {
@@ -15448,6 +15582,7 @@ mod tests {
                 attempt
                     .evidence_recoveries
                     .push(crate::work_model::EvidenceRecovery {
+                        required_check: None,
                         id: "host-evidence-abc".to_string(),
                         candidate_commit: "abc123".to_string(),
                         attachment: crate::work_model::EvidenceAttachment {
@@ -15813,6 +15948,7 @@ mod tests {
                 attempt
                     .evidence_recoveries
                     .push(crate::work_model::EvidenceRecovery {
+                        required_check: None,
                         id: recovery_id.clone(),
                         candidate_commit: "abc123".to_string(),
                         attachment: attachment.clone(),
@@ -16646,6 +16782,7 @@ mod tests {
                 attempt
                     .evidence_recoveries
                     .push(crate::work_model::EvidenceRecovery {
+                        required_check: None,
                         id: "host-evidence-abc".to_string(),
                         candidate_commit: candidate.clone(),
                         attachment: attachment.clone(),

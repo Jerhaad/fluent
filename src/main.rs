@@ -710,8 +710,25 @@ fn cmd_attempt(
                     review_artifact,
                     recheck_artifact,
                     plan_row,
+                    required_check,
                 },
         } => {
+            if let Some(required_check) = required_check {
+                let recovery = fluent::host_evidence::attach_required_check(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &required_check,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached host evidence {} for required check {}; targeted review: tests",
+                    recovery.attachment.digest, required_check
+                );
+                return Ok(());
+            }
             if let Some(plan_row) = plan_row {
                 anyhow::ensure!(
                     review_artifact.is_empty() && recheck_artifact.is_none(),

@@ -1847,6 +1847,7 @@ mod tests {
                 completed_at: None,
             }],
             evidence_recoveries: vec![crate::work_model::EvidenceRecovery {
+                required_check: None,
                 id: recovery_id.to_string(),
                 candidate_commit: candidate_commit.to_string(),
                 attachment,
@@ -1879,6 +1880,7 @@ mod tests {
             work_item_id: "work-1".to_string(),
             status: AttemptStatus::NeedsUser,
             evidence_recoveries: vec![crate::work_model::EvidenceRecovery {
+                required_check: None,
                 id: "host-evidence-1".to_string(),
                 candidate_commit: "abc123".to_string(),
                 attachment: crate::work_model::EvidenceAttachment {

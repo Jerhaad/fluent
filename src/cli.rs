@@ -740,6 +740,9 @@ pub enum AttemptEvidenceCommands {
         /// Required Plan completion row completed by this authorized-host run
         #[arg(long, value_name = "ROW", conflicts_with_all = ["review_artifact", "recheck_artifact"])]
         plan_row: Option<String>,
+        /// Stable canonical check selector printed in evidence recovery guidance
+        #[arg(long, value_name = "ID", conflicts_with_all = ["review_artifact", "recheck_artifact", "plan_row"])]
+        required_check: Option<String>,
     },
 }
 

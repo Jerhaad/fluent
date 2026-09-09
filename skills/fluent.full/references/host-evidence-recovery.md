@@ -26,6 +26,25 @@ schedules a Writer on the existing Attempt.
 
 ## Attach host-only evidence
 
+For an exact failed canonical Tester command, use the required-check selector:
+
+```sh
+fluent attempt evidence attach <work-item> <attempt> \
+  --candidate <exact-commit> --required-check <check-id> \
+  --evidence-file <host-result.json>
+```
+
+The check ID is `tester:<tester.yaml-sha256>:<zero-based-command-index>`, using
+the digest recorded in that Tester's `canonical-run.json` without its `sha256:`
+prefix. The evidence must name the exact command and candidate-relative working
+directory (`.` for canonical commands). This attachment requires no failed
+ordinary Review, failed-command recheck, or new Writer. Resume the Attempt to
+run its targeted Tests Review. An attached result grants no pass until review
+accepts it; accepted proof credits that occurrence only. Fluent retains the
+failed result and reuses other valid results from the complete canonical run.
+A diagnostic command cannot replace the required command. Creating this result
+still requires the existing authorization to run on its host.
+
 Use this path when the candidate does not need a source change and either a
 failed review asks for proof that a trusted host can run or the final candidate
 gate asks for one command-shaped `Test:` reference that canonical Tester did not

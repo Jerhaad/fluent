@@ -2015,6 +2015,7 @@ pub(crate) fn attach_with_cancellation_policy(
             .map(|task| task.role.clone())
             .collect::<Vec<_>>();
         let recovery = attempt.attach_evidence_recovery(EvidenceRecovery {
+            required_check: None,
             id: format!("host-evidence-{recovery_token}"),
             candidate_commit: candidate_commit.to_string(),
             attachment: EvidenceAttachment {
@@ -2470,6 +2471,7 @@ pub fn attach_plan_row(
             };
 
             let recovery = EvidenceRecovery {
+                required_check: None,
                 id: recovery_id,
                 candidate_commit: candidate_commit.to_string(),
                 attachment: EvidenceAttachment {
@@ -5259,4 +5261,250 @@ mod tests {
         );
         assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
+}
+
+/// Attach one exact canonical command result through the existing targeted
+/// Tests Review lifecycle. Declaring a selector never authorizes execution.
+pub fn attach_required_check(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    candidate_commit: &str,
+    required_check: &str,
+    evidence_file: &Path,
+) -> Result<EvidenceRecovery> {
+    anyhow::ensure!(
+        !fs::symlink_metadata(evidence_file)?
+            .file_type()
+            .is_symlink(),
+        "evidence file must not be a symlink"
+    );
+    let bytes = fs::read(evidence_file)?;
+    let document = parse_evidence_document(&bytes)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let snapshot = snapshot_path(work_item_id, attempt_id, &digest)?;
+    let operation = work_model::RecoveryOperationRequest::new(
+        "host-evidence-required-check-attachment",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.to_string()),
+        None,
+        Some(digest.clone()),
+        None,
+        None,
+        Some(format!(
+            "sha256:{:x}",
+            Sha256::digest(required_check.as_bytes())
+        )),
+    );
+    // Reject an unrelated command without creating lock or artifact paths.
+    // The lock-held mutation below repeats the complete source assessment.
+    let observed = store.read_work_item_snapshot(work_item_id)?;
+    let observed_attempt = observed
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+        .context("Attempt is missing")?;
+    let observed_checks =
+        crate::recovery_contracts::assess_canonical_checks(project_root, observed_attempt)?;
+    let observed_check = observed_checks
+        .checks
+        .iter()
+        .find(|check| check.id == required_check)
+        .context("required check is not in the current canonical configuration")?;
+    anyhow::ensure!(
+        document.check == observed_check.command
+            && document.working_directory == observed_check.working_directory,
+        "evidence must name the exact required command and working directory"
+    );
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
+    Ok(store.mutate_work_item_from_external(
+        work_item_id,
+        format!("attach evidence for required check {required_check}"),
+        Some(snapshot.clone()),
+        |item| {
+            let reject = |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.into(),
+                reason,
+            };
+            item.validate_recovery_operation(project_root, &operation)?;
+            let attempt = item
+                .attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| reject("Attempt is missing".into()))?;
+            if item
+                .merge_candidates
+                .iter()
+                .any(|candidate| candidate.attempt_id == attempt_id)
+                || attempt.tasks.iter().any(|task| {
+                    task.status == TaskStatus::Executing
+                        || crate::lease::is_leased(&crate::lease::task_lock_path(
+                            project_root,
+                            work_item_id,
+                            &task.id,
+                        ))
+                })
+            {
+                return Err(reject(
+                    "candidate or execution owners are not settled".into(),
+                ));
+            }
+            let output = attempt
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+                .and_then(|task| task.output.as_ref())
+                .ok_or_else(|| reject("no completed Writer candidate".into()))?;
+            if output.commit != candidate_commit
+                || !candidate_workspace_is_clean_at(project_root, output, candidate_commit)
+            {
+                return Err(reject(
+                    "host evidence requires the unchanged clean candidate".into(),
+                ));
+            }
+            let assessment =
+                crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+                    .map_err(|error| reject(format!("{error:#}")))?;
+            let check = assessment
+                .checks
+                .iter()
+                .find(|check| check.id == required_check)
+                .ok_or_else(|| {
+                    reject("required check is not in the current canonical configuration".into())
+                })?
+                .clone();
+            if document.check != check.command
+                || document.working_directory != check.working_directory
+            {
+                return Err(reject(
+                    "evidence must name the exact required command and working directory".into(),
+                ));
+            }
+            let binding_bytes =
+                serde_json::to_vec_pretty(&check).map_err(|error| reject(error.to_string()))?;
+            let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+            let binding_path = snapshot_path(work_item_id, attempt_id, &binding_digest)
+                .map_err(|error| reject(error.to_string()))?;
+            if let Some(prior) = attempt.evidence_recoveries.iter().find(|prior| {
+                prior.required_check.as_ref() == Some(&check) && prior.attachment.digest == digest
+            }) {
+                for (path, expected) in [(&snapshot, &bytes), (&binding_path, &binding_bytes)] {
+                    let (_, actual) =
+                        crate::recovery_contracts::bound_recovery_artifact(project_root, path)
+                            .map_err(|error| reject(format!("{error:#}")))?;
+                    if actual != *expected {
+                        return Err(reject("recorded evidence bytes changed".into()));
+                    }
+                }
+                return Ok(prior.clone());
+            }
+            let work_model::RequiredCheckSource::CanonicalTester { command_index, .. } =
+                &check.source;
+            if !assessment.outstanding.contains(command_index) {
+                return Err(reject(
+                    "required check has no outstanding failed command".into(),
+                ));
+            }
+            if attempt.active_evidence_recovery().is_some()
+                || attempt
+                    .tasks
+                    .iter()
+                    .any(|task| task.status == TaskStatus::Planned)
+            {
+                return Err(reject(
+                    "another reserved Task or evidence review must settle first".into(),
+                ));
+            }
+            if !matches!(
+                attempt.status,
+                work_model::AttemptStatus::Reviewing
+                    | work_model::AttemptStatus::NeedsUser
+                    | work_model::AttemptStatus::Failed
+                    | work_model::AttemptStatus::Executing
+                    | work_model::AttemptStatus::Complete
+            ) {
+                return Err(reject(
+                    "Attempt is not eligible for evidence recovery".into(),
+                ));
+            }
+            let recovery_id = format!(
+                "required-check-{:x}",
+                Sha256::digest(format!("{binding_digest}\0{digest}").as_bytes())
+            );
+            for (path, content) in [(&snapshot, &bytes), (&binding_path, &binding_bytes)] {
+                publish_snapshot(project_root, path, content)
+                    .map_err(|error| reject(format!("{error:#}")))?;
+            }
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .unwrap();
+            attempt.resume_cancellation()?;
+            attempt.attach_evidence_recovery(EvidenceRecovery {
+                required_check: Some(check),
+                id: recovery_id.clone(),
+                candidate_commit: candidate_commit.into(),
+                attachment: EvidenceAttachment {
+                    snapshot_path: snapshot.clone(),
+                    digest: digest.clone(),
+                },
+                targets: vec![EvidenceReviewTarget {
+                    role: "tests".into(),
+                    prior_review_artifact: binding_path.clone(),
+                    review_task_id: None,
+                    review_digest: None,
+                }],
+                state: EvidenceRecoveryState::Reviewing,
+                created_at: work_model::now_iso8601(),
+                code_change_classification: None,
+            })?;
+            let task_ids = item.add_next_review_tasks(attempt_id, &["tests"])?;
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .unwrap();
+            let task = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_ids[0])
+                .unwrap();
+            task.input_artifacts.extend([
+                ArtifactRef {
+                    producer_id: "required-check".into(),
+                    path: binding_path.clone(),
+                },
+                ArtifactRef {
+                    producer_id: "host-evidence".into(),
+                    path: snapshot.clone(),
+                },
+            ]);
+            let recovery = attempt
+                .evidence_recoveries
+                .iter_mut()
+                .find(|recovery| recovery.id == recovery_id)
+                .unwrap();
+            recovery.targets[0].review_task_id = Some(task.id.clone());
+            task.evidence_review_context = Some(EvidenceReviewContext {
+                recovery_id,
+                candidate_commit: candidate_commit.into(),
+                attachment: recovery.attachment.clone(),
+                prior_review_artifact: binding_path,
+            });
+            attempt.pause_kind = None;
+            attempt.pause_recovery = None;
+            attempt.completed_at = None;
+            let result = recovery.clone();
+            let next = crate::work_status::derive_attempt_recovery_next_action(
+                Some(attempt),
+                Some(project_root),
+            );
+            attempt.record_recovery_operation(&operation, next)?;
+            Ok(result)
+        },
+    )?)
 }

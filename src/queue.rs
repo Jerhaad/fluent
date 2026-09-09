@@ -1905,6 +1905,7 @@ mod tests {
         attempt.status = AttemptStatus::Reviewing;
         attempt.review_state = Some(AttemptReviewState::NotReviewed);
         attempt.evidence_recoveries.push(EvidenceRecovery {
+            required_check: None,
             id: recovery_id,
             candidate_commit: candidate,
             attachment,

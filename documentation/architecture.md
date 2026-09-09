@@ -1107,6 +1107,29 @@ write Task. Uncertain verdicts without failures mark the Attempt
 
 ### Host evidence recovery
 
+Canonical Tester failures also accept exact host proof through
+`fluent attempt evidence attach --required-check <id>`. A selector uses
+`tester:<tester.yaml-sha256>:<zero-based-command-index>` so repeated command
+entries remain separate requirements. A canonical execution writes
+`canonical-run.json` before running commands. That manifest records the full
+command list, configuration and extractor digests, and whether the run covers
+the complete configured list.
+
+The existing Attempt evidence-recovery record stores a typed `required_check`
+with the project Work Item, Attempt, candidate, exact command, relative working
+directory, comparison commit, original Tester Task, and immutable manifest,
+result, and log references. Attachment creates a targeted Tests Review without
+requiring a failed ordinary Review or recheck. Passing review records its digest
+and acceptance before further advancement. `recovery_contracts` evaluates the
+complete original result plus applicable reviewed replacements; it does not
+rewrite the failed source result. Missing commands, unattributed structured
+failures, invalid extraction, and unresolved process leaks still block readiness.
+
+Work and Attempt record schema 3 and transaction schema 2 fence executables
+that predate this authority. Current readers accept earlier supported records
+and schema-1 journals. The compatibility test invokes the pinned pre-change
+executable against both published and pending state and checks exact bytes.
+
 When one missing focused result prevents a Tests Reviewer from deciding, the
 review may emit one `Evidence-Command` and one candidate-relative
 `Evidence-Working-Directory`, either as plain lines or Markdown list entries.

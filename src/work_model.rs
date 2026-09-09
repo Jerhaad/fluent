@@ -30,7 +30,7 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// before this marker omit the field and are read as version 0. They remain
 /// readable, but the explicit `work-item upgrade` command rewrites them using
 /// this version after checking every record.
-pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 3;
 pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
@@ -7893,9 +7893,37 @@ pub struct EvidenceReviewTarget {
     pub review_digest: Option<String>,
 }
 
+/// Identify one canonical command independently of execution Task order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredCheck {
+    pub id: String,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub candidate_commit: String,
+    pub command: String,
+    pub working_directory: String,
+    pub source: RequiredCheckSource,
+}
+
+/// Preserve immutable source bytes and the original Task as provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RequiredCheckSource {
+    CanonicalTester {
+        task_id: String,
+        command_index: usize,
+        results: BoundRecheckArtifact,
+        manifest: BoundRecheckArtifact,
+        logs: Vec<BoundRecheckArtifact>,
+        comparison_commit: Option<String>,
+    },
+}
+
 /// Append-only, host-owned recovery record for an unchanged candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceRecovery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_check: Option<RequiredCheck>,
     pub id: String,
     pub candidate_commit: String,
     pub attachment: EvidenceAttachment,
@@ -9355,7 +9383,7 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -10611,7 +10639,7 @@ impl WorkModelStore {
             Some(base) => base.checked_add(1),
             None => Some(0),
         };
-        if transaction.schema_version != WorkItemTransaction::SCHEMA_VERSION
+        if !(1..=WorkItemTransaction::SCHEMA_VERSION).contains(&transaction.schema_version)
             || transaction.id != id
             || transaction.work_item.id != id
             || expected_target != Some(transaction.target_revision)
@@ -13309,6 +13337,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let recovery = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-123".to_string(),
             candidate_commit: "abc123".to_string(),
             attachment: EvidenceAttachment {
@@ -13462,6 +13491,7 @@ random banner prose that must be ignored
             sha2::Sha256::digest(targeted_content.as_bytes())
         );
         let recovery = EvidenceRecovery {
+            required_check: None,
             id: recovery_id,
             candidate_commit: candidate.clone(),
             attachment,
@@ -13558,6 +13588,7 @@ random banner prose that must be ignored
         fs::create_dir_all(root.join(&later_path).parent().unwrap()).unwrap();
         fs::write(root.join(&later_path), later_content).unwrap();
         let later_recovery = EvidenceRecovery {
+            required_check: None,
             id: later_recovery_id.clone(),
             candidate_commit: candidate.clone(),
             attachment: EvidenceAttachment {
@@ -13635,6 +13666,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let prior = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-123".to_string(),
             candidate_commit: "abc123".to_string(),
             attachment: attachment.clone(),
@@ -13650,6 +13682,7 @@ random banner prose that must be ignored
         };
         attempt.attach_evidence_recovery(prior).unwrap();
         let later = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-123-recheck".to_string(),
             candidate_commit: "abc123".to_string(),
             attachment,
@@ -13679,6 +13712,7 @@ random banner prose that must be ignored
             digest: "sha256:proof".to_string(),
         };
         let recovery = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-proof".to_string(),
             candidate_commit: "candidate".to_string(),
             attachment: attachment.clone(),
@@ -13771,6 +13805,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let mut prior = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-prior".to_string(),
             candidate_commit: "abc123".to_string(),
             attachment: EvidenceAttachment {
@@ -13788,6 +13823,7 @@ random banner prose that must be ignored
         attempt.evidence_recoveries[0] = prior;
 
         let next = EvidenceRecovery {
+            required_check: None,
             id: "host-evidence-next".to_string(),
             candidate_commit: "abc123".to_string(),
             attachment: EvidenceAttachment {
@@ -20748,6 +20784,7 @@ random banner prose that must be ignored
     #[test]
     fn evidence_code_changes_advance_the_effective_write_cap() {
         let recovery = |id: &str, state: EvidenceRecoveryState| EvidenceRecovery {
+            required_check: None,
             id: id.to_string(),
             candidate_commit: format!("candidate-{id}"),
             attachment: EvidenceAttachment {
@@ -20929,7 +20966,7 @@ pub enum EvidenceResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BoundRecheckArtifact {
+pub struct BoundRecheckArtifact {
     pub(crate) path: String,
     pub(crate) digest: String,
 }
