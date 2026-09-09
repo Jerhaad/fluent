@@ -1125,6 +1125,24 @@ complete original result plus applicable reviewed replacements; it does not
 rewrite the failed source result. Missing commands, unattributed structured
 failures, invalid extraction, and unresolved process leaks still block readiness.
 
+`CheckApplicability` declares bounded environment facts, comparison refs, and a
+freshness rule beside each command. Required Plan rows may add an `Applicability`
+column with a JSON object; review requests use one `Evidence-Applicability` JSON
+line; Tester command entries use `applicability`. The default is candidate-code,
+which has no age-only expiry. Live-state requires positive `max_age_seconds` and
+expires at that boundary. Unsupported or missing required facts block acceptance.
+Mutable comparison names resolve when execution or authorized host attachment
+captures the binding; current ref values cannot establish historical values.
+
+Canonical manifests and managed verification receipts record only declared facts
+the executor can observe (`os` and `architecture`) and resolved comparison commits.
+Unknown environment facts remain unproven until applicable host evidence supplies
+them. Receipt ingestion preserves recorded observations. The neutral validator
+rechecks those bindings for acceptance; a passing exit alone does not establish
+the declared environment. Plan proof overlays the current completion matrix only
+when its row identity, command, requirements, and candidate match the preserved
+source. A no-change Writer does not alter that original source or Review.
+
 Work and Attempt record schema 3 and transaction schema 2 fence executables
 that predate this authority. Current readers accept earlier supported records
 and schema-1 journals. The compatibility test invokes the pinned pre-change

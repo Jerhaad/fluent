@@ -109,6 +109,40 @@ Fluent snapshots the exact document, binds it to that candidate, and reruns only
 the named reviewers. Do not edit the candidate or invent a commit. Inspect the
 Work Item again for the next action.
 
+## Declare when a command result applies
+
+Keep applicability beside its command. A required host Plan row can add an
+`Applicability` column containing JSON. An authorized Tests Review can add one
+`Evidence-Applicability: <JSON>` line. A `.fluent/tester.yaml` command entry uses:
+
+```yaml
+applicability:
+  environment: {os: linux}
+  comparison_refs: [main]
+  freshness: {kind: candidate-code}
+```
+
+Host evidence for that command includes the declared observations and the actual
+comparison commits used during execution:
+
+```json
+{"environment":{"os":"linux"},"comparison_commits":{"main":"<full-commit>"}}
+```
+
+These fields supplement the schema-1 evidence document above. Record actual
+observations; a current ref value cannot establish what an older run compared.
+Fluent records only declared local `os` and `architecture` facts automatically.
+Other facts need verifiable host evidence under the existing review rules.
+
+Code checks have no age-only expiry, including code checks executed on an
+external host. Checks about current external state must instead declare
+`freshness: {kind: live-state, max_age_seconds: 3600}` (the JSON spelling uses
+quoted keys and values). Such evidence expires exactly at `run_at` plus that
+interval. Missing, unsupported, or expired policies do not imply unlimited
+validity. No-change Writer history preserves acceptance only while the exact
+candidate, configuration, command, comparison, environment, and freshness still
+match. Declaring a policy grants no permission to execute on another host.
+
 ## Run one focused Tests check
 
 Use this public path when a failed Tests Review asks for one exact

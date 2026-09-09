@@ -40074,13 +40074,22 @@ fn canonical_evidence_fixture(
     work: &str,
     commands: &[&str],
 ) -> (PathBuf, String, PathBuf) {
+    canonical_evidence_fixture_with_applicability(tmp, work, commands, serde_json::json!({}))
+}
+
+fn canonical_evidence_fixture_with_applicability(
+    tmp: &TempDir,
+    work: &str,
+    commands: &[&str],
+    applicability: serde_json::Value,
+) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::{TaskKind, TaskOutput, TaskStatus, WorkItem};
     let project = setup_git_project(tmp);
     let definitions = commands
         .iter()
         .map(|command| {
             serde_json::json!({
-                "command": command, "test_harness": "shell-harness"
+                "command": command, "test_harness": "shell-harness", "applicability": applicability
             })
         })
         .collect::<Vec<_>>();
@@ -40517,4 +40526,349 @@ fn canonical_tester_failed_host_result_cannot_satisfy_check() {
     )
     .unwrap();
     assert_eq!(stored["result"], "fail");
+}
+
+fn canonical_attachment_command(
+    project: &Path,
+    work: &str,
+    candidate: &str,
+    evidence: &Path,
+) -> LoggedCommand {
+    let config = fs::read(project.join(".fluent/tester.yaml")).unwrap();
+    let selector = format!("tester:{:x}:1", Sha256::digest(&config));
+    let mut command = fluent_cmd();
+    command.current_dir(project).args([
+        "attempt",
+        "evidence",
+        "attach",
+        work,
+        "attempt-1",
+        "--candidate",
+        candidate,
+        "--evidence-file",
+        evidence.to_str().unwrap(),
+        "--required-check",
+        &selector,
+    ]);
+    command
+}
+
+#[test]
+fn candidate_code_evidence_does_not_expire_by_age() {
+    let tmp = TempDir::new().unwrap();
+    let work = "code-evidence-age";
+    let (project, candidate, _) = canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+    let evidence = tmp.path().join("old-code.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1, "producer": "authorized fixture host", "check": "false", "working_directory": ".",
+        "result": "pass", "run_at": "1999-01-01T00:00:00Z", "output": "passed"
+    })).unwrap()).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready"));
+}
+
+#[test]
+fn live_state_evidence_obeys_declared_freshness() {
+    let tmp = TempDir::new().unwrap();
+    let work = "live-evidence-age";
+    let (project, candidate, _) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["true", "false"],
+        serde_json::json!({"freshness": {"kind": "live-state", "max_age_seconds": 60}}),
+    );
+    let evidence = tmp.path().join("old-live.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1, "producer": "authorized fixture host", "check": "false", "working_directory": ".",
+        "result": "pass", "run_at": "1999-01-01T00:00:00Z", "output": "passed"
+    })).unwrap()).unwrap();
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("expired"));
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+}
+
+#[test]
+fn evidence_reuse_rejects_changed_missing_or_expired_bindings() {
+    let tmp = TempDir::new().unwrap();
+    let work = "environment-bindings";
+    let (project, candidate, _) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["true", "false"],
+        serde_json::json!({"environment": {"os": "linux"}}),
+    );
+    let evidence = tmp.path().join("environment.json");
+    let mut document = serde_json::json!({
+        "schema_version": 1, "producer": "authorized fixture host", "check": "false", "working_directory": ".",
+        "result": "pass", "run_at": "2026-09-09T12:00:00Z", "output": "passed"
+    });
+    fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("environment"));
+    document["environment"] = serde_json::json!({"os": "macos"});
+    fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("environment"));
+    document["environment"] = serde_json::json!({"os": "linux"});
+    fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+}
+
+#[test]
+fn review_requested_evidence_obeys_declared_applicability() {
+    let tmp = TempDir::new().unwrap();
+    let work = "review-applicability";
+    let (project, candidate, review) = setup_focused_evidence_fixture(
+        &tmp,
+        work,
+        "tests",
+        "Verdict: fail\nEvidence-Command: true\nEvidence-Working-Directory: .\nEvidence-Applicability: {\"environment\":{\"os\":\"linux\"}}\n",
+    );
+    let evidence = tmp.path().join("review-host.json");
+    let document = serde_json::json!({"schema_version":1,"producer":"host","check":"true","working_directory":".",
+        "result":"pass","run_at":"2026-09-09T12:00:00Z","output":"ok"});
+    fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            work,
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+            "--review-artifact",
+            &review,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("environment"));
+}
+
+#[test]
+fn canonical_evidence_rejects_changed_comparison_ref() {
+    let tmp = TempDir::new().unwrap();
+    let work = "comparison-binding";
+    let (project, candidate, _) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["true", "false"],
+        serde_json::json!({"comparison_refs": ["main"]}),
+    );
+    let evidence = tmp.path().join("comparison.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass",
+        "run_at":"2026-09-09T12:00:00Z","output":"ok","comparison_commits":{"main":candidate}
+    })).unwrap()).unwrap();
+    // The declared name moves while the candidate and command text stay fixed.
+    commit_file(
+        &project,
+        "README.md",
+        "new comparison state\n",
+        "Update comparison state",
+    );
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("comparison ref"));
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+}
+
+#[test]
+fn accepted_evidence_survives_no_change_writer_and_resume() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let work = "no-change-evidence";
+    let (project, candidate, _) = canonical_evidence_fixture(&tmp, work, &["false", "false"]);
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 0, "false");
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let store = WorkModelStore::new(&project);
+    let mut history = store.read_work_item(work).unwrap();
+    let preserved = history.attempts[0].evidence_recoveries[0].clone();
+    assert_eq!(preserved.state, EvidenceRecoveryState::Complete);
+    let mut later = history.attempts[0].tasks[0].clone();
+    later.id = "attempt-1-write-2".into();
+    later.artifact_area.as_mut().unwrap().path = work_artifact_path(work, "attempt-1", &later.id);
+    let declaration_path = format!(
+        "{}/no-change.json",
+        later.artifact_area.as_ref().unwrap().path
+    );
+    later.output.as_mut().unwrap().no_change = Some(NoChangeOutput {
+        schema_version: 1,
+        declaration_path: declaration_path.clone(),
+        reason: "Preserve the verified candidate".into(),
+        verification: vec![NoChangeVerification {
+            command: "true".into(),
+            result: NoChangeVerificationResult::Pass,
+        }],
+    });
+    let artifact = project.join(&later.artifact_area.as_ref().unwrap().path);
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("transcript.jsonl"), "{}\n").unwrap();
+    fs::write(project.join(declaration_path),serde_json::to_vec(&serde_json::json!({"schema_version":1,"candidate_commit":candidate,"reason":"Preserve the verified candidate","verification":[{"command":"true","result":"pass"}]})).unwrap()).unwrap();
+    // Preserve a historical no-change Writer before beginning the next public
+    // recovery. Candidate integrity and acceptance stay in production code.
+    history.attempts[0].tasks.push(later);
+    store.write_work_item(&history).unwrap();
+    let result_path = project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/attempt-1-tester/tester-results.json"
+    ));
+    let original = fs::read(&result_path).unwrap();
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready"));
+    let completed = store.read_work_item(work).unwrap();
+    assert_eq!(completed.attempts[0].evidence_recoveries[0], preserved);
+    assert_eq!(
+        completed.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1
+    );
+    assert_eq!(
+        completed.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(result_path).unwrap(), original);
+}
+
+#[test]
+fn managed_verification_preserves_observed_applicability() {
+    let tmp = TempDir::new().unwrap();
+    let work = "observed-applicability";
+    let request = format!(
+        "Verdict: fail\nEvidence-Command: true\nEvidence-Working-Directory: .\nEvidence-Applicability: {{\"environment\":{{\"os\":\"{}\"}},\"comparison_refs\":[\"main\"]}}\n",
+        std::env::consts::OS
+    );
+    let (project, candidate, review) =
+        setup_focused_evidence_fixture(&tmp, work, "tests", &request);
+    let bin = tmp.path().join("bin");
+    write_mock_executable(&bin, "sandbox-exec", "#!/bin/sh\nshift 2\nexec \"$@\"\n");
+    fluent_cmd()
+        .current_dir(&project)
+        .args([
+            "attempt",
+            "evidence",
+            "run",
+            work,
+            "attempt-1",
+            "--review-artifact",
+            &review,
+        ])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .env(
+            "FLUENT_TEST_FOCUSED_EVIDENCE_SANDBOX_EXEC",
+            bin.join("sandbox-exec"),
+        )
+        .args(["task", "run", work, "attempt-1", "attempt-1-verification-1"])
+        .assert()
+        .success();
+    accept_focused_verification(&project, work).unwrap();
+    let item = work_item_value(&project, work);
+    let attachment = &item["attempts"][0]["evidence_recoveries"][0]["attachment"];
+    let document: serde_json::Value = serde_json::from_slice(
+        &fs::read(project.join(attachment["snapshot_path"].as_str().unwrap())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(document["environment"]["os"], std::env::consts::OS);
+    assert_eq!(document["comparison_commits"]["main"], candidate);
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &fs::read(project.join(format!(
+            ".fluent/work/artifacts/{work}/attempt-1/attempt-1-verification-1/receipt.json"
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["environment"], document["environment"]);
+    assert_eq!(
+        receipt["comparison_commits"],
+        document["comparison_commits"]
+    );
+}
+
+#[test]
+fn canonical_gate_requires_declared_environment_proof() {
+    let tmp = TempDir::new().unwrap();
+    let work = "unobserved-environment";
+    let (project, _, _) = canonical_evidence_fixture_with_applicability(
+        &tmp,
+        work,
+        &["true"],
+        serde_json::json!({"environment":{"runtime":"declared-host"}}),
+    );
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is ready").not());
+    let item = work_item_value(&project, work);
+    assert_eq!(item["attempts"][0]["status"], "needs-user");
+    assert_eq!(item["attempts"][0]["pause_kind"], "host-evidence");
+    assert_eq!(
+        item["attempts"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["kind"] == "write")
+            .count(),
+        1
+    );
 }

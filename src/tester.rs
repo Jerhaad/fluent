@@ -132,6 +132,11 @@ pub(crate) struct TesterConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TesterCommand {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::work_model::CheckApplicability::is_default"
+    )]
+    pub(crate) applicability: crate::work_model::CheckApplicability,
     pub(crate) command: String,
     pub(crate) test_harness: String,
     #[serde(default)]
@@ -141,6 +146,12 @@ pub(crate) struct TesterCommand {
 /// Capture the complete configured command list before a canonical execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CanonicalRunManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment: Vec<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applicability: Vec<crate::work_model::ResolvedCheckApplicability>,
     pub schema_version: u32,
     pub config_digest: String,
     pub extractor_digest: String,
@@ -664,6 +675,34 @@ fn run_with_prepared_sandbox_profile_and_collector(
     use sha2::{Digest, Sha256};
     let configured = read_tester_config(&candidate_workspace.join(TESTER_YAML_PATH))?;
     let manifest = CanonicalRunManifest {
+        run_at: Some(crate::work_model::now_iso8601()),
+        environment: commands
+            .iter()
+            .map(|command| {
+                command
+                    .applicability
+                    .environment
+                    .keys()
+                    .filter_map(|key| {
+                        let value = match key.as_str() {
+                            "os" => std::env::consts::OS,
+                            "architecture" => std::env::consts::ARCH,
+                            _ => return None,
+                        };
+                        Some((key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .collect(),
+        applicability: commands
+            .iter()
+            .map(|command| {
+                crate::recovery_contracts::resolve_check_applicability(
+                    candidate_workspace,
+                    &command.applicability,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
         schema_version: 1,
         config_digest: format!(
             "sha256:{:x}",

@@ -2813,7 +2813,21 @@ pub(crate) fn assess_canonical_checks(
     let mut outstanding = Vec::new();
     let mut accepted = Vec::new();
     for (index, definition) in manifest.commands.iter().enumerate() {
+        let applicability = match manifest.applicability.get(index) {
+            Some(binding) => binding.clone(),
+            None if definition.applicability.is_default() => {
+                work_model::ResolvedCheckApplicability::default()
+            }
+            None => bail!("required command applicability snapshot is missing"),
+        };
+        anyhow::ensure!(
+            applicability.definition == definition.applicability
+                && resolve_check_applicability(&workspace, &definition.applicability)?
+                    == applicability,
+            "declared comparison ref or check applicability changed since execution"
+        );
         let check = work_model::RequiredCheck {
+            applicability,
             id: format!(
                 "tester:{}:{index}",
                 manifest
@@ -2851,8 +2865,25 @@ pub(crate) fn assess_canonical_checks(
                 "command {index} has no required process-settlement proof"
             ));
         }
-        if !matches || result.is_none_or(|command| command.exit_code != 0) {
-            if matches && canonical_check_is_accepted(project_root, attempt, &check) {
+        let local_evidence = EvidenceDocument {
+            schema_version: 1,
+            producer: tester.id.clone(),
+            check: check.command.clone(),
+            working_directory: check.working_directory.clone(),
+            result: EvidenceResult::Pass,
+            output: String::new(),
+            run_at: manifest.run_at.clone().unwrap_or_default(),
+            environment: manifest.environment.get(index).cloned().unwrap_or_default(),
+            comparison_commits: check.applicability.comparison_commits.clone(),
+        };
+        let local_applies = validate_check_applicability_at(
+            &check.applicability,
+            &local_evidence,
+            chrono::Utc::now(),
+        )
+        .is_ok();
+        if !matches || !local_applies || result.is_none_or(|command| command.exit_code != 0) {
+            if matches && required_check_is_accepted(project_root, attempt, &check) {
                 accepted.push(index);
             } else {
                 outstanding.push(index);
@@ -2869,7 +2900,7 @@ pub(crate) fn assess_canonical_checks(
     })
 }
 
-fn canonical_check_is_accepted(
+pub(crate) fn required_check_is_accepted(
     project_root: &Path,
     attempt: &work_model::Attempt,
     check: &work_model::RequiredCheck,
@@ -2897,6 +2928,7 @@ fn canonical_check_is_accepted(
             "host evidence bytes changed"
         );
         let document = parse_evidence_document(&bytes)?;
+        validate_check_applicability_at(&check.applicability, &document, chrono::Utc::now())?;
         anyhow::ensure!(
             document.result == EvidenceResult::Pass
                 && document.check == check.command
@@ -2924,10 +2956,17 @@ fn canonical_check_is_accepted(
             "targeted review binding changed"
         );
         let (_, binding) = bound_recovery_artifact(project_root, &target.prior_review_artifact)?;
-        anyhow::ensure!(
-            serde_json::from_slice::<work_model::RequiredCheck>(&binding)? == *check,
-            "required check snapshot changed"
-        );
+        match &check.source {
+            work_model::RequiredCheckSource::CanonicalTester { .. } => anyhow::ensure!(
+                serde_json::from_slice::<work_model::RequiredCheck>(&binding)? == *check,
+                "required check snapshot changed"
+            ),
+            work_model::RequiredCheckSource::ReviewRequested { request, .. } => anyhow::ensure!(
+                request.path == target.prior_review_artifact
+                    && request.digest == format!("sha256:{:x}", Sha256::digest(&binding)),
+                "review request snapshot changed"
+            ),
+        }
         let path = format!(
             "{}/review.md",
             task.artifact_area
@@ -2944,4 +2983,189 @@ fn canonical_check_is_accepted(
         Ok(())
     };
     validate().is_ok()
+}
+
+#[cfg(test)]
+mod applicability_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_freshness_uses_exact_expiry_and_requires_a_policy() {
+        let mut binding = work_model::ResolvedCheckApplicability::default();
+        let document: EvidenceDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "producer": "host", "check": "check", "working_directory": ".",
+            "result": "pass", "run_at": "2026-09-09T12:00:00Z", "output": "passed"
+        }))
+        .unwrap();
+        let at = |time: &str| {
+            DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        assert!(
+            validate_check_applicability_at(&binding, &document, at("2099-01-01T00:00:00Z"))
+                .is_ok()
+        );
+        binding.definition.freshness = work_model::CheckFreshness::LiveState {
+            max_age_seconds: Some(60),
+        };
+        assert!(
+            validate_check_applicability_at(&binding, &document, at("2026-09-09T12:00:59Z"))
+                .is_ok()
+        );
+        assert!(
+            validate_check_applicability_at(&binding, &document, at("2026-09-09T12:01:00Z"))
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+        binding.definition.freshness = work_model::CheckFreshness::LiveState {
+            max_age_seconds: None,
+        };
+        assert!(
+            validate_check_applicability_at(&binding, &document, at("2026-09-09T12:00:00Z"))
+                .unwrap_err()
+                .to_string()
+                .contains("freshness")
+        );
+    }
+}
+
+pub(crate) fn resolve_check_applicability(
+    workspace: &Path,
+    definition: &work_model::CheckApplicability,
+) -> Result<work_model::ResolvedCheckApplicability> {
+    definition.validate().map_err(anyhow::Error::msg)?;
+    let mut comparison_commits = BTreeMap::new();
+    for name in &definition.comparison_refs {
+        let commit = git::run_stdout(
+            workspace,
+            &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
+            "resolve declared comparison commit",
+        )?;
+        comparison_commits.insert(name.clone(), commit);
+    }
+    Ok(work_model::ResolvedCheckApplicability {
+        definition: definition.clone(),
+        comparison_commits,
+    })
+}
+
+pub(crate) fn validate_check_applicability_at(
+    binding: &work_model::ResolvedCheckApplicability,
+    document: &EvidenceDocument,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    for (name, expected) in &binding.definition.environment {
+        anyhow::ensure!(
+            document.environment.get(name) == Some(expected),
+            "required environment fact {name} is missing or changed"
+        );
+    }
+    anyhow::ensure!(
+        binding
+            .comparison_commits
+            .iter()
+            .all(|(name, commit)| document.comparison_commits.get(name) == Some(commit)),
+        "required comparison commit is missing or changed"
+    );
+    if let work_model::CheckFreshness::LiveState { max_age_seconds } = binding.definition.freshness
+    {
+        let seconds = max_age_seconds
+            .filter(|seconds| *seconds > 0 && *seconds <= i64::MAX as u64)
+            .context("live-state evidence is missing a supported freshness expiry")?;
+        let recorded = DateTime::parse_from_rfc3339(&document.run_at)?.with_timezone(&chrono::Utc);
+        let expiry = chrono::TimeDelta::try_seconds(seconds as i64)
+            .and_then(|duration| recorded.checked_add_signed(duration))
+            .context("unsupported live-state freshness expiry")?;
+        anyhow::ensure!(
+            recorded <= now && now < expiry,
+            "live-state evidence has expired or has an unverified future timestamp"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_check_applicability(
+    workspace: &Path,
+    binding: &work_model::ResolvedCheckApplicability,
+    document: &EvidenceDocument,
+) -> Result<()> {
+    anyhow::ensure!(
+        resolve_check_applicability(workspace, &binding.definition)? == *binding,
+        "declared comparison ref changed since execution"
+    );
+    validate_check_applicability_at(binding, document, chrono::Utc::now())
+}
+
+pub(crate) fn validate_required_check_binding(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    check: &work_model::RequiredCheck,
+) -> Result<()> {
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .context("required check has no current candidate")?;
+    anyhow::ensure!(
+        check.work_item_id == attempt.work_item_id
+            && check.attempt_id == attempt.id
+            && check.candidate_commit == output.commit,
+        "required check belongs to another candidate or Attempt"
+    );
+    match &check.source {
+        work_model::RequiredCheckSource::CanonicalTester { .. } => {
+            anyhow::ensure!(
+                assess_canonical_checks(project_root, attempt)?
+                    .checks
+                    .contains(check),
+                "required canonical check changed"
+            );
+        }
+        work_model::RequiredCheckSource::ReviewRequested {
+            task_id,
+            request,
+            comparison_commit,
+        } => {
+            let task = attempt
+                .tasks
+                .iter()
+                .find(|task| {
+                    task.id == *task_id
+                        && task.kind == TaskKind::Review
+                        && task.status == TaskStatus::Complete
+                })
+                .context("required reviewer request has no completed source Task")?;
+            let context = task
+                .review_context
+                .as_ref()
+                .context("reviewer request has no comparison context")?;
+            anyhow::ensure!(
+                context.candidate_commit == check.candidate_commit
+                    && &context.base_commit == comparison_commit
+                    && task
+                        .artifact_area
+                        .as_ref()
+                        .is_some_and(|area| request.path == format!("{}/review.md", area.path)),
+                "review request source binding changed"
+            );
+            let (actual, bytes) = bound_recovery_artifact(project_root, &request.path)?;
+            anyhow::ensure!(actual == *request, "review request source bytes changed");
+            let definition = review::extract_focused_evidence_request(std::str::from_utf8(&bytes)?)
+                .context("review request is missing its command declaration")?;
+            anyhow::ensure!(
+                definition.command == check.command
+                    && definition.working_directory == check.working_directory
+                    && resolve_check_applicability(
+                        &candidate_workspace_path(project_root, output),
+                        &definition.applicability
+                    )? == check.applicability,
+                "review request command, environment, freshness, or comparison changed"
+            );
+        }
+    }
+    Ok(())
 }

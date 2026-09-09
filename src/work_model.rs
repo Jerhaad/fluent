@@ -3109,12 +3109,83 @@ pub enum WriterCompletionRequirementKind {
     Finding,
 }
 
+/// Declare only the facts that determine whether one command result applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckApplicability {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comparison_refs: Vec<String>,
+    #[serde(default)]
+    pub freshness: CheckFreshness,
+}
+
+impl CheckApplicability {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.environment.len() > 32 || self.comparison_refs.len() > 16 {
+            return Err("check applicability exceeds the supported fact limit".into());
+        }
+        if self.environment.iter().any(|(key, value)| {
+            key.trim().is_empty() || key.len() > 64 || value.trim().is_empty() || value.len() > 256
+        }) {
+            return Err(
+                "check environment facts must have bounded nonempty names and values".into(),
+            );
+        }
+        if let CheckFreshness::LiveState { max_age_seconds } = self.freshness {
+            if !max_age_seconds.is_some_and(|seconds| seconds > 0 && seconds <= i64::MAX as u64) {
+                return Err(
+                    "live-state check requires a supported explicit freshness expiry".into(),
+                );
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        if self.comparison_refs.iter().any(|name| {
+            name.is_empty() || name.len() > 256 || name.starts_with('-') || !names.insert(name)
+        }) {
+            return Err("check comparison refs must be bounded, unique Git references".into());
+        }
+        Ok(())
+    }
+
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum CheckFreshness {
+    #[default]
+    CandidateCode,
+    LiveState {
+        max_age_seconds: Option<u64>,
+    },
+}
+
+/// Resolve mutable comparison names when an authorized execution is captured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedCheckApplicability {
+    pub definition: CheckApplicability,
+    pub comparison_commits: BTreeMap<String, String>,
+}
+
+impl ResolvedCheckApplicability {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// One immutable requirement in the planning portion of a Writer completion
 /// matrix. `verification_refs` preserves the approved `Test:` marker or Plan
 /// verification cell; it does not create a new test-selector vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PlanCommand {
+    #[serde(default, skip_serializing_if = "CheckApplicability::is_default")]
+    pub applicability: CheckApplicability,
     /// The exact shell invocation approved for this Plan row.
     pub command: String,
     /// The directory in which the command must run. `.` means the candidate
@@ -3141,6 +3212,7 @@ impl PlanCommand {
         let command = crate::plan_command::resolve_legacy_plan_command(texts)?;
         let environment = crate::plan_command::extract_command_environment(&command);
         Some(Self {
+            applicability: CheckApplicability::default(),
             command,
             working_directory: default_plan_working_directory(),
             environment,
@@ -3292,6 +3364,12 @@ impl WriterCompletionContract {
             ));
         }
         for row in &self.requirements {
+            if let Some(command) = &row.command {
+                command
+                    .applicability
+                    .validate()
+                    .map_err(|error| format!("{}: {error}", row.id))?;
+            }
             if row.responsibility == Some(CompletionResponsibility::Unknown)
                 || (row.kind != WriterCompletionRequirementKind::Plan
                     && !writer_responsibility(row.responsibility))
@@ -3779,6 +3857,7 @@ fn parse_approach_completion_requirements(source: &str) -> Vec<WriterCompletionR
 fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequirement> {
     let mut requirements = Vec::new();
     let mut responsibility_column = None;
+    let mut applicability_column = None;
     for line in source.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') {
@@ -3791,6 +3870,7 @@ fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequi
             .collect::<Vec<_>>();
         if cells.first() == Some(&"#") {
             responsibility_column = cells.iter().position(|cell| *cell == "Responsibility");
+            applicability_column = cells.iter().position(|cell| *cell == "Applicability");
         }
         if cells.len() < 3
             || cells[0].is_empty()
@@ -3811,6 +3891,17 @@ fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequi
             command_texts.push(*verification);
         }
         let row_id = format!("plan:step-{}", cells[0]);
+        let mut command = PlanCommand::from_legacy_texts(&row_id, command_texts);
+        if let Some(policy) = applicability_column
+            .and_then(|index| cells.get(index))
+            .filter(|text| !text.is_empty())
+        {
+            // A malformed declaration cannot fall back to an unrestricted command.
+            command = command.and_then(|mut command| {
+                command.applicability = serde_json::from_str(policy.trim_matches('`')).ok()?;
+                Some(command)
+            });
+        }
         requirements.push(WriterCompletionRequirement {
             responsibility: responsibility_column.map(|column| {
                 CompletionResponsibility::from_plan(cells.get(column).copied().unwrap_or(""))
@@ -3820,7 +3911,7 @@ fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequi
             source: format!("plan.md#step-{}", cells[0]),
             requirement: cells[1].to_string(),
             verification_refs,
-            command: PlanCommand::from_legacy_texts(&row_id, command_texts),
+            command,
         });
     }
     requirements
@@ -7324,6 +7415,11 @@ pub struct Task {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationChecker {
+    #[serde(
+        default,
+        skip_serializing_if = "ResolvedCheckApplicability::is_default"
+    )]
+    pub applicability: ResolvedCheckApplicability,
     pub schema_version: u32,
     pub command: String,
     pub working_directory: String,
@@ -7896,6 +7992,11 @@ pub struct EvidenceReviewTarget {
 /// Identify one canonical command independently of execution Task order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequiredCheck {
+    #[serde(
+        default,
+        skip_serializing_if = "ResolvedCheckApplicability::is_default"
+    )]
+    pub applicability: ResolvedCheckApplicability,
     pub id: String,
     pub work_item_id: String,
     pub attempt_id: String,
@@ -7909,6 +8010,11 @@ pub struct RequiredCheck {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RequiredCheckSource {
+    ReviewRequested {
+        task_id: String,
+        request: BoundRecheckArtifact,
+        comparison_commit: Option<String>,
+    },
     CanonicalTester {
         task_id: String,
         command_index: usize,
@@ -7917,6 +8023,12 @@ pub enum RequiredCheckSource {
         logs: Vec<BoundRecheckArtifact>,
         comparison_commit: Option<String>,
     },
+}
+
+impl RequiredCheckSource {
+    pub fn is_canonical_tester(&self) -> bool {
+        matches!(self, Self::CanonicalTester { .. })
+    }
 }
 
 /// Append-only, host-owned recovery record for an unchanged candidate.
@@ -12424,6 +12536,32 @@ mod tests {
             Some(&contract),
             "the approved manifest is stamped before the Attempt is persisted"
         );
+    }
+
+    #[test]
+    fn plan_check_captures_approved_applicability() {
+        for (policy, valid) in [
+            (
+                r#"{"environment":{"os":"linux"},"comparison_refs":["main"]}"#,
+                true,
+            ),
+            (r#"{"freshness":{"kind":"live-state"}}"#, false),
+            ("invalid", false),
+        ] {
+            let context = PlanningContext {
+                plan: Some(format!(
+                    "| # | State reached | Behaviors | Verification | Applicability | Responsibility | Req? |\n| 1 | Check host. | | `bash check.sh` | {policy} | host | Yes |\n"
+                )),
+                ..Default::default()
+            };
+            let contract = WriterCompletionContract::from_planning_context(&context).unwrap();
+            assert_eq!(contract.validate().is_ok(), valid, "{policy}");
+            if valid {
+                let command = contract.requirements[0].command.as_ref().unwrap();
+                assert_eq!(command.applicability.environment["os"], "linux");
+                assert_eq!(command.applicability.comparison_refs, ["main"]);
+            }
+        }
     }
 
     #[test]
@@ -20948,6 +21086,10 @@ pub(crate) fn publish_recovery_snapshot(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceDocument {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub comparison_commits: BTreeMap<String, String>,
     pub schema_version: u32,
     pub producer: String,
     pub check: String,
@@ -20974,6 +21116,11 @@ pub struct BoundRecheckArtifact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct PlanHostEvidenceBinding {
+    #[serde(
+        default,
+        skip_serializing_if = "ResolvedCheckApplicability::is_default"
+    )]
+    pub(crate) applicability: ResolvedCheckApplicability,
     pub(crate) schema_version: u32,
     pub(crate) work_item_id: String,
     pub(crate) attempt_id: String,

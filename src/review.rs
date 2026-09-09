@@ -388,6 +388,7 @@ pub fn extract_evidence_disposition(content: &str) -> Option<EvidenceDisposition
 /// One focused command requested by a failed Tests Reviewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedEvidenceRequest {
+    pub applicability: crate::work_model::CheckApplicability,
     pub command: String,
     pub working_directory: String,
 }
@@ -422,7 +423,14 @@ pub fn extract_focused_evidence_request(content: &str) -> Option<FocusedEvidence
     {
         return None;
     }
+    let declarations = values("Evidence-Applicability");
+    let applicability = match declarations.as_slice() {
+        [] => crate::work_model::CheckApplicability::default(),
+        [value] => serde_json::from_str(value).ok()?,
+        _ => return None,
+    };
     Some(FocusedEvidenceRequest {
+        applicability,
         command: commands[0].to_string(),
         working_directory: working_directories[0].to_string(),
     })

@@ -656,6 +656,7 @@ mod tests {
         };
         let mut contract = WriterCompletionContract::from_planning_context(&context).unwrap();
         contract.requirements[0].command = Some(crate::work_model::PlanCommand {
+            applicability: Default::default(),
             command: "bash tests/host.sh".into(),
             working_directory: ".".into(),
             environment: BTreeMap::new(),

@@ -663,11 +663,17 @@ Test: src/work_attempt_loop.rs (evidence_targeted_reviews_advance_unchanged_cand
 ### B8
 
 IF a host evidence attachment names a stale Work Item, Attempt, candidate,
-review artifact, or a frontier owned by a live Task or landing operation, THEN
-THE SYSTEM SHALL reject it without changing Work or candidate state.
+review artifact, or state owned by a live Task or landing operation, THEN
+THE SYSTEM SHALL reject it without changing Work or candidate state. Missing or
+changed command, configuration, comparison, declared environment, or required
+freshness bindings SHALL exclude a result from satisfying its check while
+preserving the original evidence.
 Test: tests/binary.rs (attempt_evidence_attach_rejects_stale_or_owned_frontier_without_mutation)
 Test: tests/binary.rs (attempt_evidence_attach_rejects_live_task_owner_without_mutation)
 Test: tests/binary.rs (attempt_evidence_attach_revalidates_after_landing_owner_releases_lock)
+Test: tests/binary.rs (evidence_reuse_rejects_changed_missing_or_expired_bindings)
+Test: tests/binary.rs (live_state_evidence_obeys_declared_freshness)
+Test: tests/binary.rs (canonical_evidence_rejects_changed_comparison_ref)
 
 ### B9
 
@@ -930,6 +936,15 @@ review. Repeating the exact attachment SHALL return the existing recovery;
 stale candidates, commands, or rows SHALL be rejected without mutation.
 Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
 Test: src/host_evidence.rs (plan_row_host_evidence_rejects_wrong_command_without_mutation)
+
+A later no-change Writer or unrelated Task SHALL NOT invalidate accepted proof
+when the candidate and all check bindings still match. Original Writer, matrix,
+result, and targeted Review identities remain provenance. Candidate-code checks
+SHALL NOT expire solely because of age; live-state checks require an explicit
+valid expiry and become inapplicable at that boundary.
+Test: tests/binary.rs (accepted_evidence_survives_no_change_writer_and_resume)
+Test: tests/binary.rs (candidate_code_evidence_does_not_expire_by_age)
+Test: src/recovery_contracts.rs (evidence_freshness_uses_exact_expiry_and_requires_a_policy)
 
 ### B26
 

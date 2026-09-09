@@ -798,6 +798,13 @@ pub fn run_focused(
     let candidate_workspace = canonical_candidate_workspace(&candidate_workspace)?;
     resolve_working_directory(&candidate_workspace, &working_directory)?;
     let checker = work_model::VerificationChecker {
+        applicability: crate::recovery_contracts::resolve_check_applicability(
+            &candidate_workspace,
+            &declared
+                .as_ref()
+                .map(|request| request.applicability.clone())
+                .unwrap_or_default(),
+        )?,
         schema_version: 1,
         command: command.clone(),
         working_directory: working_directory.clone(),
@@ -1260,6 +1267,18 @@ pub(crate) fn completed_plan_host_matrix_ref(
         if evidence.result != EvidenceResult::Pass
             || evidence.check != binding.command
             || evidence.working_directory != binding.working_directory
+            || source_row
+                .command
+                .as_ref()
+                .map(|command| command.applicability.clone())
+                .unwrap_or_default()
+                != binding.applicability.definition
+            || crate::recovery_contracts::validate_check_applicability(
+                &project_root.join(&writer.output.as_ref()?.workspace_path),
+                &binding.applicability,
+                &evidence,
+            )
+            .is_err()
         {
             return None;
         }
@@ -1308,6 +1327,9 @@ pub(crate) fn apply_completed_plan_host_evidence(
     let Some(output) = writer.output.as_ref() else {
         return false;
     };
+    if writer_completion_matrix_ref(project_root, attempt, writer).as_ref() != Some(source_matrix) {
+        return false;
+    }
     let mut changed = false;
     for artifact in attempt.artifacts.iter().filter(|artifact| {
         artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
@@ -1322,17 +1344,32 @@ pub(crate) fn apply_completed_plan_host_evidence(
         if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
             || binding.work_item_id != attempt.work_item_id
             || binding.attempt_id != attempt.id
-            || binding.writer_task_id != writer.id
             || binding.candidate_commit != output.commit
             || binding.result != EvidenceResult::Pass
         {
             continue;
         }
+        let Some(original_writer) = attempt.tasks.iter().find(|task| {
+            task.id == binding.writer_task_id
+                && task.kind == TaskKind::Write
+                && task.status == TaskStatus::Complete
+                && task
+                    .output
+                    .as_ref()
+                    .is_some_and(|original| original.commit == output.commit)
+        }) else {
+            continue;
+        };
+        let Some(original_source) =
+            writer_completion_matrix_ref(project_root, attempt, original_writer)
+        else {
+            continue;
+        };
         let source_matrix_value = match crate::recovery_contracts::plan_host_source_matrix(
             project_root,
             attempt,
-            writer,
-            source_matrix,
+            original_writer,
+            &original_source,
             &binding.source_matrix,
             &binding.plan_row,
         ) {
@@ -1370,6 +1407,19 @@ pub(crate) fn apply_completed_plan_host_evidence(
         if evidence.result != EvidenceResult::Pass
             || evidence.check != binding.command
             || evidence.working_directory != binding.working_directory
+            || source_row
+                .command
+                .as_ref()
+                .map(|command| &command.applicability)
+                .cloned()
+                .unwrap_or_default()
+                != binding.applicability.definition
+            || crate::recovery_contracts::validate_check_applicability(
+                &project_root.join(&output.workspace_path),
+                &binding.applicability,
+                &evidence,
+            )
+            .is_err()
         {
             continue;
         }
@@ -1402,6 +1452,8 @@ pub(crate) fn apply_completed_plan_host_evidence(
         };
         if resolve_plan_row_command(row).as_deref() != Some(binding.command.as_str())
             || row.requirement != binding.requirement
+            || row.command != source_row.command
+            || row.verification_refs != source_row.verification_refs
         {
             continue;
         }
@@ -1938,6 +1990,68 @@ pub(crate) fn attach_with_cancellation_policy(
                 review_artifacts,
             )?,
         };
+        let required_check = if recheck_frontier.is_none()
+            && candidate_gate_frontier.is_none()
+            && prior_reviews.len() == 1
+            && prior_reviews[0].role == "tests"
+        {
+            let prior = &prior_reviews[0];
+            let path = review_artifact_path(prior).expect("validated prior review artifact");
+            let (request_ref, request_bytes) =
+                crate::recovery_contracts::bound_recovery_artifact(project_root, &path).map_err(
+                    |error| WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: attempt_id.into(),
+                        reason: format!("{error:#}"),
+                    },
+                )?;
+            if let Some(request) =
+                review::extract_focused_evidence_request(&String::from_utf8_lossy(&request_bytes))
+            {
+                let context = prior
+                    .review_context
+                    .as_ref()
+                    .expect("validated review context");
+                let applicability = crate::recovery_contracts::resolve_check_applicability(
+                    &project_root.join(&context.candidate_workspace_path),
+                    &request.applicability,
+                )
+                .and_then(|binding| {
+                    crate::recovery_contracts::validate_check_applicability_at(
+                        &binding,
+                        &document,
+                        chrono::Utc::now(),
+                    )?;
+                    Ok(binding)
+                })
+                .map_err(|error| {
+                    WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: attempt_id.into(),
+                        reason: format!("{error:#}"),
+                    }
+                })?;
+                Some(work_model::RequiredCheck {
+                    applicability,
+                    id: format!(
+                        "review:{}",
+                        request_ref.digest.strip_prefix("sha256:").unwrap()
+                    ),
+                    work_item_id: work_item_id.into(),
+                    attempt_id: attempt_id.into(),
+                    candidate_commit: candidate_commit.into(),
+                    command: request.command,
+                    working_directory: request.working_directory,
+                    source: work_model::RequiredCheckSource::ReviewRequested {
+                        task_id: prior.id.clone(),
+                        request: request_ref,
+                        comparison_commit: context.base_commit.clone(),
+                    },
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let interrupted_correction_id = (recheck_frontier.is_none()
             && candidate_gate_frontier.is_none())
         .then(|| {
@@ -2015,7 +2129,7 @@ pub(crate) fn attach_with_cancellation_policy(
             .map(|task| task.role.clone())
             .collect::<Vec<_>>();
         let recovery = attempt.attach_evidence_recovery(EvidenceRecovery {
-            required_check: None,
+            required_check,
             id: format!("host-evidence-{recovery_token}"),
             candidate_commit: candidate_commit.to_string(),
             attachment: EvidenceAttachment {
@@ -2356,7 +2470,14 @@ pub fn attach_plan_row(
                 return Err(ineligible("evidence working directory does not match the approved host command"));
             }
             let source_matrix_digest = format!("sha256:{:x}", Sha256::digest(&matrix_bytes));
+            let applicability = crate::recovery_contracts::resolve_check_applicability(
+                &project_root.join(&output.workspace_path),
+                &row.command.as_ref().map(|command| command.applicability.clone()).unwrap_or_default(),
+            ).map_err(|error| ineligible(&format!("{error:#}")))?;
+            crate::recovery_contracts::validate_check_applicability_at(&applicability, &document, chrono::Utc::now())
+                .map_err(|error| ineligible(&format!("{error:#}")))?;
             let binding = PlanHostEvidenceBinding {
+                applicability,
                 schema_version: PLAN_HOST_EVIDENCE_SCHEMA_VERSION,
                 work_item_id: work_item_id.to_string(),
                 attempt_id: attempt_id.to_string(),
@@ -3652,6 +3773,25 @@ pub(crate) fn completed_review_evidence_commands(
             {
                 return None;
             }
+            if let Some(check) = &recovery.required_check {
+                if !matches!(
+                    check.source,
+                    work_model::RequiredCheckSource::ReviewRequested { .. }
+                ) || crate::recovery_contracts::validate_required_check_binding(
+                    project_root,
+                    attempt,
+                    check,
+                )
+                .is_err()
+                    || !crate::recovery_contracts::required_check_is_accepted(
+                        project_root,
+                        attempt,
+                        check,
+                    )
+                {
+                    return None;
+                }
+            }
             let evidence_bytes =
                 fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
             if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
@@ -3670,6 +3810,9 @@ pub(crate) fn completed_review_evidence_commands(
                 let prior_review =
                     fs::read_to_string(project_root.join(&target.prior_review_artifact)).ok()?;
                 let request = review::extract_focused_evidence_request(&prior_review)?;
+                if recovery.required_check.is_none() && !request.applicability.is_default() {
+                    return None;
+                }
                 if evidence.check != request.command
                     || request.working_directory != "."
                     || evidence.working_directory != request.working_directory
@@ -4016,6 +4159,8 @@ mod tests {
 
         let evidence_path = project.path().join("evidence.json");
         let document = EvidenceDocument {
+            environment: Default::default(),
+            comparison_commits: Default::default(),
             schema_version: 1,
             producer: "authorized host".to_string(),
             check: command.to_string(),
@@ -4151,6 +4296,8 @@ mod tests {
 
         let evidence_path = project.path().join("host-evidence.json");
         let document = EvidenceDocument {
+            environment: Default::default(),
+            comparison_commits: Default::default(),
             schema_version: 1,
             producer: "authorized host".to_string(),
             check: command.to_string(),
@@ -4270,6 +4417,8 @@ mod tests {
 
         let evidence_path = evidence_dir.path().join("host-evidence.json");
         let document = EvidenceDocument {
+            environment: Default::default(),
+            comparison_commits: Default::default(),
             schema_version: 1,
             producer: "authorized host".to_string(),
             check: command.to_string(),
@@ -4532,6 +4681,39 @@ mod tests {
             WriterCompletionState::Complete
         );
         assert!(host_matrix.path.ends_with("writer-completion.json"));
+        let mut later_history = attempt.clone();
+        let mut later_writer = writer.clone();
+        later_writer.id = "attempt-1-write-2".into();
+        later_writer.artifact_area.as_mut().unwrap().path =
+            work_artifact_path("work-1", "attempt-1", &later_writer.id);
+        later_history.tasks.push(later_writer.clone());
+        let later_source =
+            writer_completion_matrix_ref(project.path(), &later_history, &later_writer).unwrap();
+        let mut later_matrix: WriterCompletionMatrix =
+            serde_json::from_slice(&source_bytes).unwrap();
+        later_matrix.task_id = later_writer.id.clone();
+        let later_path = project.path().join(&later_source.path);
+        fs::create_dir_all(later_path.parent().unwrap()).unwrap();
+        fs::write(
+            &later_path,
+            serde_json::to_vec_pretty(&later_matrix).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            apply_completed_plan_host_evidence(
+                project.path(),
+                &later_history,
+                &later_writer,
+                &later_source,
+                &mut later_matrix
+            ),
+            "a later Writer with the same candidate must retain accepted Plan evidence"
+        );
+        assert_eq!(
+            fs::read(project.path().join(&source.path)).unwrap(),
+            source_bytes
+        );
+
         assert_eq!(
             fs::read(project.path().join(&source.path)).unwrap(),
             source_bytes,
@@ -4772,6 +4954,7 @@ mod tests {
                 "The check preserves isolation and reports content-free evidence.".to_string(),
             ],
             command: Some(work_model::PlanCommand {
+                applicability: Default::default(),
                 command: "python3 tests/fluent_merge_readiness.py".to_string(),
                 working_directory: ".".to_string(),
                 environment: std::collections::BTreeMap::new(),
@@ -5318,6 +5501,11 @@ pub fn attach_required_check(
             && document.working_directory == observed_check.working_directory,
         "evidence must name the exact required command and working directory"
     );
+    crate::recovery_contracts::validate_check_applicability_at(
+        &observed_check.applicability,
+        &document,
+        chrono::Utc::now(),
+    )?;
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
     Ok(store.mutate_work_item_from_external(
         work_item_id,
@@ -5351,6 +5539,18 @@ pub fn attach_required_check(
                     "candidate or execution owners are not settled".into(),
                 ));
             }
+            for task in &attempt.tasks {
+                if let Some(area) = &task.artifact_area {
+                    if crate::execution::execution_is_live(
+                        &crate::execution::record_path_for_artifact(project_root, &area.path),
+                    )
+                    .map_err(|error| {
+                        reject(format!("cannot establish execution settlement: {error:#}"))
+                    })? {
+                        return Err(reject("the Attempt has a live execution owner".into()));
+                    }
+                }
+            }
             let output = attempt
                 .tasks
                 .iter()
@@ -5359,7 +5559,11 @@ pub fn attach_required_check(
                 .and_then(|task| task.output.as_ref())
                 .ok_or_else(|| reject("no completed Writer candidate".into()))?;
             if output.commit != candidate_commit
-                || !candidate_workspace_is_clean_at(project_root, output, candidate_commit)
+                || !crate::recovery_contracts::candidate_workspace_is_clean_at_managed(
+                    project_root,
+                    output,
+                    candidate_commit,
+                )
             {
                 return Err(reject(
                     "host evidence requires the unchanged clean candidate".into(),
@@ -5376,6 +5580,12 @@ pub fn attach_required_check(
                     reject("required check is not in the current canonical configuration".into())
                 })?
                 .clone();
+            crate::recovery_contracts::validate_check_applicability_at(
+                &check.applicability,
+                &document,
+                chrono::Utc::now(),
+            )
+            .map_err(|error| reject(format!("{error:#}")))?;
             if document.check != check.command
                 || document.working_directory != check.working_directory
             {
@@ -5402,7 +5612,12 @@ pub fn attach_required_check(
                 return Ok(prior.clone());
             }
             let work_model::RequiredCheckSource::CanonicalTester { command_index, .. } =
-                &check.source;
+                &check.source
+            else {
+                return Err(reject(
+                    "required check selector must name a canonical Tester command".into(),
+                ));
+            };
             if !assessment.outstanding.contains(command_index) {
                 return Err(reject(
                     "required check has no outstanding failed command".into(),

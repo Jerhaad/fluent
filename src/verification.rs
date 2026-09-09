@@ -23,6 +23,10 @@ pub struct VerificationReceipt {
     pub command: String,
     pub working_directory: String,
     pub checker_digest: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub comparison_commits: std::collections::BTreeMap<String, String>,
     pub result: host_evidence::EvidenceResult,
     pub started_at: String,
     pub completed_at: String,
@@ -110,6 +114,13 @@ pub(crate) fn validate_context(
         "verify clean candidate",
     )?;
     ensure!(status.trim().is_empty(), "verification candidate is dirty");
+    ensure!(
+        crate::recovery_contracts::resolve_check_applicability(
+            workspace,
+            &context.checker.applicability.definition
+        )? == context.checker.applicability,
+        "verification comparison context changed"
+    );
     host_evidence::resolve_working_directory(workspace, &context.checker.working_directory)?;
     Ok(())
 }
@@ -138,6 +149,22 @@ pub(crate) fn execute(project: &Path, task: &Task, resolver: &ContentResolver) -
         .started_at
         .clone()
         .context("verification has no start reservation")?;
+    let environment = context
+        .checker
+        .applicability
+        .definition
+        .environment
+        .keys()
+        .filter_map(|key| {
+            let value = match key.as_str() {
+                "os" => std::env::consts::OS,
+                "architecture" => std::env::consts::ARCH,
+                _ => return None,
+            };
+            Some((key.clone(), value.to_owned()))
+        })
+        .collect();
+    let comparison_commits = context.checker.applicability.comparison_commits.clone();
     let execution = host_evidence::execute_focused_command(
         candidate,
         &working_path,
@@ -158,6 +185,8 @@ pub(crate) fn execute(project: &Path, task: &Task, resolver: &ContentResolver) -
         })
         .collect::<Result<Vec<_>>>()?;
     let receipt = VerificationReceipt {
+        environment,
+        comparison_commits,
         schema_version: 1,
         work_item_id: task.work_item_id.clone(),
         attempt_id: task
@@ -242,6 +271,8 @@ pub fn accept(
         );
     }
     let document = host_evidence::EvidenceDocument {
+        environment: receipt.environment,
+        comparison_commits: receipt.comparison_commits,
         schema_version: 1,
         producer: "fluent verification worker".into(),
         check: receipt.command,

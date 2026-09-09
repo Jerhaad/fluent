@@ -6187,11 +6187,13 @@ fn tester_errored(tester_results_path: &Path) -> bool {
 }
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    if attempt
-        .evidence_recoveries
-        .iter()
-        .any(|recovery| recovery.required_check.is_some())
-        && let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+    if attempt.evidence_recoveries.iter().any(|recovery| {
+        recovery
+            .required_check
+            .as_ref()
+            .is_some_and(|check| check.source.is_canonical_tester())
+    }) && let Ok(view) =
+        crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
     {
         return Some(view.results_path);
     }
@@ -8858,7 +8860,8 @@ fn interpret_reviews(
                     }
                 }
             }
-            if recovery.required_check.is_some()
+            if !targeted.is_empty()
+                && targeted.len() == recovery.targets.len()
                 && targeted.iter().all(|task| {
                     task.artifact_area.as_ref().is_some_and(|area| {
                         fs::read_to_string(project_root.join(&area.path).join("review.md"))
@@ -8882,17 +8885,21 @@ fn interpret_reviews(
                             attempt_id: attempt_id.into(),
                             reason,
                         };
-                    let assessment =
-                        crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
-                            .map_err(|error| rejected(format!("{error:#}")))?;
-                    if !assessment
-                        .checks
-                        .iter()
-                        .any(|check| Some(check) == recovery.required_check.as_ref())
-                    {
-                        return Err(rejected(
-                            "required check changed before review acceptance".into(),
-                        ));
+                    if let Some(check) = &recovery.required_check {
+                        crate::recovery_contracts::validate_required_check_binding(
+                            project_root,
+                            attempt,
+                            check,
+                        )
+                        .map_err(|error| rejected(format!("{error:#}")))?;
+                    }
+                    let (attachment, _) = crate::recovery_contracts::bound_recovery_artifact(
+                        project_root,
+                        &recovery.attachment.snapshot_path,
+                    )
+                    .map_err(|error| rejected(format!("{error:#}")))?;
+                    if attachment.digest != recovery.attachment.digest {
+                        return Err(rejected("host evidence changed before acceptance".into()));
                     }
                     for expected in &targeted {
                         if !attempt.tasks.iter().any(|task| task == expected) {
@@ -9073,11 +9080,36 @@ fn interpret_reviews(
             baseline_path.as_deref(),
         )
     });
+    let canonical_has_policy = tester_result_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|area| area.join("canonical-run.json"))
+        .filter(|path| path.exists())
+        .is_some_and(|path| {
+            fs::read(path)
+                .ok()
+                .and_then(|bytes| {
+                    serde_json::from_slice::<crate::tester::CanonicalRunManifest>(&bytes).ok()
+                })
+                .is_none_or(|manifest| {
+                    manifest
+                        .commands
+                        .iter()
+                        .any(|command| !command.applicability.is_default())
+                })
+        });
     let canonical_assessment = item.attempts[attempt_index]
         .evidence_recoveries
         .iter()
-        .any(|recovery| recovery.required_check.is_some())
-        .then(|| {
+        .any(|recovery| {
+            recovery
+                .required_check
+                .as_ref()
+                .is_some_and(|check| check.source.is_canonical_tester())
+        })
+        .then_some(())
+        .or(canonical_has_policy.then_some(()))
+        .map(|_| {
             crate::recovery_contracts::assess_canonical_checks(
                 project_root,
                 &item.attempts[attempt_index],
