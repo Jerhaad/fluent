@@ -338,3 +338,35 @@ evidence. See [[python-test-selectors-use-static-class-ownership]] for the
 supported declaration boundary and
 [the architecture documentation](../../documentation/architecture.md)
 for source and evidence matching.
+
+---
+
+## Canonical check identity includes configuration and position
+
+Use `tester:<tester.yaml-sha256>:<zero-based-command-index>` to select a canonical
+command. Command text alone cannot distinguish duplicate entries. Acceptance
+also binds the exact candidate, checker inputs, immutable producer artifacts,
+and targeted Tests Review; the selector alone never grants acceptance.
+See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
+and `canonical_tester_replacement_covers_attributed_failure` in `tests/binary.rs`.
+
+## Legacy reconstruction proves only default candidate-code checks
+
+Reconstruct an absent canonical manifest only from a completed candidate-bound
+Tester whose ordered command results exactly match committed configuration.
+The supported legacy shape has default candidate-code applicability. Never
+invent historical environment facts, comparison values, or live-state expiry.
+An authorized recovery publishes the deterministic audit and derived manifest
+without changing the source result; status only derives the same view.
+See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
+and `legacy_evidence_reuses_proven_bindings_without_host_rerun` in `tests/binary.rs`.
+
+## Evidence authority fences older record and transaction writers
+
+Work and Attempt record schema 3 and transaction schema 2 prevent older
+executables from mutating away required-check acceptance or recovering a newer
+pending transaction. Current readers retain supported older records and journals.
+Compatibility must use the pinned pre-change executable, including an interrupted
+real transaction, rather than model round trips alone.
+See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
+and `tests/behaviors/operations/test-evidence-recovery-old-reader.sh`.

@@ -459,8 +459,18 @@ reviewers receive it only after it passes.
 
 After reviewers pass, one final Tester produces `tester-results.json`, bound to
 the exact reviewed commit, as the complete-suite gate before Learning. Failed
-reviews return to the Writer before this gate; Tester failures return their
-artifact to a corrective Writer.
+reviews return to the Writer before this gate. Established Tester assertion or
+harness defects retain their source-correction or harness-repair routes. Verified
+prerequisites that prevented execution require environment recovery; unexplained
+failures pause for diagnosis without an automatic Writer round.
+
+For an outstanding canonical command, use the status-provided
+`attempt evidence attach --required-check <id>` route to submit exact host proof
+for targeted Tests Review. It does not require a prior recheck or exhausted
+Writer budget. A complete canonical run plus applicable reviewed replacements
+can satisfy the gate without another full run; unresolved aggregate failures
+still block it. Read [host evidence recovery](references/host-evidence-recovery.md)
+for binding, expiry, and retry requirements.
 
 `fluent status` and `fluent work-item show <work-item-id>` also report cycle-cost
 measurements: review rounds, completed-stage duration, local transcript tokens,

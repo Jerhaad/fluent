@@ -1120,8 +1120,9 @@ with the project Work Item, Attempt, candidate, exact command, relative working
 directory, comparison commit, original Tester Task, and immutable manifest,
 result, and log references. Attachment creates a targeted Tests Review without
 requiring a failed ordinary Review or recheck. Passing review records its digest
-and acceptance before further advancement. `recovery_contracts` evaluates the
-complete original result plus applicable reviewed replacements; it does not
+and acceptance before further advancement. `check_applicability` resolves declared comparison inputs below both Tester and
+recovery. `recovery_contracts` evaluates the complete original result plus
+applicable reviewed replacements; it does not
 rewrite the failed source result. Missing commands, unattributed structured
 failures, invalid extraction, and unresolved process leaks still block readiness.
 
