@@ -722,9 +722,14 @@ test command sequentially, invokes `.fluent/extract-tester-results` to
 normalize the raw output into per-test entries, and writes
 `tester-results.json` to its artifact directory. This final canonical gate is
 bound to the exact reviewed candidate and runs once per candidate that reaches
-it. An introduced failure or unreadable/error result returns to a corrective
-Writer; a pass advances to Learning. The Tester does not spawn a Coder process
-or write a transcript — it is a deterministic subprocess, not an LLM agent.
+it. Established introduced assertion or harness defects retain their corrective
+Writer or harness-repair routes. Verified unmet prerequisites require environment
+recovery; unexplained failures pause for diagnosis without another Writer.
+Missing or unreadable proof cannot establish a pass. Preserve the result and logs,
+and follow the [host evidence recovery](#host-evidence-recovery) handoff when an
+outstanding check needs exact authorized proof. Applicable passing results advance
+to Learning. The Tester does not spawn a Coder process or write a transcript — it
+is a deterministic subprocess, not an LLM agent.
 
 Each Work Task Tester launch is wrapped in a host-owned tracked-state guard. The
 guard admits only the expected candidate commit with a clean tracked index and
@@ -1053,11 +1058,15 @@ artifacts with the review subsystem verdict parser. A failed or uncertain
 review returns directly to a Writer without spending a canonical Tester run.
 When a corrective Writer returns an accepted no-change declaration over failed
 final-Tester command evidence, Fluent first runs the failed-command recheck
-described above. Another command, structured-test, or process-settlement failure
-returns the recheck manifest, result, and relevant logs directly to the next
-Writer; the existing write-round budget decides whether to continue or pause at
-round cap. A passing subset admits the normal Reviewer round but never replaces
-the complete post-review Tester.
+described above. An established command, structured-test, or process-settlement
+defect returns the recheck manifest, result, and relevant logs to the next Writer;
+the existing write-round budget decides whether to continue or pause at round
+cap. A verified unmet prerequisite requires environment recovery. An unexplained
+nonzero exit pauses for diagnosis without another Writer; preserve the manifest,
+result, and logs to establish the cause. Follow the status-provided command in
+[host evidence recovery](#host-evidence-recovery) when exact authorized proof can
+satisfy the outstanding check. A passing subset admits the normal Reviewer round
+but never replaces the complete post-review Tester.
 When all reviews pass, Fluent plans one final Tester and checks its
 `tester-results.json` — only failures the
 Work Item introduced (tests failing now that were not failing in the
