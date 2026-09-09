@@ -3860,15 +3860,21 @@ pub(crate) fn required_check_recovery_status(
     });
     // A changed Writer candidate still needs its ordinary reviews and first
     // complete Tester. Historical results cannot satisfy or prevent that run.
-    let has_canonical = attempt.tasks.iter().any(|task| {
-        task.kind == TaskKind::Tester
-            && task.status == TaskStatus::Complete
-            && !task.is_failed_command_recheck()
-            && task
+    // A later failed-command recheck owns its existing recovery route unless
+    // an explicit required-check binding still needs validation.
+    let has_canonical = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && task
                 .review_context
                 .as_ref()
                 .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
-    });
+        })
+        .is_some_and(|task| !task.is_failed_command_recheck());
     if (!has_bound_check
         && !(has_canonical && attempt.pause_kind == Some(work_model::PauseKind::HostEvidence)))
         || (attempt.status == work_model::AttemptStatus::Complete
