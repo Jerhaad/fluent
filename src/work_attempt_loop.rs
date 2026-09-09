@@ -13007,21 +13007,12 @@ mod tests {
         }
 
         let project = tempfile::TempDir::new().unwrap();
-        let (store, _workspace, _candidate) = final_tester_evidence_fixture(project.path());
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
 
-        let outcome = interpret_reviews(
-            project.path(),
-            &store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-            true,
-            None,
-        )
-        .unwrap();
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("failed final evidence must plan a corrective Writer")
-        };
+        // Seed the rejected gate and correction saved by older Fluent. Current
+        // admission pauses unexplained command exits before planning a Writer.
+        let task_id = complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
         let item = store.read_work_item("work-1").unwrap();
         let write_index = item.attempts[0]
             .tasks
@@ -14243,19 +14234,9 @@ mod tests {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
         add_failed_final_tester_command(project.path(), &store);
-        let outcome = interpret_reviews(
-            project.path(),
-            &store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-            true,
-            None,
-        )
-        .unwrap();
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("rejected final Tester gate must plan a corrective Writer")
-        };
-        complete_planned_no_change_writer(project.path(), &store, &candidate, &task_id);
+        // Seed the rejected gate and correction saved by older Fluent. Current
+        // admission pauses unexplained command exits before planning a Writer.
+        let _task_id = complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
         let item = store.read_work_item("work-1").unwrap();
 
         let frontier =
@@ -15047,10 +15028,13 @@ mod tests {
         results["commands"][0]["stdout_log"] = serde_json::json!("../private.log");
         fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
 
-        let error = interpret_reviews(project.path(), &store, item, "attempt-1", true, None)
-            .expect_err("a Tester result may not choose the Writer sandbox grant");
-
+        let error =
+            failed_tester_command_artifacts(project.path(), &item.attempts[0], &results_path)
+                .expect_err("a Tester result may not choose the Writer sandbox grant");
         assert!(error.to_string().contains("does not match"));
+        let outcome =
+            interpret_reviews(project.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
         let stored = store.read_work_item("work-1").unwrap();
         assert_eq!(
             stored.attempts[0]
@@ -15084,16 +15068,18 @@ mod tests {
             })
             .unwrap();
 
-        let outcome = interpret_reviews(
-            project.path(),
-            &store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        // Retain an already rejected final gate from an older admission path.
+        let mut item = store.read_work_item("work-1").unwrap();
+        let results = latest_tester_results_path(project.path(), &item.attempts[0]).unwrap();
+        assert!(
+            gate_candidate_after_final_tester(project.path(), &mut item, 0, Some(&results))
+                .unwrap()
+                .is_some()
+        );
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        store.write_work_item(&item).unwrap();
 
         let stored = store.read_work_item("work-1").unwrap();
         let frontier = round_cap_failure_frontier(project.path(), &stored.attempts[0])
