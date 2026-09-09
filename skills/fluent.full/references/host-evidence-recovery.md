@@ -19,6 +19,7 @@ schedules a Writer on the existing Attempt.
 ## Contents
 
 - [Attach host-only evidence](#attach-host-only-evidence)
+- [Declare when a command result applies](#declare-when-a-command-result-applies)
 - [Run one focused Tests check](#run-one-focused-tests-check)
 - [Classify a candidate-bound source correction](#classify-a-candidate-bound-source-correction)
 - [Approve responsibility for a saved mixed Plan row](#approve-responsibility-for-a-saved-mixed-plan-row)
@@ -124,6 +125,16 @@ continues a partial publication without new review or operation identities.
 Missing historical environment, freshness, or comparison proof remains a blocker;
 current values cannot supply facts about a past run. Status never publishes a
 reconstruction or changes the saved evidence.
+
+Read `fluent work-item show <work-item>` again before continuing. Its
+`evidence-recovery` reason and `next-action` describe the current check and
+eligible operation. Missing or changed proof can withhold resume; foreground
+execution, queue admission, scheduler claim and Review launch each revalidate it.
+Repeating an eligible attachment reuses its recovery and Review Task. Repeating
+queue resume while its dispatch is active reuses that dispatch. A later stop
+requires explicit resume authority; an earlier queued dispatch cannot clear it.
+Remove an unclaimed stale dispatch with `fluent queue remove <work-item>` before
+issuing the newly authorized `fluent queue resume <work-item> --attempt <attempt>`.
 
 ## Declare when a command result applies
 

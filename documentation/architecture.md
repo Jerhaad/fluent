@@ -1180,7 +1180,12 @@ as well as the passing targeted Review.
 Work and Attempt record schema 3 and transaction schema 2 fence executables
 that predate this authority. Current readers accept earlier supported records
 and schema-1 journals. The compatibility test invokes the pinned pre-change
-executable against both published and pending state and checks exact bytes.
+executable against both published and pending state and checks exact bytes. The pinned-reader
+regression preserves required-check policy, source and reconstruction references,
+and accepted Review digests through public current writes. It makes a Task
+record directory unwritable to interrupt a real public mutation after journal
+publication, verifies that the old executable cannot recover it, and then lets
+the current executable recover without losing authority or changing audit bytes.
 
 When one missing focused result prevents a Tests Reviewer from deciding, the
 review may emit one `Evidence-Command` and one candidate-relative

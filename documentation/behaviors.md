@@ -881,8 +881,8 @@ Test: tests/binary.rs (canonical_tester_host_evidence_enters_targeted_review)
 ### B19
 
 WHEN a targeted Tests Review accepts passing evidence for the unchanged
-candidate and exact failed command, THE SYSTEM SHALL continue to Learning
-without rerunning that command.
+candidate and exact failed command, THE SYSTEM SHALL retain that command's
+accepted result and evaluate the remaining gates without rerunning it.
 Test: src/work_attempt_loop.rs (external_recheck_evidence_advances_round_cap_to_candidate)
 
 Advancement SHALL require the complete canonical run and accepted replacements
@@ -1019,6 +1019,12 @@ Test: src/work_model.rs (known_and_future_pause_kinds_preserve_their_wire_values
 Test: src/work_model.rs (host_sandbox_pause_round_trips_through_storage)
 Test: src/work_model.rs (tester_harness_pause_round_trips_through_storage)
 Test: src/work_model.rs (unknown_pause_is_readable_but_mutation_fails_closed)
+
+Required-check sources, applicability, reconstruction audit references and
+accepted Review digests SHALL survive current split-record writes and journal
+recovery. The pinned pre-change executable SHALL refuse public mutation of the
+new record or pending journal before changing any model or artifact bytes.
+Test: tests/behaviors/operations/test-evidence-recovery-old-reader.sh
 
 ### B2
 
