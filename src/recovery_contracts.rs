@@ -3526,14 +3526,29 @@ pub(crate) fn required_check_recovery_status(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<RequiredCheckRecoveryStatus>> {
-    let has_bound_check = attempt
-        .evidence_recoveries
+    let candidate = attempt
+        .tasks
         .iter()
-        .any(|recovery| recovery.required_check.is_some());
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+    let has_bound_check = attempt.evidence_recoveries.iter().any(|recovery| {
+        recovery
+            .required_check
+            .as_ref()
+            .is_some_and(|check| Some(check.candidate_commit.as_str()) == candidate)
+    });
+    // A changed Writer candidate still needs its ordinary reviews and first
+    // complete Tester. Historical results cannot satisfy or prevent that run.
     let has_canonical = attempt.tasks.iter().any(|task| {
         task.kind == TaskKind::Tester
             && task.status == TaskStatus::Complete
             && !task.is_failed_command_recheck()
+            && task
+                .review_context
+                .as_ref()
+                .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
     });
     if (!has_bound_check
         && !(has_canonical && attempt.pause_kind == Some(work_model::PauseKind::HostEvidence)))

@@ -42202,3 +42202,106 @@ fn established_canonical_defects_grant_writer_exact_inputs() {
         assert!(item.merge_candidates.is_empty());
     }
 }
+
+#[test]
+fn changed_candidate_recovery_runs_fresh_checks() {
+    use fluent::work_model::*;
+    for queued in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let work = "combined-current";
+        let (project, candidate, results) =
+            canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+        let original = fs::read(&results).unwrap();
+        let bin = tmp.path().join("bin");
+        let control = tmp.path().join("control");
+        fs::write(&control, "request-correction").unwrap();
+        let provider = combined_evidence_provider(&project, &control).replace(
+            "        (path.parent / 'no-change.json').write_text(json.dumps({'schema_version':1,\n            'reason':'Inspection confirms the source already meets the requested behavior.',\n            'verification':[{'command':'true','result':'pass'}]}))",
+            "        Path('README.md').write_text('Corrected candidate source\\n')\n        subprocess.run(['git','add','README.md'], check=True)\n        subprocess.run(['git','commit','-m','Fix candidate source'], check=True, stdout=subprocess.DEVNULL)",
+        );
+        let provider = provider.replace("    path = max(matrices,", "    if not matrices:\n        Path('README.md').write_text('Corrected candidate source\\n')\n        subprocess.run(['git','add','README.md'], check=True)\n        subprocess.run(['git','commit','-m','Fix candidate source'], check=True, stdout=subprocess.DEVNULL)\n        sys.exit(0)\n    path = max(matrices,");
+        write_mock_claude(&bin, &provider);
+        let failed = tmp.path().join("failed.json");
+        fs::write(&failed, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"fail","run_at":"2026-09-09T12:00:00Z","output":"assertion failed"})).unwrap()).unwrap();
+        canonical_attachment_command(&project, work, &candidate, &failed)
+            .assert()
+            .success();
+        let store = WorkModelStore::new(&project);
+        let before = store.read_work_item(work).unwrap();
+        if queued {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["queue", "resume", work, "--attempt", "attempt-1"])
+                .assert()
+                .success();
+            let dispatch = fluent::scheduler::pick_next_queued(&project)
+                .unwrap()
+                .unwrap();
+            fluent::scheduler::dispatch_one(
+                &project,
+                &dispatch,
+                &EvidenceCliRunner { bin: bin.clone() },
+            )
+            .unwrap();
+        } else {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+                .env("PATH", mock_path(&bin))
+                .assert()
+                .success();
+        }
+        let changed = store.read_work_item(work).unwrap();
+        let output = changed.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap();
+        assert_ne!(output.commit, candidate);
+        assert!(output.no_change.is_none());
+        let testers = changed.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            testers.len(),
+            2,
+            "new code needs its own complete canonical run"
+        );
+        assert_eq!(
+            testers[1].review_context.as_ref().unwrap().candidate_commit,
+            output.commit
+        );
+        assert_eq!(
+            changed.attempts[0].evidence_recoveries[0].attachment,
+            before.attempts[0].evidence_recoveries[0].attachment
+        );
+        assert!(
+            changed.merge_candidates.is_empty(),
+            "old-candidate evidence cannot accept new code"
+        );
+        let snapshot = snapshot_tree(&project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .assert()
+            .success();
+        assert_eq!(snapshot_tree(&project.join(".fluent/work")), snapshot);
+        attach_canonical_fixture_result(&tmp, &project, work, &output.commit, 1, "false");
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready"));
+        let ready = store.read_work_item(work).unwrap();
+        assert_eq!(ready.merge_candidates[0].candidate_commit, output.commit);
+        assert_eq!(fs::read(&results).unwrap(), original);
+    }
+}
