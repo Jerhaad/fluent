@@ -9855,7 +9855,13 @@ Test: src/host_evidence.rs (pending_host_verification_blocks_readiness)
 WHEN an operator previews responsibility for a saved mixed Plan obligation,
 THE SYSTEM SHALL show the exact candidate and complete proposed split without
 adopting it until a fresh explicit approval is recorded.
+For a legacy row without a stored command, a host split SHALL use the one exact
+verification command in the original approved text, and SHALL remain invalid
+when that text supplies no command or ambiguous commands.
 Test: tests/binary.rs (legacy_ownership_adoption_requires_approval)
+Test: tests/binary.rs (legacy_ownership_adoption_recovers_missing_command)
+Test: tests/binary.rs (legacy_ownership_adoption_rejects_unresolved_command)
+Test: tests/binary.rs (legacy_ownership_adoption_preserves_stored_command)
 Test: tests/binary.rs (legacy_ownership_adoption_rejects_stale_state)
 Test: tests/binary.rs (legacy_ownership_adoption_exact_retry_preserves_history)
 Test: tests/binary.rs (legacy_ownership_old_reader_refuses_mutation)

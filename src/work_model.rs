@@ -3522,6 +3522,13 @@ impl OwnershipProposal {
                 requirement.responsibility = Some(part.responsibility);
                 if let Some(command) = &mut requirement.command {
                     command.source_row = requirement.id.clone();
+                } else if part.responsibility == CompletionResponsibility::Host {
+                    // Inspect the entire approved row so splitting cannot hide ambiguity.
+                    requirement.command = PlanCommand::from_legacy_texts(
+                        &requirement.id,
+                        std::iter::once(row.requirement.as_str())
+                            .chain(row.verification_refs.iter().map(String::as_str)),
+                    );
                 }
                 let mut claim = WriterCompletionRow::from(&requirement);
                 if let Some(from) = &part.completion_from {

@@ -36316,6 +36316,53 @@ fn ownership_preview(
     value
 }
 
+fn setup_legacy_ownership_text_fixture(
+    tmp: &TempDir,
+    id: &str,
+    parts: [&str; 5],
+    verification: &str,
+) -> (PathBuf, String, PathBuf) {
+    use fluent::work_model::*;
+    let (project, candidate, proposal) = setup_legacy_ownership_fixture(tmp, id);
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item(id).unwrap();
+    let requirement = parts.concat();
+    item.planning_context.as_mut().unwrap().plan = Some(format!(
+        "| # | State reached | Behaviors | Verification | Req? |\n| 1 | Fix source. | | `cargo test fix` | Yes |\n| 2 | {requirement} | | {verification} | Yes |\n"
+    ));
+    let attempt = &mut item.attempts[0];
+    attempt.progress_contract.as_mut().unwrap().required[1].requirement = requirement.clone();
+    let row = &mut attempt
+        .writer_completion_contract
+        .as_mut()
+        .unwrap()
+        .requirements[1];
+    row.requirement = requirement;
+    row.verification_refs = vec![verification.into()];
+    // Reproduce a saved row from before intake stored command metadata.
+    row.command = None;
+    row.responsibility = None;
+    let source = project
+        .join(&attempt.tasks[0].artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let mut matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    matrix.rows[1] = WriterCompletionRow::from(&*row);
+    fs::write(&source, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    store.write_work_item(&item).unwrap();
+    let mut value = read_json_path(&proposal);
+    for (part, requirement) in value["splits"][0]["parts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(parts)
+    {
+        part["requirement"] = serde_json::json!(requirement);
+    }
+    write_json_path(&proposal, &value);
+    (project, candidate, proposal)
+}
+
 fn ownership_approve(project: &Path, id: &str, preview: &Path) -> log::LoggedCommand {
     let mut command = fluent_cmd();
     command.current_dir(project).args([
@@ -37229,6 +37276,206 @@ printf 'Verdict: pass\n' > review.md
             resumed.attempts[0].evidence_recoveries, before.attempts[0].evidence_recoveries,
             "reference recovery must reuse accepted host proof without another attachment"
         );
+    }
+}
+
+#[test]
+fn legacy_ownership_adoption_recovers_missing_command() {
+    let tmp = TempDir::new().unwrap();
+    let id = "missing-command-ownership";
+    let parts = [
+        "Fix source.",
+        " Run HOST_CHECK_LIVE=1 ./tests/host-smoke.sh unchanged on fixture-host.",
+        " Review.",
+        " Test.",
+        " Learn.",
+    ];
+    let (project, candidate, proposal) = setup_legacy_ownership_text_fixture(
+        &tmp,
+        id,
+        parts,
+        "The live smoke preserves isolation and reports content-free evidence.",
+    );
+    let before = work_item_value(&project, id);
+    let original = &before["attempts"][0]["writer_completion_contract"];
+    let original_row = &original["requirements"][1];
+    assert!(original_row.get("command").is_none());
+    assert!(original_row.get("responsibility").is_none());
+    let source = project.join(format!(
+        ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-1/writer-completion.json"
+    ));
+    let source_bytes = fs::read(&source).unwrap();
+    let source_matrix = read_json_path(&source);
+    assert!(source_matrix["rows"][1].get("command").is_none());
+    assert!(source_matrix["rows"][1].get("responsibility").is_none());
+    let work_before = snapshot_tree(&project.join(".fluent/work"));
+    let preview_path = tmp.path().join("preview.json");
+    let preview = ownership_preview(&project, id, &proposal, &preview_path);
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), work_before);
+    assert_eq!(preview["candidate_commit"], candidate);
+    assert_eq!(preview["original_contract"], *original);
+    assert_eq!(preview["proposal"], read_json_path(&proposal));
+
+    ownership_approve(&project, id, &preview_path)
+        .assert()
+        .success();
+    let after = work_item_value(&project, id);
+    let attempt = &after["attempts"][0];
+    let rows = attempt["writer_completion_contract"]["requirements"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0], original["requirements"][0]);
+    let expected_command = serde_json::json!({
+        "command": "HOST_CHECK_LIVE=1 ./tests/host-smoke.sh",
+        "working-directory": ".",
+        "environment": {"HOST_CHECK_LIVE": "1"},
+        "source-row": "plan:step-2:part-2"
+    });
+    assert_eq!(rows[2]["command"], expected_command);
+    for (index, (row, text)) in rows[1..].iter().zip(parts).enumerate() {
+        assert_eq!(row["id"], format!("plan:step-2:part-{}", index + 1));
+        assert_eq!(row["requirement"], text);
+        assert_eq!(row["source"], original_row["source"]);
+        assert_eq!(row["verification_refs"], original_row["verification_refs"]);
+        if index != 1 {
+            assert!(row.get("command").is_none());
+        }
+    }
+    let audit_ref = attempt["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|artifact| {
+            artifact["producer_id"] == "ownership-recovery"
+                && artifact["path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("/approval.json")
+        })
+        .unwrap();
+    let audit = read_json_path(&project.join(audit_ref["path"].as_str().unwrap()));
+    assert_eq!(audit["preview"], preview);
+    let matrix = read_json_path(&project.join(audit["matrix_artifact"]["path"].as_str().unwrap()));
+    assert_eq!(matrix["rows"][2]["command"], expected_command);
+    assert_eq!(matrix["rows"][1]["state"], "complete");
+    assert_eq!(
+        matrix["rows"][1]["implementation-evidence"],
+        source_matrix["rows"][0]["implementation-evidence"]
+    );
+    for (row, owner) in matrix["rows"].as_array().unwrap()[2..]
+        .iter()
+        .zip(["host", "review", "tester", "learner"])
+    {
+        assert_eq!(row["responsibility"], owner);
+        assert_eq!(row["state"], "pending");
+        assert_eq!(row["implementation-evidence"], serde_json::json!([]));
+        assert_eq!(row["verification"], serde_json::json!([]));
+    }
+    assert_eq!(attempt["tasks"], before["attempts"][0]["tasks"]);
+    assert_eq!(after["planning_context"], before["planning_context"]);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(git_head(&project), candidate);
+    assert_eq!(attempt["recovery_operations"].as_array().unwrap().len(), 1);
+
+    let adopted = snapshot_tree(&project.join(".fluent/work"));
+    ownership_approve(&project, id, &preview_path)
+        .assert()
+        .success();
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), adopted);
+    assert_eq!(git_head(&project), candidate);
+}
+
+#[test]
+fn legacy_ownership_adoption_rejects_unresolved_command() {
+    for (host, review, verification) in [
+        (" Check host.", " Review.", "Inspect the saved output."),
+        (
+            " Run HOST_CHECK_LIVE=1 ./tests/host-smoke.sh unchanged on fixture-host.",
+            " Review after running `bash tests/other.sh`.",
+            "Inspect the saved output.",
+        ),
+        (
+            " Run HOST_CHECK_LIVE=1 ./tests/host-smoke.sh unchanged on fixture-host.",
+            " Review.",
+            "Run `bash tests/other.sh`.",
+        ),
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let id = "unresolved-command-ownership";
+        let (project, _, proposal) = setup_legacy_ownership_text_fixture(
+            &tmp,
+            id,
+            ["Fix source.", host, review, " Test.", " Learn."],
+            verification,
+        );
+        let before = snapshot_tree(&project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "ownership",
+                "preview",
+                id,
+                "attempt-1",
+                "--proposal-file",
+                proposal.to_str().unwrap(),
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "host obligation plan:step-2:part-2 requires one exact verification command",
+            ));
+        assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+    }
+}
+
+#[test]
+fn legacy_ownership_adoption_preserves_stored_command() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let id = "stored-command-ownership";
+    let (project, _, proposal) = setup_legacy_ownership_fixture(&tmp, id);
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item(id).unwrap();
+    let command = item.attempts[0]
+        .writer_completion_contract
+        .as_mut()
+        .unwrap()
+        .requirements[1]
+        .command
+        .as_mut()
+        .unwrap();
+    command.command = "bash tests/stored-host.sh".into();
+    command.working_directory = "host-checks".into();
+    command
+        .environment
+        .insert("HOST_TARGET".into(), "fixture-host".into());
+    let mut expected = command.clone();
+    let source = project.join(format!(
+        ".fluent/work/artifacts/{id}/attempt-1/attempt-1-write-1/writer-completion.json"
+    ));
+    let mut matrix: WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&source).unwrap()).unwrap();
+    matrix.rows[1].command = Some(expected.clone());
+    fs::write(&source, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    store.write_work_item(&item).unwrap();
+    let preview_path = tmp.path().join("preview.json");
+    ownership_preview(&project, id, &proposal, &preview_path);
+    ownership_approve(&project, id, &preview_path)
+        .assert()
+        .success();
+    let after = store.read_work_item(id).unwrap();
+    for (index, row) in after.attempts[0]
+        .writer_completion_contract
+        .as_ref()
+        .unwrap()
+        .requirements[1..]
+        .iter()
+        .enumerate()
+    {
+        expected.source_row = format!("plan:step-2:part-{}", index + 1);
+        assert_eq!(row.command.as_ref(), Some(&expected));
     }
 }
 
