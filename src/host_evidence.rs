@@ -1073,12 +1073,10 @@ pub(crate) fn ensure_owned_host_resume_ready(
     let attempt =
         if crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)? {
             settled = attempt.clone();
-            settled
-                .evidence_recoveries
-                .iter_mut()
-                .find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
-                .expect("validated active receipt")
-                .state = EvidenceRecoveryState::Complete;
+            crate::recovery_contracts::complete_owned_plan_evidence_review(
+                project_root,
+                &mut settled,
+            )?;
             &settled
         } else {
             attempt
@@ -1345,15 +1343,13 @@ pub(crate) fn completed_plan_host_matrix_ref(
                 && recovery.targets.iter().any(|target| {
                     target.role == "tests"
                         && target.prior_review_artifact == binding_path.to_string_lossy()
-                        && target.review_task_id.as_ref().is_some_and(|task_id| {
-                            attempt.tasks.iter().any(|task| {
-                                task.id == *task_id
-                                    && task.kind == TaskKind::Review
-                                    && task.role == "tests"
-                                    && task.status == TaskStatus::Complete
-                                    && read_verdict(project_root, task) == Some(Verdict::Pass)
-                            })
-                        })
+                        && crate::recovery_contracts::plan_evidence_review_is_accepted(
+                            project_root,
+                            attempt,
+                            recovery,
+                            target,
+                            &binding,
+                        )
                 })
         })?;
         if recovery.state != EvidenceRecoveryState::Complete {
@@ -1491,15 +1487,13 @@ pub(crate) fn apply_completed_plan_host_evidence(
                 && recovery.targets.iter().any(|target| {
                     target.role == "tests"
                         && target.prior_review_artifact == artifact.path
-                        && target.review_task_id.as_ref().is_some_and(|task_id| {
-                            attempt.tasks.iter().any(|task| {
-                                task.id == *task_id
-                                    && task.kind == TaskKind::Review
-                                    && task.role == "tests"
-                                    && task.status == TaskStatus::Complete
-                                    && read_verdict(project_root, task) == Some(Verdict::Pass)
-                            })
-                        })
+                        && crate::recovery_contracts::plan_evidence_review_is_accepted(
+                            project_root,
+                            attempt,
+                            recovery,
+                            target,
+                            &binding,
+                        )
                 })
         }) else {
             continue;
@@ -2406,11 +2400,8 @@ pub fn attach_plan_row(
         |item| {
             let historical = item.attempts.iter_mut().find(|attempt| attempt.id == attempt_id)
                 .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
-            if crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, historical)
-                .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible { attempt_id: attempt_id.to_string(), reason: format!("{error:#}") })? {
-                historical.evidence_recoveries.iter_mut().find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
-                    .expect("validated active receipt").state = EvidenceRecoveryState::Complete;
-            }
+            crate::recovery_contracts::complete_owned_plan_evidence_review(project_root, historical)
+                .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible { attempt_id: attempt_id.to_string(), reason: format!("{error:#}") })?;
             let attempt = item
                 .attempts
                 .iter()

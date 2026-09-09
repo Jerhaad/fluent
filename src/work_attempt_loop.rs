@@ -570,7 +570,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                     .ok_or_else(|| WorkModelError::AttemptNotFound {
                         id: config.attempt_id.to_string(),
                     })?;
-                if crate::recovery_contracts::validate_owned_plan_evidence_review(
+                crate::recovery_contracts::complete_owned_plan_evidence_review(
                     config.project_root,
                     attempt,
                 )
@@ -579,14 +579,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                         attempt_id: config.attempt_id.to_string(),
                         reason: format!("{error:#}"),
                     }
-                })? {
-                    attempt
-                        .evidence_recoveries
-                        .iter_mut()
-                        .find(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
-                        .expect("validated active receipt")
-                        .state = EvidenceRecoveryState::Complete;
-                }
+                })?;
                 Ok(())
             })?;
             continue;

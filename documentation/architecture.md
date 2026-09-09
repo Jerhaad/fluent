@@ -1142,7 +1142,11 @@ them. Receipt ingestion preserves recorded observations. The neutral validator
 rechecks those bindings for acceptance; a passing exit alone does not establish
 the declared environment. Plan proof overlays the current completion matrix only
 when its row identity, command, requirements, and candidate match the preserved
-source. A no-change Writer does not alter that original source or Review.
+source. Settlement records the passing Plan Review digest; later overlays check
+that digest and the Review context before crediting completion. Policy-bearing
+Plan receipts require this digest, while preserved default-code receipts retain
+the older verdict-based compatibility path. A no-change Writer does not alter
+that original source or Review.
 
 Tester command results keep `failure_cause` separate from exit status. An observed
 mismatch in a declared `os` or `architecture` prerequisite prevents launch and

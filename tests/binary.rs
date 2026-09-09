@@ -36234,6 +36234,15 @@ fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, 
 }
 
 fn setup_ownership_fixture(tmp: &TempDir, id: &str, explicit: bool) -> (PathBuf, String, PathBuf) {
+    setup_ownership_fixture_with_plan(tmp, id, explicit, None)
+}
+
+fn setup_ownership_fixture_with_plan(
+    tmp: &TempDir,
+    id: &str,
+    explicit: bool,
+    plan: Option<String>,
+) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::*;
     let project = setup_git_project(tmp);
     let candidate = git_head(&project);
@@ -36244,6 +36253,9 @@ fn setup_ownership_fixture(tmp: &TempDir, id: &str, explicit: bool) -> (PathBuf,
     });
     if explicit {
         item.planning_context.as_mut().unwrap().plan = Some("| # | State reached | Behaviors | Verification | Responsibility | Req? |\n| 1 | Fix source. | | `cargo test fix` | writer | Yes |\n| 2 | Check host. | | `bash tests/host.sh` | host | Yes |\n| 3 | Review. | | Review candidate | review | Yes |\n| 4 | Test. | | Run Tester | tester | Yes |\n| 5 | Learn. | | Capture expertise | learner | Yes |\n".into());
+    }
+    if let Some(plan) = plan {
+        item.planning_context.as_mut().unwrap().plan = Some(plan);
     }
     item.add_initial_attempt("attempt-1").unwrap();
     let attempt = &mut item.attempts[0];
@@ -42210,17 +42222,33 @@ fn changed_candidate_recovery_runs_fresh_checks() {
         let tmp = TempDir::new().unwrap();
         let work = "combined-current";
         let (project, candidate, results) =
-            canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+            canonical_evidence_fixture(&tmp, work, &["false", "false"]);
         let original = fs::read(&results).unwrap();
         let bin = tmp.path().join("bin");
         let control = tmp.path().join("control");
-        fs::write(&control, "request-correction").unwrap();
+        fs::write(&control, "pass").unwrap();
         let provider = combined_evidence_provider(&project, &control).replace(
             "        (path.parent / 'no-change.json').write_text(json.dumps({'schema_version':1,\n            'reason':'Inspection confirms the source already meets the requested behavior.',\n            'verification':[{'command':'true','result':'pass'}]}))",
             "        Path('README.md').write_text('Corrected candidate source\\n')\n        subprocess.run(['git','add','README.md'], check=True)\n        subprocess.run(['git','commit','-m','Fix candidate source'], check=True, stdout=subprocess.DEVNULL)",
         );
         let provider = provider.replace("    path = max(matrices,", "    if not matrices:\n        Path('README.md').write_text('Corrected candidate source\\n')\n        subprocess.run(['git','add','README.md'], check=True)\n        subprocess.run(['git','commit','-m','Fix candidate source'], check=True, stdout=subprocess.DEVNULL)\n        sys.exit(0)\n    path = max(matrices,");
         write_mock_claude(&bin, &provider);
+        attach_canonical_fixture_result(&tmp, &project, work, &candidate, 0, "false");
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready").not());
+        let accepted_first = WorkModelStore::new(&project)
+            .read_work_item(work)
+            .unwrap()
+            .attempts[0]
+            .evidence_recoveries[0]
+            .clone();
+        assert_eq!(accepted_first.state, EvidenceRecoveryState::Complete);
+        fs::write(&control, "request-correction").unwrap();
         let failed = tmp.path().join("failed.json");
         fs::write(&failed, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"fail","run_at":"2026-09-09T12:00:00Z","output":"assertion failed"})).unwrap()).unwrap();
         canonical_attachment_command(&project, work, &candidate, &failed)
@@ -42293,6 +42321,18 @@ fn changed_candidate_recovery_runs_fresh_checks() {
             .success();
         assert_eq!(snapshot_tree(&project.join(".fluent/work")), snapshot);
         attach_canonical_fixture_result(&tmp, &project, work, &output.commit, 1, "false");
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready").not());
+        assert_eq!(
+            store.read_work_item(work).unwrap().attempts[0].evidence_recoveries[0],
+            accepted_first
+        );
+        attach_canonical_fixture_result(&tmp, &project, work, &output.commit, 0, "false");
         fluent_cmd()
             .current_dir(&project)
             .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
@@ -42427,5 +42467,356 @@ fn expired_pending_evidence_accepts_fresh_proof() {
             first_bytes
         );
         assert_eq!(fs::read(&results).unwrap(), original);
+    }
+}
+
+#[test]
+fn canonical_completed_acceptance_revalidates_bindings() {
+    completed_required_acceptance_revalidates_bindings(false);
+}
+
+#[test]
+fn requested_completed_acceptance_revalidates_bindings() {
+    completed_required_acceptance_revalidates_bindings(true);
+}
+
+fn completed_required_acceptance_revalidates_bindings(requested: bool) {
+    use fluent::work_model::*;
+    for mutation in [
+        "source-missing",
+        "source-altered",
+        "review",
+        "comparison",
+        "environment",
+        "expiry",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let work = "accepted-bindings";
+        let mut policy = serde_json::json!({"environment":{"os":std::env::consts::OS}});
+        if mutation == "comparison" {
+            policy["comparison_refs"] = serde_json::json!(["main"]);
+        }
+        if mutation == "expiry" {
+            policy["freshness"] = serde_json::json!({"kind":"live-state","max_age_seconds":600});
+        }
+        let (project, candidate, results) = canonical_evidence_fixture_with_applicability(
+            &tmp,
+            work,
+            &["false", "sh -c false"],
+            serde_json::json!([policy, {}]),
+        );
+        let store = WorkModelStore::new(&project);
+        let evidence = tmp.path().join("accepted.json");
+        let issued = chrono::Utc::now();
+        fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"passed","environment":{"os":std::env::consts::OS},"comparison_commits":{"main":candidate}})).unwrap()).unwrap();
+        let config = fs::read(project.join(".fluent/tester.yaml")).unwrap();
+        let selector = format!("tester:{:x}:0", Sha256::digest(config));
+        let (option, binding) = if requested {
+            let mut item = store.read_work_item(work).unwrap();
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+            item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+            let review = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Review)
+                .unwrap();
+            let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+            fs::write(project.join(&path), format!("Verdict: fail\nEvidence-Command: false\nEvidence-Working-Directory: .\nEvidence-Applicability: {policy}\n")).unwrap();
+            store.write_work_item(&item).unwrap();
+            ("--review-artifact", path)
+        } else {
+            ("--required-check", selector)
+        };
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                option,
+                &binding,
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready").not());
+        let accepted = store.read_work_item(work).unwrap();
+        let recovery = &accepted.attempts[0].evidence_recoveries[0];
+        assert_eq!(
+            recovery.state,
+            EvidenceRecoveryState::Complete,
+            "{requested}/{mutation}"
+        );
+        assert!(recovery.targets[0].review_digest.is_some());
+        assert!(accepted.merge_candidates.is_empty());
+        let source = match &recovery.required_check.as_ref().unwrap().source {
+            RequiredCheckSource::CanonicalTester { .. } => {
+                results.parent().unwrap().join("commands/0-stderr.log")
+            }
+            RequiredCheckSource::ReviewRequested { .. } => {
+                project.join(&recovery.targets[0].prior_review_artifact)
+            }
+        };
+        let review = accepted.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| Some(&task.id) == recovery.targets[0].review_task_id.as_ref())
+            .unwrap();
+        let review_path = project
+            .join(&review.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        let mut at = chrono::Utc::now().to_rfc3339();
+        match mutation {
+            "source-missing" => fs::remove_file(&source).unwrap(),
+            "source-altered" => {
+                let mut bytes = fs::read(&source).unwrap();
+                bytes.push(b'\n');
+                fs::write(&source, bytes).unwrap();
+            }
+            "review" => {
+                let mut bytes = fs::read(&review_path).unwrap();
+                bytes.extend_from_slice(b"\nDifferent passing proof\n");
+                fs::write(&review_path, bytes).unwrap();
+            }
+            "comparison" => commit_file(
+                &project,
+                "README.md",
+                "changed comparison\n",
+                "Update comparison",
+            ),
+            "environment" => {
+                let path = project.join(&recovery.attachment.snapshot_path);
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                doc.as_object_mut().unwrap().remove("environment");
+                fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            }
+            "expiry" => at = (issued + chrono::TimeDelta::seconds(600)).to_rfc3339(),
+            _ => unreachable!(),
+        }
+        let before = snapshot_tree(&project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+            .assert()
+            .success();
+        assert!(
+            snapshot_tree(&project.join(".fluent/work")) == before,
+            "status mutated {requested}/{mutation}"
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+            .assert()
+            .failure();
+        assert!(
+            store.read_work_item(work).unwrap() == accepted,
+            "obsolete proof changed history: {requested}/{mutation}"
+        );
+        // Try to finish the other requirement as well. Even if it is admitted,
+        // the earlier acceptance must no longer allow readiness.
+        let second = tmp.path().join("second.json");
+        fs::write(&second, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"sh -c false","working_directory":".","result":"pass","run_at":at,"output":"passed"})).unwrap()).unwrap();
+        let second_binding = format!(
+            "tester:{:x}:1",
+            Sha256::digest(fs::read(project.join(".fluent/tester.yaml")).unwrap())
+        );
+        let attach = fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--required-check",
+                &second_binding,
+                "--evidence-file",
+                second.to_str().unwrap(),
+            ])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+            .output()
+            .unwrap();
+        if attach.status.success() {
+            let _ = fluent_cmd()
+                .current_dir(&project)
+                .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+                .env("PATH", mock_path(&bin))
+                .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+                .output()
+                .unwrap();
+        }
+        let after = store.read_work_item(work).unwrap();
+        assert!(
+            after.merge_candidates.is_empty(),
+            "obsolete acceptance reached readiness: {requested}/{mutation}"
+        );
+        assert_eq!(&after.attempts[0].evidence_recoveries[0], recovery);
+    }
+}
+
+#[test]
+fn plan_completed_acceptance_revalidates_bindings() {
+    use fluent::work_model::*;
+    for mutation in [
+        "review",
+        "source-missing",
+        "source-altered",
+        "comparison",
+        "environment",
+        "expiry",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let work = "accepted-plan";
+        let mut policy = serde_json::json!({"environment":{"os":std::env::consts::OS}});
+        if mutation == "comparison" {
+            policy["comparison_refs"] = serde_json::json!(["main"]);
+        }
+        if mutation == "expiry" {
+            policy["freshness"] = serde_json::json!({"kind":"live-state","max_age_seconds":600});
+        }
+        let plan = format!(
+            "| # | State reached | Behaviors | Verification | Applicability | Responsibility | Req? |\n| 1 | Fix source. | | `cargo test fix` | {{}} | writer | Yes |\n| 2 | Check host. | | `bash tests/host.sh` | {policy} | host | Yes |\n| 3 | Check another host. | | `bash tests/other.sh` | {{}} | host | Yes |\n"
+        );
+        let (project, candidate, _) =
+            setup_ownership_fixture_with_plan(&tmp, work, true, Some(plan));
+        let store = WorkModelStore::new(&project);
+        let writer = store.read_work_item(work).unwrap().attempts[0].tasks[0].clone();
+        let source = project
+            .join(&writer.artifact_area.as_ref().unwrap().path)
+            .join("writer-completion.json");
+        fs::write(source.parent().unwrap().join("transcript.jsonl"), "{}\n").unwrap();
+        let _managed = bind_candidate_to_managed_sibling(&project, work, &candidate);
+        let issued = chrono::Utc::now();
+        let evidence = tmp.path().join("host.json");
+        fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"passed","environment":{"os":std::env::consts::OS},"comparison_commits":{"main":candidate}})).unwrap()).unwrap();
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "attempt",
+                "evidence",
+                "attach",
+                work,
+                "attempt-1",
+                "--candidate",
+                &candidate,
+                "--plan-row",
+                "plan:step-2",
+                "--evidence-file",
+                evidence.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready").not());
+        let accepted = store.read_work_item(work).unwrap();
+        let recovery = &accepted.attempts[0].evidence_recoveries[0];
+        assert_eq!(recovery.state, EvidenceRecoveryState::Complete);
+        assert!(
+            work_item_value(&project, work)["next-action"]
+                .as_str()
+                .unwrap()
+                .contains("plan:step-3"),
+            "accepted Plan row must first unlock the next requirement"
+        );
+        let review = accepted.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| Some(&task.id) == recovery.targets[0].review_task_id.as_ref())
+            .unwrap();
+        let review_path = project
+            .join(&review.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        let mut at = chrono::Utc::now().to_rfc3339();
+        match mutation {
+            "review" => {
+                let mut bytes = fs::read(&review_path).unwrap();
+                bytes.extend_from_slice(b"\nDifferent passing proof\n");
+                fs::write(&review_path, bytes).unwrap();
+            }
+            "source-missing" => fs::remove_file(&source).unwrap(),
+            "source-altered" => {
+                let mut bytes = fs::read(&source).unwrap();
+                bytes.push(b'\n');
+                fs::write(&source, bytes).unwrap();
+            }
+            "comparison" => commit_file(
+                &project,
+                "README.md",
+                "changed comparison\n",
+                "Update comparison",
+            ),
+            "environment" => {
+                let path = project.join(&recovery.attachment.snapshot_path);
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                doc.as_object_mut().unwrap().remove("environment");
+                fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            }
+            "expiry" => at = (issued + chrono::TimeDelta::seconds(600)).to_rfc3339(),
+            _ => unreachable!(),
+        }
+        let before = snapshot_tree(&project.join(".fluent/work"));
+        let shown = fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+            .output()
+            .unwrap();
+        assert!(shown.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert!(
+            value["next-action"]
+                .as_str()
+                .is_none_or(|action| !action.contains("plan:step-3")),
+            "obsolete Plan acceptance remains credited: {mutation}"
+        );
+        assert!(
+            snapshot_tree(&project.join(".fluent/work")) == before,
+            "status mutated {mutation}"
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &at)
+            .assert()
+            .failure();
+        assert!(
+            store.read_work_item(work).unwrap() == accepted,
+            "obsolete proof changed history: {mutation}"
+        );
     }
 }

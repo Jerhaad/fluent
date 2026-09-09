@@ -328,6 +328,98 @@ pub(crate) fn validate_owned_plan_evidence_review(
     Ok(completed)
 }
 
+/// Record the exact passing Review bytes when Plan evidence settles.
+pub(crate) fn complete_owned_plan_evidence_review(
+    project_root: &Path,
+    attempt: &mut work_model::Attempt,
+) -> Result<bool> {
+    if !validate_owned_plan_evidence_review(project_root, attempt)? {
+        return Ok(false);
+    }
+    let recovery = attempt
+        .active_evidence_recovery()
+        .context("validated Plan recovery disappeared")?;
+    let recovery_id = recovery.id.clone();
+    let digests = recovery
+        .targets
+        .iter()
+        .map(|target| {
+            let task = attempt
+                .tasks
+                .iter()
+                .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+                .context("validated Plan reviewer disappeared")?;
+            let path = review_artifact_path(task).context("Plan Review artifact is missing")?;
+            let (bound, bytes) = bound_recovery_artifact(project_root, &path)?;
+            anyhow::ensure!(
+                review::extract_verdict(std::str::from_utf8(&bytes)?) == review::Verdict::Pass,
+                "Plan Review no longer passes"
+            );
+            Ok(bound.digest)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let recovery = attempt
+        .evidence_recoveries
+        .iter_mut()
+        .find(|entry| entry.id == recovery_id)
+        .unwrap();
+    for (target, digest) in recovery.targets.iter_mut().zip(digests) {
+        target.review_digest = Some(digest);
+    }
+    recovery.state = EvidenceRecoveryState::Complete;
+    Ok(true)
+}
+
+/// Validate completed Plan review authority without changing its history.
+pub(crate) fn plan_evidence_review_is_accepted(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+    target: &work_model::EvidenceReviewTarget,
+    binding: &work_model::PlanHostEvidenceBinding,
+) -> bool {
+    let validate = || -> Result<()> {
+        let task = attempt
+            .tasks
+            .iter()
+            .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+            .context("Plan reviewer is missing")?;
+        let context = task
+            .evidence_review_context
+            .as_ref()
+            .context("Plan review context is missing")?;
+        anyhow::ensure!(
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && context.recovery_id == recovery.id
+                && context.candidate_commit == binding.candidate_commit
+                && context.attachment == recovery.attachment
+                && context.prior_review_artifact == target.prior_review_artifact,
+            "Plan review binding changed"
+        );
+        let (bound, bytes) = bound_recovery_artifact(
+            project_root,
+            &review_artifact_path(task).context("Plan Review artifact is missing")?,
+        )?;
+        anyhow::ensure!(
+            match &target.review_digest {
+                Some(digest) => *digest == bound.digest,
+                // Older default-code Plan receipts did not record a review digest.
+                // Policy-bearing receipts require complete proof from their reader.
+                None => binding.applicability.is_default(),
+            },
+            "accepted Plan Review proof is missing or changed"
+        );
+        anyhow::ensure!(
+            review::extract_verdict(std::str::from_utf8(&bytes)?) == review::Verdict::Pass,
+            "accepted Plan Review no longer passes"
+        );
+        Ok(())
+    };
+    validate().is_ok()
+}
+
 /// Verify the candidate and stopped owners before an operator adopts a saved
 /// responsibility split. Approval itself never retries a Writer.
 pub(crate) fn inspect_ownership_adoption(
