@@ -4,6 +4,8 @@
 //! and task executor. Queue admission, direct execution, and host recovery all
 //! consume the same immutable checks without introducing a module cycle.
 
+use crate::check_applicability::resolve_check_applicability;
+
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
 use sha2::{Digest, Sha256};
@@ -2458,6 +2460,16 @@ mod tests {
     #[test]
     fn recovery_contracts_remain_independent_of_lifecycle_callers() {
         let source = include_str!("recovery_contracts.rs");
+        assert!(
+            !include_str!("tester.rs").contains("crate::recovery_contracts::"),
+            "Tester must resolve applicability below the recovery consumer"
+        );
+        for consumer in ["tester", "recovery_contracts"] {
+            assert!(
+                !include_str!("check_applicability.rs").contains(&format!("crate::{consumer}::")),
+                "shared applicability must not depend on {consumer}"
+            );
+        }
         for caller in [
             "lifecycle_recovery",
             "work_task_executor",
@@ -3316,26 +3328,6 @@ mod applicability_tests {
                 .contains("freshness")
         );
     }
-}
-
-pub(crate) fn resolve_check_applicability(
-    workspace: &Path,
-    definition: &work_model::CheckApplicability,
-) -> Result<work_model::ResolvedCheckApplicability> {
-    definition.validate().map_err(anyhow::Error::msg)?;
-    let mut comparison_commits = BTreeMap::new();
-    for name in &definition.comparison_refs {
-        let commit = git::run_stdout(
-            workspace,
-            &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
-            "resolve declared comparison commit",
-        )?;
-        comparison_commits.insert(name.clone(), commit);
-    }
-    Ok(work_model::ResolvedCheckApplicability {
-        definition: definition.clone(),
-        comparison_commits,
-    })
 }
 
 pub(crate) fn validate_check_applicability_at(

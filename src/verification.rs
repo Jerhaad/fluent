@@ -115,7 +115,7 @@ pub(crate) fn validate_context(
     )?;
     ensure!(status.trim().is_empty(), "verification candidate is dirty");
     ensure!(
-        crate::recovery_contracts::resolve_check_applicability(
+        crate::check_applicability::resolve_check_applicability(
             workspace,
             &context.checker.applicability.definition
         )? == context.checker.applicability,

@@ -4,6 +4,7 @@ pub(crate) mod baseline_cache;
 pub mod candidate_ancestry_recovery;
 pub mod candidate_gate;
 pub mod candidate_metadata_recovery;
+pub(crate) mod check_applicability;
 pub mod claude_auth;
 pub mod claude_diagnostics;
 pub mod cleanup;

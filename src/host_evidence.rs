@@ -798,7 +798,7 @@ pub fn run_focused(
     let candidate_workspace = canonical_candidate_workspace(&candidate_workspace)?;
     resolve_working_directory(&candidate_workspace, &working_directory)?;
     let checker = work_model::VerificationChecker {
-        applicability: crate::recovery_contracts::resolve_check_applicability(
+        applicability: crate::check_applicability::resolve_check_applicability(
             &candidate_workspace,
             &declared
                 .as_ref()
@@ -2094,7 +2094,7 @@ pub(crate) fn attach_with_cancellation_policy(
                     .review_context
                     .as_ref()
                     .expect("validated review context");
-                let applicability = crate::recovery_contracts::resolve_check_applicability(
+                let applicability = crate::check_applicability::resolve_check_applicability(
                     &project_root.join(&context.candidate_workspace_path),
                     &request.applicability,
                 )
@@ -2553,7 +2553,7 @@ pub fn attach_plan_row(
                 return Err(ineligible("evidence working directory does not match the approved host command"));
             }
             let source_matrix_digest = format!("sha256:{:x}", Sha256::digest(&matrix_bytes));
-            let applicability = crate::recovery_contracts::resolve_check_applicability(
+            let applicability = crate::check_applicability::resolve_check_applicability(
                 &project_root.join(&output.workspace_path),
                 &row.command.as_ref().map(|command| command.applicability.clone()).unwrap_or_default(),
             ).map_err(|error| ineligible(&format!("{error:#}")))?;

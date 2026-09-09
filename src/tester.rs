@@ -720,7 +720,7 @@ fn run_with_prepared_sandbox_profile_and_collector(
         applicability: commands
             .iter()
             .map(|command| {
-                crate::recovery_contracts::resolve_check_applicability(
+                crate::check_applicability::resolve_check_applicability(
                     candidate_workspace,
                     &command.applicability,
                 )
