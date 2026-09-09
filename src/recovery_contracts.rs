@@ -111,6 +111,7 @@ pub(crate) fn validate_owned_plan_evidence_review(
         project_root,
         attempt,
         crate::check_applicability::evaluation_time(),
+        false,
     )
 }
 
@@ -118,6 +119,7 @@ fn validate_owned_plan_evidence_review_at(
     project_root: &Path,
     attempt: &work_model::Attempt,
     now: chrono::DateTime<chrono::Utc>,
+    settle_history: bool,
 ) -> Result<bool> {
     let Some(recovery) = attempt
         .active_evidence_recovery()
@@ -246,26 +248,47 @@ fn validate_owned_plan_evidence_review_at(
             row.responsibility == Some(work_model::CompletionResponsibility::Host),
             "evidence row is not host-owned"
         );
+        for artifact in [&binding.source_matrix, &binding.evidence] {
+            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            anyhow::ensure!(
+                format!("sha256:{:x}", Sha256::digest(&bytes)) == artifact.digest,
+                "host evidence digest changed: {}",
+                artifact.path
+            );
+        }
         let output = writer
             .output
             .as_ref()
             .context("host evidence source output disappeared")?;
         let command = row.command.as_ref().context("host command disappeared")?;
-        let current_row = current_matrix
-            .rows
-            .iter()
-            .find(|current| current.id == row.id)
-            .context("current host requirement disappeared")?;
-        anyhow::ensure!(
-            current_writer
-                .output
-                .as_ref()
-                .is_some_and(|output| output.commit == binding.candidate_commit)
-                && current_row.command == row.command
-                && current_row.requirement == row.requirement
-                && current_row.verification_refs == row.verification_refs,
-            "current host requirement or candidate changed"
-        );
+        // Explicit fresh attachment may settle a prior passing Review as history.
+        // Resume and current acceptance still require the current candidate and row.
+        if settle_history {
+            anyhow::ensure!(
+                current_writer
+                    .output
+                    .as_ref()
+                    .is_some_and(|current| current.commit != output.commit),
+                "historical Plan settlement requires a different current candidate"
+            );
+        } else {
+            let current_row = current_matrix
+                .rows
+                .iter()
+                .find(|current| current.id == row.id)
+                .context("current host requirement disappeared")?;
+            anyhow::ensure!(
+                current_writer
+                    .output
+                    .as_ref()
+                    .is_some_and(|output| output.commit == binding.candidate_commit)
+                    && current_row.command == row.command
+                    && current_row.requirement == row.requirement
+                    && current_row.verification_refs == row.verification_refs,
+                "current host requirement or candidate changed: {}",
+                binding.plan_row
+            );
+        }
         anyhow::ensure!(
             binding.applicability.definition == command.applicability,
             "host check applicability changed"
@@ -284,14 +307,6 @@ fn validate_owned_plan_evidence_review_at(
                 && binding.evidence.digest == recovery.attachment.digest,
             "host evidence no longer matches its candidate, row, command, or source"
         );
-        for artifact in [&binding.source_matrix, &binding.evidence] {
-            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
-            anyhow::ensure!(
-                format!("sha256:{:x}", Sha256::digest(&bytes)) == artifact.digest,
-                "host evidence digest changed: {}",
-                artifact.path
-            );
-        }
         let evidence = parse_evidence_document(&fs::read(resolve_input_artifact_path(
             project_root,
             &binding.evidence.path,
@@ -338,11 +353,19 @@ fn validate_owned_plan_evidence_review_at(
 }
 
 /// Record the exact passing Review bytes when Plan evidence settles.
+/// Only fresh explicit attachment may settle an older candidate's completed
+/// Review as history; resume always validates the current candidate and row.
 pub(crate) fn complete_owned_plan_evidence_review(
     project_root: &Path,
     attempt: &mut work_model::Attempt,
+    settle_history: bool,
 ) -> Result<bool> {
-    if !validate_owned_plan_evidence_review(project_root, attempt)? {
+    if !validate_owned_plan_evidence_review_at(
+        project_root,
+        attempt,
+        crate::check_applicability::evaluation_time(),
+        settle_history,
+    )? {
         return Ok(false);
     }
     let recovery = attempt
@@ -360,6 +383,13 @@ pub(crate) fn complete_owned_plan_evidence_review(
                 .context("validated Plan reviewer disappeared")?;
             let path = review_artifact_path(task).context("Plan Review artifact is missing")?;
             let (bound, bytes) = bound_recovery_artifact(project_root, &path)?;
+            anyhow::ensure!(
+                target
+                    .review_digest
+                    .as_ref()
+                    .is_none_or(|digest| *digest == bound.digest),
+                "Plan Review digest changed"
+            );
             anyhow::ensure!(
                 review::extract_verdict(std::str::from_utf8(&bytes)?) == review::Verdict::Pass,
                 "Plan Review no longer passes"
@@ -3400,7 +3430,7 @@ pub(crate) fn inspect_expired_pending_evidence(
     if crate::check_applicability::evaluation_time() < expiry {
         return Ok(None);
     }
-    validate_owned_plan_evidence_review_at(project_root, attempt, issued)?;
+    validate_owned_plan_evidence_review_at(project_root, attempt, issued, false)?;
     Ok(Some(ExpiredPendingEvidence {
         recovery: recovery.clone(),
         selector,
@@ -3870,9 +3900,9 @@ pub(crate) fn required_check_recovery_status(
             task.kind == TaskKind::Tester
                 && task.status == TaskStatus::Complete
                 && task
-                .review_context
-                .as_ref()
-                .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
         })
         .is_some_and(|task| !task.is_failed_command_recheck());
     if (!has_bound_check

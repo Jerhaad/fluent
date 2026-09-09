@@ -573,6 +573,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
                 crate::recovery_contracts::complete_owned_plan_evidence_review(
                     config.project_root,
                     attempt,
+                    false,
                 )
                 .map_err(|error| {
                     WorkModelError::HostEvidenceRecoveryIneligible {

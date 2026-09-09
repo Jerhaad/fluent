@@ -1165,6 +1165,12 @@ Plan receipts require this digest, while preserved default-code receipts retain
 the older verdict-based compatibility path. A no-change Writer does not alter
 that original source or Review.
 
+When a saved passing Plan Review still has an unsettled receipt for an older
+candidate, explicit fresh attachment can settle that receipt against its original
+bindings. This preserves completed history while requiring new proof for the
+current candidate; changed evidence or previously recorded Review bytes still
+block attachment.
+
 Tester command results keep `failure_cause` separate from exit status. An observed
 mismatch in a declared `os` or `architecture` prerequisite prevents launch and
 records the required and observed values with the failed result. The executor

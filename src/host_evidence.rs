@@ -1076,6 +1076,7 @@ pub(crate) fn ensure_owned_host_resume_ready(
             crate::recovery_contracts::complete_owned_plan_evidence_review(
                 project_root,
                 &mut settled,
+                false,
             )?;
             &settled
         } else {
@@ -2560,7 +2561,10 @@ pub fn attach_plan_row(
                 .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
             let expired = retire_expired_pending_evidence(project_root, historical, candidate_commit,
                 &crate::recovery_contracts::EvidenceSelector::PlanRow(plan_row.clone()), &document)?;
-            crate::recovery_contracts::complete_owned_plan_evidence_review(project_root, historical)
+            let settle_history = historical.active_evidence_recovery().is_some_and(|recovery| {
+                recovery.required_check.is_none() && recovery.candidate_commit != candidate_commit
+            });
+            crate::recovery_contracts::complete_owned_plan_evidence_review(project_root, historical, settle_history)
                 .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible { attempt_id: attempt_id.to_string(), reason: format!("{error:#}") })?;
             let attempt = item
                 .attempts

@@ -36920,7 +36920,60 @@ printf '{"type":"result","subtype":"success","result":"Implemented the approved 
                 .failure()
                 .stderr(predicate::str::contains("digest changed"));
             assert_eq!(work_item_value(&project, &id), before);
+            // Explicit attachment must also reject tampered historical proof
+            // without settling the older receipt or changing the current model.
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "evidence",
+                    "attach",
+                    &id,
+                    "attempt-1",
+                    "--candidate",
+                    next_candidate,
+                    "--plan-row",
+                    plan_row,
+                    "--evidence-file",
+                    passing.to_str().unwrap(),
+                ])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("digest changed"));
+            assert_eq!(work_item_value(&project, &id), before);
             fs::write(evidence_path, original_evidence).unwrap();
+            let prior_target = &prior_recovery.targets[0];
+            assert!(prior_target.review_digest.is_some());
+            let prior_review = current
+                .tasks
+                .iter()
+                .find(|task| Some(task.id.as_str()) == prior_target.review_task_id.as_deref())
+                .unwrap();
+            let review_path = project
+                .join(&prior_review.artifact_area.as_ref().unwrap().path)
+                .join("review.md");
+            let original_review = fs::read(&review_path).unwrap();
+            fs::write(&review_path, [original_review.as_slice(), b"\n"].concat()).unwrap();
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "evidence",
+                    "attach",
+                    &id,
+                    "attempt-1",
+                    "--candidate",
+                    next_candidate,
+                    "--plan-row",
+                    plan_row,
+                    "--evidence-file",
+                    passing.to_str().unwrap(),
+                ])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("Plan Review digest changed"));
+            assert_eq!(work_item_value(&project, &id), before);
+            fs::write(review_path, original_review).unwrap();
         }
         // The old accepted check cannot authorize this new candidate.
         for _ in 0..2 {
