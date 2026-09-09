@@ -640,7 +640,7 @@ fn work_model_store_writes_deterministic_pretty_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 2,
+  "schema_version": 3,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
@@ -694,7 +694,7 @@ fn capture_mode_preserves_minimal_work_item_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 2,
+  "schema_version": 3,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
