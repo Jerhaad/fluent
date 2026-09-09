@@ -40074,8 +40074,21 @@ fn canonical_evidence_fixture_with_applicability(
     commands: &[&str],
     applicability: serde_json::Value,
 ) -> (PathBuf, String, PathBuf) {
+    canonical_evidence_fixture_with_extractor(tmp, work, commands, applicability, None)
+}
+
+fn canonical_evidence_fixture_with_extractor(
+    tmp: &TempDir,
+    work: &str,
+    commands: &[&str],
+    applicability: serde_json::Value,
+    extractor: Option<&str>,
+) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::{TaskKind, TaskOutput, TaskStatus, WorkItem};
     let project = setup_git_project(tmp);
+    if let Some(extractor) = extractor {
+        fs::write(project.join(".fluent/extract-tester-results"), extractor).unwrap();
+    }
     let definitions = commands
         .iter()
         .enumerate()
@@ -40090,7 +40103,16 @@ fn canonical_evidence_fixture_with_applicability(
         serde_json::to_vec(&serde_json::json!({"commands": definitions})).unwrap(),
     )
     .unwrap();
-    git::run(&project, &["add", ".fluent/tester.yaml"], "stage Tester").unwrap();
+    git::run(
+        &project,
+        &[
+            "add",
+            ".fluent/tester.yaml",
+            ".fluent/extract-tester-results",
+        ],
+        "stage Tester",
+    )
+    .unwrap();
     git::run(
         &project,
         &["commit", "-m", "Add canonical commands"],
@@ -40144,15 +40166,42 @@ fn canonical_evidence_fixture_with_applicability(
     }
     let tester = item.add_final_tester_task("attempt-1").unwrap();
     store.create_work_item(&item).unwrap();
-    fluent_cmd()
+    let execution = fluent_cmd()
         .current_dir(&project)
         .args(["task", "run", work, "attempt-1", &tester, "--no-sandbox"])
-        .assert()
-        .success();
+        .assert();
+    if extractor.is_some_and(|source| source.contains("invalid extractor output")) {
+        execution.failure().stderr(predicate::str::contains(
+            "Tester harness could not produce trustworthy evidence",
+        ));
+        let mut archived = store.read_work_item(work).unwrap();
+        assert_eq!(
+            archived.attempts[0].pause_kind,
+            Some(fluent::work_model::PauseKind::TesterHarness)
+        );
+        // Current Task execution already preserves its harness-repair route.
+        // Older completed error results must also retain correction after the
+        // assessment starts. Seed that historical producer shape before recovery.
+        archived.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester)
+            .unwrap()
+            .status = TaskStatus::Complete;
+        archived.attempts[0].pause_kind = None;
+        archived.attempts[0].status = fluent::work_model::AttemptStatus::Reviewing;
+        store.write_work_item(&archived).unwrap();
+    } else {
+        execution.success();
+    }
     let result = project.join(format!(
         ".fluent/work/artifacts/{work}/attempt-1/{tester}/tester-results.json"
     ));
-    let value: serde_json::Value = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+    if value["error"].is_object() {
+        value["candidate_commit"] = serde_json::json!(candidate);
+        fs::write(&result, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
     assert_eq!(value["commands"].as_array().unwrap().len(), commands.len());
     assert_eq!(value["candidate_commit"], candidate);
     (project, candidate, result)
@@ -40255,12 +40304,28 @@ fn attach_canonical_fixture_result(
 
 #[test]
 fn canonical_tester_recovery_reuses_other_passing_results() {
+    canonical_tester_replacement_reaches_ready(None);
+}
+
+#[test]
+fn canonical_tester_replacement_covers_attributed_failure() {
+    canonical_tester_replacement_reaches_ready(Some(
+        "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"command-1:false\",\"test_harness\":\"shell-harness\",\"status\":\"fail\"}]'\n",
+    ));
+}
+
+fn canonical_tester_replacement_reaches_ready(extractor: Option<&str>) {
     let tmp = TempDir::new().unwrap();
     let work = "canonical-reuse";
     let marker = tmp.path().join("passing-runs");
     let command = format!("echo pass >> '{}'", marker.display());
-    let (project, candidate, results) =
-        canonical_evidence_fixture(&tmp, work, &[&command, "false"]);
+    let (project, candidate, results) = canonical_evidence_fixture_with_extractor(
+        &tmp,
+        work,
+        &[&command, "false"],
+        serde_json::json!({}),
+        extractor,
+    );
     let original = fs::read(&results).unwrap();
     attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
     let bin = tmp.path().join("bin");
@@ -40365,7 +40430,7 @@ fn reviewed_host_result_satisfies_only_bound_check() {
 fn canonical_tester_recovery_preserves_aggregate_blockers() {
     for (case, reason) in [
         ("missing", "missing configured"),
-        ("structured", "unattributed"),
+        ("structured", "structured"),
         ("extractor", "extractor or harness"),
         ("leak", "process leaks"),
     ] {
@@ -40406,6 +40471,7 @@ fn canonical_tester_recovery_preserves_aggregate_blockers() {
             .current_dir(&project)
             .args(["attempt", "run", &work, "attempt-1", "--no-sandbox"])
             .env("PATH", mock_path(&bin))
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
             .assert()
             .success()
             .stdout(predicate::str::contains("is ready").not());
@@ -40419,13 +40485,20 @@ fn canonical_tester_recovery_preserves_aggregate_blockers() {
                 .count(),
             1
         );
-        assert!(
-            fs::read_to_string(project.join(format!(
-                ".fluent/work/artifacts/{work}/attempt-1/required-check-needs-user.md"
-            )))
-            .unwrap()
-            .contains(reason)
-        );
+        if matches!(case, "missing" | "leak") {
+            assert!(
+                fs::read_to_string(project.join(format!(
+                    ".fluent/work/artifacts/{work}/attempt-1/required-check-needs-user.md"
+                )))
+                .unwrap()
+                .contains(reason)
+            );
+        } else {
+            assert_eq!(
+                item.attempts[0].pause_kind,
+                Some(fluent::work_model::PauseKind::RoundCap)
+            );
+        }
         assert_eq!(fs::read(path).unwrap(), before);
     }
 }
@@ -42061,4 +42134,71 @@ fn evidence_recovery_receipt_cannot_clear_intervening_stop() {
         ))
         .unwrap()
     );
+}
+
+#[test]
+fn established_canonical_defects_grant_writer_exact_inputs() {
+    use fluent::work_model::TaskKind;
+    for extractor in [
+        "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"new-source-assertion\",\"test_harness\":\"shell-harness\",\"status\":\"fail\"}]'\n",
+        "#!/bin/sh\nprintf 'invalid extractor output'\n",
+    ] {
+        let tmp = TempDir::new().unwrap();
+        let work = "established-defect";
+        let (project, _, results) = canonical_evidence_fixture_with_extractor(
+            &tmp,
+            work,
+            &["false"],
+            serde_json::json!({"environment":{"os":std::env::consts::OS}}),
+            Some(extractor),
+        );
+        let original = fs::read(&results).unwrap();
+        let bin = tmp.path().join("bin");
+        // Stop at the provider boundary after production has granted the Writer
+        // its correction inputs. No fixture edits repair lifecycle decisions.
+        write_mock_claude(&bin, "#!/bin/bash\nexit 23\n");
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+            .assert()
+            .failure();
+        let item = WorkModelStore::new(&project).read_work_item(work).unwrap();
+        let writers = item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            writers.len(),
+            2,
+            "established defects must authorize correction"
+        );
+        let writer = writers[1];
+        for path in [
+            &results,
+            &results.parent().unwrap().join("commands/0-stdout.log"),
+            &results.parent().unwrap().join("commands/0-stderr.log"),
+        ] {
+            let relative = path.strip_prefix(&project).unwrap().to_str().unwrap();
+            assert!(
+                writer
+                    .input_artifacts
+                    .iter()
+                    .any(|input| input.path == relative),
+                "missing exact correction input {relative}"
+            );
+            assert!(
+                !writer
+                    .workspace_access
+                    .writes
+                    .iter()
+                    .any(|workspace| path.starts_with(project.join(&workspace.path))),
+                "Tester input must remain read-only"
+            );
+        }
+        assert_eq!(fs::read(results).unwrap(), original);
+        assert!(item.merge_candidates.is_empty());
+    }
 }

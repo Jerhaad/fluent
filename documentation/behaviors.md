@@ -431,7 +431,7 @@ Test: src/candidate_gate.rs (missing_test_reference_reports_failed_tester_comman
 IF final Tester evidence returns to a corrective Writer, THEN THE SYSTEM SHALL
 grant read-only access to the exact gate, structured Tester result, and failed
 command logs while leaving sibling Tester artifacts inaccessible.
-Test: src/work_attempt_loop.rs (unclassified_final_tester_logs_remain_diagnosis_inputs)
+Test: tests/binary.rs (established_canonical_defects_grant_writer_exact_inputs)
 Test: src/work_attempt_loop.rs (final_tester_correction_rejects_noncanonical_log_path)
 Test: src/work_task_executor.rs (writer_launch_names_and_confines_preserved_work_item_input)
 

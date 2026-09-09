@@ -2785,6 +2785,8 @@ pub(crate) struct CanonicalCheckAssessment {
     pub accepted: Vec<usize>,
     pub blockers: Vec<String>,
     pub diagnoses: Vec<String>,
+    /// Demonstrated assertion or harness defects retain source correction.
+    pub defects: Vec<String>,
     pub reconstruction: Option<CanonicalReconstruction>,
 }
 
@@ -2797,7 +2799,7 @@ pub(crate) struct CanonicalReconstruction {
 
 impl CanonicalCheckAssessment {
     pub fn is_satisfied(&self) -> bool {
-        self.outstanding.is_empty() && self.blockers.is_empty()
+        self.outstanding.is_empty() && self.blockers.is_empty() && self.defects.is_empty()
     }
 }
 
@@ -2969,8 +2971,12 @@ pub(crate) fn assess_canonical_checks(
     if results.commands.len() != manifest.commands.len() {
         blockers.push("canonical Tester is missing configured command results".into());
     }
-    if results.error.is_some() {
-        blockers.push("canonical Tester has an unresolved extractor or harness error".into());
+    let mut defects = Vec::new();
+    if let Some(error) = &results.error {
+        defects.push(format!(
+            "canonical Tester has an unresolved extractor or harness error: {}",
+            error.kind
+        ));
     }
     if results.summary.total != results.tests.len()
         || results.summary.pass
@@ -2994,9 +3000,6 @@ pub(crate) fn assess_canonical_checks(
     {
         blockers
             .push("canonical Tester summary does not account for its structured results".into());
-    }
-    if results.tests.iter().any(|test| test.status == "fail") {
-        blockers.push("canonical Tester has unattributed structured failures".into());
     }
     let mut logs = Vec::new();
     for (index, command) in results.commands.iter().enumerate() {
@@ -3135,7 +3138,23 @@ pub(crate) fn assess_canonical_checks(
         }
         checks.push(check);
     }
+    for test in results.tests.iter().filter(|test| test.status == "fail") {
+        // Only the established command identity can be discharged by a reviewed
+        // replacement. A harness match alone cannot attribute an assertion.
+        let covered = accepted.iter().any(|index| {
+            let command = &manifest.commands[*index];
+            test.id == format!("command-{index}:{}", command.command)
+                && test.test_harness == command.test_harness
+        });
+        if !covered {
+            defects.push(format!(
+                "canonical Tester has an unresolved structured failure: {}",
+                test.id
+            ));
+        }
+    }
     Ok(CanonicalCheckAssessment {
+        defects,
         reconstruction,
         diagnoses,
         results_path: project_root.join(results_ref.path),
@@ -3550,6 +3569,10 @@ pub(crate) fn required_check_recovery_status(
     let assessment = assess_canonical_checks(project_root, attempt)?;
     if assessment.is_satisfied() {
         return Ok(Some(RequiredCheckRecoveryStatus { can_resume: true, reason: "The complete canonical run and reviewed evidence satisfy every required check; resume the remaining lifecycle gates.".into(), next_action: Some(format!("fluent queue resume {} --attempt {}", attempt.work_item_id, attempt.id)) }));
+    }
+    // A known defect follows the existing Writer budget and correction gates.
+    if !assessment.defects.is_empty() {
+        return Ok(None);
     }
     let mut reasons = assessment.blockers.clone();
     reasons.extend(assessment.diagnoses.iter().cloned());

@@ -9171,7 +9171,7 @@ fn interpret_reviews(
         && canonical_assessment.as_ref().is_some_and(|assessment| {
             assessment
                 .as_ref()
-                .map_or(true, |view| !view.is_satisfied())
+                .map_or(true, |view| !view.is_satisfied() && view.defects.is_empty())
         })
     {
         let reason = match canonical_assessment.as_ref().unwrap() {
