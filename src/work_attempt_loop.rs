@@ -15693,6 +15693,13 @@ mod tests {
         fs::create_dir_all(&artifact_dir).unwrap();
         fs::write(artifact_dir.join("review.md"), content).unwrap();
 
+        let evidence_path = ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json";
+        let evidence_bytes =
+            br#"{"schema_version":1,"check":"host check","result":"pass","working_directory":"."}"#;
+        fs::create_dir_all(project_root.join(evidence_path).parent().unwrap()).unwrap();
+        fs::write(project_root.join(evidence_path), evidence_bytes).unwrap();
+        let evidence_digest = format!("sha256:{:x}", Sha256::digest(evidence_bytes));
+
         store
             .mutate_work_item("work-1", |item| {
                 let attempt = &mut item.attempts[0];
@@ -15714,7 +15721,7 @@ mod tests {
                             snapshot_path:
                                 ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
                                     .to_string(),
-                            digest: "sha256:abc".to_string(),
+                            digest: evidence_digest.clone(),
                         },
                         targets: vec![crate::work_model::EvidenceReviewTarget {
                             role: "behaviors".to_string(),
@@ -15734,7 +15741,7 @@ mod tests {
                         snapshot_path:
                             ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
                                 .to_string(),
-                        digest: "sha256:abc".to_string(),
+                        digest: evidence_digest.clone(),
                     },
                     prior_review_artifact,
                 });
@@ -16880,6 +16887,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, project_root, _workspace, candidate) =
             make_learner_passing_fixture(tmp.path(), 1);
+
+        let evidence_path = ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json";
+        let evidence_bytes =
+            br#"{"schema_version":1,"check":"host check","result":"pass","working_directory":"."}"#;
+        fs::create_dir_all(project_root.join(evidence_path).parent().unwrap()).unwrap();
+        fs::write(project_root.join(evidence_path), evidence_bytes).unwrap();
+        let evidence_digest = format!("sha256:{:x}", Sha256::digest(evidence_bytes));
+
         let targeted_id = "attempt-1-evidence-abc-tests";
         let targeted_path = work_artifact_path("work-1", "attempt-1", targeted_id);
         fs::create_dir_all(project_root.join(&targeted_path)).unwrap();
@@ -16902,7 +16917,7 @@ mod tests {
                 let attachment = crate::work_model::EvidenceAttachment {
                     snapshot_path: ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
                         .to_string(),
-                    digest: "sha256:abc".to_string(),
+                    digest: evidence_digest.clone(),
                 };
                 attempt
                     .evidence_recoveries
