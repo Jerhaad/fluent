@@ -848,6 +848,12 @@ Test: tests/binary.rs (attempt_evidence_attach_rejects_ineligible_failed_attempt
 WHEN an evidence-only recovery needs more host evidence, THE SYSTEM SHALL show
 its recovery history and the exact next attachment command.
 Test: tests/binary.rs (work_show_explains_evidence_only_recovery_history_and_next_action)
+For a required check, THE SYSTEM SHALL report its exact identity, unresolved
+reason, and an eligible attachment or resume command. If current proof or
+ownership prevents an operation, it SHALL identify that missing proof or
+settlement instead. Foreground admission, queue admission and claim SHALL
+revalidate the same bindings after read-only guidance.
+Test: tests/binary.rs (evidence_recovery_guidance_matches_foreground_and_queue_admission)
 
 ### B17
 
@@ -5326,6 +5332,11 @@ is queued and no coordinator is live, project status SHALL instead name
 Test: src/work_status.rs (resumable_needs_user_status_names_exact_queue_resume_command)
 Test: tests/binary.rs (queue_resume_records_exact_authorization_and_is_idempotent,
 status_reports_queued_work_without_live_scheduler)
+Evidence recovery SHALL offer queue resume only while current bound proof
+permits it. A queued dispatch admitted before a later durable stop SHALL NOT
+claim that Attempt; a new explicit resume must carry the current stop authority.
+Test: tests/binary.rs (evidence_recovery_retries_preserve_task_and_dispatch_identity)
+Test: tests/binary.rs (evidence_recovery_guidance_matches_foreground_and_queue_admission)
 
 ### B2g
 
@@ -9425,6 +9436,9 @@ THE SYSTEM SHALL print, after the result, a next-action line naming the specific
 command to run next for that state.
 Test: tests/binary.rs (work_item_create_output_names_attempt_create_next)
 Test: tests/binary.rs (attempt_create_output_names_attempt_run_next)
+For evidence recovery without an eligible command, THE SYSTEM SHALL report the
+missing proof or authorization instead of inventing a next operation.
+Test: src/guidance.rs (missing_check_proof_does_not_offer_generic_resume)
 
 ### B2
 
@@ -9516,10 +9530,12 @@ Test: tests/binary.rs (next_action_is_appended_not_interleaved_into_result)
 ### B8
 
 WHEN an Attempt is `needs-user` for a non-auth pause,
-THE SYSTEM SHALL print a next-action line naming the handoff file to read, then
-`fluent attempt run`.
+THE SYSTEM SHALL print the applicable recovery action and handoff. For evidence
+recovery, it SHALL use the eligible evidence operation or name missing proof;
+other non-auth pauses retain the handoff followed by `fluent attempt run`.
 Test: tests/binary.rs (needs_user_generic_output_names_handoff_file)
 Test: src/guidance.rs (after_attempt_run_needs_user_generic_names_handoff_file)
+Test: tests/binary.rs (evidence_recovery_guidance_matches_foreground_and_queue_admission)
 
 ### B9
 
@@ -9967,6 +9983,11 @@ eligible, THE SYSTEM SHALL retain the recorded Task and dispatch identities,
 rechecking candidate and evidence bindings through foreground and queued paths.
 Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent)
 Test: tests/binary.rs (host_plan_recovery_public_commands_are_idempotent_recheck_changed_evidence)
+This includes canonical-command and host recovery interrupted after immutable
+evidence publication or targeted Review settlement. Repeated active queue resume
+SHALL retain the dispatch; a later stop requires fresh explicit authorization.
+Test: tests/binary.rs (evidence_recovery_retries_preserve_task_and_dispatch_identity)
+Test: tests/binary.rs (canonical_attachment_resumes_settled_stop_and_rejects_live_owner)
 
 ## Rebased landing verification
 

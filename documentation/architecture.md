@@ -1152,6 +1152,17 @@ manifest before explaining an environment handoff. Unexplained nonzero exits
 pause for diagnosis; structured test failures and identified harness errors keep
 their existing correction routes. Log phrases alone grant no correction authority.
 
+Required-check admission and status use `recovery_contracts` to revalidate the
+same source digests, candidate, policy and targeted Review bindings. Foreground
+resume, queue admission, scheduler claim and direct Review Task launch each use
+that evaluator before execution. Read-only status reports the outstanding check
+and the currently eligible operation; missing proof suppresses generic resume.
+Attachment repeats validation under the model lock. Immutable publication may
+precede reservation; retries reuse content-addressed snapshots and recorded
+recovery, Review Task and operation identities. Queue claim also compares its
+resume authority with the current durable stop, so an earlier dispatch cannot
+claim an Attempt canceled after admission.
+
 The bounded legacy adapter supports a completed, exact-candidate canonical
 Tester without `canonical-run.json` when its ordered result commands account
 for the committed configuration and every command uses default candidate-code

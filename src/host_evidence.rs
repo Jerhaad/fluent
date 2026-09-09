@@ -1055,6 +1055,20 @@ pub(crate) fn ensure_owned_host_resume_ready(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<()> {
+    if let Some(status) =
+        crate::recovery_contracts::required_check_recovery_status(project_root, attempt)?
+    {
+        if !status.can_resume {
+            bail!(
+                "{}{}",
+                status.reason,
+                status
+                    .next_action
+                    .map(|action| format!("\n\n{action}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
     let mut settled;
     let attempt =
         if crate::recovery_contracts::validate_owned_plan_evidence_review(project_root, attempt)? {
@@ -2020,6 +2034,16 @@ pub(crate) fn attach_with_cancellation_policy(
                 });
             }
             if let Some(request) = request {
+                if document.check != request.command
+                    || document.working_directory != request.working_directory
+                {
+                    return Err(WorkModelError::HostEvidenceRecoveryIneligible {
+                        attempt_id: attempt_id.into(),
+                        reason:
+                            "evidence must match the exact requested command and working directory"
+                                .into(),
+                    });
+                }
                 let context = prior
                     .review_context
                     .as_ref()
@@ -3767,110 +3791,7 @@ pub(crate) fn completed_review_evidence_commands(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Vec<String> {
-    let latest_candidate = attempt
-        .tasks
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-        .and_then(|task| task.output.as_ref())
-        .map(|output| output.commit.as_str());
-    let Some(latest_candidate) = latest_candidate else {
-        return Vec::new();
-    };
-    let mut commands = attempt
-        .evidence_recoveries
-        .iter()
-        .filter_map(|recovery| {
-            if recovery.state != EvidenceRecoveryState::Complete
-                || recovery.candidate_commit != latest_candidate
-            {
-                return None;
-            }
-            if let Some(check) = &recovery.required_check {
-                if !matches!(
-                    check.source,
-                    work_model::RequiredCheckSource::ReviewRequested { .. }
-                ) || crate::recovery_contracts::validate_required_check_binding(
-                    project_root,
-                    attempt,
-                    check,
-                )
-                .is_err()
-                    || !crate::recovery_contracts::required_check_is_accepted(
-                        project_root,
-                        attempt,
-                        check,
-                    )
-                {
-                    return None;
-                }
-            }
-            let evidence_bytes =
-                fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
-            if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
-            {
-                return None;
-            }
-            let evidence = parse_evidence_document(&evidence_bytes).ok()?;
-            if evidence.result != EvidenceResult::Pass {
-                return None;
-            }
-
-            recovery.targets.iter().find_map(|target| {
-                if target.role != "tests" {
-                    return None;
-                }
-                let prior_review =
-                    fs::read_to_string(project_root.join(&target.prior_review_artifact)).ok()?;
-                let request = review::extract_focused_evidence_request(&prior_review)?;
-                if recovery.required_check.is_none() && !request.applicability.is_default() {
-                    return None;
-                }
-                if evidence.check != request.command
-                    || request.working_directory != "."
-                    || evidence.working_directory != request.working_directory
-                {
-                    return None;
-                }
-                let prior_task_is_bound = attempt.tasks.iter().any(|task| {
-                    task.kind == TaskKind::Review
-                        && task.role == "tests"
-                        && task.status == TaskStatus::Complete
-                        && task
-                            .review_context
-                            .as_ref()
-                            .map(|context| context.candidate_commit.as_str())
-                            == Some(latest_candidate)
-                        && review_artifact_path(task).as_deref()
-                            == Some(target.prior_review_artifact.as_str())
-                        && read_verdict(project_root, task) == Some(Verdict::Fail)
-                });
-                let targeted_review_passed = target.review_task_id.as_ref().is_some_and(|id| {
-                    attempt.tasks.iter().any(|task| {
-                        task.id == *id
-                            && task.kind == TaskKind::Review
-                            && task.role == "tests"
-                            && task.status == TaskStatus::Complete
-                            && task
-                                .evidence_review_context
-                                .as_ref()
-                                .is_some_and(|context| {
-                                    context.recovery_id == recovery.id
-                                        && context.candidate_commit == recovery.candidate_commit
-                                        && context.attachment == recovery.attachment
-                                        && context.prior_review_artifact
-                                            == target.prior_review_artifact
-                                })
-                            && read_verdict(project_root, task) == Some(Verdict::Pass)
-                    })
-                });
-                (prior_task_is_bound && targeted_review_passed).then_some(request.command)
-            })
-        })
-        .collect::<Vec<_>>();
-    commands.sort();
-    commands.dedup();
-    commands
+    crate::recovery_contracts::completed_review_check_commands(project_root, attempt)
 }
 
 pub(crate) fn pending_candidate_gate_evidence_recovery_action(
@@ -5502,6 +5423,50 @@ pub fn attach_required_check(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .context("Attempt is missing")?;
+    anyhow::ensure!(
+        !observed
+            .merge_candidates
+            .iter()
+            .any(|candidate| candidate.attempt_id == attempt_id),
+        "candidate or execution owners are not settled"
+    );
+    for task in &observed_attempt.tasks {
+        anyhow::ensure!(
+            task.status != TaskStatus::Executing
+                && !crate::lease::is_leased(&crate::lease::task_lock_path(
+                    project_root,
+                    work_item_id,
+                    &task.id
+                )),
+            "candidate or execution owners are not settled"
+        );
+        if let Some(area) = &task.artifact_area {
+            anyhow::ensure!(
+                !crate::execution::execution_is_live(&crate::execution::record_path_for_artifact(
+                    project_root,
+                    &area.path
+                ))?,
+                "the Attempt has a live execution owner"
+            );
+        }
+    }
+    let observed_output = observed_attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .context("no completed Writer candidate")?;
+    anyhow::ensure!(
+        observed_output.commit == candidate_commit
+            && crate::recovery_contracts::candidate_workspace_is_clean_at_managed(
+                project_root,
+                observed_output,
+                candidate_commit
+            ),
+        "host evidence requires the unchanged clean candidate"
+    );
+    let observed_stop = observed_attempt.cancellation.clone();
     let observed_checks =
         crate::recovery_contracts::assess_canonical_checks(project_root, observed_attempt)?;
     let observed_check = observed_checks
@@ -5535,6 +5500,9 @@ pub fn attach_required_check(
                 .iter()
                 .find(|attempt| attempt.id == attempt_id)
                 .ok_or_else(|| reject("Attempt is missing".into()))?;
+            if attempt.cancellation != observed_stop {
+                return Err(reject("stop authority changed during attachment; retry explicitly after execution settles".into()));
+            }
             if item
                 .merge_candidates
                 .iter()

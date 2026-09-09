@@ -6187,13 +6187,11 @@ fn tester_errored(tester_results_path: &Path) -> bool {
 }
 
 fn latest_tester_results_path(project_root: &Path, attempt: &Attempt) -> Option<PathBuf> {
-    if attempt.evidence_recoveries.iter().any(|recovery| {
-        recovery
-            .required_check
-            .as_ref()
-            .is_some_and(|check| check.source.is_canonical_tester())
-    }) && let Ok(view) =
-        crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
+    if attempt
+        .evidence_recoveries
+        .iter()
+        .any(|recovery| recovery.required_check.as_ref().is_some())
+        && let Ok(view) = crate::recovery_contracts::assess_canonical_checks(project_root, attempt)
     {
         return Some(view.results_path);
     }
@@ -9150,7 +9148,7 @@ fn interpret_reviews(
             recovery
                 .required_check
                 .as_ref()
-                .is_some_and(|check| check.source.is_canonical_tester())
+                .is_some_and(|check| check.source.is_canonical_tester() || assessed_checks.is_ok())
         })
         .then_some(())
         .or((canonical_has_policy || needs_diagnosis).then_some(()))

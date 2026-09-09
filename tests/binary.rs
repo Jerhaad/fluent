@@ -40723,81 +40723,131 @@ fn canonical_evidence_rejects_changed_comparison_ref() {
 #[test]
 fn accepted_evidence_survives_no_change_writer_and_resume() {
     use fluent::work_model::*;
-    let tmp = TempDir::new().unwrap();
-    let work = "no-change-evidence";
-    let (project, candidate, _) = canonical_evidence_fixture(&tmp, work, &["false", "false"]);
-    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 0, "false");
-    let bin = tmp.path().join("bin");
-    write_mock_claude(
-        &bin,
-        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
-    );
-    fluent_cmd()
-        .current_dir(&project)
-        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
-        .env("PATH", mock_path(&bin))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("is ready").not());
-    let store = WorkModelStore::new(&project);
-    let mut history = store.read_work_item(work).unwrap();
-    let preserved = history.attempts[0].evidence_recoveries[0].clone();
-    assert_eq!(preserved.state, EvidenceRecoveryState::Complete);
-    let mut later = history.attempts[0].tasks[0].clone();
-    later.id = "attempt-1-write-2".into();
-    later.artifact_area.as_mut().unwrap().path = work_artifact_path(work, "attempt-1", &later.id);
-    let declaration_path = format!(
-        "{}/no-change.json",
-        later.artifact_area.as_ref().unwrap().path
-    );
-    later.output.as_mut().unwrap().no_change = Some(NoChangeOutput {
-        schema_version: 1,
-        declaration_path: declaration_path.clone(),
-        reason: "Preserve the verified candidate".into(),
-        verification: vec![NoChangeVerification {
-            command: "true".into(),
-            result: NoChangeVerificationResult::Pass,
-        }],
-    });
-    let artifact = project.join(&later.artifact_area.as_ref().unwrap().path);
-    fs::create_dir_all(&artifact).unwrap();
-    fs::write(artifact.join("transcript.jsonl"), "{}\n").unwrap();
-    fs::write(project.join(declaration_path),serde_json::to_vec(&serde_json::json!({"schema_version":1,"candidate_commit":candidate,"reason":"Preserve the verified candidate","verification":[{"command":"true","result":"pass"}]})).unwrap()).unwrap();
-    // Preserve a historical no-change Writer before beginning the next public
-    // recovery. Candidate integrity and acceptance stay in production code.
-    history.attempts[0].tasks.push(later);
-    store.write_work_item(&history).unwrap();
-    let result_path = project.join(format!(
-        ".fluent/work/artifacts/{work}/attempt-1/attempt-1-tester/tester-results.json"
-    ));
-    let original = fs::read(&result_path).unwrap();
-    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
-    fluent_cmd()
-        .current_dir(&project)
-        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
-        .env("PATH", mock_path(&bin))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("is ready"));
-    let completed = store.read_work_item(work).unwrap();
-    assert_eq!(completed.attempts[0].evidence_recoveries[0], preserved);
-    assert_eq!(
-        completed.attempts[0]
-            .tasks
-            .iter()
-            .filter(|task| task.kind == TaskKind::Tester)
-            .count(),
-        1
-    );
-    assert_eq!(
-        completed.attempts[0]
-            .tasks
-            .iter()
-            .filter(|task| task.kind == TaskKind::Write)
-            .count(),
-        2
-    );
-    assert_eq!(fs::read(result_path).unwrap(), original);
+    for requested in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let work = if requested {
+            "no-change-review-evidence"
+        } else {
+            "no-change-evidence"
+        };
+        let (project, candidate, _) =
+            canonical_evidence_fixture(&tmp, work, &["false", "sh -c false"]);
+        if requested {
+            let mut item = WorkModelStore::new(&project).read_work_item(work).unwrap();
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
+            item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+            WorkModelStore::new(&project)
+                .write_work_item(&item)
+                .unwrap();
+            let prior = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Review)
+                .unwrap();
+            let prior_path = format!("{}/review.md", prior.artifact_area.as_ref().unwrap().path);
+            // Preserve an authorized review request as part of the saved history,
+            // before any evidence recovery begins.
+            fs::write(
+                project.join(&prior_path),
+                "Verdict: fail\nEvidence-Command: false\nEvidence-Working-Directory: .\n",
+            )
+            .unwrap();
+            let evidence = tmp.path().join("requested.json");
+            fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":"2026-09-09T12:00:00Z","output":"passed"})).unwrap()).unwrap();
+            fluent_cmd()
+                .current_dir(&project)
+                .args([
+                    "attempt",
+                    "evidence",
+                    "attach",
+                    work,
+                    "attempt-1",
+                    "--candidate",
+                    &candidate,
+                    "--review-artifact",
+                    &prior_path,
+                    "--evidence-file",
+                    evidence.to_str().unwrap(),
+                ])
+                .assert()
+                .success();
+        } else {
+            attach_canonical_fixture_result(&tmp, &project, work, &candidate, 0, "false");
+        }
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready").not());
+        let store = WorkModelStore::new(&project);
+        let mut history = store.read_work_item(work).unwrap();
+        let preserved = history.attempts[0].evidence_recoveries[0].clone();
+        assert_eq!(preserved.state, EvidenceRecoveryState::Complete);
+        let mut later = history.attempts[0].tasks[0].clone();
+        later.id = "attempt-1-write-2".into();
+        later.artifact_area.as_mut().unwrap().path =
+            work_artifact_path(work, "attempt-1", &later.id);
+        let declaration_path = format!(
+            "{}/no-change.json",
+            later.artifact_area.as_ref().unwrap().path
+        );
+        later.output.as_mut().unwrap().no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path: declaration_path.clone(),
+            reason: "Preserve the verified candidate".into(),
+            verification: vec![NoChangeVerification {
+                command: "true".into(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
+        let artifact = project.join(&later.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join("transcript.jsonl"), "{}\n").unwrap();
+        fs::write(project.join(declaration_path),serde_json::to_vec(&serde_json::json!({"schema_version":1,"candidate_commit":candidate,"reason":"Preserve the verified candidate","verification":[{"command":"true","result":"pass"}]})).unwrap()).unwrap();
+        // Preserve a historical no-change Writer before beginning the next public
+        // recovery. Candidate integrity and acceptance stay in production code.
+        history.attempts[0].tasks.push(later);
+        store.write_work_item(&history).unwrap();
+        let result_path = project.join(format!(
+            ".fluent/work/artifacts/{work}/attempt-1/attempt-1-tester/tester-results.json"
+        ));
+        let original = fs::read(&result_path).unwrap();
+        attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "sh -c false");
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready"));
+        let completed = store.read_work_item(work).unwrap();
+        assert_eq!(completed.attempts[0].evidence_recoveries[0], preserved);
+        assert_eq!(
+            completed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Tester)
+                .count(),
+            1
+        );
+        assert_eq!(
+            completed.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            2
+        );
+        assert_eq!(fs::read(result_path).unwrap(), original);
+    }
 }
 
 #[test]
@@ -41106,4 +41156,332 @@ fn legacy_evidence_requires_historical_comparison_proof() {
         .failure()
         .stderr(predicate::str::contains("historical applicability"));
     assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+}
+
+#[test]
+fn evidence_recovery_guidance_matches_foreground_and_queue_admission() {
+    let tmp = TempDir::new().unwrap();
+    let work = "check-recovery-guidance";
+    let (project, candidate, _) = canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--required-check"));
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    let shown = work_item_value(&project, work);
+    let action = shown["next-action"]
+        .as_str()
+        .expect("status names the exact outstanding check")
+        .to_string();
+    assert!(action.contains("--required-check tester:"));
+    assert_eq!(shown["evidence-recovery"]["can-resume"], false);
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+    for args in [
+        vec!["attempt", "run", work, "attempt-1", "--no-sandbox"],
+        vec!["queue", "resume", work, "--attempt", "attempt-1"],
+    ] {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--required-check"));
+    }
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 1, "false");
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", work, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let attached = work_item_value(&project, work);
+    let snapshot = attached["attempts"][0]["evidence_recoveries"][0]["attachment"]["snapshot_path"]
+        .as_str()
+        .unwrap();
+    let target = attached["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_task_id"]
+        .as_str()
+        .unwrap();
+    let mut bytes = fs::read(project.join(snapshot)).unwrap();
+    bytes.push(b'\n');
+    fs::write(project.join(snapshot), bytes).unwrap();
+    let changed = snapshot_tree(&project.join(".fluent/work"));
+    let shown = work_item_value(&project, work);
+    assert!(shown["next-action"].is_null());
+    assert!(
+        shown["evidence-recovery"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("digest")
+    );
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), changed);
+    for args in [
+        vec!["attempt", "run", work, "attempt-1", "--no-sandbox"],
+        vec!["queue", "resume", work, "--attempt", "attempt-1"],
+        vec!["task", "run", work, "attempt-1", target, "--no-sandbox"],
+    ] {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("digest"));
+    }
+    assert!(
+        fluent::queue::claim(&project, work, "attempt-1")
+            .unwrap_err()
+            .to_string()
+            .contains("digest")
+    );
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), changed);
+}
+
+struct EvidenceCliRunner {
+    bin: PathBuf,
+}
+impl fluent::scheduler::AttemptRunner for EvidenceCliRunner {
+    fn run(
+        &self,
+        project: &Path,
+        work: &str,
+        attempt: &str,
+        _: bool,
+    ) -> anyhow::Result<fluent::scheduler::AttemptOutcome> {
+        let ledger = fluent::queue::read_ledger(project, work)?.unwrap();
+        let dispatch = ledger.active().unwrap();
+        let output = fluent_cmd()
+            .current_dir(project)
+            .env("PATH", mock_path(&self.bin))
+            .args([
+                "attempt",
+                "run",
+                work,
+                attempt,
+                "--dispatch-id",
+                &dispatch.dispatch_id,
+                "--no-sandbox",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "fixture CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fluent::scheduler::classify_attempt_outcome(project, work, attempt)
+    }
+}
+
+#[test]
+fn evidence_recovery_retries_preserve_task_and_dispatch_identity() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let work = "check-recovery-retries";
+    let (project, candidate, results) = canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+    let original_results = fs::read(&results).unwrap();
+    let area = format!(".fluent/work/artifacts/{work}/attempt-1/attempt-1-tester");
+    let bound = |path: String| serde_json::json!({"digest":format!("sha256:{:x}",Sha256::digest(fs::read(project.join(&path)).unwrap())),"path":path});
+    let config = fs::read(project.join(".fluent/tester.yaml")).unwrap();
+    let check: RequiredCheck = serde_json::from_value(serde_json::json!({
+        "id":format!("tester:{:x}:1",Sha256::digest(&config)),"work_item_id":work,"attempt_id":"attempt-1","candidate_commit":candidate,"command":"false","working_directory":".",
+        "source":{"kind":"canonical-tester","task_id":"attempt-1-tester","command_index":1,"results":bound(format!("{area}/tester-results.json")),"manifest":bound(format!("{area}/canonical-run.json")),"logs":[bound(format!("{area}/commands/0-stdout.log")),bound(format!("{area}/commands/0-stderr.log")),bound(format!("{area}/commands/1-stdout.log")),bound(format!("{area}/commands/1-stderr.log"))],"comparison_commit":null}
+    })).unwrap();
+    let binding = serde_json::to_vec_pretty(&check).unwrap();
+    let host_dir = project.join(format!(
+        ".fluent/work/artifacts/{work}/attempt-1/host-evidence"
+    ));
+    fs::create_dir_all(&host_dir).unwrap();
+    let obstruction = host_dir.join(format!("{:x}.json", Sha256::digest(&binding)));
+    fs::create_dir(&obstruction).unwrap();
+    let evidence = tmp.path().join("interrupted-attachment.json");
+    let document = serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"fixture host","check":"false","working_directory":".","result":"pass","run_at":"2026-09-09T12:00:00Z","output":"passed"})).unwrap();
+    fs::write(&evidence, &document).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure();
+    let durable_snapshot = host_dir.join(format!("{:x}.json", Sha256::digest(&document)));
+    assert_eq!(fs::read(&durable_snapshot).unwrap(), document);
+    assert!(
+        work_item_value(&project, work)["attempts"][0]["evidence_recoveries"]
+            .as_array()
+            .is_none_or(|r| r.is_empty())
+    );
+    fs::remove_dir(obstruction).unwrap();
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    let first = work_item_value(&project, work);
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    assert_eq!(work_item_value(&project, work), first);
+    let mut first_dispatch = None;
+    for _ in 0..2 {
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", work, "--attempt", "attempt-1"])
+            .assert()
+            .success();
+        let current = fluent::queue::read_ledger(&project, work).unwrap().unwrap();
+        let identity = current.active().unwrap().dispatch_id.clone();
+        if let Some(expected) = &first_dispatch {
+            assert_eq!(&identity, expected);
+        }
+        first_dispatch = Some(identity);
+        assert_eq!(
+            work_item_value(&project, work)["attempts"][0]["tasks"],
+            first["attempts"][0]["tasks"]
+        );
+    }
+    let queued = fluent::queue::read_ledger(&project, work).unwrap().unwrap();
+    let old_dispatch = queued.active().unwrap().clone();
+    let target = first["attempts"][0]["evidence_recoveries"][0]["targets"][0]["review_task_id"]
+        .as_str()
+        .unwrap();
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .env("PATH", mock_path(&bin))
+        .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+        .assert()
+        .success();
+    let reviewed = WorkModelStore::new(&project).read_work_item(work).unwrap();
+    assert_eq!(
+        reviewed.attempts[0].evidence_recoveries[0].state,
+        EvidenceRecoveryState::Reviewing
+    );
+    let task = reviewed.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.id == target)
+        .unwrap();
+    assert_eq!(task.status, TaskStatus::Complete);
+    let review_path = project
+        .join(&task.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    let reviewed_bytes = fs::read(&review_path).unwrap();
+    assert!(!fluent::lease::is_leased(&fluent::lease::task_lock_path(
+        &project, work, target
+    )));
+    assert!(
+        !fluent::execution::execution_is_live(&fluent::execution::record_path_for_artifact(
+            &project,
+            &task.artifact_area.as_ref().unwrap().path
+        ))
+        .unwrap()
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", work, "attempt-1"])
+        .assert()
+        .success();
+    assert!(
+        fluent::queue::claim(&project, work, "attempt-1")
+            .unwrap_err()
+            .to_string()
+            .contains("cancellation")
+    );
+    let stopped = WorkModelStore::new(&project).read_work_item(work).unwrap();
+    assert!(
+        stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_none()
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "remove", work])
+        .assert()
+        .success();
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["queue", "resume", work, "--attempt", "attempt-1"])
+        .assert()
+        .success();
+    let renewed = fluent::scheduler::pick_next_queued(&project)
+        .unwrap()
+        .unwrap();
+    assert_ne!(renewed.dispatch_id, old_dispatch.dispatch_id);
+    fluent::scheduler::dispatch_one(&project, &renewed, &EvidenceCliRunner { bin }).unwrap();
+    let final_item = WorkModelStore::new(&project).read_work_item(work).unwrap();
+    assert!(final_item.merge_candidates[0].ready_at.is_some());
+    assert_eq!(
+        final_item.attempts[0].evidence_recoveries[0].id,
+        reviewed.attempts[0].evidence_recoveries[0].id
+    );
+    assert_eq!(
+        final_item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(review_path).unwrap(), reviewed_bytes);
+    assert_eq!(fs::read(results).unwrap(), original_results);
+    assert_eq!(fs::read(durable_snapshot).unwrap(), document);
+    let ledger = fluent::queue::read_ledger(&project, work).unwrap().unwrap();
+    assert!(ledger.active().is_none());
+    assert_eq!(
+        ledger.latest().unwrap().status,
+        fluent::queue::DispatchStatus::CandidateReady
+    );
+}
+
+#[test]
+fn canonical_attachment_resumes_settled_stop_and_rejects_live_owner() {
+    let tmp = TempDir::new().unwrap();
+    let work = "canonical-stop-owner";
+    let (project, candidate, _) = canonical_evidence_fixture(&tmp, work, &["true", "false"]);
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "cancel", work, "attempt-1"])
+        .assert()
+        .success();
+    let stopped = WorkModelStore::new(&project).read_work_item(work).unwrap();
+    let evidence = tmp.path().join("stopped-proof.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":"2026-09-09T12:00:00Z","output":"passed"})).unwrap()).unwrap();
+    let owner = fluent::lease::acquire(&fluent::lease::task_lock_path(
+        &project,
+        work,
+        "attempt-1-tester",
+    ))
+    .unwrap();
+    let before = snapshot_tree(&project.join(".fluent/work"));
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("owners"));
+    assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
+    drop(owner);
+    canonical_attachment_command(&project, work, &candidate, &evidence)
+        .assert()
+        .success();
+    let resumed = WorkModelStore::new(&project).read_work_item(work).unwrap();
+    assert_eq!(
+        resumed.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at,
+        stopped.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .requested_at
+    );
+    assert!(
+        resumed.attempts[0]
+            .cancellation
+            .as_ref()
+            .unwrap()
+            .resumed_at
+            .is_some()
+    );
+    assert_eq!(resumed.attempts[0].evidence_recoveries.len(), 1);
 }

@@ -1452,6 +1452,26 @@ pub fn claim(
         return Ok(None);
     }
 
+    if let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == bound_attempt_id)
+    {
+        if attempt.cancellation_requested()
+            && (active.intent != DispatchIntent::ResumeAttempt
+                || active.resume_cancellation_requested_at.as_deref()
+                    != attempt
+                        .cancellation
+                        .as_ref()
+                        .map(|stop| stop.requested_at.as_str()))
+        {
+            bail!(
+                "dispatch {} predates the current cancellation; remove this unclaimed dispatch and authorize a new queue resume",
+                active.dispatch_id
+            );
+        }
+    }
+
     match active.intent {
         DispatchIntent::Run => {
             if active.tester_no_sandbox {

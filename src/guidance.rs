@@ -139,6 +139,7 @@ pub fn after_attempt_run(
             Some(PauseKind::TranscriptPump) => Some(format!(
                 "\n→ Next: fix the transcript/console transport (see {handoff_path}), then fluent attempt run <work-item-id> to retry"
             )),
+            Some(PauseKind::HostEvidence) => Some(format!("\n→ Next: inspect the outstanding check and missing proof in {handoff_path}")),
             Some(PauseKind::CandidateGate) => Some(format!(
                 "\n→ Next: read the candidate-gate handoff {handoff_path}, then run fluent queue resume {work_item_id} --attempt <attempt-id> and fluent scheduler run; use fluent attempt run {work_item_id} <attempt-id> for foreground recovery"
             )),
@@ -205,6 +206,9 @@ pub fn next_action_for_action(action: &str, id: &str, merge_candidate_id: &str) 
 }
 
 pub fn next_action_for_status_row(row: &crate::work_status::WorkItemStatus) -> Option<String> {
+    if row.recovery_blocker.is_some() && row.next_action.is_none() {
+        return None;
+    }
     row.next_action
         .as_ref()
         .map(|action| format!("\n→ Next: {action}"))
@@ -493,6 +497,7 @@ mod tests {
 
     fn status_row(id: &str, action: &str) -> crate::work_status::WorkItemStatus {
         crate::work_status::WorkItemStatus {
+            recovery_blocker: None,
             id: id.to_string(),
             title: "Title".to_string(),
             attempt: "-".to_string(),
@@ -506,6 +511,25 @@ mod tests {
             compatibility_warnings: Vec::new(),
             release: None,
         }
+    }
+
+    #[test]
+    fn missing_check_proof_does_not_offer_generic_resume() {
+        let mut row = status_row("work-1", "needs-user");
+        row.recovery_blocker = Some("Required check evidence digest changed".into());
+        assert!(next_action_for_status_row(&row).is_none());
+        let outcome = WorkAttemptRunOutcome::NeedsUser {
+            handoff_path: "required-check.md".into(),
+        };
+        let context = AttemptRunContext {
+            pause_kind: Some(&PauseKind::HostEvidence),
+            ..Default::default()
+        };
+        assert!(
+            !after_attempt_run(&outcome, "work-1", &context)
+                .unwrap()
+                .contains("attempt run")
+        );
     }
 
     #[test]

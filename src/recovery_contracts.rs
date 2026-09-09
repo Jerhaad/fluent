@@ -111,6 +111,75 @@ pub(crate) fn validate_owned_plan_evidence_review(
     else {
         return Ok(false);
     };
+    if let Some(check) = &recovery.required_check {
+        validate_required_check_binding(project_root, attempt, check)?;
+        let output = attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .context("required check candidate is missing")?;
+        let clean = if check.source.is_canonical_tester() {
+            candidate_workspace_is_clean_at_managed(project_root, output, &check.candidate_commit)
+        } else {
+            candidate_workspace_is_clean_at(project_root, output, &check.candidate_commit)
+        };
+        anyhow::ensure!(
+            clean,
+            "required check candidate is changed, dirty, or no longer managed"
+        );
+        let (attachment, bytes) =
+            bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path)?;
+        anyhow::ensure!(
+            attachment.digest == recovery.attachment.digest,
+            "required check evidence digest changed"
+        );
+        let document = parse_evidence_document(&bytes)?;
+        validate_check_applicability_at(&check.applicability, &document, chrono::Utc::now())?;
+        anyhow::ensure!(
+            recovery.candidate_commit == check.candidate_commit
+                && document.check == check.command
+                && document.working_directory == check.working_directory,
+            "required check result no longer matches its candidate or command"
+        );
+        anyhow::ensure!(
+            recovery.targets.len() == 1,
+            "required check needs one targeted Tests Review"
+        );
+        let target = &recovery.targets[0];
+        let (prior, bytes) = bound_recovery_artifact(project_root, &target.prior_review_artifact)?;
+        match &check.source {
+            work_model::RequiredCheckSource::CanonicalTester { .. } => anyhow::ensure!(
+                serde_json::from_slice::<work_model::RequiredCheck>(&bytes)? == *check
+                    && prior.path
+                        == snapshot_path(&attempt.work_item_id, &attempt.id, &prior.digest)?,
+                "required check source snapshot digest changed"
+            ),
+            work_model::RequiredCheckSource::ReviewRequested { request, .. } => {
+                anyhow::ensure!(prior == *request, "review request digest changed")
+            }
+        }
+        let reviewer = attempt
+            .tasks
+            .iter()
+            .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+            .context("required check reviewer is missing")?;
+        let context = reviewer
+            .evidence_review_context
+            .as_ref()
+            .context("required check review context is missing")?;
+        anyhow::ensure!(
+            target.role == "tests"
+                && reviewer.kind == TaskKind::Review
+                && reviewer.role == "tests"
+                && context.recovery_id == recovery.id
+                && context.candidate_commit == check.candidate_commit
+                && context.attachment == recovery.attachment
+                && context.prior_review_artifact == target.prior_review_artifact,
+            "required check reviewer binding changed"
+        );
+    }
     let mut completed = !recovery.targets.is_empty();
     for target in &recovery.targets {
         if !attempt.artifacts.iter().any(|artifact| {
@@ -125,10 +194,12 @@ pub(crate) fn validate_owned_plan_evidence_review(
         )?)?;
         // Keep current candidate admission strict, but validate each receipt
         // against the Writer it actually reviewed, including completed history.
-        if owned_host_completion_matrix(project_root, attempt)?.is_none() {
+        let Some((current_writer, _, current_matrix)) =
+            owned_host_completion_matrix(project_root, attempt)?
+        else {
             completed = false;
             continue;
-        }
+        };
         let writer = attempt
             .tasks
             .iter()
@@ -166,6 +237,25 @@ pub(crate) fn validate_owned_plan_evidence_review(
             .as_ref()
             .context("host evidence source output disappeared")?;
         let command = row.command.as_ref().context("host command disappeared")?;
+        let current_row = current_matrix
+            .rows
+            .iter()
+            .find(|current| current.id == row.id)
+            .context("current host requirement disappeared")?;
+        anyhow::ensure!(
+            current_writer
+                .output
+                .as_ref()
+                .is_some_and(|output| output.commit == binding.candidate_commit)
+                && current_row.command == row.command
+                && current_row.requirement == row.requirement
+                && current_row.verification_refs == row.verification_refs,
+            "current host requirement or candidate changed"
+        );
+        anyhow::ensure!(
+            binding.applicability.definition == command.applicability,
+            "host check applicability changed"
+        );
         anyhow::ensure!(
             binding.schema_version == 1
                 && binding.work_item_id == attempt.work_item_id
@@ -199,6 +289,11 @@ pub(crate) fn validate_owned_plan_evidence_review(
                 && evidence.run_at == binding.run_at,
             "host evidence document changed"
         );
+        validate_check_applicability(
+            &candidate_workspace_path(project_root, current_writer.output.as_ref().unwrap()),
+            &binding.applicability,
+            &evidence,
+        )?;
         let reviewer = target
             .review_task_id
             .as_ref()
@@ -2449,6 +2544,18 @@ mod tests {
     }
 
     #[test]
+    fn required_check_status_ignores_unrelated_attempts() {
+        let project = tempfile::tempdir().unwrap();
+        let mut item = crate::work_model::WorkItem::planned("work-1", "Initial work");
+        item.add_initial_attempt("attempt-1").unwrap();
+        assert!(
+            super::required_check_recovery_status(project.path(), &item.attempts[0])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn legacy_manifest_requires_complete_default_commands() {
         let results: crate::tester::TesterResults = serde_json::from_value(serde_json::json!({
             "commands":[{"command":"false","test_harness":"shell-harness","exit_code":1,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}],
@@ -2911,6 +3018,7 @@ pub(crate) fn assess_canonical_checks(
             blockers.push(format!("command {index} has unresolved process leaks"));
         }
     }
+    let reviewed = accepted_review_check_results(project_root, attempt);
     let mut checks = Vec::new();
     let mut outstanding = Vec::new();
     let mut accepted = Vec::new();
@@ -2997,7 +3105,21 @@ pub(crate) fn assess_canonical_checks(
         )
         .is_ok();
         if !matches || !local_applies || result.is_none_or(|command| command.exit_code != 0) {
-            if matches && required_check_is_accepted(project_root, attempt, &check) {
+            let reviewed_replacement = manifest
+                .commands
+                .iter()
+                .filter(|other| other.command == definition.command)
+                .count()
+                == 1
+                && reviewed.iter().any(|result| {
+                    result.command == check.command
+                        && result.applicability == check.applicability
+                        && result.comparison_commit == context.base_commit
+                });
+            if matches
+                && (required_check_is_accepted(project_root, attempt, &check)
+                    || reviewed_replacement)
+            {
                 accepted.push(index);
             } else {
                 outstanding.push(index);
@@ -3263,7 +3385,24 @@ pub(crate) fn validate_required_check_binding(
         "required check belongs to another candidate or Attempt"
     );
     match &check.source {
-        work_model::RequiredCheckSource::CanonicalTester { .. } => {
+        work_model::RequiredCheckSource::CanonicalTester {
+            results,
+            manifest,
+            logs,
+            reconstruction,
+            ..
+        } => {
+            for source in std::iter::once(results)
+                .chain(std::iter::once(manifest))
+                .chain(logs)
+                .chain(reconstruction)
+            {
+                anyhow::ensure!(
+                    bound_recovery_artifact(project_root, &source.path)?.0 == *source,
+                    "required source digest changed: {}",
+                    source.path
+                );
+            }
             anyhow::ensure!(
                 assess_canonical_checks(project_root, attempt)?
                     .checks
@@ -3353,4 +3492,252 @@ fn reconstruct_legacy_manifest(
         environment: vec![],
         applicability: vec![],
     })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct RequiredCheckRecoveryStatus {
+    pub can_resume: bool,
+    pub reason: String,
+    pub next_action: Option<String>,
+}
+
+/// Derive admission and guidance from current evidence without publishing state.
+pub(crate) fn required_check_recovery_status(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<RequiredCheckRecoveryStatus>> {
+    let has_bound_check = attempt
+        .evidence_recoveries
+        .iter()
+        .any(|recovery| recovery.required_check.is_some());
+    let has_canonical = attempt.tasks.iter().any(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+    });
+    if (!has_bound_check
+        && !(has_canonical && attempt.pause_kind == Some(work_model::PauseKind::HostEvidence)))
+        || (attempt.status == work_model::AttemptStatus::Complete
+            && attempt.review_state == Some(work_model::AttemptReviewState::Passed))
+        || attempt.tasks.iter().any(|task| {
+            task.kind == TaskKind::Write
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
+        })
+    {
+        return Ok(None);
+    }
+    if let Some(active) = attempt.active_evidence_recovery() {
+        if active.required_check.is_none() || active.state != EvidenceRecoveryState::Reviewing {
+            return Ok(None);
+        }
+        validate_owned_plan_evidence_review(project_root, attempt)?;
+        return Ok(Some(RequiredCheckRecoveryStatus {
+            can_resume: true,
+            reason: format!(
+                "Required check {} has bound evidence awaiting targeted Tests Review or settlement.",
+                active.required_check.as_ref().unwrap().id
+            ),
+            next_action: Some(format!(
+                "fluent queue resume {} --attempt {}",
+                attempt.work_item_id, attempt.id
+            )),
+        }));
+    }
+    if !has_canonical {
+        return Ok(None);
+    }
+    let assessment = assess_canonical_checks(project_root, attempt)?;
+    if assessment.is_satisfied() {
+        return Ok(Some(RequiredCheckRecoveryStatus { can_resume: true, reason: "The complete canonical run and reviewed evidence satisfy every required check; resume the remaining lifecycle gates.".into(), next_action: Some(format!("fluent queue resume {} --attempt {}", attempt.work_item_id, attempt.id)) }));
+    }
+    let mut reasons = assessment.blockers.clone();
+    reasons.extend(assessment.diagnoses.iter().cloned());
+    reasons.extend(assessment.outstanding.iter().map(|index| {
+        let check = &assessment.checks[*index];
+        format!(
+            "Required check {} remains unresolved: `{}` (working directory {}).",
+            check.id, check.command, check.working_directory
+        )
+    }));
+    let owners_settled = attempt.tasks.iter().all(|task| {
+        task.status != TaskStatus::Executing
+            && !crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                &attempt.work_item_id,
+                &task.id,
+            ))
+            && task.artifact_area.as_ref().is_none_or(|area| {
+                !crate::execution::execution_is_live(&crate::execution::record_path_for_artifact(
+                    project_root,
+                    &area.path,
+                ))
+                .unwrap_or(true)
+            })
+    });
+    let no_reserved_tasks = attempt
+        .tasks
+        .iter()
+        .all(|task| task.status != TaskStatus::Planned);
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .context("required check candidate is missing")?;
+    let clean = candidate_workspace_is_clean_at_managed(project_root, output, &output.commit);
+    if !owners_settled || !no_reserved_tasks {
+        reasons.push(
+            "Execution owners and reserved Tasks must settle before another attachment.".into(),
+        );
+    }
+    if !clean {
+        reasons.push("Restore the unchanged clean managed candidate before attachment.".into());
+    }
+    let next_action = (owners_settled && no_reserved_tasks && clean).then(|| assessment.outstanding.first()).flatten().map(|index| {
+        let check = &assessment.checks[*index];
+        format!("fluent attempt evidence attach {} {} --candidate {} --required-check {} --evidence-file <path>", attempt.work_item_id, attempt.id, check.candidate_commit, check.id)
+    });
+    Ok(Some(RequiredCheckRecoveryStatus {
+        can_resume: false,
+        reason: reasons.join("\n\n"),
+        next_action,
+    }))
+}
+
+struct ReviewedCheckResult {
+    command: String,
+    applicability: work_model::ResolvedCheckApplicability,
+    comparison_commit: Option<String>,
+}
+
+pub(crate) fn completed_review_check_commands(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Vec<String> {
+    let mut commands = accepted_review_check_results(project_root, attempt)
+        .into_iter()
+        .map(|result| result.command)
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    commands
+}
+
+fn accepted_review_check_results(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Vec<ReviewedCheckResult> {
+    let latest_candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+    let Some(latest_candidate) = latest_candidate else {
+        return Vec::new();
+    };
+    let read_verdict = |root: &Path, task: &Task| {
+        let path = review_artifact_path(task)?;
+        let (_, bytes) = bound_recovery_artifact(root, &path).ok()?;
+        Some(review::extract_verdict(std::str::from_utf8(&bytes).ok()?))
+    };
+    let commands = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|recovery| {
+            if recovery.state != EvidenceRecoveryState::Complete
+                || recovery.candidate_commit != latest_candidate
+            {
+                return None;
+            }
+            if let Some(check) = &recovery.required_check {
+                if !matches!(
+                    check.source,
+                    work_model::RequiredCheckSource::ReviewRequested { .. }
+                ) || validate_required_check_binding(project_root, attempt, check).is_err()
+                    || !required_check_is_accepted(project_root, attempt, check)
+                {
+                    return None;
+                }
+            }
+            let (_, evidence_bytes) =
+                bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path).ok()?;
+            if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
+            {
+                return None;
+            }
+            let evidence = parse_evidence_document(&evidence_bytes).ok()?;
+            if evidence.result != EvidenceResult::Pass {
+                return None;
+            }
+
+            recovery.targets.iter().find_map(|target| {
+                if target.role != "tests" {
+                    return None;
+                }
+                let (_, prior_bytes) =
+                    bound_recovery_artifact(project_root, &target.prior_review_artifact).ok()?;
+                let prior_review = std::str::from_utf8(&prior_bytes).ok()?;
+                let request = review::extract_focused_evidence_request(&prior_review)?;
+                if recovery.required_check.is_none() && !request.applicability.is_default() {
+                    return None;
+                }
+                if evidence.check != request.command
+                    || request.working_directory != "."
+                    || evidence.working_directory != request.working_directory
+                {
+                    return None;
+                }
+                let prior_task_is_bound = attempt.tasks.iter().any(|task| {
+                    task.kind == TaskKind::Review
+                        && task.role == "tests"
+                        && task.status == TaskStatus::Complete
+                        && task
+                            .review_context
+                            .as_ref()
+                            .map(|context| context.candidate_commit.as_str())
+                            == Some(latest_candidate)
+                        && review_artifact_path(task).as_deref()
+                            == Some(target.prior_review_artifact.as_str())
+                        && read_verdict(project_root, task) == Some(review::Verdict::Fail)
+                });
+                let targeted_review_passed = target.review_task_id.as_ref().is_some_and(|id| {
+                    attempt.tasks.iter().any(|task| {
+                        task.id == *id
+                            && task.kind == TaskKind::Review
+                            && task.role == "tests"
+                            && task.status == TaskStatus::Complete
+                            && task
+                                .evidence_review_context
+                                .as_ref()
+                                .is_some_and(|context| {
+                                    context.recovery_id == recovery.id
+                                        && context.candidate_commit == recovery.candidate_commit
+                                        && context.attachment == recovery.attachment
+                                        && context.prior_review_artifact
+                                            == target.prior_review_artifact
+                                })
+                            && read_verdict(project_root, task) == Some(review::Verdict::Pass)
+                    })
+                });
+                let source_task = attempt.tasks.iter().find(|task| {
+                    review_artifact_path(task).as_deref()
+                        == Some(target.prior_review_artifact.as_str())
+                })?;
+                (prior_task_is_bound && targeted_review_passed).then_some(ReviewedCheckResult {
+                    command: request.command,
+                    applicability: recovery
+                        .required_check
+                        .as_ref()
+                        .map(|check| check.applicability.clone())
+                        .unwrap_or_default(),
+                    comparison_commit: source_task.review_context.as_ref()?.base_commit.clone(),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    commands
 }

@@ -124,6 +124,7 @@ mod tests {
     use crate::work_status::WorkItemStatus;
     fn row(action: &str) -> WorkItemStatus {
         WorkItemStatus {
+            recovery_blocker: None,
             id: action.into(),
             title: action.into(),
             attempt: "-".into(),

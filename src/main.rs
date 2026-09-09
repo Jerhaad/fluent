@@ -1271,19 +1271,12 @@ fn cmd_attempt(
                             .into_iter()
                             .next()
                     }),
-                    attempt
-                        .filter(|attempt| {
-                            attempt.evidence_recoveries.last().is_some_and(|recovery| {
-                                recovery.state
-                                    == fluent::work_model::EvidenceRecoveryState::NeedsEvidence
-                            })
-                        })
-                        .and_then(|attempt| {
-                            fluent::work_status::attempt_recovery_next_action(
-                                Some(attempt),
-                                Some(project_root),
-                            )
-                        }),
+                    attempt.and_then(|attempt| {
+                        fluent::work_status::attempt_recovery_next_action(
+                            Some(attempt),
+                            Some(project_root),
+                        )
+                    }),
                 )
             };
             let hint_ctx = guidance::AttemptRunContext {

@@ -696,6 +696,12 @@ pub fn run_task(config: WorkTaskRunConfig<'_>) -> Result<WorkTaskRunResult> {
         find_attempt_task_indexes(&item, config.attempt_id, config.task_id)
             .ok_or_else(|| anyhow::anyhow!("Task {:?} not found", config.task_id))?;
 
+    if item.attempts[attempt_index].tasks[task_index].kind == TaskKind::Review {
+        crate::recovery_contracts::validate_owned_plan_evidence_review(
+            project_root,
+            &item.attempts[attempt_index],
+        )?;
+    }
     let _owner = item.attempts[attempt_index].tasks[task_index]
         .artifact_area
         .as_ref()

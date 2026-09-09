@@ -32,6 +32,7 @@ pub struct WorkItemStatus {
     pub action: String,
     /// An exact operator command for exceptional recovery states.
     pub next_action: Option<String>,
+    pub recovery_blocker: Option<String>,
     pub metrics: WorkMetrics,
     pub compatibility_warnings: Vec<String>,
     pub release: Option<ReleaseStatus>,
@@ -134,7 +135,20 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .find(|candidate| candidate.attempt_id == attempt.id)
     });
 
+    let recovery_blocker =
+        attempt
+            .and_then(|attempt| project_root.map(|root| (root, attempt)))
+            .and_then(|(root, attempt)| {
+                match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
+                    Ok(Some(status)) => Some(status.reason),
+                    Err(error) => Some(format!(
+                        "Required check proof is missing or changed: {error:#}"
+                    )),
+                    Ok(None) => None,
+                }
+            });
     WorkItemStatus {
+        recovery_blocker,
         id: item.id.clone(),
         title: item.title.clone(),
         attempt: attempt
@@ -391,11 +405,19 @@ pub fn work_item_show_value(
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
     }
     let attempt = display_attempt(item, Some(project_root));
-    if attempt
-        .is_some_and(|attempt| attempt.pause_recovery.is_some() || attempt.pause_record.is_some())
-        && let Some(next_action) = attempt_recovery_next_action(attempt, Some(project_root))
-    {
+    if let Some(next_action) = attempt_recovery_next_action(attempt, Some(project_root)) {
         output["next-action"] = serde_json::to_value(next_action)?;
+    }
+    if let Some(attempt) = attempt {
+        match crate::recovery_contracts::required_check_recovery_status(project_root, attempt) {
+            Ok(Some(status)) => {
+                output["evidence-recovery"] = serde_json::to_value(status)?;
+            }
+            Err(error) => {
+                output["evidence-recovery"] = serde_json::json!({"can-resume":false,"reason":format!("Required check proof is missing or changed: {error:#}")});
+            }
+            Ok(None) => {}
+        }
     }
     Ok(output)
 }
@@ -551,6 +573,9 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                     release.criteria, release.blockers, release.proposed_follow_ups
                 ));
             }
+            if let Some(reason) = &row.recovery_blocker {
+                output.push_str(&format!("  evidence: {reason}\n"));
+            }
             if let Some(next_action) = row.next_action.as_deref() {
                 output.push_str(&format!("  next-action: {next_action}\n"));
             }
@@ -607,6 +632,9 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
             row.metrics.artifact_bytes,
             row.metrics.avoided_cycles
         ));
+        if let Some(reason) = &row.recovery_blocker {
+            lines.push(format!("  Evidence: {reason}"));
+        }
         if let Some(next_action) = row.next_action.as_deref() {
             lines.push(format!("  Next action: {next_action}"));
         }
@@ -884,6 +912,14 @@ pub(crate) fn derive_attempt_recovery_next_action(
     project_root: Option<&Path>,
 ) -> Option<String> {
     let attempt = attempt?;
+    if let Some(root) = project_root {
+        match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
+            Ok(Some(status)) => return status.next_action,
+            Err(_) => return None,
+            Ok(None) => {}
+        }
+    }
+
     if let Some(action) = project_root.and_then(|root| {
         crate::host_evidence::failed_recheck_evidence_recovery_action(root, attempt)
     }) {
@@ -1697,6 +1733,7 @@ mod tests {
     fn format_work_status_includes_errors_after_rows() {
         let status = WorkStatus {
             rows: vec![WorkItemStatus {
+                recovery_blocker: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),
@@ -1726,6 +1763,7 @@ mod tests {
     fn dashboard_lines_are_readable() {
         let status = WorkStatus {
             rows: vec![WorkItemStatus {
+                recovery_blocker: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),
