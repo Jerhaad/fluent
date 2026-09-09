@@ -684,6 +684,7 @@ Test: tests/binary.rs (attempt_evidence_attach_rejects_live_task_owner_without_m
 Test: tests/binary.rs (attempt_evidence_attach_revalidates_after_landing_owner_releases_lock)
 Test: tests/binary.rs (evidence_reuse_rejects_changed_missing_or_expired_bindings)
 Test: tests/binary.rs (live_state_evidence_obeys_declared_freshness)
+Test: tests/binary.rs (expired_pending_evidence_accepts_fresh_proof)
 Test: tests/binary.rs (canonical_evidence_rejects_changed_comparison_ref)
 
 ### B9

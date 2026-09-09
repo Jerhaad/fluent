@@ -2102,7 +2102,7 @@ pub(crate) fn attach_with_cancellation_policy(
                     crate::recovery_contracts::validate_check_applicability_at(
                         &binding,
                         &document,
-                        chrono::Utc::now(),
+                        crate::check_applicability::evaluation_time(),
                     )?;
                     Ok(binding)
                 })
@@ -2557,7 +2557,7 @@ pub fn attach_plan_row(
                 &project_root.join(&output.workspace_path),
                 &row.command.as_ref().map(|command| command.applicability.clone()).unwrap_or_default(),
             ).map_err(|error| ineligible(&format!("{error:#}")))?;
-            crate::recovery_contracts::validate_check_applicability_at(&applicability, &document, chrono::Utc::now())
+            crate::recovery_contracts::validate_check_applicability_at(&applicability, &document, crate::check_applicability::evaluation_time())
                 .map_err(|error| ineligible(&format!("{error:#}")))?;
             let binding = PlanHostEvidenceBinding {
                 applicability,
@@ -5585,7 +5585,7 @@ pub fn attach_required_check(
     crate::recovery_contracts::validate_check_applicability_at(
         &observed_check.applicability,
         &document,
-        chrono::Utc::now(),
+        crate::check_applicability::evaluation_time(),
     )?;
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))?;
     Ok(store.mutate_work_item_from_external(
@@ -5667,7 +5667,7 @@ pub fn attach_required_check(
             crate::recovery_contracts::validate_check_applicability_at(
                 &check.applicability,
                 &document,
-                chrono::Utc::now(),
+                crate::check_applicability::evaluation_time(),
             )
             .map_err(|error| reject(format!("{error:#}")))?;
             if document.check != check.command
@@ -5707,11 +5707,11 @@ pub fn attach_required_check(
                     "required check has no outstanding failed command".into(),
                 ));
             }
-            if attempt.active_evidence_recovery().is_some()
-                || attempt
-                    .tasks
-                    .iter()
-                    .any(|task| task.status == TaskStatus::Planned)
+            let expired = crate::recovery_contracts::expired_required_check_recovery(project_root, attempt, &check)
+                .map_err(|error| reject(format!("{error:#}")))?.cloned();
+            if (attempt.active_evidence_recovery().is_some() && expired.is_none())
+                || attempt.tasks.iter().any(|task| task.status == TaskStatus::Planned
+                    && expired.as_ref().is_none_or(|recovery| !recovery.targets.iter().any(|target| target.review_task_id.as_deref() == Some(task.id.as_str()))))
             {
                 return Err(reject(
                     "another reserved Task or evidence review must settle first".into(),
@@ -5761,6 +5761,17 @@ pub fn attach_required_check(
                         attempt.artifacts.push(reference);
                     }
                 }
+            }
+            if let Some(expired) = expired {
+                // Preserve evidence bytes and completed Reviews. Only an idle,
+                // unconsumed review reservation loses authority to run.
+                for task in &mut attempt.tasks {
+                    if expired.targets.iter().any(|target| target.review_task_id.as_deref() == Some(task.id.as_str()))
+                        && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded) {
+                        work_model::set_task_terminal(task, TaskStatus::Superseded);
+                    }
+                }
+                attempt.evidence_recoveries.iter_mut().find(|entry| entry.id == expired.id).unwrap().state = EvidenceRecoveryState::NeedsEvidence;
             }
             attempt.resume_cancellation()?;
             attempt.attach_evidence_recovery(EvidenceRecovery {

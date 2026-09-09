@@ -23,3 +23,14 @@ pub(crate) fn resolve_check_applicability(
         comparison_commits,
     })
 }
+
+/// Evaluate evidence at one instant without changing lifecycle timestamps.
+pub(crate) fn evaluation_time() -> chrono::DateTime<chrono::Utc> {
+    #[cfg(feature = "test-support")]
+    if let Ok(value) = std::env::var("FLUENT_TEST_EVIDENCE_NOW") {
+        return chrono::DateTime::parse_from_rfc3339(&value)
+            .expect("test evidence time must be RFC3339")
+            .with_timezone(&chrono::Utc);
+    }
+    chrono::Utc::now()
+}

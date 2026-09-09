@@ -344,3 +344,9 @@ refuses to advance the same Task. All paths recheck the bound candidate and
 evidence; a changed attachment, source matrix, or dirty candidate requires
 inspection before recovery can continue. Scheduler claim and Review launch
 repeat those checks, including when a queue entry predates the changed evidence.
+
+If live-state proof for a canonical check expires while its targeted Review is
+pending, submit fresh proof with the same `--required-check` selector after
+execution owners settle. Fluent preserves the expired attachment and completed
+Review artifacts, supersedes any idle review reservation, and creates a new
+targeted Tests Review. Repeating the fresh attachment reuses that recovery.

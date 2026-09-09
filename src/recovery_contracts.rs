@@ -138,7 +138,11 @@ pub(crate) fn validate_owned_plan_evidence_review(
             "required check evidence digest changed"
         );
         let document = parse_evidence_document(&bytes)?;
-        validate_check_applicability_at(&check.applicability, &document, chrono::Utc::now())?;
+        validate_check_applicability_at(
+            &check.applicability,
+            &document,
+            crate::check_applicability::evaluation_time(),
+        )?;
         anyhow::ensure!(
             recovery.candidate_commit == check.candidate_commit
                 && document.check == check.command
@@ -3116,7 +3120,7 @@ pub(crate) fn assess_canonical_checks(
         let local_applies = validate_check_applicability_at(
             &check.applicability,
             &local_evidence,
-            chrono::Utc::now(),
+            crate::check_applicability::evaluation_time(),
         )
         .is_ok();
         if !matches || !local_applies || result.is_none_or(|command| command.exit_code != 0) {
@@ -3177,6 +3181,44 @@ pub(crate) fn assess_canonical_checks(
     })
 }
 
+/// Identify intact live-state proof that expired before its review settled.
+/// Only explicit attachment may retire it; readers merely report the blocker.
+pub(crate) fn expired_required_check_recovery<'a>(
+    project_root: &Path,
+    attempt: &'a work_model::Attempt,
+    check: &work_model::RequiredCheck,
+) -> Result<Option<&'a EvidenceRecovery>> {
+    let Some(recovery) = attempt
+        .active_evidence_recovery()
+        .filter(|recovery| recovery.required_check.as_ref() == Some(check))
+    else {
+        return Ok(None);
+    };
+    let work_model::CheckFreshness::LiveState {
+        max_age_seconds: Some(seconds),
+    } = check.applicability.definition.freshness
+    else {
+        return Ok(None);
+    };
+    validate_required_check_binding(project_root, attempt, check)?;
+    let (bound, bytes) = bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path)?;
+    anyhow::ensure!(
+        bound.digest == recovery.attachment.digest,
+        "pending evidence bytes changed"
+    );
+    let document = parse_evidence_document(&bytes)?;
+    anyhow::ensure!(
+        document.check == check.command && document.working_directory == check.working_directory,
+        "pending evidence command changed"
+    );
+    let issued = DateTime::parse_from_rfc3339(&document.run_at)?.with_timezone(&chrono::Utc);
+    validate_check_applicability_at(&check.applicability, &document, issued)?;
+    let expiry = chrono::TimeDelta::try_seconds(i64::try_from(seconds)?)
+        .and_then(|duration| issued.checked_add_signed(duration))
+        .context("unsupported live-state freshness expiry")?;
+    Ok((crate::check_applicability::evaluation_time() >= expiry).then_some(recovery))
+}
+
 pub(crate) fn required_check_is_accepted(
     project_root: &Path,
     attempt: &work_model::Attempt,
@@ -3205,7 +3247,11 @@ pub(crate) fn required_check_is_accepted(
             "host evidence bytes changed"
         );
         let document = parse_evidence_document(&bytes)?;
-        validate_check_applicability_at(&check.applicability, &document, chrono::Utc::now())?;
+        validate_check_applicability_at(
+            &check.applicability,
+            &document,
+            crate::check_applicability::evaluation_time(),
+        )?;
         anyhow::ensure!(
             document.result == EvidenceResult::Pass
                 && document.check == check.command
@@ -3374,7 +3420,11 @@ pub(crate) fn validate_check_applicability(
         resolve_check_applicability(workspace, &binding.definition)? == *binding,
         "declared comparison ref changed since execution"
     );
-    validate_check_applicability_at(binding, document, chrono::Utc::now())
+    validate_check_applicability_at(
+        binding,
+        document,
+        crate::check_applicability::evaluation_time(),
+    )
 }
 
 pub(crate) fn validate_required_check_binding(
@@ -3556,6 +3606,30 @@ pub(crate) fn required_check_recovery_status(
     if let Some(active) = attempt.active_evidence_recovery() {
         if active.required_check.is_none() || active.state != EvidenceRecoveryState::Reviewing {
             return Ok(None);
+        }
+        let check = active.required_check.as_ref().unwrap();
+        if check.source.is_canonical_tester()
+            && expired_required_check_recovery(project_root, attempt, check)?.is_some()
+        {
+            let settled = attempt.tasks.iter().all(|task| {
+                task.status != TaskStatus::Executing
+                    && !crate::lease::is_leased(&crate::lease::task_lock_path(
+                        project_root,
+                        &attempt.work_item_id,
+                        &task.id,
+                    ))
+                    && task.artifact_area.as_ref().is_none_or(|area| {
+                        !crate::execution::execution_is_live(
+                            &crate::execution::record_path_for_artifact(project_root, &area.path),
+                        )
+                        .unwrap_or(true)
+                    })
+            });
+            return Ok(Some(RequiredCheckRecoveryStatus {
+                can_resume: false,
+                reason: format!("Required check {} has expired live-state evidence; submit fresh proof after execution owners settle.", check.id),
+                next_action: settled.then(|| format!("fluent attempt evidence attach {} {} --candidate {} --required-check {} --evidence-file <path>", attempt.work_item_id, attempt.id, check.candidate_commit, check.id)),
+            }));
         }
         validate_owned_plan_evidence_review(project_root, attempt)?;
         return Ok(Some(RequiredCheckRecoveryStatus {

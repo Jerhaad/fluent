@@ -2691,7 +2691,9 @@ fn has_open_review_round(tasks: &[Task]) -> bool {
     for task in tasks.iter().rev() {
         match task.kind {
             TaskKind::Write => return false,
-            TaskKind::Review | TaskKind::Tester if task.status != TaskStatus::Complete => {
+            TaskKind::Review | TaskKind::Tester
+                if !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded) =>
+            {
                 return true;
             }
             _ => {}

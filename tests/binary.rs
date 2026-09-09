@@ -42305,3 +42305,127 @@ fn changed_candidate_recovery_runs_fresh_checks() {
         assert_eq!(fs::read(&results).unwrap(), original);
     }
 }
+
+#[test]
+fn expired_pending_evidence_accepts_fresh_proof() {
+    use fluent::work_model::*;
+    for review_completed in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let work = "expired-pending";
+        let (project, candidate, results) = canonical_evidence_fixture_with_applicability(
+            &tmp,
+            work,
+            &["true", "false"],
+            serde_json::json!([{}, {"freshness":{"kind":"live-state","max_age_seconds":600}}]),
+        );
+        let original = fs::read(&results).unwrap();
+        let issued = chrono::Utc::now();
+        let expired = (issued + chrono::TimeDelta::seconds(600)).to_rfc3339();
+        let evidence = tmp.path().join("host.json");
+        let mut document = serde_json::json!({"schema_version":1,"producer":"host","check":"false","working_directory":".","result":"pass","run_at":issued.to_rfc3339(),"output":"passed"});
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        canonical_attachment_command(&project, work, &candidate, &evidence)
+            .assert()
+            .success();
+        let store = WorkModelStore::new(&project);
+        let attached = store.read_work_item(work).unwrap();
+        let first = attached.attempts[0].evidence_recoveries[0].clone();
+        let target = first.targets[0].review_task_id.as_ref().unwrap();
+        let first_bytes = fs::read(project.join(&first.attachment.snapshot_path)).unwrap();
+        let bin = tmp.path().join("bin");
+        write_mock_claude(
+            &bin,
+            &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+        );
+        if review_completed {
+            fluent_cmd()
+                .current_dir(&project)
+                .args(["task", "run", work, "attempt-1", target, "--no-sandbox"])
+                .env("PATH", mock_path(&bin))
+                .assert()
+                .success();
+        }
+        let before = snapshot_tree(&project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("expired"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["queue", "resume", work, "--attempt", "attempt-1"])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .failure();
+        let before_status = snapshot_tree(&project.join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["work-item", "show", work])
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success();
+        assert!(
+            snapshot_tree(&project.join(".fluent/work")) == before_status,
+            "status must remain read-only"
+        );
+        assert!(
+            before.iter().all(|entry| before_status.contains(entry)),
+            "rejected resume must preserve existing history"
+        );
+        document["run_at"] = serde_json::json!(expired);
+        document["output"] = serde_json::json!("fresh execution passed");
+        fs::write(&evidence, serde_json::to_vec(&document).unwrap()).unwrap();
+        canonical_attachment_command(&project, work, &candidate, &evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success();
+        let fresh = store.read_work_item(work).unwrap();
+        assert_eq!(fresh.attempts[0].evidence_recoveries.len(), 2);
+        assert_eq!(
+            fresh.attempts[0].evidence_recoveries[0].state,
+            EvidenceRecoveryState::NeedsEvidence
+        );
+        assert_eq!(
+            fresh.attempts[0].evidence_recoveries[0].targets,
+            first.targets
+        );
+        let old_review = fresh.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == *target)
+            .unwrap();
+        assert_eq!(
+            old_review.status,
+            if review_completed {
+                TaskStatus::Complete
+            } else {
+                TaskStatus::Superseded
+            }
+        );
+        canonical_attachment_command(&project, work, &candidate, &evidence)
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success();
+        assert_eq!(
+            store.read_work_item(work).unwrap(),
+            fresh,
+            "retry must preserve fresh identities"
+        );
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_TEST_EVIDENCE_NOW", &expired)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("is ready"));
+        assert_eq!(
+            fs::read(project.join(&first.attachment.snapshot_path)).unwrap(),
+            first_bytes
+        );
+        assert_eq!(fs::read(&results).unwrap(), original);
+    }
+}
