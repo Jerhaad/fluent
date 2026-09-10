@@ -1,11 +1,10 @@
 //! Classify immutable Tester results and failed-command recheck artifacts.
 
-use anyhow::{Result, bail};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::work_model::{ArtifactRef, Attempt, Task, work_artifact_path};
+use crate::work_model::{Attempt, work_artifact_path};
 
 pub(crate) fn tester_failures(tester_results_path: &Path) -> usize {
     let content = match fs::read_to_string(tester_results_path) {
@@ -170,86 +169,4 @@ pub(crate) fn baseline_tester_results_path(
     path.is_file().then_some(path)
 }
 
-pub(crate) fn failed_command_recheck_correction_artifacts(
-    project_root: &Path,
-    recheck: &Task,
-) -> Result<Vec<ArtifactRef>> {
-    let area = recheck
-        .artifact_area
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no artifact area"))?;
-    let artifact_dir =
-        crate::work_task_executor::resolve_managed_artifact_area_path(project_root, &area.path)?;
-    let manifest_path = artifact_dir.join("failed-command-recheck.json");
-    let manifest: crate::tester::FailedCommandRecheckManifest =
-        serde_json::from_slice(&fs::read(&manifest_path)?)?;
-    let results_path = artifact_dir.join("tester-results.json");
-    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&results_path)?)?;
-    let expected_commit = recheck
-        .review_context
-        .as_ref()
-        .map(|context| context.candidate_commit.as_str())
-        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no candidate context"))?;
-    if results.candidate_commit.as_deref() != Some(expected_commit) {
-        bail!(
-            "failed-command recheck result is not bound to candidate {}",
-            expected_commit
-        );
-    }
-    let indexes_are_strict = manifest
-        .failed_command_indexes
-        .windows(2)
-        .all(|indexes| indexes[0] < indexes[1]);
-    let expected_source = recheck
-        .input_artifacts
-        .first()
-        .map(|artifact| artifact.path.as_str());
-    if manifest.schema_version != crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION
-        || manifest.candidate_commit != expected_commit
-        || manifest.failed_command_indexes.len() != results.commands.len()
-        || manifest.failed_command_indexes.is_empty()
-        || !indexes_are_strict
-        || expected_source != Some(manifest.source_results.as_str())
-    {
-        bail!("failed-command recheck manifest does not match its candidate and command results");
-    }
-    let structured_failure = results.summary.fail > 0 || results.error.is_some();
-    let failed = results.commands.iter().enumerate().filter(|(_, command)| {
-        structured_failure
-            || command.exit_code != 0
-            || command
-                .process_settlement
-                .as_ref()
-                .is_some_and(|evidence| !evidence.leaks.is_empty())
-    });
-    let mut failed = failed.peekable();
-    if !structured_failure && failed.peek().is_none() {
-        return Ok(Vec::new());
-    }
-
-    let mut artifacts = vec![
-        ArtifactRef {
-            producer_id: recheck.id.clone(),
-            path: format!("{}/failed-command-recheck.json", area.path),
-        },
-        ArtifactRef {
-            producer_id: recheck.id.clone(),
-            path: format!("{}/tester-results.json", area.path),
-        },
-    ];
-    for (index, command) in failed {
-        for (actual, expected) in [
-            (&command.stdout_log, format!("commands/{index}-stdout.log")),
-            (&command.stderr_log, format!("commands/{index}-stderr.log")),
-        ] {
-            if actual != &expected || !artifact_dir.join(&expected).is_file() {
-                bail!("failed-command recheck log path {actual:?} does not match {expected:?}");
-            }
-            artifacts.push(ArtifactRef {
-                producer_id: recheck.id.clone(),
-                path: format!("{}/{}", area.path, expected),
-            });
-        }
-    }
-    Ok(artifacts)
-}
+pub(crate) use crate::verification_assessment::failed_command_recheck_correction_artifacts;

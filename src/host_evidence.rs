@@ -28,22 +28,7 @@ const PLAN_HOST_EVIDENCE_PRODUCER: &str = "plan-host-evidence";
 const PLAN_HOST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 const CODE_CHANGE_DISPOSITION: &str = "code-change";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FailedCommandRecheckEvidenceBinding {
-    schema_version: u32,
-    candidate_commit: String,
-    recheck_task_id: String,
-    source_results: BoundRecheckArtifact,
-    recheck_artifacts: Vec<BoundRecheckArtifact>,
-    command_index: usize,
-    command: String,
-    /// The command the authorized host actually ran. Older bindings used the
-    /// recheck command for both fields, so absence retains that interpretation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    evidence_check: Option<String>,
-    working_directory: String,
-}
+use crate::verification_assessment::FailedCommandRecheckEvidenceBinding;
 
 #[derive(Debug, Clone)]
 struct ValidatedRecheckFrontier {
@@ -3805,144 +3790,15 @@ pub(crate) fn completed_recheck_evidence_source(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Option<PathBuf> {
-    attempt
-        .evidence_recoveries
-        .iter()
-        .rev()
-        .find_map(|recovery| {
-            completed_recheck_evidence_source_for_recovery(project_root, attempt, recovery)
-        })
-}
-
-fn completed_recheck_evidence_source_for_recovery(
-    project_root: &Path,
-    attempt: &work_model::Attempt,
-    recovery: &EvidenceRecovery,
-) -> Option<PathBuf> {
-    if recovery.state != EvidenceRecoveryState::Complete
-        || recovery.targets.len() != 1
-        || recovery.targets[0].role != "tests"
-    {
-        return None;
-    }
-    let target = &recovery.targets[0];
-    let binding_bytes = fs::read(project_root.join(&target.prior_review_artifact)).ok()?;
-    let binding: FailedCommandRecheckEvidenceBinding =
-        serde_json::from_slice(&binding_bytes).ok()?;
-    let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
-    if binding.schema_version != 1
-        || binding.candidate_commit != recovery.candidate_commit
-        || snapshot_path(
-            attempt.work_item_id.as_str(),
-            attempt.id.as_str(),
-            &binding_digest,
-        )
-        .ok()
-        .as_deref()
-            != Some(target.prior_review_artifact.as_str())
-        || attempt
-            .tasks
-            .iter()
-            .rev()
-            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-            .and_then(|task| task.output.as_ref())
-            .map(|output| output.commit.as_str())
-            != Some(recovery.candidate_commit.as_str())
-    {
-        return None;
-    }
-    let evidence_bytes = fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
-    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
-        return None;
-    }
-    let evidence = parse_evidence_document(&evidence_bytes).ok()?;
-    let evidence_check = binding
-        .evidence_check
-        .as_deref()
-        .unwrap_or(binding.command.as_str());
-    if evidence.result != EvidenceResult::Pass
-        || evidence.check != evidence_check
-        || evidence_check != binding.command
-        || evidence.working_directory != binding.working_directory
-    {
-        return None;
-    }
-    let review_task = target.review_task_id.as_ref().and_then(|id| {
-        attempt.tasks.iter().find(|task| {
-            task.id == *id
-                && task.kind == TaskKind::Review
-                && task.role == "tests"
-                && task.status == TaskStatus::Complete
-                && task
-                    .evidence_review_context
-                    .as_ref()
-                    .is_some_and(|context| {
-                        context.recovery_id == recovery.id
-                            && context.candidate_commit == recovery.candidate_commit
-                            && context.prior_review_artifact == target.prior_review_artifact
-                    })
-        })
-    })?;
-    if read_verdict(project_root, review_task) != Some(Verdict::Pass) {
-        return None;
-    }
-    let recheck = attempt.tasks.iter().find(|task| {
-        task.id == binding.recheck_task_id
-            && task.kind == TaskKind::Tester
-            && task.status == TaskStatus::Complete
-            && task.is_failed_command_recheck()
-    })?;
-    let current_artifacts =
-        crate::tester_evidence::failed_command_recheck_correction_artifacts(project_root, recheck)
-            .ok()?;
-    if current_artifacts.len() != binding.recheck_artifacts.len()
-        || !current_artifacts
-            .iter()
-            .zip(&binding.recheck_artifacts)
-            .all(|(current, bound)| {
-                current.path == bound.path
-                    && fs::read(project_root.join(&current.path)).is_ok_and(|bytes| {
-                        format!("sha256:{:x}", Sha256::digest(&bytes)) == bound.digest
-                    })
-            })
-    {
-        return None;
-    }
-    let source_path = project_root.join(&binding.source_results.path);
-    let source_bytes = fs::read(&source_path).ok()?;
-    if format!("sha256:{:x}", Sha256::digest(&source_bytes)) != binding.source_results.digest {
-        return None;
-    }
-    let source: crate::tester::TesterResults = serde_json::from_slice(&source_bytes).ok()?;
-    let command = source.commands.get(binding.command_index)?;
-    if source.candidate_commit.as_deref() != Some(recovery.candidate_commit.as_str())
-        || source.error.is_some()
-        || command.exit_code == 0
-        || command
-            .process_settlement
-            .as_ref()
-            .is_some_and(|settlement| !settlement.leaks.is_empty())
-        || command.command != binding.command
-        || source.summary.fail
-            != source
-                .tests
-                .iter()
-                .filter(|test| test.status == "fail")
-                .count()
-        || crate::tester_evidence::introduced_tester_failures_except_command(
-            &source_path,
-            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
-            binding.command_index,
-            &command.command,
-        ) != 0
-        || crate::tester_evidence::unexplained_failed_tester_commands(
-            &source_path,
-            crate::tester_evidence::baseline_tester_results_path(project_root, attempt).as_deref(),
-        ) != 1
-    {
-        return None;
-    }
-    Some(source_path)
+    let assessment =
+        crate::verification_assessment::assess_canonical_checks(project_root, attempt).ok()?;
+    (assessment.is_satisfied()
+        && assessment
+            .review_bindings
+            .values()
+            .flatten()
+            .any(|binding| binding.path.ends_with("/failed-command-recheck.json")))
+    .then_some(assessment.results_path)
 }
 
 /// Resolve command-shaped Test references whose host execution was bound to a
@@ -4011,75 +3867,22 @@ pub(crate) fn pending_candidate_gate_evidence_recovery_action(
     })
 }
 
-/// Return true when one otherwise-unexplained final Tester command is exactly
-/// the focused command already accepted for this candidate by a targeted Tests
-/// review. This is the pre-Tester evidence path: the canonical Tester still
-/// runs the complete suite, but a host-only command failure must not send the
-/// unchanged candidate through a Writer and failed-command recheck again.
+/// Read final Tester acceptance from the canonical assessment. Retain this
+/// lifecycle adapter for saved round-cap recovery and require exact results.
 pub(crate) fn completed_review_evidence_covers_tester_failure(
     project_root: &Path,
     attempt: &work_model::Attempt,
     tester_results_path: &Path,
     baseline_path: Option<&Path>,
 ) -> bool {
-    let results: crate::tester::TesterResults = match fs::read(tester_results_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    {
-        Some(results) => results,
-        None => return false,
-    };
-    let Some(candidate) = attempt
-        .tasks
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-        .and_then(|task| task.output.as_ref())
-        .map(|output| output.commit.as_str())
-    else {
-        return false;
-    };
-    if results.candidate_commit.as_deref() != Some(candidate)
-        || results.error.is_some()
-        || results.summary.fail
-            != results
-                .tests
-                .iter()
-                .filter(|test| test.status == "fail")
-                .count()
-        || crate::tester_evidence::unexplained_failed_tester_commands(
-            tester_results_path,
-            baseline_path,
-        ) != 1
-    {
-        return false;
-    }
-    let mut failed = results
-        .commands
-        .iter()
-        .enumerate()
-        .filter(|(_, command)| command.exit_code != 0);
-    let Some((command_index, command)) = failed.next() else {
-        return false;
-    };
-    if failed.next().is_some()
-        || command
-            .process_settlement
-            .as_ref()
-            .is_some_and(|settlement| !settlement.leaks.is_empty())
-        || crate::tester_evidence::introduced_tester_failures_except_command(
-            tester_results_path,
-            baseline_path,
-            command_index,
-            &command.command,
-        ) != 0
-    {
-        return false;
-    }
-
-    completed_review_evidence_commands(project_root, attempt)
-        .iter()
-        .any(|accepted| accepted == &command.command)
+    let _ = baseline_path;
+    crate::verification_assessment::assess_canonical_checks(project_root, attempt).is_ok_and(
+        |assessment| {
+            assessment.results_path == tester_results_path
+                && assessment.is_satisfied()
+                && !assessment.accepted.is_empty()
+        },
+    )
 }
 
 fn candidate_workspace_is_clean_at(

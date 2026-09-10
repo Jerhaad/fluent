@@ -9126,20 +9126,7 @@ fn interpret_reviews(
     let tester_gate_applicable = failed.is_empty() && uncertain.is_empty();
     let tester_result_path =
         latest_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let tester_recheck_is_recovered = crate::host_evidence::completed_recheck_evidence_source(
-        project_root,
-        &item.attempts[attempt_index],
-    )
-    .is_some();
     let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let tester_review_evidence_is_recovered = tester_result_path.as_ref().is_some_and(|path| {
-        crate::host_evidence::completed_review_evidence_covers_tester_failure(
-            project_root,
-            &item.attempts[attempt_index],
-            path,
-            baseline_path.as_deref(),
-        )
-    });
     let canonical_has_policy = tester_result_path
         .as_ref()
         .and_then(|path| path.parent())
@@ -9162,8 +9149,10 @@ fn interpret_reviews(
         project_root,
         &item.attempts[attempt_index],
     );
-    let needs_diagnosis = !tester_recheck_is_recovered
-        && !tester_review_evidence_is_recovered
+    let tester_external_evidence_is_recovered = assessed_checks
+        .as_ref()
+        .is_ok_and(|view| view.is_satisfied());
+    let needs_diagnosis = !tester_external_evidence_is_recovered
         && tester_result_path.as_ref().is_some_and(|path| {
             unexplained_failed_tester_commands(path, baseline_path.as_deref()) > 0
         })
@@ -9230,11 +9219,6 @@ fn interpret_reviews(
             &|_| {},
         );
     }
-    let tester_external_evidence_is_recovered = tester_recheck_is_recovered
-        || tester_review_evidence_is_recovered
-        || canonical_assessment
-            .as_ref()
-            .is_some_and(|assessment| assessment.as_ref().is_ok_and(|view| view.is_satisfied()));
     let tester_fail_count = tester_result_path
         .as_ref()
         .filter(|_| tester_gate_applicable)
@@ -14950,6 +14934,20 @@ mod tests {
             .find(|entry| entry.id == recovery.id)
             .unwrap()
             .state = EvidenceRecoveryState::Complete;
+        let shared = crate::verification_assessment::assess_current_verification(
+            project.path(),
+            &stored.attempts[0],
+        )
+        .unwrap();
+        assert!(
+            shared.commands.iter().any(|row| row.satisfied
+                && row.owner == crate::work_model::CompletionResponsibility::Host),
+            "the shared view must credit the accepted recheck occurrence"
+        );
+        assert!(
+            shared.candidate_defects().is_empty(),
+            "accepted command proof must also cover its synthetic command failure"
+        );
         let stored_recovery = stored.attempts[0]
             .evidence_recoveries
             .iter()
@@ -16208,7 +16206,25 @@ mod tests {
         store: &WorkModelStore,
         command: &str,
     ) {
-        let prior_id = "attempt-1-review-behaviors";
+        let saved = store.read_work_item("work-1").unwrap();
+        let prior_id = saved.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap()
+            .id
+            .as_str();
+        let candidate = saved.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .unwrap()
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
         let prior_path = format!(
             "{}/review.md",
             work_artifact_path("work-1", "attempt-1", prior_id)
@@ -16263,7 +16279,7 @@ mod tests {
                     .push(crate::work_model::EvidenceRecovery {
                         required_check: None,
                         id: recovery_id.clone(),
-                        candidate_commit: "abc123".to_string(),
+                        candidate_commit: candidate.clone(),
                         attachment: attachment.clone(),
                         targets: vec![crate::work_model::EvidenceReviewTarget {
                             role: "tests".to_string(),
@@ -16278,7 +16294,7 @@ mod tests {
                 let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_area);
                 targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
                     recovery_id,
-                    candidate_commit: "abc123".to_string(),
+                    candidate_commit: candidate.clone(),
                     attachment,
                     prior_review_artifact: prior_path,
                 });
@@ -16291,14 +16307,20 @@ mod tests {
     #[test]
     fn accepted_pre_tester_host_evidence_supersedes_same_final_tester_command() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let command = "./tests/container-smoke.sh";
-        let mut results: serde_json::Value = serde_json::from_str(
-            &tester_json_with_failed_command(&[&format!("command-0:{command}")], command, 1),
+        let command = "xcodebuild test";
+        let (store, _workspace, candidate) = final_tester_evidence_fixture(tmp.path());
+        add_failed_final_tester_command(tmp.path(), &store);
+        let path = crate::verification_assessment::assess_canonical_checks(
+            tmp.path(),
+            &store.read_work_item("work-1").unwrap().attempts[0],
         )
-        .unwrap();
-        results["candidate_commit"] = serde_json::json!("abc123");
-        let tester_json = serde_json::to_string(&results).unwrap();
-        let (store, _) = make_interpret_reviews_fixture(tmp.path(), "PASS", Some(&tester_json));
+        .unwrap()
+        .results_path;
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results["tests"][0]["id"] = serde_json::json!("required_behavior");
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        assert_eq!(results["candidate_commit"], candidate);
         add_completed_focused_tests_evidence(tmp.path(), &store, command);
         store
             .mutate_work_item("work-1", |item| {
@@ -16329,10 +16351,14 @@ mod tests {
         let outcome =
             interpret_reviews(tmp.path(), &store, reopened, "attempt-1", false, None).unwrap();
 
-        assert!(matches!(
-            outcome,
-            WorkAttemptRunOutcome::MergeCandidateReady { .. }
-        ));
+        assert!(
+            matches!(
+                outcome,
+                WorkAttemptRunOutcome::PlannedReviews { .. }
+                    | WorkAttemptRunOutcome::MergeCandidateReady { .. }
+            ),
+            "{outcome:?}"
+        );
         let stored = store.read_work_item("work-1").unwrap();
         assert_eq!(
             stored.attempts[0]
@@ -16348,6 +16374,82 @@ mod tests {
                 .tasks
                 .iter()
                 .all(|task| !task.is_failed_command_recheck())
+        );
+    }
+
+    #[test]
+    fn focused_proof_cannot_cover_duplicate_command_occurrences() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+        let config = "commands:\n  - command: xcodebuild test\n    test_harness: xcodebuild\n  - command: xcodebuild test\n    test_harness: xcodebuild\n";
+        fs::write(workspace.path().join(".fluent/tester.yaml"), config).unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["add", ".fluent/tester.yaml"],
+            "stage duplicate occurrence",
+        )
+        .unwrap();
+        crate::git::run(
+            workspace.path(),
+            &["commit", "-qm", "Add repeated command"],
+            "commit duplicate occurrence",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                .unwrap();
+        store
+            .mutate_work_item("work-1", |item| {
+                for task in &mut item.attempts[0].tasks {
+                    if let Some(output) = &mut task.output {
+                        output.commit = candidate.clone();
+                    }
+                    if let Some(context) = &mut task.review_context {
+                        context.candidate_commit = candidate.clone();
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        add_failed_final_tester_command(root.path(), &store);
+        let saved = store.read_work_item("work-1").unwrap();
+        let tester = saved.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Tester)
+            .unwrap();
+        let area = root
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path);
+        let path = area.join("tester-results.json");
+        let mut results: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results["candidate_commit"] = serde_json::json!(candidate);
+        let mut second = results["commands"][0].clone();
+        second["exit_code"] = serde_json::json!(0);
+        for stream in ["stdout", "stderr"] {
+            let log = format!("commands/1-{stream}.log");
+            fs::write(area.join(&log), "").unwrap();
+            second[format!("{stream}_log")] = serde_json::json!(log);
+        }
+        results["commands"].as_array_mut().unwrap().push(second);
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        add_completed_focused_tests_evidence(root.path(), &store, "xcodebuild test");
+        let item = store.read_work_item("work-1").unwrap();
+        let view = crate::verification_assessment::assess_current_verification(
+            root.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(!view.commands[0].satisfied);
+        assert!(view.commands[1].satisfied);
+        assert!(
+            !crate::host_evidence::completed_review_evidence_covers_tester_failure(
+                root.path(),
+                &item.attempts[0],
+                &path,
+                None
+            )
         );
     }
 

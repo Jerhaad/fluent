@@ -374,6 +374,11 @@ fn assess_canonical_checks_at(
     let requested = unresolved_review_checks(project_root, attempt, now);
     blockers.extend(requested.iter().map(|check| check.reason.clone()));
     let reviewed = accepted_review_check_results(project_root, attempt, now);
+    let rechecked = attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|recovery| accepted_recheck_result(project_root, attempt, recovery))
+        .collect::<Vec<_>>();
     let mut checks = Vec::new();
     let mut outstanding = Vec::new();
     let mut accepted = Vec::new();
@@ -469,13 +474,23 @@ fn assess_canonical_checks_at(
                     && result.applicability == check.applicability
                     && result.comparison_commit == context.base_commit
             });
+            let recheck_replacement = rechecked.iter().find(|proof| {
+                proof.source_results == results_ref
+                    && proof.command_index == index
+                    && proof.command == check.command
+                    && proof.comparison_commit == context.base_commit
+                    && check.applicability == work_model::ResolvedCheckApplicability::default()
+            });
             if matches
                 && (validate_required_check_acceptance_at(project_root, attempt, &check, now)
                     .is_ok()
-                    || reviewed_replacement.is_some())
+                    || reviewed_replacement.is_some()
+                    || recheck_replacement.is_some())
             {
                 accepted.push(index);
                 if let Some(proof) = reviewed_replacement {
+                    review_bindings.insert(index, proof.bindings.clone());
+                } else if let Some(proof) = recheck_replacement {
                     review_bindings.insert(index, proof.bindings.clone());
                 }
             } else {
@@ -1828,4 +1843,295 @@ pub(crate) fn accepted_legacy_commands(
             }),
     );
     proofs
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FailedCommandRecheckEvidenceBinding {
+    pub(crate) schema_version: u32,
+    pub(crate) candidate_commit: String,
+    pub(crate) recheck_task_id: String,
+    pub(crate) source_results: work_model::BoundRecheckArtifact,
+    pub(crate) recheck_artifacts: Vec<work_model::BoundRecheckArtifact>,
+    pub(crate) command_index: usize,
+    pub(crate) command: String,
+    /// The command the authorized host actually ran. Older bindings used the
+    /// recheck command for both fields, so absence retains that interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence_check: Option<String>,
+    pub(crate) working_directory: String,
+}
+
+struct AcceptedRecheckResult {
+    source_results: work_model::BoundRecheckArtifact,
+    command_index: usize,
+    command: String,
+    comparison_commit: Option<String>,
+    bindings: Vec<work_model::BoundRecheckArtifact>,
+}
+
+fn accepted_recheck_result(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+) -> Option<AcceptedRecheckResult> {
+    if recovery.state != EvidenceRecoveryState::Complete
+        || recovery.targets.len() != 1
+        || recovery.targets[0].role != "tests"
+    {
+        return None;
+    }
+    let target = &recovery.targets[0];
+    let binding_bytes = bound_recovery_artifact(project_root, &target.prior_review_artifact)
+        .ok()?
+        .1;
+    let binding: FailedCommandRecheckEvidenceBinding =
+        serde_json::from_slice(&binding_bytes).ok()?;
+    let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+    if binding.schema_version != 1
+        || binding.candidate_commit != recovery.candidate_commit
+        || snapshot_path(
+            attempt.work_item_id.as_str(),
+            attempt.id.as_str(),
+            &binding_digest,
+        )
+        .ok()
+        .as_deref()
+            != Some(target.prior_review_artifact.as_str())
+        || attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .and_then(|task| task.output.as_ref())
+            .map(|output| output.commit.as_str())
+            != Some(recovery.candidate_commit.as_str())
+    {
+        return None;
+    }
+    let evidence_bytes = bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path)
+        .ok()?
+        .1;
+    if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest {
+        return None;
+    }
+    let evidence = parse_evidence_document(&evidence_bytes).ok()?;
+    let evidence_check = binding
+        .evidence_check
+        .as_deref()
+        .unwrap_or(binding.command.as_str());
+    if evidence.result != EvidenceResult::Pass
+        || evidence.check != evidence_check
+        || evidence_check != binding.command
+        || evidence.working_directory != binding.working_directory
+    {
+        return None;
+    }
+    let review_task = target.review_task_id.as_ref().and_then(|id| {
+        attempt.tasks.iter().find(|task| {
+            task.id == *id
+                && task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.status == TaskStatus::Complete
+                && task
+                    .evidence_review_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.recovery_id == recovery.id
+                            && context.candidate_commit == recovery.candidate_commit
+                            && context.prior_review_artifact == target.prior_review_artifact
+                            && context.attachment == recovery.attachment
+                    })
+        })
+    })?;
+    let review_path = review_artifact_path(review_task)?;
+    let (review_binding, review_bytes) =
+        bound_recovery_artifact(project_root, &review_path).ok()?;
+    if review::extract_verdict(std::str::from_utf8(&review_bytes).ok()?) != review::Verdict::Pass
+        || target
+            .review_digest
+            .as_ref()
+            .is_some_and(|digest| digest != &review_binding.digest)
+    {
+        return None;
+    }
+    let recheck = attempt.tasks.iter().find(|task| {
+        task.id == binding.recheck_task_id
+            && task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task.is_failed_command_recheck()
+    })?;
+    let current_artifacts =
+        failed_command_recheck_correction_artifacts(project_root, recheck).ok()?;
+    if current_artifacts.len() != binding.recheck_artifacts.len()
+        || !current_artifacts
+            .iter()
+            .zip(&binding.recheck_artifacts)
+            .all(|(current, bound)| {
+                current.path == bound.path
+                    && bound_recovery_artifact(project_root, &current.path).is_ok_and(
+                        |(_, bytes)| format!("sha256:{:x}", Sha256::digest(&bytes)) == bound.digest,
+                    )
+            })
+    {
+        return None;
+    }
+    let source_bytes = bound_recovery_artifact(project_root, &binding.source_results.path)
+        .ok()?
+        .1;
+    if format!("sha256:{:x}", Sha256::digest(&source_bytes)) != binding.source_results.digest {
+        return None;
+    }
+    let source: crate::tester::TesterResults = serde_json::from_slice(&source_bytes).ok()?;
+    let command = source.commands.get(binding.command_index)?;
+    let area = &recheck.artifact_area.as_ref()?.path;
+    let (_, manifest_bytes) =
+        bound_recovery_artifact(project_root, &format!("{area}/failed-command-recheck.json"))
+            .ok()?;
+    let manifest: crate::tester::FailedCommandRecheckManifest =
+        serde_json::from_slice(&manifest_bytes).ok()?;
+    let (_, recheck_bytes) =
+        bound_recovery_artifact(project_root, &format!("{area}/tester-results.json")).ok()?;
+    let recheck_results: crate::tester::TesterResults =
+        serde_json::from_slice(&recheck_bytes).ok()?;
+    let position = manifest
+        .failed_command_indexes
+        .iter()
+        .position(|index| *index == binding.command_index)?;
+    let checked = recheck_results.commands.get(position)?;
+    if manifest.source_results != binding.source_results.path
+        || manifest.candidate_commit != binding.candidate_commit
+        || binding.working_directory != "."
+        || checked.command != command.command
+        || checked.test_harness != command.test_harness
+    {
+        return None;
+    }
+
+    if source.candidate_commit.as_deref() != Some(recovery.candidate_commit.as_str())
+        || source.error.is_some()
+        || command.exit_code == 0
+        || command
+            .process_settlement
+            .as_ref()
+            .is_some_and(|settlement| !settlement.leaks.is_empty())
+        || command.command != binding.command
+        || source.summary.fail
+            != source
+                .tests
+                .iter()
+                .filter(|test| test.status == "fail")
+                .count()
+    {
+        return None;
+    }
+    let mut bindings = binding.recheck_artifacts.clone();
+    bindings.extend([
+        binding.source_results.clone(),
+        review_binding,
+        work_model::BoundRecheckArtifact {
+            path: target.prior_review_artifact.clone(),
+            digest: binding_digest,
+        },
+        work_model::BoundRecheckArtifact {
+            path: recovery.attachment.snapshot_path.clone(),
+            digest: recovery.attachment.digest.clone(),
+        },
+    ]);
+    Some(AcceptedRecheckResult {
+        source_results: binding.source_results,
+        command_index: binding.command_index,
+        command: binding.command,
+        comparison_commit: recheck.review_context.as_ref()?.base_commit.clone(),
+        bindings,
+    })
+}
+
+pub(crate) fn failed_command_recheck_correction_artifacts(
+    project_root: &Path,
+    recheck: &Task,
+) -> Result<Vec<work_model::ArtifactRef>> {
+    let area = recheck
+        .artifact_area
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no artifact area"))?;
+    let manifest_path = validate_managed_file_path(
+        project_root,
+        &format!("{}/failed-command-recheck.json", area.path),
+    )?;
+    let manifest: crate::tester::FailedCommandRecheckManifest =
+        serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let results_path =
+        validate_managed_file_path(project_root, &format!("{}/tester-results.json", area.path))?;
+    let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&results_path)?)?;
+    let expected_commit = recheck
+        .review_context
+        .as_ref()
+        .map(|context| context.candidate_commit.as_str())
+        .ok_or_else(|| anyhow::anyhow!("failed-command recheck has no candidate context"))?;
+    if results.candidate_commit.as_deref() != Some(expected_commit) {
+        bail!(
+            "failed-command recheck result is not bound to candidate {}",
+            expected_commit
+        );
+    }
+    let indexes_are_strict = manifest
+        .failed_command_indexes
+        .windows(2)
+        .all(|indexes| indexes[0] < indexes[1]);
+    let expected_source = recheck
+        .input_artifacts
+        .first()
+        .map(|artifact| artifact.path.as_str());
+    if manifest.schema_version != crate::tester::FAILED_COMMAND_RECHECK_SCHEMA_VERSION
+        || manifest.candidate_commit != expected_commit
+        || manifest.failed_command_indexes.len() != results.commands.len()
+        || manifest.failed_command_indexes.is_empty()
+        || !indexes_are_strict
+        || expected_source != Some(manifest.source_results.as_str())
+    {
+        bail!("failed-command recheck manifest does not match its candidate and command results");
+    }
+    let structured_failure = results.summary.fail > 0 || results.error.is_some();
+    let failed = results.commands.iter().enumerate().filter(|(_, command)| {
+        structured_failure
+            || command.exit_code != 0
+            || command
+                .process_settlement
+                .as_ref()
+                .is_some_and(|evidence| !evidence.leaks.is_empty())
+    });
+    let mut failed = failed.peekable();
+    if !structured_failure && failed.peek().is_none() {
+        return Ok(Vec::new());
+    }
+
+    let mut artifacts = vec![
+        work_model::ArtifactRef {
+            producer_id: recheck.id.clone(),
+            path: format!("{}/failed-command-recheck.json", area.path),
+        },
+        work_model::ArtifactRef {
+            producer_id: recheck.id.clone(),
+            path: format!("{}/tester-results.json", area.path),
+        },
+    ];
+    for (index, command) in failed {
+        for (actual, expected) in [
+            (&command.stdout_log, format!("commands/{index}-stdout.log")),
+            (&command.stderr_log, format!("commands/{index}-stderr.log")),
+        ] {
+            if actual != &expected
+                || validate_managed_file_path(project_root, &format!("{}/{}", area.path, expected))
+                    .is_err()
+            {
+                bail!("failed-command recheck log path {actual:?} does not match {expected:?}");
+            }
+            artifacts.push(work_model::ArtifactRef {
+                producer_id: recheck.id.clone(),
+                path: format!("{}/{}", area.path, expected),
+            });
+        }
+    }
+    Ok(artifacts)
 }
