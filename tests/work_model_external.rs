@@ -640,12 +640,12 @@ fn work_model_store_writes_deterministic_pretty_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 3,
+  "schema_version": 4,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 1,
+    "schema_version": 2,
     "version": "{version}"
   }}
 }}
@@ -694,12 +694,12 @@ fn capture_mode_preserves_minimal_work_item_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 3,
+  "schema_version": 4,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 1,
+    "schema_version": 2,
     "version": "{version}"
   }}
 }}
@@ -1665,7 +1665,7 @@ fn current_record_has_old_reader_wire_fence() {
     assert_eq!(
         record["model_writer_version"],
         serde_json::json!({
-            "format": "fluent-work-item-writer", "schema_version": 1,
+            "format": "fluent-work-item-writer", "schema_version": 2,
             "version": env!("CARGO_PKG_VERSION")
         })
     );
@@ -1755,7 +1755,7 @@ fn writer_envelope_rejects_unknown_or_malformed_values() {
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     for envelope in [
         serde_json::json!({"format": "other", "schema_version": 1, "version": "0.3.0"}),
-        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 2, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 3, "version": "0.3.0"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 0, "version": "0.3.0"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1, "version": "invalid"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1}),

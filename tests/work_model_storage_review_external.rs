@@ -208,12 +208,12 @@ fn reviewer_storage_writes_documented_deterministic_json() {
         fs::read_to_string(path).unwrap(),
         format!(
             r#"{{
-  "schema_version": 3,
+  "schema_version": 4,
   "id": "work-review",
   "title": "Review durable storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 1,
+    "schema_version": 2,
     "version": "{version}"
   }}
 }}
