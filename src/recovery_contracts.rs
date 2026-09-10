@@ -2487,14 +2487,7 @@ fn validate_code_change_review_and_evidence_binding(
     Ok(())
 }
 
-pub(crate) fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
-    let hex = digest
-        .strip_prefix("sha256:")
-        .context("invalid evidence digest")?;
-    Ok(format!(
-        ".fluent/work/artifacts/{work}/{attempt}/host-evidence/{hex}.json"
-    ))
-}
+pub(crate) use crate::verification_assessment::snapshot_path;
 
 
 
@@ -2525,6 +2518,9 @@ mod tests {
                 !source.contains(&format!("crate::{caller}::")),
                 "neutral recovery contracts must not depend on {caller}"
             );
+        }
+        for caller in ["candidate_gate", "host_evidence", "lifecycle_recovery", "queue", "work_task_executor", "recovery_contracts"] {
+            assert!(!include_str!("verification_assessment.rs").contains(&format!("crate::{caller}::")), "verification assessment must stay below {caller}");
         }
     }
 
@@ -3342,11 +3338,17 @@ pub(crate) mod verification_tests {
         let path = assess_canonical_checks(root.path(), attempt).unwrap().results_path;
         let mut results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         results.tests[0].failure_excerpt = Some("the same assertion, explained differently".into());
-        fs::write(path, serde_json::to_vec(&results).unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
         let second = assess_current_verification(root.path(), attempt).unwrap();
         let identities = |view: &crate::verification_assessment::VerificationAssessment| view.unresolved().map(|row| (row.id.clone(), row.cause.clone(), row.owner)).collect::<Vec<_>>();
         assert_eq!(identities(&first), identities(&second));
         assert_eq!(first.references.len(), 1, "identity lists are diagnostics, not extra requirements");
+        results.summary.total += 1;
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        let invalid = assess_current_verification(root.path(), attempt).unwrap();
+        results.tests[0].failure_excerpt = Some("another explanation of the same facts".into());
+        fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+        assert_eq!(identities(&invalid), identities(&assess_current_verification(root.path(), attempt).unwrap()));
     }
 }
 

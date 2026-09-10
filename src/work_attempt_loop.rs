@@ -6564,6 +6564,8 @@ fn recover_legacy_learner_tester_evidence_failure(
         );
     }
 
+    let needs_correction = crate::verification_assessment::assess_current_verification(project_root, &gate_item.attempts[attempt_index])
+        .is_ok_and(|view| !view.candidate_defects().is_empty());
     let expected = item.clone();
     let recovery_artifacts = final_tester_correction_artifacts(
         project_root,
@@ -6596,9 +6598,19 @@ fn recover_legacy_learner_tester_evidence_failure(
                 attempt.artifacts.push(artifact.clone());
             }
         }
-        fresh.add_next_write_round(attempt_id, recovery_artifacts.clone())
+        if needs_correction {
+            fresh.add_next_write_round(attempt_id, recovery_artifacts.clone()).map(Some)
+        } else {
+            crate::work_model::suspend_attempt(attempt, PauseKind::CandidateGate);
+            Ok(None)
+        }
     })?;
-    Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
+    if let Some(task_id) = task_id {
+        Ok(Some(WorkAttemptRunOutcome::PlannedWriteRound { task_id }))
+    } else {
+        let mut current = store.read_work_item(&item.id)?;
+        pause_candidate_gate_after_tester(project_root, store, &mut current, attempt_index, attempt_id, &artifact, &normalized).map(Some)
+    }
 }
 
 /// When a marked Attempt's current required progress does not reconcile with its
@@ -15498,7 +15510,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt() {
+    fn legacy_learner_tester_evidence_failure_pauses_for_diagnosis() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate, _dispatch) =
             legacy_learner_tester_evidence_fixture(project.path());
@@ -15511,9 +15523,7 @@ mod tests {
         )
         .unwrap()
         .expect("the exact legacy failure must normalize");
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("legacy evidence recovery must plan a correction")
-        };
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }), "legacy evidence alone must not authorize a Writer");
         let recovered = store.read_work_item("work-1").unwrap();
         assert_eq!(recovered.attempts.len(), 1);
         assert!(recovered.merge_candidates.is_empty());
@@ -15523,16 +15533,8 @@ mod tests {
                 .as_ref()
                 .is_some_and(AttemptLearning::is_failed)
         );
-        let writer = recovered.attempts[0]
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .unwrap();
-        let gate = writer
-            .input_artifacts
-            .iter()
-            .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
-            .unwrap();
+        assert_eq!(recovered.attempts[0].tasks.iter().filter(|task| task.kind == TaskKind::Write).count(), 1);
+        let gate = recovered.attempts[0].artifacts.iter().rev().find(|artifact| artifact.path.ends_with("candidate-gate.json")).unwrap();
         let normalized: crate::candidate_gate::CandidateGateEvidence =
             serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
         assert_eq!(
@@ -15543,7 +15545,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_evidence_recovery_can_resume_false_ready_and_blocked_dispatches() {
+    fn legacy_evidence_recovery_blocks_false_ready_and_blocked_dispatches() {
         for terminal in [
             crate::queue::DispatchStatus::CandidateReady,
             crate::queue::DispatchStatus::Blocked,
@@ -15553,16 +15555,10 @@ mod tests {
                 legacy_learner_tester_evidence_fixture(project.path());
             crate::queue::reconcile(project.path(), &dispatch, terminal).unwrap();
 
-            assert_eq!(
-                crate::queue::resume(project.path(), "work-1", "attempt-1", None).unwrap(),
-                crate::queue::ResumeDispatchOutcome::Created
-            );
-            assert!(
-                crate::queue::claim(project.path(), "work-1", "attempt-1")
-                    .unwrap()
-                    .is_some(),
-                "{terminal} must admit the exact legacy resume"
-            );
+            let error = crate::queue::resume(project.path(), "work-1", "attempt-1", None).unwrap_err();
+            assert!(error.to_string().contains("no passing Tester result matches"), "{terminal}: {error}");
+            assert!(crate::queue::claim(project.path(), "work-1", "attempt-1").unwrap().is_none(), "a terminal dispatch cannot authorize a missing-evidence Writer");
+
         }
     }
 

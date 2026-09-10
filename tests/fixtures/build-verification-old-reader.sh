@@ -9,7 +9,7 @@ if [[ ! -f "$reader_root/source-commit" ]]; then
     git -C "$repository" archive "$source_commit" | tar -x -C "$reader_root"
     echo "$source_commit" > "$reader_root/source-commit"
 fi
-if ! cargo build --locked --offline --manifest-path "$reader_root/Cargo.toml" > "$reader_root/build.log" 2>&1; then
+if ! cargo build --locked --offline --manifest-path "$reader_root/Cargo.toml" --target-dir "$reader_root/target" > "$reader_root/build.log" 2>&1; then
     cat "$reader_root/build.log" >&2
     exit 1
 fi

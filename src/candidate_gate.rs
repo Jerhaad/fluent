@@ -8,12 +8,13 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
+#[cfg(test)]
 use crate::verification_reference::*;
 use crate::work_model::{
     CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract, WriterCompletionRequirementKind,
 };
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 5;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = crate::verification_assessment::VERIFICATION_GATE_SCHEMA_VERSION;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
@@ -1652,7 +1653,8 @@ fn check_behavior_references(
         return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec!["Tester evidence is not bound to this candidate commit".into()])]);
     }
     let bindings = request.tester_results_path.map(|path| crate::work_model::BoundRecheckArtifact { path: path.display().to_string(), digest: String::new() }).into_iter().collect::<Vec<_>>();
-    let rows = crate::verification_assessment::assess_references(request.workspace, request.work_item_id, request.attempt_id, request.candidate_commit, contract, adjusted.as_ref(), canonical.as_ref(), &bindings)?;
+    let accepted = saved_attempt.map(|attempt| crate::verification_assessment::accepted_legacy_commands(request.project_root, attempt, crate::check_applicability::evaluation_time())).unwrap_or_default();
+    let rows = crate::verification_assessment::assess_references(request.workspace, request.work_item_id, request.attempt_id, request.candidate_commit, contract, adjusted.as_ref(), canonical.as_ref(), &bindings, &accepted)?;
     let mut source_diagnostics = Vec::new();
     for requirement in contract.requirements.iter().filter(|row| row.kind == WriterCompletionRequirementKind::Behavior) {
         if requirement.verification_refs.is_empty() { source_diagnostics.push(format!("{} has neither a Test: reference nor an Untestable: reason", requirement.source)); }
@@ -1670,44 +1672,9 @@ fn check_behavior_references(
 
 /// Resolve one exact command-shaped Test reference that a rejected final
 /// candidate gate could not find in canonical Tester evidence. Selector-only
-/// diagnostics remain code/test-contract corrections rather than host runs.
+/// diagnostics require diagnosis before any source correction.
 pub(crate) fn requested_host_evidence_command(evidence: &CandidateGateEvidence) -> Option<String> {
-    if evidence.schema_version == 0
-        || evidence.schema_version > CANDIDATE_GATE_SCHEMA_VERSION
-        || evidence.phase != CandidateGatePhase::FinalTester
-        || evidence.disposition != CandidateGateDisposition::Rejected
-    {
-        return None;
-    }
-    let mut blocking = evidence.checks.iter().filter(|check| {
-        matches!(
-            check.status,
-            CandidateCheckStatus::Failed | CandidateCheckStatus::Error
-        )
-    });
-    let tester = blocking.next()?;
-    if tester.name != "tester-reference-evidence"
-        || tester.status != CandidateCheckStatus::Failed
-        || blocking.next().is_some()
-    {
-        return None;
-    }
-    let mut commands = tester
-        .diagnostics
-        .iter()
-        .filter_map(|diagnostic| {
-            diagnostic
-                .strip_prefix("no passing Tester result matches ")
-                .and_then(|reference| parse_test_reference(reference).ok())
-                .and_then(|reference| reference.command)
-        })
-        .collect::<Vec<_>>();
-    commands.sort();
-    commands.dedup();
-    let [command] = commands.as_slice() else {
-        return None;
-    };
-    Some(command.clone())
+    crate::verification_assessment::requested_legacy_host_command(&serde_json::to_value(evidence).ok()?)
 }
 
 fn learner_only_delta(workspace: &Path, from: &str, to: &str) -> Result<bool> {

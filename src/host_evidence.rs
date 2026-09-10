@@ -3951,87 +3951,8 @@ pub(crate) fn completed_candidate_gate_evidence_commands(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Vec<String> {
-    let latest_candidate = attempt
-        .tasks
-        .iter()
-        .rev()
-        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
-        .and_then(|task| task.output.as_ref())
-        .map(|output| output.commit.as_str());
-    let Some(latest_candidate) = latest_candidate else {
-        return Vec::new();
-    };
-    let mut commands = attempt
-        .evidence_recoveries
-        .iter()
-        .filter_map(|recovery| {
-            if recovery.state != EvidenceRecoveryState::Complete
-                || recovery.candidate_commit != latest_candidate
-                || recovery.targets.len() != 1
-                || recovery.targets[0].role != "tests"
-            {
-                return None;
-            }
-            let target = &recovery.targets[0];
-            let binding_bytes = fs::read(project_root.join(&target.prior_review_artifact)).ok()?;
-            let binding: CandidateGateEvidenceBinding =
-                serde_json::from_slice(&binding_bytes).ok()?;
-            let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
-            if binding.schema_version != 1
-                || binding.candidate_commit != recovery.candidate_commit
-                || snapshot_path(
-                    attempt.work_item_id.as_str(),
-                    attempt.id.as_str(),
-                    &binding_digest,
-                )
-                .ok()
-                .as_deref()
-                    != Some(target.prior_review_artifact.as_str())
-            {
-                return None;
-            }
-            if binding.gate_evidence.candidate_commit != recovery.candidate_commit
-                || crate::candidate_gate::requested_host_evidence_command(&binding.gate_evidence)
-                    .as_deref()
-                    != Some(binding.command.as_str())
-            {
-                return None;
-            }
-            let evidence_bytes =
-                fs::read(project_root.join(&recovery.attachment.snapshot_path)).ok()?;
-            if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != recovery.attachment.digest
-            {
-                return None;
-            }
-            let evidence = parse_evidence_document(&evidence_bytes).ok()?;
-            if evidence.result != EvidenceResult::Pass
-                || evidence.check != binding.command
-                || evidence.working_directory != binding.working_directory
-            {
-                return None;
-            }
-            let review_task_id = target.review_task_id.as_ref()?;
-            let review = attempt.tasks.iter().find(|task| {
-                task.id == *review_task_id
-                    && task.kind == TaskKind::Review
-                    && task.role == "tests"
-                    && task.status == TaskStatus::Complete
-                    && task
-                        .evidence_review_context
-                        .as_ref()
-                        .is_some_and(|context| {
-                            context.recovery_id == recovery.id
-                                && context.candidate_commit == recovery.candidate_commit
-                                && context.attachment == recovery.attachment
-                                && context.prior_review_artifact == target.prior_review_artifact
-                        })
-            })?;
-            (read_verdict(project_root, review) == Some(Verdict::Pass)).then_some(binding.command)
-        })
-        .collect::<Vec<_>>();
-    commands.sort();
-    commands.dedup();
-    commands
+    crate::verification_assessment::accepted_legacy_gate_commands(project_root, attempt)
+        .into_iter().map(|proof| proof.command).collect()
 }
 
 /// Resolve focused Tests Review commands whose candidate-bound host evidence
@@ -5444,7 +5365,7 @@ mod tests {
     #[test]
     fn candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent() {
         let command = "python3 tests/readiness.py";
-        let (project, _workspace, store, candidate, gate_path, evidence_path) =
+        let (project, workspace, store, candidate, gate_path, evidence_path) =
             candidate_gate_evidence_fixture(command);
 
         assert!(
@@ -5576,6 +5497,35 @@ mod tests {
             completed_candidate_gate_evidence_commands(project.path(), &completed.attempts[0]),
             vec![command.to_string()]
         );
+        // Exercise admission as well as attachment: accepted legacy command
+        // evidence must survive the shared reference assessment.
+        let contract = work_model::WriterCompletionContract {
+            version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![work_model::WriterCompletionRequirement {
+                responsibility: None, id: "behavior:host:b1".into(),
+                kind: work_model::WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#host:b1".into(), requirement: "Check readiness".into(),
+                verification_refs: vec![command.into()], command: None,
+            }],
+        };
+        let results_path = project.path().join("tester-results.json");
+        fs::write(&results_path, serde_json::to_vec(&serde_json::json!({
+            "candidate_commit": candidate, "commands": [], "tests": [],
+            "summary": {"total":0,"pass":0,"fail":0,"skipped":0}, "error": null
+        })).unwrap()).unwrap();
+        let run_gate = || crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
+            project_root: project.path(), workspace: workspace.path(), work_item_id: "work-1", attempt_id: "attempt-1",
+            task_id: None, phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            base_commit: &passed_gate.base_commit, candidate_commit: &candidate, completion_contract: Some(&contract),
+            allow_tree_identical_metadata_rewrite: false, metadata_rewrite_authorization: None,
+            tester_results_path: Some(&results_path), accepted_tester_commands: &[], artifact_path: &project.path().join("recheck-gate.json"),
+        }).unwrap().checks.into_iter().find(|check| check.name == "tester-reference-evidence").unwrap().status;
+        assert_eq!(run_gate(), crate::candidate_gate::CandidateCheckStatus::Passed);
+        let snapshot = project.path().join(&recovery.attachment.snapshot_path);
+        let original = fs::read(&snapshot).unwrap();
+        fs::write(&snapshot, b"{}").unwrap();
+        assert_eq!(run_gate(), crate::candidate_gate::CandidateCheckStatus::Failed);
+        fs::write(snapshot, original).unwrap();
         assert_eq!(
             attach(
                 project.path(),

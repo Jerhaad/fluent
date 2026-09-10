@@ -85,11 +85,13 @@ pub(crate) fn review_artifact_path(task: &Task) -> Option<String> {
 }
 /// Evaluate canonical checks without publishing state or scheduling work.
 pub(crate) struct CanonicalCheckAssessment {
+    pub config_digest: String,
     pub results_path: PathBuf,
     pub checks: Vec<work_model::RequiredCheck>,
     pub outstanding: Vec<usize>,
     pub requested: Vec<UnresolvedReviewCheck>,
     pub accepted: Vec<usize>,
+    pub review_bindings: std::collections::HashMap<usize, Vec<work_model::BoundRecheckArtifact>>,
     pub blockers: Vec<String>,
     pub diagnoses: Vec<String>,
     /// Demonstrated assertion or harness defects retain source correction.
@@ -120,7 +122,10 @@ pub(crate) fn bound_recovery_artifact(
     path: &str,
 ) -> Result<(work_model::BoundRecheckArtifact, Vec<u8>)> {
     let resolved = validate_managed_file_path(project_root, path)?;
-    anyhow::ensure!(fs::metadata(&resolved)?.len() <= 16 * MAX_EVIDENCE_BYTES as u64, "verification artifact exceeds the bounded read limit: {path}");
+    anyhow::ensure!(
+        fs::metadata(&resolved)?.len() <= 16 * MAX_EVIDENCE_BYTES as u64,
+        "verification artifact exceeds the bounded read limit: {path}"
+    );
     let bytes = fs::read(resolved)?;
     Ok((
         work_model::BoundRecheckArtifact {
@@ -137,10 +142,18 @@ pub(crate) fn assess_canonical_checks(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<CanonicalCheckAssessment> {
-    assess_canonical_checks_at(project_root, attempt, crate::check_applicability::evaluation_time())
+    assess_canonical_checks_at(
+        project_root,
+        attempt,
+        crate::check_applicability::evaluation_time(),
+    )
 }
 
-fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt, now: chrono::DateTime<chrono::Utc>) -> Result<CanonicalCheckAssessment> {
+fn assess_canonical_checks_at(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CanonicalCheckAssessment> {
     let output = attempt
         .tasks
         .iter()
@@ -288,7 +301,13 @@ fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt
     }
     let mut defects = Vec::new();
     if let Some(error) = &results.error {
-        defects.push(CanonicalDefect { id: format!("tester-harness:{}:{}", manifest.config_digest, error.kind), diagnostic: format!("canonical Tester has an unresolved extractor or harness error: {}", error.kind) });
+        defects.push(CanonicalDefect {
+            id: format!("tester-harness:{}:{}", manifest.config_digest, error.kind),
+            diagnostic: format!(
+                "canonical Tester has an unresolved extractor or harness error: {}",
+                error.kind
+            ),
+        });
     }
     if results.summary.total != results.tests.len()
         || results.summary.pass
@@ -333,12 +352,13 @@ fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt
             blockers.push(format!("command {index} has unresolved process leaks"));
         }
     }
-    let requested = unresolved_review_checks(project_root, attempt);
+    let requested = unresolved_review_checks(project_root, attempt, now);
     blockers.extend(requested.iter().map(|check| check.reason.clone()));
-    let reviewed = accepted_review_check_results(project_root, attempt);
+    let reviewed = accepted_review_check_results(project_root, attempt, now);
     let mut checks = Vec::new();
     let mut outstanding = Vec::new();
     let mut accepted = Vec::new();
+    let mut review_bindings = std::collections::HashMap::new();
     let mut diagnoses = Vec::new();
     for (index, definition) in manifest.commands.iter().enumerate() {
         let applicability = match manifest.applicability.get(index) {
@@ -415,29 +435,30 @@ fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt
             environment: manifest.environment.get(index).cloned().unwrap_or_default(),
             comparison_commits: check.applicability.comparison_commits.clone(),
         };
-        let local_applies = validate_check_applicability_at(
-            &check.applicability,
-            &local_evidence,
-            now,
-        )
-        .is_ok();
+        let local_applies =
+            validate_check_applicability_at(&check.applicability, &local_evidence, now).is_ok();
         if !matches || !local_applies || result.is_none_or(|command| command.exit_code != 0) {
-            let reviewed_replacement = manifest
+            let unique_command = manifest
                 .commands
                 .iter()
                 .filter(|other| other.command == definition.command)
                 .count()
-                == 1
-                && reviewed.iter().any(|result| {
-                    result.command == check.command
-                        && result.applicability == check.applicability
-                        && result.comparison_commit == context.base_commit
-                });
+                == 1;
+            let reviewed_replacement = reviewed.iter().find(|result| {
+                unique_command
+                    && result.command == check.command
+                    && result.applicability == check.applicability
+                    && result.comparison_commit == context.base_commit
+            });
             if matches
-                && (validate_required_check_acceptance_at(project_root, attempt, &check, now).is_ok()
-                    || reviewed_replacement)
+                && (validate_required_check_acceptance_at(project_root, attempt, &check, now)
+                    .is_ok()
+                    || reviewed_replacement.is_some())
             {
                 accepted.push(index);
+                if let Some(proof) = reviewed_replacement {
+                    review_bindings.insert(index, proof.bindings.clone());
+                }
             } else {
                 outstanding.push(index);
                 if let Some(reason) = unmet_prerequisite {
@@ -461,13 +482,26 @@ fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt
                 && test.test_harness == command.test_harness
         });
         if !covered {
-            let native = references::normalized_result(test).map(|test| test.id).unwrap_or_else(|_| test.id.clone());
-            defects.push(CanonicalDefect { id: format!("tester-failure:{}:{}", manifest.config_digest, crate::verification_policy::digest(native.as_bytes())), diagnostic: format!("canonical Tester has an unresolved structured failure: {}", test.id) });
+            let native = references::normalized_result(test)
+                .map(|test| test.id)
+                .unwrap_or_else(|_| test.id.clone());
+            defects.push(CanonicalDefect {
+                id: format!(
+                    "tester-failure:{}:{}",
+                    manifest.config_digest,
+                    crate::verification_policy::digest(native.as_bytes())
+                ),
+                diagnostic: format!(
+                    "canonical Tester has an unresolved structured failure: {}",
+                    test.id
+                ),
+            });
         }
     }
     defects.sort_by(|a, b| a.id.cmp(&b.id));
     defects.dedup_by(|a, b| a.id == b.id);
     Ok(CanonicalCheckAssessment {
+        config_digest: manifest.config_digest,
         requested,
         defects,
         reconstruction,
@@ -476,22 +510,9 @@ fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt
         checks,
         outstanding,
         accepted,
+        review_bindings,
         blockers,
     })
-}
-
-pub(crate) fn required_check_is_accepted(
-    project_root: &Path,
-    attempt: &work_model::Attempt,
-    check: &work_model::RequiredCheck,
-) -> bool {
-    validate_required_check_acceptance_at(
-        project_root,
-        attempt,
-        check,
-        crate::check_applicability::evaluation_time(),
-    )
-    .is_ok()
 }
 
 pub(crate) fn validate_required_check_acceptance_at(
@@ -800,6 +821,7 @@ pub(crate) struct UnresolvedReviewCheck {
 fn unresolved_review_checks(
     project_root: &Path,
     attempt: &work_model::Attempt,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<UnresolvedReviewCheck> {
     let candidate = attempt
         .tasks
@@ -824,16 +846,11 @@ fn unresolved_review_checks(
         }
         let accepted =
             validate_required_check_binding(project_root, attempt, check).and_then(|()| {
-                validate_required_check_acceptance_at(
-                    project_root,
-                    attempt,
-                    check,
-                    crate::check_applicability::evaluation_time(),
-                )
+                validate_required_check_acceptance_at(project_root, attempt, check, now)
             });
         if let Err(error) = accepted {
             let can_refresh =
-                expired_completed_review_recovery(project_root, attempt, &request.path)
+                expired_completed_review_recovery_at(project_root, attempt, &request.path, now)
                     .is_ok_and(|recovery| recovery.is_some());
             unresolved.push(UnresolvedReviewCheck {
                 check: check.clone(),
@@ -851,6 +868,20 @@ pub(crate) fn expired_completed_review_recovery<'a>(
     project_root: &Path,
     attempt: &'a work_model::Attempt,
     review_artifact: &str,
+) -> Result<Option<&'a EvidenceRecovery>> {
+    expired_completed_review_recovery_at(
+        project_root,
+        attempt,
+        review_artifact,
+        crate::check_applicability::evaluation_time(),
+    )
+}
+
+fn expired_completed_review_recovery_at<'a>(
+    project_root: &Path,
+    attempt: &'a work_model::Attempt,
+    review_artifact: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<&'a EvidenceRecovery>> {
     let Some(recovery) = attempt.evidence_recoveries.iter().rev().find(|recovery| {
         recovery.required_check.as_ref().is_some_and(|check| matches!(&check.source,
@@ -893,7 +924,7 @@ pub(crate) fn expired_completed_review_recovery<'a>(
     let expiry = chrono::TimeDelta::try_seconds(i64::try_from(seconds)?)
         .and_then(|duration| issued.checked_add_signed(duration))
         .context("unsupported live-state freshness expiry")?;
-    if crate::check_applicability::evaluation_time() < expiry {
+    if now < expiry {
         return Ok(None);
     }
     validate_required_check_acceptance_at(project_root, attempt, check, issued)?;
@@ -904,16 +935,21 @@ struct ReviewedCheckResult {
     command: String,
     applicability: work_model::ResolvedCheckApplicability,
     comparison_commit: Option<String>,
+    bindings: Vec<work_model::BoundRecheckArtifact>,
 }
 
 pub(crate) fn completed_review_check_commands(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Vec<String> {
-    let mut commands = accepted_review_check_results(project_root, attempt)
-        .into_iter()
-        .map(|result| result.command)
-        .collect::<Vec<_>>();
+    let mut commands = accepted_review_check_results(
+        project_root,
+        attempt,
+        crate::check_applicability::evaluation_time(),
+    )
+    .into_iter()
+    .map(|result| result.command)
+    .collect::<Vec<_>>();
     commands.sort();
     commands.dedup();
     commands
@@ -922,6 +958,7 @@ pub(crate) fn completed_review_check_commands(
 fn accepted_review_check_results(
     project_root: &Path,
     attempt: &work_model::Attempt,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<ReviewedCheckResult> {
     let latest_candidate = attempt
         .tasks
@@ -952,7 +989,8 @@ fn accepted_review_check_results(
                     check.source,
                     work_model::RequiredCheckSource::ReviewRequested { .. }
                 ) || validate_required_check_binding(project_root, attempt, check).is_err()
-                    || !required_check_is_accepted(project_root, attempt, check)
+                    || validate_required_check_acceptance_at(project_root, attempt, check, now)
+                        .is_err()
                 {
                     return None;
                 }
@@ -1029,6 +1067,24 @@ fn accepted_review_check_results(
                         .map(|check| check.applicability.clone())
                         .unwrap_or_default(),
                     comparison_commit: source_task.review_context.as_ref()?.base_commit.clone(),
+                    bindings: vec![
+                        bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path)
+                            .ok()?
+                            .0,
+                        bound_recovery_artifact(project_root, &target.prior_review_artifact)
+                            .ok()?
+                            .0,
+                        bound_recovery_artifact(
+                            project_root,
+                            &review_artifact_path(
+                                attempt.tasks.iter().find(|task| {
+                                    Some(&task.id) == target.review_task_id.as_ref()
+                                })?,
+                            )?,
+                        )
+                        .ok()?
+                        .0,
+                    ],
                 })
             })
         })
@@ -1096,6 +1152,7 @@ pub(crate) fn assess_references(
     results: Option<&crate::tester::TesterResults>,
     canonical: Option<&CanonicalCheckAssessment>,
     bindings: &[work_model::BoundRecheckArtifact],
+    accepted: &[AcceptedCommandProof],
 ) -> Result<Vec<RequirementAssessment>> {
     let mut rows = Vec::new();
     for requirement in contract
@@ -1144,16 +1201,57 @@ pub(crate) fn assess_references(
             }
             let result =
                 results.filter(|results| results.candidate_commit.as_deref() == Some(candidate));
-            let declared_command_is_bound = if let Some(ReferenceMeaning::Command { command, command_index, .. }) = &reference.declared {
-                let config = crate::git::run_raw(workspace, &["show", &format!("{candidate}:.fluent/tester.yaml")])?;
-                let config: Option<crate::tester::TesterConfig> = config.status.success().then(|| serde_yaml::from_slice(&config.stdout).ok()).flatten();
+            let declared_command_is_bound = if let Some(ReferenceMeaning::Command {
+                command,
+                command_index,
+                ..
+            }) = &reference.declared
+            {
+                let config = crate::git::run_raw(
+                    workspace,
+                    &["show", &format!("{candidate}:.fluent/tester.yaml")],
+                )?;
+                let config: Option<crate::tester::TesterConfig> = config
+                    .status
+                    .success()
+                    .then(|| serde_yaml::from_slice(&config.stdout).ok())
+                    .flatten();
                 config.is_some_and(|config| {
-                    let entries = config.commands.iter().enumerate().filter(|(index, entry)| entry.command == *command && command_index.is_none_or(|expected| expected == *index)).collect::<Vec<_>>();
-                    let [(index, entry)] = entries.as_slice() else { return false; };
-                    result.is_some_and(|results| results.commands.get(*index).is_some_and(|result| result.command == entry.command && result.test_harness == entry.test_harness))
+                    let entries = config
+                        .commands
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, entry)| {
+                            entry.command == *command
+                                && command_index.is_none_or(|expected| expected == *index)
+                        })
+                        .collect::<Vec<_>>();
+                    let [(index, entry)] = entries.as_slice() else {
+                        return false;
+                    };
+                    result.is_some_and(|results| {
+                        results.commands.get(*index).is_some_and(|result| {
+                            result.command == entry.command
+                                && result.test_harness == entry.test_harness
+                        })
+                    })
                 })
-            } else { true };
-            row.satisfied = declared_command_is_bound && result.is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
+            } else {
+                true
+            };
+            row.satisfied = declared_command_is_bound
+                && result
+                    .is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
+            if reference.declared.is_none() {
+                if let Some(proof) = accepted
+                    .iter()
+                    .find(|proof| reference.command.as_deref() == Some(proof.command.as_str()))
+                {
+                    row.satisfied = true;
+                    row.owner = work_model::CompletionResponsibility::Host;
+                    row.bindings.extend(proof.bindings.clone());
+                }
+            }
             if row.satisfied {
                 row.cause = None;
                 row.next_action = None;
@@ -1236,7 +1334,8 @@ pub(crate) fn validate_reference_source(
         reference.path
     );
     anyhow::ensure!(
-        reference.selector.is_none() || reference.source_contains_selector(&String::from_utf8_lossy(&output.stdout)),
+        reference.selector.is_none()
+            || reference.source_contains_selector(&String::from_utf8_lossy(&output.stdout)),
         "references test identifier {:?}, which is absent from {}",
         reference.selector,
         reference.path
@@ -1249,8 +1348,14 @@ fn reference_is_satisfied(
     results: &crate::tester::TesterResults,
     canonical: Option<&CanonicalCheckAssessment>,
 ) -> bool {
-    let normalized = results.tests.iter().map(references::normalized_result).collect::<std::result::Result<Vec<_>, _>>();
-    let Ok(normalized) = normalized else { return false; };
+    let normalized = results
+        .tests
+        .iter()
+        .map(references::normalized_result)
+        .collect::<std::result::Result<Vec<_>, _>>();
+    let Ok(normalized) = normalized else {
+        return false;
+    };
     let mut results = results.clone();
     results.tests = normalized;
     match reference.meaning() {
@@ -1276,7 +1381,6 @@ fn reference_is_satisfied(
                     .get(*index)
                     .is_some_and(|check| check.command == command)
                     && !view.outstanding.contains(index)
-
             })
         }
         ReferenceMeaning::WholeScript { path, .. } => {
@@ -1328,10 +1432,18 @@ pub fn assess_current_verification(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<VerificationAssessment> {
-    assess_current_verification_at(project_root, attempt, crate::check_applicability::evaluation_time())
+    assess_current_verification_at(
+        project_root,
+        attempt,
+        crate::check_applicability::evaluation_time(),
+    )
 }
 
-pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model::Attempt, now: chrono::DateTime<chrono::Utc>) -> Result<VerificationAssessment> {
+pub fn assess_current_verification_at(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<VerificationAssessment> {
     let canonical = assess_canonical_checks_at(project_root, attempt, now)?;
     let output = attempt
         .tasks
@@ -1360,22 +1472,55 @@ pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model:
             Some(&results),
             Some(&canonical),
             &bindings,
+            &accepted_legacy_commands(project_root, attempt, now),
         )?,
         None => vec![],
     };
     let mut commands = Vec::new();
     for (index, check) in canonical.checks.iter().enumerate() {
         let mut supporting = bindings.clone();
-        if let work_model::RequiredCheckSource::CanonicalTester { manifest, logs, reconstruction, .. } = &check.source {
-            supporting.push(manifest.clone()); supporting.extend(logs.clone()); supporting.extend(reconstruction.clone());
+        supporting.extend(
+            canonical
+                .review_bindings
+                .get(&index)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        if let work_model::RequiredCheckSource::CanonicalTester {
+            manifest,
+            logs,
+            reconstruction,
+            ..
+        } = &check.source
+        {
+            supporting.push(manifest.clone());
+            supporting.extend(logs.clone());
+            supporting.extend(reconstruction.clone());
         }
         if canonical.accepted.contains(&index) {
-            if let Some(recovery) = attempt.evidence_recoveries.iter().rev().find(|recovery| recovery.required_check.as_ref() == Some(check)) {
-                supporting.push(work_model::BoundRecheckArtifact { path: recovery.attachment.snapshot_path.clone(), digest: recovery.attachment.digest.clone() });
+            if let Some(recovery) = attempt
+                .evidence_recoveries
+                .iter()
+                .rev()
+                .find(|recovery| recovery.required_check.as_ref() == Some(check))
+            {
+                supporting.push(work_model::BoundRecheckArtifact {
+                    path: recovery.attachment.snapshot_path.clone(),
+                    digest: recovery.attachment.digest.clone(),
+                });
                 for target in &recovery.targets {
-                    supporting.push(bound_recovery_artifact(project_root, &target.prior_review_artifact)?.0);
-                    if let Some(task) = attempt.tasks.iter().find(|task| target.review_task_id.as_deref() == Some(task.id.as_str())) {
-                        if let Some(path) = review_artifact_path(task) { supporting.push(bound_recovery_artifact(project_root, &path)?.0); }
+                    supporting.push(
+                        bound_recovery_artifact(project_root, &target.prior_review_artifact)?.0,
+                    );
+                    if let Some(task) = attempt
+                        .tasks
+                        .iter()
+                        .find(|task| target.review_task_id.as_deref() == Some(task.id.as_str()))
+                    {
+                        if let Some(path) = review_artifact_path(task) {
+                            supporting.push(bound_recovery_artifact(project_root, &path)?.0);
+                        }
                     }
                 }
             }
@@ -1406,9 +1551,12 @@ pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model:
             diagnostics: vec![defect.diagnostic.clone()],
         });
     }
-    for (index, blocker) in canonical.blockers.iter().enumerate() {
+    if !canonical.blockers.is_empty() {
         commands.push(RequirementAssessment {
-            id: format!("tester-binding:{}:{index}", bindings[0].digest),
+            id: format!(
+                "tester-binding:{}:{}:{}",
+                attempt.work_item_id, attempt.id, canonical.config_digest
+            ),
             source: bindings[0].path.clone(),
             meaning: None,
             check: None,
@@ -1420,16 +1568,27 @@ pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model:
                     .into(),
             ),
             bindings: bindings.clone(),
-            diagnostics: vec![blocker.clone()],
+            diagnostics: canonical.blockers.clone(),
         });
     }
     for reference in &mut references {
-        if let Some(ReferenceMeaning::Command { command, command_index, .. }) = &reference.meaning {
+        if let Some(ReferenceMeaning::Command {
+            command,
+            command_index,
+            ..
+        }) = &reference.meaning
+        {
             let matches = commands.iter().filter(|row| matches!(&row.meaning, Some(ReferenceMeaning::Command { command: actual, command_index: actual_index, .. }) if actual == command && command_index.is_none_or(|index| Some(index) == *actual_index))).collect::<Vec<_>>();
             if let [row] = matches.as_slice() {
                 reference.check = row.check.clone();
-                reference.bindings = row.bindings.clone();
-                if reference.satisfied { reference.owner = row.owner; }
+                for binding in &row.bindings {
+                    if !reference.bindings.contains(binding) {
+                        reference.bindings.push(binding.clone());
+                    }
+                }
+                if reference.satisfied {
+                    reference.owner = row.owner;
+                }
             }
         }
     }
@@ -1438,4 +1597,186 @@ pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model:
         references,
         commands,
     })
+}
+
+pub(crate) fn snapshot_path(work: &str, attempt: &str, digest: &str) -> Result<String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .context("invalid evidence digest")?;
+    Ok(format!(
+        ".fluent/work/artifacts/{work}/{attempt}/host-evidence/{hex}.json"
+    ))
+}
+
+pub const VERIFICATION_GATE_SCHEMA_VERSION: u32 = 5;
+
+/// Adapt the one supported legacy gate shape without depending on gate execution.
+pub(crate) fn requested_legacy_host_command(gate: &serde_json::Value) -> Option<String> {
+    let version = gate.get("schema_version")?.as_u64()?;
+    if version == 0
+        || version > u64::from(VERIFICATION_GATE_SCHEMA_VERSION)
+        || gate.get("phase")?.as_str()? != "final-tester"
+        || gate.get("disposition")?.as_str()? != "rejected"
+    {
+        return None;
+    }
+    let blocking = gate
+        .get("checks")?
+        .as_array()?
+        .iter()
+        .filter(|check| {
+            matches!(
+                check.get("status").and_then(|status| status.as_str()),
+                Some("failed" | "error")
+            )
+        })
+        .collect::<Vec<_>>();
+    let [check] = blocking.as_slice() else {
+        return None;
+    };
+    if check.get("name")?.as_str()? != "tester-reference-evidence"
+        || check.get("status")?.as_str()? != "failed"
+    {
+        return None;
+    }
+    let mut commands = check
+        .get("diagnostics")?
+        .as_array()?
+        .iter()
+        .filter_map(|diagnostic| {
+            let reference = references::parse_test_reference(
+                diagnostic
+                    .as_str()?
+                    .strip_prefix("no passing Tester result matches ")?,
+            )
+            .ok()?;
+            // Explicit commands name canonical occurrences; this adapter only
+            // preserves legacy commands checked outside the configured Tester.
+            if reference.declared.is_some() {
+                return None;
+            }
+            reference.command
+        })
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
+    let [command] = commands.as_slice() else {
+        return None;
+    };
+    Some(command.clone())
+}
+
+pub(crate) struct AcceptedCommandProof {
+    pub command: String,
+    bindings: Vec<work_model::BoundRecheckArtifact>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGateBinding {
+    schema_version: u32,
+    candidate_commit: String,
+    gate_artifact: work_model::BoundRecheckArtifact,
+    gate_evidence: serde_json::Value,
+    command: String,
+    working_directory: String,
+}
+
+pub(crate) fn accepted_legacy_gate_commands(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Vec<AcceptedCommandProof> {
+    let candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+    attempt
+        .evidence_recoveries
+        .iter()
+        .filter_map(|recovery| {
+            if recovery.state != EvidenceRecoveryState::Complete
+                || Some(recovery.candidate_commit.as_str()) != candidate
+                || recovery.required_check.is_some()
+            {
+                return None;
+            }
+            let [target] = recovery.targets.as_slice() else {
+                return None;
+            };
+            if target.role != "tests" {
+                return None;
+            }
+            let (source, bytes) =
+                bound_recovery_artifact(project_root, &target.prior_review_artifact).ok()?;
+            let binding: LegacyGateBinding = serde_json::from_slice(&bytes).ok()?;
+            if binding.schema_version != 1
+                || binding.candidate_commit != recovery.candidate_commit
+                || snapshot_path(&attempt.work_item_id, &attempt.id, &source.digest).ok()?
+                    != source.path
+                || binding.gate_evidence.get("candidate_commit")?.as_str()?
+                    != recovery.candidate_commit
+                || requested_legacy_host_command(&binding.gate_evidence).as_deref()
+                    != Some(binding.command.as_str())
+                || binding.working_directory != "."
+            {
+                return None;
+            }
+            let (attachment, bytes) =
+                bound_recovery_artifact(project_root, &recovery.attachment.snapshot_path).ok()?;
+            if attachment.digest != recovery.attachment.digest {
+                return None;
+            }
+            let evidence = parse_evidence_document(&bytes).ok()?;
+            if evidence.result != EvidenceResult::Pass
+                || evidence.check != binding.command
+                || evidence.working_directory != binding.working_directory
+            {
+                return None;
+            }
+            let review = attempt.tasks.iter().find(|task| {
+                Some(&task.id) == target.review_task_id.as_ref()
+                    && task.kind == TaskKind::Review
+                    && task.role == "tests"
+                    && task.status == TaskStatus::Complete
+                    && task
+                        .evidence_review_context
+                        .as_ref()
+                        .is_some_and(|context| {
+                            context.recovery_id == recovery.id
+                                && context.candidate_commit == recovery.candidate_commit
+                                && context.attachment == recovery.attachment
+                                && context.prior_review_artifact == target.prior_review_artifact
+                        })
+            })?;
+            let (review_source, bytes) =
+                bound_recovery_artifact(project_root, &review_artifact_path(review)?).ok()?;
+            if review::extract_verdict(std::str::from_utf8(&bytes).ok()?) != review::Verdict::Pass {
+                return None;
+            }
+            Some(AcceptedCommandProof {
+                command: binding.command,
+                bindings: vec![source, binding.gate_artifact, attachment, review_source],
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn accepted_legacy_commands(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<AcceptedCommandProof> {
+    let mut proofs = accepted_legacy_gate_commands(project_root, attempt);
+    proofs.extend(
+        accepted_review_check_results(project_root, attempt, now)
+            .into_iter()
+            .map(|result| AcceptedCommandProof {
+                command: result.command,
+                bindings: result.bindings,
+            }),
+    );
+    proofs
 }
