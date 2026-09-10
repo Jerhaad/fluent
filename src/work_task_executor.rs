@@ -5314,7 +5314,9 @@ fn current_verification_for_context(
         .strip_prefix(fluent.join("work/artifacts"))?
         .components()
         .collect::<Vec<_>>();
-    if parts.len() < 2 {
+    // Only a Task's own artifact directory identifies its Attempt. Temporary
+    // projects nested in a Tester run must not read the enclosing Work record.
+    if parts.len() != 3 {
         return Ok(None);
     }
     if let Err(error) = fs::symlink_metadata(
@@ -16367,6 +16369,12 @@ while time.monotonic() < deadline:
         let input_path = project_root.join(&item.input_artifacts[0].snapshot_path);
         let prior_review = project_root
             .join(".fluent/work/artifacts/work-1/attempt-0/attempt-0-review-tests/review.md");
+        fs::create_dir_all(prior_review.parent().unwrap()).unwrap();
+        fs::write(
+            &prior_review,
+            "Verdict: fail\n\n- [ ] Preserve the input evidence.\n",
+        )
+        .unwrap();
         let artifact_dir =
             project_root.join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
         let prompts = build_work_review_prompts(WorkReviewPromptInput {
@@ -16865,6 +16873,25 @@ while time.monotonic() < deadline:
     }
 
     #[test]
+    fn execution_context_ignores_enclosing_tester_artifacts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fluent = tmp.path().join(".fluent");
+        let items = fluent.join("work/items");
+        fs::create_dir_all(&items).unwrap();
+        fs::write(
+            items.join("enclosing.json"),
+            "unrelated enclosing Work record",
+        )
+        .unwrap();
+        let artifact_dir = fluent.join(
+            "work/artifacts/enclosing/attempt-1/attempt-1-tester/commands/settlement/0/fixture/context",
+        );
+        fs::create_dir_all(&artifact_dir).unwrap();
+        let current = current_verification_for_context(&artifact_dir, "candidate");
+        assert!(matches!(current, Ok(None)), "{current:?}");
+    }
+
+    #[test]
     fn execution_context_retains_unclassified_tester_history() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
@@ -17114,7 +17141,7 @@ while time.monotonic() < deadline:
         assert!(
             prompts
                 .review_prompt
-                .contains("failed configured Tester command")
+                .contains("Read the latest Tester correction evidence")
         );
         assert!(
             prompts
@@ -18659,6 +18686,34 @@ while time.monotonic() < deadline:
             });
             resolved.push(path);
         }
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: "base".into(),
+            candidate_commit: "candidate".into(),
+            tester_results_path: Some(relative_paths[1].into()),
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "tester-reference-evidence".into(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec!["Required test has no passing evidence".into()],
+                log_path: None,
+            }],
+        };
+        fs::write(&resolved[0], serde_json::to_vec_pretty(&gate).unwrap()).unwrap();
+        fs::write(
+            &resolved[1],
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "candidate_commit": "candidate",
+                "commands": [],
+                "tests": [],
+                "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
+                "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let mut item = review_item();
         let task_id = item.add_next_write_round("attempt-1", refs).unwrap();
 
@@ -19525,13 +19580,15 @@ while time.monotonic() < deadline:
             matrix.rows[1].id,
             format!(
                 "finding:candidate-gate:{}",
-                crate::review::finding_identity("candidate-gate", diagnostic)
+                crate::review::finding_identity("candidate-gate", "rejected:commit-metadata")
             )
         );
         assert_eq!(matrix.rows[1].source, gate_rel);
         assert_eq!(
             matrix.rows[1].requirement,
-            format!("Address candidate-gate review finding: {diagnostic}")
+            format!(
+                "Address candidate-gate review finding: commit-metadata check remains unresolved: {diagnostic}"
+            )
         );
         assert_eq!(
             matrix.rows[1].state,
@@ -19592,11 +19649,16 @@ while time.monotonic() < deadline:
             matrix.rows[1].kind,
             crate::work_model::WriterCompletionRequirementKind::Finding
         );
-        assert!(matrix.rows[1].id.starts_with("finding:tester:sha256:"));
+        assert!(
+            matrix.rows[1]
+                .id
+                .starts_with("finding:verification:sha256:")
+        );
+        assert_eq!(matrix.rows[1].source, tester_rel);
         assert!(
             matrix.rows[1]
                 .requirement
-                .contains("Configured Tester command 0 failed with exit code 101")
+                .contains("Historical Tester evidence needs diagnosis and candidate binding")
         );
         assert!(
             !matrix
