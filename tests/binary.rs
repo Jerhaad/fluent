@@ -40149,8 +40149,20 @@ fn canonical_evidence_fixture_with_extractor(
     applicability: serde_json::Value,
     extractor: Option<&str>,
 ) -> (PathBuf, String, PathBuf) {
+    canonical_evidence_fixture_with_sources(tmp, work, commands, applicability, extractor, &[])
+}
+
+fn canonical_evidence_fixture_with_sources(
+    tmp: &TempDir, work: &str, commands: &[&str], applicability: serde_json::Value,
+    extractor: Option<&str>, sources: &[(&str, &str)],
+) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::{TaskKind, TaskOutput, TaskStatus, WorkItem};
     let project = setup_git_project(tmp);
+    for (path, source) in sources {
+        fs::create_dir_all(project.join(path).parent().unwrap()).unwrap();
+        fs::write(project.join(path), source).unwrap();
+        git::run(&project, &["add", path], "stage native source").unwrap();
+    }
     if let Some(extractor) = extractor {
         fs::write(project.join(".fluent/extract-tester-results"), extractor).unwrap();
     }
@@ -43361,5 +43373,56 @@ fn plan_completed_acceptance_revalidates_bindings() {
             store.read_work_item(work).unwrap() == accepted,
             "obsolete proof changed history: {mutation}"
         );
+    }
+}
+
+#[test]
+fn verification_views_agree_on_current_requirements() {
+    use fluent::{candidate_gate::*, work_model::*};
+    for present in [true, false] {
+        let tmp = TempDir::new().unwrap();
+        let work = "verification-views";
+        // The command emits native TAP; the project extractor reads that exact log.
+        let command = if present { "printf 'ok tests/native.sh::stops\\n'" } else { "printf 'ok tests/native.sh::other\\n'" };
+        let extractor = r#"#!/usr/bin/env python3
+import json, pathlib, sys
+lines=(pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()
+print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness'} for line in lines if line.startswith('ok ')]))
+"#;
+        let (project, candidate, results) = canonical_evidence_fixture_with_sources(
+            &tmp, work, &[command], serde_json::json!({}), Some(extractor), &[("tests/native.sh", "#!/bin/sh\nstops() { true; }\n")]);
+        let store = WorkModelStore::new(&project);
+        let mut item = store.read_work_item(work).unwrap();
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap().clone();
+        let workspace = project.join(&output.workspace_path);
+        let contract = WriterCompletionContract { version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                responsibility: None, id: "behavior:native:b1".into(),
+                kind: WriterCompletionRequirementKind::Behavior, source: "behaviors.md#native:b1".into(),
+                requirement: "THE SYSTEM SHALL stop.".into(), command: None,
+                verification_refs: vec![r#"{"kind":"named-test","path":"tests/native.sh","name":"stops","description":"endpoint closes"}"#.into()],
+            }] };
+        item.attempts[0].writer_completion_contract = Some(contract.clone());
+        store.write_work_item(&item).unwrap();
+        let before = snapshot_tree(&project.join(".fluent/work"));
+        let assessment = fluent::verification_assessment::assess_current_verification(&project, &item.attempts[0]).unwrap();
+        assert_eq!(assessment.references[0].satisfied, present);
+        assert!(assessment.candidate_defects().is_empty());
+        let status = fluent::work_status::summarize_work_item(&item, Some(&project));
+        assert_eq!(status.recovery_blocker.is_some(), !present);
+        assert_eq!(snapshot_tree(&project.join(".fluent/work")), before, "current observation is read-only");
+        let gate = run_candidate_gate(CandidateGateRequest {
+            project_root: &project, workspace: &workspace, work_item_id: work, attempt_id: "attempt-1", task_id: None,
+            phase: CandidateGatePhase::FinalTester, base_commit: &candidate, candidate_commit: &candidate,
+            completion_contract: Some(&contract), allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None, tester_results_path: Some(&results), accepted_tester_commands: &[],
+            artifact_path: &project.join("gate.json"),
+        }).unwrap();
+        assert_eq!(gate.checks.iter().find(|check| check.name == "tester-reference-evidence").unwrap().status,
+            if present { CandidateCheckStatus::Passed } else { CandidateCheckStatus::Failed });
+        let (findings, context) = fluent::work_task_executor::verification_views_for_test(&project, &item.attempts[0], &workspace);
+        assert!(findings.is_empty(), "evidence gaps are not Writer defects: {findings:?}");
+        assert!(context["current-findings"].as_array().unwrap().is_empty());
+        assert_eq!(context["verification"]["references"][0]["satisfied"], present);
     }
 }

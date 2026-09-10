@@ -9238,6 +9238,10 @@ fn interpret_reviews(
             match evidence.disposition {
                 crate::candidate_gate::CandidateGateDisposition::Passed => {}
                 crate::candidate_gate::CandidateGateDisposition::Rejected => {
+                    let verification = crate::verification_assessment::assess_current_verification(project_root, &item.attempts[attempt_index]);
+                    if verification.as_ref().map_or(true, |view| view.candidate_defects().is_empty()) {
+                        return pause_candidate_gate_after_tester(project_root, store, &mut item, attempt_index, attempt_id, &artifact, &evidence);
+                    }
                     failed.extend(final_tester_correction_artifacts(
                         project_root,
                         &item.attempts[attempt_index],

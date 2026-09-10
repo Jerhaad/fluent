@@ -84,3 +84,6 @@ pub mod ownership_recovery;
 
 pub mod verification;
 pub(crate) mod verification_policy;
+
+pub mod verification_assessment;
+pub mod verification_reference;

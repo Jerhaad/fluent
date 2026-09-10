@@ -87,6 +87,8 @@ pub struct ProcessLeak {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::verification_reference::NativeTestIdentity>,
     pub id: String,
     pub test_harness: String,
     pub status: String,
@@ -1066,6 +1068,10 @@ fn extract_and_normalize(
         .into());
     }
     let mut tests = cap_failure_excerpts(tests);
+    for test in &mut tests {
+        let native = crate::verification_reference::normalize_native_identity(&test.id);
+        if test.identity.is_none() { test.identity = native; }
+    }
     tests.sort_by(|a, b| {
         a.test_harness
             .cmp(&b.test_harness)
@@ -2821,6 +2827,7 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
         };
         assert!(results.needs_failure_diagnosis());
         results.tests.push(TestResult {
+            identity: None,
             id: "assertion".into(),
             test_harness: "shell-harness".into(),
             status: "fail".into(),
