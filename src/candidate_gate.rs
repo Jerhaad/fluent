@@ -10,9 +10,7 @@ use std::path::Path;
 
 #[cfg(test)]
 use crate::verification_reference::*;
-use crate::work_model::{
-    CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract, WriterCompletionRequirementKind,
-};
+use crate::work_model::{CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract};
 
 pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 =
     crate::verification_assessment::VERIFICATION_GATE_SCHEMA_VERSION;
@@ -1779,18 +1777,6 @@ fn check_behavior_references(
         &accepted,
     )?;
     let mut source_diagnostics = Vec::new();
-    for requirement in contract
-        .requirements
-        .iter()
-        .filter(|row| row.kind == WriterCompletionRequirementKind::Behavior)
-    {
-        if requirement.verification_refs.is_empty() {
-            source_diagnostics.push(format!(
-                "{} has neither a Test: reference nor an Untestable: reason",
-                requirement.source
-            ));
-        }
-    }
     for row in &rows {
         if row.cause == Some(crate::verification_assessment::VerificationCause::CandidateDefect) {
             source_diagnostics.extend(row.diagnostics.clone());

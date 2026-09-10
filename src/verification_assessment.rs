@@ -1237,8 +1237,8 @@ impl VerificationAssessment {
     }
 }
 
-/// Evaluate one reference occurrence from immutable planning text. Result prose
-/// explains the row; only the approved row, occurrence and source digest name it.
+/// Evaluate reference occurrences and missing markers from immutable planning
+/// text. Result prose explains the row without assigning its identity.
 pub(crate) fn assess_references(
     workspace: &Path,
     work: &str,
@@ -1256,6 +1256,24 @@ pub(crate) fn assess_references(
         .iter()
         .filter(|row| row.kind == work_model::WriterCompletionRequirementKind::Behavior)
     {
+        if requirement.verification_refs.is_empty() {
+            rows.push(RequirementAssessment {
+                id: format!("reference:{work}:{attempt}:{}:missing", requirement.id),
+                source: requirement.source.clone(),
+                meaning: None,
+                check: None,
+                satisfied: false,
+                cause: Some(VerificationCause::UninterpretableEvidence),
+                owner: work_model::CompletionResponsibility::Tester,
+                next_action: Some("Inspect the approved behavior and establish its intended Test: reference or Untestable: reason; clarification recording is not available in this version.".into()),
+                bindings: bindings.to_vec(),
+                diagnostics: vec![format!(
+                    "{} has neither a Test: reference nor an Untestable: reason",
+                    requirement.source
+                )],
+            });
+            continue;
+        }
         for (index, text) in requirement.verification_refs.iter().enumerate() {
             if text
                 .strip_prefix("Untestable:")

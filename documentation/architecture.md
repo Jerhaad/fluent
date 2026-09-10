@@ -541,6 +541,9 @@ do not create obligations. The read-only result separates satisfaction, cause,
 owner, next action, and source bindings. Status uses nonmutating snapshots and
 bounded managed-file reads. An assessment records what was valid at its explicit
 evaluation time; execution boundaries must revalidate current applicability.
+A behavior with neither a `Test:` reference nor an `Untestable:` reason retains
+one unsatisfied row keyed to its approved requirement. Its missing meaning needs
+diagnosis before verification can proceed, including before the first Tester.
 Before a changed candidate has its first Tester, Writer requirements, context,
 and status use its pending assessment and retain earlier Tester failures only
 as history.

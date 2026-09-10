@@ -12810,8 +12810,9 @@ mod tests {
     #[test]
     fn reference_assessment_controls_writer_admission() {
         for (reference, source_defect) in [
-            (r#"{"kind":"unknown","path":"src/lib.rs"}"#, false),
-            ("src/missing.rs::required_behavior", true),
+            (None, false),
+            (Some(r#"{"kind":"unknown","path":"src/lib.rs"}"#), false),
+            (Some("src/missing.rs::required_behavior"), true),
         ] {
             let project = tempfile::tempdir().unwrap();
             let (store, _workspace) = make_candidate_gate_fixture(
@@ -12820,11 +12821,14 @@ mod tests {
                 None,
             );
             let mut item = store.read_work_item("work-1").unwrap();
+            let marker = reference
+                .map(|text| format!("Test: {text}\n"))
+                .unwrap_or_default();
             item.attempts[0].writer_completion_contract =
                 crate::work_model::WriterCompletionContract::from_planning_context(
                     &crate::work_model::PlanningContext {
                         behaviors: Some(format!(
-                            "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {reference}\n"
+                            "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\n{marker}"
                         )),
                         ..Default::default()
                     },
@@ -12835,7 +12839,28 @@ mod tests {
                 &item.attempts[0],
             )
             .unwrap();
+            assert_eq!(
+                view.references.len(),
+                1,
+                "a behavior without a marker remains unresolved"
+            );
+            assert_eq!(view.unresolved().count(), 1);
             assert_eq!(!view.candidate_defects().is_empty(), source_defect);
+            assert_eq!(
+                view.references[0].cause,
+                Some(if source_defect {
+                    crate::verification_assessment::VerificationCause::CandidateDefect
+                } else {
+                    crate::verification_assessment::VerificationCause::UninterpretableEvidence
+                })
+            );
+            if reference.is_none() {
+                assert!(view.references[0].diagnostics[0].contains("neither a Test:"));
+                assert_eq!(
+                    view.references[0].owner,
+                    crate::work_model::CompletionResponsibility::Tester
+                );
+            }
             let outcome =
                 gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0)
                     .unwrap()
@@ -12866,6 +12891,37 @@ mod tests {
                     "{handoff}"
                 );
                 assert!(handoff.contains(&view.candidate_commit), "{handoff}");
+            }
+            let saved = store.read_work_item("work-1").unwrap();
+            let status = crate::work_status::summarize_work_item(&saved, Some(project.path()));
+            assert_eq!(status.verification.as_ref(), Some(&view));
+            let task = saved.attempts[0]
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == TaskKind::Write)
+                .unwrap();
+            let findings =
+                crate::recovery_contracts::writer_completion_findings(project.path(), task)
+                    .unwrap();
+            assert_eq!(findings.len(), usize::from(source_defect), "{findings:?}");
+            #[cfg(feature = "test-support")]
+            {
+                let (context_findings, context) =
+                    crate::work_task_executor::verification_views_for_test(
+                        project.path(),
+                        &saved.attempts[0],
+                        _workspace.path(),
+                    );
+                assert_eq!(context_findings, findings);
+                assert_eq!(
+                    context["verification"],
+                    serde_json::to_value(&view).unwrap()
+                );
+                assert_eq!(
+                    context["current-findings"].as_array().unwrap().len(),
+                    findings.len()
+                );
             }
         }
     }
