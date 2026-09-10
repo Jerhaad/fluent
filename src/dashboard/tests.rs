@@ -86,7 +86,7 @@ fn dashboard_snapshot_is_nonmutating() {
 fn row(id: &str, action: &str) -> WorkItemStatus {
     WorkItemStatus {
         recovery_blocker: None,
-            verification: None,
+        verification: None,
         id: id.into(),
         title: format!("{id} title"),
         attempt: "attempt [running]".into(),

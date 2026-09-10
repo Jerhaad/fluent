@@ -148,7 +148,11 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
                     Ok(None) => None,
                 }
             });
-    let verification = attempt.and_then(|attempt| project_root.and_then(|root| crate::verification_assessment::assess_current_verification(root, attempt).ok()));
+    let verification = attempt.and_then(|attempt| {
+        project_root.and_then(|root| {
+            crate::verification_assessment::assess_current_verification(root, attempt).ok()
+        })
+    });
     WorkItemStatus {
         verification,
         recovery_blocker,
@@ -578,7 +582,16 @@ pub fn format_work_status(status: &WorkStatus) -> String {
             }
             if let Some(view) = &row.verification {
                 for requirement in view.references.iter().chain(&view.commands) {
-                    output.push_str(&format!("  Verification {}: {} ({:?})\n", requirement.id, if requirement.satisfied { "satisfied" } else { "outstanding" }, requirement.owner));
+                    output.push_str(&format!(
+                        "  Verification {}: {} ({:?})\n",
+                        requirement.id,
+                        if requirement.satisfied {
+                            "satisfied"
+                        } else {
+                            "outstanding"
+                        },
+                        requirement.owner
+                    ));
                 }
             }
             if let Some(reason) = &row.recovery_blocker {
@@ -642,7 +655,16 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
         ));
         if let Some(view) = &row.verification {
             for requirement in view.references.iter().chain(&view.commands) {
-                lines.push(format!("  Verification {}: {} ({:?})", requirement.id, if requirement.satisfied { "satisfied" } else { "outstanding" }, requirement.owner));
+                lines.push(format!(
+                    "  Verification {}: {} ({:?})",
+                    requirement.id,
+                    if requirement.satisfied {
+                        "satisfied"
+                    } else {
+                        "outstanding"
+                    },
+                    requirement.owner
+                ));
             }
         }
         if let Some(reason) = &row.recovery_blocker {

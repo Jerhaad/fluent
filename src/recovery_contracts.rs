@@ -1,12 +1,17 @@
 #[cfg(test)]
 use crate::verification_assessment::reconstruct_legacy_manifest;
-pub(crate) use crate::verification_assessment::{candidate_workspace_path,validate_managed_file_path,parse_evidence_document,review_artifact_path,bound_recovery_artifact,assess_canonical_checks,validate_check_applicability_at,validate_check_applicability,validate_check_applicability_in_workspace_at,validate_required_check_binding,expired_completed_review_recovery,completed_review_check_commands};
+pub(crate) use crate::verification_assessment::{
+    assess_canonical_checks, bound_recovery_artifact, candidate_workspace_path,
+    completed_review_check_commands, expired_completed_review_recovery, parse_evidence_document,
+    review_artifact_path, validate_check_applicability, validate_check_applicability_at,
+    validate_check_applicability_in_workspace_at, validate_managed_file_path,
+    validate_required_check_binding,
+};
 // Shared admission and completion contracts for recovery-bound Writers.
 //
 // This boundary is intentionally independent from the host-evidence producer
 // and task executor. Queue admission, direct execution, and host recovery all
 // consume the same immutable checks without introducing a module cycle.
-
 
 use anyhow::{Context, Result, bail};
 use chrono::DateTime;
@@ -1105,20 +1110,49 @@ pub(crate) fn writer_completion_findings(
     project_root: &Path,
     task: &Task,
 ) -> Result<Vec<WriterCompletionFinding>> {
-    let item = work_model::WorkModelStore::new(project_root).read_work_item_snapshot(&task.work_item_id).ok();
-    let assessment = item.as_ref().and_then(|item| item.attempts.iter().find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref()))
-        .filter(|attempt| attempt.tasks.iter().any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete))
-        .map(|attempt| crate::verification_assessment::assess_current_verification(project_root, attempt)).transpose()?;
-    for artifact in &task.input_artifacts { resolve_input_artifact_path(project_root, &artifact.path)?; }
-    findings_from_inputs(project_root, &task.input_artifacts, task.role != work_model::TESTER_HARNESS_REPAIR_ROLE, assessment.as_ref())
+    let item = work_model::WorkModelStore::new(project_root)
+        .read_work_item_snapshot(&task.work_item_id)
+        .ok();
+    let assessment =
+        item.as_ref()
+            .and_then(|item| {
+                item.attempts
+                    .iter()
+                    .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+            })
+            .filter(|attempt| {
+                attempt.tasks.iter().any(|task| {
+                    task.kind == TaskKind::Tester && task.status == TaskStatus::Complete
+                })
+            })
+            .map(|attempt| {
+                crate::verification_assessment::assess_current_verification(project_root, attempt)
+            })
+            .transpose()?;
+    for artifact in &task.input_artifacts {
+        resolve_input_artifact_path(project_root, &artifact.path)?;
+    }
+    findings_from_inputs(
+        project_root,
+        &task.input_artifacts,
+        task.role != work_model::TESTER_HARNESS_REPAIR_ROLE,
+        assessment.as_ref(),
+    )
 }
 
-pub(crate) fn findings_from_inputs(project_root: &Path, inputs: &[ArtifactRef], include_tester: bool, assessment: Option<&crate::verification_assessment::VerificationAssessment>) -> Result<Vec<WriterCompletionFinding>> {
+pub(crate) fn findings_from_inputs(
+    project_root: &Path,
+    inputs: &[ArtifactRef],
+    include_tester: bool,
+    assessment: Option<&crate::verification_assessment::VerificationAssessment>,
+) -> Result<Vec<WriterCompletionFinding>> {
     let mut findings = BTreeMap::new();
     // A Tester-harness repair is authorized by its explicit operator decision.
     // Its ordinary command failures are not product obligations for the scoped
     // repair and therefore do not enter this matrix.
-    if !include_tester { return Ok(vec![]); }
+    if !include_tester {
+        return Ok(vec![]);
+    }
     for artifact in inputs {
         let relative = Path::new(&artifact.path);
         let is_review = relative.file_name().is_some_and(|name| {
@@ -1127,7 +1161,11 @@ pub(crate) fn findings_from_inputs(project_root: &Path, inputs: &[ArtifactRef], 
         if !is_review {
             continue;
         }
-        let path = if Path::new(&artifact.path).is_absolute() { PathBuf::from(&artifact.path) } else { resolve_input_artifact_path(project_root, &artifact.path)? };
+        let path = if Path::new(&artifact.path).is_absolute() {
+            PathBuf::from(&artifact.path)
+        } else {
+            resolve_input_artifact_path(project_root, &artifact.path)?
+        };
         let source = fs::read_to_string(&path).with_context(|| {
             format!(
                 "read review findings for Writer completion matrix: {}",
@@ -1162,7 +1200,11 @@ pub(crate) fn findings_from_inputs(project_root: &Path, inputs: &[ArtifactRef], 
         if !is_candidate_gate {
             continue;
         }
-        let path = if Path::new(&artifact.path).is_absolute() { PathBuf::from(&artifact.path) } else { resolve_input_artifact_path(project_root, &artifact.path)? };
+        let path = if Path::new(&artifact.path).is_absolute() {
+            PathBuf::from(&artifact.path)
+        } else {
+            resolve_input_artifact_path(project_root, &artifact.path)?
+        };
         let source = fs::read(&path).with_context(|| {
             format!(
                 "read candidate gate findings for Writer completion matrix: {}",
@@ -1184,30 +1226,60 @@ pub(crate) fn findings_from_inputs(project_root: &Path, inputs: &[ArtifactRef], 
             .iter()
             .filter(|check| check.status == candidate_gate::CandidateCheckStatus::Failed)
         {
-            if check.name == "tester-reference-evidence" && assessment.is_some() { continue; }
+            if check.name == "tester-reference-evidence" && assessment.is_some() {
+                continue;
+            }
             let role = "candidate-gate";
-            let identity = review::finding_identity(role, &format!("{}:{}", evidence.candidate_commit, check.name));
-            findings.entry((role.to_string(), identity.clone())).or_insert(WriterCompletionFinding {
-                id: format!("finding:{role}:{identity}"), role: role.into(), source: artifact.path.clone(),
-                requirement: format!("{} check remains unresolved: {}", check.name, check.diagnostics.join("; ")),
-            });
+            let identity = review::finding_identity(
+                role,
+                &format!("{}:{}", evidence.candidate_commit, check.name),
+            );
+            findings
+                .entry((role.to_string(), identity.clone()))
+                .or_insert(WriterCompletionFinding {
+                    id: format!("finding:{role}:{identity}"),
+                    role: role.into(),
+                    source: artifact.path.clone(),
+                    requirement: format!(
+                        "{} check remains unresolved: {}",
+                        check.name,
+                        check.diagnostics.join("; ")
+                    ),
+                });
         }
     }
     if let Some(assessment) = assessment {
         for row in assessment.candidate_defects() {
             let role = "verification";
-            findings.entry((role.into(), row.id.clone())).or_insert(WriterCompletionFinding {
-                id: format!("finding:verification:{}", row.id), role: role.into(), source: row.source.clone(),
-                requirement: row.diagnostics.join("; "),
-            });
+            findings
+                .entry((role.into(), row.id.clone()))
+                .or_insert(WriterCompletionFinding {
+                    id: format!("finding:verification:{}", row.id),
+                    role: role.into(),
+                    source: row.source.clone(),
+                    requirement: row.diagnostics.join("; "),
+                });
         }
     } else {
-        for artifact in inputs.iter().filter(|artifact| artifact.path.ends_with("/tester-results.json")) {
+        for artifact in inputs
+            .iter()
+            .filter(|artifact| artifact.path.ends_with("/tester-results.json"))
+        {
             // Without bound current facts, keep one unknown source obligation.
             // A historical exit alone cannot identify a source correction.
-            let path = if Path::new(&artifact.path).is_absolute() { PathBuf::from(&artifact.path) } else { resolve_input_artifact_path(project_root, &artifact.path)? };
+            let path = if Path::new(&artifact.path).is_absolute() {
+                PathBuf::from(&artifact.path)
+            } else {
+                resolve_input_artifact_path(project_root, &artifact.path)?
+            };
             let results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&path)?)?;
-            if results.error.is_some() || results.commands.iter().any(|command| command.exit_code != 0) || results.tests.iter().any(|test| test.status == "fail") {
+            if results.error.is_some()
+                || results
+                    .commands
+                    .iter()
+                    .any(|command| command.exit_code != 0)
+                || results.tests.iter().any(|test| test.status == "fail")
+            {
                 let role = "verification";
                 let identity = review::finding_identity(role, &artifact.path);
                 findings.entry((role.into(), identity.clone())).or_insert(WriterCompletionFinding {
@@ -2489,8 +2561,6 @@ fn validate_code_change_review_and_evidence_binding(
 
 pub(crate) use crate::verification_assessment::snapshot_path;
 
-
-
 #[cfg(test)]
 mod tests {
     use super::{EvidenceResult, parse_evidence_document, validate_failed_evidence_snapshot};
@@ -2519,8 +2589,18 @@ mod tests {
                 "neutral recovery contracts must not depend on {caller}"
             );
         }
-        for caller in ["candidate_gate", "host_evidence", "lifecycle_recovery", "queue", "work_task_executor", "recovery_contracts"] {
-            assert!(!include_str!("verification_assessment.rs").contains(&format!("crate::{caller}::")), "verification assessment must stay below {caller}");
+        for caller in [
+            "candidate_gate",
+            "host_evidence",
+            "lifecycle_recovery",
+            "queue",
+            "work_task_executor",
+            "recovery_contracts",
+        ] {
+            assert!(
+                !include_str!("verification_assessment.rs").contains(&format!("crate::{caller}::")),
+                "verification assessment must stay below {caller}"
+            );
         }
     }
 
@@ -3060,13 +3140,40 @@ pub(crate) fn required_check_recovery_status(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<RequiredCheckRecoveryStatus>> {
-    if attempt.writer_completion_contract.is_some() && attempt.tasks.iter().any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete) {
-        let assessment = crate::verification_assessment::assess_current_verification(project_root, attempt)?;
-        let gaps = assessment.references.iter().filter(|row| !row.satisfied && row.cause != Some(crate::verification_assessment::VerificationCause::CandidateDefect)).collect::<Vec<_>>();
+    if attempt.writer_completion_contract.is_some()
+        && attempt
+            .tasks
+            .iter()
+            .any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+    {
+        let assessment =
+            crate::verification_assessment::assess_current_verification(project_root, attempt)?;
+        let gaps = assessment
+            .references
+            .iter()
+            .filter(|row| {
+                !row.satisfied
+                    && row.cause
+                        != Some(crate::verification_assessment::VerificationCause::CandidateDefect)
+            })
+            .collect::<Vec<_>>();
         if !gaps.is_empty() {
-            return Ok(Some(RequiredCheckRecoveryStatus { can_resume: false,
-                reason: gaps.iter().map(|row| format!("{}: {}. {}", row.id, row.diagnostics.join("; "), row.next_action.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("\n\n"),
-                next_action: None }));
+            return Ok(Some(RequiredCheckRecoveryStatus {
+                can_resume: false,
+                reason: gaps
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{}: {}. {}",
+                            row.id,
+                            row.diagnostics.join("; "),
+                            row.next_action.as_deref().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                next_action: None,
+            }));
         }
     }
     if let Some(expired) = inspect_expired_pending_evidence(project_root, attempt)? {
@@ -3225,11 +3332,20 @@ pub(crate) mod verification_tests {
     use crate::work_model::*;
     use std::os::unix::fs::PermissionsExt;
 
-    pub(crate) fn fixture(failed_test: bool) -> (tempfile::TempDir, WorkItem) { fixture_with_lifetime(failed_test, None) }
+    pub(crate) fn fixture(failed_test: bool) -> (tempfile::TempDir, WorkItem) {
+        fixture_with_lifetime(failed_test, None)
+    }
 
-    fn fixture_with_lifetime(failed_test: bool, lifetime: Option<u64>) -> (tempfile::TempDir, WorkItem) {
+    fn fixture_with_lifetime(
+        failed_test: bool,
+        lifetime: Option<u64>,
+    ) -> (tempfile::TempDir, WorkItem) {
         let root = tempfile::tempdir().unwrap();
-        for args in [&["init", "-q"][..], &["config", "user.email", "tests@example.test"], &["config", "user.name", "Tests"]] {
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "tests@example.test"],
+            &["config", "user.name", "Tests"],
+        ] {
             crate::git::run(root.path(), args, "prepare assessment fixture").unwrap();
         }
         fs::create_dir_all(root.path().join(".fluent")).unwrap();
@@ -3242,32 +3358,79 @@ pub(crate) mod verification_tests {
                 {"command":"sh -c false","test_harness":"shell-harness"}
             ]})).unwrap()).unwrap();
         }
-        let native = if failed_test { r#"[{"id":"tests/native.sh::broken","test_harness":"shell-harness","status":"fail","failure_excerpt":"assertion failed"}]"# } else { "[]" };
+        let native = if failed_test {
+            r#"[{"id":"tests/native.sh::broken","test_harness":"shell-harness","status":"fail","failure_excerpt":"assertion failed"}]"#
+        } else {
+            "[]"
+        };
         let extractor = root.path().join(".fluent/extract-tester-results");
-        fs::write(&extractor, format!("#!/bin/sh\nprintf '%s\\n' '{native}'\n")).unwrap();
+        fs::write(
+            &extractor,
+            format!("#!/bin/sh\nprintf '%s\\n' '{native}'\n"),
+        )
+        .unwrap();
         fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
         crate::git::run(root.path(), &["add", "."], "stage fixture").unwrap();
-        crate::git::run(root.path(), &["commit", "-qm", "Add fixture"], "commit fixture").unwrap();
-        let candidate = crate::git::run_stdout(root.path(), &["rev-parse", "HEAD"], "read candidate").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-qm", "Add fixture"],
+            "commit fixture",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(root.path(), &["rev-parse", "HEAD"], "read candidate").unwrap();
         let mut item = WorkItem::planned("verification", "Assess current evidence");
         item.add_initial_attempt("attempt-1").unwrap();
         let writer = &mut item.attempts[0].tasks[0];
         writer.status = TaskStatus::Complete;
-        writer.output = Some(TaskOutput { workspace_id: writer.workspace_access.writes[0].id.clone(), workspace_path: root.path().display().to_string(), source_branch: "candidate".into(), base_commit: Some(candidate.clone()), commit: candidate.clone(), no_change: None, learner_canonicalization: None });
+        writer.output = Some(TaskOutput {
+            workspace_id: writer.workspace_access.writes[0].id.clone(),
+            workspace_path: root.path().display().to_string(),
+            source_branch: "candidate".into(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate.clone(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
         item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
-        for task in item.attempts[0].tasks.iter_mut().filter(|task| task.kind == TaskKind::Review) { task.status = TaskStatus::Complete; }
+        for task in item.attempts[0]
+            .tasks
+            .iter_mut()
+            .filter(|task| task.kind == TaskKind::Review)
+        {
+            task.status = TaskStatus::Complete;
+        }
         let id = item.add_final_tester_task("attempt-1").unwrap();
-        let tester = item.attempts[0].tasks.iter_mut().find(|task| task.id == id).unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id)
+            .unwrap();
         tester.status = TaskStatus::Complete;
-        let area = root.path().join(&tester.artifact_area.as_ref().unwrap().path);
+        let area = root
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path);
         fs::create_dir_all(&area).unwrap();
-        crate::tester::run(root.path(), &area, true, &crate::content::ContentResolver::new(Some(root.path()))).unwrap();
+        crate::tester::run(
+            root.path(),
+            &area,
+            true,
+            &crate::content::ContentResolver::new(Some(root.path())),
+        )
+        .unwrap();
         crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
         item.attempts[0].writer_completion_contract = Some(WriterCompletionContract {
-            version: WRITER_COMPLETION_CONTRACT_VERSION, requirements: vec![WriterCompletionRequirement {
-                responsibility: None, id: "behavior:native:b1".into(), kind: WriterCompletionRequirementKind::Behavior,
-                source: "behaviors.md#native:b1".into(), requirement: "THE SYSTEM SHALL work.".into(), command: None,
-                verification_refs: vec![r#"{"kind":"named-test","path":"tests/native.sh","name":"missing"}"#.into()],
+            version: WRITER_COMPLETION_CONTRACT_VERSION,
+            requirements: vec![WriterCompletionRequirement {
+                responsibility: None,
+                id: "behavior:native:b1".into(),
+                kind: WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#native:b1".into(),
+                requirement: "THE SYSTEM SHALL work.".into(),
+                command: None,
+                verification_refs: vec![
+                    r#"{"kind":"named-test","path":"tests/native.sh","name":"missing"}"#.into(),
+                ],
             }],
         });
         (root, item)
@@ -3283,16 +3446,45 @@ pub(crate) mod verification_tests {
         let proof_path = format!("{area}/evidence.json");
         let proof = serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"authorized host","check":check.command,"working_directory":".","result":"pass","output":"passed","run_at":now_iso8601()})).unwrap();
         fs::write(root.join(&proof_path), &proof).unwrap();
-        let attachment = EvidenceAttachment { snapshot_path: proof_path, digest: crate::verification_policy::digest(&proof) };
-        let mut review = attempt.tasks.iter().find(|task| task.kind == TaskKind::Review).unwrap().clone();
+        let attachment = EvidenceAttachment {
+            snapshot_path: proof_path,
+            digest: crate::verification_policy::digest(&proof),
+        };
+        let mut review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Review)
+            .unwrap()
+            .clone();
         review.id = "accepted-tests-review".into();
         review.artifact_area.as_mut().unwrap().path = format!("{area}/review");
         fs::create_dir_all(root.join(format!("{area}/review"))).unwrap();
-        fs::write(root.join(format!("{area}/review/review.md")), "Verdict: pass\n").unwrap();
-        review.evidence_review_context = Some(EvidenceReviewContext { recovery_id: "accepted".into(), candidate_commit: check.candidate_commit.clone(), attachment: attachment.clone(), prior_review_artifact: prior.clone() });
-        attempt.evidence_recoveries.push(EvidenceRecovery { id: "accepted".into(), candidate_commit: check.candidate_commit.clone(), attachment,
-            targets: vec![EvidenceReviewTarget { role: "tests".into(), prior_review_artifact: prior, review_task_id: Some(review.id.clone()), review_digest: Some(crate::verification_policy::digest(b"Verdict: pass\n")) }],
-            state: EvidenceRecoveryState::Complete, created_at: now_iso8601(), required_check: Some(check), code_change_classification: None });
+        fs::write(
+            root.join(format!("{area}/review/review.md")),
+            "Verdict: pass\n",
+        )
+        .unwrap();
+        review.evidence_review_context = Some(EvidenceReviewContext {
+            recovery_id: "accepted".into(),
+            candidate_commit: check.candidate_commit.clone(),
+            attachment: attachment.clone(),
+            prior_review_artifact: prior.clone(),
+        });
+        attempt.evidence_recoveries.push(EvidenceRecovery {
+            id: "accepted".into(),
+            candidate_commit: check.candidate_commit.clone(),
+            attachment,
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".into(),
+                prior_review_artifact: prior,
+                review_task_id: Some(review.id.clone()),
+                review_digest: Some(crate::verification_policy::digest(b"Verdict: pass\n")),
+            }],
+            state: EvidenceRecoveryState::Complete,
+            created_at: now_iso8601(),
+            required_check: Some(check),
+            code_change_classification: None,
+        });
         attempt.tasks.push(review);
     }
 
@@ -3300,34 +3492,92 @@ pub(crate) mod verification_tests {
     fn accepted_evidence_survives_unrelated_failures_and_no_change_rounds() {
         let (root, mut item) = fixture(false);
         accept_first_check(root.path(), &mut item);
-        let path = assess_canonical_checks(root.path(), &item.attempts[0]).unwrap().results_path;
+        let path = assess_canonical_checks(root.path(), &item.attempts[0])
+            .unwrap()
+            .results_path;
         let original = fs::read(&path).unwrap();
         let first = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
         assert!(first.commands[0].satisfied);
         assert_eq!(first.commands[0].owner, CompletionResponsibility::Host);
         assert!(!first.commands[1].satisfied && !first.references[0].satisfied);
-        assert!(!first.commands[0].bindings.iter().all(|binding| binding.path.ends_with("tester-results.json")), "accepted evidence must expose its supporting proof bindings");
-        let mut later = item.attempts[0].tasks[0].clone(); later.id = "attempt-1-write-2".into();
+        assert!(
+            !first.commands[0]
+                .bindings
+                .iter()
+                .all(|binding| binding.path.ends_with("tester-results.json")),
+            "accepted evidence must expose its supporting proof bindings"
+        );
+        let mut later = item.attempts[0].tasks[0].clone();
+        later.id = "attempt-1-write-2".into();
         let area = work_artifact_path(&item.id, "attempt-1", &later.id);
         later.artifact_area.as_mut().unwrap().path = area.clone();
         let declaration = format!("{area}/no-change.json");
-        later.output.as_mut().unwrap().no_change = Some(NoChangeOutput { schema_version: 1, declaration_path: declaration.clone(), reason: "Evidence remains applicable".into(), verification: vec![NoChangeVerification { command: "true".into(), result: NoChangeVerificationResult::Pass }] });
+        later.output.as_mut().unwrap().no_change = Some(NoChangeOutput {
+            schema_version: 1,
+            declaration_path: declaration.clone(),
+            reason: "Evidence remains applicable".into(),
+            verification: vec![NoChangeVerification {
+                command: "true".into(),
+                result: NoChangeVerificationResult::Pass,
+            }],
+        });
         fs::create_dir_all(root.path().join(&area)).unwrap();
-        fs::write(root.path().join(declaration), serde_json::to_vec(&later.output.as_ref().unwrap().no_change).unwrap()).unwrap();
+        fs::write(
+            root.path().join(declaration),
+            serde_json::to_vec(&later.output.as_ref().unwrap().no_change).unwrap(),
+        )
+        .unwrap();
         item.attempts[0].tasks.push(later);
         let unchanged = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
         assert_eq!(first, unchanged);
         assert_eq!(fs::read(&path).unwrap(), original);
-        let attachment = &item.attempts[0].evidence_recoveries[0].attachment.snapshot_path;
+        let attachment = &item.attempts[0].evidence_recoveries[0]
+            .attachment
+            .snapshot_path;
         fs::write(root.path().join(attachment), "changed proof").unwrap();
-        assert!(!assess_current_verification(root.path(), &item.attempts[0]).unwrap().commands[0].satisfied);
+        assert!(
+            !assess_current_verification(root.path(), &item.attempts[0])
+                .unwrap()
+                .commands[0]
+                .satisfied
+        );
         assert_eq!(fs::read(path).unwrap(), original);
         let (live_root, mut live) = fixture_with_lifetime(false, Some(60));
         accept_first_check(live_root.path(), &mut live);
-        let document = parse_evidence_document(&fs::read(live_root.path().join(&live.attempts[0].evidence_recoveries[0].attachment.snapshot_path)).unwrap()).unwrap();
-        let issued = DateTime::parse_from_rfc3339(&document.run_at).unwrap().with_timezone(&chrono::Utc);
-        assert!(crate::verification_assessment::assess_current_verification_at(live_root.path(), &live.attempts[0], issued + chrono::TimeDelta::seconds(30)).unwrap().commands[0].satisfied);
-        assert!(!crate::verification_assessment::assess_current_verification_at(live_root.path(), &live.attempts[0], issued + chrono::TimeDelta::seconds(60)).unwrap().commands[0].satisfied);
+        let document = parse_evidence_document(
+            &fs::read(
+                live_root.path().join(
+                    &live.attempts[0].evidence_recoveries[0]
+                        .attachment
+                        .snapshot_path,
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let issued = DateTime::parse_from_rfc3339(&document.run_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(
+            crate::verification_assessment::assess_current_verification_at(
+                live_root.path(),
+                &live.attempts[0],
+                issued + chrono::TimeDelta::seconds(30)
+            )
+            .unwrap()
+            .commands[0]
+                .satisfied
+        );
+        assert!(
+            !crate::verification_assessment::assess_current_verification_at(
+                live_root.path(),
+                &live.attempts[0],
+                issued + chrono::TimeDelta::seconds(60)
+            )
+            .unwrap()
+            .commands[0]
+                .satisfied
+        );
     }
 
     #[test]
@@ -3335,44 +3585,108 @@ pub(crate) mod verification_tests {
         let (root, item) = fixture(true);
         let attempt = &item.attempts[0];
         let first = assess_current_verification(root.path(), attempt).unwrap();
-        let path = assess_canonical_checks(root.path(), attempt).unwrap().results_path;
-        let mut results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let path = assess_canonical_checks(root.path(), attempt)
+            .unwrap()
+            .results_path;
+        let mut results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         results.tests[0].failure_excerpt = Some("the same assertion, explained differently".into());
         fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
         let second = assess_current_verification(root.path(), attempt).unwrap();
-        let identities = |view: &crate::verification_assessment::VerificationAssessment| view.unresolved().map(|row| (row.id.clone(), row.cause.clone(), row.owner)).collect::<Vec<_>>();
+        let identities = |view: &crate::verification_assessment::VerificationAssessment| {
+            view.unresolved()
+                .map(|row| (row.id.clone(), row.cause.clone(), row.owner))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(identities(&first), identities(&second));
-        assert_eq!(first.references.len(), 1, "identity lists are diagnostics, not extra requirements");
+        assert_eq!(
+            first.references.len(),
+            1,
+            "identity lists are diagnostics, not extra requirements"
+        );
         results.summary.total += 1;
         fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
         let invalid = assess_current_verification(root.path(), attempt).unwrap();
         results.tests[0].failure_excerpt = Some("another explanation of the same facts".into());
         fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
-        assert_eq!(identities(&invalid), identities(&assess_current_verification(root.path(), attempt).unwrap()));
+        assert_eq!(
+            identities(&invalid),
+            identities(&assess_current_verification(root.path(), attempt).unwrap())
+        );
     }
 }
 
-
 /// Recheck current correction ownership before a saved or direct Writer starts.
-pub(crate) fn validate_verification_writer_start(project_root: &Path, attempt: &work_model::Attempt, task: &Task) -> Result<()> {
-    if task.role == work_model::TESTER_HARNESS_REPAIR_ROLE { return Ok(()); }
+pub(crate) fn validate_verification_writer_start(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    task: &Task,
+) -> Result<()> {
+    if task.role == work_model::TESTER_HARNESS_REPAIR_ROLE {
+        return Ok(());
+    }
     let mut verification_input = false;
-    let candidate = attempt.tasks.iter().rev().find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete).and_then(|task| task.output.as_ref()).map(|output| output.commit.as_str());
+    let candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
     for artifact in &task.input_artifacts {
-        if artifact.path.ends_with("/tester-results.json") { verification_input = true; }
+        if artifact.path.ends_with("/tester-results.json") {
+            verification_input = true;
+        }
         if artifact.path.ends_with("/candidate-gate.json") {
             let path = resolve_input_artifact_path(project_root, &artifact.path)?;
             let gate = candidate_gate::read_prior_writer_gate(&path).map_err(anyhow::Error::msg)?;
             verification_input = true;
-            if gate.phase != candidate_gate::CandidateGatePhase::FinalTester && Some(gate.candidate_commit.as_str()) == candidate && gate.checks.iter().any(|check| check.status == candidate_gate::CandidateCheckStatus::Failed && matches!(check.name.as_str(), "whitespace" | "commit-metadata" | "behavior-references" | "project-check")) { return Ok(()); }
+            if gate.phase != candidate_gate::CandidateGatePhase::FinalTester
+                && Some(gate.candidate_commit.as_str()) == candidate
+                && gate.checks.iter().any(|check| {
+                    check.status == candidate_gate::CandidateCheckStatus::Failed
+                        && matches!(
+                            check.name.as_str(),
+                            "whitespace"
+                                | "commit-metadata"
+                                | "behavior-references"
+                                | "project-check"
+                        )
+                })
+            {
+                return Ok(());
+            }
         }
         if artifact.path.ends_with("/review.md") {
-            let source = fs::read_to_string(resolve_input_artifact_path(project_root, &artifact.path)?)?;
-            if review::extract_verdict(&source) == review::Verdict::Fail && !review::open_finding_titles(&source).is_empty() { return Ok(()); }
+            let source =
+                fs::read_to_string(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            if review::extract_verdict(&source) == review::Verdict::Fail
+                && !review::open_finding_titles(&source).is_empty()
+            {
+                return Ok(());
+            }
         }
     }
-    if !verification_input { return Ok(()); }
-    let assessment = crate::verification_assessment::assess_current_verification(project_root, attempt).context("verification recovery needs current bound evidence before a corrective Writer")?;
-    anyhow::ensure!(!assessment.candidate_defects().is_empty(), "verification recovery must establish a candidate defect before a corrective Writer; inspect these requirements and their retained evidence: {}", assessment.unresolved().map(|row| format!("{}: {}", row.id, row.next_action.as_deref().unwrap_or("inspect evidence"))).collect::<Vec<_>>().join("; "));
+    if !verification_input {
+        return Ok(());
+    }
+    let assessment =
+        crate::verification_assessment::assess_current_verification(project_root, attempt)
+            .context(
+                "verification recovery needs current bound evidence before a corrective Writer",
+            )?;
+    anyhow::ensure!(
+        !assessment.candidate_defects().is_empty(),
+        "verification recovery must establish a candidate defect before a corrective Writer; inspect these requirements and their retained evidence: {}",
+        assessment
+            .unresolved()
+            .map(|row| format!(
+                "{}: {}",
+                row.id,
+                row.next_action.as_deref().unwrap_or("inspect evidence")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     Ok(())
 }

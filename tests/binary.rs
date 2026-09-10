@@ -40151,8 +40151,12 @@ fn canonical_evidence_fixture_with_extractor(
 }
 
 fn canonical_evidence_fixture_with_sources(
-    tmp: &TempDir, work: &str, commands: &[&str], applicability: serde_json::Value,
-    extractor: Option<&str>, sources: &[(&str, &str)],
+    tmp: &TempDir,
+    work: &str,
+    commands: &[&str],
+    applicability: serde_json::Value,
+    extractor: Option<&str>,
+    sources: &[(&str, &str)],
 ) -> (PathBuf, String, PathBuf) {
     use fluent::work_model::{TaskKind, TaskOutput, TaskStatus, WorkItem};
     let project = setup_git_project(tmp);
@@ -43381,14 +43385,24 @@ fn verification_views_agree_on_current_requirements() {
         let tmp = TempDir::new().unwrap();
         let work = "verification-views";
         // The command emits native TAP; the project extractor reads that exact log.
-        let command = if present { "printf 'ok tests/native.sh::stops\\n'" } else { "printf 'ok tests/native.sh::other\\n'" };
+        let command = if present {
+            "printf 'ok tests/native.sh::stops\\n'"
+        } else {
+            "printf 'ok tests/native.sh::other\\n'"
+        };
         let extractor = r#"#!/usr/bin/env python3
 import json, pathlib, sys
 lines=(pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()
 print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness'} for line in lines if line.startswith('ok ')]))
 "#;
         let (project, candidate, results) = canonical_evidence_fixture_with_sources(
-            &tmp, work, &[command], serde_json::json!({}), Some(extractor), &[("tests/native.sh", "#!/bin/sh\nstops() { true; }\n")]);
+            &tmp,
+            work,
+            &[command],
+            serde_json::json!({}),
+            Some(extractor),
+            &[("tests/native.sh", "#!/bin/sh\nstops() { true; }\n")],
+        );
         let store = WorkModelStore::new(&project);
         let mut item = store.read_work_item(work).unwrap();
         let output = item.attempts[0].tasks[0].output.as_ref().unwrap().clone();
@@ -43403,34 +43417,93 @@ print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness
         item.attempts[0].writer_completion_contract = Some(contract.clone());
         store.write_work_item(&item).unwrap();
         let before = snapshot_tree(&project.join(".fluent/work"));
-        let assessment = fluent::verification_assessment::assess_current_verification(&project, &item.attempts[0]).unwrap();
+        let assessment = fluent::verification_assessment::assess_current_verification(
+            &project,
+            &item.attempts[0],
+        )
+        .unwrap();
         assert_eq!(assessment.references[0].satisfied, present);
         assert!(assessment.candidate_defects().is_empty());
         let status = fluent::work_status::summarize_work_item(&item, Some(&project));
         assert_eq!(status.recovery_blocker.is_some(), !present);
-        assert_eq!(status.verification.as_ref().unwrap().references, assessment.references);
-        assert_eq!(snapshot_tree(&project.join(".fluent/work")), before, "current observation is read-only");
+        assert_eq!(
+            status.verification.as_ref().unwrap().references,
+            assessment.references
+        );
+        assert_eq!(
+            snapshot_tree(&project.join(".fluent/work")),
+            before,
+            "current observation is read-only"
+        );
         let gate = run_candidate_gate(CandidateGateRequest {
-            project_root: &project, workspace: &workspace, work_item_id: work, attempt_id: "attempt-1", task_id: None,
-            phase: CandidateGatePhase::FinalTester, base_commit: &candidate, candidate_commit: &candidate,
-            completion_contract: Some(&contract), allow_tree_identical_metadata_rewrite: false,
-            metadata_rewrite_authorization: None, tester_results_path: Some(&results), accepted_tester_commands: &[],
+            project_root: &project,
+            workspace: &workspace,
+            work_item_id: work,
+            attempt_id: "attempt-1",
+            task_id: None,
+            phase: CandidateGatePhase::FinalTester,
+            base_commit: &candidate,
+            candidate_commit: &candidate,
+            completion_contract: Some(&contract),
+            allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
+            tester_results_path: Some(&results),
+            accepted_tester_commands: &[],
             artifact_path: &project.join("gate.json"),
-        }).unwrap();
-        assert_eq!(gate.checks.iter().find(|check| check.name == "tester-reference-evidence").unwrap().status,
-            if present { CandidateCheckStatus::Passed } else { CandidateCheckStatus::Failed });
-        let (findings, context) = fluent::work_task_executor::verification_views_for_test(&project, &item.attempts[0], &workspace);
-        assert!(findings.is_empty(), "evidence gaps are not Writer defects: {findings:?}");
+        })
+        .unwrap();
+        assert_eq!(
+            gate.checks
+                .iter()
+                .find(|check| check.name == "tester-reference-evidence")
+                .unwrap()
+                .status,
+            if present {
+                CandidateCheckStatus::Passed
+            } else {
+                CandidateCheckStatus::Failed
+            }
+        );
+        let (findings, context) = fluent::work_task_executor::verification_views_for_test(
+            &project,
+            &item.attempts[0],
+            &workspace,
+        );
+        assert!(
+            findings.is_empty(),
+            "evidence gaps are not Writer defects: {findings:?}"
+        );
         assert!(context["current-findings"].as_array().unwrap().is_empty());
-        assert_eq!(context["verification"]["references"][0]["satisfied"], present);
+        assert_eq!(
+            context["verification"]["references"][0]["satisfied"],
+            present
+        );
     }
 }
 
 fn verification_old_reader() -> PathBuf {
-    let binary = PathBuf::from(std::env::var_os("FLUENT_VERIFICATION_OLD_BIN").expect("build tests/fixtures/build-verification-old-reader.sh before this selection"));
-    let identity = read_json_path(&binary.parent().unwrap().parent().unwrap().parent().unwrap().join("identity.json"));
-    assert_eq!(identity["source_commit"], "0b769cb4681aade324f0cee351832a94f8e72687");
-    assert_eq!(identity["binary_sha256"], format!("{:x}", Sha256::digest(fs::read(&binary).unwrap())));
+    let binary = PathBuf::from(
+        std::env::var_os("FLUENT_VERIFICATION_OLD_BIN")
+            .expect("build tests/fixtures/build-verification-old-reader.sh before this selection"),
+    );
+    let identity = read_json_path(
+        &binary
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("identity.json"),
+    );
+    assert_eq!(
+        identity["source_commit"],
+        "0b769cb4681aade324f0cee351832a94f8e72687"
+    );
+    assert_eq!(
+        identity["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
     binary
 }
 
@@ -43453,7 +43526,8 @@ fn verification_contract_old_reader_refuses_published_records() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let store = WorkModelStore::new(&project);
-    let mut item = fluent::work_model::WorkItem::planned("verification-reader", "Keep explicit meaning");
+    let mut item =
+        fluent::work_model::WorkItem::planned("verification-reader", "Keep explicit meaning");
     add_verification_contract(&mut item);
     store.create_work_item(&item).unwrap();
     let work_root = project.join(".fluent/work");
@@ -43462,22 +43536,48 @@ fn verification_contract_old_reader_refuses_published_records() {
     let record = read_json_path(&record_path);
     for fence in ["outer", "record", "contract"] {
         let mut current = record.clone();
-        if fence != "outer" { current["model_writer_version"]["schema_version"] = serde_json::json!(1); }
+        if fence != "outer" {
+            current["model_writer_version"]["schema_version"] = serde_json::json!(1);
+        }
         if fence == "contract" {
             current["schema_version"] = serde_json::json!(3);
-            let mut attempt = read_json_path(&attempt_path); attempt["schema_version"] = serde_json::json!(3); write_json_path(&attempt_path, &attempt);
+            let mut attempt = read_json_path(&attempt_path);
+            attempt["schema_version"] = serde_json::json!(3);
+            write_json_path(&attempt_path, &attempt);
         }
         write_json_path(&record_path, &current);
         let before = snapshot_tree(&work_root);
-        let output = Command::new(&binary).current_dir(&project).env("FLUENT_NO_UPDATE_CHECK", "1")
-            .args(["work-item", "upgrade", "verification-reader"]).output().unwrap();
-        assert!(!output.status.success(), "{fence} fence allowed old mutation: {}", String::from_utf8_lossy(&output.stdout));
-        assert_eq!(snapshot_tree(&work_root), before, "{fence} fence must preserve bytes and entries");
+        let output = Command::new(&binary)
+            .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args(["work-item", "upgrade", "verification-reader"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{fence} fence allowed old mutation: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            snapshot_tree(&work_root),
+            before,
+            "{fence} fence must preserve bytes and entries"
+        );
     }
-    let mut current = store.read_work_item_snapshot("verification-reader").unwrap();
+    let mut current = store
+        .read_work_item_snapshot("verification-reader")
+        .unwrap();
     let contract = current.attempts[0].writer_completion_contract.clone();
-    current.title = "Preserve the new contract".into(); store.write_work_item(&current).unwrap();
-    assert_eq!(store.read_work_item_snapshot("verification-reader").unwrap().attempts[0].writer_completion_contract, contract);
+    current.title = "Preserve the new contract".into();
+    store.write_work_item(&current).unwrap();
+    assert_eq!(
+        store
+            .read_work_item_snapshot("verification-reader")
+            .unwrap()
+            .attempts[0]
+            .writer_completion_contract,
+        contract
+    );
 }
 
 #[test]
@@ -43486,29 +43586,48 @@ fn verification_contract_old_reader_refuses_interrupted_transaction() {
     let tmp = TempDir::new().unwrap();
     let project = setup_git_project(&tmp);
     let store = WorkModelStore::new(&project);
-    let item = fluent::work_model::WorkItem::planned("verification-transaction", "Preserve transaction");
+    let item =
+        fluent::work_model::WorkItem::planned("verification-transaction", "Preserve transaction");
     store.create_work_item(&item).unwrap();
     let mut item = store.read_work_item("verification-transaction").unwrap();
     add_verification_contract(&mut item);
     let blocker = project.join(".fluent/work/tasks/verification-transaction/attempt-1");
     fs::create_dir_all(blocker.parent().unwrap()).unwrap();
     fs::write(&blocker, "interrupt child publication").unwrap();
-    assert!(store.write_work_item(&item).is_err(), "fixture must interrupt a real aggregate write");
+    assert!(
+        store.write_work_item(&item).is_err(),
+        "fixture must interrupt a real aggregate write"
+    );
     let journal_path = project.join(".fluent/work/transactions/verification-transaction.json");
     let journal = read_json_path(&journal_path);
-    let journal_item: fluent::work_model::WorkItem = serde_json::from_value(journal["work_item"].clone()).unwrap();
-    assert_eq!(journal_item.attempts[0].writer_completion_contract, item.attempts[0].writer_completion_contract);
+    let journal_item: fluent::work_model::WorkItem =
+        serde_json::from_value(journal["work_item"].clone()).unwrap();
+    assert_eq!(
+        journal_item.attempts[0].writer_completion_contract,
+        item.attempts[0].writer_completion_contract
+    );
     for inner in [false, true] {
-        if inner { let mut journal = journal.clone(); journal["schema_version"] = serde_json::json!(2); write_json_path(&journal_path, &journal); }
+        if inner {
+            let mut journal = journal.clone();
+            journal["schema_version"] = serde_json::json!(2);
+            write_json_path(&journal_path, &journal);
+        }
         let before = snapshot_tree(&project.join(".fluent/work"));
-        let output = Command::new(&binary).current_dir(&project).env("FLUENT_NO_UPDATE_CHECK", "1")
-            .args(["work-item", "upgrade", "verification-transaction"]).output().unwrap();
+        let output = Command::new(&binary)
+            .current_dir(&project)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args(["work-item", "upgrade", "verification-transaction"])
+            .output()
+            .unwrap();
         assert!(!output.status.success());
         assert_eq!(snapshot_tree(&project.join(".fluent/work")), before);
     }
     fs::remove_file(blocker).unwrap();
     let recovered = store.read_work_item("verification-transaction").unwrap();
-    assert_eq!(recovered.attempts[0].writer_completion_contract, item.attempts[0].writer_completion_contract);
+    assert_eq!(
+        recovered.attempts[0].writer_completion_contract,
+        item.attempts[0].writer_completion_contract
+    );
     assert!(!journal_path.exists());
 }
 
@@ -43519,18 +43638,39 @@ fn verification_contract_legacy_snapshots_preserve_history() {
     let store = WorkModelStore::new(&project);
     let mut item = fluent::work_model::WorkItem::planned("legacy-verification", "Retain history");
     add_verification_contract(&mut item);
-    let contract = item.attempts[0].writer_completion_contract.as_mut().unwrap();
-    contract.version = 1; contract.requirements[0].verification_refs = vec!["tests/native.sh (coverage description)".into()];
+    let contract = item.attempts[0]
+        .writer_completion_contract
+        .as_mut()
+        .unwrap();
+    contract.version = 1;
+    contract.requirements[0].verification_refs =
+        vec!["tests/native.sh (coverage description)".into()];
     store.create_work_item(&item).unwrap();
     let root = project.join(".fluent/work");
     let record_path = root.join("items/legacy-verification.json");
     let attempt_path = root.join("attempts/legacy-verification/attempt-1.json");
-    let mut record = read_json_path(&record_path); record["schema_version"] = serde_json::json!(3); record["model_writer_version"]["schema_version"] = serde_json::json!(1); write_json_path(&record_path, &record);
-    let mut attempt = read_json_path(&attempt_path); attempt["schema_version"] = serde_json::json!(3); write_json_path(&attempt_path, &attempt);
-    let history = root.join("artifacts/legacy-verification/history.json"); fs::create_dir_all(history.parent().unwrap()).unwrap(); fs::write(&history, b"{\"result\":\"fail\",\"original\":true}\n").unwrap();
+    let mut record = read_json_path(&record_path);
+    record["schema_version"] = serde_json::json!(3);
+    record["model_writer_version"]["schema_version"] = serde_json::json!(1);
+    write_json_path(&record_path, &record);
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["schema_version"] = serde_json::json!(3);
+    write_json_path(&attempt_path, &attempt);
+    let history = root.join("artifacts/legacy-verification/history.json");
+    fs::create_dir_all(history.parent().unwrap()).unwrap();
+    fs::write(&history, b"{\"result\":\"fail\",\"original\":true}\n").unwrap();
     let before = snapshot_tree(&root);
-    let observed = store.read_work_item_snapshot("legacy-verification").unwrap();
-    assert_eq!(observed.attempts[0].writer_completion_contract, item.attempts[0].writer_completion_contract);
-    fluent_cmd().current_dir(&project).args(["work-item", "show", "legacy-verification"]).assert().success();
+    let observed = store
+        .read_work_item_snapshot("legacy-verification")
+        .unwrap();
+    assert_eq!(
+        observed.attempts[0].writer_completion_contract,
+        item.attempts[0].writer_completion_contract
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["work-item", "show", "legacy-verification"])
+        .assert()
+        .success();
     assert_eq!(snapshot_tree(&root), before);
 }

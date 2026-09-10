@@ -5181,11 +5181,41 @@ fn write_execution_context_with_finding_policy(
         .map(|step| truncate_utf8(step, 500))
         .collect::<Vec<_>>();
     let current = current_verification_for_context(artifact_dir, candidate_commit)?;
-    let root = current.as_ref().map(|(root, _)| root.as_path()).unwrap_or(workspace);
-    let inputs = input_artifacts.iter().map(|path| ArtifactRef { producer_id: String::new(), path: std::path::absolute(path).unwrap_or_else(|_| path.clone()).display().to_string() }).collect::<Vec<_>>();
-    let current_findings = crate::recovery_contracts::findings_from_inputs(root, &inputs, include_tester_findings, current.as_ref().map(|(_, view)| view))?.into_iter().map(|finding| ExecutionContextFinding {
-        identity: finding.id.strip_prefix(&format!("finding:{}:", finding.role)).unwrap_or(&finding.id).to_string(), role: finding.role, title: truncate_utf8(&finding.requirement, EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES), artifact: finding.source,
-    }).collect();
+    let root = current
+        .as_ref()
+        .map(|(root, _)| root.as_path())
+        .unwrap_or(workspace);
+    let inputs = input_artifacts
+        .iter()
+        .map(|path| ArtifactRef {
+            producer_id: String::new(),
+            path: std::path::absolute(path)
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string(),
+        })
+        .collect::<Vec<_>>();
+    let current_findings = crate::recovery_contracts::findings_from_inputs(
+        root,
+        &inputs,
+        include_tester_findings,
+        current.as_ref().map(|(_, view)| view),
+    )?
+    .into_iter()
+    .map(|finding| ExecutionContextFinding {
+        identity: finding
+            .id
+            .strip_prefix(&format!("finding:{}:", finding.role))
+            .unwrap_or(&finding.id)
+            .to_string(),
+        role: finding.role,
+        title: truncate_utf8(
+            &finding.requirement,
+            EXECUTION_CONTEXT_MAX_FINDING_TITLE_BYTES,
+        ),
+        artifact: finding.source,
+    })
+    .collect();
     let verification = current.map(|(_, view)| view);
     let (passing_evidence, executed_commands) =
         execution_context_evidence(input_artifacts, candidate_commit);
@@ -5264,28 +5294,86 @@ fn bounded_execution_context_json(context: &mut ExecutionContextV1) -> Result<St
     }
 }
 
-fn current_verification_for_context(artifact_dir: &Path, candidate: &str) -> Result<Option<(PathBuf, crate::verification_assessment::VerificationAssessment)>> {
-    let Some(fluent) = artifact_dir.ancestors().find(|path| path.file_name().is_some_and(|name| name == ".fluent")) else { return Ok(None); };
+fn current_verification_for_context(
+    artifact_dir: &Path,
+    candidate: &str,
+) -> Result<
+    Option<(
+        PathBuf,
+        crate::verification_assessment::VerificationAssessment,
+    )>,
+> {
+    let Some(fluent) = artifact_dir
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == ".fluent"))
+    else {
+        return Ok(None);
+    };
     let root = fluent.parent().context("missing project root")?;
-    let parts = artifact_dir.strip_prefix(fluent.join("work/artifacts"))?.components().collect::<Vec<_>>();
-    if parts.len() < 2 { return Ok(None); }
-    if let Err(error) = fs::symlink_metadata(root.join(".fluent/work/items").join(format!("{}.json", parts[0].as_os_str().to_string_lossy()))) {
-        if error.kind() == std::io::ErrorKind::NotFound { return Ok(None); }
+    let parts = artifact_dir
+        .strip_prefix(fluent.join("work/artifacts"))?
+        .components()
+        .collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return Ok(None);
+    }
+    if let Err(error) = fs::symlink_metadata(
+        root.join(".fluent/work/items")
+            .join(format!("{}.json", parts[0].as_os_str().to_string_lossy())),
+    ) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
         return Err(error.into());
     }
-    let item = crate::work_model::WorkModelStore::new(root).read_work_item_snapshot(&parts[0].as_os_str().to_string_lossy())?;
-    let attempt = item.attempts.iter().find(|attempt| attempt.id == parts[1].as_os_str().to_string_lossy()).context("missing context Attempt")?;
-    if !attempt.tasks.iter().any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete && task.review_context.as_ref().is_some_and(|context| context.candidate_commit == candidate)) { return Ok(None); }
-    Ok(Some((root.into(), crate::verification_assessment::assess_current_verification(root, attempt)?)))
+    let item = crate::work_model::WorkModelStore::new(root)
+        .read_work_item_snapshot(&parts[0].as_os_str().to_string_lossy())?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == parts[1].as_os_str().to_string_lossy())
+        .context("missing context Attempt")?;
+    if !attempt.tasks.iter().any(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && task
+                .review_context
+                .as_ref()
+                .is_some_and(|context| context.candidate_commit == candidate)
+    }) {
+        return Ok(None);
+    }
+    Ok(Some((
+        root.into(),
+        crate::verification_assessment::assess_current_verification(root, attempt)?,
+    )))
 }
 
 #[cfg(feature = "test-support")]
-pub fn verification_views_for_test(project_root: &Path, attempt: &crate::work_model::Attempt, workspace: &Path) -> (Vec<crate::work_model::WriterCompletionFinding>, serde_json::Value) {
+pub fn verification_views_for_test(
+    project_root: &Path,
+    attempt: &crate::work_model::Attempt,
+    workspace: &Path,
+) -> (
+    Vec<crate::work_model::WriterCompletionFinding>,
+    serde_json::Value,
+) {
     let task = &attempt.tasks[0];
     let findings = writer_completion_findings(project_root, task).unwrap();
-    let path = write_execution_context(&project_root.join(&task.artifact_area.as_ref().unwrap().path), workspace,
-        &task.output.as_ref().unwrap().commit, None, &[], &[], None).unwrap();
-    (findings, serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+    let path = write_execution_context(
+        &project_root.join(&task.artifact_area.as_ref().unwrap().path),
+        workspace,
+        &task.output.as_ref().unwrap().commit,
+        None,
+        &[],
+        &[],
+        None,
+    )
+    .unwrap();
+    (
+        findings,
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+    )
 }
 
 fn execution_context_evidence(
@@ -16804,8 +16892,15 @@ while time.monotonic() < deadline:
 
         assert_eq!(context.current_findings.len(), 1);
         assert_eq!(context.current_findings[0].role, "verification");
-        assert!(context.current_findings[0].title.contains("needs diagnosis"));
-        assert_eq!(context.current_findings[0].artifact, tester_results.display().to_string());
+        assert!(
+            context.current_findings[0]
+                .title
+                .contains("needs diagnosis")
+        );
+        assert_eq!(
+            context.current_findings[0].artifact,
+            tester_results.display().to_string()
+        );
         assert_eq!(context.executed_commands.len(), 3);
     }
 

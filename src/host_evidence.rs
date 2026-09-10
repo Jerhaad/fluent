@@ -3952,7 +3952,9 @@ pub(crate) fn completed_candidate_gate_evidence_commands(
     attempt: &work_model::Attempt,
 ) -> Vec<String> {
     crate::verification_assessment::accepted_legacy_gate_commands(project_root, attempt)
-        .into_iter().map(|proof| proof.command).collect()
+        .into_iter()
+        .map(|proof| proof.command)
+        .collect()
 }
 
 /// Resolve focused Tests Review commands whose candidate-bound host evidence
@@ -5502,29 +5504,60 @@ mod tests {
         let contract = work_model::WriterCompletionContract {
             version: work_model::WRITER_COMPLETION_CONTRACT_VERSION,
             requirements: vec![work_model::WriterCompletionRequirement {
-                responsibility: None, id: "behavior:host:b1".into(),
+                responsibility: None,
+                id: "behavior:host:b1".into(),
                 kind: work_model::WriterCompletionRequirementKind::Behavior,
-                source: "behaviors.md#host:b1".into(), requirement: "Check readiness".into(),
-                verification_refs: vec![command.into()], command: None,
+                source: "behaviors.md#host:b1".into(),
+                requirement: "Check readiness".into(),
+                verification_refs: vec![command.into()],
+                command: None,
             }],
         };
         let results_path = project.path().join("tester-results.json");
-        fs::write(&results_path, serde_json::to_vec(&serde_json::json!({
-            "candidate_commit": candidate, "commands": [], "tests": [],
-            "summary": {"total":0,"pass":0,"fail":0,"skipped":0}, "error": null
-        })).unwrap()).unwrap();
-        let run_gate = || crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
-            project_root: project.path(), workspace: workspace.path(), work_item_id: "work-1", attempt_id: "attempt-1",
-            task_id: None, phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
-            base_commit: &passed_gate.base_commit, candidate_commit: &candidate, completion_contract: Some(&contract),
-            allow_tree_identical_metadata_rewrite: false, metadata_rewrite_authorization: None,
-            tester_results_path: Some(&results_path), accepted_tester_commands: &[], artifact_path: &project.path().join("recheck-gate.json"),
-        }).unwrap().checks.into_iter().find(|check| check.name == "tester-reference-evidence").unwrap().status;
-        assert_eq!(run_gate(), crate::candidate_gate::CandidateCheckStatus::Passed);
+        fs::write(
+            &results_path,
+            serde_json::to_vec(&serde_json::json!({
+                "candidate_commit": candidate, "commands": [], "tests": [],
+                "summary": {"total":0,"pass":0,"fail":0,"skipped":0}, "error": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let run_gate = || {
+            crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
+                project_root: project.path(),
+                workspace: workspace.path(),
+                work_item_id: "work-1",
+                attempt_id: "attempt-1",
+                task_id: None,
+                phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                base_commit: &passed_gate.base_commit,
+                candidate_commit: &candidate,
+                completion_contract: Some(&contract),
+                allow_tree_identical_metadata_rewrite: false,
+                metadata_rewrite_authorization: None,
+                tester_results_path: Some(&results_path),
+                accepted_tester_commands: &[],
+                artifact_path: &project.path().join("recheck-gate.json"),
+            })
+            .unwrap()
+            .checks
+            .into_iter()
+            .find(|check| check.name == "tester-reference-evidence")
+            .unwrap()
+            .status
+        };
+        assert_eq!(
+            run_gate(),
+            crate::candidate_gate::CandidateCheckStatus::Passed
+        );
         let snapshot = project.path().join(&recovery.attachment.snapshot_path);
         let original = fs::read(&snapshot).unwrap();
         fs::write(&snapshot, b"{}").unwrap();
-        assert_eq!(run_gate(), crate::candidate_gate::CandidateCheckStatus::Failed);
+        assert_eq!(
+            run_gate(),
+            crate::candidate_gate::CandidateCheckStatus::Failed
+        );
         fs::write(snapshot, original).unwrap();
         assert_eq!(
             attach(

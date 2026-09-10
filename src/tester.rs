@@ -1070,8 +1070,15 @@ fn extract_and_normalize(
     let mut tests = cap_failure_excerpts(tests);
     for test in &mut tests {
         let native = crate::verification_reference::normalize_native_identity(&test.id);
-        if test.identity.is_none() { test.identity = native; }
-        crate::verification_reference::normalized_result(test).map_err(|message| NormalizationError { kind: "invalid_test_identity", message })?;
+        if test.identity.is_none() {
+            test.identity = native;
+        }
+        crate::verification_reference::normalized_result(test).map_err(|message| {
+            NormalizationError {
+                kind: "invalid_test_identity",
+                message,
+            }
+        })?;
     }
     tests.sort_by(|a, b| {
         a.test_harness

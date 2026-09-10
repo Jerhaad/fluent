@@ -14,7 +14,8 @@ use crate::work_model::{
     CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract, WriterCompletionRequirementKind,
 };
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = crate::verification_assessment::VERIFICATION_GATE_SCHEMA_VERSION;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 =
+    crate::verification_assessment::VERIFICATION_GATE_SCHEMA_VERSION;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;
@@ -1624,57 +1625,171 @@ fn check_behavior_references(
             ),
         ]);
     };
-    let results = request.tester_results_path.map(|path| fs::read(path)
-        .with_context(|| format!("read Tester evidence {}", path.display()))
-        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).context("cannot parse Tester evidence"))).transpose();
+    let results = request
+        .tester_results_path
+        .map(|path| {
+            fs::read(path)
+                .with_context(|| format!("read Tester evidence {}", path.display()))
+                .and_then(|bytes| {
+                    serde_json::from_slice::<crate::tester::TesterResults>(&bytes)
+                        .context("cannot parse Tester evidence")
+                })
+        })
+        .transpose();
     let results = match results {
         Ok(results) => results,
-        Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![error.to_string()])]),
-    };
-    let saved = crate::work_model::WorkModelStore::new(request.project_root).read_work_item_snapshot(request.work_item_id).ok();
-    let saved_attempt = saved.as_ref().and_then(|item| item.attempts.iter().find(|attempt| attempt.id == request.attempt_id));
-    let canonical = if let Some(attempt) = saved_attempt.filter(|attempt| request.tester_results_path.is_some() && attempt.tasks.iter().any(|task| task.kind == crate::work_model::TaskKind::Tester && task.status == crate::work_model::TaskStatus::Complete)) {
-        match crate::verification_assessment::assess_canonical_checks(request.project_root, attempt) {
-            Ok(view) => Some(view),
-            Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![format!("Current verification bindings need diagnosis: {error:#}. Approved requirements: {}", contract.requirements.iter().flat_map(|row| row.verification_refs.iter().map(move |reference| format!("{}: {reference}", row.id))).collect::<Vec<_>>().join("; "))])]),
+        Err(error) => {
+            return Ok(vec![check(
+                "tester-reference-evidence",
+                CandidateCheckStatus::Error,
+                vec![error.to_string()],
+            )]);
         }
-    } else { None };
+    };
+    let saved = crate::work_model::WorkModelStore::new(request.project_root)
+        .read_work_item_snapshot(request.work_item_id)
+        .ok();
+    let saved_attempt = saved.as_ref().and_then(|item| {
+        item.attempts
+            .iter()
+            .find(|attempt| attempt.id == request.attempt_id)
+    });
+    let canonical = if let Some(attempt) = saved_attempt.filter(|attempt| {
+        request.tester_results_path.is_some()
+            && attempt.tasks.iter().any(|task| {
+                task.kind == crate::work_model::TaskKind::Tester
+                    && task.status == crate::work_model::TaskStatus::Complete
+            })
+    }) {
+        match crate::verification_assessment::assess_canonical_checks(request.project_root, attempt)
+        {
+            Ok(view) => Some(view),
+            Err(error) => {
+                return Ok(vec![check(
+                    "tester-reference-evidence",
+                    CandidateCheckStatus::Error,
+                    vec![format!(
+                        "Current verification bindings need diagnosis: {error:#}. Approved requirements: {}",
+                        contract
+                            .requirements
+                            .iter()
+                            .flat_map(|row| row
+                                .verification_refs
+                                .iter()
+                                .map(move |reference| format!("{}: {reference}", row.id)))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )],
+                )]);
+            }
+        }
+    } else {
+        None
+    };
     let mut adjusted = results.clone();
     if request.phase == CandidateGatePhase::Learner {
         if let Some(results) = &mut adjusted {
             if let Some(commit) = &results.candidate_commit {
-                if commit != request.candidate_commit && learner_only_delta(request.workspace, commit, request.candidate_commit)? {
+                if commit != request.candidate_commit
+                    && learner_only_delta(request.workspace, commit, request.candidate_commit)?
+                {
                     results.candidate_commit = Some(request.candidate_commit.to_string());
                 }
             }
         }
     }
-    if adjusted.as_ref().is_some_and(|results| results.candidate_commit.as_deref() != Some(request.candidate_commit)) {
-        return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec!["Tester evidence is not bound to this candidate commit".into()])]);
+    if adjusted.as_ref().is_some_and(|results| {
+        results.candidate_commit.as_deref() != Some(request.candidate_commit)
+    }) {
+        return Ok(vec![check(
+            "tester-reference-evidence",
+            CandidateCheckStatus::Error,
+            vec!["Tester evidence is not bound to this candidate commit".into()],
+        )]);
     }
-    let bindings = request.tester_results_path.map(|path| crate::work_model::BoundRecheckArtifact { path: path.display().to_string(), digest: String::new() }).into_iter().collect::<Vec<_>>();
-    let accepted = saved_attempt.map(|attempt| crate::verification_assessment::accepted_legacy_commands(request.project_root, attempt, crate::check_applicability::evaluation_time())).unwrap_or_default();
-    let rows = crate::verification_assessment::assess_references(request.workspace, request.work_item_id, request.attempt_id, request.candidate_commit, contract, adjusted.as_ref(), canonical.as_ref(), &bindings, &accepted)?;
+    let bindings = request
+        .tester_results_path
+        .map(|path| crate::work_model::BoundRecheckArtifact {
+            path: path.display().to_string(),
+            digest: String::new(),
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    let accepted = saved_attempt
+        .map(|attempt| {
+            crate::verification_assessment::accepted_legacy_commands(
+                request.project_root,
+                attempt,
+                crate::check_applicability::evaluation_time(),
+            )
+        })
+        .unwrap_or_default();
+    let rows = crate::verification_assessment::assess_references(
+        request.workspace,
+        request.work_item_id,
+        request.attempt_id,
+        request.candidate_commit,
+        contract,
+        adjusted.as_ref(),
+        canonical.as_ref(),
+        &bindings,
+        &accepted,
+    )?;
     let mut source_diagnostics = Vec::new();
-    for requirement in contract.requirements.iter().filter(|row| row.kind == WriterCompletionRequirementKind::Behavior) {
-        if requirement.verification_refs.is_empty() { source_diagnostics.push(format!("{} has neither a Test: reference nor an Untestable: reason", requirement.source)); }
+    for requirement in contract
+        .requirements
+        .iter()
+        .filter(|row| row.kind == WriterCompletionRequirementKind::Behavior)
+    {
+        if requirement.verification_refs.is_empty() {
+            source_diagnostics.push(format!(
+                "{} has neither a Test: reference nor an Untestable: reason",
+                requirement.source
+            ));
+        }
     }
     for row in &rows {
-        if row.meaning.is_none() || row.cause == Some(crate::verification_assessment::VerificationCause::CandidateDefect) {
+        if row.meaning.is_none()
+            || row.cause == Some(crate::verification_assessment::VerificationCause::CandidateDefect)
+        {
             source_diagnostics.extend(row.diagnostics.clone());
         }
     }
-    let source_status = if source_diagnostics.is_empty() { CandidateCheckStatus::Passed } else { CandidateCheckStatus::Failed };
-    let evidence_diagnostics = rows.iter().filter(|row| !row.satisfied && row.meaning.is_some() && row.cause != Some(crate::verification_assessment::VerificationCause::CandidateDefect)).flat_map(|row| row.diagnostics.clone()).collect::<Vec<_>>();
-    let status = if request.tester_results_path.is_none() { CandidateCheckStatus::Skipped } else if evidence_diagnostics.is_empty() { CandidateCheckStatus::Passed } else { CandidateCheckStatus::Failed };
-    Ok(vec![check("behavior-references", source_status, source_diagnostics), check("tester-reference-evidence", status, evidence_diagnostics)])
+    let source_status = if source_diagnostics.is_empty() {
+        CandidateCheckStatus::Passed
+    } else {
+        CandidateCheckStatus::Failed
+    };
+    let evidence_diagnostics = rows
+        .iter()
+        .filter(|row| {
+            !row.satisfied
+                && row.meaning.is_some()
+                && row.cause
+                    != Some(crate::verification_assessment::VerificationCause::CandidateDefect)
+        })
+        .flat_map(|row| row.diagnostics.clone())
+        .collect::<Vec<_>>();
+    let status = if request.tester_results_path.is_none() {
+        CandidateCheckStatus::Skipped
+    } else if evidence_diagnostics.is_empty() {
+        CandidateCheckStatus::Passed
+    } else {
+        CandidateCheckStatus::Failed
+    };
+    Ok(vec![
+        check("behavior-references", source_status, source_diagnostics),
+        check("tester-reference-evidence", status, evidence_diagnostics),
+    ])
 }
 
 /// Resolve one exact command-shaped Test reference that a rejected final
 /// candidate gate could not find in canonical Tester evidence. Selector-only
 /// diagnostics require diagnosis before any source correction.
 pub(crate) fn requested_host_evidence_command(evidence: &CandidateGateEvidence) -> Option<String> {
-    crate::verification_assessment::requested_legacy_host_command(&serde_json::to_value(evidence).ok()?)
+    crate::verification_assessment::requested_legacy_host_command(
+        &serde_json::to_value(evidence).ok()?,
+    )
 }
 
 fn learner_only_delta(workspace: &Path, from: &str, to: &str) -> Result<bool> {
@@ -4650,11 +4765,19 @@ mod tests {
         assert_eq!(requested_host_evidence_command(&selector_only), None);
     }
 
-    fn explicit_gate(reference: &str, tests: serde_json::Value, commands: serde_json::Value) -> CandidateGateEvidence {
+    fn explicit_gate(
+        reference: &str,
+        tests: serde_json::Value,
+        commands: serde_json::Value,
+    ) -> CandidateGateEvidence {
         let fixture = Fixture::new();
         fixture.commit("tests/native.sh", "#!/bin/sh\n", "Add native script");
         fixture.commit("src/native.rs", "fn works() {}\n", "Add Rust test");
-        fixture.commit("tests/native.py", "class Native:\n def works(self): pass\n", "Add Python test");
+        fixture.commit(
+            "tests/native.py",
+            "class Native:\n def works(self): pass\n",
+            "Add Python test",
+        );
         let candidate = fixture.commit(".fluent/tester.yaml", "commands:\n  - command: check\n    test_harness: shell-harness\n  - command: check\n    test_harness: shell-harness\n", "Add configured checks");
         let tester = fixture.artifacts.path().join("tester-results.json");
         let values = tests.as_array().unwrap();
@@ -4662,7 +4785,13 @@ mod tests {
             "summary":{"total":values.len(),"pass":values.iter().filter(|test| test["status"]=="pass").count(),"fail":values.iter().filter(|test| test["status"]=="fail").count(),"skipped":values.iter().filter(|test| test["status"]=="skipped").count()},"error":null});
         fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
         let contract = behavior_contract(reference);
-        run_candidate_gate(fixture.request(&candidate, Some(&contract), Some(&tester), &fixture.artifacts.path().join("candidate-gate.json"))).unwrap()
+        run_candidate_gate(fixture.request(
+            &candidate,
+            Some(&contract),
+            Some(&tester),
+            &fixture.artifacts.path().join("candidate-gate.json"),
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -4675,18 +4804,39 @@ mod tests {
             r#"{"kind":"whole-script","path":"tests/native.sh","description":"not a native identity"}"#,
             r#"{"kind":"named-test","path":"tests/native.sh","name":"works","description":"another explanation"}"#,
         ] {
-            assert_eq!(explicit_gate(reference, tests.clone(), serde_json::json!([])).disposition, CandidateGateDisposition::Passed);
+            assert_eq!(
+                explicit_gate(reference, tests.clone(), serde_json::json!([])).disposition,
+                CandidateGateDisposition::Passed
+            );
         }
         let commands = serde_json::json!([
             {"command":"check","test_harness":"shell-harness","exit_code":1,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"},
             {"command":"check","test_harness":"shell-harness","exit_code":0,"duration_ms":1,"stdout_log":"commands/1-stdout.log","stderr_log":"commands/1-stderr.log"}
         ]);
         for (reference, expected) in [
-            (r#"{"kind":"command","command":"check","command_index":1,"description":"the second occurrence"}"#, CandidateGateDisposition::Passed),
-            (r#"{"kind":"command","command":"check"}"#, CandidateGateDisposition::Rejected),
-            (r#"{"kind":"command","command":"check","command_index":0}"#, CandidateGateDisposition::Rejected),
-            (r#"{"kind":"command","command":"check","command_index":2}"#, CandidateGateDisposition::Rejected),
-        ] { assert_eq!(explicit_gate(reference, serde_json::json!([]), commands.clone()).disposition, expected, "{reference}"); }
+            (
+                r#"{"kind":"command","command":"check","command_index":1,"description":"the second occurrence"}"#,
+                CandidateGateDisposition::Passed,
+            ),
+            (
+                r#"{"kind":"command","command":"check"}"#,
+                CandidateGateDisposition::Rejected,
+            ),
+            (
+                r#"{"kind":"command","command":"check","command_index":0}"#,
+                CandidateGateDisposition::Rejected,
+            ),
+            (
+                r#"{"kind":"command","command":"check","command_index":2}"#,
+                CandidateGateDisposition::Rejected,
+            ),
+        ] {
+            assert_eq!(
+                explicit_gate(reference, serde_json::json!([]), commands.clone()).disposition,
+                expected,
+                "{reference}"
+            );
+        }
         for malformed in [
             r#"{"kind":"named-test","path":"tests/native.sh","name":"works","binary":"pkg"}"#,
             r#"{"kind":"named-test","path":"tests/native.sh","name":""}"#,
@@ -4695,18 +4845,41 @@ mod tests {
             r#"{"kind":"named-test","path":"src/native.rs","name":"other.rs::works"}"#,
             r#"{"kind":"unknown","path":"tests/native.sh"}"#,
             r#"{"kind":"command","command":"check","command_index":-1}"#,
-        ] { assert_ne!(explicit_gate(malformed, tests.clone(), commands.clone()).disposition, CandidateGateDisposition::Passed, "{malformed}"); }
+        ] {
+            assert_ne!(
+                explicit_gate(malformed, tests.clone(), commands.clone()).disposition,
+                CandidateGateDisposition::Passed,
+                "{malformed}"
+            );
+        }
     }
 
     #[test]
     fn named_shell_reference_requires_exact_script_and_test() {
         let reference = r#"{"kind":"named-test","path":"tests/native.sh","name":"works"}"#;
-        for (id, expected) in [("tests/native.sh::works", true), ("tests/other.sh::works", false), ("tests/native.sh::other", false), ("native.sh::works", false)] {
-            let evidence = explicit_gate(reference, serde_json::json!([{"id":id,"status":"pass","test_harness":"shell-harness"}]), serde_json::json!([]));
-            assert_eq!(evidence.disposition == CandidateGateDisposition::Passed, expected, "{id}");
+        for (id, expected) in [
+            ("tests/native.sh::works", true),
+            ("tests/other.sh::works", false),
+            ("tests/native.sh::other", false),
+            ("native.sh::works", false),
+        ] {
+            let evidence = explicit_gate(
+                reference,
+                serde_json::json!([{"id":id,"status":"pass","test_harness":"shell-harness"}]),
+                serde_json::json!([]),
+            );
+            assert_eq!(
+                evidence.disposition == CandidateGateDisposition::Passed,
+                expected,
+                "{id}"
+            );
         }
         // A producer may separate its display label from its typed native identity.
-        let evidence = explicit_gate(reference, serde_json::json!([{"id":"human readable label", "status":"pass","test_harness":"shell-harness","identity":{"kind":"named-test","path":"tests/native.sh","name":"works"}}]), serde_json::json!([]));
+        let evidence = explicit_gate(
+            reference,
+            serde_json::json!([{"id":"human readable label", "status":"pass","test_harness":"shell-harness","identity":{"kind":"named-test","path":"tests/native.sh","name":"works"}}]),
+            serde_json::json!([]),
+        );
         assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
     }
 
@@ -4719,17 +4892,38 @@ mod tests {
             serde_json::json!([{"id":"tests/native.sh::works","status":"skipped","test_harness":"shell-harness"}]),
             serde_json::json!([{"id":"tests/native.sh::works","status":"pass","test_harness":"shell-harness"},{"id":"tests/native.sh::works","status":"fail","test_harness":"shell-harness"}]),
             serde_json::json!([{"id":"tests/native.sh::works","status":"pass","test_harness":"shell-harness","identity":{"kind":"named-test","path":"tests/other.sh","name":"works"}}]),
-        ] { assert_ne!(explicit_gate(reference, tests, serde_json::json!([])).disposition, CandidateGateDisposition::Passed); }
+        ] {
+            assert_ne!(
+                explicit_gate(reference, tests, serde_json::json!([])).disposition,
+                CandidateGateDisposition::Passed
+            );
+        }
     }
 
     #[test]
     fn unambiguous_legacy_reference_meaning_is_preserved() {
         for (reference, id) in [
             ("tests/native.sh (coverage description)", "tests/native.sh"),
-            ("src/native.rs (pkg::lib$module::works)", "src/native.rs (pkg::lib$module::works)"),
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "src/native.rs (pkg::lib$module::works)",
+            ),
             ("tests/native.py (Native.works)", "works (module.Native)"),
-            (r#"{"kind":"named-test","path":"src/native.rs","name":"module::works","binary":"pkg::lib"}"#, "src/native.rs (pkg::lib$module::works)"),
-        ] { assert_eq!(explicit_gate(reference, serde_json::json!([{"id":id,"status":"pass","test_harness":"native"}]), serde_json::json!([])).disposition, CandidateGateDisposition::Passed, "{reference}"); }
+            (
+                r#"{"kind":"named-test","path":"src/native.rs","name":"module::works","binary":"pkg::lib"}"#,
+                "src/native.rs (pkg::lib$module::works)",
+            ),
+        ] {
+            assert_eq!(
+                explicit_gate(
+                    reference,
+                    serde_json::json!([{"id":id,"status":"pass","test_harness":"native"}]),
+                    serde_json::json!([])
+                )
+                .disposition,
+                CandidateGateDisposition::Passed,
+                "{reference}"
+            );
+        }
     }
-
 }
