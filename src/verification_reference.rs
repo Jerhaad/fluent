@@ -723,6 +723,11 @@ pub(crate) fn normalized_result(
                 .as_ref()
                 .map_or_else(|| native.clone(), |path| format!("{path} ({native})"));
             let parsed = RustTestIdentity::parse(&id).ok_or("malformed Rust identity")?;
+            if RustTestIdentity::parse(&test.id).is_none()
+                && normalize_native_identity(&test.id).is_some()
+            {
+                return Err("Rust identity replaces a different native identity kind".into());
+            }
             if RustTestIdentity::parse(&test.id).is_some_and(|raw| {
                 !parsed.compatible_with(&raw)
                     || raw.path.is_some_and(|path| parsed.path != Some(path))
@@ -753,6 +758,11 @@ pub(crate) fn normalized_result(
                 .as_ref()
                 .map_or_else(|| name.clone(), |path| format!("{path}::{name}"));
             let parsed = PythonTestIdentity::parse(&id).ok_or("malformed Python identity")?;
+            if PythonTestIdentity::parse(&test.id).is_none()
+                && normalize_native_identity(&test.id).is_some()
+            {
+                return Err("Python identity replaces a different native identity kind".into());
+            }
             if PythonTestIdentity::parse(&test.id).is_some_and(|raw| {
                 !parsed.compatible_with(&raw)
                     || raw.path.is_some_and(|path| parsed.path != Some(path))

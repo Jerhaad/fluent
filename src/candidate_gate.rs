@@ -5066,6 +5066,31 @@ mod tests {
                 "tests/native.py::module.Other.works",
                 serde_json::json!({"kind":"python","name":"works"}),
             ),
+            (
+                "src/native.rs (other::lib$other::works)",
+                "src/native.rs (pkg::lib$module::works)",
+                serde_json::json!({"kind":"python","name":"works"}),
+            ),
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "tests/native.py::module.Native.works",
+                serde_json::json!({"kind":"rust","name":"works"}),
+            ),
+            (
+                "tests/native.py (Native.works)",
+                "src/native.rs (pkg::lib$module::works)",
+                serde_json::json!({"kind":"python","path":"tests/native.py","class":"Native","name":"works"}),
+            ),
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "tests/other.sh::works",
+                serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"module::works"}),
+            ),
+            (
+                "tests/native.py (Native.works)",
+                "tests/other.sh::works",
+                serde_json::json!({"kind":"python","name":"works"}),
+            ),
         ] {
             let gate = explicit_gate(
                 reference,

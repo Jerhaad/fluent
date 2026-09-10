@@ -522,10 +522,12 @@ requirements. `whole-script` requires `path`; `named-test` requires `path` and
 native `name`, with an optional Rust `binary`; `command` requires the exact
 `command`, with an optional zero-based `command_index`. Every kind accepts
 non-identity `description` metadata. Unknown fields, malformed values, and
-contradictory qualifiers cannot establish a pass. A named shell result must use
-the exact `path::name`; a whole-script pass cannot satisfy it. An explicit
-command must resolve to a committed canonical entry, and duplicate command text
-requires an index. See the [planning examples](../skills/fluent.full/references/define-behaviors.md#rules).
+contradictory qualifiers or recognized identities from another native format
+cannot establish a pass. Unqualified native names and free-form display labels
+remain supported when they do not contradict the structured identity. A named
+shell result must use the exact `path::name`; a whole-script pass cannot satisfy
+it. An explicit command must resolve to a committed canonical entry, and duplicate
+command text requires an index. See the [planning examples](../skills/fluent.full/references/define-behaviors.md#rules).
 
 `verification_assessment.rs` evaluates references and canonical checks below the
 gate, recovery, executor, and status consumers. It reuses `verification_policy`

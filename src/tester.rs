@@ -2826,6 +2826,8 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
                 "src/native.rs (pkg::lib$module::works)",
                 serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"module::works"}),
                 vec![
+                    serde_json::json!({"kind":"python","name":"works"}),
+                    serde_json::json!({"kind":"python","path":"tests/native.py","class":"Native","name":"works"}),
                     serde_json::json!({"kind":"rust","binary":"pkg::lib","name":"module::works"}),
                     serde_json::json!({"kind":"rust","path":"src/native.rs","name":"module::works"}),
                     serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"works"}),
@@ -2836,11 +2838,49 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
                 "tests/native.py::module.Native.works",
                 serde_json::json!({"kind":"python","path":"tests/native.py","module":"module","class":"Native","name":"works"}),
                 vec![
+                    serde_json::json!({"kind":"rust","name":"works"}),
+                    serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"module::works"}),
                     serde_json::json!({"kind":"python","module":"module","class":"Native","name":"works"}),
                     serde_json::json!({"kind":"python","path":"tests/native.py","class":"Native","name":"works"}),
                     serde_json::json!({"kind":"python","path":"tests/native.py","name":"works"}),
                     serde_json::json!({"kind":"python","path":"tests/native.py","module":"other","class":"Native","name":"works"}),
                 ],
+            ),
+            (
+                "tests/other.sh::works",
+                serde_json::json!({"kind":"named-test","path":"tests/other.sh","name":"works"}),
+                vec![
+                    serde_json::json!({"kind":"rust","name":"works"}),
+                    serde_json::json!({"kind":"python","name":"works"}),
+                ],
+            ),
+            (
+                "tests/other.sh",
+                serde_json::json!({"kind":"whole-script","path":"tests/other.sh"}),
+                vec![
+                    serde_json::json!({"kind":"rust","name":"works"}),
+                    serde_json::json!({"kind":"python","name":"works"}),
+                ],
+            ),
+            (
+                "works",
+                serde_json::json!({"kind":"rust","name":"works"}),
+                vec![],
+            ),
+            (
+                "works",
+                serde_json::json!({"kind":"python","name":"works"}),
+                vec![],
+            ),
+            (
+                "producer display label",
+                serde_json::json!({"kind":"rust","name":"works"}),
+                vec![],
+            ),
+            (
+                "producer display label",
+                serde_json::json!({"kind":"python","name":"works"}),
+                vec![],
             ),
         ] {
             for (identity, valid) in std::iter::once((complete, true))
@@ -2864,8 +2904,8 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
                     assert!(result.error.is_none());
                     assert_eq!(result.tests[0].id, raw);
                     assert_eq!(
-                        serde_json::to_value(&result.tests[0].identity).unwrap(),
-                        identity
+                        result.tests[0].identity.as_ref().unwrap(),
+                        &serde_json::from_value::<crate::verification_reference::NativeTestIdentity>(identity).unwrap()
                     );
                 } else {
                     assert_eq!(
