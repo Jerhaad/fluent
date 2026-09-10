@@ -864,9 +864,43 @@ mod tests {
 
         let (tmp, store) = fixture();
         let root = tmp.path();
+        let workspace = root.join("candidate");
+        fs::create_dir_all(&workspace).unwrap();
+        for name in ["recovery_test", "revised_test", "final_test"] {
+            fs::write(workspace.join(name), "#!/bin/sh\nexit 0\n").unwrap();
+        }
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "Add reference sources"],
+        ] {
+            crate::git::run(&workspace, &args, "prepare candidate sources").unwrap();
+        }
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
         store
             .mutate_work_item("work-1", |item| {
                 let attempt = &mut item.attempts[0];
+                for task in &mut attempt.tasks {
+                    if let Some(output) = &mut task.output {
+                        output.workspace_path = "candidate".into();
+                        output.commit = candidate.clone();
+                        output.base_commit = Some(candidate.clone());
+                    }
+                    if let Some(context) = &mut task.review_context {
+                        context.candidate_workspace_path = "candidate".into();
+                        context.candidate_commit = candidate.clone();
+                        context.base_commit = Some(candidate.clone());
+                    }
+                    for workspace in &mut task.workspace_access.reads {
+                        if workspace.id == "candidate" {
+                            workspace.path = "candidate".into();
+                        }
+                    }
+                }
                 let writer = &attempt.tasks[0];
                 let matrix = WriterCompletionMatrix::skeleton(
                     attempt.writer_completion_contract.as_ref().unwrap(),

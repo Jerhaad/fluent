@@ -19686,18 +19686,31 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
                     finding.applicable_constraints = vec!["behavior:dashboard:b1".into()];
                 }
                 fs::write(&path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+                let workspace = tmp.path().join("candidate");
+                let base =
+                    git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read prior candidate")
+                        .unwrap();
+                if !(round == 2 && scenario == "no-output") {
+                    fs::write(workspace.join("correction.txt"), format!("round {round}\n"))
+                        .unwrap();
+                    git::run(&workspace, &["add", "correction.txt"], "stage correction").unwrap();
+                    git::run(
+                        &workspace,
+                        &["commit", "-qm", "Record correction"],
+                        "commit correction",
+                    )
+                    .unwrap();
+                }
+                let candidate =
+                    git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
                 let task = item.attempts[0].tasks.last_mut().unwrap();
                 task.status = TaskStatus::Complete;
                 task.output = Some(TaskOutput {
                     workspace_id: "candidate".into(),
                     workspace_path: "candidate".into(),
                     source_branch: "main".into(),
-                    base_commit: Some(if round == 2 && scenario == "no-output" {
-                        format!("commit-{round}")
-                    } else {
-                        format!("commit-{}", round - 1i32)
-                    }),
-                    commit: format!("commit-{round}"),
+                    base_commit: Some(base),
+                    commit: candidate,
                     no_change: None,
                     learner_canonicalization: None,
                 });
@@ -20080,6 +20093,28 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
     }
 
     fn make_completed_writer_matrix_fixture(project_root: &Path, complete: bool) -> WorkModelStore {
+        let workspace = project_root.join("candidate");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        init_learner_repo(&workspace);
+        fs::write(
+            workspace.join("tests/dashboard.rs"),
+            "#[test]\nfn preserves_selection() {}\n",
+        )
+        .unwrap();
+        git::run(
+            &workspace,
+            &["add", "tests/dashboard.rs"],
+            "stage behavior source",
+        )
+        .unwrap();
+        git::run(
+            &workspace,
+            &["commit", "-qm", "Add behavior source"],
+            "commit behavior source",
+        )
+        .unwrap();
+        let candidate =
+            git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
         let store = WorkModelStore::new(project_root);
         let mut item = WorkItem::planned("matrix-work", "Complete the approved behaviors");
         item.planning_context = Some(crate::work_model::PlanningContext {
@@ -20122,7 +20157,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             workspace_path: "candidate".to_string(),
             source_branch: "work/attempt-1".to_string(),
             base_commit: None,
-            commit: "abc123".to_string(),
+            commit: candidate,
             no_change: None,
             learner_canonicalization: None,
         });
@@ -20352,11 +20387,8 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         fs::write(&source_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
         store
             .mutate_work_item("matrix-work", |item| {
-                item.attempts[0].tasks[0]
-                    .output
-                    .as_mut()
-                    .unwrap()
-                    .base_commit = Some("abc123".to_string());
+                let output = item.attempts[0].tasks[0].output.as_mut().unwrap();
+                output.base_commit = Some(output.commit.clone());
                 Ok(())
             })
             .unwrap();

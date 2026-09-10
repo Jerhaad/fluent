@@ -676,6 +676,27 @@ mod tests {
     fn public_recovery_revises_selected_test_references() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path();
+        let workspace = project.join("candidate");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        fs::write(
+            workspace.join("tests/policy.py"),
+            "def relevant():\n    pass\ndef stale():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("tests/local.rs"), "#[test]\nfn idle() {}\n").unwrap();
+        fs::write(workspace.join("tests/fluent_merge_readiness.py"), "pass\n").unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["add", "tests"],
+            vec!["commit", "-qm", "Add reference sources"],
+        ] {
+            crate::git::run(&workspace, &args, "prepare candidate sources").unwrap();
+        }
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read candidate").unwrap();
         let store = WorkModelStore::new(project);
         let mut item = crate::work_model::WorkItem::planned("work-1", "Revise references");
         item.planning_context = Some(PlanningContext {
@@ -706,10 +727,10 @@ mod tests {
         writer.status = TaskStatus::Complete;
         writer.output = Some(TaskOutput {
             workspace_id: "candidate".to_string(),
-            workspace_path: "../candidate".to_string(),
+            workspace_path: "candidate".to_string(),
             source_branch: "work/references".to_string(),
-            base_commit: Some("base".to_string()),
-            commit: "candidate".to_string(),
+            base_commit: Some(candidate.clone()),
+            commit: candidate,
             no_change: None,
             learner_canonicalization: None,
         });
