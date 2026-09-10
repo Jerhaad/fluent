@@ -24501,6 +24501,8 @@ fn queue_resume_requires_exact_legacy_learner_evidence() {
         serde_json::to_vec_pretty(&exact_evidence).unwrap(),
     )
     .unwrap();
+    // The exact legacy gate cannot authorize recovery when its Tester source
+    // is still an empty, unverifiable historical object.
     fluent_cmd()
         .current_dir(tmp.path())
         .args([
@@ -24511,18 +24513,14 @@ fn queue_resume_requires_exact_legacy_learner_evidence() {
             "attempt-1",
         ])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Queued resume of Attempt attempt-1 for Work Item wi-legacy-evidence",
-        ));
+        .failure()
+        .stderr(predicate::str::contains("missing field `commands`"));
     let ledger = queue::read_ledger(tmp.path(), "wi-legacy-evidence")
         .unwrap()
         .unwrap();
     assert_eq!(ledger.dispatches[0].status, DispatchStatus::CandidateReady);
-    assert_eq!(
-        ledger.active().unwrap().bound_attempt_id.as_deref(),
-        Some("attempt-1")
-    );
+    assert!(ledger.active().is_none());
+    assert_eq!(ledger.dispatches.len(), 1);
 }
 
 #[test]
