@@ -1682,7 +1682,18 @@ fn check_behavior_references(
     }) {
         match crate::verification_assessment::assess_canonical_checks(request.project_root, attempt)
         {
-            Ok(view) => Some(view),
+            Ok(view) => {
+                if !request
+                    .tester_results_path
+                    .and_then(|path| fs::canonicalize(path).ok())
+                    .zip(fs::canonicalize(&view.results_path).ok())
+                    .is_some_and(|(supplied, recorded)| supplied == recorded)
+                {
+                    return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error,
+                        vec!["Supplied Tester evidence is not the recorded current canonical artifact".into()])]);
+                }
+                Some(view)
+            }
             Err(error) => {
                 return Ok(vec![check(
                     "tester-reference-evidence",
@@ -4858,7 +4869,7 @@ mod tests {
         let contract =
             behavior_contract(r#"{"kind":"command","command":"false","command_index":0}"#);
         let artifact = root.path().join("gate.json");
-        let request = CandidateGateRequest {
+        let mut request = CandidateGateRequest {
             project_root: root.path(),
             workspace: root.path(),
             work_item_id: &item.id,
@@ -4882,6 +4893,26 @@ mod tests {
                 .iter()
                 .all(|check| check.status == CandidateCheckStatus::Passed)
         );
+        let copy = root.path().join("unbound-results.json");
+        fs::write(&copy, fs::read(&result).unwrap()).unwrap();
+        request.tester_results_path = Some(&copy);
+        assert!(
+            check_behavior_references(&request)
+                .unwrap()
+                .iter()
+                .any(|check| check.status != CandidateCheckStatus::Passed)
+        );
+        request.tester_results_path = Some(&result);
+        let child = store.work_attempt_path(&item.id, &attempt.id).unwrap();
+        let child_bytes = fs::read(&child).unwrap();
+        fs::remove_file(&child).unwrap();
+        assert!(
+            check_behavior_references(&request)
+                .unwrap()
+                .iter()
+                .any(|check| check.status != CandidateCheckStatus::Passed)
+        );
+        fs::write(child, child_bytes).unwrap();
         let saved = store.work_item_path(&item.id).unwrap();
         let bytes = fs::read(&saved).unwrap();
         fs::write(&saved, b"{broken snapshot").unwrap();
