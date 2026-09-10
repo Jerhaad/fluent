@@ -262,22 +262,39 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
 
     // A successful setup is the control. Failures must stop even if the helper
     // has already printed a path, and must preserve its diagnostic and status.
-    for (setup_status, prints_path) in [(0, true), (37, false), (37, true)] {
+    for (failed_helper, setup_status, prints_path) in [
+        ("", 0, true),
+        ("ownership", 37, false),
+        ("ownership", 37, true),
+        ("verification", 37, false),
+        ("verification", 37, true),
+    ] {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("tester project");
         let fixtures = project.join("tests/fixtures");
         let bin_dir = tmp.path().join("bin");
-        write_mock_executable(
-            &fixtures,
-            "build-ownership-old-reader.sh",
-            r#"#!/bin/sh
-printf '%s' "$FLUENT_TEST_READER_OUTPUT"
-if [ "$FLUENT_TEST_READER_STATUS" -ne 0 ]; then
-    echo 'historical reader build failed' >&2
-fi
-exit "$FLUENT_TEST_READER_STATUS"
-"#,
-        );
+        for helper in ["ownership", "verification"] {
+            let status = if helper == failed_helper {
+                setup_status
+            } else {
+                0
+            };
+            let reader_output = if helper != failed_helper || prints_path {
+                bin_dir
+                    .join(format!("{helper} old reader"))
+                    .display()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            write_mock_executable(
+                &fixtures,
+                &format!("build-{helper}-old-reader.sh"),
+                &format!(
+                    "#!/bin/sh\nprintf '%s' '{reader_output}'\nif [ {status} -ne 0 ]; then echo 'historical reader build failed' >&2; fi\nexit {status}\n"
+                ),
+            );
+        }
         write_mock_executable(&bin_dir, "old reader", "#!/bin/sh\nexit 0\n");
         write_mock_executable(
             &bin_dir,
@@ -285,7 +302,7 @@ exit "$FLUENT_TEST_READER_STATUS"
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$FLUENT_TEST_CARGO_CALLS"
-printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
+printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
 case "$1" in
     build) mkdir -p target/debug; touch target/debug/fluent ;;
     nextest) exit 0 ;;
@@ -293,7 +310,6 @@ case "$1" in
 esac
 "#,
         );
-        let reader = bin_dir.join("old reader");
         let cargo_calls = tmp.path().join("cargo-calls");
         let reader_paths = tmp.path().join("reader-paths");
         // Tester executes each configured command through sh -c.
@@ -301,15 +317,7 @@ esac
             .args(["-c", command])
             .current_dir(&project)
             .env_remove("FLUENT_OWNERSHIP_OLD_BIN")
-            .env("FLUENT_TEST_READER_STATUS", setup_status.to_string())
-            .env(
-                "FLUENT_TEST_READER_OUTPUT",
-                if prints_path {
-                    reader.to_str().unwrap()
-                } else {
-                    ""
-                },
-            )
+            .env_remove("FLUENT_VERIFICATION_OLD_BIN")
             .env("FLUENT_TEST_CARGO_CALLS", &cargo_calls)
             .env("FLUENT_TEST_READER_PATHS", &reader_paths)
             .env(
@@ -329,7 +337,12 @@ esac
             assert!(calls[2].starts_with("nextest run "), "{calls:?}");
             assert_eq!(
                 fs::read_to_string(reader_paths).unwrap(),
-                format!("{}\n", reader.display()).repeat(3),
+                format!(
+                    "{}\n{}\n",
+                    bin_dir.join("ownership old reader").display(),
+                    bin_dir.join("verification old reader").display()
+                )
+                .repeat(3),
                 "every Cargo child must receive the exported reader path"
             );
         } else {
@@ -34047,7 +34060,11 @@ fn attempt_run_write_round_conveys_iteration() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("follow-up") || stderr.contains("keep iterating"),
@@ -36459,11 +36476,7 @@ fn check_owned_planning_recovery(
     }
     fs::write(
         project.join(".fluent/tester.yaml"),
-        if approach {
-            "commands:\n  - command: bash tests/original.sh\n    test_harness: shell-harness\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n"
-        } else {
-            "commands:\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n"
-        },
+        "commands:\n  - command: bash tests/original.sh\n    test_harness: shell-harness\n  - command: bash tests/final.sh\n    test_harness: shell-harness\n",
     )
     .unwrap();
     fs::write(
@@ -36610,26 +36623,24 @@ fn check_owned_planning_recovery(
             .unwrap(),
     )
     .unwrap();
-    if approach {
-        store
-            .mutate_work_item(&id, |item| {
-                item.add_review_tasks(
-                    "attempt-1",
-                    &[
-                        "architecture",
-                        "behaviors",
-                        "tests",
-                        "documentation",
-                        "skills",
-                    ],
-                )?;
-                item.attempts[0].status = AttemptStatus::NeedsUser;
-                item.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
-                item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
-                Ok(())
-            })
-            .unwrap();
-    }
+    store
+        .mutate_work_item(&id, |item| {
+            item.add_review_tasks(
+                "attempt-1",
+                &[
+                    "architecture",
+                    "behaviors",
+                    "tests",
+                    "documentation",
+                    "skills",
+                ],
+            )?;
+            item.attempts[0].status = AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(PauseKind::WriterCompletion);
+            item.attempts[0].review_state = Some(AttemptReviewState::NotReviewed);
+            Ok(())
+        })
+        .unwrap();
     let passing = tmp.path().join("passing.json");
     fs::write(&passing, br#"{"schema_version":1,"producer":"isolated host","check":"bash tests/host.sh","working_directory":".","result":"pass","run_at":"2026-09-04T22:00:00Z","output":"host check passed"}"#).unwrap();
     let plan_row = if explicit {
