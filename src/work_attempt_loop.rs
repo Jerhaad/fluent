@@ -17782,6 +17782,16 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         fs::create_dir_all(&workspace).unwrap();
         init_learner_repo(&workspace);
         fs::write(workspace.join("src.rs"), "fn main() {}").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
         git::run(&workspace, &["add", "."], "add").unwrap();
         git::run(&workspace, &["commit", "-m", "initial"], "commit").unwrap();
         let base = git::run_stdout(&workspace, &["rev-parse", "HEAD"], "base").unwrap();
@@ -17847,11 +17857,14 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         attempt.tasks.push(tester_task(tester_id, &tester_path));
         let tester_dir = project_root.join(&tester_path);
         fs::create_dir_all(&tester_dir).unwrap();
-        fs::write(
-            tester_dir.join("tester-results.json"),
-            passing_tester_json(),
+        crate::tester::run(
+            &workspace,
+            &tester_dir,
+            true,
+            &crate::content::ContentResolver::new(Some(&workspace)),
         )
         .unwrap();
+        crate::tester::bind_candidate_commit(&tester_dir, &base).unwrap();
 
         // The reviewed change lives at `base`, so every Tester and reviewer context
         // names it. The pre-land no-expertise pointer-identity gate reads these
@@ -18043,7 +18056,13 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
 
         assert!(
             matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
-            "first-pass reviews passed — candidate ready; got {outcome:?}"
+            "first-pass reviews passed — candidate ready; got {outcome:?}; gate: {}",
+            fs::read_to_string(project_root.join(work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "learner/runs/run-1/candidate-gate.json",
+            )))
+            .unwrap_or_default()
         );
         let stored = store.read_work_item("work-1").unwrap();
         let learning = stored.attempts[0]
@@ -26983,12 +27002,13 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
                 learning.handoff.is_none(),
                 "{name}: no handoff is referenced"
             );
+            let failure = learning.last_failure.as_deref().unwrap();
             assert!(
-                learning
-                    .last_failure
-                    .as_deref()
-                    .unwrap()
-                    .contains("pointer-identity check failed before advancing Learning"),
+                if name.starts_with("reviewed SHA") {
+                    failure.contains("Learner candidate gate could not verify")
+                } else {
+                    failure.contains("pointer-identity check failed before advancing Learning")
+                },
                 "{name}: the exact postflight contradiction is stored: {:?}",
                 learning.last_failure
             );
@@ -29473,6 +29493,16 @@ git update-ref HEAD "$replacement" "$host"
             }
         }
         store.write_work_item(&item).unwrap();
+        let results = latest_tester_results_path(&project_root, &item.attempts[0]).unwrap();
+        let tester_dir = results.parent().unwrap();
+        crate::tester::run(
+            &workspace,
+            tester_dir,
+            true,
+            &ContentResolver::new(Some(&workspace)),
+        )
+        .unwrap();
+        crate::tester::bind_candidate_commit(tester_dir, &baseline).unwrap();
 
         let run_coder = |request: &LearnerCoderRequest<'_>| -> Result<()> {
             fs::remove_file(request.workspace_path.join(".fluent/expertise/obsolete.md")).unwrap();
