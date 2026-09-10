@@ -107,6 +107,19 @@ the explanation remains the row's normal state and verification text. Older
 Attempts without this stored field use one compatibility parser and pause when
 the old text names zero or multiple commands.
 
+Keep each behavior's evidence meaning explicit: whole-script, named-test, or
+complete-command, using the [reference forms](define-behaviors.md#rules).
+Repeated canonical commands need their zero-based command index; their text alone
+does not identify one occurrence. Plan references identify required evidence and
+never authorize a host command.
+
+Plan corrective work from established candidate defects. A missing result or an
+unexplained nonzero command remains a verification gap until diagnosis establishes
+its cause. Applicable accepted proof stays effective through unrelated failures
+and no-change Writer history. Preserve its original owner, candidate, source,
+review, and freshness bindings; host and workflow obligations remain outside
+Writer completion.
+
 When an Attempt pauses for user input, Fluent also stores one versioned pause
 record beside the Attempt. It contains the plain-language blocker, the current
 candidate and blocking Task when known, the evidence or decision needed, and

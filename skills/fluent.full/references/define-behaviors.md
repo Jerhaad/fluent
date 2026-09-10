@@ -168,6 +168,30 @@ Omit sections with no content. Reference existing statements when a new one depe
 
 ## Rules
 
+Choose the evidence identity when writing each `Test:` reference. These JSON
+forms declare its meaning explicitly:
+
+```text
+Test: {"kind":"whole-script","path":"tests/lifecycle.sh","description":"checks shutdown"}
+Test: {"kind":"named-test","path":"tests/lifecycle.sh","name":"stop_makes_endpoint_unavailable"}
+Test: {"kind":"named-test","path":"tests/binary.rs","name":"verification_views_agree_on_current_requirements","binary":"fluent::binary"}
+Test: {"kind":"command","command":"cargo test --lib","command_index":0}
+```
+
+`description` is optional metadata on every form. It never selects a result.
+`binary` is an optional Rust qualifier; preserve the native module, class, and
+test name. `command_index` is the zero-based entry in `.fluent/tester.yaml` and
+may be omitted only when the exact command appears once. Unknown fields and
+contradictory qualifiers cannot establish a passing identity. Paths must use
+their exact committed, project-relative spelling.
+
+Keep supported legacy examples such as `src/lib.rs (tests::works)`,
+`tests/test_api.py::ApiTests.test_close`, and
+`tests/lifecycle.sh (checks shutdown)`. The last example requires a whole-script
+pass; a named shell reference requires `tests/lifecycle.sh::stop_makes_endpoint_unavailable`.
+A reference identifies evidence and does not authorize execution. Do not rewrite
+an already approved Attempt's markers to adopt the new notation.
+
 - Ask one question at a time, with a blank line after the question stem. Use two archetypes:
   - **Decision** — pick one option. Label the options (a)/(b)/(c), each self-contained; put the
     recommended option first and mark it `(recommended: <why>)`. The answer is a single letter.

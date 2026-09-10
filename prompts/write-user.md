@@ -44,6 +44,8 @@ The script must:
 [{"id": "test_name", "test_harness": "cargo-nextest", "status": "pass", "duration_ms": 42, "failure_excerpt": null}]
 ```
 - Every `id` must be globally unique across all commands and harnesses. When a test name recurs across binaries, files, or sections, prefix with the binary, file, or section to disambiguate.
+- Preserve native qualification: Rust binary and module, Python module and class, and exact script path. A whole-script result uses `tests/check.sh`; a named shell result uses `tests/check.sh::test_name`. Coverage descriptions and harness display labels do not identify tests.
+- Existing native IDs are normalized by Fluent. A producer may also supply `identity`, for example `{"kind":"named-test","path":"tests/check.sh","name":"test_name"}`. Preserve the raw `id` and `status`; a supplied identity must agree with any native qualifiers in the raw ID. The producer cannot supply canonical command occurrence or host acceptance authority.
 - `status` must be one of: `pass`, `fail`, `skipped`, `not_run`.
 - `failure_excerpt` is a string (at most 500 chars) or null.
 - Be executable (`chmod +x`).

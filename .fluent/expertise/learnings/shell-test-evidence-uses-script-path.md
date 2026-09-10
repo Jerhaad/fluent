@@ -5,7 +5,7 @@ metadata:
   type: convention
 ---
 
-For a `.sh` behavior reference, the script's exact committed project-relative
+For a legacy `.sh` behavior reference, the script's exact committed project-relative
 path identifies the test. Its parenthetical describes coverage and need not
 appear in either the script source or the structured result. The result's
 `test_harness` label may be project-defined; requiring a particular display
@@ -23,3 +23,10 @@ Path admission and a passing script result establish traceability, while the
 coverage description guides that semantic review. Related:
 [[declared-behavior-tests-must-exist-before-land]],
 [[rust-test-evidence-preserves-native-qualifiers]].
+
+Explicit `Test:` JSON distinguishes `whole-script` from `named-test`. A named
+shell test requires the exact `path::name` result; a whole-script pass cannot
+satisfy it. `verification_reference` adapts both forms, and
+`verification_assessment` supplies the same read-only result to the gate,
+Writer context and requirements, and status. A missing native result remains
+a verification gap until evidence establishes a candidate defect.

@@ -87,10 +87,11 @@ remediation is named, emit exactly one `Disposition: code-change` line.
 1. Read the review-{{role}} skill at {{skill_path}} and apply it to evaluate the candidate.
 2. Identify findings — concerns the Writer should address.
 {{#if is_review_tests}}
-   - Treat each failed configured Tester command in the generated context as the finding that caused
-     this correction. Inspect its structured result and named logs, then verify whether the current
-     candidate addresses it. A result bound to the prior candidate explains the correction; it is
-     not passing evidence for the current commit.
+   - Read current verification requirements in the generated context and inspect their bound
+     structured results and named logs. Only established unresolved candidate defects require
+     source correction. Missing evidence and unexplained command failures need diagnosis;
+     applicable accepted proof remains effective through unrelated failures. Historical results
+     retain their original candidate and do not establish a pass for a changed commit.
    - Verify `Untestable:` justifications from progress.md rather than accepting them at face value. Reasons like "trivial delegation" or "framework guarantee" are fair; "hard to set up" usually isn't.
    - Each behavior in behaviors.md should have at least one test that verifies it. Flag behaviors without a verifying test.
    - Do not rerun the full suite. If the Tester evidence omits one result needed to decide a concrete finding, you may run one named missing evidence check. Use the shared candidate cache with `CARGO_HOME="{{reviewer_cache_dir}}/cargo-home" CARGO_TARGET_DIR="{{reviewer_cache_dir}}/target"` for Cargo. Record the exact command and result in review.md.
@@ -100,7 +101,7 @@ remediation is named, emit exactly one `Disposition: code-change` line.
    - Every new or changed EARS statement should have a `Test:` reference or `Untestable:` marker. Missing markers are gaps.
 {{/if}}
 {{#if is_review_behaviors_with_final_tester}}
-   - For each `Test:` reference, verify the matching entry in the `tests` array of tester-results.json has `status: pass`. A failed test or a missing reference is a finding.
+   - For each `Test:` reference, inspect the current shared assessment and its supporting evidence. Whole-script and named-test references need their exact passing native identity; a command reference needs its exact canonical occurrence or supported legacy reviewed host proof. Descriptions do not select tests. Report missing evidence as a verification gap and establish its cause before asking for source correction.
    - If tester-results.json has a non-null `error` field, produce a single finding naming the error `kind` and `message` — don't flag individual behaviors when the test infrastructure itself failed.
 {{/if}}
 {{#if is_review_behaviors_before_final_tester}}

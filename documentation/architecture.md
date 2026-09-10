@@ -477,7 +477,8 @@ but never repair. The later landing check remains an independent final safeguard
 
 After the final Tester, the host runs a final-Tester candidate gate before it
 creates a Merge Candidate or launches the Learner. The gate matches each `Test:`
-reference to its passing structured result. Inside `candidate_gate.rs`, Rust
+reference to its passing structured result. `verification_reference.rs` parses
+declared meanings and adapts supported native identities. Rust
 identities retain any supplied source path, binary, and module qualification.
 Supported forms are bare or qualified names, `path.rs (name)`, `path.rs::name`,
 and nextest's `binary$name` or `binary name`, including qualified names inside
@@ -509,12 +510,32 @@ Short method identities remain supported when unambiguous. The gate retains
 every supplied path, module, and class qualifier, so a result from another
 supplied class cannot satisfy the reference through its method name alone.
 
-For `.sh` references, the exact
+For legacy `.sh` references, the exact
 committed script path identifies the test at both gates. A parenthetical such as
 `tests/lifecycle.sh (help documents drain lifecycle)` describes coverage; it
 need not appear in source or result text. The structured result may use a
 project-specific harness display label, but must still name the exact path and
 pass. Applicable reviewers assess whether the script covers the stated behavior.
+
+Explicit `Test:` objects distinguish whole-script, named-test, and command
+requirements. `whole-script` requires `path`; `named-test` requires `path` and
+native `name`, with an optional Rust `binary`; `command` requires the exact
+`command`, with an optional zero-based `command_index`. Every kind accepts
+non-identity `description` metadata. Unknown fields, malformed values, and
+contradictory qualifiers cannot establish a pass. A named shell result must use
+the exact `path::name`; a whole-script pass cannot satisfy it. An explicit
+command must resolve to a committed canonical entry, and duplicate command text
+requires an index. See the [planning examples](../skills/fluent.full/references/define-behaviors.md#rules).
+
+`verification_assessment.rs` evaluates references and canonical checks below the
+gate, recovery, executor, and status consumers. It reuses `verification_policy`
+and `check_applicability`, with no calls to orchestration or execution modules.
+Each reference ID binds the Work Item, Attempt, approved requirement row,
+reference occurrence, and original-text digest. Diagnostic wording and ordering
+do not create obligations. The read-only result separates satisfaction, cause,
+owner, next action, and source bindings. Status uses nonmutating snapshots and
+bounded managed-file reads. An assessment records what was valid at its explicit
+evaluation time; execution boundaries must revalidate current applicability.
 
 The gate builds its Rust and Python evidence views before selecting a passing result.
 Failed and skipped tests still count when resolving a short name. Matching
@@ -528,8 +549,9 @@ These checks consume the canonical final Tester output; they add no test run
 before review. Required coverage, applicable reviews, the complete final Tester,
 and a successful Learner remain mandatory.
 
-Missing selector evidence starts a corrective Writer round and
-invalidates the superseded review and Tester frontier. When the only missing
+Missing or uninterpretable evidence pauses for diagnosis and verification
+recovery. Only established unresolved candidate defects authorize a corrective
+Writer, including when reopening a saved gate. When the only missing
 evidence is one complete command-shaped `Test:` reference that did not run in
 canonical Tester, Fluent pauses before another Writer. It binds
 host-run evidence to the exact rejected gate and candidate, then asks a targeted
@@ -538,8 +560,8 @@ the exact command when the candidate gate runs again. Multiple missing commands,
 another failing gate check, candidate drift, and selector-only gaps remain
 ineligible for this route. When missing evidence
 coincides with failed Tester commands, the gate records every failed command,
-its exit code, and its durable stdout and stderr paths so the Writer can inspect
-the harness failure instead of renaming a test blindly. The correction Task
+its exit code, and its durable stdout and stderr paths so diagnosis can establish
+whether a candidate change is needed. An authorized correction Task
 attaches the gate, the exact structured Tester result, and only the stdout and
 stderr files for nonzero commands. Those files receive individual read-only
 sandbox grants; their parent directories and sibling Tester artifacts remain
@@ -554,7 +576,8 @@ the current SHA-256 digest; the host validates that exact set before it can
 launch another review wave. A legacy recovery recognizes only a generic Learner
 failure whose retained gate proves this exact
 frozen-evidence gap; it retracts the pending candidate that never passed Learner
-advancement and resumes the same Attempt at that Writer boundary. Other Learner
+advancement and rechecks the cause in the same Attempt. A gap alone pauses for
+diagnosis without adding a Writer. Other Learner
 failures retain their existing recovery disposition.
 
 A capture Learner runs a separate gate after canonicalizing expertise but before
@@ -615,11 +638,13 @@ bodies. Corrective Writers save complete command output under their task
 artifact's `commands/` directory and inspect concise summaries or relevant
 failure excerpts in the model conversation.
 
-The generated context also turns every nonzero configured Tester command in an
-attached `tester-results.json` into a current finding. The finding names the
-command, exit code, and exact stdout and stderr logs, while its stable identity
-uses the command index and command text rather than round-specific artifact
-paths. After the Writer returns a corrected candidate, the tests reviewer alone
+The generated context includes the shared current verification assessment.
+Canonical checks retain their configuration digest and command occurrence;
+native failures retain their qualified identity. The Writer matrix receives
+only unresolved candidate defects from that assessment. Missing or unknown
+historical proof stays blocking diagnostic context, and applicable accepted host
+proof keeps its external owner. Diagnostic lines and historical command failures
+do not each become a new Writer row. After the Writer returns a corrected candidate, the tests reviewer alone
 receives that structured result and its failed-command logs. If an unchanged
 Writer follows the failed Tester, correction artifacts resolve the exact
 candidate-bound Tester result by path rather than assuming a newer Tester must
@@ -1130,7 +1155,7 @@ directory, comparison commit, original Tester Task, and immutable manifest,
 result, and log references. Attachment creates a targeted Tests Review without
 requiring a failed ordinary Review or recheck. Passing review records its digest
 and acceptance before further advancement. `check_applicability` resolves declared comparison inputs below both Tester and
-recovery. `recovery_contracts` evaluates the complete original result plus
+recovery. `verification_assessment` evaluates the complete original result plus
 applicable reviewed replacements; it does not
 rewrite the failed source result. Missing commands, unattributed structured
 failures, invalid extraction, and unresolved process leaks still block readiness.
@@ -1187,7 +1212,7 @@ complete canonical run against the unchanged candidate and committed checker
 inputs before considering a new Tester. This includes a Plan Review that settled
 after a historical no-change Writer.
 
-Required-check admission and status use `recovery_contracts` to revalidate the
+Required-check admission and status use the shared verification assessment to revalidate the
 same source digests, candidate, policy and targeted Review bindings. Foreground
 resume, queue admission, scheduler claim and direct Review Task launch each use
 that evaluator before execution. Read-only status reports the outstanding check
@@ -1212,9 +1237,11 @@ reuse the same paths and require identical bytes, including a partial publicatio
 that stopped before review reservation. Acceptance checks the referenced proof
 as well as the passing targeted Review.
 
-Work and Attempt record schema 3 and transaction schema 2 fence executables
-that predate this authority. Current readers accept earlier supported records
-and schema-1 journals. The compatibility test invokes the pinned pre-change
+Work and Attempt record schema 4, writer envelope schema 2, completion contract
+and matrix version 2, and transaction schema 3 fence executables that predate
+explicit verification meaning. Candidate gates use schema 5; execution context
+with a verification assessment uses schema 2. Current readers accept supported
+earlier records and journals. The compatibility test invokes the pinned pre-change
 executable against both published and pending state and checks exact bytes. The
 pinned-reader
 regression preserves required-check policy, source and reconstruction references,
@@ -1222,6 +1249,11 @@ and accepted Review digests through public current writes. It makes a Task
 record directory unwritable to interrupt a real public mutation after journal
 publication, verifies that the old executable cannot recover it, and then lets
 the current executable recover without losing authority or changing audit bytes.
+`tests/fixtures/build-verification-old-reader.sh` builds source
+`0b769cb4681aade324f0cee351832a94f8e72687` with locked, offline dependencies in a
+separate target directory. The canonical Tester requires that binary and verifies
+its source commit and executable SHA-256. Published records and real interrupted
+transactions exercise both outer and otherwise-hidden inner schema fences.
 
 When one missing focused result prevents a Tests Reviewer from deciding, the
 review may emit one `Evidence-Command` and one candidate-relative
@@ -3355,6 +3387,8 @@ fluent/main/
     lib.rs                   ← public API for tests
     auto_merge.rs            ← Auto-merge watcher for merge-ready Work Items
     candidate_gate.rs        ← Host-owned candidate admission and evidence
+    verification_reference.rs ← Declared reference and native result identities
+    verification_assessment.rs ← Read-only current requirements and bound proof
     tester.rs                ← Tester subcommand (deterministic test runner)
     claude_auth.rs           ← Claude OAuth authentication
     cleanup.rs               ← Cleanup of terminal Work state
@@ -3550,6 +3584,16 @@ Three files form the Tester contract:
   `summary`, and `error` fields. A guarded command may also carry optional
   `process_settlement` evidence without replacing its output or exit-status
   record. All five reviewers receive it via `input_artifacts`.
+
+Tester preserves each raw native test `id` and status and adds a normalized
+typed `identity` where supported. Producers may supply that identity directly,
+but it must agree with qualifiers already present in the raw ID. For shell
+results, `{"kind":"whole-script","path":"tests/check.sh"}` differs from
+`{"kind":"named-test","path":"tests/check.sh","name":"stops"}`.
+Rust and Python identities preserve binary, module, class, source path, and native
+name where supplied. Harness display text cannot grant a passing identity or
+author a canonical command occurrence. The host continues to bind commands,
+configuration, extractor, result provenance, and accepted review evidence.
 
 These contract files live at the top of `.fluent/`, not under
 `.fluent/hooks/`. Top-level `.fluent/` entries are required

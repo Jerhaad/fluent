@@ -554,7 +554,7 @@ Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_
 
 WHEN the targeted Tests Review accepts candidate-gate host evidence, THE SYSTEM
 SHALL credit only its exact command when the candidate gate runs again.
-Test: src/candidate_gate.rs (python_command_reference_matches_accepted_candidate_bound_host_evidence)
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
 
 ### B15a
 
@@ -6442,7 +6442,9 @@ Test: src/tester.rs (tester_results_bind_once_to_the_exact_candidate_commit)
 IF a code-producing final Tester reports an introduced failure, a top-level
 infrastructure error, or no readable `tester-results.json`,
 THEN THE SYSTEM SHALL block Learning and Merge Candidate readiness and return
-the Tester artifact to a corrective Writer while write-round budget remains.
+established unresolved candidate defects to a corrective Writer while write-round
+budget remains. Missing or uninterpretable evidence SHALL pause for diagnosis
+without authorizing source correction.
 Test: src/work_attempt_loop.rs (tester_failure_routes_to_followup_within_budget)
 Test: src/work_attempt_loop.rs (tester_error_routes_to_followup_within_budget)
 Test: src/work_attempt_loop.rs (unreadable_final_tester_results_fail_closed)
@@ -6793,6 +6795,13 @@ currently open review finding as a pending row without inventing test-selector
 names. THE SYSTEM SHALL enumerate in the Writer instructions every Behavior,
 Approach, and required Plan row ID that a finding may cite.
 Test: src/work_task_executor.rs (corrective_writer_matrix_carries_planning_rows_and_adds_open_findings)
+
+WHEN current verification evidence establishes a candidate defect, THE SYSTEM
+SHALL add only unresolved candidate-correction obligations to the Writer's work,
+preserving applicable accepted proof and its external owner through unrelated
+failures and no-change Writer history.
+Test: src/work_attempt_loop.rs (writer_receives_only_unresolved_candidate_defects)
+Test: src/recovery_contracts.rs (accepted_evidence_survives_unrelated_failures_and_no_change_rounds)
 Test: src/work_task_executor.rs (corrective_writer_inherits_approved_ownership_matrix)
 Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execution_context)
 Test: src/work_task_executor.rs (reviewed_correction_prompt_is_bounded_and_references_full_artifacts_by_path)
@@ -7191,14 +7200,26 @@ SYSTEM SHALL check the committed script path without requiring that description
 to appear in its source.
 Test: src/candidate_gate.rs (matches_shell_script_without_description_literals)
 
+WHEN a `Test:` reference declares a whole-script, named-test, or complete-command
+kind, THE SYSTEM SHALL retain that meaning independently of its optional coverage
+description and preserve the approved meaning of supported legacy references.
+Test: src/candidate_gate.rs (explicit_reference_meaning_controls_evidence_matching)
+Test: src/candidate_gate.rs (unambiguous_legacy_reference_meaning_is_preserved)
+
 ### B27
 
 WHEN final structured Tester evidence is available, THE SYSTEM SHALL require a
-matching passing Rust test identity or shell-script identity for every approved
+matching passing native identity or bound command occurrence for every approved
 `Test:` reference.
 Test: src/candidate_gate.rs (validates_test_references_against_passing_structured_tester_evidence)
 Test: src/candidate_gate.rs (validates_nextest_integration_test_references)
 Test: src/candidate_gate.rs (shell_evidence_uses_the_harness_native_script_identity)
+
+WHEN a reference explicitly names a shell test, THE SYSTEM SHALL require a pass
+for its exact script path and native test name. A whole-script pass, another
+script's result, or a failed or skipped matching result SHALL NOT satisfy it.
+Test: src/candidate_gate.rs (named_shell_reference_requires_exact_script_and_test)
+Test: src/candidate_gate.rs (named_shell_reference_rejects_whole_script_and_conflicting_results)
 
 WHEN Rust results unambiguously identify the referenced test, THE SYSTEM SHALL
 accept bare or qualified native names, source-path wrappers, and nextest binary
@@ -7230,28 +7251,31 @@ WHEN the final Tester has completed and ordinary baseline comparison would
 otherwise pass, THE SYSTEM SHALL validate every approved `Test:` reference
 against that exact Tester's passing structured results before creating a Merge
 Candidate or launching the Learner.
-Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+Test: src/work_attempt_loop.rs (missing_evidence_does_not_authorize_writer)
 
 ### B27b
 
-IF the post-Tester candidate gate rejects frozen-candidate evidence, THEN THE
-SYSTEM SHALL route that gate artifact to the corrective Writer frontier.
-Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+IF required evidence is missing or uninterpretable, THEN THE SYSTEM SHALL route
+the requirement to verification recovery without treating that condition alone
+as a candidate defect. IF its cause is unknown, THEN THE SYSTEM SHALL pause at
+`needs-user` with the requirement, available evidence, and next diagnostic action.
+Test: src/work_attempt_loop.rs (missing_evidence_does_not_authorize_writer)
+Test: src/work_attempt_loop.rs (unclassified_verification_failure_pauses_for_diagnosis)
 
 ### B27c
 
 IF the post-Tester candidate gate rejects frozen-candidate evidence, THEN THE
 SYSTEM SHALL NOT create a Merge Candidate or launch the Learner for that
 evidence.
-Test: src/work_attempt_loop.rs (missing_behavior_tester_evidence_returns_to_writer_before_learner)
+Test: src/work_attempt_loop.rs (missing_evidence_does_not_authorize_writer)
 
 ### B27d
 
 WHEN Fluent reads an older complete Attempt whose generic Learner failure points
 to rejected gate evidence with missing Tester references, THE SYSTEM SHALL
-return that same Attempt to a corrective Writer with normalized post-Tester gate
-evidence.
-Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt)
+reassess the normalized post-Tester gate in that same Attempt and pause for
+diagnosis when evidence alone is missing, preserving the old Learner history.
+Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_pauses_for_diagnosis)
 
 ### B25f
 
@@ -7269,14 +7293,15 @@ the approved complete command or passing candidate-bound host evidence for that
 same command accepted by a targeted Tests Review.
 Test: src/candidate_gate.rs (python_command_reference_matches_exact_passing_tester_command)
 Test: src/candidate_gate.rs (python_command_reference_rejects_different_passing_tester_command)
-Test: src/candidate_gate.rs (python_command_reference_matches_accepted_candidate_bound_host_evidence)
+Test: src/host_evidence.rs (candidate_gate_evidence_is_candidate_bound_reviewed_and_idempotent)
+Test: src/candidate_gate.rs (python_command_reference_rejects_unbound_host_command_claim)
 
 ### B27e
 
-WHEN Fluent returns that exact older Attempt to its corrective Writer, THE
+WHEN Fluent recovers that exact older Attempt, THE
 SYSTEM SHALL remove its unreviewed, unlanded, Learner-unapproved Merge Candidate
 from pending land.
-Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_returns_to_same_writer_attempt)
+Test: src/work_attempt_loop.rs (legacy_learner_tester_evidence_failure_pauses_for_diagnosis)
 
 ### B27f
 
@@ -7288,10 +7313,11 @@ Test: src/work_attempt_loop.rs (legacy_evidence_recovery_rejects_nonempty_unreco
 
 ### B27g
 
-WHEN an operator explicitly queues the exact legacy Attempt for resume after an
-older false `candidate-ready` or corrected `blocked` dispatch, THE SYSTEM SHALL
-queue that same Attempt for the corrective recovery.
-Test: src/work_attempt_loop.rs (legacy_evidence_recovery_can_resume_false_ready_and_blocked_dispatches)
+WHEN an operator explicitly queues the exact legacy Attempt after an older
+false `candidate-ready` or corrected `blocked` dispatch, THE SYSTEM SHALL
+revalidate current verification requirements and reject correction admission
+when the evidence establishes only a missing-result gap.
+Test: src/work_attempt_loop.rs (legacy_evidence_recovery_blocks_false_ready_and_blocked_dispatches)
 Test: tests/binary.rs (queue_resume_requires_exact_legacy_learner_evidence)
 
 ### B28
@@ -7310,7 +7336,7 @@ Test: src/candidate_gate.rs (a_project_check_that_mutates_the_candidate_blocks_a
 
 ### B30
 
-IF a Writer candidate fails deterministic checks, THEN THE SYSTEM SHALL return
+IF deterministic checks establish a Writer candidate defect, THEN THE SYSTEM SHALL return
 the structured gate evidence as current findings to one corrective Writer
 without planning a reviewer or final Tester. The findings SHALL remain
 available when the artifact's absolute path is too long to include in full or
@@ -7333,7 +7359,8 @@ Test: tests/behaviors/operations/test-work-attempt-loop.sh (candidate gate block
 
 WHEN the user explicitly resumes a repeated rejected candidate gate, THE SYSTEM
 SHALL preserve the same Attempt, candidate workspace, and provider session and
-admit exactly one more corrective Writer. IF an older binary hard-failed that
+admit exactly one more corrective Writer only when current evidence establishes
+an unresolved candidate defect. IF an older binary hard-failed that
 already-planned corrective Writer before it produced output, THE SYSTEM SHALL
 replan that same Task only when its attached gate evidence still belongs to an
 earlier completed Writer; every other failed Attempt remains terminal.
@@ -7432,6 +7459,15 @@ current finding, unresolved progress entry, and correction-input artifact path
 within the bounded authoritative core.
 Test: src/work_task_executor.rs (execution_context_never_silently_omits_current_findings)
 Test: src/work_task_executor.rs (execution_context_is_bounded_and_preserves_authoritative_core)
+
+WHEN the candidate gate, Writer context and requirements, or status report
+verification, THE SYSTEM SHALL use the same current satisfaction, cause, owner,
+and supporting proof. Diagnostic wording and ordering SHALL NOT create or revive
+requirements. Changed or expired proof and unknown historical findings SHALL
+remain blocking for the applicable advancement.
+Test: tests/binary.rs (verification_views_agree_on_current_requirements)
+Test: src/recovery_contracts.rs (diagnostic_text_does_not_change_requirements)
+Test: src/recovery_contracts.rs (accepted_evidence_survives_unrelated_failures_and_no_change_rounds)
 
 ### B3
 
