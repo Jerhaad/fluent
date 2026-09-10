@@ -5358,15 +5358,30 @@ pub fn verification_views_for_test(
     Vec<crate::work_model::WriterCompletionFinding>,
     serde_json::Value,
 ) {
-    let task = &attempt.tasks[0];
+    let task = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write)
+        .unwrap();
+    let output = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    let inputs = resolve_input_artifact_paths(project_root, &task.input_artifacts).unwrap();
     let findings = writer_completion_findings(project_root, task).unwrap();
     let path = write_execution_context(
         &project_root.join(&task.artifact_area.as_ref().unwrap().path),
         workspace,
-        &task.output.as_ref().unwrap().commit,
-        None,
+        &output.commit,
+        output.base_commit.as_deref(),
         &[],
-        &[],
+        &inputs,
         None,
     )
     .unwrap();

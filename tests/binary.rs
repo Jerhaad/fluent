@@ -43543,6 +43543,228 @@ fi
 }
 
 #[test]
+fn corrective_writer_views_preserve_current_proof_and_history() {
+    use fluent::{candidate_gate::*, work_model::*};
+    let tmp = TempDir::new().unwrap();
+    let work = "corrective-verification-views";
+    let script = "#!/bin/sh\nbroken() { test -z broken; }\nif broken; then echo 'ok tests/native.sh::broken'; else echo 'not ok tests/native.sh::broken'; exit 1; fi\n";
+    let extractor = r#"#!/usr/bin/env python3
+import json, pathlib, sys
+lines=(pathlib.Path(sys.argv[1])/'commands/1-stdout.log').read_text().splitlines()
+print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':'fail' if line.startswith('not ') else 'pass', 'test_harness':'shell-harness'} for line in lines if line.startswith(('ok ', 'not ok '))]))
+"#;
+    let (project, candidate, results) = canonical_evidence_fixture_with_sources(
+        &tmp,
+        work,
+        &["false", "sh tests/native.sh"],
+        serde_json::json!({}),
+        Some(extractor),
+        &[("tests/native.sh", script)],
+    );
+    let store = WorkModelStore::new(&project);
+    attach_canonical_fixture_result(&tmp, &project, work, &candidate, 0, "false");
+    let mut item = store.read_work_item(work).unwrap();
+    let recovery = &mut item.attempts[0].evidence_recoveries[0];
+    // Seed completed targeted Review history; attachment itself used the public
+    // command and the production assessor still validates every bound byte.
+    recovery.state = EvidenceRecoveryState::Complete;
+    let target = &mut recovery.targets[0];
+    target.review_digest = Some(format!("sha256:{:x}", Sha256::digest(b"Verdict: pass\n")));
+    let reviewer_id = target.review_task_id.clone().unwrap();
+    let reviewer = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == reviewer_id)
+        .unwrap();
+    reviewer.status = TaskStatus::Complete;
+    let review_path = project
+        .join(&reviewer.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+    fs::write(review_path, "Verdict: pass\n").unwrap();
+    let contract = WriterCompletionContract {
+        version: WRITER_COMPLETION_CONTRACT_VERSION,
+        requirements: vec![WriterCompletionRequirement {
+            responsibility: None,
+            id: "behavior:current:b1".into(),
+            kind: WriterCompletionRequirementKind::Behavior,
+            source: "behaviors.md#current:b1".into(),
+            requirement: "THE SYSTEM SHALL verify current requirements.".into(),
+            command: None,
+            verification_refs: vec![
+                r#"{"kind":"command","command":"false","command_index":0}"#.into(),
+                r#"{"kind":"named-test","path":"tests/native.sh","name":"missing"}"#.into(),
+            ],
+        }],
+    };
+    item.attempts[0].writer_completion_contract = Some(contract.clone());
+    store.write_work_item(&item).unwrap();
+    let output = item.attempts[0].tasks[0].output.as_ref().unwrap().clone();
+    let workspace = project.join(&output.workspace_path);
+    let historical = work_artifact_path(work, "attempt-1", "historical/candidate-gate.json");
+    let gate_path = project.join(&historical);
+    let mut gate = run_candidate_gate(CandidateGateRequest {
+        project_root: &project,
+        workspace: &workspace,
+        work_item_id: work,
+        attempt_id: "attempt-1",
+        task_id: None,
+        phase: CandidateGatePhase::FinalTester,
+        base_commit: &candidate,
+        candidate_commit: &candidate,
+        completion_contract: Some(&contract),
+        allow_tree_identical_metadata_rewrite: false,
+        metadata_rewrite_authorization: None,
+        tester_results_path: Some(&results),
+        accepted_tester_commands: &[],
+        artifact_path: &gate_path,
+    })
+    .unwrap();
+    assert_eq!(gate.disposition, CandidateGateDisposition::Rejected);
+    let raw_results = fs::read(&results).unwrap();
+    let original_recovery = item.attempts[0].evidence_recoveries[0].clone();
+    let inputs = vec![
+        ArtifactRef {
+            producer_id: "candidate-gate".into(),
+            path: historical,
+        },
+        ArtifactRef {
+            producer_id: "tester".into(),
+            path: results
+                .strip_prefix(&project)
+                .unwrap()
+                .display()
+                .to_string(),
+        },
+    ];
+    let corrective = item
+        .add_next_write_round("attempt-1", inputs.clone())
+        .unwrap();
+    store.write_work_item(&item).unwrap();
+    let mut previous_ids = None;
+    for variant in 0..3 {
+        if variant > 0 {
+            gate.checks.reverse();
+            for check in &mut gate.checks {
+                check.diagnostics.reverse();
+                check
+                    .diagnostics
+                    .push(format!("Historical explanation {variant}"));
+            }
+            fs::write(&gate_path, serde_json::to_vec(&gate).unwrap()).unwrap();
+        }
+        if variant == 2 {
+            let writer = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == corrective)
+                .unwrap();
+            writer.status = TaskStatus::Complete;
+            let declaration = format!(
+                "{}/no-change.json",
+                writer.artifact_area.as_ref().unwrap().path
+            );
+            let mut unchanged = output.clone();
+            unchanged.no_change = Some(NoChangeOutput {
+                schema_version: 1,
+                declaration_path: declaration.clone(),
+                reason: "Preserve current proof".into(),
+                verification: vec![NoChangeVerification {
+                    command: "true".into(),
+                    result: NoChangeVerificationResult::Pass,
+                }],
+            });
+            fs::write(
+                project.join(declaration),
+                serde_json::to_vec(&unchanged.no_change).unwrap(),
+            )
+            .unwrap();
+            writer.output = Some(unchanged);
+            store.write_work_item(&item).unwrap();
+        }
+        let view = fluent::verification_assessment::assess_current_verification(
+            &project,
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(view.references[0].satisfied && view.commands[0].satisfied);
+        assert_eq!(view.commands[0].owner, CompletionResponsibility::Host);
+        assert!(!view.references[1].satisfied);
+        assert_eq!(view.candidate_defects().len(), 1);
+        let status = fluent::work_status::summarize_work_item(&item, Some(&project));
+        assert_eq!(status.verification.as_ref().unwrap(), &view);
+        let (findings, context) = fluent::work_task_executor::verification_views_for_test(
+            &project,
+            &item.attempts[0],
+            &workspace,
+        );
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the native defect belongs to Writer: {findings:?}"
+        );
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>();
+        if let Some(previous) = &previous_ids {
+            assert_eq!(&ids, previous);
+        }
+        previous_ids = Some(ids);
+        assert_eq!(
+            context["verification"],
+            serde_json::to_value(&view).unwrap()
+        );
+        assert_eq!(context["current-findings"].as_array().unwrap().len(), 1);
+        let history = context["historical-artifacts"].as_array().unwrap();
+        assert!(
+            inputs
+                .iter()
+                .all(|input| history.contains(&serde_json::json!(
+                    project.join(&input.path).display().to_string()
+                )))
+        );
+        assert!(
+            project
+                .join(
+                    &item.attempts[0]
+                        .tasks
+                        .iter()
+                        .find(|task| task.id == corrective)
+                        .unwrap()
+                        .artifact_area
+                        .as_ref()
+                        .unwrap()
+                        .path
+                )
+                .join("execution-context.json")
+                .is_file()
+        );
+        assert_eq!(item.attempts[0].evidence_recoveries[0], original_recovery);
+        assert_eq!(fs::read(&results).unwrap(), raw_results);
+    }
+    fs::write(
+        project.join(&original_recovery.attachment.snapshot_path),
+        "changed proof",
+    )
+    .unwrap();
+    let invalid =
+        fluent::verification_assessment::assess_current_verification(&project, &item.attempts[0])
+            .unwrap();
+    assert!(!invalid.commands[0].satisfied && !invalid.references[0].satisfied);
+    let (_, context) = fluent::work_task_executor::verification_views_for_test(
+        &project,
+        &item.attempts[0],
+        &workspace,
+    );
+    assert_eq!(
+        context["verification"],
+        serde_json::to_value(&invalid).unwrap()
+    );
+    assert_eq!(fs::read(results).unwrap(), raw_results);
+}
+
+#[test]
 fn changed_candidate_resumes_through_reviews_and_tester() {
     use fluent::work_model::*;
     let tmp = TempDir::new().unwrap();
