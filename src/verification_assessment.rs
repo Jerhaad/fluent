@@ -1276,7 +1276,18 @@ pub(crate) fn assess_references(
             row.satisfied = declared_command_is_bound
                 && result
                     .is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
-            if reference.declared.is_none() {
+            // A configured legacy command shares the canonical occurrence's
+            // ambiguity, applicability, and comparison checks. The historical
+            // adapter applies only after a current run proves the command lies
+            // outside its configured checks.
+            if reference.declared.is_none()
+                && canonical.is_some_and(|view| {
+                    !view
+                        .checks
+                        .iter()
+                        .any(|check| Some(check.command.as_str()) == reference.command.as_deref())
+                })
+            {
                 if let Some(proof) = accepted
                     .iter()
                     .find(|proof| reference.command.as_deref() == Some(proof.command.as_str()))

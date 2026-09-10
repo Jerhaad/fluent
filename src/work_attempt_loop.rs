@@ -16378,6 +16378,161 @@ mod tests {
     }
 
     #[test]
+    fn legacy_command_references_use_canonical_applicability() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in [
+            "duplicate",
+            "comparison",
+            "applicability",
+            "matching",
+            "outside",
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            let command = "python3 tests/check.py";
+            fs::write(
+                workspace.path().join("tests/check.py"),
+                "raise SystemExit(1)\n",
+            )
+            .unwrap();
+            let applicability = if case == "applicability" {
+                serde_json::json!({"environment":{"os":std::env::consts::OS}})
+            } else {
+                serde_json::json!({})
+            };
+            let mut definitions = vec![
+                serde_json::json!({"command":if case == "outside" { "true" } else { command },"test_harness":"shell-harness","applicability":applicability}),
+            ];
+            if case == "duplicate" {
+                definitions.push(definitions[0].clone());
+            }
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                serde_json::to_vec(&serde_json::json!({"commands":definitions})).unwrap(),
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", "tests/check.py", ".fluent"],
+                "stage legacy command fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare Python commands"],
+                "commit legacy command fixture",
+            )
+            .unwrap();
+            let candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            store
+                .mutate_work_item("work-1", |item| {
+                    for task in &mut item.attempts[0].tasks {
+                        if let Some(output) = &mut task.output {
+                            output.commit = candidate.clone();
+                        }
+                        if let Some(context) = &mut task.review_context {
+                            context.candidate_commit = candidate.clone();
+                        }
+                    }
+                    item.attempts[0].writer_completion_contract =
+                        crate::work_model::WriterCompletionContract::from_planning_context(
+                            &crate::work_model::PlanningContext {
+                                behaviors: Some(format!(
+                                    "### B1\n\nTHE SYSTEM SHALL verify the Python script.\nTest: {command}\n"
+                                )),
+                                ..Default::default()
+                            },
+                        );
+                    Ok(())
+                })
+                .unwrap();
+            let item = store.read_work_item("work-1").unwrap();
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            crate::tester::run(
+                workspace.path(),
+                &area,
+                true,
+                &crate::content::ContentResolver::new(Some(workspace.path())),
+            )
+            .unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            add_completed_focused_tests_evidence(root.path(), &store, command);
+            if case == "comparison" {
+                store
+                    .mutate_work_item("work-1", |item| {
+                        let review = item.attempts[0]
+                            .tasks
+                            .iter_mut()
+                            .find(|task| {
+                                task.kind == TaskKind::Review
+                                    && task.evidence_review_context.is_none()
+                            })
+                            .unwrap();
+                        review.review_context.as_mut().unwrap().base_commit =
+                            Some("different-comparison".into());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let item = store.read_work_item("work-1").unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            let expected = matches!(case, "matching" | "outside");
+            assert_eq!(view.commands[0].satisfied, expected, "{case}");
+            assert_eq!(
+                view.references[0].satisfied, expected,
+                "{case}: canonical and legacy references must agree"
+            );
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert_eq!(status.verification.as_ref().unwrap(), &view);
+            let results = area.join("tester-results.json");
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&results),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("current-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status
+                    == crate::candidate_gate::CandidateCheckStatus::Passed,
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn focused_proof_cannot_cover_duplicate_command_occurrences() {
         let root = tempfile::TempDir::new().unwrap();
         let (store, workspace, _) = final_tester_evidence_fixture(root.path());
