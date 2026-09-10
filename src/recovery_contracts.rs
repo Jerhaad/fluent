@@ -1113,22 +1113,24 @@ pub(crate) fn writer_completion_findings(
     let item = work_model::WorkModelStore::new(project_root)
         .read_work_item_snapshot(&task.work_item_id)
         .ok();
-    let assessment =
-        item.as_ref()
-            .and_then(|item| {
-                item.attempts
-                    .iter()
-                    .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+    let assessment = item
+        .as_ref()
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+        })
+        .filter(|attempt| {
+            attempt.tasks.iter().any(|task| {
+                task.kind == TaskKind::Write
+                    && task.status == TaskStatus::Complete
+                    && task.output.is_some()
             })
-            .filter(|attempt| {
-                attempt.tasks.iter().any(|task| {
-                    task.kind == TaskKind::Tester && task.status == TaskStatus::Complete
-                })
-            })
-            .map(|attempt| {
-                crate::verification_assessment::assess_current_verification(project_root, attempt)
-            })
-            .transpose()?;
+        })
+        .map(|attempt| {
+            crate::verification_assessment::assess_current_verification(project_root, attempt)
+        })
+        .transpose()?;
     for artifact in &task.input_artifacts {
         resolve_input_artifact_path(project_root, &artifact.path)?;
     }

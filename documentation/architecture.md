@@ -541,8 +541,9 @@ do not create obligations. The read-only result separates satisfaction, cause,
 owner, next action, and source bindings. Status uses nonmutating snapshots and
 bounded managed-file reads. An assessment records what was valid at its explicit
 evaluation time; execution boundaries must revalidate current applicability.
-Before a changed candidate has its first Tester, context and status use its
-pending assessment and retain earlier Tester failures only as history.
+Before a changed candidate has its first Tester, Writer requirements, context,
+and status use its pending assessment and retain earlier Tester failures only
+as history.
 The shared assessment also attributes suite failures to the retained pre-write
 baseline. Matching pre-existing failures do not become Writer obligations; an
 unrelated review or newly introduced failure retains its correction route.

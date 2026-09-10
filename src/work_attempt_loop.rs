@@ -12872,80 +12872,161 @@ mod tests {
 
     #[test]
     fn unsupported_reference_cannot_admit_saved_writer() {
-        let project = tempfile::tempdir().unwrap();
-        let (store, _workspace) = make_candidate_gate_fixture(
-            project.path(),
-            "#[test]\nfn required_behavior() {}\n",
-            None,
-        );
-        let mut item = store.read_work_item("work-1").unwrap();
-        item.attempts[0].writer_completion_contract =
-            crate::work_model::WriterCompletionContract::from_planning_context(
-                &crate::work_model::PlanningContext {
-                    behaviors: Some("### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {\"kind\":\"unknown\",\"path\":\"src/lib.rs\"}\n".into()),
-                    ..Default::default()
-                },
-            );
-        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
-        let artifact = ArtifactRef {
-            producer_id: item.attempts[0].tasks[0].id.clone(),
-            path: work_artifact_path(
-                "work-1",
-                "attempt-1",
-                "candidate-gates/attempt-1-write-1/candidate-gate.json",
-            ),
-        };
-        // Preserve a saved gate from the implementation that classified every
-        // unsupported reference as a source defect.
-        let gate = crate::candidate_gate::CandidateGateEvidence {
-            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
-            phase: crate::candidate_gate::CandidateGatePhase::Writer,
-            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
-            base_commit: output.base_commit.clone().unwrap(),
-            candidate_commit: output.commit.clone(),
-            tester_results_path: None,
-            metadata_rewrite: None,
-            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
-                name: "behavior-references".into(),
-                status: crate::candidate_gate::CandidateCheckStatus::Failed,
-                diagnostics: vec!["unsupported Test reference".into()],
-                log_path: None,
-            }],
-        };
-        let path = project.path().join(&artifact.path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let bytes = serde_json::to_vec_pretty(&gate).unwrap();
-        fs::write(&path, &bytes).unwrap();
-        let writer = item
-            .add_next_write_round("attempt-1", vec![artifact.clone()])
-            .unwrap();
-        store.write_work_item(&item).unwrap();
-        let reason = crate::recovery_contracts::validate_code_change_writer_start(
-            project.path(),
-            &item,
-            "attempt-1",
-            &writer,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(reason.contains("verification recovery"), "{reason}");
-        let view = crate::verification_assessment::assess_current_verification(
-            project.path(),
-            &item.attempts[0],
-        )
-        .unwrap();
-        assert!(
-            crate::recovery_contracts::findings_from_inputs(
-                project.path(),
-                &[artifact],
-                true,
-                Some(&view),
-            )
-            .unwrap()
-            .is_empty(),
-            "historical source checks cannot override the current cause"
-        );
-        assert_eq!(fs::read(path).unwrap(), bytes);
+        for (reference, source_defect) in [
+            (r#"{"kind":"unknown","path":"src/lib.rs"}"#, false),
+            ("src/missing.rs::required_behavior", true),
+        ] {
+            for unrelated_review in [false, true] {
+                let project = tempfile::tempdir().unwrap();
+                let (store, _workspace) = make_candidate_gate_fixture(
+                    project.path(),
+                    "#[test]\nfn required_behavior() {}\n",
+                    None,
+                );
+                let mut item = store.read_work_item("work-1").unwrap();
+                item.attempts[0].writer_completion_contract =
+                    crate::work_model::WriterCompletionContract::from_planning_context(
+                        &crate::work_model::PlanningContext {
+                            behaviors: Some(format!(
+                                "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {reference}\n"
+                            )),
+                            ..Default::default()
+                        },
+                    );
+                let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+                let artifact = ArtifactRef {
+                    producer_id: item.attempts[0].tasks[0].id.clone(),
+                    path: work_artifact_path(
+                        "work-1",
+                        "attempt-1",
+                        "candidate-gates/attempt-1-write-1/candidate-gate.json",
+                    ),
+                };
+                // Preserve a saved gate from the implementation that classified
+                // every unsupported reference as a source defect.
+                let gate = crate::candidate_gate::CandidateGateEvidence {
+                    schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+                    phase: crate::candidate_gate::CandidateGatePhase::Writer,
+                    disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+                    base_commit: output.base_commit.clone().unwrap(),
+                    candidate_commit: output.commit.clone(),
+                    tester_results_path: None,
+                    metadata_rewrite: None,
+                    checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                        name: "behavior-references".into(),
+                        status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                        diagnostics: vec!["unresolved Test reference".into()],
+                        log_path: None,
+                    }],
+                };
+                let path = project.path().join(&artifact.path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let bytes = serde_json::to_vec_pretty(&gate).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                let mut inputs = vec![artifact];
+                if unrelated_review {
+                    item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+                    let review = item.attempts[0]
+                        .tasks
+                        .iter_mut()
+                        .find(|task| task.kind == TaskKind::Review)
+                        .unwrap();
+                    review.status = TaskStatus::Complete;
+                    let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+                    fs::create_dir_all(project.path().join(&path).parent().unwrap()).unwrap();
+                    fs::write(
+                        project.path().join(&path),
+                        "Verdict: fail\n\n- [ ] Repair unrelated source handling\n",
+                    )
+                    .unwrap();
+                    inputs.push(ArtifactRef {
+                        producer_id: review.id.clone(),
+                        path,
+                    });
+                }
+                let writer = item.add_next_write_round("attempt-1", inputs).unwrap();
+                store.write_work_item(&item).unwrap();
+                assert!(
+                    !item.attempts[0]
+                        .tasks
+                        .iter()
+                        .any(|task| task.kind == TaskKind::Tester)
+                );
+                let admission = crate::recovery_contracts::validate_code_change_writer_start(
+                    project.path(),
+                    &item,
+                    "attempt-1",
+                    &writer,
+                );
+                assert_eq!(
+                    admission.is_ok(),
+                    source_defect || unrelated_review,
+                    "{admission:?}"
+                );
+                let view = crate::verification_assessment::assess_current_verification(
+                    project.path(),
+                    &item.attempts[0],
+                )
+                .unwrap();
+                assert_eq!(view.unresolved().count(), 1);
+                let row = &view.references[0];
+                assert_eq!(!view.candidate_defects().is_empty(), source_defect);
+                assert!(row.next_action.is_some());
+                let task = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == writer)
+                    .unwrap();
+                let findings =
+                    crate::recovery_contracts::writer_completion_findings(project.path(), task)
+                        .unwrap();
+                assert_eq!(
+                    findings.len(),
+                    usize::from(source_defect) + usize::from(unrelated_review),
+                    "only current correction belongs in Writer requirements: {findings:?}"
+                );
+                assert_eq!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.id == format!("finding:verification:{}", row.id)),
+                    source_defect
+                );
+                assert_eq!(
+                    findings
+                        .iter()
+                        .any(|finding| finding.requirement.contains("unrelated source handling")),
+                    unrelated_review
+                );
+                let status = crate::work_status::summarize_work_item(&item, Some(project.path()));
+                assert_eq!(status.verification.as_ref(), Some(&view));
+                #[cfg(feature = "test-support")]
+                {
+                    let (context_findings, context) =
+                        crate::work_task_executor::verification_views_for_test(
+                            project.path(),
+                            &item.attempts[0],
+                            _workspace.path(),
+                        );
+                    assert_eq!(context_findings, findings);
+                    assert_eq!(
+                        context["verification"],
+                        serde_json::to_value(&view).unwrap()
+                    );
+                    assert_eq!(
+                        context["current-findings"].as_array().unwrap().len(),
+                        findings.len()
+                    );
+                    assert!(
+                        context["historical-artifacts"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|value| value.as_str().unwrap().ends_with("candidate-gate.json"))
+                    );
+                }
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
     }
 
     #[test]
