@@ -13,7 +13,7 @@ use crate::work_model::{
     CANDIDATE_METADATA_REPAIR_ROLE, WriterCompletionContract, WriterCompletionRequirementKind,
 };
 
-pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 4;
+pub const CANDIDATE_GATE_SCHEMA_VERSION: u32 = 5;
 pub const CANDIDATE_GATE_FILE: &str = "candidate-gate.json";
 const CANDIDATE_GATE_MAX_BYTES: u64 = 256 * 1024;
 const MAX_PROJECT_CHECK_LOG_BYTES: u64 = 256 * 1024;

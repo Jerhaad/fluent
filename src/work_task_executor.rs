@@ -5200,8 +5200,8 @@ fn write_execution_context_with_finding_policy(
     let (executed_commands, omitted_executed_commands) =
         bounded_vec(executed_commands, EXECUTION_CONTEXT_MAX_COMMANDS);
     let mut context = ExecutionContextV1 {
+        schema_version: if verification.is_some() { 2 } else { 1 },
         verification,
-        schema_version: 1,
         candidate_commit: truncate_utf8(candidate_commit, 128),
         base_commit: base_commit
             .filter(|value| !value.is_empty())

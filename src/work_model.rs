@@ -30,7 +30,7 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// before this marker omit the field and are read as version 0. They remain
 /// readable, but the explicit `work-item upgrade` command rewrites them using
 /// this version after checking every record.
-pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 3;
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 4;
 pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
@@ -3092,7 +3092,7 @@ pub struct ProgressContract {
 
 /// Schema version for the immutable planning manifest that backs every
 /// host-generated Writer completion matrix.
-pub const WRITER_COMPLETION_CONTRACT_VERSION: u32 = 1;
+pub const WRITER_COMPLETION_CONTRACT_VERSION: u32 = 2;
 
 /// Maximum serialized size accepted for one Writer completion matrix. The
 /// matrix is prompt context and durable evidence, so fail before launching a
@@ -3357,7 +3357,7 @@ pub struct WriterCompletionContract {
 
 impl WriterCompletionContract {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != WRITER_COMPLETION_CONTRACT_VERSION {
+        if !(1..=WRITER_COMPLETION_CONTRACT_VERSION).contains(&self.version) {
             return Err(format!(
                 "unsupported completion contract version {}",
                 self.version
@@ -4132,7 +4132,7 @@ impl WriterCompletionMatrix {
                 WRITER_COMPLETION_MATRIX_MAX_BYTES
             ));
         }
-        if self.schema_version != WRITER_COMPLETION_CONTRACT_VERSION {
+        if !(1..=WRITER_COMPLETION_CONTRACT_VERSION).contains(&self.schema_version) {
             return Err(format!(
                 "Writer completion matrix schema version {} does not match {}",
                 self.schema_version, WRITER_COMPLETION_CONTRACT_VERSION
@@ -4187,7 +4187,7 @@ impl WriterCompletionMatrix {
                 WRITER_COMPLETION_MATRIX_MAX_BYTES
             ));
         }
-        if self.schema_version != WRITER_COMPLETION_CONTRACT_VERSION {
+        if !(1..=WRITER_COMPLETION_CONTRACT_VERSION).contains(&self.schema_version) {
             return Err(format!(
                 "Writer completion matrix schema version {} does not match {}",
                 self.schema_version, WRITER_COMPLETION_CONTRACT_VERSION
@@ -4311,7 +4311,7 @@ impl WriterCompletionMatrix {
         prior: Option<&Self>,
     ) -> Result<Self, String> {
         contract.validate()?;
-        if contract.version != WRITER_COMPLETION_CONTRACT_VERSION {
+        if !(1..=WRITER_COMPLETION_CONTRACT_VERSION).contains(&contract.version) {
             return Err(format!(
                 "Writer completion contract schema version {} does not match {}",
                 contract.version, WRITER_COMPLETION_CONTRACT_VERSION
@@ -9389,7 +9389,7 @@ pub struct WorkModelSnapshot {
 }
 
 const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
-const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 2;
 
 /// Fence readers that deserialize the existing writer field as Option<String>.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9414,7 +9414,7 @@ fn deserialize_model_writer_version<'de, D: Deserializer<'de>>(
     }) = &writer
     {
         if format != WORK_MODEL_WRITER_ENVELOPE_FORMAT
-            || *schema_version != WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION
+            || !(1..=WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION).contains(schema_version)
         {
             return Err(serde::de::Error::custom(
                 "unsupported Work Item writer envelope format/schema",
@@ -9497,7 +9497,7 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
 }
 
 fn is_zero_u64(value: &u64) -> bool {
