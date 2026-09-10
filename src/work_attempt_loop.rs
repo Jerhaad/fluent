@@ -12815,6 +12815,147 @@ mod tests {
     }
 
     #[test]
+    fn reference_assessment_controls_writer_admission() {
+        for (reference, source_defect) in [
+            (r#"{"kind":"unknown","path":"src/lib.rs"}"#, false),
+            ("src/missing.rs::required_behavior", true),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let (store, _workspace) = make_candidate_gate_fixture(
+                project.path(),
+                "#[test]\nfn required_behavior() {}\n",
+                None,
+            );
+            let mut item = store.read_work_item("work-1").unwrap();
+            item.attempts[0].writer_completion_contract =
+                crate::work_model::WriterCompletionContract::from_planning_context(
+                    &crate::work_model::PlanningContext {
+                        behaviors: Some(format!(
+                            "### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {reference}\n"
+                        )),
+                        ..Default::default()
+                    },
+                );
+            store.write_work_item(&item).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                project.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            assert_eq!(!view.candidate_defects().is_empty(), source_defect);
+            let outcome =
+                gate_candidate_after_writer(project.path(), &store, &mut item, "attempt-1", 0)
+                    .unwrap()
+                    .unwrap();
+            if source_defect {
+                let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
+                    panic!("committed-source defects must retain correction: {outcome:?}");
+                };
+                crate::recovery_contracts::validate_code_change_writer_start(
+                    project.path(),
+                    &item,
+                    "attempt-1",
+                    &task_id,
+                )
+                .unwrap();
+            } else {
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("unsupported meaning must pause without a Writer: {outcome:?}");
+                };
+                let saved = store.read_work_item("work-1").unwrap();
+                assert_eq!(saved.attempts[0].tasks.len(), 1);
+                assert_eq!(saved.attempts[0].status, AttemptStatus::NeedsUser);
+                assert!(saved.merge_candidates.is_empty());
+                let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+                assert!(handoff.contains(&view.references[0].id), "{handoff}");
+                assert!(
+                    handoff.contains(view.references[0].next_action.as_deref().unwrap()),
+                    "{handoff}"
+                );
+                assert!(handoff.contains(&view.candidate_commit), "{handoff}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_reference_cannot_admit_saved_writer() {
+        let project = tempfile::tempdir().unwrap();
+        let (store, _workspace) = make_candidate_gate_fixture(
+            project.path(),
+            "#[test]\nfn required_behavior() {}\n",
+            None,
+        );
+        let mut item = store.read_work_item("work-1").unwrap();
+        item.attempts[0].writer_completion_contract =
+            crate::work_model::WriterCompletionContract::from_planning_context(
+                &crate::work_model::PlanningContext {
+                    behaviors: Some("### B1\n\nWHEN checks run, THE SYSTEM SHALL verify them.\nTest: {\"kind\":\"unknown\",\"path\":\"src/lib.rs\"}\n".into()),
+                    ..Default::default()
+                },
+            );
+        let output = item.attempts[0].tasks[0].output.as_ref().unwrap();
+        let artifact = ArtifactRef {
+            producer_id: item.attempts[0].tasks[0].id.clone(),
+            path: work_artifact_path(
+                "work-1",
+                "attempt-1",
+                "candidate-gates/attempt-1-write-1/candidate-gate.json",
+            ),
+        };
+        // Preserve a saved gate from the implementation that classified every
+        // unsupported reference as a source defect.
+        let gate = crate::candidate_gate::CandidateGateEvidence {
+            schema_version: crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION,
+            phase: crate::candidate_gate::CandidateGatePhase::Writer,
+            disposition: crate::candidate_gate::CandidateGateDisposition::Rejected,
+            base_commit: output.base_commit.clone().unwrap(),
+            candidate_commit: output.commit.clone(),
+            tester_results_path: None,
+            metadata_rewrite: None,
+            checks: vec![crate::candidate_gate::CandidateCheckEvidence {
+                name: "behavior-references".into(),
+                status: crate::candidate_gate::CandidateCheckStatus::Failed,
+                diagnostics: vec!["unsupported Test reference".into()],
+                log_path: None,
+            }],
+        };
+        let path = project.path().join(&artifact.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&gate).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let writer = item
+            .add_next_write_round("attempt-1", vec![artifact.clone()])
+            .unwrap();
+        store.write_work_item(&item).unwrap();
+        let reason = crate::recovery_contracts::validate_code_change_writer_start(
+            project.path(),
+            &item,
+            "attempt-1",
+            &writer,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(reason.contains("verification recovery"), "{reason}");
+        let view = crate::verification_assessment::assess_current_verification(
+            project.path(),
+            &item.attempts[0],
+        )
+        .unwrap();
+        assert!(
+            crate::recovery_contracts::findings_from_inputs(
+                project.path(),
+                &[artifact],
+                true,
+                Some(&view),
+            )
+            .unwrap()
+            .is_empty(),
+            "historical source checks cannot override the current cause"
+        );
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
     fn missing_evidence_does_not_authorize_writer() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());

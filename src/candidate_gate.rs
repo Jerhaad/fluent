@@ -1792,9 +1792,7 @@ fn check_behavior_references(
         }
     }
     for row in &rows {
-        if row.meaning.is_none()
-            || row.cause == Some(crate::verification_assessment::VerificationCause::CandidateDefect)
-        {
+        if row.cause == Some(crate::verification_assessment::VerificationCause::CandidateDefect) {
             source_diagnostics.extend(row.diagnostics.clone());
         }
     }
@@ -1807,13 +1805,31 @@ fn check_behavior_references(
         .iter()
         .filter(|row| {
             !row.satisfied
-                && row.meaning.is_some()
                 && row.cause
                     != Some(crate::verification_assessment::VerificationCause::CandidateDefect)
         })
-        .flat_map(|row| row.diagnostics.clone())
+        .flat_map(|row| {
+            let mut diagnostics = row.diagnostics.clone();
+            if row.cause
+                == Some(crate::verification_assessment::VerificationCause::UninterpretableEvidence)
+            {
+                diagnostics.push(format!(
+                    "{}: {}",
+                    row.id,
+                    row.next_action
+                        .as_deref()
+                        .unwrap_or("Inspect retained evidence")
+                ));
+            }
+            diagnostics
+        })
         .collect::<Vec<_>>();
-    let status = if request.tester_results_path.is_none() {
+    let status = if rows.iter().any(|row| {
+        row.cause
+            == Some(crate::verification_assessment::VerificationCause::UninterpretableEvidence)
+    }) {
+        CandidateCheckStatus::Error
+    } else if request.tester_results_path.is_none() {
         CandidateCheckStatus::Skipped
     } else if evidence_diagnostics.is_empty() {
         CandidateCheckStatus::Passed

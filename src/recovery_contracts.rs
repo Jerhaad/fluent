@@ -1226,7 +1226,11 @@ pub(crate) fn findings_from_inputs(
             .iter()
             .filter(|check| check.status == candidate_gate::CandidateCheckStatus::Failed)
         {
-            if check.name == "tester-reference-evidence" && assessment.is_some() {
+            if matches!(
+                check.name.as_str(),
+                "tester-reference-evidence" | "behavior-references"
+            ) && assessment.is_some()
+            {
                 continue;
             }
             let role = "candidate-gate";
@@ -3789,10 +3793,7 @@ pub(crate) fn validate_verification_writer_start(
                     check.status == candidate_gate::CandidateCheckStatus::Failed
                         && matches!(
                             check.name.as_str(),
-                            "whitespace"
-                                | "commit-metadata"
-                                | "behavior-references"
-                                | "project-check"
+                            "whitespace" | "commit-metadata" | "project-check"
                         )
                 })
             {
