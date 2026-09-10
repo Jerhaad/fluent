@@ -9209,48 +9209,17 @@ fn interpret_reviews(
     let tester_gate_applicable = failed.is_empty() && uncertain.is_empty();
     let tester_result_path =
         latest_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let canonical_run_recorded = tester_result_path
+    // A completed Tester remains authoritative even when its legacy artifact
+    // cannot be reconstructed. Only the neutral assessor classifies its facts.
+    let canonical_assessment = tester_result_path
         .as_ref()
-        .and_then(|path| path.parent())
-        .is_some_and(|area| area.join("canonical-run.json").exists());
-    let assessed_checks = crate::recovery_contracts::assess_canonical_checks(
-        project_root,
-        &item.attempts[attempt_index],
-    );
-    let tester_external_evidence_is_recovered = assessed_checks
-        .as_ref()
-        .is_ok_and(|view| view.is_satisfied());
-    let needs_diagnosis = !tester_external_evidence_is_recovered
-        && tester_result_path.as_ref().is_some_and(|path| {
-            unexplained_failed_tester_commands(path, baseline_path.as_deref()) > 0
-        })
-        && (assessed_checks
-            .as_ref()
-            .is_ok_and(|view| !view.diagnoses.is_empty())
-            || tester_result_path
-                .as_ref()
-                .and_then(|path| fs::read(path).ok())
-                .and_then(|bytes| {
-                    serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok()
-                })
-                .is_some_and(|results| results.needs_failure_diagnosis()));
-    // Every available current assessment controls advancement, including
-    // reconstructed default-policy runs. Recorded runs retain that authority
-    // when a binding read fails.
-    let canonical_assessment = (assessed_checks.is_ok()
-        || canonical_run_recorded
-        || needs_diagnosis
-        || item.attempts[attempt_index]
-            .evidence_recoveries
-            .iter()
-            .any(|recovery| {
-                recovery
-                    .required_check
-                    .as_ref()
-                    .is_some_and(|check| check.source.is_canonical_tester())
-            }))
-    .then_some(assessed_checks);
+        .filter(|_| tester_gate_applicable)
+        .map(|_| {
+            crate::verification_assessment::assess_canonical_checks(
+                project_root,
+                &item.attempts[attempt_index],
+            )
+        });
     if tester_gate_applicable
         && canonical_assessment.as_ref().is_some_and(|assessment| {
             assessment.as_ref().map_or(true, |view| {
@@ -9289,77 +9258,15 @@ fn interpret_reviews(
             &|_| {},
         );
     }
-    let tester_fail_count = tester_result_path
-        .as_ref()
-        .filter(|_| tester_gate_applicable)
-        .map(|p| {
-            if let Some(Ok(view)) = &canonical_assessment {
-                view.defects.len()
-            } else if tester_external_evidence_is_recovered {
-                0
-            } else {
-                introduced_tester_failures(p, baseline_path.as_deref())
-            }
-        })
-        .unwrap_or(0);
-    // A planned and completed canonical Tester without a readable result is an
-    // infrastructure failure, never permission to advance without evidence.
-    let tester_has_error = tester_result_path
-        .as_ref()
-        .filter(|_| tester_gate_applicable)
-        .map(|p| !p.is_file() || (!tester_external_evidence_is_recovered && tester_errored(p)))
-        .unwrap_or(false);
-    let tester_failed_command_count = tester_result_path
-        .as_ref()
-        .filter(|_| tester_gate_applicable)
-        .map(|path| {
-            if let Some(Ok(view)) = &canonical_assessment {
-                view.outstanding.len()
-            } else if tester_external_evidence_is_recovered {
-                0
-            } else {
-                unexplained_failed_tester_commands(path, baseline_path.as_deref())
-            }
-        })
-        .unwrap_or(0);
+    let (tester_fail_count, tester_failed_command_count) = match &canonical_assessment {
+        Some(Ok(view)) => (view.defects.len(), view.outstanding.len()),
+        // Unverifiable completed evidence already paused above. No evidence
+        // here means this review round does not consume a Tester result.
+        None => (0, 0),
+        Some(Err(_)) => unreachable!("canonical assessment errors pause before correction"),
+    };
 
-    if tester_gate_applicable && tester_has_error {
-        let results = tester_result_path
-            .as_ref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok());
-        if results.as_ref().is_none_or(|results| {
-            results.error.as_ref().is_none_or(|error| {
-                !crate::verification_assessment::tester_error_is_candidate_defect(error)
-            })
-        }) {
-            let reason = format!(
-                "{}\nCanonical Tester evidence needs diagnosis. Restore readable, candidate-bound results or resolve the reported host infrastructure failure before retrying verification.\n",
-                tester_diagnosis_details(
-                    project_root,
-                    &item.attempts[attempt_index],
-                    tester_result_path.as_deref()
-                )
-            );
-            return settle_review_pause(
-                store,
-                project_root,
-                &item.id,
-                attempt_id,
-                AttemptReviewState::Failed,
-                PauseKind::HostEvidence,
-                &[],
-                |root, work, attempt, _| {
-                    let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
-                    crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
-                    Ok(handoff)
-                },
-                &|_| {},
-            );
-        }
-    }
-
-    if tester_gate_applicable && tester_fail_count == 0 && !tester_has_error {
+    if tester_gate_applicable && tester_fail_count == 0 {
         if let Some((artifact, evidence)) = gate_candidate_after_final_tester(
             project_root,
             &mut item,
@@ -9436,10 +9343,8 @@ fn interpret_reviews(
         }
     }
 
-    let has_failures = !failed.is_empty()
-        || tester_fail_count > 0
-        || tester_has_error
-        || tester_failed_command_count > 0;
+    let has_failures =
+        !failed.is_empty() || tester_fail_count > 0 || tester_failed_command_count > 0;
 
     if has_failures {
         if tester_failed_command_count > 0 {
@@ -9454,7 +9359,7 @@ fn interpret_reviews(
                     }
                 }
             }
-        } else if tester_fail_count > 0 || tester_has_error {
+        } else if tester_fail_count > 0 {
             if let Some(ref path) = tester_result_path {
                 if let Ok(relative) = path.strip_prefix(project_root) {
                     failed.push(ArtifactRef {
@@ -12262,14 +12167,58 @@ mod tests {
         };
         item.add_initial_attempt("attempt-1").unwrap();
 
+        let workspace_rel = ".fluent/work/workspaces/work-1/attempt-1/candidate";
+        let workspace = project_root.join(workspace_rel);
+        fs::create_dir_all(workspace.join(".fluent")).unwrap();
+        init_learner_repo(&workspace);
+        let mut results =
+            tester_json.and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+        if let Some(results) = &mut results {
+            if results["commands"].as_array().unwrap().is_empty() {
+                results["commands"] = serde_json::json!([{
+                    "command":"true", "test_harness":"shell-harness", "exit_code":0,
+                    "duration_ms":1, "stdout_log":"commands/0-stdout.log", "stderr_log":"commands/0-stderr.log"
+                }]);
+            }
+        }
+        let definitions = results.as_ref().map(|results| {
+            results["commands"].as_array().unwrap().iter().map(|command| {
+                serde_json::json!({"command":command["command"], "test_harness":command["test_harness"]})
+            }).collect::<Vec<_>>()
+        }).unwrap_or_else(|| vec![serde_json::json!({"command":"true", "test_harness":"shell-harness"})]);
+        fs::write(
+            workspace.join(".fluent/tester.yaml"),
+            serde_yaml::to_string(&serde_json::json!({"commands":definitions})).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".fluent/extract-tester-results"),
+            "#!/bin/sh\necho '[]'\n",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["add", "."],
+            "stage canonical fixture configuration",
+        )
+        .unwrap();
+        crate::git::run(
+            &workspace,
+            &["commit", "-q", "-m", "Add verification fixture"],
+            "commit canonical fixture configuration",
+        )
+        .unwrap();
+        let candidate =
+            crate::git::run_stdout(&workspace, &["rev-parse", "HEAD"], "read fixture candidate")
+                .unwrap();
         let attempt = &mut item.attempts[0];
         attempt.tasks[0].status = TaskStatus::Complete;
         attempt.tasks[0].output = Some(TaskOutput {
             workspace_id: "candidate".to_string(),
-            workspace_path: ".fluent/work/workspaces/work-1/attempt-1/candidate".to_string(),
+            workspace_path: workspace_rel.to_string(),
             source_branch: "work/attempt-1".to_string(),
             base_commit: None,
-            commit: "abc123".to_string(),
+            commit: candidate.clone(),
             no_change: None,
             learner_canonicalization: None,
         });
@@ -12282,7 +12231,23 @@ mod tests {
         if let Some(json) = tester_json {
             let tester_dir = project_root.join(&tester_artifact_path);
             fs::create_dir_all(&tester_dir).unwrap();
-            fs::write(tester_dir.join("tester-results.json"), json).unwrap();
+            if let Some(results) = &mut results {
+                results["candidate_commit"] = serde_json::json!(candidate);
+                for command in results["commands"].as_array().unwrap() {
+                    for key in ["stdout_log", "stderr_log"] {
+                        let path = tester_dir.join(command[key].as_str().unwrap());
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(path, "retained command output\n").unwrap();
+                    }
+                }
+                fs::write(
+                    tester_dir.join("tester-results.json"),
+                    serde_json::to_vec_pretty(results).unwrap(),
+                )
+                .unwrap();
+            } else {
+                fs::write(tester_dir.join("tester-results.json"), json).unwrap();
+            }
         }
 
         let review_artifact_path =
@@ -12301,6 +12266,17 @@ mod tests {
         )
         .unwrap();
 
+        for task in &mut item.attempts[0].tasks {
+            if matches!(task.kind, TaskKind::Review | TaskKind::Tester) {
+                task.review_context = Some(crate::work_model::ReviewContext {
+                    candidate_workspace_id: "candidate".into(),
+                    candidate_workspace_path: workspace_rel.into(),
+                    source_branch: "work/attempt-1".into(),
+                    candidate_commit: candidate.clone(),
+                    base_commit: None,
+                });
+            }
+        }
         store.create_work_item(&item).unwrap();
         (store, item)
     }
@@ -12353,7 +12329,10 @@ mod tests {
                 .review_context
                 .as_ref()
                 .map(|context| context.candidate_commit.as_str()),
-            Some("abc123")
+            stored.attempts[0].tasks[0]
+                .output
+                .as_ref()
+                .map(|output| output.commit.as_str())
         );
     }
 
@@ -12548,6 +12527,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (store, _) =
             make_interpret_reviews_fixture(tmp.path(), "PASS", Some(passing_tester_json()));
+        let prior = store.read_work_item("work-1").unwrap();
+        let candidate = prior.attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
+        let evidence_dir = latest_tester_results_path(tmp.path(), &prior.attempts[0])
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let results = fs::read(evidence_dir.join("tester-results.json")).unwrap();
+        let log = fs::read(evidence_dir.join("commands/0-stdout.log")).unwrap();
         let item = remove_round_tester(tmp.path(), &store);
         interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
 
@@ -12568,12 +12561,11 @@ mod tests {
             "attempt-1-tester",
         ));
         fs::create_dir_all(&tester_dir).unwrap();
-        fs::write(
-            tester_dir.join("tester-results.json"),
-            passing_tester_json(),
-        )
-        .unwrap();
+        fs::write(tester_dir.join("tester-results.json"), results).unwrap();
 
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), &log).unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), &log).unwrap();
         let item = store.read_work_item("work-1").unwrap();
         let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
 
@@ -12588,7 +12580,7 @@ mod tests {
             Some(AttemptReviewState::Passed)
         );
         assert_eq!(stored.merge_candidates.len(), 1);
-        assert_eq!(stored.merge_candidates[0].candidate_commit, "abc123");
+        assert_eq!(stored.merge_candidates[0].candidate_commit, candidate);
     }
 
     #[test]
@@ -12624,6 +12616,7 @@ mod tests {
         )
         .unwrap();
 
+        let retained = fs::read_to_string(tester_dir.join("tester-results.json")).unwrap();
         let outcome = interpret_reviews(
             tmp.path(),
             &store,
@@ -12648,7 +12641,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(tester_dir.join("tester-results.json")).unwrap(),
-            tester_json
+            retained
         );
         assert_eq!(
             fs::read_to_string(tester_dir.join("commands/0-stderr.log")).unwrap(),
@@ -12953,6 +12946,131 @@ mod tests {
             "historical source checks cannot override the current cause"
         );
         assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_tester_binding_errors_remain_authoritative() {
+        for has_contract in [false, true] {
+            for binding in [None, Some("different-candidate")] {
+                let project = tempfile::tempdir().unwrap();
+                let (store, workspace, candidate) = final_tester_evidence_fixture(project.path());
+                let mut item = store.read_work_item("work-1").unwrap();
+                if !has_contract {
+                    item.attempts[0].writer_completion_contract = None;
+                }
+                store.write_work_item(&item).unwrap();
+                let results =
+                    latest_tester_results_path(project.path(), &item.attempts[0]).unwrap();
+                assert!(
+                    !results
+                        .parent()
+                        .unwrap()
+                        .join("canonical-run.json")
+                        .exists()
+                );
+                assert!(
+                    crate::verification_assessment::assess_canonical_checks(
+                        project.path(),
+                        &item.attempts[0],
+                    )
+                    .unwrap()
+                    .is_satisfied(),
+                    "valid legacy command coverage must reconstruct"
+                );
+                let mut document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&results).unwrap()).unwrap();
+                document["candidate_commit"] = serde_json::json!(binding);
+                let bytes = serde_json::to_vec_pretty(&document).unwrap();
+                fs::write(&results, &bytes).unwrap();
+                let diagnosis = crate::verification_assessment::assess_current_verification(
+                    project.path(),
+                    &item.attempts[0],
+                )
+                .err()
+                .expect("unbound legacy evidence cannot satisfy current verification")
+                .to_string();
+                assert!(diagnosis.contains("candidate binding"), "{diagnosis}");
+                let status =
+                    crate::work_status::work_item_show_value(&item, project.path()).unwrap();
+                assert_eq!(status["evidence-recovery"]["can-resume"], false, "{status}");
+                assert!(
+                    status["evidence-recovery"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&diagnosis),
+                    "{status}"
+                );
+                let gate = crate::candidate_gate::run_candidate_gate(
+                    crate::candidate_gate::CandidateGateRequest {
+                        project_root: project.path(),
+                        workspace: workspace.path(),
+                        work_item_id: "work-1",
+                        attempt_id: "attempt-1",
+                        task_id: None,
+                        phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                        base_commit: item.attempts[0].tasks[0]
+                            .output
+                            .as_ref()
+                            .unwrap()
+                            .base_commit
+                            .as_deref()
+                            .unwrap(),
+                        candidate_commit: &candidate,
+                        completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                        allow_tree_identical_metadata_rewrite: false,
+                        metadata_rewrite_authorization: None,
+                        tester_results_path: Some(&results),
+                        accepted_tester_commands: &[],
+                        artifact_path: &project.path().join("comparison-gate.json"),
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    gate.disposition,
+                    crate::candidate_gate::CandidateGateDisposition::Blocked
+                );
+                let outcome =
+                    interpret_reviews(project.path(), &store, item, "attempt-1", true, None)
+                        .unwrap();
+                let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else {
+                    panic!("a shared binding error must pause legacy routing: {outcome:?}");
+                };
+                let saved = store.read_work_item("work-1").unwrap();
+                assert_eq!(saved.attempts[0].status, AttemptStatus::NeedsUser);
+                assert_eq!(saved.attempts[0].pause_kind, Some(PauseKind::HostEvidence));
+                assert!(saved.merge_candidates.is_empty());
+                assert!(saved.attempts[0].learning.is_none());
+                assert_eq!(
+                    saved.attempts[0]
+                        .tasks
+                        .iter()
+                        .filter(|task| task.kind == TaskKind::Write)
+                        .count(),
+                    1
+                );
+                let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+                assert!(handoff.contains(&diagnosis), "{handoff}");
+                assert!(handoff.contains(&candidate), "{handoff}");
+                let status =
+                    crate::work_status::work_item_show_value(&saved, project.path()).unwrap();
+                assert_eq!(status["evidence-recovery"]["can-resume"], false, "{status}");
+                assert!(
+                    status["evidence-recovery"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&diagnosis),
+                    "{status}"
+                );
+                assert_eq!(fs::read(&results).unwrap(), bytes);
+                assert!(
+                    !results
+                        .parent()
+                        .unwrap()
+                        .join("canonical-run.json")
+                        .exists()
+                );
+            }
+        }
     }
 
     #[test]
@@ -16116,6 +16234,19 @@ mod tests {
         store
             .mutate_work_item("work-1", |item| {
                 let attempt = &mut item.attempts[0];
+                let candidate = attempt
+                    .tasks
+                    .iter()
+                    .rev()
+                    .find(|task| {
+                        task.kind == TaskKind::Write && task.status == TaskStatus::Complete
+                    })
+                    .unwrap()
+                    .output
+                    .as_ref()
+                    .unwrap()
+                    .commit
+                    .clone();
                 let prior = attempt
                     .tasks
                     .iter()
@@ -16129,7 +16260,7 @@ mod tests {
                     .push(crate::work_model::EvidenceRecovery {
                         required_check: None,
                         id: "host-evidence-abc".to_string(),
-                        candidate_commit: "abc123".to_string(),
+                        candidate_commit: candidate.clone(),
                         attachment: crate::work_model::EvidenceAttachment {
                             snapshot_path:
                                 ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
@@ -16147,9 +16278,11 @@ mod tests {
                         code_change_classification: None,
                     });
                 let mut targeted = review_task_with_artifact(task_id, "behaviors", &artifact_path);
+                targeted.review_context = prior.review_context.clone();
+                targeted.workspace_access = prior.workspace_access.clone();
                 targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
                     recovery_id: "host-evidence-abc".to_string(),
-                    candidate_commit: "abc123".to_string(),
+                    candidate_commit: candidate.clone(),
                     attachment: crate::work_model::EvidenceAttachment {
                         snapshot_path:
                             ".fluent/work/artifacts/work-1/attempt-1/host-evidence/abc.json"
@@ -16526,6 +16659,13 @@ mod tests {
                         code_change_classification: None,
                     });
                 let mut targeted = review_task_with_artifact(targeted_id, "tests", &targeted_area);
+                let prior = attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == prior_id)
+                    .unwrap();
+                targeted.review_context = prior.review_context.clone();
+                targeted.workspace_access = prior.workspace_access.clone();
                 targeted.evidence_review_context = Some(crate::work_model::EvidenceReviewContext {
                     recovery_id,
                     candidate_commit: candidate.clone(),
@@ -17707,8 +17847,14 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             "required-check-needs-user.md",
         )))
         .unwrap();
+        let candidate = store_missing.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
         for expected in [
-            "abc123",
+            candidate.as_str(),
             "attempt-1-tester",
             "tester-results.json",
             "cannot read",
@@ -17735,8 +17881,14 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             "required-check-needs-user.md",
         )))
         .unwrap();
+        let candidate = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
         for expected in [
-            "abc123",
+            candidate.as_str(),
             "attempt-1-tester",
             "tester-results.json",
             "cannot parse",
@@ -17777,8 +17929,14 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
             "required-check-needs-user.md",
         )))
         .unwrap();
+        let candidate = store.read_work_item("work-1").unwrap().attempts[0].tasks[0]
+            .output
+            .as_ref()
+            .unwrap()
+            .commit
+            .clone();
         for expected in [
-            "abc123",
+            candidate.as_str(),
             "attempt-1-tester",
             "tester-results.json",
             "process_settlement_infrastructure",

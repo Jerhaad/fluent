@@ -3241,16 +3241,15 @@ pub(crate) fn required_check_recovery_status(
     }
     // Integrity failures remain authoritative even when native failures also
     // exist. Pending verification owners have already been admitted above.
-    if let Ok(canonical) = assess_canonical_checks(project_root, attempt) {
-        // Expired independent reviewer checks retain their refresh action below.
-        // Integrity failures unrelated to those checks still fail closed here.
-        if canonical.has_integrity_blockers {
-            return Ok(Some(RequiredCheckRecoveryStatus {
-                can_resume: false,
-                reason: canonical.blockers.join("\n\n"),
-                next_action: None,
-            }));
-        }
+    let canonical = assess_canonical_checks(project_root, attempt)?;
+    // Expired independent reviewer checks retain their refresh action below.
+    // Integrity failures unrelated to those checks still fail closed here.
+    if canonical.has_integrity_blockers {
+        return Ok(Some(RequiredCheckRecoveryStatus {
+            can_resume: false,
+            reason: canonical.blockers.join("\n\n"),
+            next_action: None,
+        }));
     }
     if attempt.writer_completion_contract.is_some()
         && attempt
