@@ -43864,6 +43864,33 @@ print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':
     .unwrap();
     item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
     store.write_work_item(&item).unwrap();
+    let pending =
+        fluent::verification_assessment::assess_current_verification(&project, &item.attempts[0])
+            .unwrap();
+    assert_eq!(pending.candidate_commit, candidate_b);
+    assert!(pending.commands.is_empty());
+    assert!(!pending.references[0].satisfied);
+    let (findings, context) = fluent::work_task_executor::verification_views_for_test(
+        &project,
+        &item.attempts[0],
+        &workspace,
+    );
+    assert!(findings.is_empty(), "{findings:?}");
+    assert_eq!(context["candidate-commit"], candidate_b);
+    assert_eq!(context["current-findings"], serde_json::json!([]));
+    assert!(
+        context["historical-artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| {
+                path.as_str()
+                    .is_some_and(|path| path.ends_with("tester-results.json"))
+            })
+    );
+    let status = fluent::work_status::summarize_work_item(&item, Some(&project));
+    assert_eq!(status.verification.as_ref(), Some(&pending));
+    let retained_results = fs::read(&old_results).unwrap();
     let bin = tmp.path().join("bin");
     write_mock_claude(
         &bin,
@@ -43908,6 +43935,10 @@ print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':
         serde_json::from_slice(&fs::read(old_results).unwrap()).unwrap();
     assert_eq!(old.candidate_commit.as_deref(), Some(candidate_a.as_str()));
     assert_eq!(old.summary.fail, 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&retained_results).unwrap(),
+        serde_json::to_value(old).unwrap()
+    );
 }
 
 fn verification_old_reader() -> PathBuf {

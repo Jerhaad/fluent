@@ -5333,14 +5333,16 @@ fn current_verification_for_context(
         .iter()
         .find(|attempt| attempt.id == parts[1].as_os_str().to_string_lossy())
         .context("missing context Attempt")?;
-    if !attempt.tasks.iter().any(|task| {
-        task.kind == TaskKind::Tester
-            && task.status == TaskStatus::Complete
-            && task
-                .review_context
-                .as_ref()
-                .is_some_and(|context| context.candidate_commit == candidate)
-    }) {
+    // A current candidate can still be awaiting its first Tester. Use the
+    // shared pending assessment instead of promoting retained failures to work.
+    if attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .is_none_or(|output| output.commit != candidate)
+    {
         return Ok(None);
     }
     Ok(Some((

@@ -541,6 +541,8 @@ do not create obligations. The read-only result separates satisfaction, cause,
 owner, next action, and source bindings. Status uses nonmutating snapshots and
 bounded managed-file reads. An assessment records what was valid at its explicit
 evaluation time; execution boundaries must revalidate current applicability.
+Before a changed candidate has its first Tester, context and status use its
+pending assessment and retain earlier Tester failures only as history.
 Returned integrity and binding blockers prevent final advancement even when
 native results pass, or the Attempt has no completion contract. Pending reviews
 and testing may still run to collect evidence. Diagnostic handoffs identify the
