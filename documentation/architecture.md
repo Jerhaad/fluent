@@ -543,7 +543,8 @@ bounded managed-file reads. An assessment records what was valid at its explicit
 evaluation time; execution boundaries must revalidate current applicability.
 Returned integrity and binding blockers prevent final advancement even when
 native results pass, or the Attempt has no completion contract. Pending reviews
-and testing may still run to collect evidence.
+and testing may still run to collect evidence. Diagnostic handoffs identify the
+candidate, Tester task, expected result path, specific error, and recorded logs.
 
 The gate builds its Rust and Python evidence views before selecting a passing result.
 Failed and skipped tests still count when resolving a short name. Matching

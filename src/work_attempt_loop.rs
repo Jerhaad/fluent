@@ -8809,6 +8809,89 @@ fn settle_review_pause(
     Ok(WorkAttemptRunOutcome::NeedsUser { handoff_path })
 }
 
+/// Render retained bindings and failures without reading or executing commands.
+fn tester_diagnosis_details(
+    project_root: &Path,
+    attempt: &Attempt,
+    results_path: Option<&Path>,
+) -> String {
+    let candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str())
+        .unwrap_or("not recorded");
+    let tester = attempt.tasks.iter().rev().find(|task| {
+        task.kind == TaskKind::Tester
+            && task.artifact_area.as_ref().is_some_and(|area| {
+                results_path.is_some_and(|path| {
+                    project_root.join(&area.path).join("tester-results.json") == path
+                })
+            })
+    });
+    let mut details = format!(
+        "Candidate: `{candidate}`\nTester task: `{}`\nExpected Tester results: `{}`\n",
+        tester
+            .map(|task| task.id.as_str())
+            .unwrap_or("not recorded"),
+        results_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not recorded".into())
+    );
+    let Some(path) = results_path else {
+        return details;
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            details.push_str(&format!(
+                "\nResult failure: cannot read Tester results: {error}\n"
+            ));
+            return details;
+        }
+    };
+    let results: crate::tester::TesterResults = match serde_json::from_slice(&bytes) {
+        Ok(results) => results,
+        Err(error) => {
+            details.push_str(&format!(
+                "\nResult failure: cannot parse Tester results: {error}\n"
+            ));
+            return details;
+        }
+    };
+    details.push_str(&format!(
+        "Result candidate: `{}`\n",
+        results
+            .candidate_commit
+            .as_deref()
+            .unwrap_or("not recorded")
+    ));
+    if let Some(error) = &results.error {
+        details.push_str(&format!(
+            "\nTester error `{}`: {}\n{}\n",
+            error.kind, error.message, error.details
+        ));
+    }
+    for (index, command) in results.commands.iter().enumerate() {
+        details.push_str(&format!(
+            "\nCommand {index}: `{}` (exit {})\nstdout: `{}`\nstderr: `{}`\n",
+            command.command,
+            command.exit_code,
+            path.parent()
+                .unwrap_or(project_root)
+                .join(&command.stdout_log)
+                .display(),
+            path.parent()
+                .unwrap_or(project_root)
+                .join(&command.stderr_log)
+                .display()
+        ));
+    }
+    details
+}
+
 fn interpret_reviews(
     project_root: &Path,
     store: &WorkModelStore,
@@ -9182,6 +9265,14 @@ fn interpret_reviews(
             })).collect::<Vec<_>>().join("\n\n"),
             Err(error) => format!("Required canonical check needs diagnosis; its bindings cannot be verified: {error:#}. Restore the named immutable proof before retrying."),
         };
+        let reason = format!(
+            "{}\n\n{reason}",
+            tester_diagnosis_details(
+                project_root,
+                &item.attempts[attempt_index],
+                tester_result_path.as_deref()
+            )
+        );
         return settle_review_pause(
             store,
             project_root,
@@ -9238,6 +9329,14 @@ fn interpret_reviews(
                 !crate::verification_assessment::tester_error_is_candidate_defect(error)
             })
         }) {
+            let reason = format!(
+                "{}\nCanonical Tester evidence needs diagnosis. Restore readable, candidate-bound results or resolve the reported host infrastructure failure before retrying verification.\n",
+                tester_diagnosis_details(
+                    project_root,
+                    &item.attempts[attempt_index],
+                    tester_result_path.as_deref()
+                )
+            );
             return settle_review_pause(
                 store,
                 project_root,
@@ -9248,8 +9347,7 @@ fn interpret_reviews(
                 &[],
                 |root, work, attempt, _| {
                     let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
-                    crate::atomic_write::atomic_write(&root.join(&handoff),
-                        b"Canonical Tester evidence needs diagnosis. Restore readable, candidate-bound results or resolve the reported host infrastructure failure before retrying verification.")?;
+                    crate::atomic_write::atomic_write(&root.join(&handoff), reason.as_bytes())?;
                     Ok(handoff)
                 },
                 &|_| {},
@@ -17173,6 +17271,20 @@ mod tests {
             matches!(outcome_missing, WorkAttemptRunOutcome::NeedsUser { .. }),
             "missing final Tester results must pause for diagnosis; got {outcome_missing:?}"
         );
+        let handoff = fs::read_to_string(tmp_missing.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        for expected in [
+            "abc123",
+            "attempt-1-tester",
+            "tester-results.json",
+            "cannot read",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
     }
 
     #[test]
@@ -17187,14 +17299,31 @@ mod tests {
             matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
             "unreadable final Tester evidence must pause for diagnosis; got {outcome:?}"
         );
+        let handoff = fs::read_to_string(tmp.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        for expected in [
+            "abc123",
+            "attempt-1-tester",
+            "tester-results.json",
+            "cannot parse",
+            "line 1 column",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
     }
 
     #[test]
     fn host_inventory_failure_does_not_schedule_a_writer() {
         let root = tempfile::TempDir::new().unwrap();
-        let source =
-            errored_tester_json().replace("extractor_failure", "process_settlement_infrastructure");
-        let (store, _) = make_interpret_reviews_fixture(root.path(), "PASS", Some(&source));
+        let mut source: serde_json::Value = serde_json::from_str(errored_tester_json()).unwrap();
+        source["error"] = serde_json::json!({"kind":"process_settlement_infrastructure", "message":"cannot inventory processes", "details":"process collector unavailable"});
+        source["commands"] = serde_json::json!([{"command":"host inventory", "test_harness":"shell-harness", "exit_code":0,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}]);
+        let (store, _) =
+            make_interpret_reviews_fixture(root.path(), "PASS", Some(&source.to_string()));
         let item = store.read_work_item("work-1").unwrap();
         let writers = item.attempts[0]
             .tasks
@@ -17212,6 +17341,24 @@ mod tests {
                 .count(),
             writers
         );
+        let handoff = fs::read_to_string(root.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "required-check-needs-user.md",
+        )))
+        .unwrap();
+        for expected in [
+            "abc123",
+            "attempt-1-tester",
+            "tester-results.json",
+            "process_settlement_infrastructure",
+            "cannot inventory processes",
+            "process collector unavailable",
+            "commands/0-stdout.log",
+            "commands/0-stderr.log",
+        ] {
+            assert!(handoff.contains(expected), "{expected}: {handoff}");
+        }
         let (bound_root, bound) = crate::recovery_contracts::verification_tests::fixture(false);
         let path = crate::verification_assessment::assess_canonical_checks(
             bound_root.path(),
