@@ -103,6 +103,8 @@ pub(crate) struct CanonicalCheckAssessment {
     pub outstanding: Vec<usize>,
     pub requested: Vec<UnresolvedReviewCheck>,
     pub accepted: Vec<usize>,
+    pub preexisting: Vec<usize>,
+    pub baseline: Option<work_model::BoundRecheckArtifact>,
     pub review_bindings: std::collections::HashMap<usize, Vec<work_model::BoundRecheckArtifact>>,
     pub blockers: Vec<String>,
     pub diagnoses: Vec<String>,
@@ -207,6 +209,30 @@ fn assess_canonical_checks_at(
         results.candidate_commit.as_deref() == Some(output.commit.as_str()),
         "canonical Tester result has a different or missing candidate binding"
     );
+    // The pre-write baseline explains suite health; it never supplies a
+    // passing result for an explicit reference. Keep the exact read as proof.
+    let baseline_path = format!(
+        "{}/tester-results.json",
+        work_model::work_artifact_path(
+            &attempt.work_item_id,
+            &attempt.id,
+            &format!("{}-baseline-tester", attempt.id)
+        )
+    );
+    let baseline = match fs::symlink_metadata(project_root.join(&baseline_path)) {
+        Ok(_) => {
+            let (binding, bytes) = bound_recovery_artifact(project_root, &baseline_path)?;
+            serde_json::from_slice::<crate::tester::TesterResults>(&bytes)
+                .ok()
+                .map(|results| (binding, results))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let baseline_results = baseline.as_ref().map(|(_, results)| results);
+    let preexisting_commands =
+        crate::tester_evidence::preexisting_failed_tester_commands(&results, baseline_results);
+    let mut preexisting = Vec::new();
     let workspace = candidate_workspace_path(project_root, output);
     let committed_bytes = |path: &str| -> Result<Vec<u8>> {
         let committed =
@@ -493,6 +519,8 @@ fn assess_canonical_checks_at(
                 } else if let Some(proof) = recheck_replacement {
                     review_bindings.insert(index, proof.bindings.clone());
                 }
+            } else if matches && local_applies && preexisting_commands.contains(&index) {
+                preexisting.push(index);
             } else {
                 outstanding.push(index);
                 if let Some(reason) = unmet_prerequisite {
@@ -515,7 +543,13 @@ fn assess_canonical_checks_at(
             test.id == format!("command-{index}:{}", command.command)
                 && test.test_harness == command.test_harness
         });
-        if !covered {
+        let preexisting = baseline_results.is_some_and(|baseline| {
+            baseline
+                .tests
+                .iter()
+                .any(|prior| prior.status == "fail" && prior.id == test.id)
+        });
+        if !covered && !preexisting {
             let native = references::normalized_result(test)
                 .map(|test| test.id)
                 .unwrap_or_else(|_| test.id.clone());
@@ -544,6 +578,8 @@ fn assess_canonical_checks_at(
         checks,
         outstanding,
         accepted,
+        preexisting,
+        baseline: baseline.map(|(binding, _)| binding),
         review_bindings,
         blockers,
     })
@@ -1418,7 +1454,7 @@ fn reference_is_satisfied(
                         && command_index.is_none_or(|expected| expected == *index)
                 })
                 .collect::<Vec<_>>();
-            let [(index, _result)] = matches.as_slice() else {
+            let [(index, result)] = matches.as_slice() else {
                 return false;
             };
             canonical.is_some_and(|view| {
@@ -1426,6 +1462,7 @@ fn reference_is_satisfied(
                     .get(*index)
                     .is_some_and(|check| check.command == command)
                     && !view.outstanding.contains(index)
+                    && (result.exit_code == 0 || view.accepted.contains(index))
             })
         }
         ReferenceMeaning::WholeScript { path, .. } => {
@@ -1554,6 +1591,7 @@ pub fn assess_current_verification_at(
     let mut commands = Vec::new();
     for (index, check) in canonical.checks.iter().enumerate() {
         let mut supporting = bindings.clone();
+        supporting.extend(canonical.baseline.iter().cloned());
         supporting.extend(
             canonical
                 .review_bindings
@@ -1607,7 +1645,9 @@ pub fn assess_current_verification_at(
             satisfied, cause: (!satisfied).then_some(VerificationCause::Unknown),
             owner: if canonical.accepted.contains(&index) { work_model::CompletionResponsibility::Host } else { work_model::CompletionResponsibility::Tester },
             next_action: (!satisfied).then(|| "Inspect the retained command logs and establish the cause before authorizing candidate correction.".into()),
-            bindings: supporting, diagnostics: canonical.diagnoses.clone(),
+            bindings: supporting, diagnostics: if canonical.preexisting.contains(&index) {
+                vec!["The command exit is explained by matching pre-write baseline failures; it is not passing evidence for an explicit reference.".into()]
+            } else { canonical.diagnoses.clone() },
         });
     }
     for defect in &canonical.defects {

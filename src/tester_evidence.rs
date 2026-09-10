@@ -81,22 +81,27 @@ pub(crate) fn unexplained_failed_tester_commands(
         Some(results) => results,
         None => return 0,
     };
-    let failed_count = current
+    let baseline = baseline_path
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok());
+    current
         .commands
         .iter()
         .filter(|command| command.exit_code != 0)
-        .count();
-    if failed_count == 0 {
-        return 0;
-    }
-    let baseline: crate::tester::TesterResults = match baseline_path
-        .and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok())
-    {
-        Some(results) if current.error.is_none() && results.error.is_none() => results,
-        _ => return failed_count,
-    };
+        .count()
+        - preexisting_failed_tester_commands(&current, baseline.as_ref()).len()
+}
 
+/// Attribute a failed command only through matching native baseline failures.
+pub(crate) fn preexisting_failed_tester_commands(
+    current: &crate::tester::TesterResults,
+    baseline: Option<&crate::tester::TesterResults>,
+) -> Vec<usize> {
+    let Some(baseline) =
+        baseline.filter(|baseline| current.error.is_none() && baseline.error.is_none())
+    else {
+        return vec![];
+    };
     current
         .commands
         .iter()
@@ -106,7 +111,7 @@ pub(crate) fn unexplained_failed_tester_commands(
                 return false;
             }
             let Some(baseline_command) = baseline.commands.get(*index) else {
-                return true;
+                return false;
             };
             let command_identity_matches = command.command == baseline_command.command
                 && command.test_harness == baseline_command.test_harness
@@ -145,13 +150,14 @@ pub(crate) fn unexplained_failed_tester_commands(
                 .filter(|test| test.status == "fail" && test.test_harness == command.test_harness)
                 .map(|test| test.id.as_str())
                 .collect::<HashSet<_>>();
-            !(command_identity_matches
+            command_identity_matches
                 && settlements_are_clean
                 && harness_is_unambiguous
                 && !current_failures.is_empty()
-                && current_failures.is_subset(&baseline_failures))
+                && current_failures.is_subset(&baseline_failures)
         })
-        .count()
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub(crate) fn baseline_tester_results_path(

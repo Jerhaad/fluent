@@ -9293,7 +9293,9 @@ fn interpret_reviews(
         .as_ref()
         .filter(|_| tester_gate_applicable)
         .map(|p| {
-            if tester_external_evidence_is_recovered {
+            if let Some(Ok(view)) = &canonical_assessment {
+                view.defects.len()
+            } else if tester_external_evidence_is_recovered {
                 0
             } else {
                 introduced_tester_failures(p, baseline_path.as_deref())
@@ -9311,7 +9313,9 @@ fn interpret_reviews(
         .as_ref()
         .filter(|_| tester_gate_applicable)
         .map(|path| {
-            if tester_external_evidence_is_recovered {
+            if let Some(Ok(view)) = &canonical_assessment {
+                view.outstanding.len()
+            } else if tester_external_evidence_is_recovered {
                 0
             } else {
                 unexplained_failed_tester_commands(path, baseline_path.as_deref())
@@ -14398,7 +14402,6 @@ mod tests {
         }]);
         results["summary"] = serde_json::json!({"total": 1, "pass": 0, "fail": 1, "skipped": 0});
         fs::write(&results_path, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
-        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
 
         let item = store.read_work_item("work-1").unwrap();
         let tester = item.attempts[0]
@@ -14417,6 +14420,8 @@ mod tests {
         ));
         fs::create_dir_all(&baseline).unwrap();
         fs::copy(&source, baseline.join("tester-results.json")).unwrap();
+        // Baseline evidence predates the Writer and its completion matrix.
+        complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
 
         let outcome = plan_after_completed_writer(
             project.path(),
@@ -14538,6 +14543,24 @@ mod tests {
         source_results["summary"] =
             serde_json::json!({"total": 2, "pass": 0, "fail": 2, "skipped": 0});
         fs::write(&source, serde_json::to_vec_pretty(&source_results).unwrap()).unwrap();
+        // Seed the pre-write failure before the Writer materializes its work.
+        let baseline = project.path().join(work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "attempt-1-baseline-tester",
+        ));
+        fs::create_dir_all(&baseline).unwrap();
+        let mut baseline_results = source_results.clone();
+        baseline_results["tests"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(1);
+        baseline_results["summary"] = serde_json::json!({"total":1,"pass":0,"fail":1,"skipped":0});
+        fs::write(
+            baseline.join("tester-results.json"),
+            serde_json::to_vec(&baseline_results).unwrap(),
+        )
+        .unwrap();
         complete_failed_tester_no_change_writer(project.path(), &store, &candidate);
 
         let outcome = plan_after_completed_writer(
@@ -14583,13 +14606,6 @@ mod tests {
         item.attempts[0].pause_kind = Some(PauseKind::RoundCap);
         item.attempts[0].review_state = Some(AttemptReviewState::Failed);
         store.write_work_item(&item).unwrap();
-        let baseline = project.path().join(work_artifact_path(
-            "work-1",
-            "attempt-1",
-            "attempt-1-baseline-tester",
-        ));
-        fs::create_dir_all(&baseline).unwrap();
-        fs::copy(&recheck_path, baseline.join("tester-results.json")).unwrap();
 
         assert!(
             reopen_baseline_covered_round_cap_attempt(
@@ -16452,6 +16468,279 @@ mod tests {
                 .iter()
                 .all(|task| !task.is_failed_command_recheck())
         );
+    }
+
+    #[test]
+    #[cfg(feature = "test-support")]
+    fn baseline_attribution_agrees_across_current_consumers() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in [
+            "pass",
+            "review",
+            "missing",
+            "failed-reference",
+            "command-reference",
+            "introduced",
+            "no-baseline",
+        ] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            let command = "sh tests/suite.sh";
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                format!("commands:\n  - command: {command}\n    test_harness: shell-harness\n"),
+            )
+            .unwrap();
+            fs::write(workspace.path().join("tests/behavior.rs"),
+                "#[test]\nfn required_behavior() {}\n#[test]\nfn preexisting_failure() {}\n#[test]\nfn missing_behavior() {}\n").unwrap();
+            fs::write(
+                workspace.path().join("tests/suite.sh"),
+                r#"#!/bin/sh
+if test 1 = 2; then result=pass; else result=fail; fi
+printf '{"id":"preexisting_failure","test_harness":"shell-harness","status":"%s"}\n' "$result"
+printf '%s\n' '{"id":"required_behavior","test_harness":"shell-harness","status":"pass"}'
+if test -f tests/introduced; then
+    printf '%s\n' '{"id":"introduced_failure","test_harness":"shell-harness","status":"fail"}'
+fi
+exit 1
+"#,
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::write(&extractor, r#"#!/usr/bin/env python3
+import json, pathlib, sys
+print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()]))
+"#).unwrap();
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", ".fluent", "tests"],
+                "stage suite fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare suite checks"],
+                "commit suite fixture",
+            )
+            .unwrap();
+            let mut candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            let mut item = store.read_work_item("work-1").unwrap();
+            for task in &mut item.attempts[0].tasks {
+                if let Some(output) = &mut task.output {
+                    output.commit = candidate.clone();
+                }
+                if let Some(context) = &mut task.review_context {
+                    context.candidate_commit = candidate.clone();
+                }
+            }
+            let reference = match case {
+                "missing" => "tests/behavior.rs::missing_behavior".to_string(),
+                "failed-reference" => "tests/behavior.rs::preexisting_failure".to_string(),
+                "command-reference" => {
+                    serde_json::json!({"kind":"command","command":command}).to_string()
+                }
+                _ => "tests/behavior.rs::required_behavior".to_string(),
+            };
+            item.attempts[0]
+                .writer_completion_contract
+                .as_mut()
+                .unwrap()
+                .requirements[0]
+                .verification_refs = vec![reference];
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            let results_ref = format!(
+                "{}/tester-results.json",
+                tester.artifact_area.as_ref().unwrap().path
+            );
+            let baseline_ref = format!(
+                "{}/tester-results.json",
+                work_artifact_path("work-1", "attempt-1", "attempt-1-baseline-tester")
+            );
+            let baseline_area = root
+                .path()
+                .join(&baseline_ref)
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            let resolver = crate::content::ContentResolver::new(Some(workspace.path()));
+            if case != "no-baseline" {
+                fs::create_dir_all(&baseline_area).unwrap();
+                crate::tester::run(workspace.path(), &baseline_area, true, &resolver).unwrap();
+            }
+            if case == "introduced" {
+                fs::write(workspace.path().join("tests/introduced"), "new failure\n").unwrap();
+                crate::git::run(
+                    workspace.path(),
+                    &["add", "tests/introduced"],
+                    "stage introduced failure",
+                )
+                .unwrap();
+                crate::git::run(
+                    workspace.path(),
+                    &["commit", "-qm", "Introduce a failure"],
+                    "commit introduced failure",
+                )
+                .unwrap();
+                candidate = crate::git::run_stdout(
+                    workspace.path(),
+                    &["rev-parse", "HEAD"],
+                    "read changed candidate",
+                )
+                .unwrap();
+                for task in &mut item.attempts[0].tasks {
+                    if let Some(output) = &mut task.output {
+                        output.commit = candidate.clone();
+                    }
+                    if let Some(context) = &mut task.review_context {
+                        context.candidate_commit = candidate.clone();
+                    }
+                }
+            }
+            crate::tester::run(workspace.path(), &area, true, &resolver).unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            let current_bytes = fs::read(area.join("tester-results.json")).unwrap();
+            let baseline_bytes = fs::read(root.path().join(&baseline_ref)).ok();
+            assert!(area.join("canonical-run.json").is_file());
+            let mut inputs = vec![ArtifactRef {
+                producer_id: "tester".into(),
+                path: results_ref.clone(),
+            }];
+            if case == "review" {
+                let review = item.attempts[0]
+                    .tasks
+                    .iter()
+                    .find(|task| task.kind == TaskKind::Review)
+                    .unwrap();
+                let path = format!("{}/review.md", review.artifact_area.as_ref().unwrap().path);
+                fs::write(
+                    root.path().join(&path),
+                    "Verdict: fail\n\n- [ ] Repair the unrelated source check\n",
+                )
+                .unwrap();
+                inputs.push(ArtifactRef {
+                    producer_id: review.id.clone(),
+                    path,
+                });
+            }
+            item.attempts[0].tasks[0].input_artifacts = inputs;
+            store.write_work_item(&item).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            let introduced = matches!(case, "introduced" | "no-baseline");
+            assert_eq!(
+                view.candidate_defects().len(),
+                usize::from(introduced),
+                "{case}: baseline failures are historical"
+            );
+            let reference_passes = matches!(case, "pass" | "review" | "introduced" | "no-baseline");
+            assert_eq!(view.references[0].satisfied, reference_passes, "{case}");
+            if !introduced {
+                assert!(
+                    view.commands[0].satisfied,
+                    "{case}: baseline explains the suite exit"
+                );
+                assert!(
+                    view.commands[0]
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.path == baseline_ref)
+                );
+            }
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert_eq!(status.verification.as_ref(), Some(&view), "{case}");
+            let (findings, context) = crate::work_task_executor::verification_views_for_test(
+                root.path(),
+                &item.attempts[0],
+                workspace.path(),
+            );
+            assert_eq!(
+                findings.len(),
+                usize::from(case == "review" || introduced),
+                "{case}: {findings:?}"
+            );
+            if case == "introduced" {
+                assert!(findings[0].requirement.contains("introduced_failure"));
+            }
+            assert_eq!(
+                context["current-findings"].as_array().unwrap().len(),
+                findings.len()
+            );
+            if case == "review" {
+                assert!(findings[0].requirement.contains("unrelated source check"));
+            }
+            let admission = crate::recovery_contracts::validate_verification_writer_start(
+                root.path(),
+                &item.attempts[0],
+                &item.attempts[0].tasks[0],
+            );
+            assert_eq!(admission.is_ok(), case == "review" || introduced, "{case}");
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&area.join("tester-results.json")),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("baseline-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status
+                    == crate::candidate_gate::CandidateCheckStatus::Passed,
+                reference_passes,
+                "{case}"
+            );
+            let outcome =
+                interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+            match case {
+                "pass" => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::MergeCandidateReady { .. }),
+                    "{outcome:?}"
+                ),
+                "review" | "introduced" | "no-baseline" => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
+                    "{outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+                    "{outcome:?}"
+                ),
+            }
+            assert_eq!(
+                fs::read(area.join("tester-results.json")).unwrap(),
+                current_bytes
+            );
+            assert_eq!(
+                fs::read(root.path().join(&baseline_ref)).ok(),
+                baseline_bytes
+            );
+        }
     }
 
     #[test]

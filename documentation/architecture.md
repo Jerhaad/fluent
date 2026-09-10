@@ -543,6 +543,10 @@ bounded managed-file reads. An assessment records what was valid at its explicit
 evaluation time; execution boundaries must revalidate current applicability.
 Before a changed candidate has its first Tester, context and status use its
 pending assessment and retain earlier Tester failures only as history.
+The shared assessment also attributes suite failures to the retained pre-write
+baseline. Matching pre-existing failures do not become Writer obligations; an
+unrelated review or newly introduced failure retains its correction route.
+Baseline attribution never substitutes for passing explicit-reference evidence.
 Returned integrity and binding blockers prevent final advancement even when
 native results pass, or the Attempt has no completion contract. Pending reviews
 and testing may still run to collect evidence. Diagnostic handoffs identify the
