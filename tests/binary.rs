@@ -43381,27 +43381,88 @@ fn plan_completed_acceptance_revalidates_bindings() {
 #[test]
 fn verification_views_agree_on_current_requirements() {
     use fluent::{candidate_gate::*, work_model::*};
-    for present in [true, false] {
+    for mode in ["pass", "missing", "fail", "skipped"] {
+        let present = mode == "pass";
+        let failed = mode == "fail";
         let tmp = TempDir::new().unwrap();
         let work = "verification-views";
-        // The command emits native TAP; the project extractor reads that exact log.
-        let command = if present {
-            "printf 'ok tests/native.sh::stops\\n'"
-        } else {
-            "printf 'ok tests/native.sh::other\\n'"
-        };
+        let command = format!("sh tests/native.sh {mode}");
         let extractor = r#"#!/usr/bin/env python3
 import json, pathlib, sys
 lines=(pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()
-print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness'} for line in lines if line.startswith('ok ')]))
+tests=[]
+for line in lines:
+    if line.startswith(('ok ', 'not ok ')):
+        status='fail' if line.startswith('not ok ') else 'pass'
+        name=line.removeprefix('not ').removeprefix('ok ')
+        if ' # SKIP' in name:
+            name=name.split(' # SKIP')[0]
+            status='skipped'
+        tests.append({'id':name, 'status':status, 'test_harness':'shell-harness'})
+print(json.dumps(tests))
+"#;
+        let script = r#"#!/bin/sh
+mode=$1
+stops() {
+    echo '# executed native assertion'
+    marker=$(mktemp)
+    if [ "$mode" != fail ]; then rm "$marker"; fi
+    test ! -e "$marker"
+    result=$?
+    rm -f "$marker"
+    return "$result"
+}
+other() { stops; }
+name=stops
+if [ "$mode" = missing ]; then name=other; fi
+if [ "$mode" = skipped ]; then
+    echo "ok tests/native.sh::$name # SKIP unavailable prerequisite"
+    exit 0
+fi
+if "$name"; then
+    echo "ok tests/native.sh::$name"
+else
+    echo "not ok tests/native.sh::$name"
+    exit 1
+fi
 "#;
         let (project, candidate, results) = canonical_evidence_fixture_with_sources(
             &tmp,
             work,
-            &[command],
+            &[&command],
             serde_json::json!({}),
             Some(extractor),
-            &[("tests/native.sh", "#!/bin/sh\nstops() { true; }\n")],
+            &[("tests/native.sh", script)],
+        );
+        let produced: fluent::tester::TesterResults =
+            serde_json::from_slice(&fs::read(&results).unwrap()).unwrap();
+        let stdout = fs::read_to_string(
+            results
+                .parent()
+                .unwrap()
+                .join(&produced.commands[0].stdout_log),
+        )
+        .unwrap();
+        assert_eq!(
+            stdout.contains("executed native assertion"),
+            mode != "skipped"
+        );
+        assert_eq!(produced.commands[0].exit_code, if failed { 1 } else { 0 });
+        let name = if mode == "missing" { "other" } else { "stops" };
+        assert_eq!(produced.tests[0].id, format!("tests/native.sh::{name}"));
+        assert_eq!(
+            produced.tests[0].status,
+            if failed {
+                "fail"
+            } else if mode == "skipped" {
+                "skipped"
+            } else {
+                "pass"
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&produced.tests[0].identity).unwrap(),
+            serde_json::json!({"kind":"named-test","path":"tests/native.sh","name":name})
         );
         let store = WorkModelStore::new(&project);
         let mut item = store.read_work_item(work).unwrap();
@@ -43423,9 +43484,9 @@ print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness
         )
         .unwrap();
         assert_eq!(assessment.references[0].satisfied, present);
-        assert!(assessment.candidate_defects().is_empty());
+        assert_eq!(assessment.candidate_defects().is_empty(), !failed);
         let status = fluent::work_status::summarize_work_item(&item, Some(&project));
-        assert_eq!(status.recovery_blocker.is_some(), !present);
+        assert_eq!(status.recovery_blocker.is_some(), !present && !failed);
         assert_eq!(
             status.verification.as_ref().unwrap().references,
             assessment.references
@@ -43469,11 +43530,11 @@ print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness
             &item.attempts[0],
             &workspace,
         );
-        assert!(
-            findings.is_empty(),
-            "evidence gaps are not Writer defects: {findings:?}"
+        assert_eq!(findings.is_empty(), !failed, "{findings:?}");
+        assert_eq!(
+            context["current-findings"].as_array().unwrap().is_empty(),
+            !failed
         );
-        assert!(context["current-findings"].as_array().unwrap().is_empty());
         assert_eq!(
             context["verification"]["references"][0]["satisfied"],
             present
