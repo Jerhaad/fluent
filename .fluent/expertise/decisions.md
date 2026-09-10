@@ -341,6 +341,27 @@ for source and evidence matching.
 
 ---
 
+## Assess verification below lifecycle consumers
+
+`verification_reference` owns declared reference meaning and native identity
+normalization. Structured producer identities must retain every qualifier in
+the raw identity; missing or conflicting paths, binaries, modules, or classes
+cannot weaken the match. `verification_assessment` owns the read-only current
+requirements, canonical command occurrences, failure causes, proof bindings,
+and accepted-evidence adapters. Candidate gating, Writer findings and context,
+status, and recovery admission consume that shared result. Keep scheduling,
+publication, and host execution in their existing lifecycle modules.
+
+Missing current evidence does not authorize a corrective Writer. A changed
+candidate may still run its ordinary reviews and canonical Tester, and a bound
+pending evidence Review may run while unrelated references remain unresolved.
+Known native failures and project-owned extractor defects retain correction;
+unreadable results and host infrastructure errors require diagnosis. Accepted
+legacy recheck proof covers its bound canonical command occurrence only, under
+default candidate-code applicability and the original comparison context.
+See `corrective_writer_views_preserve_current_proof_and_history` and
+`changed_candidate_resumes_through_reviews_and_tester` in `tests/binary.rs`.
+
 ## Canonical check identity includes configuration and position
 
 Use `tester:<tester.yaml-sha256>:<zero-based-command-index>` to select a canonical
@@ -363,9 +384,14 @@ and `legacy_evidence_reuses_proven_bindings_without_host_rerun` in `tests/binary
 
 ## Evidence authority fences older record and transaction writers
 
-Work and Attempt record schema 3 and transaction schema 2 prevent older
-executables from mutating away required-check acceptance or recovering a newer
-pending transaction. Current readers retain supported older records and journals.
+Work and Attempt record schema 4 and transaction schema 3 prevent older
+executables from removing explicit verification meaning, required-check
+acceptance, or recovering a newer pending transaction. Writer envelopes,
+completion contracts, and completion matrices use version 2; candidate gates
+use schema 5, and execution contexts containing verification assessments use
+schema 2. These extend the earlier record-3/transaction-2 authority fence.
+Current readers retain supported older records and journals through bounded
+compatibility adapters without inventing qualifiers or historical proof.
 Compatibility must use the pinned pre-change executable, including an interrupted
 real transaction, rather than model round trips alone.
 See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)

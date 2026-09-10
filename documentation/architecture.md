@@ -3587,7 +3587,8 @@ Three files form the Tester contract:
 
 Tester preserves each raw native test `id` and status and adds a normalized
 typed `identity` where supported. Producers may supply that identity directly,
-but it must agree with qualifiers already present in the raw ID. For shell
+but it must retain every qualifier already present in the raw ID; omitted or
+conflicting qualifiers invalidate the producer identity. For shell
 results, `{"kind":"whole-script","path":"tests/check.sh"}` differs from
 `{"kind":"named-test","path":"tests/check.sh","name":"stops"}`.
 Rust and Python identities preserve binary, module, class, source path, and native
