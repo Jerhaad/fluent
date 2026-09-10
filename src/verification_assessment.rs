@@ -107,6 +107,8 @@ pub(crate) struct CanonicalCheckAssessment {
     pub baseline: Option<work_model::BoundRecheckArtifact>,
     pub review_bindings: std::collections::HashMap<usize, Vec<work_model::BoundRecheckArtifact>>,
     pub blockers: Vec<String>,
+    /// Distinguish broken evidence bindings from renewable reviewer checks.
+    pub has_integrity_blockers: bool,
     pub diagnoses: Vec<String>,
     /// Demonstrated assertion or harness defects retain source correction.
     pub defects: Vec<CanonicalDefect>,
@@ -420,7 +422,6 @@ fn assess_canonical_checks_at(
         }
     }
     let requested = unresolved_review_checks(project_root, attempt, now);
-    blockers.extend(requested.iter().map(|check| check.reason.clone()));
     let reviewed = accepted_review_check_results(project_root, attempt, now);
     let rechecked = attempt
         .evidence_recoveries
@@ -590,7 +591,10 @@ fn assess_canonical_checks_at(
     }
     defects.sort_by(|a, b| a.id.cmp(&b.id));
     defects.dedup_by(|a, b| a.id == b.id);
+    let has_integrity_blockers = !blockers.is_empty();
+    blockers.extend(requested.iter().map(|check| check.reason.clone()));
     Ok(CanonicalCheckAssessment {
+        has_integrity_blockers,
         config_digest: manifest.config_digest,
         requested,
         defects,

@@ -3191,13 +3191,10 @@ pub(crate) fn required_check_recovery_status(
                     .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
         })
         .is_some();
-    if (attempt.status == work_model::AttemptStatus::Complete
-        && attempt.review_state == Some(work_model::AttemptReviewState::Passed))
-        || attempt.tasks.iter().any(|task| {
-            task.kind == TaskKind::Write
-                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
-        })
-    {
+    if attempt.tasks.iter().any(|task| {
+        task.kind == TaskKind::Write
+            && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
+    }) {
         return Ok(None);
     }
     if let Some(active) = attempt.active_evidence_recovery() {
@@ -3241,7 +3238,9 @@ pub(crate) fn required_check_recovery_status(
     // Integrity failures remain authoritative even when native failures also
     // exist. Pending verification owners have already been admitted above.
     if let Ok(canonical) = assess_canonical_checks(project_root, attempt) {
-        if !canonical.blockers.is_empty() {
+        // Expired independent reviewer checks retain their refresh action below.
+        // Integrity failures unrelated to those checks still fail closed here.
+        if canonical.has_integrity_blockers {
             return Ok(Some(RequiredCheckRecoveryStatus {
                 can_resume: false,
                 reason: canonical.blockers.join("\n\n"),
