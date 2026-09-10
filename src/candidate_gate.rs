@@ -4678,4 +4678,87 @@ mod tests {
         ]);
         assert_eq!(requested_host_evidence_command(&selector_only), None);
     }
+
+    fn explicit_gate(reference: &str, tests: serde_json::Value, commands: serde_json::Value) -> CandidateGateEvidence {
+        let fixture = Fixture::new();
+        fixture.commit("tests/native.sh", "#!/bin/sh\n", "Add native script");
+        fixture.commit("src/native.rs", "fn works() {}\n", "Add Rust test");
+        fixture.commit("tests/native.py", "class Native:\n def works(self): pass\n", "Add Python test");
+        let candidate = fixture.commit(".fluent/tester.yaml", "commands:\n  - command: check\n    test_harness: shell-harness\n  - command: check\n    test_harness: shell-harness\n", "Add configured checks");
+        let tester = fixture.artifacts.path().join("tester-results.json");
+        let values = tests.as_array().unwrap();
+        let results = serde_json::json!({"candidate_commit": candidate, "commands": commands, "tests": tests,
+            "summary":{"total":values.len(),"pass":values.iter().filter(|test| test["status"]=="pass").count(),"fail":values.iter().filter(|test| test["status"]=="fail").count(),"skipped":values.iter().filter(|test| test["status"]=="skipped").count()},"error":null});
+        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
+        let contract = behavior_contract(reference);
+        run_candidate_gate(fixture.request(&candidate, Some(&contract), Some(&tester), &fixture.artifacts.path().join("candidate-gate.json"))).unwrap()
+    }
+
+    #[test]
+    fn explicit_reference_meaning_controls_evidence_matching() {
+        let tests = serde_json::json!([
+            {"id":"tests/native.sh", "test_harness":"display", "status":"pass"},
+            {"id":"tests/native.sh::works", "test_harness":"display", "status":"pass"}
+        ]);
+        for reference in [
+            r#"{"kind":"whole-script","path":"tests/native.sh","description":"not a native identity"}"#,
+            r#"{"kind":"named-test","path":"tests/native.sh","name":"works","description":"another explanation"}"#,
+        ] {
+            assert_eq!(explicit_gate(reference, tests.clone(), serde_json::json!([])).disposition, CandidateGateDisposition::Passed);
+        }
+        let commands = serde_json::json!([
+            {"command":"check","test_harness":"shell-harness","exit_code":1,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"},
+            {"command":"check","test_harness":"shell-harness","exit_code":0,"duration_ms":1,"stdout_log":"commands/1-stdout.log","stderr_log":"commands/1-stderr.log"}
+        ]);
+        for (reference, expected) in [
+            (r#"{"kind":"command","command":"check","command_index":1,"description":"the second occurrence"}"#, CandidateGateDisposition::Passed),
+            (r#"{"kind":"command","command":"check"}"#, CandidateGateDisposition::Rejected),
+            (r#"{"kind":"command","command":"check","command_index":0}"#, CandidateGateDisposition::Rejected),
+            (r#"{"kind":"command","command":"check","command_index":2}"#, CandidateGateDisposition::Rejected),
+        ] { assert_eq!(explicit_gate(reference, serde_json::json!([]), commands.clone()).disposition, expected, "{reference}"); }
+        for malformed in [
+            r#"{"kind":"named-test","path":"tests/native.sh","name":"works","binary":"pkg"}"#,
+            r#"{"kind":"named-test","path":"tests/native.sh","name":""}"#,
+            r#"{"kind":"whole-script","path":"tests/native.sh","name":"works"}"#,
+            r#"{"kind":"named-test","path":"tests//native.sh","name":"works"}"#,
+            r#"{"kind":"named-test","path":"src/native.rs","name":"other.rs::works"}"#,
+            r#"{"kind":"unknown","path":"tests/native.sh"}"#,
+            r#"{"kind":"command","command":"check","command_index":-1}"#,
+        ] { assert_ne!(explicit_gate(malformed, tests.clone(), commands.clone()).disposition, CandidateGateDisposition::Passed, "{malformed}"); }
+    }
+
+    #[test]
+    fn named_shell_reference_requires_exact_script_and_test() {
+        let reference = r#"{"kind":"named-test","path":"tests/native.sh","name":"works"}"#;
+        for (id, expected) in [("tests/native.sh::works", true), ("tests/other.sh::works", false), ("tests/native.sh::other", false), ("native.sh::works", false)] {
+            let evidence = explicit_gate(reference, serde_json::json!([{"id":id,"status":"pass","test_harness":"shell-harness"}]), serde_json::json!([]));
+            assert_eq!(evidence.disposition == CandidateGateDisposition::Passed, expected, "{id}");
+        }
+        // A producer may separate its display label from its typed native identity.
+        let evidence = explicit_gate(reference, serde_json::json!([{"id":"human readable label", "status":"pass","test_harness":"shell-harness","identity":{"kind":"named-test","path":"tests/native.sh","name":"works"}}]), serde_json::json!([]));
+        assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
+    }
+
+    #[test]
+    fn named_shell_reference_rejects_whole_script_and_conflicting_results() {
+        let reference = r#"{"kind":"named-test","path":"tests/native.sh","name":"works"}"#;
+        for tests in [
+            serde_json::json!([{"id":"tests/native.sh","status":"pass","test_harness":"shell-harness"}]),
+            serde_json::json!([{"id":"tests/native.sh::works","status":"fail","test_harness":"shell-harness"}]),
+            serde_json::json!([{"id":"tests/native.sh::works","status":"skipped","test_harness":"shell-harness"}]),
+            serde_json::json!([{"id":"tests/native.sh::works","status":"pass","test_harness":"shell-harness"},{"id":"tests/native.sh::works","status":"fail","test_harness":"shell-harness"}]),
+            serde_json::json!([{"id":"tests/native.sh::works","status":"pass","test_harness":"shell-harness","identity":{"kind":"named-test","path":"tests/other.sh","name":"works"}}]),
+        ] { assert_ne!(explicit_gate(reference, tests, serde_json::json!([])).disposition, CandidateGateDisposition::Passed); }
+    }
+
+    #[test]
+    fn unambiguous_legacy_reference_meaning_is_preserved() {
+        for (reference, id) in [
+            ("tests/native.sh (coverage description)", "tests/native.sh"),
+            ("src/native.rs (pkg::lib$module::works)", "src/native.rs (pkg::lib$module::works)"),
+            ("tests/native.py (Native.works)", "works (module.Native)"),
+            (r#"{"kind":"named-test","path":"src/native.rs","name":"module::works","binary":"pkg::lib"}"#, "src/native.rs (pkg::lib$module::works)"),
+        ] { assert_eq!(explicit_gate(reference, serde_json::json!([{"id":id,"status":"pass","test_harness":"native"}]), serde_json::json!([])).disposition, CandidateGateDisposition::Passed, "{reference}"); }
+    }
+
 }

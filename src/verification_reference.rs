@@ -37,7 +37,7 @@ impl TestReference {
             ..
         }) = &self.declared
         {
-            if identity.binary.is_some_and(|native| native != binary) {
+            if !is_nextest_binary_id(binary) || identity.binary.is_some_and(|native| native != binary) {
                 return None;
             }
             identity.binary = Some(binary);
@@ -681,4 +681,49 @@ pub(crate) fn normalize_native_identity(id: &str) -> Option<NativeTestIdentity> 
         binary: identity.binary.map(str::to_owned),
         name: identity.name.into(),
     })
+}
+
+/// Validate supplied qualifiers against every qualifier retained in native text.
+/// A free-form display label may accompany a structured identity.
+pub(crate) fn normalized_result(test: &crate::tester::TestResult) -> Result<crate::tester::TestResult, String> {
+    let Some(identity) = &test.identity else { return Ok(test.clone()); };
+    let id = match identity {
+        NativeTestIdentity::WholeScript { path } => {
+            validate_test_path(path)?;
+            if let Some(native) = normalize_native_identity(&test.id) {
+                if native != *identity { return Err("native script identity contradicts producer text".into()); }
+            }
+            path.clone()
+        }
+        NativeTestIdentity::NamedTest { path, name } => {
+            validate_test_path(path)?;
+            if name.trim().is_empty() || name.trim() != name { return Err("native name is empty or malformed".into()); }
+            if let Some(native) = normalize_native_identity(&test.id) {
+                if native != *identity { return Err("native test identity contradicts producer text".into()); }
+            }
+            format!("{path}::{name}")
+        }
+        NativeTestIdentity::Rust { path, binary, name } => {
+            let native = binary.as_ref().map_or_else(|| name.clone(), |binary| format!("{binary}${name}"));
+            let id = path.as_ref().map_or_else(|| native.clone(), |path| format!("{path} ({native})"));
+            let parsed = RustTestIdentity::parse(&id).ok_or("malformed Rust identity")?;
+            if RustTestIdentity::parse(&test.id).is_some_and(|raw| !parsed.compatible_with(&raw)) {
+                return Err("Rust qualifiers contradict producer text".into());
+            }
+            id
+        }
+        NativeTestIdentity::Python { path, module, class, name } => {
+            if module.is_some() && class.is_none() { return Err("Python module needs a class qualifier".into()); }
+            let name = [module.as_deref(), class.as_deref(), Some(name.as_str())].into_iter().flatten().collect::<Vec<_>>().join(".");
+            let id = path.as_ref().map_or_else(|| name.clone(), |path| format!("{path}::{name}"));
+            let parsed = PythonTestIdentity::parse(&id).ok_or("malformed Python identity")?;
+            if PythonTestIdentity::parse(&test.id).is_some_and(|raw| !parsed.compatible_with(&raw)) {
+                return Err("Python qualifiers contradict producer text".into());
+            }
+            id
+        }
+    };
+    let mut result = test.clone();
+    result.id = id;
+    Ok(result)
 }

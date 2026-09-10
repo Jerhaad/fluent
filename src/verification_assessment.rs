@@ -1135,8 +1135,16 @@ pub(crate) fn assess_references(
             }
             let result =
                 results.filter(|results| results.candidate_commit.as_deref() == Some(candidate));
-            row.satisfied = result
-                .is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
+            let declared_command_is_bound = if let Some(ReferenceMeaning::Command { command, command_index, .. }) = &reference.declared {
+                let config = crate::git::run_raw(workspace, &["show", &format!("{candidate}:.fluent/tester.yaml")])?;
+                let config: Option<crate::tester::TesterConfig> = config.status.success().then(|| serde_yaml::from_slice(&config.stdout).ok()).flatten();
+                config.is_some_and(|config| {
+                    let entries = config.commands.iter().enumerate().filter(|(index, entry)| entry.command == *command && command_index.is_none_or(|expected| expected == *index)).collect::<Vec<_>>();
+                    let [(index, entry)] = entries.as_slice() else { return false; };
+                    result.is_some_and(|results| results.commands.get(*index).is_some_and(|result| result.command == entry.command && result.test_harness == entry.test_harness))
+                })
+            } else { true };
+            row.satisfied = declared_command_is_bound && result.is_some_and(|results| reference_is_satisfied(&reference, results, canonical));
             if row.satisfied {
                 row.cause = None;
                 row.next_action = None;
@@ -1232,6 +1240,10 @@ fn reference_is_satisfied(
     results: &crate::tester::TesterResults,
     canonical: Option<&CanonicalCheckAssessment>,
 ) -> bool {
+    let normalized = results.tests.iter().map(references::normalized_result).collect::<std::result::Result<Vec<_>, _>>();
+    let Ok(normalized) = normalized else { return false; };
+    let mut results = results.clone();
+    results.tests = normalized;
     match reference.meaning() {
         ReferenceMeaning::Command {
             command,
