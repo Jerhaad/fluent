@@ -3140,42 +3140,6 @@ pub(crate) fn required_check_recovery_status(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<RequiredCheckRecoveryStatus>> {
-    if attempt.writer_completion_contract.is_some()
-        && attempt
-            .tasks
-            .iter()
-            .any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
-    {
-        let assessment =
-            crate::verification_assessment::assess_current_verification(project_root, attempt)?;
-        let gaps = assessment
-            .references
-            .iter()
-            .filter(|row| {
-                !row.satisfied
-                    && row.cause
-                        != Some(crate::verification_assessment::VerificationCause::CandidateDefect)
-            })
-            .collect::<Vec<_>>();
-        if !gaps.is_empty() {
-            return Ok(Some(RequiredCheckRecoveryStatus {
-                can_resume: false,
-                reason: gaps
-                    .iter()
-                    .map(|row| {
-                        format!(
-                            "{}: {}. {}",
-                            row.id,
-                            row.diagnostics.join("; "),
-                            row.next_action.as_deref().unwrap_or("")
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-                next_action: None,
-            }));
-        }
-    }
     if let Some(expired) = inspect_expired_pending_evidence(project_root, attempt)? {
         let settled =
             validate_pending_evidence_owners(project_root, attempt, &expired.recovery).is_ok();
@@ -3219,13 +3183,14 @@ pub(crate) fn required_check_recovery_status(
         .rev()
         .find(|task| {
             task.kind == TaskKind::Tester
+                && !task.is_failed_command_recheck()
                 && task.status == TaskStatus::Complete
                 && task
                     .review_context
                     .as_ref()
                     .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
         })
-        .is_some_and(|task| !task.is_failed_command_recheck());
+        .is_some();
     if (!has_bound_check
         && !(has_canonical && attempt.pause_kind == Some(work_model::PauseKind::HostEvidence)))
         || (attempt.status == work_model::AttemptStatus::Complete
@@ -3256,6 +3221,42 @@ pub(crate) fn required_check_recovery_status(
     }
     if !has_canonical {
         return Ok(None);
+    }
+    if attempt.writer_completion_contract.is_some()
+        && attempt
+            .tasks
+            .iter()
+            .any(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+    {
+        let assessment =
+            crate::verification_assessment::assess_current_verification(project_root, attempt)?;
+        let gaps = assessment
+            .references
+            .iter()
+            .filter(|row| {
+                !row.satisfied
+                    && row.cause
+                        != Some(crate::verification_assessment::VerificationCause::CandidateDefect)
+            })
+            .collect::<Vec<_>>();
+        if !gaps.is_empty() {
+            return Ok(Some(RequiredCheckRecoveryStatus {
+                can_resume: false,
+                reason: gaps
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{}: {}. {}",
+                            row.id,
+                            row.diagnostics.join("; "),
+                            row.next_action.as_deref().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                next_action: None,
+            }));
+        }
     }
     let assessment = assess_canonical_checks(project_root, attempt)?;
     if assessment.is_satisfied() {
@@ -3486,6 +3487,105 @@ pub(crate) mod verification_tests {
             code_change_classification: None,
         });
         attempt.tasks.push(review);
+    }
+
+    #[test]
+    fn changed_candidate_can_run_reviews_and_its_first_tester() {
+        let (root, mut item) = fixture(true);
+        fs::write(root.path().join("candidate-change"), "repair").unwrap();
+        crate::git::run(root.path(), &["add", "candidate-change"], "stage repair").unwrap();
+        crate::git::run(
+            root.path(),
+            &["commit", "-qm", "Repair candidate"],
+            "commit repair",
+        )
+        .unwrap();
+        let commit =
+            crate::git::run_stdout(root.path(), &["rev-parse", "HEAD"], "read repair").unwrap();
+        let mut writer = item.attempts[0].tasks[0].clone();
+        writer.id = "attempt-1-write-2".into();
+        writer.output.as_mut().unwrap().commit = commit.clone();
+        item.attempts[0].tasks.push(writer);
+        item.attempts[0].status = AttemptStatus::Executing;
+        item.attempts[0].pause_kind = None;
+        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0])
+            .unwrap();
+        let pending = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
+        assert_eq!(pending.candidate_commit, commit);
+        assert!(pending.commands.is_empty());
+        assert!(!pending.references[0].satisfied);
+        item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        for task in &mut item.attempts[0].tasks {
+            if task.kind == TaskKind::Review {
+                task.status = TaskStatus::Complete;
+            }
+        }
+        item.add_final_tester_task("attempt-1").unwrap();
+        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0])
+            .unwrap();
+    }
+
+    #[test]
+    fn missing_reference_allows_pending_targeted_evidence_review() {
+        let (root, mut item) = fixture(false);
+        accept_first_check(root.path(), &mut item);
+        let workspace = root.path().join(".fluent/work/workspaces/candidate");
+        crate::git::run(
+            root.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                workspace.to_str().unwrap(),
+                "HEAD",
+            ],
+            "prepare managed candidate",
+        )
+        .unwrap();
+        item.attempts[0].tasks[0]
+            .output
+            .as_mut()
+            .unwrap()
+            .workspace_path = workspace.display().to_string();
+        let attempt = &mut item.attempts[0];
+        attempt.status = AttemptStatus::Executing;
+        attempt.pause_kind = Some(PauseKind::HostEvidence);
+        let recovery = &mut attempt.evidence_recoveries[0];
+        recovery.state = EvidenceRecoveryState::Reviewing;
+        let target = &mut recovery.targets[0];
+        let bytes = fs::read(root.path().join(&target.prior_review_artifact)).unwrap();
+        let prior = snapshot_path(
+            &item.id,
+            &attempt.id,
+            &crate::verification_policy::digest(&bytes),
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join(&prior).parent().unwrap()).unwrap();
+        fs::write(root.path().join(&prior), bytes).unwrap();
+        target.prior_review_artifact = prior.clone();
+        target.review_digest = None;
+        let review = attempt
+            .tasks
+            .iter_mut()
+            .find(|task| target.review_task_id.as_deref() == Some(task.id.as_str()))
+            .unwrap();
+        review.status = TaskStatus::Planned;
+        review
+            .evidence_review_context
+            .as_mut()
+            .unwrap()
+            .prior_review_artifact = prior;
+        let status = required_check_recovery_status(root.path(), attempt)
+            .unwrap()
+            .unwrap();
+        assert!(status.can_resume, "{}", status.reason);
+        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), attempt).unwrap();
+        assert!(
+            !assess_current_verification(root.path(), attempt)
+                .unwrap()
+                .references[0]
+                .satisfied
+        );
     }
 
     #[test]

@@ -1463,7 +1463,6 @@ pub fn assess_current_verification_at(
     attempt: &work_model::Attempt,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<VerificationAssessment> {
-    let canonical = assess_canonical_checks_at(project_root, attempt, now)?;
     let output = attempt
         .tasks
         .iter()
@@ -1471,6 +1470,37 @@ pub fn assess_current_verification_at(
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref())
         .context("no candidate")?;
+    // Absence of a run for a new candidate is pending work. Historical runs
+    // neither satisfy its requirements nor prevent its ordinary verification.
+    if !attempt.tasks.iter().any(|task| {
+        task.kind == TaskKind::Tester
+            && task.status == TaskStatus::Complete
+            && !task.is_failed_command_recheck()
+            && task
+                .review_context
+                .as_ref()
+                .is_some_and(|context| context.candidate_commit == output.commit)
+    }) {
+        return Ok(VerificationAssessment {
+            candidate_commit: output.commit.clone(),
+            references: match &attempt.writer_completion_contract {
+                Some(contract) => assess_references(
+                    &candidate_workspace_path(project_root, output),
+                    &attempt.work_item_id,
+                    &attempt.id,
+                    &output.commit,
+                    contract,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                )?,
+                None => vec![],
+            },
+            commands: vec![],
+        });
+    }
+    let canonical = assess_canonical_checks_at(project_root, attempt, now)?;
     let bytes = fs::read(&canonical.results_path)?;
     let results = serde_json::from_slice(&bytes)?;
     let bindings = vec![work_model::BoundRecheckArtifact {
