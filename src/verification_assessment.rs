@@ -11,6 +11,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+/// Credit only errors produced by the candidate's configuration or extractor.
+pub(crate) fn tester_error_is_candidate_defect(error: &crate::tester::TesterError) -> bool {
+    matches!(
+        error.kind.as_str(),
+        "tester_yaml_problem"
+            | "extractor_missing"
+            | "extractor_failure"
+            | "duplicate_test_ids"
+            | "invalid_test_identity"
+    )
+}
+
 const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 pub(crate) fn candidate_workspace_path(
     project_root: &Path,
@@ -301,13 +313,20 @@ fn assess_canonical_checks_at(
     }
     let mut defects = Vec::new();
     if let Some(error) = &results.error {
-        defects.push(CanonicalDefect {
-            id: format!("tester-harness:{}:{}", manifest.config_digest, error.kind),
-            diagnostic: format!(
-                "canonical Tester has an unresolved extractor or harness error: {}",
+        if tester_error_is_candidate_defect(error) {
+            defects.push(CanonicalDefect {
+                id: format!("tester-harness:{}:{}", manifest.config_digest, error.kind),
+                diagnostic: format!(
+                    "canonical Tester has an unresolved extractor or harness error: {}",
+                    error.kind
+                ),
+            });
+        } else {
+            blockers.push(format!(
+                "canonical Tester needs infrastructure diagnosis: {}",
                 error.kind
-            ),
-        });
+            ));
+        }
     }
     if results.summary.total != results.tests.len()
         || results.summary.pass

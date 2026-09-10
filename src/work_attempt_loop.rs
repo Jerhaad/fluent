@@ -9265,6 +9265,35 @@ fn interpret_reviews(
         })
         .unwrap_or(0);
 
+    if tester_gate_applicable && tester_has_error {
+        let results = tester_result_path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok());
+        if results.as_ref().is_none_or(|results| {
+            results.error.as_ref().is_none_or(|error| {
+                !crate::verification_assessment::tester_error_is_candidate_defect(error)
+            })
+        }) {
+            return settle_review_pause(
+                store,
+                project_root,
+                &item.id,
+                attempt_id,
+                AttemptReviewState::Failed,
+                PauseKind::HostEvidence,
+                &[],
+                |root, work, attempt, _| {
+                    let handoff = work_artifact_path(work, attempt, "required-check-needs-user.md");
+                    crate::atomic_write::atomic_write(&root.join(&handoff),
+                        b"Canonical Tester evidence needs diagnosis. Restore readable, candidate-bound results or resolve the reported host infrastructure failure before retrying verification.")?;
+                    Ok(handoff)
+                },
+                &|_| {},
+            );
+        }
+    }
+
     if tester_gate_applicable && tester_fail_count == 0 && !tester_has_error {
         if let Some((artifact, evidence)) = gate_candidate_after_final_tester(
             project_root,
@@ -16759,11 +16788,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(
-                outcome_missing,
-                WorkAttemptRunOutcome::PlannedWriteRound { .. }
-            ),
-            "missing final Tester results should return to the Writer; got {outcome_missing:?}"
+            matches!(outcome_missing, WorkAttemptRunOutcome::NeedsUser { .. }),
+            "missing final Tester results must pause for diagnosis; got {outcome_missing:?}"
         );
     }
 
@@ -16776,8 +16802,53 @@ mod tests {
         let outcome = interpret_reviews(tmp.path(), &store, item, "attempt-1", true, None).unwrap();
 
         assert!(
-            matches!(outcome, WorkAttemptRunOutcome::PlannedWriteRound { .. }),
-            "unreadable final Tester evidence should return to the Writer; got {outcome:?}"
+            matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+            "unreadable final Tester evidence must pause for diagnosis; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn host_inventory_failure_does_not_schedule_a_writer() {
+        let root = tempfile::TempDir::new().unwrap();
+        let source =
+            errored_tester_json().replace("extractor_failure", "process_settlement_infrastructure");
+        let (store, _) = make_interpret_reviews_fixture(root.path(), "PASS", Some(&source));
+        let item = store.read_work_item("work-1").unwrap();
+        let writers = item.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count();
+        let outcome =
+            interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+        assert!(matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }));
+        assert_eq!(
+            store.read_work_item("work-1").unwrap().attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count(),
+            writers
+        );
+        let (bound_root, bound) = crate::recovery_contracts::verification_tests::fixture(false);
+        let path = crate::verification_assessment::assess_canonical_checks(
+            bound_root.path(),
+            &bound.attempts[0],
+        )
+        .unwrap()
+        .results_path;
+        let mut result: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        result["error"] = serde_json::json!({"kind":"process_settlement_infrastructure","message":"cannot inventory host processes","details":"host process inventory failed"});
+        fs::write(path, serde_json::to_vec(&result).unwrap()).unwrap();
+        assert!(
+            crate::verification_assessment::assess_current_verification(
+                bound_root.path(),
+                &bound.attempts[0]
+            )
+            .unwrap()
+            .candidate_defects()
+            .is_empty()
         );
     }
 
