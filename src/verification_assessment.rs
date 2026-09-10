@@ -1392,10 +1392,10 @@ fn reference_is_satisfied(
                         && command_index.is_none_or(|expected| expected == *index)
                 })
                 .collect::<Vec<_>>();
-            let [(index, result)] = matches.as_slice() else {
+            let [(index, _result)] = matches.as_slice() else {
                 return false;
             };
-            canonical.map_or(result.exit_code == 0, |view| {
+            canonical.is_some_and(|view| {
                 view.checks
                     .get(*index)
                     .is_some_and(|check| check.command == command)

@@ -1646,9 +1646,28 @@ fn check_behavior_references(
             )]);
         }
     };
-    let saved = crate::work_model::WorkModelStore::new(request.project_root)
+    let saved = match crate::work_model::WorkModelStore::new(request.project_root)
         .read_work_item_snapshot(request.work_item_id)
-        .ok();
+    {
+        Ok(item) => Some(item),
+        Err(crate::work_model::WorkModelStorageError::ReadFile { source, path })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && crate::work_model::WorkModelStore::new(request.project_root)
+                    .work_item_path(request.work_item_id)
+                    .is_ok_and(|root| root == path) =>
+        {
+            None
+        }
+        Err(error) => {
+            return Ok(vec![check(
+                "tester-reference-evidence",
+                CandidateCheckStatus::Error,
+                vec![format!(
+                    "Current verification snapshot needs diagnosis: {error}"
+                )],
+            )]);
+        }
+    };
     let saved_attempt = saved.as_ref().and_then(|item| {
         item.attempts
             .iter()
@@ -4130,47 +4149,18 @@ mod tests {
 
     #[test]
     fn python_command_reference_matches_exact_passing_tester_command() {
-        let fixture = Fixture::new();
-        let candidate = fixture.commit(
-            "tests/fluent_merge_readiness.py",
-            "#!/usr/bin/env python3\n",
-            "Add readiness journey\n\n- Cover the public workflow",
+        let evidence = explicit_gate(
+            "python3 tests/native.py",
+            serde_json::json!([]),
+            serde_json::json!([{
+                "command":"python3 tests/native.py", "test_harness":"shell-harness", "exit_code":0,
+                "duration_ms":1, "stdout_log":"commands/0-stdout.log", "stderr_log":"commands/0-stderr.log"
+            }]),
         );
-        let tester = fixture.artifacts.path().join("tester-results.json");
-        let results = serde_json::json!({
-            "candidate_commit": candidate,
-            "commands": [{
-                "command": "python3 tests/fluent_merge_readiness.py",
-                "test_harness": "shell-harness",
-                "exit_code": 0,
-                "duration_ms": 1,
-                "stdout_log": "commands/0-stdout.log",
-                "stderr_log": "commands/0-stderr.log"
-            }],
-            "tests": [],
-            "summary": {"total": 0, "pass": 0, "fail": 0, "skipped": 0},
-            "error": null
-        });
-        fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
-        let artifact = fixture.artifacts.path().join("candidate-gate.json");
-        let contract = behavior_contract("python3 tests/fluent_merge_readiness.py");
-
-        let evidence = run_candidate_gate(fixture.request(
-            &candidate,
-            Some(&contract),
-            Some(&tester),
-            &artifact,
-        ))
-        .unwrap();
-
         assert_eq!(
             evidence.disposition,
             CandidateGateDisposition::Passed,
             "{evidence:#?}"
-        );
-        assert_eq!(
-            check(&evidence, "tester-reference-evidence").status,
-            CandidateCheckStatus::Passed
         );
     }
 
@@ -4778,11 +4768,70 @@ mod tests {
             "class Native:\n def works(self): pass\n",
             "Add Python test",
         );
-        let candidate = fixture.commit(".fluent/tester.yaml", "commands:\n  - command: check\n    test_harness: shell-harness\n  - command: check\n    test_harness: shell-harness\n", "Add configured checks");
-        let tester = fixture.artifacts.path().join("tester-results.json");
+        fixture.commit(
+            ".fluent/extract-tester-results",
+            "#!/bin/sh\nprintf '[]\\n'\n",
+            "Add extractor",
+        );
+        let configured = if commands.as_array().unwrap().is_empty() {
+            serde_json::json!([
+                {"command":"check", "test_harness":"shell-harness"}, {"command":"check", "test_harness":"shell-harness"}
+            ])
+        } else {
+            serde_json::Value::Array(commands.as_array().unwrap().iter().map(|command| serde_json::json!({"command":command["command"], "test_harness":command["test_harness"]})).collect())
+        };
+        let candidate = fixture.commit(
+            ".fluent/tester.yaml",
+            &serde_json::json!({"commands":configured}).to_string(),
+            "Add configured checks",
+        );
+        let mut tester = fixture.artifacts.path().join("tester-results.json");
         let values = tests.as_array().unwrap();
         let results = serde_json::json!({"candidate_commit": candidate, "commands": commands, "tests": tests,
             "summary":{"total":values.len(),"pass":values.iter().filter(|test| test["status"]=="pass").count(),"fail":values.iter().filter(|test| test["status"]=="fail").count(),"skipped":values.iter().filter(|test| test["status"]=="skipped").count()},"error":null});
+        if !commands.as_array().unwrap().is_empty() {
+            use crate::work_model::{TaskKind, TaskOutput, TaskStatus, WorkItem, WorkModelStore};
+            let mut item = WorkItem::planned("work-1", "Check explicit commands");
+            item.add_initial_attempt("attempt-1").unwrap();
+            let writer = &mut item.attempts[0].tasks[0];
+            writer.status = TaskStatus::Complete;
+            writer.output = Some(TaskOutput {
+                workspace_id: writer.workspace_access.writes[0].id.clone(),
+                workspace_path: fixture.root.path().display().to_string(),
+                source_branch: "candidate".into(),
+                base_commit: Some(fixture.base.clone()),
+                commit: candidate.clone(),
+                no_change: None,
+                learner_canonicalization: None,
+            });
+            item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+            for task in &mut item.attempts[0].tasks {
+                if task.kind == TaskKind::Review {
+                    task.status = TaskStatus::Complete;
+                }
+            }
+            let id = item.add_final_tester_task("attempt-1").unwrap();
+            let task = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .unwrap();
+            task.status = TaskStatus::Complete;
+            let area = fixture
+                .project
+                .path()
+                .join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(area.join("commands")).unwrap();
+            for command in commands.as_array().unwrap() {
+                for log in ["stdout_log", "stderr_log"] {
+                    fs::write(area.join(command[log].as_str().unwrap()), "").unwrap();
+                }
+            }
+            tester = area.join("tester-results.json");
+            WorkModelStore::new(fixture.project.path())
+                .create_work_item(&item)
+                .unwrap();
+        }
         fs::write(&tester, serde_json::to_vec(&results).unwrap()).unwrap();
         let contract = behavior_contract(reference);
         run_candidate_gate(fixture.request(
@@ -4792,6 +4841,64 @@ mod tests {
             &fixture.artifacts.path().join("candidate-gate.json"),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn command_reference_requires_readable_current_bindings() {
+        let (root, item) = crate::recovery_contracts::verification_tests::fixture(false);
+        let attempt = &item.attempts[0];
+        let output = attempt.tasks[0].output.as_ref().unwrap();
+        let result = crate::verification_assessment::assess_canonical_checks(root.path(), attempt)
+            .unwrap()
+            .results_path;
+        let mut results: crate::tester::TesterResults =
+            serde_json::from_slice(&fs::read(&result).unwrap()).unwrap();
+        results.commands[0].exit_code = 0;
+        fs::write(&result, serde_json::to_vec(&results).unwrap()).unwrap();
+        let contract =
+            behavior_contract(r#"{"kind":"command","command":"false","command_index":0}"#);
+        let artifact = root.path().join("gate.json");
+        let request = CandidateGateRequest {
+            project_root: root.path(),
+            workspace: root.path(),
+            work_item_id: &item.id,
+            attempt_id: &attempt.id,
+            task_id: Some(&attempt.tasks[0].id),
+            phase: CandidateGatePhase::Writer,
+            base_commit: &output.commit,
+            candidate_commit: &output.commit,
+            completion_contract: Some(&contract),
+            allow_tree_identical_metadata_rewrite: false,
+            metadata_rewrite_authorization: None,
+            tester_results_path: Some(&result),
+            accepted_tester_commands: &[],
+            artifact_path: &artifact,
+        };
+        let store = crate::work_model::WorkModelStore::new(root.path());
+        store.create_work_item(&item).unwrap();
+        assert!(
+            check_behavior_references(&request)
+                .unwrap()
+                .iter()
+                .all(|check| check.status == CandidateCheckStatus::Passed)
+        );
+        let saved = store.work_item_path(&item.id).unwrap();
+        let bytes = fs::read(&saved).unwrap();
+        fs::write(&saved, b"{broken snapshot").unwrap();
+        assert!(
+            check_behavior_references(&request)
+                .unwrap()
+                .iter()
+                .any(|check| check.status != CandidateCheckStatus::Passed)
+        );
+        fs::remove_file(&saved).unwrap();
+        assert!(
+            check_behavior_references(&request)
+                .unwrap()
+                .iter()
+                .any(|check| check.status != CandidateCheckStatus::Passed)
+        );
+        fs::write(saved, bytes).unwrap();
     }
 
     #[test]
