@@ -1635,7 +1635,7 @@ fn check_behavior_references(
     let canonical = if let Some(attempt) = saved_attempt.filter(|attempt| request.tester_results_path.is_some() && attempt.tasks.iter().any(|task| task.kind == crate::work_model::TaskKind::Tester && task.status == crate::work_model::TaskStatus::Complete)) {
         match crate::verification_assessment::assess_canonical_checks(request.project_root, attempt) {
             Ok(view) => Some(view),
-            Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![format!("Current verification bindings need diagnosis: {error:#}")])]),
+            Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![format!("Current verification bindings need diagnosis: {error:#}. Approved requirements: {}", contract.requirements.iter().flat_map(|row| row.verification_refs.iter().map(move |reference| format!("{}: {reference}", row.id))).collect::<Vec<_>>().join("; "))])]),
         }
     } else { None };
     let mut adjusted = results.clone();

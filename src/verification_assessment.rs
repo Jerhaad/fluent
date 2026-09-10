@@ -1236,7 +1236,7 @@ pub(crate) fn validate_reference_source(
         reference.path
     );
     anyhow::ensure!(
-        reference.source_contains_selector(&String::from_utf8_lossy(&output.stdout)),
+        reference.selector.is_none() || reference.source_contains_selector(&String::from_utf8_lossy(&output.stdout)),
         "references test identifier {:?}, which is absent from {}",
         reference.selector,
         reference.path

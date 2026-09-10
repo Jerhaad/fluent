@@ -1879,6 +1879,11 @@ fn reopen_candidate_gate_attempt(
     if evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Passed {
         bail!("candidate-gate pause points at passing evidence");
     }
+    if evidence.phase == crate::candidate_gate::CandidateGatePhase::FinalTester && evidence.disposition == crate::candidate_gate::CandidateGateDisposition::Rejected {
+        let mut correction = latest_writer.clone();
+        correction.input_artifacts = vec![gate.clone()];
+        crate::recovery_contracts::validate_verification_writer_start(project_root, attempt, &correction)?;
+    }
     recover_completed_tester_mutation_at_explicit_resume(project_root, attempt, output, &evidence)?;
     let correction_artifacts = if evidence.disposition
         == crate::candidate_gate::CandidateGateDisposition::Rejected
@@ -7647,7 +7652,7 @@ fn write_candidate_gate_handoff(
         work_item_id,
         attempt_id,
         format!(
-            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\n{recovery}\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
+            "# Candidate gate needs user input\n\nFluent stopped before review because host-owned candidate checks rejected the candidate again or could not establish trustworthy state.\n\nEvidence: `{artifact_path}`\n\n{diagnostics}\n\nInspect the named requirement, retained native identities, and command logs to establish the cause before requesting candidate correction.\n\n{recovery}\n\nThen run `fluent scheduler run`. To recover in the foreground instead, run `fluent attempt run {work_item_id} {attempt_id}`.\n"
         ),
     );
     fs::write(&path, body)?;
@@ -9240,6 +9245,12 @@ fn interpret_reviews(
                 crate::candidate_gate::CandidateGateDisposition::Rejected => {
                     let verification = crate::verification_assessment::assess_current_verification(project_root, &item.attempts[attempt_index]);
                     if verification.as_ref().map_or(true, |view| view.candidate_defects().is_empty()) {
+                        item.attempts[attempt_index].review_state = Some(AttemptReviewState::Failed);
+                        if let Some(action) = crate::host_evidence::pending_candidate_gate_evidence_recovery_action(project_root, &item.attempts[attempt_index]) {
+                            write_attempt_work_item(store, &item)?;
+                            return settle_review_pause(store, project_root, &item.id, attempt_id, AttemptReviewState::Failed, PauseKind::HostEvidence, std::slice::from_ref(&artifact),
+                                |root, work, attempt, _| write_candidate_gate_evidence_handoff(root, work, attempt, &action), &|_| {});
+                        }
                         return pause_candidate_gate_after_tester(project_root, store, &mut item, attempt_index, attempt_id, &artifact, &evidence);
                     }
                     failed.extend(final_tester_correction_artifacts(
@@ -12422,7 +12433,7 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_configured_tester_command_preserves_evidence_without_writer() {
+    fn unclassified_verification_failure_pauses_for_diagnosis() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tester_json = r#"{
             "candidate_commit": "abc123",
@@ -12497,9 +12508,12 @@ mod tests {
             "#[test]\nfn required_behavior() {}\n",
         )
         .unwrap();
+        fs::create_dir_all(workspace.path().join(".fluent")).unwrap();
+        fs::write(workspace.path().join(".fluent/tester.yaml"), "commands:\n  - command: xcodebuild test\n    test_harness: xcodebuild\n").unwrap();
+        fs::write(workspace.path().join(".fluent/extract-tester-results"), "#!/bin/sh\necho '[]'\n").unwrap();
         crate::git::run(
             workspace.path(),
-            &["add", "tests/behavior.rs"],
+            &["add", "tests/behavior.rs", ".fluent/tester.yaml", ".fluent/extract-tester-results"],
             "stage behavior test",
         )
         .unwrap();
@@ -12571,10 +12585,12 @@ mod tests {
             .unwrap()
             .clone();
         let tester_dir = project_root.join(&tester.artifact_area.unwrap().path);
-        fs::create_dir_all(&tester_dir).unwrap();
+        fs::create_dir_all(tester_dir.join("commands")).unwrap();
+        fs::write(tester_dir.join("commands/0-stdout.log"), "retained successful run").unwrap();
+        fs::write(tester_dir.join("commands/0-stderr.log"), "").unwrap();
         let results = serde_json::json!({
             "candidate_commit": candidate,
-            "commands": [],
+            "commands": [{"command":"xcodebuild test","test_harness":"xcodebuild","exit_code":0,"duration_ms":1,"stdout_log":"commands/0-stdout.log","stderr_log":"commands/0-stderr.log"}],
             "tests": [{
                 "id": "another_test",
                 "test_harness": "cargo-nextest",
@@ -12623,58 +12639,44 @@ mod tests {
     }
 
     #[test]
-    fn missing_behavior_tester_evidence_returns_to_writer_before_learner() {
+    fn missing_evidence_does_not_authorize_writer() {
         let project = tempfile::TempDir::new().unwrap();
         let (store, _workspace, candidate) = final_tester_evidence_fixture(project.path());
-
-        let outcome = interpret_reviews(
-            project.path(),
-            &store,
-            store.read_work_item("work-1").unwrap(),
-            "attempt-1",
-            true,
-            None,
-        )
-        .unwrap();
-
-        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else {
-            panic!("missing behavior evidence must return to Writer before Learner")
-        };
+        let outcome = interpret_reviews(project.path(), &store, store.read_work_item("work-1").unwrap(), "attempt-1", true, None).unwrap();
+        let WorkAttemptRunOutcome::NeedsUser { handoff_path } = outcome else { panic!("missing evidence must pause for verification recovery"); };
         let stored = store.read_work_item("work-1").unwrap();
-        assert!(stored.merge_candidates.is_empty());
-        assert!(stored.attempts[0].learning.is_none());
-        let writer = stored.attempts[0]
-            .tasks
-            .iter()
-            .find(|task| task.id == task_id)
-            .unwrap();
-        let gate = writer
-            .input_artifacts
-            .iter()
-            .find(|artifact| {
-                artifact
-                    .path
-                    .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
-            })
-            .unwrap();
-        assert!(writer.input_artifacts.iter().any(|artifact| {
-            artifact.producer_id.contains("tester")
-                && artifact.path.ends_with("/tester-results.json")
-        }));
-        let evidence: crate::candidate_gate::CandidateGateEvidence =
-            serde_json::from_slice(&fs::read(project.path().join(&gate.path)).unwrap()).unwrap();
-        assert_eq!(
-            evidence.phase,
-            crate::candidate_gate::CandidateGatePhase::FinalTester
-        );
-        assert_eq!(evidence.candidate_commit, candidate);
-        assert!(evidence.checks.iter().any(|check| {
-            check.name == "tester-reference-evidence"
-                && check
-                    .diagnostics
-                    .iter()
-                    .any(|line| line.contains("required_behavior"))
-        }));
+        assert!(stored.merge_candidates.is_empty() && stored.attempts[0].learning.is_none());
+        assert_eq!(stored.attempts[0].tasks.iter().filter(|task| task.kind == TaskKind::Write).count(), 1);
+        let handoff = fs::read_to_string(project.path().join(handoff_path)).unwrap();
+        assert!(handoff.contains(&candidate));
+        assert!(handoff.contains("required_behavior"), "the handoff must identify the unmet reference: {handoff}");
+        assert!(handoff.contains("diagnos") || handoff.contains("Inspect"));
+        let (root, mut history) = crate::recovery_contracts::verification_tests::fixture(false);
+        let source = history.attempts[0].tasks.iter().find(|task| task.kind == TaskKind::Tester).unwrap();
+        let artifact = ArtifactRef { producer_id: source.id.clone(), path: format!("{}/tester-results.json", source.artifact_area.as_ref().unwrap().path) };
+        let task = history.add_next_write_round("attempt-1", vec![artifact]).unwrap();
+        let reason = crate::recovery_contracts::validate_code_change_writer_start(root.path(), &history, "attempt-1", &task).unwrap_err().to_string();
+        assert!(reason.contains("verification recovery"), "{reason}");
+    }
+
+    #[test]
+    fn writer_receives_only_unresolved_candidate_defects() {
+        let (project, mut item) = crate::recovery_contracts::verification_tests::fixture(true);
+        crate::recovery_contracts::verification_tests::accept_first_check(project.path(), &mut item);
+        for task in item.attempts[0].tasks.iter().filter(|task| task.kind == TaskKind::Review) {
+            let area = project.path().join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap(); fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        let store = WorkModelStore::new(project.path());
+        store.create_work_item(&item).unwrap();
+        let outcome = interpret_reviews(project.path(), &store, store.read_work_item(&item.id).unwrap(), "attempt-1", true, None).unwrap();
+        let WorkAttemptRunOutcome::PlannedWriteRound { task_id } = outcome else { panic!("the established assertion defect requires source correction: {outcome:?}"); };
+        let saved = store.read_work_item(&item.id).unwrap();
+        let writer = saved.attempts[0].tasks.iter().find(|task| task.id == task_id).unwrap();
+        let findings = crate::recovery_contracts::writer_completion_findings(project.path(), writer).unwrap();
+        assert_eq!(findings.len(), 1, "only the unresolved assertion belongs to the Writer: {findings:?}");
+        assert!(findings[0].requirement.contains("tests/native.sh::broken"));
+        assert!(!findings[0].requirement.contains("sh -c false"));
     }
 
     #[test]

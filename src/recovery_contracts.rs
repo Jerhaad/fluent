@@ -1277,6 +1277,8 @@ pub(crate) fn validate_code_change_writer_start(
                 "another classified Writer owns the planned continuation",
             ));
         }
+        validate_verification_writer_start(project_root, attempt, &attempt.tasks[writer_index])
+            .map_err(|error| code_change_writer_rejection(attempt_id, format!("{error:#}")))?;
         return Ok(());
     };
 
@@ -3346,4 +3348,29 @@ pub(crate) mod verification_tests {
         assert_eq!(identities(&first), identities(&second));
         assert_eq!(first.references.len(), 1, "identity lists are diagnostics, not extra requirements");
     }
+}
+
+
+/// Recheck current correction ownership before a saved or direct Writer starts.
+pub(crate) fn validate_verification_writer_start(project_root: &Path, attempt: &work_model::Attempt, task: &Task) -> Result<()> {
+    if task.role == work_model::TESTER_HARNESS_REPAIR_ROLE { return Ok(()); }
+    let mut verification_input = false;
+    let candidate = attempt.tasks.iter().rev().find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete).and_then(|task| task.output.as_ref()).map(|output| output.commit.as_str());
+    for artifact in &task.input_artifacts {
+        if artifact.path.ends_with("/tester-results.json") { verification_input = true; }
+        if artifact.path.ends_with("/candidate-gate.json") {
+            let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+            let gate = candidate_gate::read_prior_writer_gate(&path).map_err(anyhow::Error::msg)?;
+            verification_input = true;
+            if gate.phase != candidate_gate::CandidateGatePhase::FinalTester && Some(gate.candidate_commit.as_str()) == candidate && gate.checks.iter().any(|check| check.status == candidate_gate::CandidateCheckStatus::Failed && matches!(check.name.as_str(), "whitespace" | "commit-metadata" | "behavior-references" | "project-check")) { return Ok(()); }
+        }
+        if artifact.path.ends_with("/review.md") {
+            let source = fs::read_to_string(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            if review::extract_verdict(&source) == review::Verdict::Fail && !review::open_finding_titles(&source).is_empty() { return Ok(()); }
+        }
+    }
+    if !verification_input { return Ok(()); }
+    let assessment = crate::verification_assessment::assess_current_verification(project_root, attempt).context("verification recovery needs current bound evidence before a corrective Writer")?;
+    anyhow::ensure!(!assessment.candidate_defects().is_empty(), "verification recovery must establish a candidate defect before a corrective Writer; inspect these requirements and their retained evidence: {}", assessment.unresolved().map(|row| format!("{}: {}", row.id, row.next_action.as_deref().unwrap_or("inspect evidence"))).collect::<Vec<_>>().join("; "));
+    Ok(())
 }
