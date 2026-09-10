@@ -168,13 +168,34 @@ fn assess_canonical_checks_at(
     attempt: &work_model::Attempt,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<CanonicalCheckAssessment> {
-    let output = attempt
+    let (candidate_commit, workspace) = if let Some(output) = attempt
         .tasks
         .iter()
         .rev()
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .and_then(|task| task.output.as_ref())
-        .context("no completed Writer candidate")?;
+    {
+        (
+            output.commit.as_str(),
+            candidate_workspace_path(project_root, output),
+        )
+    } else {
+        anyhow::ensure!(
+            attempt.kind.is_review_only_like(),
+            "no completed Writer candidate"
+        );
+        // Review-only Attempts start with a Tester bound to the reviewed commit.
+        let context = attempt
+            .tasks
+            .first()
+            .filter(|task| task.kind == TaskKind::Tester)
+            .and_then(|task| task.review_context.as_ref())
+            .context("review-only Tester comparison context is missing")?;
+        (
+            context.candidate_commit.as_str(),
+            project_root.join(&context.candidate_workspace_path),
+        )
+    };
     let tester = attempt
         .tasks
         .iter()
@@ -186,7 +207,7 @@ fn assess_canonical_checks_at(
                 && task
                     .review_context
                     .as_ref()
-                    .is_some_and(|context| context.candidate_commit == output.commit)
+                    .is_some_and(|context| context.candidate_commit == candidate_commit)
         })
         .context("no complete canonical Tester for the current candidate")?;
     let context = tester
@@ -206,7 +227,7 @@ fn assess_canonical_checks_at(
         bound_recovery_artifact(project_root, &format!("{area}/tester-results.json"))?;
     let results: crate::tester::TesterResults = serde_json::from_slice(&result_bytes)?;
     anyhow::ensure!(
-        results.candidate_commit.as_deref() == Some(output.commit.as_str()),
+        results.candidate_commit.as_deref() == Some(candidate_commit),
         "canonical Tester result has a different or missing candidate binding"
     );
     // The pre-write baseline explains suite health; it never supplies a
@@ -233,10 +254,11 @@ fn assess_canonical_checks_at(
     let preexisting_commands =
         crate::tester_evidence::preexisting_failed_tester_commands(&results, baseline_results);
     let mut preexisting = Vec::new();
-    let workspace = candidate_workspace_path(project_root, output);
     let committed_bytes = |path: &str| -> Result<Vec<u8>> {
-        let committed =
-            crate::git::run_raw(&workspace, &["show", &format!("{}:{path}", output.commit)])?;
+        let committed = crate::git::run_raw(
+            &workspace,
+            &["show", &format!("{}:{path}", candidate_commit)],
+        )?;
         anyhow::ensure!(
             committed.status.success(),
             "cannot read committed checker configuration: {path}"
@@ -267,11 +289,11 @@ fn assess_canonical_checks_at(
             };
             let audit_bytes = serde_json::to_vec_pretty(&serde_json::json!({
                 "schema_version": 1, "work_item_id": attempt.work_item_id, "attempt_id": attempt.id,
-                "candidate_commit": output.commit, "source_task_id": tester.id,
+                "candidate_commit": candidate_commit, "source_task_id": tester.id,
                 "source_task_kind": tester.kind, "source_task_role": tester.role,
                 "source_task_context": context, "source_results": results_ref,
-                "configuration": {"git_object":format!("{}:.fluent/tester.yaml", output.commit), "digest":manifest.config_digest},
-                "extractor": {"git_object":format!("{}:.fluent/extract-tester-results", output.commit), "digest":manifest.extractor_digest},
+                "configuration": {"git_object":format!("{}:.fluent/tester.yaml", candidate_commit), "digest":manifest.config_digest},
+                "extractor": {"git_object":format!("{}:.fluent/extract-tester-results", candidate_commit), "digest":manifest.extractor_digest},
                 "derived_manifest": manifest_ref,
                 "basis": "Completed canonical Tester and exact ordered command coverage; default candidate-code applicability only"
             }))?;
@@ -435,7 +457,7 @@ fn assess_canonical_checks_at(
             ),
             work_item_id: attempt.work_item_id.clone(),
             attempt_id: attempt.id.clone(),
-            candidate_commit: output.commit.clone(),
+            candidate_commit: candidate_commit.to_string(),
             command: definition.command.clone(),
             working_directory: ".".into(),
             source: work_model::RequiredCheckSource::CanonicalTester {
