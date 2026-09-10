@@ -43410,6 +43410,7 @@ print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness
         assert!(assessment.candidate_defects().is_empty());
         let status = fluent::work_status::summarize_work_item(&item, Some(&project));
         assert_eq!(status.recovery_blocker.is_some(), !present);
+        assert_eq!(status.verification.as_ref().unwrap().references, assessment.references);
         assert_eq!(snapshot_tree(&project.join(".fluent/work")), before, "current observation is read-only");
         let gate = run_candidate_gate(CandidateGateRequest {
             project_root: &project, workspace: &workspace, work_item_id: work, attempt_id: "attempt-1", task_id: None,

@@ -33,6 +33,7 @@ pub struct WorkItemStatus {
     /// An exact operator command for exceptional recovery states.
     pub next_action: Option<String>,
     pub recovery_blocker: Option<String>,
+    pub verification: Option<crate::verification_assessment::VerificationAssessment>,
     pub metrics: WorkMetrics,
     pub compatibility_warnings: Vec<String>,
     pub release: Option<ReleaseStatus>,
@@ -147,7 +148,9 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
                     Ok(None) => None,
                 }
             });
+    let verification = attempt.and_then(|attempt| project_root.and_then(|root| crate::verification_assessment::assess_current_verification(root, attempt).ok()));
     WorkItemStatus {
+        verification,
         recovery_blocker,
         id: item.id.clone(),
         title: item.title.clone(),
@@ -573,6 +576,11 @@ pub fn format_work_status(status: &WorkStatus) -> String {
                     release.criteria, release.blockers, release.proposed_follow_ups
                 ));
             }
+            if let Some(view) = &row.verification {
+                for requirement in view.references.iter().chain(&view.commands) {
+                    output.push_str(&format!("  Verification {}: {} ({:?})\n", requirement.id, if requirement.satisfied { "satisfied" } else { "outstanding" }, requirement.owner));
+                }
+            }
             if let Some(reason) = &row.recovery_blocker {
                 output.push_str(&format!("  evidence: {reason}\n"));
             }
@@ -632,6 +640,11 @@ pub fn format_work_dashboard_lines(status: &WorkStatus) -> Vec<String> {
             row.metrics.artifact_bytes,
             row.metrics.avoided_cycles
         ));
+        if let Some(view) = &row.verification {
+            for requirement in view.references.iter().chain(&view.commands) {
+                lines.push(format!("  Verification {}: {} ({:?})", requirement.id, if requirement.satisfied { "satisfied" } else { "outstanding" }, requirement.owner));
+            }
+        }
         if let Some(reason) = &row.recovery_blocker {
             lines.push(format!("  Evidence: {reason}"));
         }
@@ -1734,6 +1747,7 @@ mod tests {
         let status = WorkStatus {
             rows: vec![WorkItemStatus {
                 recovery_blocker: None,
+                verification: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),
@@ -1764,6 +1778,7 @@ mod tests {
         let status = WorkStatus {
             rows: vec![WorkItemStatus {
                 recovery_blocker: None,
+                verification: None,
                 id: "work-1".to_string(),
                 title: "Build status view".to_string(),
                 attempt: "attempt-1 [planned]".to_string(),

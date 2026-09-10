@@ -27,7 +27,8 @@ pub(crate) fn candidate_workspace_path(
 pub(crate) fn validate_managed_file_path(project_root: &Path, relative: &str) -> Result<PathBuf> {
     let relative_path = Path::new(relative);
     let managed_root = Path::new(".fluent/work/artifacts");
-    if relative_path.as_os_str().is_empty()
+    if relative_path.components().collect::<PathBuf>().as_os_str() != relative_path.as_os_str()
+        || relative_path.as_os_str().is_empty()
         || relative_path.is_absolute()
         || !relative_path.starts_with(managed_root)
     {
@@ -92,8 +93,13 @@ pub(crate) struct CanonicalCheckAssessment {
     pub blockers: Vec<String>,
     pub diagnoses: Vec<String>,
     /// Demonstrated assertion or harness defects retain source correction.
-    pub defects: Vec<String>,
+    pub defects: Vec<CanonicalDefect>,
     pub reconstruction: Option<CanonicalReconstruction>,
+}
+
+pub(crate) struct CanonicalDefect {
+    pub id: String,
+    pub diagnostic: String,
 }
 
 pub(crate) struct CanonicalReconstruction {
@@ -114,6 +120,7 @@ pub(crate) fn bound_recovery_artifact(
     path: &str,
 ) -> Result<(work_model::BoundRecheckArtifact, Vec<u8>)> {
     let resolved = validate_managed_file_path(project_root, path)?;
+    anyhow::ensure!(fs::metadata(&resolved)?.len() <= 16 * MAX_EVIDENCE_BYTES as u64, "verification artifact exceeds the bounded read limit: {path}");
     let bytes = fs::read(resolved)?;
     Ok((
         work_model::BoundRecheckArtifact {
@@ -130,6 +137,10 @@ pub(crate) fn assess_canonical_checks(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<CanonicalCheckAssessment> {
+    assess_canonical_checks_at(project_root, attempt, crate::check_applicability::evaluation_time())
+}
+
+fn assess_canonical_checks_at(project_root: &Path, attempt: &work_model::Attempt, now: chrono::DateTime<chrono::Utc>) -> Result<CanonicalCheckAssessment> {
     let output = attempt
         .tasks
         .iter()
@@ -277,10 +288,7 @@ pub(crate) fn assess_canonical_checks(
     }
     let mut defects = Vec::new();
     if let Some(error) = &results.error {
-        defects.push(format!(
-            "canonical Tester has an unresolved extractor or harness error: {}",
-            error.kind
-        ));
+        defects.push(CanonicalDefect { id: format!("tester-harness:{}:{}", manifest.config_digest, error.kind), diagnostic: format!("canonical Tester has an unresolved extractor or harness error: {}", error.kind) });
     }
     if results.summary.total != results.tests.len()
         || results.summary.pass
@@ -410,7 +418,7 @@ pub(crate) fn assess_canonical_checks(
         let local_applies = validate_check_applicability_at(
             &check.applicability,
             &local_evidence,
-            crate::check_applicability::evaluation_time(),
+            now,
         )
         .is_ok();
         if !matches || !local_applies || result.is_none_or(|command| command.exit_code != 0) {
@@ -426,7 +434,7 @@ pub(crate) fn assess_canonical_checks(
                         && result.comparison_commit == context.base_commit
                 });
             if matches
-                && (required_check_is_accepted(project_root, attempt, &check)
+                && (validate_required_check_acceptance_at(project_root, attempt, &check, now).is_ok()
                     || reviewed_replacement)
             {
                 accepted.push(index);
@@ -453,12 +461,12 @@ pub(crate) fn assess_canonical_checks(
                 && test.test_harness == command.test_harness
         });
         if !covered {
-            defects.push(format!(
-                "canonical Tester has an unresolved structured failure: {}",
-                test.id
-            ));
+            let native = references::normalized_result(test).map(|test| test.id).unwrap_or_else(|_| test.id.clone());
+            defects.push(CanonicalDefect { id: format!("tester-failure:{}:{}", manifest.config_digest, crate::verification_policy::digest(native.as_bytes())), diagnostic: format!("canonical Tester has an unresolved structured failure: {}", test.id) });
         }
     }
+    defects.sort_by(|a, b| a.id.cmp(&b.id));
+    defects.dedup_by(|a, b| a.id == b.id);
     Ok(CanonicalCheckAssessment {
         requested,
         defects,
@@ -1044,6 +1052,7 @@ pub struct RequirementAssessment {
     pub id: String,
     pub source: String,
     pub meaning: Option<ReferenceMeaning>,
+    pub check: Option<work_model::RequiredCheck>,
     pub satisfied: bool,
     pub cause: Option<VerificationCause>,
     pub owner: work_model::CompletionResponsibility,
@@ -1103,7 +1112,7 @@ pub(crate) fn assess_references(
             }
             let mut row = RequirementAssessment {
                 id: format!("reference:{work}:{attempt}:{}:{index}:{:x}", requirement.id, Sha256::digest(text.as_bytes())),
-                source: requirement.source.clone(), meaning: None, satisfied: false,
+                source: requirement.source.clone(), check: None, meaning: None, satisfied: false,
                 cause: Some(VerificationCause::UninterpretableEvidence),
                 owner: work_model::CompletionResponsibility::Tester,
                 next_action: Some("Inspect the approved reference and retained native evidence to establish its meaning; clarification recording is not available in this version.".into()),
@@ -1267,7 +1276,7 @@ fn reference_is_satisfied(
                     .get(*index)
                     .is_some_and(|check| check.command == command)
                     && !view.outstanding.contains(index)
-                    && view.blockers.is_empty()
+
             })
         }
         ReferenceMeaning::WholeScript { path, .. } => {
@@ -1319,7 +1328,11 @@ pub fn assess_current_verification(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<VerificationAssessment> {
-    let canonical = assess_canonical_checks(project_root, attempt)?;
+    assess_current_verification_at(project_root, attempt, crate::check_applicability::evaluation_time())
+}
+
+pub fn assess_current_verification_at(project_root: &Path, attempt: &work_model::Attempt, now: chrono::DateTime<chrono::Utc>) -> Result<VerificationAssessment> {
+    let canonical = assess_canonical_checks_at(project_root, attempt, now)?;
     let output = attempt
         .tasks
         .iter()
@@ -1337,7 +1350,7 @@ pub fn assess_current_verification(
             .into_owned(),
         digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
     }];
-    let references = match &attempt.writer_completion_contract {
+    let mut references = match &attempt.writer_completion_contract {
         Some(contract) => assess_references(
             &candidate_workspace_path(project_root, output),
             &attempt.work_item_id,
@@ -1352,21 +1365,37 @@ pub fn assess_current_verification(
     };
     let mut commands = Vec::new();
     for (index, check) in canonical.checks.iter().enumerate() {
+        let mut supporting = bindings.clone();
+        if let work_model::RequiredCheckSource::CanonicalTester { manifest, logs, reconstruction, .. } = &check.source {
+            supporting.push(manifest.clone()); supporting.extend(logs.clone()); supporting.extend(reconstruction.clone());
+        }
+        if canonical.accepted.contains(&index) {
+            if let Some(recovery) = attempt.evidence_recoveries.iter().rev().find(|recovery| recovery.required_check.as_ref() == Some(check)) {
+                supporting.push(work_model::BoundRecheckArtifact { path: recovery.attachment.snapshot_path.clone(), digest: recovery.attachment.digest.clone() });
+                for target in &recovery.targets {
+                    supporting.push(bound_recovery_artifact(project_root, &target.prior_review_artifact)?.0);
+                    if let Some(task) = attempt.tasks.iter().find(|task| target.review_task_id.as_deref() == Some(task.id.as_str())) {
+                        if let Some(path) = review_artifact_path(task) { supporting.push(bound_recovery_artifact(project_root, &path)?.0); }
+                    }
+                }
+            }
+        }
         let satisfied = !canonical.outstanding.contains(&index);
         commands.push(RequirementAssessment {
-            id: check.id.clone(), source: "canonical Tester".into(),
+            id: check.id.clone(), source: "canonical Tester".into(), check: Some(check.clone()),
             meaning: Some(ReferenceMeaning::Command { command: check.command.clone(), command_index: Some(index), description: None }),
             satisfied, cause: (!satisfied).then_some(VerificationCause::Unknown),
             owner: if canonical.accepted.contains(&index) { work_model::CompletionResponsibility::Host } else { work_model::CompletionResponsibility::Tester },
             next_action: (!satisfied).then(|| "Inspect the retained command logs and establish the cause before authorizing candidate correction.".into()),
-            bindings: bindings.clone(), diagnostics: canonical.diagnoses.clone(),
+            bindings: supporting, diagnostics: canonical.diagnoses.clone(),
         });
     }
-    for (index, defect) in canonical.defects.iter().enumerate() {
+    for defect in &canonical.defects {
         commands.push(RequirementAssessment {
-            id: format!("tester-defect:{}:{index}", bindings[0].digest),
+            id: defect.id.clone(),
             source: bindings[0].path.clone(),
             meaning: None,
+            check: None,
             satisfied: false,
             cause: Some(VerificationCause::CandidateDefect),
             owner: work_model::CompletionResponsibility::Writer,
@@ -1374,7 +1403,7 @@ pub fn assess_current_verification(
                 "Repair the established assertion or project-owned harness defect.".into(),
             ),
             bindings: bindings.clone(),
-            diagnostics: vec![defect.clone()],
+            diagnostics: vec![defect.diagnostic.clone()],
         });
     }
     for (index, blocker) in canonical.blockers.iter().enumerate() {
@@ -1382,6 +1411,7 @@ pub fn assess_current_verification(
             id: format!("tester-binding:{}:{index}", bindings[0].digest),
             source: bindings[0].path.clone(),
             meaning: None,
+            check: None,
             satisfied: false,
             cause: Some(VerificationCause::UninterpretableEvidence),
             owner: work_model::CompletionResponsibility::Tester,
@@ -1392,6 +1422,16 @@ pub fn assess_current_verification(
             bindings: bindings.clone(),
             diagnostics: vec![blocker.clone()],
         });
+    }
+    for reference in &mut references {
+        if let Some(ReferenceMeaning::Command { command, command_index, .. }) = &reference.meaning {
+            let matches = commands.iter().filter(|row| matches!(&row.meaning, Some(ReferenceMeaning::Command { command: actual, command_index: actual_index, .. }) if actual == command && command_index.is_none_or(|index| Some(index) == *actual_index))).collect::<Vec<_>>();
+            if let [row] = matches.as_slice() {
+                reference.check = row.check.clone();
+                reference.bindings = row.bindings.clone();
+                if reference.satisfied { reference.owner = row.owner; }
+            }
+        }
     }
     Ok(VerificationAssessment {
         candidate_commit: output.commit.clone(),

@@ -1631,9 +1631,13 @@ fn check_behavior_references(
         Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![error.to_string()])]),
     };
     let saved = crate::work_model::WorkModelStore::new(request.project_root).read_work_item_snapshot(request.work_item_id).ok();
-    let canonical = saved.as_ref().and_then(|item| item.attempts.iter().find(|attempt| attempt.id == request.attempt_id))
-        .and_then(|attempt| crate::verification_assessment::assess_canonical_checks(request.project_root, attempt).ok())
-        .filter(|view| view.checks.iter().all(|check| check.candidate_commit == request.candidate_commit));
+    let saved_attempt = saved.as_ref().and_then(|item| item.attempts.iter().find(|attempt| attempt.id == request.attempt_id));
+    let canonical = if let Some(attempt) = saved_attempt.filter(|attempt| request.tester_results_path.is_some() && attempt.tasks.iter().any(|task| task.kind == crate::work_model::TaskKind::Tester && task.status == crate::work_model::TaskStatus::Complete)) {
+        match crate::verification_assessment::assess_canonical_checks(request.project_root, attempt) {
+            Ok(view) => Some(view),
+            Err(error) => return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error, vec![format!("Current verification bindings need diagnosis: {error:#}")])]),
+        }
+    } else { None };
     let mut adjusted = results.clone();
     if request.phase == CandidateGatePhase::Learner {
         if let Some(results) = &mut adjusted {

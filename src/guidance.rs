@@ -522,6 +522,7 @@ mod tests {
     fn status_row(id: &str, action: &str) -> crate::work_status::WorkItemStatus {
         crate::work_status::WorkItemStatus {
             recovery_blocker: None,
+            verification: None,
             id: id.to_string(),
             title: "Title".to_string(),
             attempt: "-".to_string(),

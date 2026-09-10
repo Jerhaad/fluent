@@ -125,6 +125,7 @@ mod tests {
     fn row(action: &str) -> WorkItemStatus {
         WorkItemStatus {
             recovery_blocker: None,
+            verification: None,
             id: action.into(),
             title: action.into(),
             attempt: "-".into(),

@@ -3219,3 +3219,131 @@ pub(crate) fn required_check_recovery_status(
         next_action,
     }))
 }
+
+#[cfg(test)]
+pub(crate) mod verification_tests {
+    use super::*;
+    use crate::verification_assessment::assess_current_verification;
+    use crate::work_model::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    pub(crate) fn fixture(failed_test: bool) -> (tempfile::TempDir, WorkItem) { fixture_with_lifetime(failed_test, None) }
+
+    fn fixture_with_lifetime(failed_test: bool, lifetime: Option<u64>) -> (tempfile::TempDir, WorkItem) {
+        let root = tempfile::tempdir().unwrap();
+        for args in [&["init", "-q"][..], &["config", "user.email", "tests@example.test"], &["config", "user.name", "Tests"]] {
+            crate::git::run(root.path(), args, "prepare assessment fixture").unwrap();
+        }
+        fs::create_dir_all(root.path().join(".fluent")).unwrap();
+        fs::create_dir_all(root.path().join("tests")).unwrap();
+        fs::write(root.path().join("tests/native.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(root.path().join(".fluent/tester.yaml"), "commands:\n  - command: 'false'\n    test_harness: shell-harness\n  - command: sh -c false\n    test_harness: shell-harness\n").unwrap();
+        if let Some(seconds) = lifetime {
+            fs::write(root.path().join(".fluent/tester.yaml"), serde_json::to_vec(&serde_json::json!({"commands":[
+                {"command":"false","test_harness":"shell-harness","applicability":{"freshness":{"kind":"live-state","max_age_seconds":seconds}}},
+                {"command":"sh -c false","test_harness":"shell-harness"}
+            ]})).unwrap()).unwrap();
+        }
+        let native = if failed_test { r#"[{"id":"tests/native.sh::broken","test_harness":"shell-harness","status":"fail","failure_excerpt":"assertion failed"}]"# } else { "[]" };
+        let extractor = root.path().join(".fluent/extract-tester-results");
+        fs::write(&extractor, format!("#!/bin/sh\nprintf '%s\\n' '{native}'\n")).unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::git::run(root.path(), &["add", "."], "stage fixture").unwrap();
+        crate::git::run(root.path(), &["commit", "-qm", "Add fixture"], "commit fixture").unwrap();
+        let candidate = crate::git::run_stdout(root.path(), &["rev-parse", "HEAD"], "read candidate").unwrap();
+        let mut item = WorkItem::planned("verification", "Assess current evidence");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let writer = &mut item.attempts[0].tasks[0];
+        writer.status = TaskStatus::Complete;
+        writer.output = Some(TaskOutput { workspace_id: writer.workspace_access.writes[0].id.clone(), workspace_path: root.path().display().to_string(), source_branch: "candidate".into(), base_commit: Some(candidate.clone()), commit: candidate.clone(), no_change: None, learner_canonicalization: None });
+        item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        for task in item.attempts[0].tasks.iter_mut().filter(|task| task.kind == TaskKind::Review) { task.status = TaskStatus::Complete; }
+        let id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0].tasks.iter_mut().find(|task| task.id == id).unwrap();
+        tester.status = TaskStatus::Complete;
+        let area = root.path().join(&tester.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        crate::tester::run(root.path(), &area, true, &crate::content::ContentResolver::new(Some(root.path()))).unwrap();
+        crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+        item.attempts[0].writer_completion_contract = Some(WriterCompletionContract {
+            version: WRITER_COMPLETION_CONTRACT_VERSION, requirements: vec![WriterCompletionRequirement {
+                responsibility: None, id: "behavior:native:b1".into(), kind: WriterCompletionRequirementKind::Behavior,
+                source: "behaviors.md#native:b1".into(), requirement: "THE SYSTEM SHALL work.".into(), command: None,
+                verification_refs: vec![r#"{"kind":"named-test","path":"tests/native.sh","name":"missing"}"#.into()],
+            }],
+        });
+        (root, item)
+    }
+
+    pub(crate) fn accept_first_check(root: &Path, item: &mut WorkItem) {
+        let attempt = &mut item.attempts[0];
+        let check = assess_canonical_checks(root, attempt).unwrap().checks[0].clone();
+        let area = work_artifact_path(&item.id, &attempt.id, "accepted-proof");
+        fs::create_dir_all(root.join(&area)).unwrap();
+        let prior = format!("{area}/check.json");
+        fs::write(root.join(&prior), serde_json::to_vec(&check).unwrap()).unwrap();
+        let proof_path = format!("{area}/evidence.json");
+        let proof = serde_json::to_vec(&serde_json::json!({"schema_version":1,"producer":"authorized host","check":check.command,"working_directory":".","result":"pass","output":"passed","run_at":now_iso8601()})).unwrap();
+        fs::write(root.join(&proof_path), &proof).unwrap();
+        let attachment = EvidenceAttachment { snapshot_path: proof_path, digest: crate::verification_policy::digest(&proof) };
+        let mut review = attempt.tasks.iter().find(|task| task.kind == TaskKind::Review).unwrap().clone();
+        review.id = "accepted-tests-review".into();
+        review.artifact_area.as_mut().unwrap().path = format!("{area}/review");
+        fs::create_dir_all(root.join(format!("{area}/review"))).unwrap();
+        fs::write(root.join(format!("{area}/review/review.md")), "Verdict: pass\n").unwrap();
+        review.evidence_review_context = Some(EvidenceReviewContext { recovery_id: "accepted".into(), candidate_commit: check.candidate_commit.clone(), attachment: attachment.clone(), prior_review_artifact: prior.clone() });
+        attempt.evidence_recoveries.push(EvidenceRecovery { id: "accepted".into(), candidate_commit: check.candidate_commit.clone(), attachment,
+            targets: vec![EvidenceReviewTarget { role: "tests".into(), prior_review_artifact: prior, review_task_id: Some(review.id.clone()), review_digest: Some(crate::verification_policy::digest(b"Verdict: pass\n")) }],
+            state: EvidenceRecoveryState::Complete, created_at: now_iso8601(), required_check: Some(check), code_change_classification: None });
+        attempt.tasks.push(review);
+    }
+
+    #[test]
+    fn accepted_evidence_survives_unrelated_failures_and_no_change_rounds() {
+        let (root, mut item) = fixture(false);
+        accept_first_check(root.path(), &mut item);
+        let path = assess_canonical_checks(root.path(), &item.attempts[0]).unwrap().results_path;
+        let original = fs::read(&path).unwrap();
+        let first = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
+        assert!(first.commands[0].satisfied);
+        assert_eq!(first.commands[0].owner, CompletionResponsibility::Host);
+        assert!(!first.commands[1].satisfied && !first.references[0].satisfied);
+        assert!(!first.commands[0].bindings.iter().all(|binding| binding.path.ends_with("tester-results.json")), "accepted evidence must expose its supporting proof bindings");
+        let mut later = item.attempts[0].tasks[0].clone(); later.id = "attempt-1-write-2".into();
+        let area = work_artifact_path(&item.id, "attempt-1", &later.id);
+        later.artifact_area.as_mut().unwrap().path = area.clone();
+        let declaration = format!("{area}/no-change.json");
+        later.output.as_mut().unwrap().no_change = Some(NoChangeOutput { schema_version: 1, declaration_path: declaration.clone(), reason: "Evidence remains applicable".into(), verification: vec![NoChangeVerification { command: "true".into(), result: NoChangeVerificationResult::Pass }] });
+        fs::create_dir_all(root.path().join(&area)).unwrap();
+        fs::write(root.path().join(declaration), serde_json::to_vec(&later.output.as_ref().unwrap().no_change).unwrap()).unwrap();
+        item.attempts[0].tasks.push(later);
+        let unchanged = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
+        assert_eq!(first, unchanged);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let attachment = &item.attempts[0].evidence_recoveries[0].attachment.snapshot_path;
+        fs::write(root.path().join(attachment), "changed proof").unwrap();
+        assert!(!assess_current_verification(root.path(), &item.attempts[0]).unwrap().commands[0].satisfied);
+        assert_eq!(fs::read(path).unwrap(), original);
+        let (live_root, mut live) = fixture_with_lifetime(false, Some(60));
+        accept_first_check(live_root.path(), &mut live);
+        let document = parse_evidence_document(&fs::read(live_root.path().join(&live.attempts[0].evidence_recoveries[0].attachment.snapshot_path)).unwrap()).unwrap();
+        let issued = DateTime::parse_from_rfc3339(&document.run_at).unwrap().with_timezone(&chrono::Utc);
+        assert!(crate::verification_assessment::assess_current_verification_at(live_root.path(), &live.attempts[0], issued + chrono::TimeDelta::seconds(30)).unwrap().commands[0].satisfied);
+        assert!(!crate::verification_assessment::assess_current_verification_at(live_root.path(), &live.attempts[0], issued + chrono::TimeDelta::seconds(60)).unwrap().commands[0].satisfied);
+    }
+
+    #[test]
+    fn diagnostic_text_does_not_change_requirements() {
+        let (root, item) = fixture(true);
+        let attempt = &item.attempts[0];
+        let first = assess_current_verification(root.path(), attempt).unwrap();
+        let path = assess_canonical_checks(root.path(), attempt).unwrap().results_path;
+        let mut results: crate::tester::TesterResults = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        results.tests[0].failure_excerpt = Some("the same assertion, explained differently".into());
+        fs::write(path, serde_json::to_vec(&results).unwrap()).unwrap();
+        let second = assess_current_verification(root.path(), attempt).unwrap();
+        let identities = |view: &crate::verification_assessment::VerificationAssessment| view.unresolved().map(|row| (row.id.clone(), row.cause.clone(), row.owner)).collect::<Vec<_>>();
+        assert_eq!(identities(&first), identities(&second));
+        assert_eq!(first.references.len(), 1, "identity lists are diagnostics, not extra requirements");
+    }
+}
