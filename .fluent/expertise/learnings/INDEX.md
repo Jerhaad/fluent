@@ -12,6 +12,7 @@
 - [authorization-language-uses-bounded-affirmatives](authorization-language-uses-bounded-affirmatives.md) — Treat only exact affirmative forms as lifecycle authorization; contextual, uncertain, and negated action mentions remain contributions
 - [autonomous-claude-safe-mode-boundary](autonomous-claude-safe-mode-boundary.md) — Launch autonomous Claude work in safe mode while leaving explicitly interactive sessions customizable
 - [backward-compatible-serde-fields](backward-compatible-serde-fields.md) — Persisted Work model field additions and renames must preserve backward compatibility with existing on-disk JSON
+- [baseline-attribution-does-not-satisfy-references](baseline-attribution-does-not-satisfy-references.md) — Exclude proven pre-existing suite failures from Writer defects while still requiring passing evidence for every explicit reference
 - [behaviors-test-citation-sync](behaviors-test-citation-sync.md) — Test renames must update all Test: citations in behaviors.md in the same commit
 - [bound-conversation-state-follows-project-authority](bound-conversation-state-follows-project-authority.md) — Keep bound conversation payloads and active state in the project runtime; the runner-owner root retains only routing, deduplication, and unbound ingress
 - [candidate-commits-should-use-separated-body](candidate-commits-should-use-separated-body.md) — Candidate commits should use a non-whitespace body separated from the subject by a blank line
@@ -105,7 +106,7 @@
 - [record-divergence-in-decisions-md](record-divergence-in-decisions-md.md) — Record accepted Approach deviations in decisions.md; editing expertise alone cannot resolve conflicting requirements
 - [recoverable-parent-child-materialization](recoverable-parent-child-materialization.md) — Stage the exact parent intent before publishing multiple child records, resume matching partial publication, and gate downstream execution until materialization completes
 - [recovered-approvals-preserve-delay-provenance](recovered-approvals-preserve-delay-provenance.md) — Mark every reconnect replay source as recovered so delayed consequential approvals require fresh confirmation
-- [recovery-contracts-form-neutral-boundary](recovery-contracts-form-neutral-boundary.md) — Keep shared recovery admission, evidence parsing, and Writer completion checks in a caller-independent crate-private module
+- [recovery-contracts-form-neutral-boundary](recovery-contracts-form-neutral-boundary.md) — Keep recovery admission and Writer completion above shared read-only verification facts, independent of lifecycle callers
 - [recovery-cursors-advance-after-durable-ingest](recovery-cursors-advance-after-durable-ingest.md) — Recover paginated event history from a durable high-water mark and advance it only after each event is durably processed
 - [recovery-receipts-separate-audit-from-live-policy](recovery-receipts-separate-audit-from-live-policy.md) — Replay recovery receipts against their recorded policy commit while revalidating the current descendant policy separately
 - [recovery-recognition-precedes-evidence-validation](recovery-recognition-precedes-evidence-validation.md) — Identify a lifecycle recovery family before validating its required evidence so malformed matches cannot fall through to generic resume
@@ -148,4 +149,5 @@
 - [token-bound-to-persisted-record](token-bound-to-persisted-record.md) — Identity tokens returned by dispatch operations must be constructed from persisted record fields, not from caller-supplied request fields
 - [unix-socket-bind-eperm-in-sandbox](unix-socket-bind-eperm-in-sandbox.md) — The execution test sandbox returns EPERM on Unix socket bind; socket-level tests must export fake types for downstream non-sandboxed consumers
 - [utf8-safe-diagnostic-truncation](utf8-safe-diagnostic-truncation.md) — Byte-capped diagnostic excerpts must realign truncation to a UTF-8 character boundary before slicing
+- [verification-requirements-ignore-diagnostic-wording](verification-requirements-ignore-diagnostic-wording.md) — Bind current verification obligations to approved requirements and native evidence rather than diagnostic lines or historical Task order
 - [verified-cleanup-for-bounded-host-probes](verified-cleanup-for-bounded-host-probes.md) — A timed host-side probe may report timeout only after its owned process group has been verifiably swept

@@ -23,9 +23,21 @@ that omits qualifiers cannot bridge conflicting identities, even when the
 reference itself is qualified. Explicit references may disambiguate evidence
 only when the supplied result qualifiers support that distinction.
 
-Keep this interpretation inside the candidate gate without rewriting references
-or Tester artifacts. Regression fixtures should drive the real gate with
+Keep native parsing and normalization in `verification_reference` and current
+matching in `verification_assessment`, which the candidate gate consumes.
+Preserve approved references and the producer's raw result ID and status.
+Regression fixtures should drive the real gate with
 committed source, include competing non-passing binary targets, reverse result
 order, and retain passing controls for explicit disambiguation. Related:
 [[declared-behavior-tests-must-exist-before-land]],
 [[shell-test-evidence-uses-script-path]].
+
+A producer-supplied structured identity must retain every qualifier already
+present in its raw ID. Compatibility that allows absent qualifiers during
+reference matching is too weak to validate this producer boundary: replacing a
+qualified raw ID with a partial structured identity would broaden its meaning.
+Reject omitted or conflicting qualifiers and recognized native identities of a
+different kind. Apply the same rule to Python path, module, and class qualifiers.
+Keep unqualified native names and free-form display labels supported when they
+do not contradict the supplied identity. Test both production Tester
+normalization and gate matching, including contradictions across native kinds.
