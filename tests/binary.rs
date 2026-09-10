@@ -43481,6 +43481,152 @@ print(json.dumps([{'id':line[3:], 'status':'pass', 'test_harness':'shell-harness
     }
 }
 
+#[test]
+fn changed_candidate_resumes_through_reviews_and_tester() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let work = "changed-verification-candidate";
+    let script = "#!/bin/sh\nbroken() { test -z broken; }\nif broken; then echo 'ok tests/native.sh::broken'; else echo 'not ok tests/native.sh::broken'; exit 1; fi\n";
+    let extractor = r#"#!/usr/bin/env python3
+import json, pathlib, sys
+lines=(pathlib.Path(sys.argv[1])/'commands/0-stdout.log').read_text().splitlines()
+print(json.dumps([{'id':line.removeprefix('not ').removeprefix('ok '), 'status':'fail' if line.startswith('not ') else 'pass', 'test_harness':'shell-harness'} for line in lines if line.startswith(('ok ', 'not ok '))]))
+"#;
+    let (project, candidate_a, old_results) = canonical_evidence_fixture_with_sources(
+        &tmp,
+        work,
+        &["sh tests/native.sh"],
+        serde_json::json!({}),
+        Some(extractor),
+        &[("tests/native.sh", script)],
+    );
+    let store = WorkModelStore::new(&project);
+    let mut item = store.read_work_item(work).unwrap();
+    let mut output = item.attempts[0].tasks[0].output.as_ref().unwrap().clone();
+    let workspace = project.join(&output.workspace_path);
+    fs::write(
+        workspace.join("tests/native.sh"),
+        script.replace("test -z broken", "test -n broken"),
+    )
+    .unwrap();
+    git::run(&workspace, &["add", "tests/native.sh"], "stage repair").unwrap();
+    git::run(
+        &workspace,
+        &["commit", "-m", "Repair native assertion"],
+        "commit repair",
+    )
+    .unwrap();
+    output.commit = git_head(&workspace);
+    let candidate_b = output.commit.clone();
+    let writer_id = item
+        .add_next_write_round(
+            "attempt-1",
+            vec![ArtifactRef {
+                producer_id: "tester".into(),
+                path: old_results
+                    .strip_prefix(&project)
+                    .unwrap()
+                    .display()
+                    .to_string(),
+            }],
+        )
+        .unwrap();
+    let writer = item.attempts[0]
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == writer_id)
+        .unwrap();
+    writer.status = TaskStatus::Complete;
+    writer.output = Some(output);
+    let area = project.join(&writer.artifact_area.as_ref().unwrap().path);
+    fs::create_dir_all(&area).unwrap();
+    fs::write(area.join("transcript.jsonl"), "{}\n").unwrap();
+    item.attempts[0].writer_completion_contract = Some(WriterCompletionContract {
+        version: WRITER_COMPLETION_CONTRACT_VERSION,
+        requirements: vec![WriterCompletionRequirement {
+            responsibility: None,
+            id: "behavior:native:b1".into(),
+            kind: WriterCompletionRequirementKind::Behavior,
+            source: "behaviors.md#native:b1".into(),
+            requirement: "THE SYSTEM SHALL execute the native test.".into(),
+            command: None,
+            verification_refs: vec![
+                r#"{"kind":"named-test","path":"tests/native.sh","name":"broken"}"#.into(),
+            ],
+        }],
+    });
+    let mut matrix = serde_json::to_value(
+        WriterCompletionMatrix::skeleton(
+            item.attempts[0]
+                .writer_completion_contract
+                .as_ref()
+                .unwrap(),
+            &writer_id,
+            &[],
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for row in matrix["rows"].as_array_mut().unwrap() {
+        row["state"] = serde_json::json!("complete");
+        row["implementation-evidence"] =
+            serde_json::json!(["tests/native.sh: repaired native assertion"]);
+        row["verification"] = serde_json::json!([{"command":"sh tests/native.sh","result":"pass"}]);
+    }
+    fs::write(
+        area.join("writer-completion.json"),
+        serde_json::to_vec(&matrix).unwrap(),
+    )
+    .unwrap();
+    item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+    store.write_work_item(&item).unwrap();
+    let bin = tmp.path().join("bin");
+    write_mock_claude(
+        &bin,
+        &learner_mock_script(r#"{"schema_version":1,"observations":[],"work_items":[]}"#),
+    );
+    fluent_cmd()
+        .current_dir(&project)
+        .args(["attempt", "run", work, "attempt-1", "--no-sandbox"])
+        .env("PATH", mock_path(&bin))
+        .assert()
+        .success();
+    let completed = store.read_work_item(work).unwrap();
+    let attempt = &completed.attempts[0];
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == candidate_b)
+        })
+        .expect("candidate B must reach its canonical Tester");
+    let results: fluent::tester::TesterResults = serde_json::from_slice(
+        &fs::read(
+            project
+                .join(&tester.artifact_area.as_ref().unwrap().path)
+                .join("tester-results.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(results.summary.pass, 1);
+    assert_eq!(
+        results.candidate_commit.as_deref(),
+        Some(candidate_b.as_str())
+    );
+    let old: fluent::tester::TesterResults =
+        serde_json::from_slice(&fs::read(old_results).unwrap()).unwrap();
+    assert_eq!(old.candidate_commit.as_deref(), Some(candidate_a.as_str()));
+    assert_eq!(old.summary.fail, 1);
+}
+
 fn verification_old_reader() -> PathBuf {
     let binary = PathBuf::from(
         std::env::var_os("FLUENT_VERIFICATION_OLD_BIN")

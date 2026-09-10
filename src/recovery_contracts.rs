@@ -3191,10 +3191,8 @@ pub(crate) fn required_check_recovery_status(
                     .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
         })
         .is_some();
-    if (!has_bound_check
-        && !(has_canonical && attempt.pause_kind == Some(work_model::PauseKind::HostEvidence)))
-        || (attempt.status == work_model::AttemptStatus::Complete
-            && attempt.review_state == Some(work_model::AttemptReviewState::Passed))
+    if (attempt.status == work_model::AttemptStatus::Complete
+        && attempt.review_state == Some(work_model::AttemptReviewState::Passed))
         || attempt.tasks.iter().any(|task| {
             task.kind == TaskKind::Write
                 && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
@@ -3222,6 +3220,24 @@ pub(crate) fn required_check_recovery_status(
     if !has_canonical {
         return Ok(None);
     }
+    if attempt.tasks.iter().any(|task| {
+        matches!(task.kind, TaskKind::Review | TaskKind::Tester)
+            && matches!(task.status, TaskStatus::Planned | TaskStatus::Executing)
+    }) {
+        return Ok(None);
+    }
+    // A completed recheck retains its existing evidence recovery route. This
+    // admits recovery work without crediting any unresolved requirement.
+    if !has_bound_check
+        && attempt
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Tester && task.status == TaskStatus::Complete)
+            .is_some_and(|task| task.is_failed_command_recheck())
+    {
+        return Ok(None);
+    }
     if attempt.writer_completion_contract.is_some()
         && attempt
             .tasks
@@ -3230,6 +3246,9 @@ pub(crate) fn required_check_recovery_status(
     {
         let assessment =
             crate::verification_assessment::assess_current_verification(project_root, attempt)?;
+        if !assessment.candidate_defects().is_empty() {
+            return Ok(None);
+        }
         let gaps = assessment
             .references
             .iter()
@@ -3257,6 +3276,9 @@ pub(crate) fn required_check_recovery_status(
                 next_action: None,
             }));
         }
+    }
+    if !has_bound_check && attempt.pause_kind != Some(work_model::PauseKind::HostEvidence) {
+        return Ok(None);
     }
     let assessment = assess_canonical_checks(project_root, attempt)?;
     if assessment.is_satisfied() {
@@ -3329,6 +3351,7 @@ pub(crate) fn required_check_recovery_status(
 #[cfg(test)]
 pub(crate) mod verification_tests {
     use super::*;
+    use crate::host_evidence;
     use crate::verification_assessment::assess_current_verification;
     use crate::work_model::*;
     use std::os::unix::fs::PermissionsExt;
@@ -3490,6 +3513,17 @@ pub(crate) mod verification_tests {
     }
 
     #[test]
+    fn native_defect_remains_actionable_with_missing_reference() {
+        let (root, item) = fixture(true);
+        assert!(
+            required_check_recovery_status(root.path(), &item.attempts[0])
+                .unwrap()
+                .is_none()
+        );
+        host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0]).unwrap();
+    }
+
+    #[test]
     fn changed_candidate_can_run_reviews_and_its_first_tester() {
         let (root, mut item) = fixture(true);
         fs::write(root.path().join("candidate-change"), "repair").unwrap();
@@ -3508,8 +3542,7 @@ pub(crate) mod verification_tests {
         item.attempts[0].tasks.push(writer);
         item.attempts[0].status = AttemptStatus::Executing;
         item.attempts[0].pause_kind = None;
-        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0])
-            .unwrap();
+        host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0]).unwrap();
         let pending = assess_current_verification(root.path(), &item.attempts[0]).unwrap();
         assert_eq!(pending.candidate_commit, commit);
         assert!(pending.commands.is_empty());
@@ -3521,8 +3554,7 @@ pub(crate) mod verification_tests {
             }
         }
         item.add_final_tester_task("attempt-1").unwrap();
-        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0])
-            .unwrap();
+        host_evidence::ensure_owned_host_resume_ready(root.path(), &item.attempts[0]).unwrap();
     }
 
     #[test]
@@ -3579,7 +3611,7 @@ pub(crate) mod verification_tests {
             .unwrap()
             .unwrap();
         assert!(status.can_resume, "{}", status.reason);
-        crate::host_evidence::ensure_owned_host_resume_ready(root.path(), attempt).unwrap();
+        host_evidence::ensure_owned_host_resume_ready(root.path(), attempt).unwrap();
         assert!(
             !assess_current_verification(root.path(), attempt)
                 .unwrap()
