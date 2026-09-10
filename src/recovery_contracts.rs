@@ -3238,6 +3238,17 @@ pub(crate) fn required_check_recovery_status(
     {
         return Ok(None);
     }
+    // Integrity failures remain authoritative even when native failures also
+    // exist. Pending verification owners have already been admitted above.
+    if let Ok(canonical) = assess_canonical_checks(project_root, attempt) {
+        if !canonical.blockers.is_empty() {
+            return Ok(Some(RequiredCheckRecoveryStatus {
+                can_resume: false,
+                reason: canonical.blockers.join("\n\n"),
+                next_action: None,
+            }));
+        }
+    }
     if attempt.writer_completion_contract.is_some()
         && attempt
             .tasks

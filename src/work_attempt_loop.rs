@@ -9127,24 +9127,10 @@ fn interpret_reviews(
     let tester_result_path =
         latest_tester_results_path(project_root, &item.attempts[attempt_index]);
     let baseline_path = baseline_tester_results_path(project_root, &item.attempts[attempt_index]);
-    let canonical_has_policy = tester_result_path
+    let canonical_run_recorded = tester_result_path
         .as_ref()
         .and_then(|path| path.parent())
-        .map(|area| area.join("canonical-run.json"))
-        .filter(|path| path.exists())
-        .is_some_and(|path| {
-            fs::read(path)
-                .ok()
-                .and_then(|bytes| {
-                    serde_json::from_slice::<crate::tester::CanonicalRunManifest>(&bytes).ok()
-                })
-                .is_none_or(|manifest| {
-                    manifest
-                        .commands
-                        .iter()
-                        .any(|command| !command.applicability.is_default())
-                })
-        });
+        .is_some_and(|area| area.join("canonical-run.json").exists());
     let assessed_checks = crate::recovery_contracts::assess_canonical_checks(
         project_root,
         &item.attempts[attempt_index],
@@ -9166,34 +9152,27 @@ fn interpret_reviews(
                     serde_json::from_slice::<crate::tester::TesterResults>(&bytes).ok()
                 })
                 .is_some_and(|results| results.needs_failure_diagnosis()));
-    let canonical_assessment = item.attempts[attempt_index]
-        .evidence_recoveries
-        .iter()
-        .any(|recovery| {
-            recovery
-                .required_check
-                .as_ref()
-                .is_some_and(|check| check.source.is_canonical_tester() || assessed_checks.is_ok())
-        })
-        .then_some(())
-        .or((canonical_has_policy || needs_diagnosis).then_some(()))
-        .or_else(|| {
-            (assessed_checks.is_ok()
-                && item.attempts[attempt_index]
-                    .artifacts
-                    .iter()
-                    .any(|artifact| {
-                        artifact.producer_id == "plan-host-evidence"
-                            && artifact.path.ends_with("/binding.json")
-                    }))
-            .then_some(())
-        })
-        .map(|_| assessed_checks);
+    // Every available current assessment controls advancement, including
+    // reconstructed default-policy runs. Recorded runs retain that authority
+    // when a binding read fails.
+    let canonical_assessment = (assessed_checks.is_ok()
+        || canonical_run_recorded
+        || needs_diagnosis
+        || item.attempts[attempt_index]
+            .evidence_recoveries
+            .iter()
+            .any(|recovery| {
+                recovery
+                    .required_check
+                    .as_ref()
+                    .is_some_and(|check| check.source.is_canonical_tester())
+            }))
+    .then_some(assessed_checks);
     if tester_gate_applicable
         && canonical_assessment.as_ref().is_some_and(|assessment| {
-            assessment
-                .as_ref()
-                .map_or(true, |view| !view.is_satisfied() && view.defects.is_empty())
+            assessment.as_ref().map_or(true, |view| {
+                !view.blockers.is_empty() || (!view.is_satisfied() && view.defects.is_empty())
+            })
         })
     {
         let reason = match canonical_assessment.as_ref().unwrap() {
@@ -16375,6 +16354,152 @@ mod tests {
                 .iter()
                 .all(|task| !task.is_failed_command_recheck())
         );
+    }
+
+    #[test]
+    fn inconsistent_summary_blocks_gate_status_and_attempt() {
+        use std::os::unix::fs::PermissionsExt;
+        for (failing_native, with_contract) in [(false, true), (true, true), (false, false)] {
+            let root = tempfile::TempDir::new().unwrap();
+            let (store, workspace, _) = final_tester_evidence_fixture(root.path());
+            fs::write(
+                workspace.path().join(".fluent/tester.yaml"),
+                "commands:\n  - command: true\n    test_harness: shell-harness\n",
+            )
+            .unwrap();
+            let extractor = workspace.path().join(".fluent/extract-tester-results");
+            fs::write(&extractor, "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"required_behavior\",\"test_harness\":\"cargo-nextest\",\"status\":\"pass\"}]'\n").unwrap();
+            fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["add", ".fluent"],
+                "stage passing canonical fixture",
+            )
+            .unwrap();
+            crate::git::run(
+                workspace.path(),
+                &["commit", "-qm", "Declare passing verification"],
+                "commit passing canonical fixture",
+            )
+            .unwrap();
+            let candidate =
+                crate::git::run_stdout(workspace.path(), &["rev-parse", "HEAD"], "read candidate")
+                    .unwrap();
+            store
+                .mutate_work_item("work-1", |item| {
+                    for task in &mut item.attempts[0].tasks {
+                        if let Some(output) = &mut task.output {
+                            output.commit = candidate.clone();
+                        }
+                        if let Some(context) = &mut task.review_context {
+                            context.candidate_commit = candidate.clone();
+                        }
+                    }
+                    if !with_contract {
+                        item.attempts[0].writer_completion_contract = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let item = store.read_work_item("work-1").unwrap();
+            let tester = item.attempts[0]
+                .tasks
+                .iter()
+                .find(|task| task.kind == TaskKind::Tester)
+                .unwrap();
+            let area = root
+                .path()
+                .join(&tester.artifact_area.as_ref().unwrap().path);
+            crate::tester::run(
+                workspace.path(),
+                &area,
+                true,
+                &crate::content::ContentResolver::new(Some(workspace.path())),
+            )
+            .unwrap();
+            crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+            assert!(area.join("canonical-run.json").is_file());
+            let path = area.join("tester-results.json");
+            let mut results: crate::tester::TesterResults =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(results.commands[0].exit_code, 0);
+            results.summary.total = 2;
+            results.summary.pass = 2;
+            if failing_native {
+                results.tests[0].status = "fail".into();
+                results.summary.pass = 0;
+                results.summary.fail = 1;
+            }
+            fs::write(&path, serde_json::to_vec(&results).unwrap()).unwrap();
+            let view = crate::verification_assessment::assess_current_verification(
+                root.path(),
+                &item.attempts[0],
+            )
+            .unwrap();
+            assert!(view.commands.iter().any(|row| row.cause
+                == Some(
+                    crate::verification_assessment::VerificationCause::UninterpretableEvidence
+                )));
+            let gate = crate::candidate_gate::run_candidate_gate(
+                crate::candidate_gate::CandidateGateRequest {
+                    project_root: root.path(),
+                    workspace: workspace.path(),
+                    work_item_id: "work-1",
+                    attempt_id: "attempt-1",
+                    task_id: None,
+                    phase: crate::candidate_gate::CandidateGatePhase::FinalTester,
+                    base_commit: &candidate,
+                    candidate_commit: &candidate,
+                    completion_contract: item.attempts[0].writer_completion_contract.as_ref(),
+                    allow_tree_identical_metadata_rewrite: false,
+                    metadata_rewrite_authorization: None,
+                    tester_results_path: Some(&path),
+                    accepted_tester_commands: &[],
+                    artifact_path: &root.path().join("current-gate.json"),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                gate.checks
+                    .iter()
+                    .find(|check| check.name == "tester-reference-evidence")
+                    .unwrap()
+                    .status,
+                crate::candidate_gate::CandidateCheckStatus::Error
+            );
+            let status = crate::work_status::summarize_work_item(&item, Some(root.path()));
+            assert!(
+                status
+                    .recovery_blocker
+                    .as_ref()
+                    .is_some_and(|reason| reason.contains("summary"))
+            );
+            let writers = item.attempts[0]
+                .tasks
+                .iter()
+                .filter(|task| task.kind == TaskKind::Write)
+                .count();
+            let outcome =
+                interpret_reviews(root.path(), &store, item, "attempt-1", true, None).unwrap();
+            assert!(
+                matches!(outcome, WorkAttemptRunOutcome::NeedsUser { .. }),
+                "{outcome:?}"
+            );
+            let current = store.read_work_item("work-1").unwrap();
+            assert!(current.merge_candidates.is_empty());
+            assert_eq!(
+                current.attempts[0].pause_kind,
+                Some(PauseKind::HostEvidence)
+            );
+            assert_eq!(
+                current.attempts[0]
+                    .tasks
+                    .iter()
+                    .filter(|task| task.kind == TaskKind::Write)
+                    .count(),
+                writers
+            );
+        }
     }
 
     #[test]

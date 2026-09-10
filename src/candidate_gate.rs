@@ -1611,20 +1611,7 @@ fn check_commit_metadata(
 fn check_behavior_references(
     request: &CandidateGateRequest<'_>,
 ) -> Result<Vec<CandidateCheckEvidence>> {
-    let Some(contract) = request.completion_contract else {
-        return Ok(vec![
-            check(
-                "behavior-references",
-                CandidateCheckStatus::Skipped,
-                vec!["Attempt has no Writer completion contract".to_string()],
-            ),
-            check(
-                "tester-reference-evidence",
-                CandidateCheckStatus::Skipped,
-                vec!["Attempt has no Writer completion contract".to_string()],
-            ),
-        ]);
-    };
+    let contract = request.completion_contract;
     let results = request
         .tester_results_path
         .map(|path| {
@@ -1692,6 +1679,18 @@ fn check_behavior_references(
                     return Ok(vec![check("tester-reference-evidence", CandidateCheckStatus::Error,
                         vec!["Supplied Tester evidence is not the recorded current canonical artifact".into()])]);
                 }
+                if !view.blockers.is_empty() {
+                    return Ok(vec![check(
+                        "tester-reference-evidence",
+                        CandidateCheckStatus::Error,
+                        view.blockers
+                            .iter()
+                            .map(|reason| {
+                                format!("Current canonical verification needs diagnosis: {reason}")
+                            })
+                            .collect(),
+                    )]);
+                }
                 Some(view)
             }
             Err(error) => {
@@ -1701,8 +1700,8 @@ fn check_behavior_references(
                     vec![format!(
                         "Current verification bindings need diagnosis: {error:#}. Approved requirements: {}",
                         contract
-                            .requirements
-                            .iter()
+                            .into_iter()
+                            .flat_map(|contract| &contract.requirements)
                             .flat_map(|row| row
                                 .verification_refs
                                 .iter()
@@ -1715,6 +1714,20 @@ fn check_behavior_references(
         }
     } else {
         None
+    };
+    let Some(contract) = contract else {
+        return Ok(vec![
+            check(
+                "behavior-references",
+                CandidateCheckStatus::Skipped,
+                vec!["Attempt has no Writer completion contract".to_string()],
+            ),
+            check(
+                "tester-reference-evidence",
+                CandidateCheckStatus::Skipped,
+                vec!["Attempt has no Writer completion contract".to_string()],
+            ),
+        ]);
     };
     let mut adjusted = results.clone();
     if request.phase == CandidateGatePhase::Learner {
