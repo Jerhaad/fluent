@@ -5328,8 +5328,22 @@ fn current_verification_for_context(
         }
         return Err(error.into());
     }
-    let item = crate::work_model::WorkModelStore::new(root)
-        .read_work_item_snapshot(&parts[0].as_os_str().to_string_lossy())?;
+    let store = crate::work_model::WorkModelStore::new(root);
+    let work_id = parts[0].as_os_str().to_string_lossy();
+    let mut snapshot = store.read_work_item_snapshot(&work_id);
+    // Parallel reviewers can publish between the read-only snapshot's child
+    // reads. Let that bounded publication settle without recovering its journal.
+    for _ in 0..20 {
+        if !matches!(
+            snapshot,
+            Err(crate::work_model::WorkModelStorageError::SnapshotUnavailable { .. })
+        ) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        snapshot = store.read_work_item_snapshot(&work_id);
+    }
+    let item = snapshot?;
     let attempt = item
         .attempts
         .iter()
@@ -16870,6 +16884,56 @@ while time.monotonic() < deadline:
         assert_eq!(context.executed_commands, ["cargo nextest run"]);
         assert_eq!(context.historical_artifacts.len(), 4);
         assert_eq!(context.omitted.current_findings, 0);
+    }
+
+    #[test]
+    fn execution_context_waits_for_publication_without_recovering_it() {
+        for host_finishes in [false, true] {
+            let project = tempfile::tempdir().unwrap();
+            let store = WorkModelStore::new(project.path());
+            store.create_work_item(&review_item()).unwrap();
+            let mut update = store.read_work_item_snapshot("work-1").unwrap();
+            update.title = "Pending publication".into();
+            let fault = crate::work_model::persist_fault::arm_split_write("work-1");
+            assert!(store.write_work_item(&update).is_err());
+            drop(fault);
+            let journal = project.path().join(".fluent/work/transactions/work-1.json");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("base_children_digest");
+            let pending = serde_json::to_vec_pretty(&value).unwrap();
+            fs::write(&journal, &pending).unwrap();
+            assert!(store.read_work_item_snapshot("work-1").is_err());
+
+            let root = project.path().to_path_buf();
+            let host = host_finishes.then(|| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    WorkModelStore::new(&root)
+                        .mutate_work_item("work-1", |_| Ok(()))
+                        .unwrap();
+                })
+            });
+            let area = project
+                .path()
+                .join(".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-tests");
+            let result = current_verification_for_context(&area, "abc123");
+            if let Some(host) = host {
+                host.join().unwrap();
+                assert_eq!(result.unwrap().unwrap().1.candidate_commit, "abc123");
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("snapshot is unavailable")
+                );
+                assert_eq!(fs::read(&journal).unwrap(), pending);
+            }
+        }
     }
 
     #[test]
