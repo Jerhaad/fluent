@@ -2820,6 +2820,65 @@ echo '[{"id": "my_test", "test_harness": "cargo-nextest", "status": "pass", "dur
     }
 
     #[test]
+    fn producer_identity_cannot_weaken_native_qualification() {
+        for (raw, complete, partials) in [
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"module::works"}),
+                vec![
+                    serde_json::json!({"kind":"rust","binary":"pkg::lib","name":"module::works"}),
+                    serde_json::json!({"kind":"rust","path":"src/native.rs","name":"module::works"}),
+                    serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"pkg::lib","name":"works"}),
+                    serde_json::json!({"kind":"rust","path":"src/native.rs","binary":"other","name":"module::works"}),
+                ],
+            ),
+            (
+                "tests/native.py::module.Native.works",
+                serde_json::json!({"kind":"python","path":"tests/native.py","module":"module","class":"Native","name":"works"}),
+                vec![
+                    serde_json::json!({"kind":"python","module":"module","class":"Native","name":"works"}),
+                    serde_json::json!({"kind":"python","path":"tests/native.py","class":"Native","name":"works"}),
+                    serde_json::json!({"kind":"python","path":"tests/native.py","name":"works"}),
+                    serde_json::json!({"kind":"python","path":"tests/native.py","module":"other","class":"Native","name":"works"}),
+                ],
+            ),
+        ] {
+            for (identity, valid) in std::iter::once((complete, true))
+                .chain(partials.into_iter().map(|identity| (identity, false)))
+            {
+                let workspace = TempDir::new().unwrap();
+                let artifacts = TempDir::new().unwrap();
+                make_workspace(workspace.path());
+                write_tester_yaml(
+                    workspace.path(),
+                    "commands:\n  - command: true\n    test_harness: shell-harness\n",
+                );
+                let rows = serde_json::json!([{"id":raw,"identity":identity,"status":"pass","test_harness":"native"}]);
+                write_extractor(
+                    workspace.path(),
+                    &format!("#!/bin/sh\ncat <<'RESULTS'\n{rows}\nRESULTS\n"),
+                );
+                run(workspace.path(), artifacts.path(), true, &resolver()).unwrap();
+                let result = read_results(artifacts.path());
+                if valid {
+                    assert!(result.error.is_none());
+                    assert_eq!(result.tests[0].id, raw);
+                    assert_eq!(
+                        serde_json::to_value(&result.tests[0].identity).unwrap(),
+                        identity
+                    );
+                } else {
+                    assert_eq!(
+                        result.error.as_ref().map(|error| error.kind.as_str()),
+                        Some("invalid_test_identity"),
+                        "{raw}: {identity}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn diagnosed_test_and_harness_defects_are_not_ambiguous() {
         let mut results = TesterResults {
             candidate_commit: None,

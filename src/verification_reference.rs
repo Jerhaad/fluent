@@ -723,8 +723,15 @@ pub(crate) fn normalized_result(
                 .as_ref()
                 .map_or_else(|| native.clone(), |path| format!("{path} ({native})"));
             let parsed = RustTestIdentity::parse(&id).ok_or("malformed Rust identity")?;
-            if RustTestIdentity::parse(&test.id).is_some_and(|raw| !parsed.compatible_with(&raw)) {
-                return Err("Rust qualifiers contradict producer text".into());
+            if RustTestIdentity::parse(&test.id).is_some_and(|raw| {
+                !parsed.compatible_with(&raw)
+                    || raw.path.is_some_and(|path| parsed.path != Some(path))
+                    || raw
+                        .binary
+                        .is_some_and(|binary| parsed.binary != Some(binary))
+                    || (raw.name.contains("::") && parsed.name != raw.name)
+            }) {
+                return Err("Rust identity contradicts or omits native qualifiers".into());
             }
             id
         }
@@ -746,9 +753,15 @@ pub(crate) fn normalized_result(
                 .as_ref()
                 .map_or_else(|| name.clone(), |path| format!("{path}::{name}"));
             let parsed = PythonTestIdentity::parse(&id).ok_or("malformed Python identity")?;
-            if PythonTestIdentity::parse(&test.id).is_some_and(|raw| !parsed.compatible_with(&raw))
-            {
-                return Err("Python qualifiers contradict producer text".into());
+            if PythonTestIdentity::parse(&test.id).is_some_and(|raw| {
+                !parsed.compatible_with(&raw)
+                    || raw.path.is_some_and(|path| parsed.path != Some(path))
+                    || raw
+                        .module
+                        .is_some_and(|module| parsed.module != Some(module))
+                    || raw.class.is_some_and(|class| parsed.class != Some(class))
+            }) {
+                return Err("Python identity contradicts or omits native qualifiers".into());
             }
             id
         }

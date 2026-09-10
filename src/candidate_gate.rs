@@ -4901,6 +4901,44 @@ mod tests {
     }
 
     #[test]
+    fn partial_structured_identities_cannot_erase_native_qualifiers() {
+        for (reference, raw, identity) in [
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "src/other.rs (pkg::lib$module::works)",
+                serde_json::json!({"kind":"rust","name":"works"}),
+            ),
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "src/native.rs (other::lib$module::works)",
+                serde_json::json!({"kind":"rust","name":"works"}),
+            ),
+            (
+                "src/native.rs (pkg::lib$module::works)",
+                "src/native.rs (pkg::lib$other::works)",
+                serde_json::json!({"kind":"rust","name":"works"}),
+            ),
+            (
+                "tests/native.py (Native.works)",
+                "tests/other.py::module.Native.works",
+                serde_json::json!({"kind":"python","name":"works"}),
+            ),
+            (
+                "tests/native.py (Native.works)",
+                "tests/native.py::module.Other.works",
+                serde_json::json!({"kind":"python","name":"works"}),
+            ),
+        ] {
+            let gate = explicit_gate(
+                reference,
+                serde_json::json!([{"id":raw,"status":"pass","test_harness":"native","identity":identity}]),
+                serde_json::json!([]),
+            );
+            assert_ne!(gate.disposition, CandidateGateDisposition::Passed, "{raw}");
+        }
+    }
+
+    #[test]
     fn unambiguous_legacy_reference_meaning_is_preserved() {
         for (reference, id) in [
             ("tests/native.sh (coverage description)", "tests/native.sh"),
