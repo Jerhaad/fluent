@@ -3990,9 +3990,19 @@ mod tests {
             "#!/usr/bin/env python3\n",
         )
         .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(workspace.path().join(".fluent")).unwrap();
+        fs::write(
+            workspace.path().join(".fluent/tester.yaml"),
+            "commands:\n  - command: true\n    test_harness: shell-harness\n",
+        )
+        .unwrap();
+        let extractor = workspace.path().join(".fluent/extract-tester-results");
+        fs::write(&extractor, "#!/bin/sh\necho '[]'\n").unwrap();
+        fs::set_permissions(&extractor, fs::Permissions::from_mode(0o755)).unwrap();
         crate::git::run(
             workspace.path(),
-            &["add", "tests/readiness.py"],
+            &["add", "tests/readiness.py", ".fluent"],
             "stage candidate",
         )
         .unwrap();
@@ -5172,6 +5182,41 @@ mod tests {
         let command = "python3 tests/readiness.py";
         let (project, workspace, store, candidate, gate_path, evidence_path) =
             candidate_gate_evidence_fixture(command);
+        // The current canonical run proves that the legacy host command is
+        // outside its configuration before reviewed proof can satisfy it.
+        let mut item = store.read_work_item("work-1").unwrap();
+        let tester_id = item.add_final_tester_task("attempt-1").unwrap();
+        let tester = item.attempts[0]
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tester_id)
+            .unwrap();
+        work_model::set_task_terminal(tester, TaskStatus::Complete);
+        let area = project
+            .path()
+            .join(&tester.artifact_area.as_ref().unwrap().path);
+        fs::create_dir_all(&area).unwrap();
+        crate::tester::run(
+            workspace.path(),
+            &area,
+            true,
+            &crate::content::ContentResolver::new(Some(workspace.path())),
+        )
+        .unwrap();
+        crate::tester::bind_candidate_commit(&area, &candidate).unwrap();
+        let results_path = area.join("tester-results.json");
+        assert!(area.join("canonical-run.json").is_file());
+        item.attempts[0].review_state = Some(work_model::AttemptReviewState::Failed);
+        work_model::suspend_attempt(&mut item.attempts[0], work_model::PauseKind::HostEvidence);
+        let mut gate: crate::candidate_gate::CandidateGateEvidence =
+            serde_json::from_slice(&fs::read(project.path().join(&gate_path)).unwrap()).unwrap();
+        gate.tester_results_path = Some(results_path.display().to_string());
+        fs::write(
+            project.path().join(&gate_path),
+            serde_json::to_vec_pretty(&gate).unwrap(),
+        )
+        .unwrap();
+        store.write_work_item(&item).unwrap();
 
         assert!(
             attach(
@@ -5316,16 +5361,6 @@ mod tests {
                 command: None,
             }],
         };
-        let results_path = project.path().join("tester-results.json");
-        fs::write(
-            &results_path,
-            serde_json::to_vec(&serde_json::json!({
-                "candidate_commit": candidate, "commands": [], "tests": [],
-                "summary": {"total":0,"pass":0,"fail":0,"skipped":0}, "error": null
-            }))
-            .unwrap(),
-        )
-        .unwrap();
         let run_gate = || {
             crate::candidate_gate::run_candidate_gate(crate::candidate_gate::CandidateGateRequest {
                 project_root: project.path(),
