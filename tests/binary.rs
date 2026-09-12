@@ -37610,6 +37610,86 @@ fn round_cap_approach_revision_replays_historical_plan_applicability_in_source_w
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_replays_bound_frontier_after_writer_completion() {
+    let fixture = setup_round_cap_approach_revision_fixture_with_accepted_host_evidence();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let prompt_log = fixture._tmp.path().join("historical-frontier-prompts.log");
+    let bin = fixture._tmp.path().join("historical-frontier-provider");
+    write_sandboxed_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let completed = fixture.store.read_work_item("work-1").unwrap();
+    assert!(completed.attempts[0].tasks.iter().any(|task| {
+        task.role == "approach-revision-correction"
+            && task.status == fluent::work_model::TaskStatus::Complete
+    }));
+    let audit_ref = completed.attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap();
+    let audit_path = fixture.main_dir.join(&audit_ref.path);
+    let mut audit = read_json_path(&audit_path);
+    audit["round-cap-extension"]["pre-extension-write-rounds"] = serde_json::json!(0);
+    write_json_path(&audit_path, &audit);
+    let audit_bytes = fs::read(&audit_path).unwrap();
+    let audit_digest = format!("{:x}", Sha256::digest(&audit_bytes));
+    let request = fluent::work_model::RecoveryOperationRequest::new(
+        "planning-approach-revision",
+        "work-1",
+        "attempt-1",
+        Some(audit["candidate-commit"].as_str().unwrap().to_string()),
+        Some(audit["source-review-task-id"].as_str().unwrap().to_string()),
+        None,
+        None,
+        Some(audit["resolution"].as_str().unwrap().to_string()),
+        Some(audit_digest.clone()),
+    );
+
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["round_cap_extensions"][0]["pre_extension_write_rounds"] = serde_json::json!(0);
+    for operation in attempt["recovery_operations"].as_array_mut().unwrap() {
+        if operation["operation-kind"] == "planning-approach-revision" {
+            operation["operation-id"] = serde_json::json!(request.operation_id());
+            operation["input-digest"] = serde_json::json!(audit_digest);
+        }
+    }
+    write_json_path(&attempt_path, &attempt);
+    assert_eq!(
+        fixture.store.read_work_item("work-1").unwrap().attempts[0].round_cap_extensions[0]
+            .pre_extension_write_rounds,
+        Some(0)
+    );
+
+    let prompt_count = fs::read_to_string(&prompt_log)
+        .unwrap()
+        .matches("--- invocation ---")
+        .count();
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("pre-extension Writer rounds"));
+    assert_eq!(
+        fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        prompt_count,
+        "historical frontier rejection must not launch another provider"
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resumes_after_a_second_revision() {
     let fixture = setup_round_cap_approach_revision_fixture();
     make_round_cap_behavior_testable(&fixture);

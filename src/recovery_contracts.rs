@@ -1168,6 +1168,13 @@ fn validate_planning_revisions(
                 "approved Approach source review candidate changed"
             );
             if revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap {
+                // Replay every failed-review round-cap audit through the
+                // bound-frontier proof. Do not compare this historical
+                // extension with the latest planning contract: later
+                // revisions may have composed a different current contract.
+                attempt
+                    .validate_round_cap_extensions_for_approach_revision()
+                    .map_err(anyhow::Error::msg)?;
                 let extension = revision
                     .round_cap_extension
                     .as_ref()
