@@ -36427,6 +36427,283 @@ fn round_cap_approach_revision_requires_extension() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_rejects_exhausted_extension() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.round_cap_extensions[0].new_cap = attempt.materialized_write_rounds();
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "approved Writer-round cap is exhausted",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions")
+            .exists()
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_changed_extension_candidate() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0].round_cap_extensions[0].candidate_commit =
+                "changed-after-approval".to_string();
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "reviewed candidate no longer matches the round-cap authorization",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_changed_failed_review_bytes() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let tests_review = stored.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.role == "tests")
+        .unwrap();
+    let review_path = fixture
+        .main_dir
+        .join(&tests_review.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    fs::write(&review_path, "Verdict: fail\nchanged after approval\n").unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "failed-review bytes no longer match the round-cap authorization",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_canceled_attempt() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["cancellation"] = serde_json::json!({
+        "requested_at": "2026-09-12T00:00:00Z",
+        "settled_at": "2026-09-12T00:00:01Z"
+    });
+    write_json_path(&attempt_path, &attempt);
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("cancellation"));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_live_task_owner() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let lease = fluent::lease::acquire(&fluent::lease::task_lock_path(
+        &fixture.main_dir,
+        "work-1",
+        "attempt-1-review-tests",
+    ))
+    .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("live Task owner"));
+
+    drop(lease);
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_unrelated_pause() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            item.attempts[0].pause_kind = Some(fluent::work_model::PauseKind::TesterHarness);
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "not paused at an uncertain Architecture review frontier",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_failed_tester_frontier() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            let tester_id = item.add_final_tester_task("attempt-1")?;
+            let tester = item.attempts[0]
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == tester_id)
+                .unwrap();
+            fluent::work_model::set_task_terminal(tester, fluent::work_model::TaskStatus::Failed);
+            item.attempts[0].status = fluent::work_model::AttemptStatus::NeedsUser;
+            item.attempts[0].pause_kind = Some(fluent::work_model::PauseKind::RoundCap);
+            item.attempts[0].review_state = Some(fluent::work_model::AttemptReviewState::Failed);
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("unresolved Task"));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_inconsistent_planning_contract() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            item.planning_context
+                .as_mut()
+                .unwrap()
+                .behaviors
+                .as_mut()
+                .unwrap()
+                .push_str("\nChanged after the Attempt was created.\n");
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "planning authority and Attempt completion contract differ",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_retry_rejects_changed_planning_contract() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            item.planning_context
+                .as_mut()
+                .unwrap()
+                .behaviors
+                .as_mut()
+                .unwrap()
+                .push_str("\nChanged after revision publication.\n");
+            Ok(())
+        })
+        .unwrap();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "planning authority and Attempt completion contract differ",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/transactions/work-1.json")
+            .exists()
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_preserves_authority_and_history() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
@@ -36440,6 +36717,27 @@ fn round_cap_approach_revision_preserves_authority_and_history() {
         .join(&source_writer.artifact_area.as_ref().unwrap().path)
         .join("writer-completion.json");
     let source_matrix = fs::read(&source_matrix_path).unwrap();
+    let source_matrix_value: fluent::work_model::WriterCompletionMatrix =
+        serde_json::from_slice(&source_matrix).unwrap();
+    assert_eq!(
+        source_matrix_value
+            .rows
+            .iter()
+            .find(|row| row.id == "plan:step-1")
+            .unwrap()
+            .responsibility,
+        Some(fluent::work_model::CompletionResponsibility::Writer)
+    );
+    let before_evidence = before_attempt.evidence_recoveries.clone();
+    let evidence_bytes: Vec<_> = before_evidence
+        .iter()
+        .map(|recovery| {
+            (
+                recovery.attachment.snapshot_path.clone(),
+                fs::read(fixture.main_dir.join(&recovery.attachment.snapshot_path)).unwrap(),
+            )
+        })
+        .collect();
     let review_bytes: Vec<_> = before_attempt
         .tasks
         .iter()
@@ -36492,7 +36790,11 @@ fn round_cap_approach_revision_preserves_authority_and_history() {
         after_attempt.round_cap_extensions,
         before_attempt.round_cap_extensions
     );
+    assert_eq!(after_attempt.evidence_recoveries, before_evidence);
     assert_eq!(fs::read(source_matrix_path).unwrap(), source_matrix);
+    for (path, bytes) in evidence_bytes {
+        assert_eq!(fs::read(fixture.main_dir.join(path)).unwrap(), bytes);
+    }
     for (path, bytes) in review_bytes {
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
@@ -36685,6 +36987,62 @@ fn round_cap_approach_revision_recovers_interrupted_publication() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_recovers_prewritten_audit_before_publication() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach_before_publication(&fixture).failure();
+
+    let revisions_dir = fixture
+        .main_dir
+        .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions");
+    let revision_dir = fs::read_dir(&revisions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("prewritten revision audit directory");
+    let audit_path = revision_dir.join("revision.json");
+    let audit_bytes = fs::read(&audit_path).unwrap();
+    let interrupted = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(serde_json::to_vec(&interrupted).unwrap(), before);
+    assert!(
+        interrupted.attempts[0]
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.producer_id != "planning-approach-recovery")
+    );
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/transactions/work-1.json")
+            .exists()
+    );
+
+    revise_round_cap_approach(&fixture).success();
+
+    let recovered = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(
+        recovered.attempts[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .count(),
+        1
+    );
+    assert_eq!(
+        recovered.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.role == "approach-revision-correction")
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resumes_through_public_routes() {
     let direct = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&direct);
@@ -36816,6 +37174,128 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
         fluent::work_model::TaskStatus::Complete
     );
     assert_round_cap_writer_prompt(&queued, &queued_prompt_log, queued_attempt);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_resume_preserves_downstream_gates() {
+    let direct = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    approve_round_cap_extension(&direct);
+    revise_round_cap_approach(&direct).success();
+    let direct_prompt_log = direct._tmp.path().join("direct-gates-provider-prompts.log");
+    let direct_bin = direct._tmp.path().join("direct-gates-provider");
+    write_mock_claude(
+        &direct_bin,
+        &round_cap_resume_provider_script(&direct_prompt_log),
+    );
+
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+    let direct_after = direct.store.read_work_item("work-1").unwrap();
+    let direct_attempt = &direct_after.attempts[0];
+    let responsibilities: Vec<_> = direct_attempt
+        .writer_completion_contract
+        .as_ref()
+        .unwrap()
+        .requirements
+        .iter()
+        .filter_map(|row| row.responsibility)
+        .collect();
+    assert!(responsibilities.contains(&fluent::work_model::CompletionResponsibility::Host));
+    assert!(responsibilities.contains(&fluent::work_model::CompletionResponsibility::Review));
+    assert!(responsibilities.contains(&fluent::work_model::CompletionResponsibility::Tester));
+    assert!(responsibilities.contains(&fluent::work_model::CompletionResponsibility::Learner));
+    assert_eq!(
+        direct_attempt.status,
+        fluent::work_model::AttemptStatus::NeedsUser
+    );
+    assert!(matches!(
+        direct_attempt.pause_kind,
+        Some(
+            fluent::work_model::PauseKind::HostEvidence
+                | fluent::work_model::PauseKind::CandidateGate
+        )
+    ));
+    assert_eq!(
+        direct_attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2
+    );
+    assert!(direct_attempt.learning.is_none());
+    assert!(direct_attempt.tasks.iter().all(|task| {
+        task.kind != fluent::work_model::TaskKind::Review
+            || task.status == fluent::work_model::TaskStatus::Complete
+    }));
+    let direct_prompt = fs::read_to_string(&direct_prompt_log).unwrap();
+    let direct_writer_invocations = direct_prompt.matches("--- invocation ---").count();
+    assert_eq!(direct_writer_invocations, 1);
+
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needs user input"));
+    assert_eq!(
+        fs::read_to_string(&direct_prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        direct_writer_invocations,
+        "host evidence pause must block another foreground provider launch"
+    );
+
+    let queued = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    approve_round_cap_extension(&queued);
+    revise_round_cap_approach(&queued).success();
+    let queued_prompt_log = queued._tmp.path().join("queued-gates-provider-prompts.log");
+    let queued_bin = queued._tmp.path().join("queued-gates-provider");
+    write_scheduler_claude(
+        &queued_bin,
+        &round_cap_resume_provider_script(&queued_prompt_log),
+    );
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queued resume"));
+    run_scheduler_until_dispatch_status(&queued.main_dir, "work-1", &queued_bin, "needs-user");
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 1);
+    let queued_attempt = queued.store.read_work_item("work-1").unwrap().attempts[0].clone();
+    assert_eq!(
+        queued_attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2,
+        "queued downstream-gate admission must not dispatch another Writer"
+    );
+    assert!(matches!(
+        queued_attempt.pause_kind,
+        Some(
+            fluent::work_model::PauseKind::HostEvidence
+                | fluent::work_model::PauseKind::CandidateGate
+        )
+    ));
+    assert!(queued_attempt.learning.is_none());
+    assert_eq!(
+        fs::read_to_string(&queued_prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        1,
+        "queued resume must not launch a second Writer past the downstream gate"
+    );
 }
 
 #[test]
@@ -37090,10 +37570,37 @@ struct RoundCapApproachRevisionFixture {
     resolution: String,
 }
 
+fn assert_no_round_cap_revision(fixture: &RoundCapApproachRevisionFixture) {
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions")
+            .exists()
+    );
+}
+
 fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_plan(
+        "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n"
+            .to_string(),
+    )
+}
+
+fn setup_round_cap_approach_revision_fixture_with_downstream_gates()
+-> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_plan(
+        "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n| 2 | Attach host proof. | | `bash tests/host.sh` | host | Yes |\n| 3 | Review the candidate. | | Review candidate | review | Yes |\n| 4 | Run the final Tester. | | Run final Tester | tester | Yes |\n| 5 | Capture Learning. | | Capture Learning | learner | Yes |\n"
+            .to_string(),
+    )
+}
+
+fn setup_round_cap_approach_revision_fixture_with_plan(
+    plan: String,
+) -> RoundCapApproachRevisionFixture {
     use fluent::work_model::{
-        AttemptReviewState, AttemptStatus, PlanningContext, TaskKind, TaskOutput, TaskStatus,
-        WorkItem, WriterCompletionMatrix, set_task_terminal,
+        ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
+        EvidenceRecoveryState, EvidenceReviewTarget, PlanningContext, TaskKind, TaskOutput,
+        TaskStatus, WorkItem, WriterCompletionMatrix, set_task_terminal,
     };
 
     let tmp = TempDir::new().unwrap();
@@ -37110,10 +37617,7 @@ fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixtur
                 .to_string(),
         ),
         approach: Some(prior_approach.clone()),
-        plan: Some(
-            "| # | State reached | Behaviors | Verification | Req? |\n|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | Yes |\n"
-                .to_string(),
-        ),
+        plan: Some(plan),
         ..Default::default()
     });
     item.add_initial_attempt("attempt-1").unwrap();
@@ -37172,6 +37676,45 @@ fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixtur
         };
         fs::write(review_path, verdict).unwrap();
     }
+    let host_evidence_path = fluent::work_model::work_artifact_path(
+        "work-1",
+        "attempt-1",
+        "host-evidence/accepted-snapshot.json",
+    );
+    let host_evidence_bytes =
+        format!("{{\"result\":\"pass\",\"candidate_commit\":\"{candidate}\"}}\n").into_bytes();
+    let host_evidence_file = main_dir.join(&host_evidence_path);
+    fs::create_dir_all(host_evidence_file.parent().unwrap()).unwrap();
+    fs::write(&host_evidence_file, &host_evidence_bytes).unwrap();
+    let tests_review_path = item.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.role == "tests")
+        .map(|task| format!("{}/review.md", task.artifact_area.as_ref().unwrap().path))
+        .unwrap();
+    let tests_review_bytes = fs::read(main_dir.join(&tests_review_path)).unwrap();
+    item.attempts[0].evidence_recoveries.push(EvidenceRecovery {
+        required_check: None,
+        id: "accepted-host-evidence".to_string(),
+        candidate_commit: candidate.clone(),
+        attachment: EvidenceAttachment {
+            snapshot_path: host_evidence_path.clone(),
+            digest: format!("sha256:{:x}", Sha256::digest(host_evidence_bytes)),
+        },
+        targets: vec![EvidenceReviewTarget {
+            role: "tests".to_string(),
+            prior_review_artifact: tests_review_path,
+            review_task_id: Some("attempt-1-review-tests".to_string()),
+            review_digest: Some(format!("sha256:{:x}", Sha256::digest(&tests_review_bytes))),
+        }],
+        state: EvidenceRecoveryState::Complete,
+        created_at: "2026-09-12T00:00:00Z".to_string(),
+        code_change_classification: None,
+    });
+    item.attempts[0].artifacts.push(ArtifactRef {
+        producer_id: "accepted-host-evidence".to_string(),
+        path: host_evidence_path,
+    });
     item.attempts[0].status = AttemptStatus::NeedsUser;
     item.attempts[0].pause_kind = Some(fluent::work_model::PauseKind::RoundCap);
     item.attempts[0].review_state = Some(AttemptReviewState::Failed);
@@ -37240,6 +37783,31 @@ fn revise_round_cap_approach_with_interrupt(
             &fixture.resolution,
         ])
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+}
+
+fn revise_round_cap_approach_before_publication(
+    fixture: &RoundCapApproachRevisionFixture,
+) -> assert_cmd::assert::Assert {
+    let approach_file = fixture.main_dir.join("replacement-approach.md");
+    fs::write(&approach_file, &fixture.replacement).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "revise-approach",
+            "work-1",
+            "attempt-1",
+            "--approach-file",
+            approach_file.to_str().unwrap(),
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .env(
+            "FLUENT_TEST_APPROACH_REVISION_INTERRUPT",
+            "before-work-model-publication",
+        )
         .assert()
 }
 

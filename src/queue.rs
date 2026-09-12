@@ -1170,7 +1170,7 @@ fn ensure_resume_eligible(
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
     crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
     let allows_planned_approach_correction =
-        crate::recovery_contracts::validate_planning_resume(project_root, attempt)?;
+        crate::recovery_contracts::validate_planning_resume(project_root, item, attempt)?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let candidate_metadata_repair = known_candidate_metadata_repair

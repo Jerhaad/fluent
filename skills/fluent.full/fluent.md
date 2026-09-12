@@ -260,30 +260,9 @@ settlement returns the settled result without changing history. Run
 unfinished work. Fluent preserves completed Tasks and prior artifacts; canceled
 verification retries use a new artifact directory.
 
-When an uncertain Architecture review has a ratified replacement design, save the
-complete replacement Approach and run:
+When an uncertain Architecture review has a ratified replacement design, save the complete replacement Approach and run `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'`. Then resume with `fluent queue resume <work-item-id> --attempt <attempt-id>` or foreground `fluent attempt run <work-item-id> <attempt-id>`.
 
-    fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'
-
-Then run `fluent queue resume <work-item-id> --attempt <attempt-id>`, or run
-`fluent attempt run <work-item-id> <attempt-id>` in the foreground, to execute
-the corrective Writer.
-
-Fluent records the decision and the before/after Approach, preserves a qualifying
-reviewer launch failure as superseded history, and gives the corrective Writer the
-settled review artifacts for the current candidate.
-
-If a failed review reaches the Writer round cap, first run `fluent attempt extend`
-and confirm that the extension binds the same candidate and exact failed-review
-bytes while leaving an unused Writer round. Then use the same `revise-approach`
-command even when Architecture passed and another review failed. Fluent records
-the round-cap authorization, prior and replacement Approach, and supporting
-review identities, publishes planning and the Writer completion contract in one
-recoverable transaction, and prepares one corrective Writer without launching it.
-Resume through the queue or foreground command above. Exact retries reuse the
-same revision and Writer; changed candidate, review, authorization, cancellation,
-or unsupported format is rejected, and later host, Tester, review, and Learning
-gates remain required.
+For a failed-review `round-cap` pause, first run `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`; the extension must bind the same candidate and exact failed-review bytes while leaving an unused Writer round. Then use `revise-approach`, even when Architecture passed and another review failed. Fluent publishes planning and the Writer completion contract in one recoverable transaction, prepares one corrective Writer, and retains later host, Tester, review, and Learning gates. Exact retries reuse the same revision and Writer; changed candidate, review, authorization, cancellation, or unsupported state is rejected.
 
 ### Recover a host-evidence finding
 

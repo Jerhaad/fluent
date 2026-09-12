@@ -66,7 +66,18 @@ pub fn revise(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Attempt {attempt_id:?} not found"))?;
     crate::recovery_contracts::validate_planning_completion_history(project_root, attempt)?;
-    if let Some(existing) = existing_revision(project_root, attempt, &replacement, resolution)? {
+    let revision_id = format!(
+        "revision-{}",
+        &digest(format!("{}\0{}\0{}", prior_approach, replacement, resolution).as_bytes())[..12]
+    );
+    let audit_artifact = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("planning-approach-revisions/{revision_id}/revision.json"),
+    );
+    if let Some(existing) =
+        existing_revision(project_root, &item, attempt, &replacement, resolution)?
+    {
         return Ok(existing);
     }
     let audited_frontier = frontier(project_root, attempt)?;
@@ -81,6 +92,13 @@ pub fn revise(
     }
     let old_planning_contract = WriterCompletionContract::from_planning_context(context)
         .ok_or_else(|| anyhow::anyhow!("Work Item has no Writer completion contract"))?;
+    let old_contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("Attempt has no authoritative completion contract")?;
+    if old_contract != &old_planning_contract {
+        bail!("planning authority and Attempt completion contract differ");
+    }
     let mut revised_context = context.clone();
     revised_context.approach = Some(replacement.clone());
     if let Some(combined) = revised_context
@@ -104,43 +122,13 @@ pub fn revise(
         WriterCompletionContract::from_planning_context(&revised_context)
             .ok_or_else(|| anyhow::anyhow!("replacement Approach lost the completion contract"))?;
     validate_contract_delta(&old_planning_contract, &new_planning_contract)?;
-    let old_contract = attempt
-        .writer_completion_contract
-        .as_ref()
-        .context("Attempt has no authoritative completion contract")?;
     let writer = attempt
         .tasks
         .iter()
         .rev()
         .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
         .expect("frontier validates the completed Writer");
-    let source_completion =
-        crate::recovery_contracts::writer_completion_matrix_ref(project_root, attempt, writer)
-            .map(|artifact| {
-                let path = crate::recovery_contracts::resolve_input_artifact_path(
-                    project_root,
-                    &artifact.path,
-                )?;
-                let bytes = match fs::read(path) {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(error.into()),
-                };
-                let matrix: crate::work_model::WriterCompletionMatrix =
-                    serde_json::from_slice(&bytes)?;
-                let findings =
-                    crate::recovery_contracts::writer_completion_findings(project_root, writer)?;
-                matrix
-                    .status_against(old_contract, &writer.id, &findings)
-                    .map_err(anyhow::Error::msg)?;
-                Ok::<_, anyhow::Error>(Some(crate::work_model::PlanningCompletionSource {
-                    artifact,
-                    sha256: digest(&bytes),
-                    contract: old_contract.clone(),
-                }))
-            })
-            .transpose()?
-            .flatten();
+    let source_completion = capture_source_completion(project_root, attempt, writer, old_contract)?;
     if round_cap_revision && source_completion.is_none() {
         bail!("round-cap Approach revision requires source completion evidence");
     }
@@ -148,6 +136,9 @@ pub fn revise(
         .with_revised_approach(prior_approach, &replacement)
         .map_err(anyhow::Error::msg)?;
     validate_contract_delta(old_contract, &new_contract)?;
+    if new_contract != new_planning_contract {
+        bail!("planning authority and Approach revision contract differ");
+    }
     let (review_refs, supporting_reviews) =
         if let Some(reviews) = audited_frontier.supporting_reviews.as_ref() {
             (
@@ -180,15 +171,6 @@ pub fn revise(
         })
         .transpose()?;
 
-    let revision_id = format!(
-        "revision-{}",
-        &digest(format!("{}\0{}\0{}", prior_approach, replacement, resolution).as_bytes())[..12]
-    );
-    let audit_artifact = work_artifact_path(
-        work_item_id,
-        attempt_id,
-        &format!("planning-approach-revisions/{revision_id}/revision.json"),
-    );
     let audit = RevisionAudit {
         schema_version: if round_cap_revision {
             ROUND_CAP_SCHEMA_VERSION
@@ -210,7 +192,7 @@ pub fn revise(
             .as_ref()
             .map(|task| task.id.clone()),
         prior_contract: Some(old_contract.clone()),
-        source_completion,
+        source_completion: source_completion.clone(),
         prior_approach_sha256: digest(prior_approach.as_bytes()),
         replacement_approach_sha256: digest(replacement.as_bytes()),
         prior_approach: prior_approach.to_string(),
@@ -223,6 +205,14 @@ pub fn revise(
     };
     let audit_bytes = serde_json::to_vec_pretty(&audit)?;
     write_once(&project_root.join(&audit_artifact), &audit_bytes)?;
+    #[cfg(feature = "test-support")]
+    if std::env::var("FLUENT_TEST_APPROACH_REVISION_INTERRUPT")
+        .ok()
+        .as_deref()
+        == Some("before-work-model-publication")
+    {
+        bail!("test interruption before Approach revision Work-model publication");
+    }
     let source_id = audited_frontier.source_review.id.clone();
     let candidate_commit = audited_frontier.candidate_commit.clone();
     let operation = crate::work_model::RecoveryOperationRequest::new(
@@ -238,6 +228,8 @@ pub fn revise(
     );
     let _ = item.validate_recovery_operation(project_root, &operation)?;
     let expected_context = context.clone();
+    let expected_source_completion = source_completion.clone();
+    let expected_supporting_reviews = audited_frontier.supporting_reviews.clone();
     let audit_ref = ArtifactRef {
         producer_id: PRODUCER.to_string(),
         path: audit_artifact.clone(),
@@ -259,7 +251,11 @@ pub fn revise(
             .ok_or_else(|| WorkModelError::AttemptNotFound { id: attempt_id.to_string() })?;
         let current_is_legacy = {
             let current = frontier(project_root, &fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
-            if current.candidate_commit != candidate_commit || current.source_review.id != source_id || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref() {
+            if current.candidate_commit != candidate_commit
+                || current.source_review.id != source_id
+                || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref()
+                || current.supporting_reviews != expected_supporting_reviews
+            {
                 return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "candidate or review frontier changed before Approach revision".to_string() });
             }
             if current.round_cap_extension != audited_frontier.round_cap_extension {
@@ -270,6 +266,50 @@ pub fn revise(
             }
             current.legacy_reconciliation.is_some()
         };
+        let fresh_context = fresh
+            .planning_context
+            .as_ref()
+            .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "planning context disappeared before Approach revision".to_string(),
+            })?;
+        let fresh_contract = WriterCompletionContract::from_planning_context(fresh_context)
+            .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "planning context lost its completion contract".to_string(),
+            })?;
+        if fresh_contract != *old_contract {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "planning authority and Attempt completion contract differ".to_string(),
+            });
+        }
+        let fresh_writer = fresh.attempts[index]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+            .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "source Writer disappeared before Approach revision".to_string(),
+            })?;
+        let fresh_source_completion =
+            capture_source_completion(
+                project_root,
+                &fresh.attempts[index],
+                fresh_writer,
+                old_contract,
+            )
+                .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("source completion changed before Approach revision: {error:#}"),
+                })?;
+        if fresh_source_completion != expected_source_completion {
+            return Err(WorkModelError::AttemptResumeIneligible {
+                attempt_id: attempt_id.to_string(),
+                reason: "source completion evidence changed before Approach revision".to_string(),
+            });
+        }
         let attempt = &mut fresh.attempts[index];
         if legacy_cap_extension
             && current_is_legacy
@@ -689,6 +729,7 @@ fn validate_contract_delta(
 
 fn existing_revision(
     project_root: &Path,
+    item: &crate::work_model::WorkItem,
     attempt: &Attempt,
     replacement: &str,
     resolution: &str,
@@ -703,6 +744,7 @@ fn existing_revision(
             if audit.revision_kind == ApproachRevisionKind::FailedReviewRoundCap {
                 crate::recovery_contracts::validate_round_cap_approach_revision_retry(
                     project_root,
+                    item,
                     attempt,
                     &audit,
                     artifact,
@@ -732,6 +774,37 @@ fn existing_revision(
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+
+fn capture_source_completion(
+    project_root: &Path,
+    attempt: &Attempt,
+    writer: &Task,
+    contract: &WriterCompletionContract,
+) -> Result<Option<crate::work_model::PlanningCompletionSource>> {
+    let Some(artifact) =
+        crate::recovery_contracts::writer_completion_matrix_ref(project_root, attempt, writer)
+    else {
+        return Ok(None);
+    };
+    let path =
+        crate::recovery_contracts::resolve_input_artifact_path(project_root, &artifact.path)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let matrix: crate::work_model::WriterCompletionMatrix = serde_json::from_slice(&bytes)?;
+    let findings = crate::recovery_contracts::writer_completion_findings(project_root, writer)?;
+    matrix
+        .status_against(contract, &writer.id, &findings)
+        .map_err(anyhow::Error::msg)?;
+    Ok(Some(crate::work_model::PlanningCompletionSource {
+        artifact,
+        sha256: digest(&bytes),
+        contract: contract.clone(),
+    }))
+}
+
 fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
