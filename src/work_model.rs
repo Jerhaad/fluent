@@ -5390,7 +5390,8 @@ impl RoundCapExtension {
             });
         }
         if let Some(previous) = previous {
-            let evidence_delta = current_evidence_write_rounds
+            let evidence_delta = self
+                .evidence_write_rounds
                 .checked_sub(previous.evidence_write_rounds)
                 .ok_or_else(|| WorkModelError::RoundCapExtensionIneligible {
                     reason: "evidence Writer rounds moved backward between extensions".to_string(),
@@ -21145,6 +21146,75 @@ random banner prose that must be ignored
         }];
         attempt.tasks.push(writer);
         assert_eq!(attempt.effective_write_round_cap(99), 14);
+    }
+
+    #[test]
+    fn round_cap_extension_chain_uses_recorded_evidence_counts() {
+        let recovery = |id: &str| EvidenceRecovery {
+            required_check: None,
+            id: id.to_string(),
+            candidate_commit: format!("candidate-{id}"),
+            attachment: EvidenceAttachment {
+                snapshot_path: format!(".fluent/work/artifacts/work-1/attempt-1/{id}.json"),
+                digest: format!("sha256:{id}"),
+            },
+            targets: vec![EvidenceReviewTarget {
+                role: "tests".to_string(),
+                prior_review_artifact: format!(
+                    ".fluent/work/artifacts/work-1/attempt-1/{id}/review.md"
+                ),
+                review_task_id: Some(format!("attempt-1-{id}-tests")),
+                review_digest: None,
+            }],
+            state: EvidenceRecoveryState::CodeChange,
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+            code_change_classification: None,
+        };
+        let mut tasks = Vec::new();
+        for id in ["evidence-1", "evidence-2"] {
+            let mut writer = task(TaskKind::Write, Vec::new());
+            writer.input_artifacts = vec![ArtifactRef {
+                producer_id: format!("attempt-1-{id}-tests"),
+                path: format!(".fluent/work/artifacts/work-1/attempt-1/{id}/review.md"),
+            }];
+            tasks.push(writer);
+        }
+        let mut attempt = Attempt {
+            evidence_recoveries: vec![recovery("evidence-1"), recovery("evidence-2")],
+            tasks,
+            round_cap_extensions: vec![
+                RoundCapExtension {
+                    id: "round-cap-10-11".to_string(),
+                    old_cap: 10,
+                    new_cap: 11,
+                    additional_write_rounds: 1,
+                    evidence_write_rounds: 0,
+                    candidate_commit: "candidate-commit".to_string(),
+                    failed_reviews: Vec::new(),
+                    human_resolution: String::new(),
+                    human_resolution_digest: String::new(),
+                    approved_at: "2026-08-11T00:00:00Z".to_string(),
+                },
+                RoundCapExtension {
+                    id: "round-cap-12-13".to_string(),
+                    old_cap: 12,
+                    new_cap: 13,
+                    additional_write_rounds: 1,
+                    evidence_write_rounds: 1,
+                    candidate_commit: "candidate-commit".to_string(),
+                    failed_reviews: Vec::new(),
+                    human_resolution: String::new(),
+                    human_resolution_digest: String::new(),
+                    approved_at: "2026-08-12T00:00:00Z".to_string(),
+                },
+            ],
+            ..Attempt::default()
+        };
+
+        assert_eq!(attempt.evidence_write_rounds(), 2);
+        attempt
+            .validate_round_cap_extensions()
+            .expect("later evidence must not rewrite historical extension continuity");
     }
 
     #[test]
