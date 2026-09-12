@@ -1063,9 +1063,13 @@ only that observed-exited case to already gone. A live same-user descendant
 remains signalable, so the group signal succeeds and retains the ordinary
 descendant-sweep path.
 
-At a legitimate failed-correction Writer-round cap, an operator may run `fluent
-attempt extend <work-item-id> <attempt-id> --additional-write-rounds N`, where N
-is one through three. Under the land lock, Fluent verifies a clean registered
+At a legitimate failed-correction Writer-round cap, an operator may run:
+
+```text
+fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution "<authorization>"
+```
+
+where N is one through three. Under the land lock, Fluent verifies a clean registered
 candidate worktree, exact candidate commit, exhausted current cap, and the exact
 SHA-256-bound failed correction bytes. The correction frontier includes failed
 review output and, for a rejected final-Tester gate, the gate, structured Tester
@@ -1085,12 +1089,22 @@ Attempt; any changed candidate or correction content fails closed.
 
 A failed-review `round-cap` may also authorize an Approach revision, but only
 after a separately recorded bounded extension leaves an unused Writer round.
-The extension binds the exact candidate and failed-review bytes; the Approach
-revision additionally binds the authorization, prior and replacement Approach,
-and every supporting review identity and digest. Architecture may pass when
-another settled review failed. One Work Item aggregate transaction publishes
-the revision audit, revised planning, completion contract, recovery binding,
-and exactly one corrective Writer; it does not launch that Writer. Foreground
+The extension binds the exact candidate and failed-review bytes. Then submit the
+replacement Approach with:
+
+```text
+fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution "<authorization>"
+```
+
+The Approach revision additionally binds the authorization, prior and
+replacement Approach, and every supporting review identity and digest.
+Architecture may pass when another settled review failed. The command first
+writes the immutable revision audit sidecar; one Work Item aggregate transaction
+then publishes its reference with the revised planning, completion contract,
+recovery binding, and exactly one corrective Writer. The transaction does not
+launch that Writer. A sidecar without the published reference is not an
+accepted revision: a matching retry can reuse its identical bytes, while an
+unrelated orphan remains inert and conflicting bytes fail closed. Foreground
 and queued resume use the same shared admission checks, while exact retries
 reuse the existing publication and changed or partial authority fails closed.
 
@@ -4180,12 +4194,15 @@ authorization. Both forms apply their authorized delta to the Attempt's current
 contract, retaining every non-Approach row, including adopted Plan splits and
 earlier Test-reference revisions. The neutral boundary replays both kinds of
 planning revision in order before source selection, exact retry, or corrective
-Writer materialization. A single aggregate journal publishes the audit,
-planning, completion contract, recovery binding, and one corrective Writer; it
-never launches execution. Host evidence keeps its original source contract and
-bytes, while changed Approach rows remain pending until the corrective Writer
-completes them. A changed audit or source digest prevents replay without
-rewriting preserved history.
+Writer materialization. The revision command writes the immutable audit sidecar
+before a single aggregate journal publishes its reference with the planning,
+completion contract, recovery binding, and one corrective Writer; the sidecar
+alone never launches execution or establishes authority. An interrupted retry
+can recover identical sidecar bytes, while an unreferenced orphan is ignored as
+an accepted revision and conflicting bytes fail closed. Host evidence keeps its
+original source contract and bytes, while changed Approach rows remain pending
+until the corrective Writer completes them. A changed audit or source digest
+prevents replay without rewriting preserved history.
 The shared evidence validator checks an active receipt against its recorded
 Writer and candidate. Once every targeted Plan review passes, Attempt execution
 settles that receipt before advancing a correction; queue admission checks the

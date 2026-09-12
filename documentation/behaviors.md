@@ -10072,9 +10072,11 @@ Architecture recovery and historical replay retain their prior admission rules;
 failed-Tester and unrelated pause types gain no new Approach-revision
 eligibility. Acceptance and resume continue to require a clean exact candidate,
 bound evidence, cancellation precedence, live-owner exclusion, and supported
-stored formats. Recording the revision does not launch a worker, and the
-corrective Writer must still pass host evidence, candidate, review, final
-Tester, and Learning gates.
+stored formats. Recording the revision does not launch a worker. After the
+corrective Writer completes, the Attempt must still pass its separate
+host-evidence, candidate, Review, final-Tester, and Learning gates. The Writer
+owns only its Writer obligations; those host and later Attempt gates remain
+separate.
 
 ## Writer continuation recovery
 

@@ -726,6 +726,25 @@ pub(crate) fn validate_planning_resume(
     item: &work_model::WorkItem,
     attempt: &work_model::Attempt,
 ) -> Result<bool> {
+    validate_planning_resume_at(project_root, item, attempt, false)
+}
+
+/// Validate planning recovery while queue admission preserves a settled
+/// cancellation authority for the runner to consume.
+pub(crate) fn validate_planning_resume_for_queue(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+) -> Result<bool> {
+    validate_planning_resume_at(project_root, item, attempt, true)
+}
+
+fn validate_planning_resume_at(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+    allow_settled_cancellation: bool,
+) -> Result<bool> {
     validate_planning_completion_history(project_root, attempt)?;
     validate_completed_plan_evidence(project_root, attempt)?;
     if attempt.status == AttemptStatus::Complete
@@ -779,6 +798,7 @@ pub(crate) fn validate_planning_resume(
         attempt,
         &revision,
         audit_artifact,
+        allow_settled_cancellation,
     )?;
     Ok(attempt.status == AttemptStatus::Planned
         && attempt.tasks.iter().any(|task| {
@@ -2920,6 +2940,7 @@ pub(crate) fn validate_round_cap_approach_revision_retry(
     attempt: &work_model::Attempt,
     revision: &work_model::ApproachRevisionAudit,
     audit_artifact: &ArtifactRef,
+    allow_settled_cancellation: bool,
 ) -> Result<()> {
     anyhow::ensure!(
         revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap
@@ -2928,7 +2949,20 @@ pub(crate) fn validate_round_cap_approach_revision_retry(
             && revision.attempt_id == attempt.id,
         "retry is not a failed-review round-cap Approach revision"
     );
-    attempt.ensure_not_canceled().map_err(anyhow::Error::msg)?;
+    if allow_settled_cancellation {
+        if attempt.cancellation_requested() {
+            anyhow::ensure!(
+                attempt
+                    .cancellation
+                    .as_ref()
+                    .and_then(|stop| stop.settled_at.as_ref())
+                    .is_some(),
+                "canceled local execution has not settled"
+            );
+        }
+    } else {
+        attempt.ensure_not_canceled().map_err(anyhow::Error::msg)?;
+    }
     let context = item
         .planning_context
         .as_ref()

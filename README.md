@@ -223,7 +223,7 @@ Each Reviewer writes a report that records its evidence, classifies each finding
 
 When an uncertain review came from an external problem and the candidate does not need to change, repair that problem and run the exact `fluent queue resume <work-item-id> --attempt <attempt-id>` command from status for scheduler-owned Work, or use `fluent attempt run <work-item-id> <attempt-id>` in the foreground. Fluent verifies that the candidate is still clean at the reviewed commit, then reruns only the uncertain Reviewer roles. Passing reviews remain valid. If the candidate or review evidence changed, Fluent refuses the resume instead of combining evidence from different candidate states.
 
-After a Reviewer `fail`, Fluent starts another round immediately. The Writer receives the failed reports, revises the candidate, runs focused checks, and commits the revision; then the affected Reviewers inspect it and mark earlier findings as addressed or still open. The full Tester runs only after the reviewers pass. A Tester regression then returns its evidence to the Writer for another focused correction and review. If the Attempt reaches its configured review-round limit, Fluent pauses with the evidence collected rather than continuing indefinitely. You can approve a bounded continuation with `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N`; Fluent binds that approval to the exact candidate and failed-review bytes before the same Attempt resumes. Scoped Writers produced by evidence-targeted `code-change` reviews count in that effective limit, so a later extension starts from the actual Writer frontier.
+After a Reviewer `fail`, Fluent starts another round immediately. The Writer receives the failed reports, revises the candidate, runs focused checks, and commits the revision; then the affected Reviewers inspect it and mark earlier findings as addressed or still open. The full Tester runs only after the reviewers pass. A Tester regression then returns its evidence to the Writer for another focused correction and review. If the Attempt reaches its configured review-round limit, Fluent pauses with the evidence collected rather than continuing indefinitely. You can approve a bounded continuation with `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`; Fluent binds that approval to the exact candidate and failed-review bytes before the same Attempt resumes. Scoped Writers produced by evidence-targeted `code-change` reviews count in that effective limit, so a later extension starts from the actual Writer frontier.
 
 ### Resume retired commit-style pauses
 
@@ -265,7 +265,27 @@ If a failed review shows that stored behavior `Test:` references name the wrong 
 
 When an uncertain Architecture review identifies a ratified replacement design, save the complete replacement document and run `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'`. Then run `fluent queue resume <work-item-id> --attempt <attempt-id>`, or `fluent attempt run <work-item-id> <attempt-id>` in the foreground, to execute the corrective Writer. Fluent accepts only the exact current candidate and Architecture-review frontier, records the prior and replacement Approach bytes with the authorization, updates the planning completion contract, and schedules one corrective Writer with that review as input. Fluent reopens an artifact-free terminal launch only with the typed provider-arguments handoff, or with the preserved Review 38/39 legacy form: producer-bound generic handoff, settled execution record, and matching Codex parser diagnostics. Other legacy launch failures remain ineligible. Repeating the exact command reuses its audit and corrective Writer.
 
-For a failed-review `round-cap` pause, approve the extension with `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`; it must bind the exact candidate and failed-review bytes and leave an unused Writer round. Then use `revise-approach`, even when Architecture passed and another review failed. Fluent records the authorization, Approach replacement, and supporting review identities, publishes planning and its completion contract together, and prepares one corrective Writer without launching it. Resume explicitly through `fluent queue resume` or foreground `fluent attempt run`; an exact retry reuses the audit and Writer, while changed, stale, canceled, or unsupported state is rejected. This path does not edit the Brief, Behaviors, Plan, or live paused repair.
+For a failed-review `round-cap` pause, first approve the extension:
+
+```text
+fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'
+```
+
+It must bind the exact candidate and failed-review bytes and leave an unused
+Writer round. Then submit the replacement Approach, even when Architecture
+passed and another review failed:
+
+```text
+fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'
+```
+
+Fluent records the authorization, Approach replacement, and supporting review
+identities, publishes planning and its completion contract together, and
+prepares one corrective Writer without launching it. Resume explicitly through
+`fluent queue resume` or foreground `fluent attempt run`; an exact retry reuses
+the audit and Writer, while changed, stale, canceled, or unsupported state is
+rejected. This path does not edit the Brief, Behaviors, Plan, or live paused
+repair.
 
 The revised completion matrix remains authoritative for the next corrective
 Writer. Fluent carries its completed planning claims forward and repairs a

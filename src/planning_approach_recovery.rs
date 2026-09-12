@@ -745,6 +745,7 @@ fn existing_revision(
                     attempt,
                     &audit,
                     artifact,
+                    false,
                 )?;
             }
             let writer = attempt

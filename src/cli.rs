@@ -545,6 +545,9 @@ pub enum AttemptCommands {
     ///
     /// Supports uncertain Architecture review and failed-review round-cap
     /// frontiers with their existing recovery safeguards.
+    /// For a failed-review round-cap frontier, the complete flow is:
+    /// `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`
+    /// `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'`
     ReviseApproach {
         /// Work Item ID
         work_item_id: String,

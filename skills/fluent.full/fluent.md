@@ -218,7 +218,8 @@ The round outcome determines what happens next:
 - Any uncertain verdict — Attempt records `needs-user`, pausing the loop.
 - A Writer-round cap reached — inspect the candidate and failed reviews. If the
   frontier is legitimate, approve one to three more rounds with `fluent attempt
-  extend <work-item-id> <attempt-id> --additional-write-rounds N`, then resume.
+  extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution
+  '<authorization>'`, then resume.
   Fluent binds the approval to the candidate and exact review bytes. A scoped
   Writer produced by an evidence-targeted `code-change` review already counts
   in the effective cap, so the extension starts from the Writer frontier shown
@@ -260,9 +261,36 @@ settlement returns the settled result without changing history. Run
 unfinished work. Fluent preserves completed Tasks and prior artifacts; canceled
 verification retries use a new artifact directory.
 
-When an uncertain Architecture review has a ratified replacement design, save the complete replacement Approach and run `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'`. Then resume with `fluent queue resume <work-item-id> --attempt <attempt-id>` or foreground `fluent attempt run <work-item-id> <attempt-id>`.
+When an uncertain Architecture review has a ratified replacement design, save
+the complete replacement Approach and run:
 
-For a failed-review `round-cap` pause, first run `fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'`; the extension must bind the same candidate and exact failed-review bytes while leaving an unused Writer round. Then use `revise-approach`, even when Architecture passed and another review failed. Fluent publishes planning and the Writer completion contract in one recoverable transaction, prepares one corrective Writer, and retains later host, Tester, review, and Learning gates. Exact retries reuse the same revision and Writer; changed candidate, review, authorization, cancellation, or unsupported state is rejected.
+```text
+fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<decision>'
+```
+
+Then resume with `fluent queue resume <work-item-id> --attempt <attempt-id>` or
+foreground `fluent attempt run <work-item-id> <attempt-id>`.
+
+For a failed-review `round-cap` pause, first run:
+
+```text
+fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'
+```
+
+The extension must bind the same candidate and exact failed-review bytes while
+leaving an unused Writer round. Then submit the replacement Approach, even when
+Architecture passed and another review failed:
+
+```text
+fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'
+```
+
+Fluent writes the immutable audit sidecar, then publishes planning and the Writer
+completion contract with its audit reference in one recoverable transaction. It
+prepares one corrective Writer and retains later host, Tester, review, and
+Learning gates. Exact retries reuse the same revision and Writer; changed
+candidate, review, authorization, cancellation, or unsupported state is
+rejected.
 
 ### Recover a host-evidence finding
 

@@ -36583,6 +36583,89 @@ fn round_cap_approach_revision_rejects_canceled_attempt() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_queue_resume_recovers_cancellation() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "cancel", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let canceled = fixture.store.read_work_item("work-1").unwrap();
+    let canceled_attempt = &canceled.attempts[0];
+    let stop = canceled_attempt.cancellation.as_ref().unwrap();
+    assert!(stop.settled_at.is_some());
+    assert!(stop.resumed_at.is_none());
+    assert_eq!(
+        canceled_attempt.pause_kind,
+        Some(fluent::work_model::PauseKind::Interrupted)
+    );
+
+    let prompt_log = fixture
+        ._tmp
+        .path()
+        .join("canceled-queue-resume-prompts.log");
+    let bin = fixture._tmp.path().join("canceled-queue-resume-provider");
+    write_scheduler_claude(&bin, &round_cap_resume_provider_script(&prompt_log));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queued resume"));
+    let queued = read_json_path(&queue_ledger_path(&fixture.main_dir, "work-1"));
+    let dispatch = queued["dispatches"].as_array().unwrap().last().unwrap();
+    assert_eq!(dispatch["intent"], "resume-attempt");
+    assert_eq!(
+        dispatch["resume_cancellation_requested_at"],
+        stop.requested_at
+    );
+    run_scheduler_until_dispatch_status(&fixture.main_dir, "work-1", &bin, "needs-user");
+
+    let recovered = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &recovered.attempts[0];
+    assert!(
+        attempt
+            .cancellation
+            .as_ref()
+            .and_then(|stop| stop.resumed_at.as_ref())
+            .is_some()
+    );
+    assert!(matches!(
+        attempt.pause_kind,
+        Some(fluent::work_model::PauseKind::WriterCompletion)
+            | Some(fluent::work_model::PauseKind::CandidateGate)
+    ));
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.role == "approach-revision-correction")
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .find(|task| task.role == "approach-revision-correction")
+            .unwrap()
+            .status,
+        fluent::work_model::TaskStatus::Complete
+    );
+    assert_eq!(
+        fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        1
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_rejects_live_task_owner() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
