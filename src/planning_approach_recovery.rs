@@ -96,9 +96,11 @@ pub fn revise(
         .writer_completion_contract
         .as_ref()
         .context("Attempt has no authoritative completion contract")?;
-    if old_contract != &old_planning_contract {
-        bail!("planning authority and Attempt completion contract differ");
-    }
+    let ownership_approval =
+        crate::recovery_contracts::validated_ownership_approval(project_root, attempt)?;
+    // An approved ownership split may intentionally make the Attempt contract
+    // richer than the retained planning markdown. Keep the Attempt contract
+    // authoritative while validating the replacement against both contracts.
     let mut revised_context = context.clone();
     revised_context.approach = Some(replacement.clone());
     if let Some(combined) = revised_context
@@ -136,8 +138,8 @@ pub fn revise(
         .with_revised_approach(prior_approach, &replacement)
         .map_err(anyhow::Error::msg)?;
     validate_contract_delta(old_contract, &new_contract)?;
-    if new_contract != new_planning_contract {
-        bail!("planning authority and Approach revision contract differ");
+    if new_contract != new_planning_contract && ownership_approval.is_none() {
+        bail!("planning authority and Attempt completion contract differ");
     }
     let (review_refs, supporting_reviews) =
         if let Some(reviews) = audited_frontier.supporting_reviews.as_ref() {
@@ -273,15 +275,10 @@ pub fn revise(
                 attempt_id: attempt_id.to_string(),
                 reason: "planning context disappeared before Approach revision".to_string(),
             })?;
-        let fresh_contract = WriterCompletionContract::from_planning_context(fresh_context)
-            .ok_or_else(|| WorkModelError::AttemptResumeIneligible {
-                attempt_id: attempt_id.to_string(),
-                reason: "planning context lost its completion contract".to_string(),
-            })?;
-        if fresh_contract != *old_contract {
+        if WriterCompletionContract::from_planning_context(fresh_context).is_none() {
             return Err(WorkModelError::AttemptResumeIneligible {
                 attempt_id: attempt_id.to_string(),
-                reason: "planning authority and Attempt completion contract differ".to_string(),
+                reason: "planning context lost its completion contract".to_string(),
             });
         }
         let fresh_writer = fresh.attempts[index]

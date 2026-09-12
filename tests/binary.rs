@@ -36705,7 +36705,7 @@ fn round_cap_approach_revision_retry_rejects_changed_planning_contract() {
 #[test]
 #[serial]
 fn round_cap_approach_revision_preserves_authority_and_history() {
-    let fixture = setup_round_cap_approach_revision_fixture();
+    let fixture = setup_round_cap_approach_revision_fixture_with_accepted_host_evidence();
     approve_round_cap_extension(&fixture);
     let before = fixture.store.read_work_item("work-1").unwrap();
     let before_attempt = &before.attempts[0];
@@ -36728,7 +36728,76 @@ fn round_cap_approach_revision_preserves_authority_and_history() {
             .responsibility,
         Some(fluent::work_model::CompletionResponsibility::Writer)
     );
+    let before_plan_authority: Vec<_> = source_matrix_value
+        .rows
+        .iter()
+        .filter(|row| row.kind == fluent::work_model::WriterCompletionRequirementKind::Plan)
+        .map(|row| (row.id.clone(), row.responsibility))
+        .collect();
+    assert_eq!(
+        before_plan_authority,
+        vec![
+            (
+                "plan:step-1".to_string(),
+                Some(fluent::work_model::CompletionResponsibility::Writer),
+            ),
+            (
+                "plan:step-2".to_string(),
+                Some(fluent::work_model::CompletionResponsibility::Host),
+            ),
+            (
+                "plan:step-3".to_string(),
+                Some(fluent::work_model::CompletionResponsibility::Review),
+            ),
+            (
+                "plan:step-4".to_string(),
+                Some(fluent::work_model::CompletionResponsibility::Tester),
+            ),
+            (
+                "plan:step-5".to_string(),
+                Some(fluent::work_model::CompletionResponsibility::Learner),
+            ),
+        ]
+    );
     let before_evidence = before_attempt.evidence_recoveries.clone();
+    let host_evidence_artifact_bytes: Vec<_> = before_attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| {
+            artifact.producer_id == "host-evidence" || artifact.producer_id == "plan-host-evidence"
+        })
+        .map(|artifact| {
+            (
+                artifact.path.clone(),
+                fs::read(fixture.main_dir.join(&artifact.path)).unwrap(),
+            )
+        })
+        .collect();
+    let accepted_host = before_evidence
+        .iter()
+        .find(|recovery| recovery.id.starts_with("plan-host-evidence-"))
+        .expect("fixture must contain accepted Plan-row host evidence");
+    let binding_path = before_attempt
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.producer_id == "plan-host-evidence" && artifact.path.ends_with("/binding.json")
+        })
+        .expect("fixture must retain the Plan-row evidence binding")
+        .path
+        .clone();
+    let binding = read_json_path(&fixture.main_dir.join(&binding_path));
+    assert_eq!(binding["candidate-commit"], fixture.candidate);
+    assert_eq!(binding["plan-row"], "plan:step-2");
+    assert_eq!(binding["result"], "pass");
+    let evidence_document = read_json_path(
+        &fixture
+            .main_dir
+            .join(&accepted_host.attachment.snapshot_path),
+    );
+    assert_eq!(evidence_document["schema_version"], 1);
+    assert_eq!(evidence_document["check"], "bash tests/host.sh");
+    assert_eq!(evidence_document["result"], "pass");
     let evidence_bytes: Vec<_> = before_evidence
         .iter()
         .map(|recovery| {
@@ -36792,6 +36861,28 @@ fn round_cap_approach_revision_preserves_authority_and_history() {
     );
     assert_eq!(after_attempt.evidence_recoveries, before_evidence);
     assert_eq!(fs::read(source_matrix_path).unwrap(), source_matrix);
+    let after_matrix_value: fluent::work_model::WriterCompletionMatrix = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .main_dir
+                .join(&after_attempt.tasks[0].artifact_area.as_ref().unwrap().path)
+                .join("writer-completion.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        after_matrix_value
+            .rows
+            .iter()
+            .filter(|row| row.kind == fluent::work_model::WriterCompletionRequirementKind::Plan)
+            .map(|row| (row.id.clone(), row.responsibility))
+            .collect::<Vec<_>>(),
+        before_plan_authority
+    );
+    for (path, bytes) in host_evidence_artifact_bytes {
+        assert_eq!(fs::read(fixture.main_dir.join(path)).unwrap(), bytes);
+    }
     for (path, bytes) in evidence_bytes {
         assert_eq!(fs::read(fixture.main_dir.join(path)).unwrap(), bytes);
     }
@@ -37186,7 +37277,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     let direct_bin = direct._tmp.path().join("direct-gates-provider");
     write_mock_claude(
         &direct_bin,
-        &round_cap_resume_provider_script(&direct_prompt_log),
+        &round_cap_downstream_provider_script(&direct_prompt_log),
     );
 
     fluent_cmd()
@@ -37213,13 +37304,10 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
         direct_attempt.status,
         fluent::work_model::AttemptStatus::NeedsUser
     );
-    assert!(matches!(
+    assert_eq!(
         direct_attempt.pause_kind,
-        Some(
-            fluent::work_model::PauseKind::HostEvidence
-                | fluent::work_model::PauseKind::CandidateGate
-        )
-    ));
+        Some(fluent::work_model::PauseKind::WriterCompletion)
+    );
     assert_eq!(
         direct_attempt
             .tasks
@@ -37229,29 +37317,79 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
         2
     );
     assert!(direct_attempt.learning.is_none());
-    assert!(direct_attempt.tasks.iter().all(|task| {
-        task.kind != fluent::work_model::TaskKind::Review
-            || task.status == fluent::work_model::TaskStatus::Complete
-    }));
     let direct_prompt = fs::read_to_string(&direct_prompt_log).unwrap();
     let direct_writer_invocations = direct_prompt.matches("--- invocation ---").count();
     assert_eq!(direct_writer_invocations, 1);
 
+    let direct_writer_count = direct_attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .count();
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
         .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("needs user input"));
+        .failure()
+        .stderr(predicate::str::contains("plan:step-2"));
     assert_eq!(
         fs::read_to_string(&direct_prompt_log)
             .unwrap()
             .matches("--- invocation ---")
             .count(),
         direct_writer_invocations,
-        "host evidence pause must block another foreground provider launch"
+        "missing host proof must block another foreground provider launch"
     );
+    assert_eq!(
+        direct.store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        direct_writer_count
+    );
+    let direct_snapshot = attach_round_cap_host_evidence(&direct, "direct");
+    let direct_original_evidence = fs::read(&direct_snapshot).unwrap();
+    fs::write(&direct_snapshot, b"changed host proof\n").unwrap();
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("digest changed"));
+    assert_eq!(
+        direct.store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        direct_writer_count,
+        "changed host proof must not dispatch another Writer"
+    );
+    fs::write(&direct_snapshot, &direct_original_evidence).unwrap();
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+    assert_round_cap_downstream_completion(&direct);
+    let direct_before_late_tamper = direct.store.read_work_item("work-1").unwrap();
+    fs::remove_file(&direct_snapshot).unwrap();
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure();
+    assert_eq!(
+        direct.store.read_work_item("work-1").unwrap(),
+        direct_before_late_tamper,
+        "missing accepted proof must block the completed downstream frontier"
+    );
+    fs::write(&direct_snapshot, &direct_original_evidence).unwrap();
 
     let queued = setup_round_cap_approach_revision_fixture_with_downstream_gates();
     approve_round_cap_extension(&queued);
@@ -37260,7 +37398,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     let queued_bin = queued._tmp.path().join("queued-gates-provider");
     write_scheduler_claude(
         &queued_bin,
-        &round_cap_resume_provider_script(&queued_prompt_log),
+        &round_cap_downstream_provider_script(&queued_prompt_log),
     );
     fluent_cmd()
         .current_dir(&queued.main_dir)
@@ -37280,21 +37418,71 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
         2,
         "queued downstream-gate admission must not dispatch another Writer"
     );
-    assert!(matches!(
+    assert_eq!(
         queued_attempt.pause_kind,
-        Some(
-            fluent::work_model::PauseKind::HostEvidence
-                | fluent::work_model::PauseKind::CandidateGate
-        )
-    ));
+        Some(fluent::work_model::PauseKind::WriterCompletion)
+    );
     assert!(queued_attempt.learning.is_none());
+    let queued_writer_count = queued_attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .count();
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("plan:step-2"));
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 1);
+    assert_eq!(
+        queued.store.read_work_item("work-1").unwrap().attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        queued_writer_count
+    );
+    let queued_snapshot = attach_round_cap_host_evidence(&queued, "queued");
+    let queued_original_evidence = fs::read(&queued_snapshot).unwrap();
+    fs::write(&queued_snapshot, b"changed queued host proof\n").unwrap();
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("digest changed"));
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 1);
+    fs::write(&queued_snapshot, &queued_original_evidence).unwrap();
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queued resume"));
+    run_scheduler_until_dispatch_status(&queued.main_dir, "work-1", &queued_bin, "candidate-ready");
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 2);
+    assert_round_cap_downstream_completion(&queued);
+    let queued_before_late_tamper = queued.store.read_work_item("work-1").unwrap();
+    fs::write(&queued_snapshot, b"late changed queued host proof\n").unwrap();
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .failure();
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 2);
+    assert_eq!(
+        queued.store.read_work_item("work-1").unwrap(),
+        queued_before_late_tamper
+    );
+    fs::write(&queued_snapshot, &queued_original_evidence).unwrap();
     assert_eq!(
         fs::read_to_string(&queued_prompt_log)
             .unwrap()
-            .matches("--- invocation ---")
+            .matches("Correct Writer Task attempt-1-write-2")
             .count(),
         1,
-        "queued resume must not launch a second Writer past the downstream gate"
+        "queued resume must not launch another Writer past the downstream gates"
     );
 }
 
@@ -37429,6 +37617,186 @@ exit 0
 "##,
         prompt_log = prompt_log.display(),
     )
+}
+
+fn round_cap_downstream_provider_script(prompt_log: &Path) -> String {
+    format!(
+        r##"#!/bin/bash
+set -eu
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    shift
+    PROMPT="${{1:-}}"
+    break
+  fi
+  shift
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+printf '\n--- invocation ---\n%s\n' "$PROMPT" >> '{prompt_log}'
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{{"learning_summary":"downstream route","follow_ups":[]}}' > "$DRAFT"
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    MATRIX=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*writer-completion.json' | tail -1 || true)
+    if [ -n "$MATRIX" ] && [ -f "$MATRIX" ]; then
+      python3 - "$MATRIX" <<'PYCODE'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+for row in data["rows"]:
+    if row.get("responsibility", "writer") == "writer":
+        row["state"] = "complete"
+        row["implementation-evidence"] = ["README.md: apply the revised Approach"]
+        row["verification"] = [{{"command": "true", "result": "pass"}}]
+path.write_text(json.dumps(data, indent=2) + "\n")
+PYCODE
+    fi
+    WRITER_TAG=$(printf '%s' "$PROMPT" | grep -o 'Task attempt-1-write-[0-9]*' | tail -1 | sed 's/ /-/g')
+    printf 'downstream route correction %s\n' "$WRITER_TAG" > "${{WRITER_TAG}}.txt"
+    git add "${{WRITER_TAG}}.txt"
+    git commit -m "Apply downstream correction" >/dev/null
+    ;;
+  *)
+    printf 'Verdict: pass\n\nDownstream route review.\n' > review.md
+    ;;
+esac
+exit 0
+"##,
+        prompt_log = prompt_log.display(),
+    )
+}
+
+fn attach_round_cap_host_evidence(
+    fixture: &RoundCapApproachRevisionFixture,
+    label: &str,
+) -> PathBuf {
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let candidate = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+        .expect("downstream fixture must have a latest Writer candidate");
+    let evidence_path = fixture
+        ._tmp
+        .path()
+        .join(format!("{label}-downstream-host-evidence.json"));
+    fs::write(
+        &evidence_path,
+        serde_json::json!({
+            "schema_version": 1,
+            "producer": "authorized downstream host",
+            "check": "bash tests/host.sh",
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-09-12T00:00:00Z",
+            "output": "downstream host check passed"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--plan-row",
+            "plan:step-2",
+            "--evidence-file",
+            evidence_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let after = fixture.store.read_work_item("work-1").unwrap();
+    let recovery = after.attempts[0]
+        .evidence_recoveries
+        .iter()
+        .rev()
+        .find(|recovery| recovery.candidate_commit == candidate)
+        .expect("host attachment must create a candidate-bound recovery");
+    assert_eq!(
+        recovery.state,
+        fluent::work_model::EvidenceRecoveryState::Reviewing
+    );
+    fixture.main_dir.join(&recovery.attachment.snapshot_path)
+}
+
+fn assert_round_cap_downstream_completion(fixture: &RoundCapApproachRevisionFixture) {
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &item.attempts[0];
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2,
+        "downstream recovery must use exactly one corrective Writer"
+    );
+    assert_eq!(attempt.status, fluent::work_model::AttemptStatus::Complete);
+    assert_eq!(
+        attempt.review_state,
+        Some(fluent::work_model::AttemptReviewState::Passed)
+    );
+    assert_eq!(
+        attempt.learning.as_ref().map(|learning| learning.status),
+        Some(fluent::work_model::LearningStatus::Succeeded)
+    );
+    let latest_writer_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    assert!(attempt.tasks[latest_writer_index + 1..].iter().all(|task| {
+        task.kind != fluent::work_model::TaskKind::Review
+            || task.status == fluent::work_model::TaskStatus::Complete
+    }));
+    assert!(
+        attempt.tasks[latest_writer_index + 1..]
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Review)
+            .all(|task| {
+                let path = fixture
+                    .main_dir
+                    .join(&task.artifact_area.as_ref().unwrap().path)
+                    .join("review.md");
+                review::extract_verdict(&fs::read_to_string(path).unwrap()) == review::Verdict::Pass
+            })
+    );
+    assert!(attempt.tasks.iter().any(|task| {
+        task.kind == fluent::work_model::TaskKind::Tester
+            && task.status == fluent::work_model::TaskStatus::Complete
+    }));
+    let candidate_gates: Vec<_> = attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.path.ends_with("candidate-gate.json"))
+        .collect();
+    assert!(
+        candidate_gates.len() >= 2,
+        "the Writer and final Tester candidate gates must both be recorded"
+    );
+    for artifact in candidate_gates {
+        assert_eq!(
+            read_json_path(&fixture.main_dir.join(&artifact.path))["disposition"],
+            "passed"
+        );
+    }
 }
 
 fn assert_round_cap_writer_prompt(
@@ -37588,10 +37956,183 @@ fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixtur
 
 fn setup_round_cap_approach_revision_fixture_with_downstream_gates()
 -> RoundCapApproachRevisionFixture {
-    setup_round_cap_approach_revision_fixture_with_plan(
+    let fixture = setup_round_cap_approach_revision_fixture_with_plan(
         "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n| 2 | Attach host proof. | | `bash tests/host.sh` | host | Yes |\n| 3 | Review the candidate. | | Review candidate | review | Yes |\n| 4 | Run the final Tester. | | Run final Tester | tester | Yes |\n| 5 | Capture Learning. | | Capture Learning | learner | Yes |\n"
             .to_string(),
+    );
+    make_round_cap_downstream_behavior_testable(&fixture);
+    fixture
+}
+
+fn make_round_cap_downstream_behavior_testable(fixture: &RoundCapApproachRevisionFixture) {
+    use fluent::work_model::{WriterCompletionContract, WriterCompletionMatrix};
+
+    let store = &fixture.store;
+    let mut item = store.read_work_item("work-1").unwrap();
+    item.planning_context
+        .as_mut()
+        .unwrap()
+        .behaviors = Some(
+        "## Behaviors\n\n### B1\n\nThe system preserves the approved obligations.\nUntestable: the fixture records lifecycle gates without running the product behavior.\n"
+            .to_string(),
+    );
+    let contract =
+        WriterCompletionContract::from_planning_context(item.planning_context.as_ref().unwrap())
+            .unwrap();
+    let writer = &item.attempts[0].tasks[0];
+    let matrix_path = fixture
+        .main_dir
+        .join(&writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let matrix = WriterCompletionMatrix::skeleton(&contract, &writer.id, &[], None).unwrap();
+    fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    item.attempts[0].writer_completion_contract = Some(contract);
+    store.write_work_item(&item).unwrap();
+}
+
+fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
+-> RoundCapApproachRevisionFixture {
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, EvidenceRecoveryState, PauseKind, TaskKind, TaskStatus,
+        WriterCompletionRequirementKind, WriterCompletionState, WriterVerificationClaim,
+        WriterVerificationResult, set_task_terminal,
+    };
+
+    let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    let initial = fixture.store.read_work_item("work-1").unwrap();
+    let writer = &initial.attempts[0].tasks[0];
+    let matrix_path = fixture
+        .main_dir
+        .join(&writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let mut matrix: fluent::work_model::WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&matrix_path).unwrap()).unwrap();
+    let writer_row = matrix
+        .rows
+        .iter_mut()
+        .find(|row| row.id == "plan:step-1")
+        .unwrap();
+    assert_eq!(
+        writer_row.kind,
+        WriterCompletionRequirementKind::Plan,
+        "fixture must expose a Writer-owned Plan row before host attachment"
+    );
+    writer_row.state = WriterCompletionState::Complete;
+    writer_row.implementation_evidence = vec!["README.md: preserve the contract".to_string()];
+    writer_row.verification = vec![WriterVerificationClaim {
+        command: "cargo test".to_string(),
+        result: WriterVerificationResult::Pass,
+    }];
+    fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            let attempt = &mut item.attempts[0];
+            attempt.evidence_recoveries.clear();
+            attempt
+                .artifacts
+                .retain(|artifact| artifact.producer_id != "accepted-host-evidence");
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::WriterCompletion);
+            attempt.review_state = Some(AttemptReviewState::NotReviewed);
+            Ok(())
+        })
+        .unwrap();
+
+    let evidence_path = fixture._tmp.path().join("accepted-host-evidence.json");
+    fs::write(
+        &evidence_path,
+        r#"{
+  "schema_version": 1,
+  "producer": "authorized host",
+  "check": "bash tests/host.sh",
+  "working_directory": ".",
+  "result": "pass",
+  "run_at": "2026-09-12T00:00:00Z",
+  "output": "host check passed"
+}
+"#,
     )
+    .unwrap();
+    let recovery = fluent::host_evidence::attach_plan_row(
+        &fixture.main_dir,
+        &fixture.store,
+        "work-1",
+        "attempt-1",
+        &fixture.candidate,
+        "plan:step-2",
+        &evidence_path,
+    )
+    .unwrap();
+    let target_task_id = recovery.targets[0]
+        .review_task_id
+        .clone()
+        .expect("Plan-row attachment must create a targeted Tests Review");
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            let attempt = &mut item.attempts[0];
+            let review = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == target_task_id && task.kind == TaskKind::Review)
+                .expect("targeted Tests Review must remain attached");
+            set_task_terminal(review, TaskStatus::Complete);
+            let review_path = fixture
+                .main_dir
+                .join(&review.artifact_area.as_ref().unwrap().path)
+                .join("review.md");
+            fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+            fs::write(&review_path, "Verdict: pass\n\nHost proof accepted.\n").unwrap();
+            let review_bytes = fs::read(review_path).unwrap();
+            let current = attempt
+                .evidence_recoveries
+                .iter_mut()
+                .find(|entry| entry.id == recovery.id)
+                .expect("attached Plan-row recovery must remain attached");
+            current.state = EvidenceRecoveryState::Complete;
+            current.targets[0].review_digest =
+                Some(format!("sha256:{:x}", Sha256::digest(review_bytes)));
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::RoundCap);
+            attempt.review_state = Some(AttemptReviewState::Failed);
+            Ok(())
+        })
+        .unwrap();
+
+    fixture
+        .store
+        .mutate_work_item("work-1", |item| {
+            let review_ids = item
+                .add_next_review_tasks("attempt-1", &["architecture", "tests", "documentation"])?;
+            for task in item.attempts[0]
+                .tasks
+                .iter_mut()
+                .filter(|task| review_ids.contains(&task.id))
+            {
+                set_task_terminal(task, TaskStatus::Complete);
+                let review_path = fixture
+                    .main_dir
+                    .join(&task.artifact_area.as_ref().unwrap().path)
+                    .join("review.md");
+                fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+                let verdict = if task.role == "tests" {
+                    "Verdict: fail\n\nTests review found a corrective issue.\n"
+                } else {
+                    "Verdict: pass\n\nReview passed.\n"
+                };
+                fs::write(review_path, verdict).unwrap();
+            }
+            let attempt = &mut item.attempts[0];
+            attempt.status = AttemptStatus::NeedsUser;
+            attempt.pause_kind = Some(PauseKind::RoundCap);
+            attempt.review_state = Some(AttemptReviewState::Failed);
+            Ok(())
+        })
+        .unwrap();
+
+    fixture
 }
 
 fn setup_round_cap_approach_revision_fixture_with_plan(

@@ -635,7 +635,7 @@ pub(crate) fn owned_host_completion_matrix(
 }
 
 /// Recheck the immutable approval before any consumer uses its completion.
-fn validated_ownership_approval(
+pub(crate) fn validated_ownership_approval(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<work_model::OwnershipApproval>> {
@@ -714,6 +714,7 @@ pub(crate) fn validate_planning_resume(
     attempt: &work_model::Attempt,
 ) -> Result<bool> {
     validate_planning_completion_history(project_root, attempt)?;
+    validate_completed_plan_evidence(project_root, attempt)?;
     let mut allows_planned_correction = false;
     for audit_artifact in attempt.artifacts.iter().filter(|artifact| {
         artifact.producer_id == "planning-approach-recovery"
@@ -744,6 +745,66 @@ pub(crate) fn validate_planning_resume(
         }
     }
     Ok(allows_planned_correction)
+}
+
+/// Revalidate every accepted structured Plan-host receipt before any resume
+/// route advances the Attempt. Active receipts take the normal settlement path,
+/// while completed receipts remain immutable evidence that may either bind the
+/// current Writer or document an earlier candidate in the same Attempt.
+fn validate_completed_plan_evidence(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    let current_candidate = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.as_str());
+
+    let recoveries = attempt
+        .evidence_recoveries
+        .iter()
+        .filter(|recovery| {
+            recovery.state == EvidenceRecoveryState::Complete
+                && recovery.required_check.is_none()
+                && (recovery.id.starts_with("plan-host-evidence-")
+                    || recovery.targets.iter().any(|target| {
+                        attempt.artifacts.iter().any(|artifact| {
+                            artifact.producer_id == "plan-host-evidence"
+                                && artifact.path == target.prior_review_artifact
+                        })
+                    }))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for recovery in recoveries {
+        let historical = current_candidate != Some(recovery.candidate_commit.as_str());
+        let mut replay = attempt.clone();
+        for entry in &mut replay.evidence_recoveries {
+            if entry.id == recovery.id {
+                entry.state = EvidenceRecoveryState::Reviewing;
+            } else if entry.is_active() {
+                // The copied Attempt may still contain a newer active frontier.
+                // Isolate this historical receipt so the shared validator reads
+                // the recovery selected by this replay pass.
+                entry.state = EvidenceRecoveryState::Complete;
+            }
+        }
+        anyhow::ensure!(
+            validate_owned_plan_evidence_review_at(
+                project_root,
+                &replay,
+                crate::check_applicability::evaluation_time(),
+                historical,
+            )?,
+            "completed Plan host evidence {} is not accepted",
+            recovery.id
+        );
+    }
+    Ok(())
 }
 
 /// Revalidate planning approvals for adopted and explicitly owned Attempts.
@@ -2674,17 +2735,20 @@ pub(crate) fn validate_round_cap_approach_revision_retry(
         .context("round-cap Approach revision has no prior completion contract")?;
     let current_contract = work_model::WriterCompletionContract::from_planning_context(context)
         .context("Work Item has no Writer completion contract")?;
-    anyhow::ensure!(
-        attempt.writer_completion_contract.as_ref() == Some(&current_contract),
-        "planning authority and Attempt completion contract differ"
-    );
+    let ownership_approval = validated_ownership_approval(project_root, attempt)?;
     let expected_contract = prior_contract
         .with_revised_approach(&revision.prior_approach, &revision.replacement_approach)
         .map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
-        current_contract == expected_contract,
-        "planning authority and Approach revision contract differ"
+        attempt.writer_completion_contract.as_ref() == Some(&expected_contract),
+        "planning authority and Attempt completion contract differ"
     );
+    // An approved ownership split may make the retained planning markdown's
+    // contract differ from the Attempt contract. The shared planning-history
+    // validator verifies that separate approval before this retry check.
+    if current_contract != expected_contract && ownership_approval.is_none() {
+        bail!("planning authority and Attempt completion contract differ");
+    }
     anyhow::ensure!(
         context.approach.as_deref() == Some(revision.replacement_approach.as_str()),
         "stored Approach does not match the accepted revision"
