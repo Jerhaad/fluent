@@ -10,9 +10,9 @@ use crate::work_model::{
     ApproachRevisionAudit as RevisionAudit, ApproachRevisionKind, ApproachRevisionSupersession,
     ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata,
     DurableTransitionOrigin, LegacyApproachReconciliationReceipt as LegacyReconciliationReceipt,
-    PauseKind, RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind,
-    TaskStatus, WorkModelError, WorkModelStore, WriterCompletionContract,
-    WriterCompletionRequirementKind, work_artifact_path,
+    ManagedWorkItemFile, PauseKind, RoundCapExtension, RoundCapExtensionRequest,
+    RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
+    WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
@@ -224,7 +224,10 @@ pub fn revise(
     )?;
     audit.revision_id = revision_id.clone();
     let audit_bytes = serde_json::to_vec_pretty(&audit)?;
-    write_once(&project_root.join(&audit_artifact), &audit_bytes)?;
+    let managed_files = [ManagedWorkItemFile::new(
+        audit_artifact.clone(),
+        audit_bytes.clone(),
+    )];
     #[cfg(feature = "test-support")]
     if std::env::var("FLUENT_TEST_APPROACH_REVISION_INTERRUPT")
         .ok()
@@ -263,7 +266,11 @@ pub fn revise(
         reason: Some("revise approved Approach".to_string()),
         evidence_ref: Some(audit_artifact.clone()),
     };
-    let writer_task_id = store.mutate_work_item_with_transition(work_item_id, &metadata, |fresh| {
+    let writer_task_id = store.mutate_work_item_with_transition_and_files(
+        work_item_id,
+        &metadata,
+        &managed_files,
+        |fresh| {
         if fresh.planning_context.as_ref() != Some(&expected_context) {
             return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "planning context changed before Approach revision".to_string() });
         }
@@ -391,7 +398,8 @@ pub fn revise(
         );
         attempt.record_recovery_operation(&operation, next_action)?;
         Ok(task_id)
-    })?;
+        },
+    )?;
     Ok(ApproachRevision {
         revision_id,
         audit_artifact,
@@ -882,7 +890,7 @@ fn select_revision_identity(
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return if use_full_frontier_identity {
-                full_revision_identity(project_root, work_item_id, attempt_id, audit)
+                full_revision_identity(work_item_id, attempt_id, audit)
             } else {
                 Ok((legacy_revision_id.to_string(), legacy_artifact))
             };
@@ -890,18 +898,17 @@ fn select_revision_identity(
         Err(error) => return Err(error.into()),
     };
     let Ok(existing) = serde_json::from_slice::<RevisionAudit>(&existing_bytes) else {
-        // Leave an unparseable sidecar at the legacy path so write_once can
-        // fail closed instead of publishing a new audit over conflicting data.
+        // Leave an unparseable sidecar at the legacy path so the transaction
+        // publisher can fail closed instead of replacing conflicting data.
         return Ok((legacy_revision_id.to_string(), legacy_artifact));
     };
     if !use_full_frontier_identity || audit_identity_matches(&existing, audit) {
         return Ok((legacy_revision_id.to_string(), legacy_artifact));
     }
-    full_revision_identity(project_root, work_item_id, attempt_id, audit)
+    full_revision_identity(work_item_id, attempt_id, audit)
 }
 
 fn full_revision_identity(
-    project_root: &Path,
     work_item_id: &str,
     attempt_id: &str,
     audit: &RevisionAudit,
@@ -952,23 +959,6 @@ fn capture_source_completion(
         sha256: digest(&bytes),
         contract: contract.clone(),
     }))
-}
-
-fn write_once(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::read(path) {
-        Ok(existing) if existing == bytes => Ok(()),
-        Ok(_) => bail!(
-            "recovery artifact already exists with different bytes: {}",
-            path.display()
-        ),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            crate::atomic_write::atomic_write(path, bytes).map_err(Into::into)
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[cfg(test)]

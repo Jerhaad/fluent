@@ -762,6 +762,41 @@ pub fn resume_with_tester_no_sandbox(
             attempt_id,
         )?;
 
+    // Read-only recovery validation may inspect revision audits, completion
+    // matrices, worktrees, and downstream evidence. Do it before taking the
+    // project-wide queue lock. An already-matching active resume is the one
+    // idempotent receipt-loss path that intentionally skips this full replay;
+    // its model and cancellation identity are checked again below.
+    let preflight_ledger = read_ledger(project_root, id)?;
+    let already_queued = preflight_ledger
+        .as_ref()
+        .and_then(DispatchLedger::active)
+        .is_some_and(|active| {
+            active.intent == DispatchIntent::ResumeAttempt
+                && active.bound_attempt_id.as_deref() == Some(attempt_id)
+        });
+    if already_queued {
+        if let Some(attempt) = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == attempt_id)
+        {
+            crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+        }
+    } else {
+        ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
+        ensure_resume_eligible(
+            project_root,
+            &item,
+            id,
+            attempt_id,
+            legacy_learner_tester_evidence,
+            reconciled_candidate_ancestry_repair,
+            reconciled_candidate_metadata_repair,
+            pending_code_change_classification,
+        )?;
+    }
+
     let _lock = lock_queue(project_root)?;
     let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
 
@@ -774,7 +809,6 @@ pub fn resume_with_tester_no_sandbox(
                 .iter()
                 .find(|attempt| attempt.id == attempt_id)
             {
-                crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
                 if attempt.cancellation_requested()
                     && active.resume_cancellation_requested_at.as_deref()
                         != attempt
@@ -805,18 +839,6 @@ pub fn resume_with_tester_no_sandbox(
             active.status
         );
     }
-
-    ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
-    ensure_resume_eligible(
-        project_root,
-        &item,
-        id,
-        attempt_id,
-        legacy_learner_tester_evidence,
-        reconciled_candidate_ancestry_repair,
-        reconciled_candidate_metadata_repair,
-        pending_code_change_classification,
-    )?;
 
     let resume_of_dispatch_id = match ledger.latest() {
         Some(previous) if previous.status == DispatchStatus::Canceled => {
@@ -1169,6 +1191,8 @@ fn ensure_resume_eligible(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
     crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+    #[cfg(test)]
+    crate::test_lock_probe::reach("queue-lifecycle", id, "resume", "EVIDENCE");
     let allows_planned_approach_correction =
         crate::recovery_contracts::validate_planning_resume_for_queue(project_root, item, attempt)?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
@@ -1443,11 +1467,39 @@ pub fn claim(
     let item = store.read_work_item_under_model_lock(work_item_id)?;
     #[cfg(test)]
     crate::test_lock_probe::reach("queue-lifecycle", work_item_id, "claim", "ELIGIBLE");
+    // The ledger file is atomically replaced, so this read is a safe admission
+    // hint. The locked reread below proves that the queue did not change while
+    // the evidence checks ran.
+    let initial_ledger = read_ledger(project_root, work_item_id)?;
+    if let Some(active) = initial_ledger.as_ref().and_then(DispatchLedger::active)
+        && active.status == DispatchStatus::Queued
+        && active.intent == DispatchIntent::ResumeAttempt
+    {
+        let persisted_attempt_id = active.bound_attempt_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "resume dispatch {:?} has no bound Attempt",
+                active.dispatch_id
+            )
+        })?;
+        ensure_resume_eligible(
+            project_root,
+            &item,
+            work_item_id,
+            persisted_attempt_id,
+            false,
+            false,
+            false,
+            false,
+        )?;
+    }
     let _lock = lock_queue(project_root)?;
     let mut ledger = match read_ledger(project_root, work_item_id)? {
         Some(ledger) => ledger,
         None => return Ok(None),
     };
+    if initial_ledger.as_ref() != Some(&ledger) {
+        bail!("Work Item {work_item_id:?} queue changed during resume admission; retry the claim");
+    }
 
     let Some(active) = ledger.active_mut() else {
         return Ok(None);
@@ -1499,16 +1551,6 @@ pub fn claim(
                     active.dispatch_id
                 );
             }
-            ensure_resume_eligible(
-                project_root,
-                &item,
-                work_item_id,
-                persisted_attempt_id,
-                false,
-                false,
-                false,
-                false,
-            )?;
             ensure_tester_no_sandbox_eligible(
                 &item,
                 work_item_id,
@@ -3484,6 +3526,50 @@ mod tests {
                 .abandonment
                 .is_some()
         );
+    }
+
+    #[test]
+    fn resume_validates_planning_evidence_before_queue_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-evidence-lock", "attempt-1");
+        let probe = crate::test_lock_probe::ScopedLockProbe::install(
+            "queue-lifecycle",
+            "wi-evidence-lock",
+            Some(("resume", "EVIDENCE")),
+        );
+        let resume_root = dir.path().to_path_buf();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_thread = std::thread::spawn(move || {
+            resume_tx
+                .send(resume(&resume_root, "wi-evidence-lock", "attempt-1", None))
+                .unwrap();
+        });
+
+        assert!(probe.wait_for("resume", "EVIDENCE"));
+        let lock_root = dir.path().to_path_buf();
+        let (lock_tx, lock_rx) = mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let lock = lock_queue(&lock_root).unwrap();
+            lock_tx.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(
+            lock_rx.recv_timeout(Duration::from_millis(250)).is_ok(),
+            "queue evidence validation must not hold the queue lock"
+        );
+        probe.release();
+        assert!(
+            resume_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        resume_thread.join().unwrap();
+        lock_thread.join().unwrap();
     }
 
     #[test]

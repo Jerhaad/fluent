@@ -783,10 +783,7 @@ fn validate_planning_resume_at(
     else {
         return Ok(false);
     };
-    let bytes = fs::read(resolve_input_artifact_path(
-        project_root,
-        &audit_artifact.path,
-    )?)?;
+    let bytes = registered_approach_revision_audit_bytes(project_root, attempt, audit_artifact)?;
     let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
     if revision.revision_kind != work_model::ApproachRevisionKind::FailedReviewRoundCap {
         return Ok(false);
@@ -1032,6 +1029,79 @@ fn validate_completed_plan_evidence(
 }
 
 /// Revalidate planning approvals for adopted and explicitly owned Attempts.
+fn registered_approach_revision_audit_bytes(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    audit_artifact: &ArtifactRef,
+) -> Result<Vec<u8>> {
+    let registration_count = attempt
+        .artifacts
+        .iter()
+        .filter(|registered| *registered == audit_artifact)
+        .count();
+    anyhow::ensure!(
+        registration_count == 1,
+        "Approach revision audit is not registered exactly once on the Attempt"
+    );
+    let path = resolve_input_artifact_path(project_root, &audit_artifact.path)?;
+    let bytes = fs::read(&path)
+        .with_context(|| format!("read registered Approach revision audit {}", path.display()))?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let operation_count = attempt
+        .recovery_operations
+        .iter()
+        .filter(|operation| {
+            operation.operation_kind == "planning-approach-revision"
+                && operation.work_item_id == attempt.work_item_id
+                && operation.attempt_id == attempt.id
+                && operation.input_digest.as_deref() == Some(digest.as_str())
+        })
+        .count();
+    anyhow::ensure!(
+        operation_count == 1,
+        "Approach revision audit is not bound to one recorded recovery operation"
+    );
+    Ok(bytes)
+}
+
+fn validate_approach_revision_operation_binding(
+    attempt: &work_model::Attempt,
+    revision: &work_model::ApproachRevisionAudit,
+    audit_digest: &str,
+) -> Result<()> {
+    let request = work_model::RecoveryOperationRequest::new(
+        "planning-approach-revision",
+        &attempt.work_item_id,
+        &attempt.id,
+        Some(revision.candidate_commit.clone()),
+        Some(revision.source_review_task_id.clone()),
+        None,
+        None,
+        Some(revision.resolution.clone()),
+        Some(audit_digest.to_string()),
+    );
+    let matches = attempt
+        .recovery_operations
+        .iter()
+        .filter(|operation| {
+            operation.operation_id == request.operation_id()
+                && operation.operation_kind == request.operation_kind
+                && operation.work_item_id == request.work_item_id
+                && operation.attempt_id == request.attempt_id
+                && operation.candidate_commit == request.candidate_commit
+                && operation.task_id == request.task_id
+                && operation.authorization == request.authorization
+                && operation.authorization_digest == request.authorization_digest()
+                && operation.input_digest == request.input_digest
+        })
+        .count();
+    anyhow::ensure!(
+        matches == 1,
+        "Approach revision audit is not bound to its exact recovery authorization"
+    );
+    Ok(())
+}
+
 fn validate_planning_revisions(
     project_root: &Path,
     attempt: &work_model::Attempt,
@@ -1045,7 +1115,7 @@ fn validate_planning_revisions(
         ) && artifact.path.ends_with("/revision.json")
     }) {
         if artifact.producer_id == "planning-approach-recovery" {
-            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            let bytes = registered_approach_revision_audit_bytes(project_root, attempt, artifact)?;
             let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
             if let Some(prior) = &revision.prior_contract {
                 if let Some(expected) = &contract {
@@ -1081,18 +1151,10 @@ fn validate_planning_revisions(
                     && format!(
                         "{:x}",
                         Sha256::digest(revision.replacement_approach.as_bytes())
-                    ) == revision.replacement_approach_sha256
-                    && attempt.recovery_operations.iter().any(|operation| {
-                        operation.operation_kind == "planning-approach-revision"
-                            && operation.work_item_id == attempt.work_item_id
-                            && operation.attempt_id == attempt.id
-                            && operation.candidate_commit.as_ref()
-                                == Some(&revision.candidate_commit)
-                            && operation.task_id.as_ref() == Some(&revision.source_review_task_id)
-                            && operation.input_digest.as_ref() == Some(&digest)
-                    }),
-                "Approach revision has no matching recorded approval"
+                    ) == revision.replacement_approach_sha256,
+                "Approach revision has invalid recorded approval bytes"
             );
+            validate_approach_revision_operation_binding(attempt, &revision, &digest)?;
             anyhow::ensure!(
                 attempt
                     .tasks
@@ -2945,6 +3007,19 @@ pub(crate) fn validate_round_cap_approach_revision_retry(
     audit_artifact: &ArtifactRef,
     allow_settled_cancellation: bool,
 ) -> Result<()> {
+    let registered_bytes =
+        registered_approach_revision_audit_bytes(project_root, attempt, audit_artifact)?;
+    let registered_revision: work_model::ApproachRevisionAudit =
+        serde_json::from_slice(&registered_bytes)?;
+    anyhow::ensure!(
+        &registered_revision == revision,
+        "retry supplied an Approach revision different from the registered audit bytes"
+    );
+    validate_approach_revision_operation_binding(
+        attempt,
+        revision,
+        &format!("{:x}", Sha256::digest(&registered_bytes)),
+    )?;
     anyhow::ensure!(
         revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap
             && revision.schema_version == 2

@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -503,6 +504,28 @@ pub struct DurableTransitionMetadata {
     pub origin: DurableTransitionOrigin,
     pub reason: Option<String>,
     pub evidence_ref: Option<String>,
+}
+
+/// One immutable managed file that a Work-model transaction must publish along
+/// with its aggregate snapshot. The bytes live in the journal so recovery can
+/// finish the same publication without depending on a sidecar that was only
+/// written before the transaction began.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ManagedWorkItemFile {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub digest: String,
+}
+
+impl ManagedWorkItemFile {
+    pub(crate) fn new(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        Self {
+            path: path.into(),
+            bytes,
+            digest,
+        }
+    }
 }
 
 /// One explicit conversion of persisted Work Item records to the current
@@ -5305,6 +5328,14 @@ pub struct RoundCapExtension {
     /// Evidence-backed Writer allowances already included in `new_cap`.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub evidence_write_rounds: usize,
+    /// The configured cap and materialized Writer frontier observed before a
+    /// new extension was approved. Together they bind the first extension's
+    /// old cap to the authorized pre-extension state instead of trusting a
+    /// self-consistent old/new/id tuple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorized_base_cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_extension_write_rounds: Option<usize>,
     pub candidate_commit: String,
     pub failed_reviews: Vec<RoundCapReviewArtifact>,
     /// The operator's exact decision for this candidate and failure frontier.
@@ -5349,6 +5380,7 @@ impl RoundCapExtension {
         &self,
         previous: Option<&RoundCapExtension>,
         current_evidence_write_rounds: usize,
+        current_materialized_write_rounds: usize,
     ) -> Result<(), WorkModelError> {
         if !(MIN_ADDITIONAL_WRITE_ROUNDS..=MAX_ADDITIONAL_WRITE_ROUNDS)
             .contains(&self.additional_write_rounds)
@@ -5389,7 +5421,51 @@ impl RoundCapExtension {
                 ),
             });
         }
+        match (self.authorized_base_cap, self.pre_extension_write_rounds) {
+            (Some(base_cap), Some(pre_extension_write_rounds)) => {
+                if base_cap == 0 {
+                    return Err(WorkModelError::RoundCapExtensionIneligible {
+                        reason: "the authorized base cap must be positive".to_string(),
+                    });
+                }
+                if pre_extension_write_rounds > current_materialized_write_rounds {
+                    return Err(WorkModelError::RoundCapExtensionIneligible {
+                        reason: format!(
+                            "the extension records {} pre-extension Writer rounds, but only {} are materialized",
+                            pre_extension_write_rounds, current_materialized_write_rounds
+                        ),
+                    });
+                }
+                if previous.is_none() {
+                    let expected_old_cap = base_cap
+                        .saturating_add(self.evidence_write_rounds)
+                        .max(pre_extension_write_rounds);
+                    if self.old_cap != expected_old_cap {
+                        return Err(WorkModelError::RoundCapExtensionIneligible {
+                            reason: format!(
+                                "old cap {} does not match the authorized pre-extension cap {}",
+                                self.old_cap, expected_old_cap
+                            ),
+                        });
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: "the authorized pre-extension frontier is incomplete".to_string(),
+                });
+            }
+        }
         if let Some(previous) = previous {
+            if let (Some(previous_base_cap), Some(base_cap)) =
+                (previous.authorized_base_cap, self.authorized_base_cap)
+                && previous_base_cap != base_cap
+            {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: "the extension chain changes its authorized base cap".to_string(),
+                });
+            }
             let evidence_delta = self
                 .evidence_write_rounds
                 .checked_sub(previous.evidence_write_rounds)
@@ -6099,9 +6175,14 @@ impl Attempt {
 
     pub(crate) fn validate_round_cap_extensions(&self) -> Result<(), WorkModelError> {
         let current_evidence_write_rounds = self.evidence_write_rounds();
+        let current_materialized_write_rounds = self.materialized_write_rounds();
         let mut previous = None;
         for extension in &self.round_cap_extensions {
-            extension.validate_structure(previous, current_evidence_write_rounds)?;
+            extension.validate_structure(
+                previous,
+                current_evidence_write_rounds,
+                current_materialized_write_rounds,
+            )?;
             previous = Some(extension);
         }
         Ok(())
@@ -6136,12 +6217,21 @@ impl Attempt {
             });
         }
         let new_cap = effective_cap.saturating_add(request.additional_write_rounds);
+        let evidence_write_rounds = self.evidence_write_rounds();
+        let pre_extension_write_rounds = self.materialized_write_rounds();
+        let authorized_base_cap = self
+            .round_cap_extensions
+            .first()
+            .and_then(|extension| extension.authorized_base_cap)
+            .unwrap_or(base_cap);
         self.round_cap_extensions.push(RoundCapExtension {
             id: format!("round-cap-{effective_cap}-{new_cap}"),
             old_cap: effective_cap,
             new_cap,
             additional_write_rounds: request.additional_write_rounds,
-            evidence_write_rounds: self.evidence_write_rounds(),
+            evidence_write_rounds,
+            authorized_base_cap: Some(authorized_base_cap),
+            pre_extension_write_rounds: Some(pre_extension_write_rounds),
             candidate_commit: request.candidate_commit,
             failed_reviews: request.failed_reviews,
             human_resolution_digest: round_cap_resolution_digest(&human_resolution),
@@ -6632,6 +6722,7 @@ impl Attempt {
                 }
             })?;
         }
+        self.validate_round_cap_extensions()?;
         for task in &self.tasks {
             if task.work_item_id != work_item_id {
                 return Err(WorkModelError::TaskWorkItemMismatch {
@@ -9622,6 +9713,10 @@ struct WorkItemTransaction {
     /// interrupted publication. Legacy journals cannot supply this proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_children_digest: Option<String>,
+    /// Managed sidecars are journaled before any split child or root record is
+    /// published. Legacy journals omit this field and remain recoverable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    managed_files: Vec<ManagedWorkItemFile>,
     work_item: WorkItem,
 }
 
@@ -9631,13 +9726,13 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    /// Version 6 fences the assignment-aware coordinator's schema-5 journal.
+    /// Version 7 journals managed sidecars with the aggregate publication.
     /// Earlier stable transaction versions remain modeled; versions 4 and 5
     /// are not admitted by their numeric position alone.
-    const SCHEMA_VERSION: u32 = 6;
+    const SCHEMA_VERSION: u32 = 7;
 
     fn is_supported_schema(version: u32) -> bool {
-        matches!(version, 1..=3 | Self::SCHEMA_VERSION)
+        matches!(version, 1..=3 | 6 | Self::SCHEMA_VERSION)
     }
 }
 
@@ -10076,6 +10171,9 @@ impl WorkModelStore {
                 let expected_digest = if Some(after.storage_revision) == transaction.base_revision {
                     transaction.base_children_digest
                 } else if after.storage_revision == transaction.target_revision {
+                    if !self.managed_files_are_published(&transaction.managed_files)? {
+                        return Err(unavailable());
+                    }
                     Some(work_item_children_digest(&transaction.work_item)?)
                 } else {
                     None
@@ -10555,6 +10653,20 @@ impl WorkModelStore {
         metadata: &DurableTransitionMetadata,
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
+        self.mutate_work_item_with_transition_and_files(id, metadata, &[], reducer)
+    }
+
+    /// Mutate an aggregate and journal immutable managed files in the same
+    /// recoverable publication. The file bytes are installed only while the
+    /// Work-model transaction is being applied, never as an orphaned
+    /// pre-publication side effect.
+    pub(crate) fn mutate_work_item_with_transition_and_files<T>(
+        &self,
+        id: &str,
+        metadata: &DurableTransitionMetadata,
+        managed_files: &[ManagedWorkItemFile],
+        reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+    ) -> Result<T, WorkModelStorageError> {
         let path = self.work_item_path(id)?;
         let _lock = self.lock_work_item_model(id)?;
         let mut work_item = self.read_work_item_under_model_lock(id)?;
@@ -10579,8 +10691,11 @@ impl WorkModelStore {
         }
         work_item
             .validate()
-            .map_err(|source| WorkModelStorageError::InvalidModel { path, source })?;
-        self.write_work_item_file_unchecked(&work_item, false)?;
+            .map_err(|source| WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source,
+            })?;
+        self.write_work_item_file_unchecked_with_managed_files(&work_item, false, managed_files)?;
         Ok(output)
     }
 
@@ -10693,7 +10808,21 @@ impl WorkModelStore {
         work_item: &WorkItem,
         create_new: bool,
     ) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file_unchecked_with_options(work_item, create_new, false)
+        self.write_work_item_file_unchecked_with_managed_files(work_item, create_new, &[])
+    }
+
+    fn write_work_item_file_unchecked_with_managed_files(
+        &self,
+        work_item: &WorkItem,
+        create_new: bool,
+        managed_files: &[ManagedWorkItemFile],
+    ) -> Result<(), WorkModelStorageError> {
+        self.write_work_item_file_unchecked_with_options(
+            work_item,
+            create_new,
+            false,
+            managed_files,
+        )
     }
 
     /// Persist a format upgrade even when the typed Work Item is otherwise
@@ -10704,7 +10833,7 @@ impl WorkModelStore {
         &self,
         work_item: &WorkItem,
     ) -> Result<(), WorkModelStorageError> {
-        self.write_work_item_file_unchecked_with_options(work_item, false, true)
+        self.write_work_item_file_unchecked_with_options(work_item, false, true, &[])
     }
 
     fn write_work_item_file_unchecked_with_options(
@@ -10712,6 +10841,7 @@ impl WorkModelStore {
         work_item: &WorkItem,
         create_new: bool,
         force_persist: bool,
+        managed_files: &[ManagedWorkItemFile],
     ) -> Result<(), WorkModelStorageError> {
         let path = self.work_item_path(&work_item.id)?;
         let dir = self.work_items_dir();
@@ -10719,7 +10849,10 @@ impl WorkModelStore {
             .map_err(|source| WorkModelStorageError::CreateDirectory { path: dir, source })?;
 
         if let Some(transaction) = self.read_work_item_transaction(&work_item.id)? {
-            if !force_persist && aggregate_snapshot_matches(&transaction.work_item, work_item)? {
+            if managed_files.is_empty()
+                && !force_persist
+                && aggregate_snapshot_matches(&transaction.work_item, work_item)?
+            {
                 self.apply_work_item_transaction(&transaction)?;
                 work_item.storage_revision.set(transaction.target_revision);
                 return Ok(());
@@ -10747,7 +10880,10 @@ impl WorkModelStore {
                 });
             }
             if let Ok(current_item) = self.read_work_item_file_unlocked(&path, false) {
-                if !force_persist && aggregate_snapshot_matches(&current_item, work_item)? {
+                if managed_files.is_empty()
+                    && !force_persist
+                    && aggregate_snapshot_matches(&current_item, work_item)?
+                {
                     work_item.storage_revision.set(current.storage_revision);
                     return Ok(());
                 }
@@ -10781,12 +10917,14 @@ impl WorkModelStore {
             })?,
             None => 0,
         };
+        self.validate_managed_files(managed_files)?;
         let transaction = WorkItemTransaction {
             schema_version: WorkItemTransaction::SCHEMA_VERSION,
             id: work_item.id.clone(),
             base_revision,
             target_revision,
             base_children_digest,
+            managed_files: managed_files.to_vec(),
             work_item: work_item.clone(),
         };
         let transaction_path = self.work_transaction_path(&work_item.id)?;
@@ -10806,6 +10944,165 @@ impl WorkModelStore {
         self.apply_work_item_transaction(&transaction)?;
         work_item.storage_revision.set(target_revision);
         Ok(())
+    }
+
+    fn validate_managed_files(
+        &self,
+        managed_files: &[ManagedWorkItemFile],
+    ) -> Result<(), WorkModelStorageError> {
+        let mut paths = HashSet::new();
+        for file in managed_files {
+            let path = self.validate_managed_file_destination(&file.path)?;
+            if !paths.insert(file.path.as_str()) {
+                return Err(self.invalid_managed_file(
+                    path,
+                    "the transaction lists the same managed file more than once",
+                ));
+            }
+            let expected_digest = format!("sha256:{:x}", Sha256::digest(&file.bytes));
+            if file.digest != expected_digest {
+                return Err(self.invalid_managed_file(
+                    path,
+                    "the managed file digest does not match its journaled bytes",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_managed_file_destination(
+        &self,
+        relative: &str,
+    ) -> Result<PathBuf, WorkModelStorageError> {
+        let relative_path = Path::new(relative);
+        let components = relative_path.components().collect::<Vec<_>>();
+        let managed_root = Path::new(WORK_ARTIFACTS_DIR);
+        let valid = !relative_path.is_absolute()
+            && components.len() > managed_root.components().count()
+            && components
+                .iter()
+                .all(|component| matches!(component, Component::Normal(_)))
+            && relative_path.starts_with(managed_root);
+        let path = self.project_root.join(relative_path);
+        if !valid {
+            return Err(self.invalid_managed_file(
+                path,
+                "managed transaction files must use normal paths under .fluent/work/artifacts",
+            ));
+        }
+
+        let mut current = self.project_root.clone();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(part) = component else {
+                unreachable!("managed file path was checked above");
+            };
+            current.push(part);
+            let is_last = index + 1 == components.len();
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(self.invalid_managed_file(
+                        path,
+                        "managed transaction files must not traverse symlinks",
+                    ));
+                }
+                Ok(metadata) if !is_last && !metadata.is_dir() => {
+                    return Err(self.invalid_managed_file(
+                        path,
+                        "a managed transaction file parent is not a directory",
+                    ));
+                }
+                Ok(metadata) if is_last && !metadata.is_file() => {
+                    return Err(self.invalid_managed_file(
+                        path,
+                        "a managed transaction file destination is not a regular file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    // Missing parents and the final destination are installed
+                    // by the transaction applier after its journal is durable.
+                    break;
+                }
+                Err(error) => {
+                    return Err(WorkModelStorageError::ReadFile {
+                        path: current,
+                        source: error,
+                    });
+                }
+            }
+        }
+        Ok(path)
+    }
+
+    fn invalid_managed_file(&self, path: PathBuf, reason: &str) -> WorkModelStorageError {
+        WorkModelStorageError::WriteFile {
+            path,
+            source: io::Error::other(reason),
+        }
+    }
+
+    fn publish_managed_files(
+        &self,
+        managed_files: &[ManagedWorkItemFile],
+    ) -> Result<(), WorkModelStorageError> {
+        self.validate_managed_files(managed_files)?;
+        for file in managed_files {
+            let path = self.validate_managed_file_destination(&file.path)?;
+            match fs::read(&path) {
+                Ok(existing) if existing == file.bytes => continue,
+                Ok(_) => {
+                    return Err(self.invalid_managed_file(
+                        path,
+                        "managed recovery artifact already exists with different bytes",
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).map_err(|source| {
+                            WorkModelStorageError::CreateDirectory {
+                                path: parent.to_path_buf(),
+                                source,
+                            }
+                        })?;
+                    }
+                    crate::atomic_write::atomic_write(&path, &file.bytes).map_err(|source| {
+                        WorkModelStorageError::WriteFile {
+                            path: path.clone(),
+                            source,
+                        }
+                    })?;
+                }
+                Err(error) => {
+                    return Err(WorkModelStorageError::ReadFile {
+                        path,
+                        source: error,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn managed_files_are_published(
+        &self,
+        managed_files: &[ManagedWorkItemFile],
+    ) -> Result<bool, WorkModelStorageError> {
+        self.validate_managed_files(managed_files)?;
+        for file in managed_files {
+            let path = self.validate_managed_file_destination(&file.path)?;
+            match fs::read(path) {
+                Ok(existing) if existing == file.bytes => {}
+                Ok(_) => return Ok(false),
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(WorkModelStorageError::ReadFile {
+                        path: self.project_root.join(&file.path),
+                        source: error,
+                    });
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn read_work_item_file(
@@ -10907,6 +11204,7 @@ impl WorkModelStore {
                 },
             });
         }
+        self.validate_managed_files(&transaction.managed_files)?;
         transaction
             .work_item
             .validate()
@@ -10960,9 +11258,11 @@ impl WorkModelStore {
             });
         }
 
-        // Integration tests can stop after the journal becomes durable and
-        // before any split child is published. Production builds do not carry
-        // this interruption path; retries exercise the normal journal recovery.
+        self.publish_managed_files(&transaction.managed_files)?;
+        // Integration tests can stop after the journal and managed sidecars
+        // become durable and before any split child is published. Production
+        // builds do not carry this interruption path; retries exercise the
+        // normal journal recovery.
         #[cfg(feature = "test-support")]
         if std::env::var("FLUENT_TEST_WORK_MODEL_INTERRUPT")
             .ok()
@@ -17331,6 +17631,7 @@ random banner prose that must be ignored
                 base_revision: Some(0),
                 target_revision: 1,
                 base_children_digest: Some(work_item_children_digest(&target).unwrap()),
+                managed_files: Vec::new(),
                 work_item: target,
             },
         )
@@ -21017,6 +21318,8 @@ random banner prose that must be ignored
             .clone();
         assert_eq!(first, duplicate);
         assert_eq!(attempt.round_cap_extensions.len(), 1);
+        assert_eq!(first.authorized_base_cap, Some(10));
+        assert_eq!(first.pre_extension_write_rounds, Some(0));
         assert_eq!(attempt.effective_write_round_cap(10), 12);
         assert_eq!(first.failed_reviews[0].digest, "sha256:approved");
         assert_eq!(
@@ -21189,6 +21492,8 @@ random banner prose that must be ignored
                     new_cap: 11,
                     additional_write_rounds: 1,
                     evidence_write_rounds: 0,
+                    authorized_base_cap: None,
+                    pre_extension_write_rounds: None,
                     candidate_commit: "candidate-commit".to_string(),
                     failed_reviews: Vec::new(),
                     human_resolution: String::new(),
@@ -21201,6 +21506,8 @@ random banner prose that must be ignored
                     new_cap: 13,
                     additional_write_rounds: 1,
                     evidence_write_rounds: 1,
+                    authorized_base_cap: None,
+                    pre_extension_write_rounds: None,
                     candidate_commit: "candidate-commit".to_string(),
                     failed_reviews: Vec::new(),
                     human_resolution: String::new(),

@@ -35964,11 +35964,12 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
         "extending the cap records approval but does not plan work before attempt run"
     );
 
-    let mut altered = stored.clone();
-    altered.attempts[0].round_cap_extensions[0]
-        .human_resolution
-        .push_str(" Changed.");
-    store.write_work_item(&altered).unwrap();
+    let attempt_path = main_dir.join(".fluent/work/attempts/work-1/attempt-1.json");
+    let original_attempt = read_json_path(&attempt_path);
+    let mut altered = original_attempt.clone();
+    altered["round_cap_extensions"][0]["human_resolution"] =
+        serde_json::json!("Preserve the reviewed contract. Changed.");
+    write_json_path(&attempt_path, &altered);
     fluent_cmd()
         .current_dir(&main_dir)
         .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
@@ -35978,9 +35979,7 @@ fn attempt_extend_binds_candidate_and_failed_review_bytes() {
         .stderr(predicate::str::contains(
             "stored human resolution no longer matches",
         ));
-    let mut restored = store.read_work_item("work-1").unwrap();
-    restored.attempts[0].round_cap_extensions[0] = extension.clone();
-    store.write_work_item(&restored).unwrap();
+    write_json_path(&attempt_path, &original_attempt);
 
     fs::write(
         review_path.unwrap(),
@@ -36472,24 +36471,21 @@ fn round_cap_approach_revision_requires_extension() {
 fn round_cap_approach_revision_rejects_exhausted_extension() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
-    fixture
-        .store
-        .mutate_work_item("work-1", |item| {
-            let attempt = &mut item.attempts[0];
-            attempt.round_cap_extensions[0].new_cap = attempt.materialized_write_rounds();
-            Ok(())
-        })
-        .unwrap();
-    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["round_cap_extensions"][0]["new_cap"] =
+        attempt["round_cap_extensions"][0]["old_cap"].clone();
+    write_json_path(&attempt_path, &attempt);
+    let before = snapshot_tree(&fixture.main_dir.join(".fluent/work"));
 
     revise_round_cap_approach(&fixture)
         .failure()
-        .stderr(predicate::str::contains(
-            "approved Writer-round cap is exhausted",
-        ));
+        .stderr(predicate::str::contains("round-cap extension"));
 
     assert_eq!(
-        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        snapshot_tree(&fixture.main_dir.join(".fluent/work")),
         before
     );
     assert!(
@@ -36550,6 +36546,27 @@ fn round_cap_approach_revision_rejects_malformed_extension_bounds() {
         before,
         "malformed cap authorization must not publish a revision"
     );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_coherently_forged_first_extension() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["round_cap_extensions"][0]["old_cap"] = serde_json::json!(100);
+    attempt["round_cap_extensions"][0]["new_cap"] = serde_json::json!(101);
+    attempt["round_cap_extensions"][0]["id"] = serde_json::json!("round-cap-100-101");
+    write_json_path(&attempt_path, &attempt);
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("round-cap extension"));
+
     assert_no_round_cap_revision(&fixture);
 }
 
@@ -37182,6 +37199,24 @@ fn round_cap_approach_revision_recovers_interrupted_publication() {
         transaction_path.is_file(),
         "publication journal must remain"
     );
+    let transaction = read_json_path(&transaction_path);
+    let managed_files = transaction["managed_files"]
+        .as_array()
+        .expect("the publication journal must own the audit file");
+    assert_eq!(managed_files.len(), 1);
+    assert_eq!(
+        managed_files[0]["path"],
+        audit_path
+            .strip_prefix(&fixture.main_dir)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        managed_files[0]["bytes"],
+        serde_json::to_value(&audit_bytes).unwrap(),
+        "the recoverable journal must retain the exact audit bytes"
+    );
     assert_eq!(
         fs::read(
             fixture
@@ -37234,7 +37269,7 @@ fn round_cap_approach_revision_recovers_interrupted_publication() {
 
 #[test]
 #[serial]
-fn round_cap_approach_revision_recovers_prewritten_audit_before_publication() {
+fn round_cap_approach_revision_does_not_prewrite_audit_before_publication() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
     let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
@@ -37244,13 +37279,7 @@ fn round_cap_approach_revision_recovers_prewritten_audit_before_publication() {
     let revisions_dir = fixture
         .main_dir
         .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions");
-    let revision_dir = fs::read_dir(&revisions_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .expect("prewritten revision audit directory");
-    let audit_path = revision_dir.join("revision.json");
-    let audit_bytes = fs::read(&audit_path).unwrap();
+    assert!(!revisions_dir.exists());
     let interrupted = fixture.store.read_work_item("work-1").unwrap();
     assert_eq!(serde_json::to_vec(&interrupted).unwrap(), before);
     assert!(
@@ -37285,27 +37314,32 @@ fn round_cap_approach_revision_recovers_prewritten_audit_before_publication() {
             .count(),
         1
     );
-    assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
+    let audit = recovered.attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap();
+    assert!(fixture.main_dir.join(&audit.path).is_file());
 }
 
 #[test]
 #[serial]
-fn round_cap_approach_revision_rejects_conflicting_prewritten_audit() {
+fn round_cap_approach_revision_rejects_conflicting_pending_audit() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
     let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
 
-    revise_round_cap_approach_before_publication(&fixture).failure();
+    revise_round_cap_approach_with_interrupt(&fixture, true).failure();
 
-    let revisions_dir = fixture
+    let transaction_path = fixture
         .main_dir
-        .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions");
-    let revision_dir = fs::read_dir(&revisions_dir)
+        .join(".fluent/work/transactions/work-1.json");
+    let transaction = read_json_path(&transaction_path);
+    let audit_relative = transaction["managed_files"][0]["path"]
+        .as_str()
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.is_dir())
-        .expect("prewritten revision audit directory");
-    let audit_path = revision_dir.join("revision.json");
+        .to_string();
+    let audit_path = fixture.main_dir.join(&audit_relative);
     let conflicting = serde_json::to_vec_pretty(&serde_json::json!({
         "conflicting": true
     }))
@@ -37319,24 +37353,12 @@ fn round_cap_approach_revision_rejects_conflicting_prewritten_audit() {
         ));
 
     assert_eq!(
-        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        serde_json::to_vec(&fixture.store.read_work_item_snapshot("work-1").unwrap()).unwrap(),
         before,
         "conflicting audit bytes must not publish aggregate authority"
     );
     assert_eq!(fs::read(&audit_path).unwrap(), conflicting);
-    assert!(
-        !fixture
-            .main_dir
-            .join(".fluent/work/transactions/work-1.json")
-            .exists()
-    );
-    let stored = fixture.store.read_work_item("work-1").unwrap();
-    assert!(
-        stored.attempts[0]
-            .tasks
-            .iter()
-            .all(|task| task.role != "approach-revision-correction")
-    );
+    assert!(transaction_path.is_file());
 }
 
 #[test]
@@ -37472,6 +37494,44 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
         fluent::work_model::TaskStatus::Complete
     );
     assert_round_cap_writer_prompt(&queued, &queued_prompt_log, queued_attempt);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_unregistered_audit_on_resume() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["artifacts"] = serde_json::Value::Array(
+        attempt["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|artifact| artifact["producer_id"] != "planning-approach-recovery")
+            .cloned()
+            .collect(),
+    );
+    write_json_path(&attempt_path, &attempt);
+
+    let prompt_log = fixture._tmp.path().join("unregistered-audit-prompts.log");
+    let provider = fixture._tmp.path().join("unregistered-audit-provider");
+    write_sandboxed_mock_claude(&provider, &round_cap_resume_provider_script(&prompt_log));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("registered"));
+    assert!(
+        !prompt_log.exists(),
+        "an unregistered audit must not launch the corrective Writer"
+    );
 }
 
 #[test]

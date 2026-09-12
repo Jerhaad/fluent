@@ -2799,6 +2799,8 @@ mod tests {
                         new_cap: 4,
                         additional_write_rounds: 1,
                         evidence_write_rounds: 0,
+                        authorized_base_cap: None,
+                        pre_extension_write_rounds: None,
                         candidate_commit: old_parent.clone(),
                         failed_reviews: vec![crate::work_model::RoundCapReviewArtifact {
                             artifact: ArtifactRef {
