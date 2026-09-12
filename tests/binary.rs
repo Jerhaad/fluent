@@ -36244,6 +36244,294 @@ fn attempt_extend_accepts_candidate_bound_failed_final_tester_without_gate() {
     }));
 }
 
+#[test]
+#[serial]
+fn round_cap_approach_revision_accepts_extended_failed_review() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+
+    revise_round_cap_approach(&fixture).success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    assert_eq!(
+        stored
+            .planning_context
+            .as_ref()
+            .unwrap()
+            .approach
+            .as_deref(),
+        Some(fixture.replacement.as_str())
+    );
+    assert_eq!(attempt.status, fluent::work_model::AttemptStatus::Planned);
+    assert_eq!(attempt.pause_kind, None);
+    assert_eq!(attempt.round_cap_extensions.len(), 1);
+    assert_eq!(attempt.round_cap_extensions[0].new_cap, 2);
+    assert_eq!(
+        attempt.tasks.last().unwrap().role,
+        "approach-revision-correction"
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_records_audit() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    let audit_ref = attempt
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap();
+    let audit = read_json_path(&fixture.main_dir.join(&audit_ref.path));
+    let extension = serde_json::to_value(&attempt.round_cap_extensions[0]).unwrap();
+
+    assert_eq!(audit["schema-version"], 2);
+    assert_eq!(audit["revision-kind"], "failed-review-round-cap");
+    assert_eq!(audit["work-item-id"], "work-1");
+    assert_eq!(audit["attempt-id"], "attempt-1");
+    assert_eq!(audit["candidate-commit"], fixture.candidate);
+    assert_eq!(
+        audit["source-review-task-id"],
+        "attempt-1-review-architecture"
+    );
+    assert_eq!(audit["prior-approach"], fixture.prior_approach);
+    assert_eq!(audit["replacement-approach"], fixture.replacement);
+    assert_eq!(audit["resolution"], fixture.resolution);
+    assert_eq!(audit["round-cap-extension"], extension);
+
+    let supporting = audit["supporting-reviews"].as_array().unwrap();
+    assert_eq!(supporting.len(), 3);
+    for entry in supporting {
+        let artifact = entry["artifact"].clone();
+        let path = artifact["path"].as_str().unwrap();
+        let bytes = fs::read(fixture.main_dir.join(path)).unwrap();
+        assert_eq!(
+            entry["digest"],
+            format!("sha256:{:x}", Sha256::digest(&bytes))
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_updates_planning_and_contract_together() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let before_context = before.planning_context.clone().unwrap();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let context = stored.planning_context.as_ref().unwrap();
+    let expected = fluent::work_model::WriterCompletionContract::from_planning_context(context);
+    assert_eq!(stored.attempts[0].writer_completion_contract, expected);
+    assert_eq!(context.behaviors, before_context.behaviors);
+    assert_eq!(context.plan, before_context.plan);
+    assert_eq!(
+        context.approved_revisions.get("behaviors"),
+        before_context.approved_revisions.get("behaviors")
+    );
+    assert_eq!(
+        stored.attempts[0].tasks[0].output.as_ref().unwrap().commit,
+        fixture.candidate
+    );
+    assert!(
+        stored.attempts[0].tasks[1..]
+            .iter()
+            .filter(|task| { task.kind == fluent::work_model::TaskKind::Review })
+            .all(|task| {
+                task.kind == fluent::work_model::TaskKind::Review
+                    && task.status == fluent::work_model::TaskStatus::Complete
+            })
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_prepares_one_writer() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    let writers: Vec<_> = attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .collect();
+    assert_eq!(writers.len(), 2);
+    assert_eq!(writers[0].status, fluent::work_model::TaskStatus::Complete);
+    assert_eq!(writers[1].status, fluent::work_model::TaskStatus::Planned);
+    assert_eq!(writers[1].role, "approach-revision-correction");
+    assert!(writers[1].output.is_none());
+    assert!(writers[1].started_at.is_none());
+    assert_eq!(attempt.materialized_write_rounds(), 2);
+    assert_eq!(attempt.effective_write_round_cap(1), 2);
+    let correction_area = writers[1].artifact_area.as_ref().unwrap();
+    assert!(
+        !fixture
+            .main_dir
+            .join(&correction_area.path)
+            .join("execution.json")
+            .exists()
+    );
+}
+
+struct RoundCapApproachRevisionFixture {
+    _tmp: TempDir,
+    main_dir: PathBuf,
+    store: WorkModelStore,
+    candidate: String,
+    prior_approach: String,
+    replacement: String,
+    resolution: String,
+}
+
+fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixture {
+    use fluent::work_model::{
+        AttemptReviewState, AttemptStatus, PlanningContext, TaskKind, TaskOutput, TaskStatus,
+        WorkItem, WriterCompletionMatrix, set_task_terminal,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let main_dir = setup_git_project(&tmp);
+    let prior_approach =
+        "# Original Approach\n\nKeep the original implementation boundary.\n".to_string();
+    let replacement =
+        "# Revised Approach\n\nUse the approved corrective implementation boundary.\n".to_string();
+    let resolution = "Approve the bounded corrective Approach revision.".to_string();
+    let mut item = WorkItem::planned("work-1", "Round-cap Approach revision");
+    item.planning_context = Some(PlanningContext {
+        behaviors: Some(
+            "## Behaviors\n\n### B1\n\nThe system preserves the approved obligations.\n"
+                .to_string(),
+        ),
+        approach: Some(prior_approach.clone()),
+        plan: Some(
+            "| # | State reached | Behaviors | Verification | Req? |\n|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | Yes |\n"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+    item.add_initial_attempt("attempt-1").unwrap();
+
+    let workspace_rel = fluent::work_model::initial_candidate_workspace_path("work-1", "attempt-1");
+    let workspace = main_dir
+        .parent()
+        .unwrap()
+        .join(workspace_rel.trim_start_matches("../"));
+    git::run(
+        &main_dir,
+        &["worktree", "add", "--detach", workspace.to_str().unwrap()],
+        "create round-cap Approach candidate worktree",
+    )
+    .unwrap();
+    let candidate = git_head(&workspace);
+
+    let writer_id = item.attempts[0].tasks[0].id.clone();
+    let writer_contract = item.attempts[0].writer_completion_contract.clone().unwrap();
+    let writer = &mut item.attempts[0].tasks[0];
+    set_task_terminal(writer, TaskStatus::Complete);
+    writer.output = Some(TaskOutput {
+        workspace_id: "candidate".to_string(),
+        workspace_path: workspace_rel,
+        source_branch: "main".to_string(),
+        base_commit: None,
+        commit: candidate.clone(),
+        no_change: None,
+        learner_canonicalization: None,
+    });
+    let matrix = WriterCompletionMatrix::skeleton(&writer_contract, &writer_id, &[], None).unwrap();
+    let matrix_path = main_dir
+        .join(&writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    fs::create_dir_all(matrix_path.parent().unwrap()).unwrap();
+    fs::write(matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+
+    item.add_next_review_tasks("attempt-1", &["architecture", "tests", "documentation"])
+        .unwrap();
+    for task in item.attempts[0]
+        .tasks
+        .iter_mut()
+        .filter(|task| task.kind == TaskKind::Review)
+    {
+        set_task_terminal(task, TaskStatus::Complete);
+        let review_path = main_dir
+            .join(&task.artifact_area.as_ref().unwrap().path)
+            .join("review.md");
+        fs::create_dir_all(review_path.parent().unwrap()).unwrap();
+        let verdict = if task.role == "architecture" {
+            "Verdict: pass\n\nArchitecture review passed.\n"
+        } else if task.role == "tests" {
+            "Verdict: fail\n\nTests review found a corrective issue.\n"
+        } else {
+            "Verdict: pass\n\nDocumentation review passed.\n"
+        };
+        fs::write(review_path, verdict).unwrap();
+    }
+    item.attempts[0].status = AttemptStatus::NeedsUser;
+    item.attempts[0].pause_kind = Some(fluent::work_model::PauseKind::RoundCap);
+    item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+    WorkModelStore::new(&main_dir)
+        .create_work_item(&item)
+        .unwrap();
+
+    RoundCapApproachRevisionFixture {
+        _tmp: tmp,
+        main_dir: main_dir.clone(),
+        store: WorkModelStore::new(&main_dir),
+        candidate,
+        prior_approach,
+        replacement,
+        resolution,
+    }
+}
+
+fn approve_round_cap_extension(fixture: &RoundCapApproachRevisionFixture) {
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+        .success();
+}
+
+fn revise_round_cap_approach(
+    fixture: &RoundCapApproachRevisionFixture,
+) -> assert_cmd::assert::Assert {
+    let approach_file = fixture.main_dir.join("replacement-approach.md");
+    fs::write(&approach_file, &fixture.replacement).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "revise-approach",
+            "work-1",
+            "attempt-1",
+            "--approach-file",
+            approach_file.to_str().unwrap(),
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .assert()
+}
+
 fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, PathBuf) {
     setup_ownership_fixture(tmp, id, false)
 }

@@ -1,4 +1,4 @@
-//! Recover one exact uncertain Architecture review through an audited Approach revision.
+//! Recover one exact review frontier through an audited Approach revision.
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -7,15 +7,17 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use crate::work_model::{
-    ApproachRevisionAudit as RevisionAudit, ApproachRevisionSupersession, ApprovedPlanningRevision,
-    ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata, DurableTransitionOrigin,
-    LegacyApproachReconciliationReceipt as LegacyReconciliationReceipt, PauseKind,
-    RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError,
-    WorkModelStore, WriterCompletionContract, WriterCompletionRequirementKind, work_artifact_path,
+    ApproachRevisionAudit as RevisionAudit, ApproachRevisionKind, ApproachRevisionSupersession,
+    ApprovedPlanningRevision, ArtifactRef, Attempt, AttemptStatus, DurableTransitionMetadata,
+    DurableTransitionOrigin, LegacyApproachReconciliationReceipt as LegacyReconciliationReceipt,
+    PauseKind, RoundCapExtension, RoundCapExtensionRequest, RoundCapReviewArtifact, Task, TaskKind,
+    TaskStatus, WorkModelError, WorkModelStore, WriterCompletionContract,
+    WriterCompletionRequirementKind, work_artifact_path,
 };
 
 const PRODUCER: &str = "planning-approach-recovery";
-const SCHEMA_VERSION: u32 = 1;
+const UNCERTAIN_SCHEMA_VERSION: u32 = 1;
+const ROUND_CAP_SCHEMA_VERSION: u32 = 2;
 const CORRECTIVE_WRITER_ROLE: &str = "approach-revision-correction";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,8 +71,10 @@ pub fn revise(
     }
     let audited_frontier = frontier(project_root, attempt)?;
     let legacy_cap_extension = audited_frontier.legacy_reconciliation.is_some();
-    if attempt.materialized_write_rounds()
-        >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
+    let round_cap_revision = audited_frontier.round_cap_extension.is_some();
+    if !round_cap_revision
+        && attempt.materialized_write_rounds()
+            >= attempt.effective_write_round_cap(crate::work_attempt_loop::max_total_write_rounds())
         && !legacy_cap_extension
     {
         bail!("Approach revision has no remaining authorized Writer round");
@@ -141,7 +145,21 @@ pub fn revise(
         .with_revised_approach(prior_approach, &replacement)
         .map_err(anyhow::Error::msg)?;
     validate_contract_delta(old_contract, &new_contract)?;
-    let review_refs = settled_round_review_artifacts(attempt, audited_frontier.source_review)?;
+    let (review_refs, supporting_reviews) =
+        if let Some(reviews) = audited_frontier.supporting_reviews.as_ref() {
+            (
+                reviews
+                    .iter()
+                    .map(|review| review.artifact.clone())
+                    .collect(),
+                reviews.clone(),
+            )
+        } else {
+            (
+                settled_round_review_artifacts(attempt, audited_frontier.source_review)?,
+                Vec::new(),
+            )
+        };
     let round_cap_reviews = legacy_cap_extension
         .then(|| {
             review_refs
@@ -169,7 +187,16 @@ pub fn revise(
         &format!("planning-approach-revisions/{revision_id}/revision.json"),
     );
     let audit = RevisionAudit {
-        schema_version: SCHEMA_VERSION,
+        schema_version: if round_cap_revision {
+            ROUND_CAP_SCHEMA_VERSION
+        } else {
+            UNCERTAIN_SCHEMA_VERSION
+        },
+        revision_kind: if round_cap_revision {
+            ApproachRevisionKind::FailedReviewRoundCap
+        } else {
+            ApproachRevisionKind::UncertainArchitecture
+        },
         revision_id: revision_id.clone(),
         work_item_id: work_item_id.to_string(),
         attempt_id: attempt_id.to_string(),
@@ -188,6 +215,8 @@ pub fn revise(
         resolution: resolution.to_string(),
         resolution_sha256: digest(resolution.as_bytes()),
         legacy_reconciliation: audited_frontier.legacy_reconciliation.clone(),
+        round_cap_extension: audited_frontier.round_cap_extension.clone(),
+        supporting_reviews,
     };
     let audit_bytes = serde_json::to_vec_pretty(&audit)?;
     write_once(&project_root.join(&audit_artifact), &audit_bytes)?;
@@ -229,6 +258,12 @@ pub fn revise(
             let current = frontier(project_root, &fresh.attempts[index]).map_err(|error| WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: format!("Approach-revision frontier changed: {error:#}") })?;
             if current.candidate_commit != candidate_commit || current.source_review.id != source_id || current.failed_launch.as_ref().map(|task| &task.id) != failed_id.as_ref() {
                 return Err(WorkModelError::AttemptResumeIneligible { attempt_id: attempt_id.to_string(), reason: "candidate or review frontier changed before Approach revision".to_string() });
+            }
+            if current.round_cap_extension != audited_frontier.round_cap_extension {
+                return Err(WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: "round-cap authorization changed before Approach revision".to_string(),
+                });
             }
             current.legacy_reconciliation.is_some()
         };
@@ -312,9 +347,39 @@ struct Frontier<'a> {
     failed_launch: Option<&'a Task>,
     candidate_commit: String,
     legacy_reconciliation: Option<LegacyReconciliationReceipt>,
+    supporting_reviews: Option<Vec<RoundCapReviewArtifact>>,
+    round_cap_extension: Option<RoundCapExtension>,
 }
 
 fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a>> {
+    if attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::RoundCap)
+        && attempt.review_state == Some(crate::work_model::AttemptReviewState::Failed)
+    {
+        let extension = attempt
+            .round_cap_extensions
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("round-cap pause has no approved extension"))?;
+        let checked = crate::recovery_contracts::validate_round_cap_approach_frontier(
+            project_root,
+            attempt,
+            extension,
+        )?;
+        let source_review = attempt
+            .tasks
+            .iter()
+            .find(|task| task.id == checked.source_review_task_id)
+            .ok_or_else(|| anyhow::anyhow!("Architecture review is not in the Attempt"))?;
+        return Ok(Frontier {
+            source_review,
+            failed_launch: None,
+            candidate_commit: checked.candidate_commit,
+            legacy_reconciliation: None,
+            supporting_reviews: Some(checked.supporting_reviews),
+            round_cap_extension: Some(checked.extension),
+        });
+    }
+
     let terminal_failure = attempt.status == AttemptStatus::Failed;
     if !(attempt.status == AttemptStatus::NeedsUser
         && attempt.pause_kind == Some(PauseKind::Uncertain))
@@ -418,6 +483,8 @@ fn frontier<'a>(project_root: &Path, attempt: &'a Attempt) -> Result<Frontier<'a
         failed_launch,
         candidate_commit,
         legacy_reconciliation,
+        supporting_reviews: None,
+        round_cap_extension: None,
     })
 }
 

@@ -3280,8 +3280,38 @@ pub(crate) struct TestReferenceChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub(crate) enum ApproachRevisionKind {
+    /// The original recovery case: an uncertain Architecture review or the
+    /// narrowly preserved historical provider-launch recovery.
+    UncertainArchitecture,
+    /// An operator-approved revision at a failed-review round-cap pause.
+    FailedReviewRoundCap,
+}
+
+impl Default for ApproachRevisionKind {
+    fn default() -> Self {
+        Self::UncertainArchitecture
+    }
+}
+
+impl ApproachRevisionKind {
+    pub(crate) fn is_uncertain_architecture(&self) -> bool {
+        matches!(self, Self::UncertainArchitecture)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) struct ApproachRevisionAudit {
     pub schema_version: u32,
+    /// Old audits omit this field and deserialize as the original recovery
+    /// case. New round-cap audits use schema version 2 and identify their
+    /// admission contract explicitly.
+    #[serde(
+        default,
+        skip_serializing_if = "ApproachRevisionKind::is_uncertain_architecture"
+    )]
+    pub revision_kind: ApproachRevisionKind,
     pub revision_id: String,
     pub work_item_id: String,
     pub attempt_id: String,
@@ -3300,6 +3330,16 @@ pub(crate) struct ApproachRevisionAudit {
     pub source_completion: Option<PlanningCompletionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_reconciliation: Option<LegacyApproachReconciliationReceipt>,
+    /// The exact bounded extension that authorized a round-cap revision. The
+    /// model record remains authoritative; this copy makes the immutable audit
+    /// independently inspectable and binds every authorization field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_cap_extension: Option<RoundCapExtension>,
+    /// All current review identities and their exact content digests at the
+    /// source candidate, including passing roles that explain why the revised
+    /// Approach was selected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supporting_reviews: Vec<RoundCapReviewArtifact>,
 }
 
 /// Evidence that permits one pre-typed provider failure to enter the ordinary

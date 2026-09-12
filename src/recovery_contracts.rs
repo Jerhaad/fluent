@@ -24,8 +24,9 @@ use crate::candidate_gate;
 use crate::git;
 use crate::review;
 use crate::work_model::{
-    self, ArtifactRef, EvidenceAttachment, EvidenceRecovery, EvidenceRecoveryState,
-    EvidenceReviewTarget, HostEvidenceClassification, Task, TaskKind, TaskStatus, WorkModelError,
+    self, ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
+    EvidenceRecoveryState, EvidenceReviewTarget, HostEvidenceClassification, PauseKind,
+    RoundCapExtension, RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError,
     WriterCompletionFinding,
 };
 
@@ -736,8 +737,15 @@ fn validate_planning_revisions(
                 continue;
             };
             let digest = format!("{:x}", Sha256::digest(&bytes));
+            let expected_schema = if revision.revision_kind
+                == work_model::ApproachRevisionKind::FailedReviewRoundCap
+            {
+                2
+            } else {
+                1
+            };
             anyhow::ensure!(
-                revision.schema_version == 1
+                revision.schema_version == expected_schema
                     && revision.work_item_id == attempt.work_item_id
                     && revision.attempt_id == attempt.id
                     && !revision.resolution.trim().is_empty()
@@ -772,6 +780,75 @@ fn validate_planning_revisions(
                             == revision.candidate_commit)),
                 "approved Approach source review candidate changed"
             );
+            if revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap {
+                let extension = revision
+                    .round_cap_extension
+                    .as_ref()
+                    .context("round-cap Approach revision has no extension binding")?;
+                extension
+                    .validate_human_resolution()
+                    .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    extension.candidate_commit == revision.candidate_commit
+                        && attempt
+                            .round_cap_extensions
+                            .iter()
+                            .any(|recorded| recorded == extension),
+                    "round-cap Approach revision lost its exact extension authorization"
+                );
+                anyhow::ensure!(
+                    !revision.supporting_reviews.is_empty(),
+                    "round-cap Approach revision has no supporting review bindings"
+                );
+                let mut failed_reviews = Vec::new();
+                let mut architecture_passed = false;
+                for supporting in &revision.supporting_reviews {
+                    let task = attempt
+                        .tasks
+                        .iter()
+                        .find(|task| {
+                            task.id == supporting.artifact.producer_id
+                                && task.kind == TaskKind::Review
+                                && task.status == TaskStatus::Complete
+                                && task.review_context.as_ref().is_some_and(|context| {
+                                    context.candidate_commit == revision.candidate_commit
+                                })
+                        })
+                        .context("Approach supporting review Task changed")?;
+                    let area = task
+                        .artifact_area
+                        .as_ref()
+                        .context("Approach supporting review has no artifact area")?;
+                    let expected_path = format!("{}/review.md", area.path);
+                    anyhow::ensure!(
+                        supporting.artifact.path == expected_path,
+                        "Approach supporting review artifact identity changed"
+                    );
+                    let review_bytes = fs::read(resolve_input_artifact_path(
+                        project_root,
+                        &supporting.artifact.path,
+                    )?)?;
+                    anyhow::ensure!(
+                        supporting.digest == format!("sha256:{:x}", Sha256::digest(&review_bytes)),
+                        "Approach supporting review evidence changed"
+                    );
+                    let verdict = review::extract_verdict(&String::from_utf8_lossy(&review_bytes));
+                    if verdict == review::Verdict::Fail {
+                        failed_reviews.push(supporting.clone());
+                    }
+                    if task.id == revision.source_review_task_id {
+                        anyhow::ensure!(
+                            verdict == review::Verdict::Pass,
+                            "round-cap Approach source Architecture review no longer passes"
+                        );
+                        architecture_passed = true;
+                    }
+                }
+                anyhow::ensure!(
+                    architecture_passed && failed_reviews == extension.failed_reviews,
+                    "round-cap Approach review evidence no longer matches its authorization"
+                );
+            }
             if let Some(source) = &revision.source_completion {
                 anyhow::ensure!(
                     &source.contract == prior,
@@ -2308,6 +2385,161 @@ fn candidate_workspace_is_clean_at_path(workspace: &Path, candidate: &str) -> bo
             "inspect evidence candidate cleanliness",
         )
         .is_ok_and(|status| status.is_empty())
+}
+
+/// The read-only proof required before a failed-review round-cap Approach
+/// revision can enter the planning publication transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoundCapApproachFrontier {
+    pub candidate_commit: String,
+    pub source_review_task_id: String,
+    pub supporting_reviews: Vec<RoundCapReviewArtifact>,
+    pub extension: RoundCapExtension,
+}
+
+/// Validate the current failed-review round-cap frontier for Approach
+/// revision. This helper intentionally returns an owned proof so the planner
+/// can re-run the same checks under the Work-model transaction without making
+/// the audit file authoritative by itself.
+pub(crate) fn validate_round_cap_approach_frontier(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    extension: &RoundCapExtension,
+) -> Result<RoundCapApproachFrontier> {
+    anyhow::ensure!(
+        attempt.status == AttemptStatus::NeedsUser
+            && attempt.pause_kind == Some(PauseKind::RoundCap)
+            && attempt.review_state == Some(AttemptReviewState::Failed),
+        "Attempt is not paused at a failed-review round-cap frontier"
+    );
+    anyhow::ensure!(
+        !attempt.has_round_cap_task_blocker(),
+        "a live or failed Task owns this Attempt"
+    );
+    anyhow::ensure!(
+        !extension.human_resolution.trim().is_empty(),
+        "round-cap Approach revision requires the recorded human authorization"
+    );
+    extension
+        .validate_human_resolution()
+        .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        attempt
+            .round_cap_extensions
+            .iter()
+            .any(|recorded| recorded == extension),
+        "the round-cap authorization is not recorded on this Attempt"
+    );
+    anyhow::ensure!(
+        extension.new_cap > attempt.materialized_write_rounds(),
+        "the approved Writer-round cap is exhausted"
+    );
+
+    let (writer_index, writer) = attempt
+        .tasks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, task)| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .ok_or_else(|| anyhow::anyhow!("Attempt has no completed Writer candidate"))?;
+    let output = writer
+        .output
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("latest Writer has no candidate output"))?;
+    anyhow::ensure!(
+        output.commit == extension.candidate_commit,
+        "the reviewed candidate no longer matches the round-cap authorization"
+    );
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at_managed(project_root, output, &output.commit),
+        "the approved candidate workspace is changed, dirty, or no longer managed"
+    );
+
+    let reviews = latest_round_cap_review_tasks(attempt, writer_index);
+    anyhow::ensure!(
+        !reviews.is_empty(),
+        "failed-review round-cap frontier has no completed review artifacts"
+    );
+    let mut supporting_reviews = Vec::with_capacity(reviews.len());
+    let mut failed_reviews = Vec::new();
+    let mut source_review_task_id = None;
+    for task in reviews {
+        let context = task
+            .review_context
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("review Task {} has no candidate context", task.id))?;
+        anyhow::ensure!(
+            context.candidate_commit == output.commit,
+            "review Task {} is not bound to the approved candidate",
+            task.id
+        );
+        let area = task
+            .artifact_area
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("review Task {} has no artifact area", task.id))?;
+        let artifact = ArtifactRef {
+            producer_id: task.id.clone(),
+            path: format!("{}/review.md", area.path),
+        };
+        let path = resolve_input_artifact_path(project_root, &artifact.path)?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("read review artifact {}", path.display()))?;
+        let bound = RoundCapReviewArtifact {
+            artifact,
+            digest: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        };
+        if review::extract_verdict(&String::from_utf8_lossy(&bytes)) == review::Verdict::Fail {
+            failed_reviews.push(bound.clone());
+        }
+        if task.role == "architecture" {
+            anyhow::ensure!(
+                source_review_task_id.is_none(),
+                "failed-review round-cap frontier has duplicate Architecture reviews"
+            );
+            anyhow::ensure!(
+                review::extract_verdict(&String::from_utf8_lossy(&bytes)) == review::Verdict::Pass,
+                "Architecture review must have passed before revising the Approach"
+            );
+            source_review_task_id = Some(task.id.clone());
+        }
+        supporting_reviews.push(bound);
+    }
+    let source_review_task_id = source_review_task_id.ok_or_else(|| {
+        anyhow::anyhow!("failed-review round-cap frontier has no Architecture review")
+    })?;
+    anyhow::ensure!(
+        !failed_reviews.is_empty(),
+        "failed-review round-cap frontier has no failed review"
+    );
+    anyhow::ensure!(
+        failed_reviews == extension.failed_reviews,
+        "failed-review bytes no longer match the round-cap authorization"
+    );
+
+    Ok(RoundCapApproachFrontier {
+        candidate_commit: output.commit.clone(),
+        source_review_task_id,
+        supporting_reviews,
+        extension: extension.clone(),
+    })
+}
+
+fn latest_round_cap_review_tasks(attempt: &work_model::Attempt, writer_index: usize) -> Vec<&Task> {
+    let mut latest_by_role: Vec<(String, &Task)> = Vec::new();
+    for task in attempt.tasks[writer_index + 1..]
+        .iter()
+        .filter(|task| task.kind == TaskKind::Review && task.status == TaskStatus::Complete)
+    {
+        if let Some((_, latest)) = latest_by_role
+            .iter_mut()
+            .find(|(role, _)| role == &task.role)
+        {
+            *latest = task;
+        } else {
+            latest_by_role.push((task.role.clone(), task));
+        }
+    }
+    latest_by_role.into_iter().map(|(_, task)| task).collect()
 }
 
 /// Require host evidence to record a failed check before allowing a source
