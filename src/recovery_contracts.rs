@@ -2949,8 +2949,12 @@ pub(crate) fn validate_round_cap_approach_frontier(
         "the approved Writer-round cap is exhausted"
     );
     attempt
-        .validate_round_cap_extensions()
+        .validate_round_cap_extensions_for_approach_revision()
         .map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        extension.pre_extension_write_rounds == Some(attempt.materialized_write_rounds()),
+        "the approved extension does not match the current pre-extension Writer frontier"
+    );
 
     let (writer_index, writer) = attempt
         .tasks
@@ -3094,7 +3098,7 @@ pub(crate) fn validate_round_cap_approach_revision_retry(
         .as_ref()
         .context("round-cap Approach revision has no extension binding")?;
     attempt
-        .validate_round_cap_extensions()
+        .validate_round_cap_extensions_for_approach_revision()
         .map_err(anyhow::Error::msg)?;
     extension
         .validate_human_resolution()

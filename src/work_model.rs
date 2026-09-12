@@ -5381,6 +5381,7 @@ impl RoundCapExtension {
         previous: Option<&RoundCapExtension>,
         current_evidence_write_rounds: usize,
         current_materialized_write_rounds: usize,
+        require_bound_frontier: bool,
     ) -> Result<(), WorkModelError> {
         if !(MIN_ADDITIONAL_WRITE_ROUNDS..=MAX_ADDITIONAL_WRITE_ROUNDS)
             .contains(&self.additional_write_rounds)
@@ -5454,6 +5455,32 @@ impl RoundCapExtension {
             _ => {
                 return Err(WorkModelError::RoundCapExtensionIneligible {
                     reason: "the authorized pre-extension frontier is incomplete".to_string(),
+                });
+            }
+        }
+        if require_bound_frontier {
+            let (Some(authorized_base_cap), Some(pre_extension_write_rounds)) =
+                (self.authorized_base_cap, self.pre_extension_write_rounds)
+            else {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: "the extension has no independently bound pre-extension frontier"
+                        .to_string(),
+                });
+            };
+            if authorized_base_cap > self.old_cap {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: format!(
+                        "the authorized base cap {} exceeds the extension old cap {}",
+                        authorized_base_cap, self.old_cap
+                    ),
+                });
+            }
+            if pre_extension_write_rounds != self.old_cap {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: format!(
+                        "the extension records {} pre-extension Writer rounds, but its old cap is {}",
+                        pre_extension_write_rounds, self.old_cap
+                    ),
                 });
             }
         }
@@ -6174,6 +6201,19 @@ impl Attempt {
     }
 
     pub(crate) fn validate_round_cap_extensions(&self) -> Result<(), WorkModelError> {
+        self.validate_round_cap_extensions_with_bound_frontier(false)
+    }
+
+    pub(crate) fn validate_round_cap_extensions_for_approach_revision(
+        &self,
+    ) -> Result<(), WorkModelError> {
+        self.validate_round_cap_extensions_with_bound_frontier(true)
+    }
+
+    fn validate_round_cap_extensions_with_bound_frontier(
+        &self,
+        require_bound_frontier: bool,
+    ) -> Result<(), WorkModelError> {
         let current_evidence_write_rounds = self.evidence_write_rounds();
         let current_materialized_write_rounds = self.materialized_write_rounds();
         let mut previous = None;
@@ -6182,6 +6222,7 @@ impl Attempt {
                 previous,
                 current_evidence_write_rounds,
                 current_materialized_write_rounds,
+                require_bound_frontier,
             )?;
             previous = Some(extension);
         }

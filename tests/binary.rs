@@ -36561,12 +36561,26 @@ fn round_cap_approach_revision_rejects_coherently_forged_first_extension() {
     attempt["round_cap_extensions"][0]["old_cap"] = serde_json::json!(100);
     attempt["round_cap_extensions"][0]["new_cap"] = serde_json::json!(101);
     attempt["round_cap_extensions"][0]["id"] = serde_json::json!("round-cap-100-101");
+    attempt["round_cap_extensions"][0]["authorized_base_cap"] = serde_json::json!(100);
+    attempt["round_cap_extensions"][0]["pre_extension_write_rounds"] = serde_json::json!(1);
     write_json_path(&attempt_path, &attempt);
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+    let before_tree = snapshot_tree(&fixture.main_dir.join(".fluent/work"));
 
     revise_round_cap_approach(&fixture)
         .failure()
         .stderr(predicate::str::contains("round-cap extension"));
 
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before,
+        "a forged extension must not mutate the Work Item"
+    );
+    assert_eq!(
+        snapshot_tree(&fixture.main_dir.join(".fluent/work")),
+        before_tree,
+        "a forged extension must not create revision artifacts"
+    );
     assert_no_round_cap_revision(&fixture);
 }
 
