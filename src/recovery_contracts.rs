@@ -706,6 +706,44 @@ pub(crate) fn validate_planning_completion_history(
     validated_ownership_approval(project_root, attempt).map(|_| ())
 }
 
+/// Validate planning history and every published round-cap Approach binding
+/// before foreground or queued execution can advance the Attempt.
+pub(crate) fn validate_planning_resume(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<bool> {
+    validate_planning_completion_history(project_root, attempt)?;
+    let mut allows_planned_correction = false;
+    for audit_artifact in attempt.artifacts.iter().filter(|artifact| {
+        artifact.producer_id == "planning-approach-recovery"
+            && artifact.path.ends_with("/revision.json")
+    }) {
+        let bytes = fs::read(resolve_input_artifact_path(
+            project_root,
+            &audit_artifact.path,
+        )?)?;
+        let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
+        if revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap {
+            validate_round_cap_approach_revision_retry(
+                project_root,
+                attempt,
+                &revision,
+                audit_artifact,
+            )?;
+            allows_planned_correction |= attempt.status == AttemptStatus::Planned
+                && attempt.tasks.iter().any(|task| {
+                    task.kind == TaskKind::Write
+                        && task.role == "approach-revision-correction"
+                        && task.status == TaskStatus::Planned
+                        && task.started_at.is_none()
+                        && task.output.is_none()
+                        && task.input_artifacts.contains(audit_artifact)
+                });
+        }
+    }
+    Ok(allows_planned_correction)
+}
+
 /// Revalidate planning approvals for adopted and explicitly owned Attempts.
 fn validate_planning_revisions(
     project_root: &Path,

@@ -1169,6 +1169,8 @@ fn ensure_resume_eligible(
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
     crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+    let allows_planned_approach_correction =
+        crate::recovery_contracts::validate_planning_resume(project_root, attempt)?;
     let candidate_ancestry_repair = known_candidate_ancestry_repair
         || crate::candidate_ancestry_recovery::is_resume_ready(project_root, item, attempt_id)?;
     let candidate_metadata_repair = known_candidate_metadata_repair
@@ -1236,6 +1238,7 @@ fn ensure_resume_eligible(
         ensure_attempt_resume_ready(
             attempt,
             legacy_review_evidence_round_cap || completed_recheck_evidence_round_cap,
+            allows_planned_approach_correction,
         )?;
         if attempt.is_uncertain_review_pause() {
             crate::lifecycle_recovery::inspect_uncertain_review_recovery(
@@ -1374,8 +1377,9 @@ fn ensure_code_change_classification_resume_ready(
 fn ensure_attempt_resume_ready(
     attempt: &crate::work_model::Attempt,
     legacy_review_evidence_round_cap: bool,
+    allows_planned_approach_correction: bool,
 ) -> Result<(), WorkModelError> {
-    if legacy_review_evidence_round_cap {
+    if legacy_review_evidence_round_cap || allows_planned_approach_correction {
         Ok(())
     } else {
         attempt.ensure_resume_ready()
@@ -2984,10 +2988,10 @@ mod tests {
         attempt.tasks[0].status = TaskStatus::Complete;
 
         assert!(
-            ensure_attempt_resume_ready(attempt, false).is_err(),
+            ensure_attempt_resume_ready(attempt, false, false).is_err(),
             "an ordinary exhausted round-cap pause still requires an extension"
         );
-        ensure_attempt_resume_ready(attempt, true)
+        ensure_attempt_resume_ready(attempt, true, false)
             .expect("validated exact host evidence admits scheduler resume");
     }
 

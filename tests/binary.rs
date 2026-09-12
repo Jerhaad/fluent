@@ -22637,6 +22637,7 @@ fn run_scheduler_until_dispatch_status(
             .env("PATH", mock_path(bin_dir))
             .env("FLUENT_NO_UPDATE_CHECK", "1")
             .env("FLUENT_TEST_HOST_SANDBOX_PREFLIGHT", "pass")
+            .env("FLUENT_TEST_HERMETIC_PROVIDERS", "1")
             .env("FLUENT_MAX_TASK_RETRIES", "0")
             .env_remove("FLUENT_TASK_KIND")
             .args(["scheduler", "run", "--poll-seconds", "1"])
@@ -36663,6 +36664,211 @@ fn round_cap_approach_revision_recovers_interrupted_publication() {
     );
     assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
     assert!(!transaction_path.exists());
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_resumes_through_public_routes() {
+    let direct = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&direct);
+    revise_round_cap_approach(&direct).success();
+    let direct_audit = direct.store.read_work_item("work-1").unwrap().attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap()
+        .clone();
+    let direct_audit_path = direct.main_dir.join(&direct_audit.path);
+    let direct_audit_bytes = fs::read(&direct_audit_path).unwrap();
+    let direct_before =
+        serde_json::to_vec(&direct.store.read_work_item("work-1").unwrap()).unwrap();
+    let mut forged = read_json_path(&direct_audit_path);
+    forged["candidate-commit"] = serde_json::json!("forged-candidate");
+    fs::write(
+        &direct_audit_path,
+        serde_json::to_vec_pretty(&forged).unwrap(),
+    )
+    .unwrap();
+    let direct_prompt_log = direct._tmp.path().join("direct-provider-prompts.log");
+    let direct_bin = direct._tmp.path().join("direct-provider");
+    write_mock_claude(
+        &direct_bin,
+        &round_cap_resume_provider_script(&direct_prompt_log),
+    );
+
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .failure();
+    assert_eq!(
+        serde_json::to_vec(&direct.store.read_work_item("work-1").unwrap()).unwrap(),
+        direct_before,
+        "foreground resume must preserve the aggregate when its audit binding changes"
+    );
+    assert!(
+        !direct_prompt_log.exists(),
+        "foreground validation must reject before launching the Writer"
+    );
+    fs::write(&direct_audit_path, direct_audit_bytes).unwrap();
+
+    fluent_cmd()
+        .current_dir(&direct.main_dir)
+        .env("PATH", mock_path(&direct_bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+    let direct_after = direct.store.read_work_item("work-1").unwrap();
+    let direct_attempt = &direct_after.attempts[0];
+    assert_eq!(
+        direct_attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(
+        direct_attempt.tasks.last().unwrap().status,
+        fluent::work_model::TaskStatus::Complete
+    );
+    assert_round_cap_writer_prompt(&direct, &direct_prompt_log, direct_attempt);
+
+    let queued = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&queued);
+    revise_round_cap_approach(&queued).success();
+    let queued_audit = queued.store.read_work_item("work-1").unwrap().attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap()
+        .clone();
+    let queued_audit_path = queued.main_dir.join(&queued_audit.path);
+    let queued_audit_bytes = fs::read(&queued_audit_path).unwrap();
+    let mut queued_forged = read_json_path(&queued_audit_path);
+    queued_forged["candidate-commit"] = serde_json::json!("forged-candidate");
+    fs::write(
+        &queued_audit_path,
+        serde_json::to_vec_pretty(&queued_forged).unwrap(),
+    )
+    .unwrap();
+    let queued_prompt_log = queued._tmp.path().join("queued-provider-prompts.log");
+    let queued_bin = queued._tmp.path().join("queued-provider");
+    write_scheduler_claude(
+        &queued_bin,
+        &round_cap_resume_provider_script(&queued_prompt_log),
+    );
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .failure();
+    assert!(
+        !queue_ledger_path(&queued.main_dir, "work-1").exists(),
+        "queue admission must reject a changed audit before creating a dispatch"
+    );
+    fs::write(&queued_audit_path, queued_audit_bytes).unwrap();
+
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Queued resume"));
+    fluent_cmd()
+        .current_dir(&queued.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already queued"));
+    run_scheduler_until_dispatch_status(&queued.main_dir, "work-1", &queued_bin, "needs-user");
+    assert_eq!(dispatch_count(&queued.main_dir, "work-1"), 1);
+    let queued_after = queued.store.read_work_item("work-1").unwrap();
+    let queued_attempt = &queued_after.attempts[0];
+    assert_eq!(
+        queued_attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(
+        queued_attempt.tasks.last().unwrap().status,
+        fluent::work_model::TaskStatus::Complete
+    );
+    assert_round_cap_writer_prompt(&queued, &queued_prompt_log, queued_attempt);
+}
+
+fn round_cap_resume_provider_script(prompt_log: &Path) -> String {
+    format!(
+        r##"#!/bin/bash
+set -eu
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    shift
+    PROMPT="${{1:-}}"
+    break
+  fi
+  shift
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+printf '\n--- invocation ---\n%s\n' "$PROMPT" >> '{prompt_log}'
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  DRAFT=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*follow-up-draft.json' | head -1)
+  mkdir -p "$(dirname "$DRAFT")"
+  printf '%s\n' '{{"learning_summary":"public route","follow_ups":[]}}' > "$DRAFT"
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    printf 'public route correction\n' > route-correction.txt
+    git add route-correction.txt
+    git commit -m "Apply public route correction" >/dev/null
+    ;;
+  *)
+    printf 'Verdict: pass\n\nPublic route review.\n' > review.md
+    ;;
+esac
+exit 0
+"##,
+        prompt_log = prompt_log.display(),
+    )
+}
+
+fn assert_round_cap_writer_prompt(
+    fixture: &RoundCapApproachRevisionFixture,
+    prompt_log: &Path,
+    attempt: &fluent::work_model::Attempt,
+) {
+    let prompt = fs::read_to_string(prompt_log).unwrap();
+    assert!(prompt.contains(&fixture.resolution));
+    assert!(prompt.contains("Apply every current finding test-first"));
+    let corrective = attempt
+        .tasks
+        .iter()
+        .find(|task| task.role == "approach-revision-correction")
+        .unwrap();
+    for artifact in &corrective.input_artifacts {
+        if artifact.producer_id == "planning-approach-recovery" {
+            continue;
+        }
+        let absolute = fixture.main_dir.join(&artifact.path).display().to_string();
+        assert!(
+            prompt.contains(&absolute),
+            "Writer prompt omitted retained input artifact {}",
+            artifact.path
+        );
+    }
+    let approach_path = fixture
+        .main_dir
+        .join(".fluent/work/items/work-1/approach.md");
+    assert_eq!(
+        fs::read_to_string(approach_path).unwrap(),
+        fixture.replacement
+    );
 }
 
 struct RoundCapApproachRevisionFixture {

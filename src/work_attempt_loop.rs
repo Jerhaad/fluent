@@ -426,6 +426,7 @@ fn run_attempt_inner(config: WorkAttemptRunConfig<'_>) -> Result<WorkAttemptRunR
             .find(|attempt| attempt.id == config.attempt_id)
             .ok_or_else(|| anyhow::anyhow!("Attempt {:?} not found", config.attempt_id))?;
         attempt.ensure_not_canceled()?;
+        crate::recovery_contracts::validate_planning_resume(config.project_root, attempt)?;
         if let Some(task) = attempt
             .tasks
             .iter()
