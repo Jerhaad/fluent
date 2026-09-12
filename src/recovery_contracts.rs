@@ -2412,6 +2412,7 @@ pub(crate) fn validate_round_cap_approach_frontier(
             && attempt.review_state == Some(AttemptReviewState::Failed),
         "Attempt is not paused at a failed-review round-cap frontier"
     );
+    attempt.ensure_not_canceled().map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         !attempt.has_round_cap_task_blocker(),
         "a live or failed Task owns this Attempt"

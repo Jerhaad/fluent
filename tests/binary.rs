@@ -36383,6 +36383,134 @@ fn round_cap_approach_revision_prepares_one_writer() {
     );
 }
 
+#[test]
+#[serial]
+fn round_cap_approach_revision_requires_extension() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "round-cap pause has no approved extension",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions")
+            .exists()
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_preserves_authority_and_history() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let before_attempt = &before.attempts[0];
+    let before_context = before.planning_context.clone().unwrap();
+    let before_contract = before_attempt.writer_completion_contract.clone().unwrap();
+    let source_writer = &before_attempt.tasks[0];
+    let source_matrix_path = fixture
+        .main_dir
+        .join(&source_writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let source_matrix = fs::read(&source_matrix_path).unwrap();
+    let review_bytes: Vec<_> = before_attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Review)
+        .map(|task| {
+            let path = fixture
+                .main_dir
+                .join(&task.artifact_area.as_ref().unwrap().path)
+                .join("review.md");
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect();
+
+    revise_round_cap_approach(&fixture).success();
+
+    let after = fixture.store.read_work_item("work-1").unwrap();
+    let after_attempt = &after.attempts[0];
+    let after_context = after.planning_context.as_ref().unwrap();
+    let mut before_revisions = before_context.approved_revisions.clone();
+    let mut after_revisions = after_context.approved_revisions.clone();
+    before_revisions.remove("approach");
+    after_revisions.remove("approach");
+    assert_eq!(after_context.behaviors, before_context.behaviors);
+    assert_eq!(after_context.plan, before_context.plan);
+    assert_eq!(after_revisions, before_revisions);
+    assert_eq!(
+        after_attempt.tasks[..before_attempt.tasks.len()],
+        before_attempt.tasks[..]
+    );
+    assert_eq!(
+        after_attempt.artifacts[..before_attempt.artifacts.len()],
+        before_attempt.artifacts[..]
+    );
+    assert_eq!(
+        after_attempt
+            .writer_completion_contract
+            .as_ref()
+            .unwrap()
+            .requirements
+            .iter()
+            .filter(|row| row.kind != fluent::work_model::WriterCompletionRequirementKind::Approach)
+            .collect::<Vec<_>>(),
+        before_contract
+            .requirements
+            .iter()
+            .filter(|row| row.kind != fluent::work_model::WriterCompletionRequirementKind::Approach)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after_attempt.round_cap_extensions,
+        before_attempt.round_cap_extensions
+    );
+    assert_eq!(fs::read(source_matrix_path).unwrap(), source_matrix);
+    for (path, bytes) in review_bytes {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_unsafe_state() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let output = stored.attempts[0].tasks[0].output.as_ref().unwrap();
+    let workspace = fixture
+        .main_dir
+        .parent()
+        .unwrap()
+        .join(output.workspace_path.trim_start_matches("../"));
+    fs::write(workspace.join("unsafe-round-cap-change.txt"), "changed\n").unwrap();
+    let before = serde_json::to_vec(&stored).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("dirty"));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before
+    );
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions")
+            .exists()
+    );
+}
+
 struct RoundCapApproachRevisionFixture {
     _tmp: TempDir,
     main_dir: PathBuf,
