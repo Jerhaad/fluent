@@ -36296,6 +36296,52 @@ fn round_cap_approach_revision_accepts_extended_failed_review() {
 fn round_cap_approach_revision_records_audit() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
+
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let before_attempt = &before.attempts[0];
+    let source_writer = before_attempt
+        .tasks
+        .iter()
+        .find(|task| {
+            task.kind == fluent::work_model::TaskKind::Write
+                && task.status == fluent::work_model::TaskStatus::Complete
+        })
+        .unwrap();
+    let source_matrix_ref = fluent::work_model::ArtifactRef {
+        producer_id: source_writer.id.clone(),
+        path: format!(
+            "{}/writer-completion.json",
+            source_writer.artifact_area.as_ref().unwrap().path
+        ),
+    };
+    let source_matrix_bytes = fs::read(fixture.main_dir.join(&source_matrix_ref.path)).unwrap();
+    let expected_source_completion = serde_json::json!({
+        "artifact": source_matrix_ref,
+        "sha256": format!("{:x}", Sha256::digest(&source_matrix_bytes)),
+        "contract": serde_json::to_value(
+            before_attempt.writer_completion_contract.clone().unwrap()
+        )
+        .unwrap(),
+    });
+    let expected_extension =
+        serde_json::to_value(before_attempt.round_cap_extensions[0].clone()).unwrap();
+    let expected_supporting_reviews: Vec<_> = before_attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Review)
+        .map(|task| {
+            let artifact = fluent::work_model::ArtifactRef {
+                producer_id: task.id.clone(),
+                path: format!("{}/review.md", task.artifact_area.as_ref().unwrap().path),
+            };
+            let bytes = fs::read(fixture.main_dir.join(&artifact.path)).unwrap();
+            serde_json::json!({
+                "artifact": artifact,
+                "digest": format!("sha256:{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect();
+
     revise_round_cap_approach(&fixture).success();
 
     let stored = fixture.store.read_work_item("work-1").unwrap();
@@ -36306,7 +36352,6 @@ fn round_cap_approach_revision_records_audit() {
         .find(|artifact| artifact.producer_id == "planning-approach-recovery")
         .unwrap();
     let audit = read_json_path(&fixture.main_dir.join(&audit_ref.path));
-    let extension = serde_json::to_value(&attempt.round_cap_extensions[0]).unwrap();
 
     assert_eq!(audit["schema-version"], 2);
     assert_eq!(audit["revision-kind"], "failed-review-round-cap");
@@ -36320,19 +36365,11 @@ fn round_cap_approach_revision_records_audit() {
     assert_eq!(audit["prior-approach"], fixture.prior_approach);
     assert_eq!(audit["replacement-approach"], fixture.replacement);
     assert_eq!(audit["resolution"], fixture.resolution);
-    assert_eq!(audit["round-cap-extension"], extension);
+    assert_eq!(audit["round-cap-extension"], expected_extension);
+    assert_eq!(audit["source-completion"], expected_source_completion);
 
     let supporting = audit["supporting-reviews"].as_array().unwrap();
-    assert_eq!(supporting.len(), 3);
-    for entry in supporting {
-        let artifact = entry["artifact"].clone();
-        let path = artifact["path"].as_str().unwrap();
-        let bytes = fs::read(fixture.main_dir.join(path)).unwrap();
-        assert_eq!(
-            entry["digest"],
-            format!("sha256:{:x}", Sha256::digest(&bytes))
-        );
-    }
+    assert_eq!(supporting, &expected_supporting_reviews);
 }
 
 #[test]
@@ -37269,6 +37306,172 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_replays_historical_plan_applicability_in_source_workspace() {
+    let fixture = setup_round_cap_approach_revision_fixture_with_accepted_host_evidence();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let prompt_log = fixture
+        ._tmp
+        .path()
+        .join("historical-applicability-prompts.log");
+    let bin = fixture
+        ._tmp
+        .path()
+        .join("historical-applicability-provider");
+    write_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    let latest_writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    assert_eq!(
+        latest_writer.status,
+        fluent::work_model::TaskStatus::Complete,
+        "the corrective Writer must finish after historical receipt replay"
+    );
+    assert_ne!(
+        latest_writer.output.as_ref().unwrap().commit,
+        fixture.candidate,
+        "the test must exercise a newer candidate workspace"
+    );
+    assert_eq!(
+        attempt.status,
+        fluent::work_model::AttemptStatus::NeedsUser,
+        "the newer candidate still waits for its current host-owned row"
+    );
+    assert_eq!(
+        attempt.pause_kind,
+        Some(fluent::work_model::PauseKind::WriterCompletion)
+    );
+    assert_eq!(
+        attempt
+            .evidence_recoveries
+            .iter()
+            .find(|recovery| recovery.candidate_commit == fixture.candidate)
+            .map(|recovery| recovery.state.clone()),
+        Some(fluent::work_model::EvidenceRecoveryState::Complete)
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_resumes_after_a_second_revision() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    make_round_cap_behavior_testable(&fixture);
+    approve_round_cap_extension(&fixture);
+
+    let prompt_log = fixture._tmp.path().join("two-revision-prompts.log");
+    let bin = fixture._tmp.path().join("two-revision-provider");
+    write_mock_claude(&bin, &round_cap_two_revision_provider_script(&prompt_log));
+    revise_round_cap_approach(&fixture).success();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+
+    let first_round = fixture.store.read_work_item("work-1").unwrap();
+    let first_attempt = &first_round.attempts[0];
+    assert_eq!(first_attempt.round_cap_extensions.len(), 1);
+    assert_eq!(
+        first_attempt.pause_kind,
+        Some(fluent::work_model::PauseKind::RoundCap),
+        "the first failed corrective review must pause at the round cap"
+    );
+    assert_eq!(
+        first_attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2
+    );
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+            "--resolution",
+            "Approve the second bounded corrective Approach revision.",
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+        .assert()
+        .success();
+    let second_approach =
+        "# Second Revised Approach\n\nUse the second approved corrective boundary.\n";
+    revise_round_cap_approach_with_values(
+        &fixture,
+        second_approach,
+        "Approve the second bounded corrective Approach revision.",
+    )
+    .success();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .assert()
+        .success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    assert_eq!(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .count(),
+        2,
+        "both Approach revisions must remain in chronological history"
+    );
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.role == "approach-revision-correction")
+            .count(),
+        2,
+        "the second revision must prepare one additional corrective Writer"
+    );
+    let latest_writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    assert_eq!(
+        latest_writer.status,
+        fluent::work_model::TaskStatus::Complete,
+        "resume must reach the second corrective Writer"
+    );
+    assert_eq!(
+        attempt.pause_kind,
+        Some(fluent::work_model::PauseKind::RoundCap),
+        "the second failed corrective review must remain at the round cap"
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     let direct = setup_round_cap_approach_revision_fixture_with_downstream_gates();
     approve_round_cap_extension(&direct);
@@ -37488,6 +37691,115 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
+    for queued in [false, true] {
+        let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+        approve_round_cap_extension(&fixture);
+        revise_round_cap_approach(&fixture).success();
+        let prompt_log = fixture._tmp.path().join(if queued {
+            "queued-downstream-tamper-prompts.log"
+        } else {
+            "foreground-downstream-tamper-prompts.log"
+        });
+        let bin = fixture._tmp.path().join(if queued {
+            "queued-downstream-tamper-provider"
+        } else {
+            "foreground-downstream-tamper-provider"
+        });
+        if queued {
+            write_scheduler_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+            fluent_cmd()
+                .current_dir(&fixture.main_dir)
+                .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+                .assert()
+                .success();
+            run_scheduler_until_dispatch_status(&fixture.main_dir, "work-1", &bin, "needs-user");
+            attach_round_cap_host_evidence(&fixture, "queued-tamper");
+            fluent_cmd()
+                .current_dir(&fixture.main_dir)
+                .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+                .assert()
+                .success();
+            run_scheduler_until_dispatch_status(
+                &fixture.main_dir,
+                "work-1",
+                &bin,
+                "candidate-ready",
+            );
+        } else {
+            write_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+            fluent_cmd()
+                .current_dir(&fixture.main_dir)
+                .env("PATH", mock_path(&bin))
+                .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                .assert()
+                .success();
+            attach_round_cap_host_evidence(&fixture, "foreground-tamper");
+            fluent_cmd()
+                .current_dir(&fixture.main_dir)
+                .env("PATH", mock_path(&bin))
+                .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                .assert()
+                .success();
+        }
+        assert_round_cap_downstream_completion(&fixture);
+        let baseline_prompt_count = fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count();
+        let baseline_dispatch_count = queued.then(|| dispatch_count(&fixture.main_dir, "work-1"));
+
+        for tamper in [
+            RoundCapDownstreamTamper::Review,
+            RoundCapDownstreamTamper::Tester,
+            RoundCapDownstreamTamper::CandidateGate,
+            RoundCapDownstreamTamper::Learning,
+        ] {
+            let (path, original, replacement, diagnostic) =
+                tamper_completed_downstream_evidence(&fixture, tamper);
+            let before = fixture.store.read_work_item("work-1").unwrap();
+            fs::write(&path, replacement).unwrap();
+            if queued {
+                fluent_cmd()
+                    .current_dir(&fixture.main_dir)
+                    .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+                    .assert()
+                    .failure()
+                    .stderr(predicate::str::contains(diagnostic));
+                assert_eq!(
+                    dispatch_count(&fixture.main_dir, "work-1"),
+                    baseline_dispatch_count.unwrap(),
+                    "queued resume must not create a dispatch for tampered {tamper:?} evidence"
+                );
+            } else {
+                fluent_cmd()
+                    .current_dir(&fixture.main_dir)
+                    .env("PATH", mock_path(&bin))
+                    .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                    .assert()
+                    .failure()
+                    .stderr(predicate::str::contains(diagnostic));
+            }
+            assert_eq!(
+                fixture.store.read_work_item("work-1").unwrap(),
+                before,
+                "tampered {tamper:?} evidence must not mutate Work-model state"
+            );
+            assert_eq!(
+                fs::read_to_string(&prompt_log)
+                    .unwrap()
+                    .matches("--- invocation ---")
+                    .count(),
+                baseline_prompt_count,
+                "tampered {tamper:?} evidence must not launch another provider"
+            );
+            fs::write(path, original).unwrap();
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_old_reader_stable_refuses_new_authority() {
     let binary = round_cap_approach_revision_old_reader(
         "FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN",
@@ -37674,6 +37986,61 @@ exit 0
     )
 }
 
+fn round_cap_two_revision_provider_script(prompt_log: &Path) -> String {
+    format!(
+        r##"#!/bin/bash
+set -eu
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-p" ]; then
+    shift
+    PROMPT="${{1:-}}"
+    break
+  fi
+  shift
+done
+if [ -z "$PROMPT" ]; then exit 0; fi
+printf '\n--- invocation ---\n%s\n' "$PROMPT" >> '{prompt_log}'
+if printf '%s' "$PROMPT" | grep -q "You are the Learner"; then
+  exit 0
+fi
+case "$PWD" in
+  */work-6-work-1-attempt-1)
+    MATRIX=$(printf '%s' "$PROMPT" | grep -o '/[^ ]*writer-completion.json' | tail -1 || true)
+    if [ -n "$MATRIX" ] && [ -f "$MATRIX" ]; then
+      python3 - "$MATRIX" <<'PYCODE'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+for row in data["rows"]:
+    if row.get("responsibility", "writer") == "writer":
+        row["state"] = "complete"
+        row["implementation-evidence"] = ["README.md: apply the revised Approach"]
+        row["verification"] = [{{"command": "true", "result": "pass"}}]
+path.write_text(json.dumps(data, indent=2) + "\n")
+PYCODE
+    fi
+    WRITER_TAG=$(printf '%s' "$PROMPT" | grep -o 'Task attempt-1-write-[0-9]*' | tail -1 | sed 's/ /-/g')
+    printf 'two-revision correction %s\n' "$WRITER_TAG" > "${{WRITER_TAG}}.txt"
+    git add "${{WRITER_TAG}}.txt"
+    git commit -m "Apply two-revision correction" >/dev/null
+    ;;
+  */attempt-1-review-tests|*/attempt-1-review-2-tests|*/attempt-1-review-3-tests|*/review-6-work-1-attempt-1-tests)
+    printf 'Verdict: fail\n\n- [ ] Resolve the second review frontier.\n' > review.md
+    ;;
+  *)
+    printf 'Verdict: pass\n\nSecond revision review.\n' > review.md
+    ;;
+esac
+exit 0
+"##,
+        prompt_log = prompt_log.display(),
+    )
+}
+
 fn attach_round_cap_host_evidence(
     fixture: &RoundCapApproachRevisionFixture,
     label: &str,
@@ -37698,6 +38065,7 @@ fn attach_round_cap_host_evidence(
             "producer": "authorized downstream host",
             "check": "bash tests/host.sh",
             "working_directory": ".",
+            "comparison_commits": {"HEAD": candidate},
             "result": "pass",
             "run_at": "2026-09-12T00:00:00Z",
             "output": "downstream host check passed"
@@ -37796,6 +38164,106 @@ fn assert_round_cap_downstream_completion(fixture: &RoundCapApproachRevisionFixt
             read_json_path(&fixture.main_dir.join(&artifact.path))["disposition"],
             "passed"
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RoundCapDownstreamTamper {
+    Review,
+    Tester,
+    CandidateGate,
+    Learning,
+}
+
+fn tamper_completed_downstream_evidence(
+    fixture: &RoundCapApproachRevisionFixture,
+    tamper: RoundCapDownstreamTamper,
+) -> (PathBuf, Vec<u8>, Vec<u8>, &'static str) {
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &item.attempts[0];
+    let latest_write_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    match tamper {
+        RoundCapDownstreamTamper::Review => {
+            let task = attempt.tasks[latest_write_index + 1..]
+                .iter()
+                .rev()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Review
+                        && task.status == fluent::work_model::TaskStatus::Complete
+                })
+                .unwrap();
+            let path = fixture
+                .main_dir
+                .join(&task.artifact_area.as_ref().unwrap().path)
+                .join("review.md");
+            (
+                path.clone(),
+                fs::read(&path).unwrap(),
+                b"Verdict: fail\n\nThe completed review was changed.\n".to_vec(),
+                "completed review",
+            )
+        }
+        RoundCapDownstreamTamper::Tester => {
+            let task = attempt.tasks[latest_write_index + 1..]
+                .iter()
+                .rev()
+                .find(|task| {
+                    task.kind == fluent::work_model::TaskKind::Tester
+                        && task.status == fluent::work_model::TaskStatus::Complete
+                        && !task.is_failed_command_recheck()
+                })
+                .unwrap();
+            let path = fixture
+                .main_dir
+                .join(&task.artifact_area.as_ref().unwrap().path)
+                .join("tester-results.json");
+            let original = fs::read(&path).unwrap();
+            let mut results = read_json_path(&path);
+            results["candidate_commit"] = serde_json::json!("tampered-candidate");
+            (
+                path,
+                original,
+                serde_json::to_vec_pretty(&results).unwrap(),
+                "candidate binding",
+            )
+        }
+        RoundCapDownstreamTamper::CandidateGate => {
+            let artifact = attempt
+                .artifacts
+                .iter()
+                .rev()
+                .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+                .unwrap();
+            let path = fixture.main_dir.join(&artifact.path);
+            let original = fs::read(&path).unwrap();
+            let mut gate = read_json_path(&path);
+            assert_eq!(gate["phase"], "final-tester");
+            gate["disposition"] = serde_json::json!("blocked");
+            (
+                path,
+                original,
+                serde_json::to_vec_pretty(&gate).unwrap(),
+                "final Tester candidate gate",
+            )
+        }
+        RoundCapDownstreamTamper::Learning => {
+            let handoff = attempt
+                .learning
+                .as_ref()
+                .and_then(|learning| learning.handoff.as_ref())
+                .unwrap();
+            let path = fixture.main_dir.join(&handoff.path);
+            (
+                path.clone(),
+                fs::read(&path).unwrap(),
+                b"tampered Learner handoff\n".to_vec(),
+                "Learner handoff",
+            )
+        }
     }
 }
 
@@ -37957,7 +38425,7 @@ fn setup_round_cap_approach_revision_fixture() -> RoundCapApproachRevisionFixtur
 fn setup_round_cap_approach_revision_fixture_with_downstream_gates()
 -> RoundCapApproachRevisionFixture {
     let fixture = setup_round_cap_approach_revision_fixture_with_plan(
-        "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n| 2 | Attach host proof. | | `bash tests/host.sh` | host | Yes |\n| 3 | Review the candidate. | | Review candidate | review | Yes |\n| 4 | Run the final Tester. | | Run final Tester | tester | Yes |\n| 5 | Capture Learning. | | Capture Learning | learner | Yes |\n"
+        "| # | State reached | Behaviors | Verification | Responsibility | Applicability | Req? |\n|---|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | | Yes |\n| 2 | Attach host proof. | | `bash tests/host.sh` | host | {\"comparison_refs\":[\"HEAD\"]} | Yes |\n| 3 | Review the candidate. | | Review candidate | review | | Yes |\n| 4 | Run the final Tester. | | Run final Tester | tester | | Yes |\n| 5 | Capture Learning. | | Capture Learning | learner | | Yes |\n"
             .to_string(),
     );
     make_round_cap_downstream_behavior_testable(&fixture);
@@ -37988,6 +38456,31 @@ fn make_round_cap_downstream_behavior_testable(fixture: &RoundCapApproachRevisio
     fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
     item.attempts[0].writer_completion_contract = Some(contract);
     store.write_work_item(&item).unwrap();
+}
+
+fn make_round_cap_behavior_testable(fixture: &RoundCapApproachRevisionFixture) {
+    use fluent::work_model::{WriterCompletionContract, WriterCompletionMatrix};
+
+    let mut item = fixture.store.read_work_item("work-1").unwrap();
+    item.planning_context
+        .as_mut()
+        .unwrap()
+        .behaviors = Some(
+        "## Behaviors\n\n### B1\n\nThe system preserves the approved obligations.\nUntestable: this fixture focuses on lifecycle recovery boundaries.\n"
+            .to_string(),
+    );
+    let contract =
+        WriterCompletionContract::from_planning_context(item.planning_context.as_ref().unwrap())
+            .unwrap();
+    let writer = &item.attempts[0].tasks[0];
+    let matrix_path = fixture
+        .main_dir
+        .join(&writer.artifact_area.as_ref().unwrap().path)
+        .join("writer-completion.json");
+    let matrix = WriterCompletionMatrix::skeleton(&contract, &writer.id, &[], None).unwrap();
+    fs::write(&matrix_path, serde_json::to_vec_pretty(&matrix).unwrap()).unwrap();
+    item.attempts[0].writer_completion_contract = Some(contract);
+    fixture.store.write_work_item(&item).unwrap();
 }
 
 fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
@@ -38048,6 +38541,7 @@ fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
   "producer": "authorized host",
   "check": "bash tests/host.sh",
   "working_directory": ".",
+  "comparison_commits": {"HEAD": "PLACEHOLDER"},
   "result": "pass",
   "run_at": "2026-09-12T00:00:00Z",
   "output": "host check passed"
@@ -38055,6 +38549,9 @@ fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
 "#,
     )
     .unwrap();
+    let mut evidence = read_json_path(&evidence_path);
+    evidence["comparison_commits"]["HEAD"] = serde_json::json!(fixture.candidate);
+    write_json_path(&evidence_path, &evidence);
     let recovery = fluent::host_evidence::attach_plan_row(
         &fixture.main_dir,
         &fixture.store,
@@ -38296,6 +38793,29 @@ fn revise_round_cap_approach(
     fixture: &RoundCapApproachRevisionFixture,
 ) -> assert_cmd::assert::Assert {
     revise_round_cap_approach_with_interrupt(fixture, false)
+}
+
+fn revise_round_cap_approach_with_values(
+    fixture: &RoundCapApproachRevisionFixture,
+    replacement: &str,
+    resolution: &str,
+) -> assert_cmd::assert::Assert {
+    let approach_file = fixture.main_dir.join("replacement-approach-next.md");
+    fs::write(&approach_file, replacement).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "revise-approach",
+            "work-1",
+            "attempt-1",
+            "--approach-file",
+            approach_file.to_str().unwrap(),
+            "--resolution",
+            resolution,
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+        .assert()
 }
 
 fn revise_round_cap_approach_with_interrupt(

@@ -325,12 +325,25 @@ fn validate_owned_plan_evidence_review_at(
                 && evidence.run_at == binding.run_at,
             "host evidence document changed"
         );
-        validate_check_applicability_in_workspace_at(
-            &candidate_workspace_path(project_root, current_writer.output.as_ref().unwrap()),
-            &binding.applicability,
-            &evidence,
-            now,
-        )?;
+        if settle_history {
+            // Writer rounds reuse one managed candidate worktree, so its live
+            // HEAD may now name a later candidate even though this receipt is
+            // historical. The binding already records the source Worker's
+            // resolved comparison commits; validate those immutable facts
+            // without consulting the newer worktree's refs.
+            crate::verification_assessment::validate_check_applicability_at(
+                &binding.applicability,
+                &evidence,
+                now,
+            )?;
+        } else {
+            validate_check_applicability_in_workspace_at(
+                &candidate_workspace_path(project_root, current_writer.output.as_ref().unwrap()),
+                &binding.applicability,
+                &evidence,
+                now,
+            )?;
+        }
         let reviewer = target
             .review_task_id
             .as_ref()
@@ -715,36 +728,227 @@ pub(crate) fn validate_planning_resume(
 ) -> Result<bool> {
     validate_planning_completion_history(project_root, attempt)?;
     validate_completed_plan_evidence(project_root, attempt)?;
-    let mut allows_planned_correction = false;
-    for audit_artifact in attempt.artifacts.iter().filter(|artifact| {
-        artifact.producer_id == "planning-approach-recovery"
-            && artifact.path.ends_with("/revision.json")
-    }) {
-        let bytes = fs::read(resolve_input_artifact_path(
-            project_root,
-            &audit_artifact.path,
-        )?)?;
-        let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
-        if revision.revision_kind == work_model::ApproachRevisionKind::FailedReviewRoundCap {
-            validate_round_cap_approach_revision_retry(
-                project_root,
-                item,
-                attempt,
-                &revision,
-                audit_artifact,
-            )?;
-            allows_planned_correction |= attempt.status == AttemptStatus::Planned
-                && attempt.tasks.iter().any(|task| {
-                    task.kind == TaskKind::Write
-                        && task.role == "approach-revision-correction"
-                        && task.status == TaskStatus::Planned
-                        && task.started_at.is_none()
-                        && task.output.is_none()
-                        && task.input_artifacts.contains(audit_artifact)
-                });
-        }
+    if attempt.status == AttemptStatus::Complete
+        && attempt.review_state == Some(AttemptReviewState::Passed)
+        && attempt
+            .tasks
+            .iter()
+            .any(|task| task.role == "approach-revision-correction")
+        && attempt
+            .learning
+            .as_ref()
+            .is_some_and(|learning| learning.is_succeeded())
+    {
+        validate_completed_downstream_evidence(project_root, attempt)?;
     }
-    Ok(allows_planned_correction)
+    // Completion-history replay above validates every accepted revision against
+    // the contract that preceded it. The strict retry validator, in contrast,
+    // applies only to the current non-terminal corrective Writer. Reapplying it
+    // to an older audit would compare that historical revision with the latest
+    // composed planning contract after a later revision and reject valid history.
+    let Some(audit_artifact) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .filter(|task| {
+            task.kind == TaskKind::Write
+                && task.role == "approach-revision-correction"
+                && !matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded)
+        })
+        .flat_map(|task| task.input_artifacts.iter())
+        .filter(|artifact| {
+            artifact.producer_id == "planning-approach-recovery"
+                && artifact.path.ends_with("/revision.json")
+        })
+        .next()
+    else {
+        return Ok(false);
+    };
+    let bytes = fs::read(resolve_input_artifact_path(
+        project_root,
+        &audit_artifact.path,
+    )?)?;
+    let revision: work_model::ApproachRevisionAudit = serde_json::from_slice(&bytes)?;
+    if revision.revision_kind != work_model::ApproachRevisionKind::FailedReviewRoundCap {
+        return Ok(false);
+    }
+
+    validate_round_cap_approach_revision_retry(
+        project_root,
+        item,
+        attempt,
+        &revision,
+        audit_artifact,
+    )?;
+    Ok(attempt.status == AttemptStatus::Planned
+        && attempt.tasks.iter().any(|task| {
+            task.kind == TaskKind::Write
+                && task.role == "approach-revision-correction"
+                && task.status == TaskStatus::Planned
+                && task.started_at.is_none()
+                && task.output.is_none()
+                && task.input_artifacts.contains(audit_artifact)
+        }))
+}
+
+/// Revalidate the downstream proof before a completed Approach-recovery Attempt
+/// can be exposed as ready again. Completion status and the Learner state are
+/// model authority, but their referenced Review, Tester, candidate-gate, and
+/// handoff files remain managed inputs that may have changed since the last
+/// execution.
+pub(crate) fn validate_completed_downstream_evidence(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<()> {
+    let writer_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .context("completed Approach recovery has no Writer")?;
+    let writer = &attempt.tasks[writer_index];
+    let output = writer
+        .output
+        .as_ref()
+        .context("completed Approach recovery Writer has no candidate")?;
+
+    let reviews = attempt.tasks[writer_index + 1..]
+        .iter()
+        .filter(|task| task.kind == TaskKind::Review)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !reviews.is_empty(),
+        "completed Approach recovery has no current Review evidence"
+    );
+    for review_task in reviews {
+        anyhow::ensure!(
+            review_task.status == TaskStatus::Complete,
+            "completed Review Task {} is not complete",
+            review_task.id
+        );
+        let context = review_task.review_context.as_ref().with_context(|| {
+            format!(
+                "completed Review Task {} has no candidate context",
+                review_task.id
+            )
+        })?;
+        anyhow::ensure!(
+            context.candidate_commit == output.commit,
+            "completed Review Task {} is bound to candidate {}, not {}",
+            review_task.id,
+            context.candidate_commit,
+            output.commit
+        );
+        let artifact = review_artifact_path(review_task)
+            .with_context(|| format!("completed Review Task {} has no artifact", review_task.id))?;
+        let path = resolve_input_artifact_path(project_root, &artifact)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("read completed Review evidence {}", path.display()))?;
+        anyhow::ensure!(
+            review::extract_verdict(&String::from_utf8_lossy(&bytes)) == review::Verdict::Pass,
+            "completed review {} changed or no longer passes",
+            artifact
+        );
+    }
+
+    let tester = attempt.tasks[writer_index + 1..]
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+        })
+        .context("completed Approach recovery has no final Tester")?;
+    let tester_area = tester
+        .artifact_area
+        .as_ref()
+        .with_context(|| format!("final Tester Task {} has no artifact area", tester.id))?;
+    let tester_results_ref = ArtifactRef {
+        producer_id: tester.id.clone(),
+        path: format!("{}/tester-results.json", tester_area.path),
+    };
+    let tester_results_path = resolve_input_artifact_path(project_root, &tester_results_ref.path)?;
+    let tester_bytes = fs::read(&tester_results_path).with_context(|| {
+        format!(
+            "read final Tester evidence {}",
+            tester_results_path.display()
+        )
+    })?;
+    let tester_results: crate::tester::TesterResults = serde_json::from_slice(&tester_bytes)
+        .with_context(|| {
+            format!(
+                "parse final Tester evidence {}",
+                tester_results_path.display()
+            )
+        })?;
+    anyhow::ensure!(
+        tester_results.candidate_commit.as_deref() == Some(output.commit.as_str()),
+        "final Tester evidence is not bound to candidate {}",
+        output.commit
+    );
+    anyhow::ensure!(
+        tester_results.error.is_none(),
+        "final Tester evidence records a harness error"
+    );
+
+    let gate_path = format!(
+        "{}/{}/{}",
+        work_model::work_artifact_path(&attempt.work_item_id, &attempt.id, "candidate-gates"),
+        tester.id,
+        crate::candidate_gate::CANDIDATE_GATE_FILE
+    );
+    let gate_ref = attempt
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.path == gate_path)
+        .with_context(|| format!("completed final Tester gate {} is not recorded", gate_path))?;
+    let gate_path = resolve_input_artifact_path(project_root, &gate_ref.path)?;
+    let gate_bytes = fs::read(&gate_path)
+        .with_context(|| format!("read final Tester candidate gate {}", gate_path.display()))?;
+    let gate: crate::candidate_gate::CandidateGateEvidence = serde_json::from_slice(&gate_bytes)
+        .with_context(|| format!("parse final Tester candidate gate {}", gate_path.display()))?;
+    anyhow::ensure!(
+        gate.schema_version == crate::candidate_gate::CANDIDATE_GATE_SCHEMA_VERSION
+            && gate.phase == crate::candidate_gate::CandidateGatePhase::FinalTester
+            && gate.disposition == crate::candidate_gate::CandidateGateDisposition::Passed,
+        "final Tester candidate gate is not a passing current gate"
+    );
+    anyhow::ensure!(
+        gate.base_commit == output.commit && gate.candidate_commit == output.commit,
+        "final Tester candidate gate is not bound to candidate {}",
+        output.commit
+    );
+    anyhow::ensure!(
+        gate.tester_results_path.as_deref() == Some(tester_results_ref.path.as_str()),
+        "final Tester candidate gate names different Tester evidence"
+    );
+    anyhow::ensure!(
+        gate.checks.iter().all(|check| {
+            !matches!(
+                check.status,
+                crate::candidate_gate::CandidateCheckStatus::Failed
+                    | crate::candidate_gate::CandidateCheckStatus::Error
+            )
+        }),
+        "final Tester candidate gate contains a failed or errored check"
+    );
+
+    let learning = attempt
+        .learning
+        .as_ref()
+        .context("completed Approach recovery has no Learning state")?;
+    anyhow::ensure!(
+        learning.is_succeeded(),
+        "completed Approach recovery Learning has not succeeded"
+    );
+    let handoff = learning
+        .handoff
+        .as_ref()
+        .context("succeeded Learning has no handoff evidence")?;
+    crate::learner::load_verified_handoff(project_root, handoff)
+        .with_context(|| "completed Learner handoff evidence changed".to_string())?;
+    Ok(())
 }
 
 /// Revalidate every accepted structured Plan-host receipt before any resume
