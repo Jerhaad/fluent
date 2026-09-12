@@ -1083,6 +1083,17 @@ without approving mutable or unreadable evidence. The append-only approval does
 no code work. Resume revalidates that frontier before reopening the same
 Attempt; any changed candidate or correction content fails closed.
 
+A failed-review `round-cap` may also authorize an Approach revision, but only
+after a separately recorded bounded extension leaves an unused Writer round.
+The extension binds the exact candidate and failed-review bytes; the Approach
+revision additionally binds the authorization, prior and replacement Approach,
+and every supporting review identity and digest. Architecture may pass when
+another settled review failed. One Work Item aggregate transaction publishes
+the revision audit, revised planning, completion contract, recovery binding,
+and exactly one corrective Writer; it does not launch that Writer. Foreground
+and queued resume use the same shared admission checks, while exact retries
+reuse the existing publication and changed or partial authority fails closed.
+
 An evidence-targeted `code-change` result supplies one scoped Writer allowance
 because that recovery transition plans the Writer even when the ordinary cap is
 exhausted. The effective cap adds only `code-change` recovery records whose
@@ -1256,23 +1267,32 @@ reuse the same paths and require identical bytes, including a partial publicatio
 that stopped before review reservation. Acceptance checks the referenced proof
 as well as the passing targeted Review.
 
-Work and Attempt record schema 4, writer envelope schema 2, completion contract
-and matrix version 2, and transaction schema 3 fence executables that predate
-explicit verification meaning. Candidate gates use schema 5; execution context
-with a verification assessment uses schema 2. Current readers accept supported
-earlier records and journals. The compatibility test invokes the pinned pre-change
-executable against both published and pending state and checks exact bytes. The
-pinned-reader
+Work and Attempt record schema 4, the prior writer envelope schema 2, completion
+contract and matrix version 2, and transaction schema 3 fence executables that
+predate explicit verification meaning. Current Fluent writes writer envelope schema 5,
+recognizes only envelope schemas 1, 2, and 5, and writes transaction schema 6,
+recognizing only transaction schemas 1 through 3 and 6. It rejects the
+unmodeled intervening assignment format (envelope schemas 3–4 and transaction
+schemas 4–5) before journal recovery or child publication. Candidate gates use
+schema 5; execution context with a verification assessment uses schema 2.
+Current readers accept supported earlier records and journals. The compatibility
+test invokes pinned stable and assignment-era older executables against both
+published and pending state and checks exact bytes. The pinned-reader
 regression preserves required-check policy, source and reconstruction references,
 and accepted Review digests through public current writes. It makes a Task
 record directory unwritable to interrupt a real public mutation after journal
 publication, verifies that the old executable cannot recover it, and then lets
 the current executable recover without losing authority or changing audit bytes.
-`tests/fixtures/build-verification-old-reader.sh` builds source
-`0b769cb4681aade324f0cee351832a94f8e72687` with locked, offline dependencies in a
-separate target directory. The canonical Tester requires that binary and verifies
-its source commit and executable SHA-256. Published records and real interrupted
-transactions exercise both outer and otherwise-hidden inner schema fences.
+`tests/fixtures/build-round-cap-approach-revision-stable-old-reader.sh` builds
+stable source `bd59cf35308bf30fa5cbabc05ff5cf69cebfff5a`, while
+`tests/fixtures/build-round-cap-approach-revision-assignment-old-reader.sh`
+builds assignment-era source `5c670fdd9eec7eda22e93aee4ea619f1c60f7a70`.
+Both use locked, offline dependencies in separate target directories; the
+canonical Tester verifies each source commit and executable SHA-256. Published
+records and real interrupted transactions exercise both outer and otherwise-
+hidden inner schema fences. The earlier
+`tests/fixtures/build-verification-old-reader.sh` remains the pinned reader for
+the independent verification-contract fence.
 
 When one missing focused result prevents a Tests Reviewer from deciding, the
 review may emit one `Evidence-Command` and one candidate-relative
@@ -2563,13 +2583,16 @@ prefix, Work Item ID, and Attempt ID so valid hyphenated IDs remain
 globally distinct.
 
 Each Work Item root record stores `model_writer_version` as a validated writer
-envelope: `{"format":"fluent-work-item-writer","schema_version":1,"version":"0.4.0"}`.
+envelope: `{"format":"fluent-work-item-writer","schema_version":5,"version":"0.4.0"}`.
 The public in-memory value remains an optional package-version string. Current
 Fluent also accepts legacy strings without rewriting them during observation.
-The envelope occupies an existing field that published v0.3.0 reads as
-`Option<String>`, so that executable rejects current records before it can
-rewrite split records or recover their journals. Adding an unknown top-level
-schema field alone cannot fence a deserializer that ignores unknown fields.
+The envelope occupies an existing field that older readers deserialize as
+`Option<String>`, so pinned stable and assignment-era readers reject current
+records before they can rewrite split records or recover their journals. Current
+Fluent similarly rejects the unsupported intervening envelope and transaction
+schemas rather than guessing their assignment-aware meaning. Adding an unknown
+top-level schema field alone cannot fence a deserializer that ignores unknown
+fields.
 The offline check in `tests/behaviors/operations/test-work-model-old-reader-fence.sh`
 builds the pinned v0.3.0 release source, checks its source and executable hashes,
 and compares the entire Work tree before and after attempted mutation, with and
@@ -4147,14 +4170,22 @@ replacement matrices. The shared history validator decodes Approach approvals
 under their own schema before evidence consumption, so interleaved approvals
 retain the accepted host check for the unchanged candidate.
 
-Approach recovery applies its authorized delta to the Attempt's current contract,
-retaining every non-Approach row, including adopted Plan splits and earlier Test
-reference revisions. Its audit binds the prior contract and available source
-matrix bytes. The neutral boundary replays both kinds of planning revision in
-order before source selection, exact retry, or corrective Writer materialization.
-Host evidence keeps its original source contract and bytes; changed Approach rows
-remain pending until the corrective Writer completes them. A changed audit or
-source digest prevents replay without rewriting the preserved history.
+Approach recovery has two audited forms. The original
+`UncertainArchitecture` form retains its existing uncertain-review and narrowly
+supported historical-replay semantics. The `FailedReviewRoundCap` form applies
+only at a failed-review round cap after a matching unused extension; its audit
+binds the exact candidate, extension, Architecture-pass and failed-review
+identities, review bytes and digests, prior and replacement Approach, and
+authorization. Both forms apply their authorized delta to the Attempt's current
+contract, retaining every non-Approach row, including adopted Plan splits and
+earlier Test-reference revisions. The neutral boundary replays both kinds of
+planning revision in order before source selection, exact retry, or corrective
+Writer materialization. A single aggregate journal publishes the audit,
+planning, completion contract, recovery binding, and one corrective Writer; it
+never launches execution. Host evidence keeps its original source contract and
+bytes, while changed Approach rows remain pending until the corrective Writer
+completes them. A changed audit or source digest prevents replay without
+rewriting preserved history.
 The shared evidence validator checks an active receipt against its recorded
 Writer and candidate. Once every targeted Plan review passes, Attempt execution
 settles that receipt before advancing a correction; queue admission checks the

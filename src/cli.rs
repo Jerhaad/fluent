@@ -541,7 +541,10 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
-    /// Replace an approved Approach at an audited uncertain-review frontier
+    /// Replace an approved Approach at an audited review frontier
+    ///
+    /// Supports uncertain Architecture review and failed-review round-cap
+    /// frontiers with their existing recovery safeguards.
     ReviseApproach {
         /// Work Item ID
         work_item_id: String,

@@ -44,6 +44,14 @@ candidate identity and exact result, matrix and Review bytes, and compare run
 markers to exclude repeated canonical commands. Provider doubles supply external
 coder output; they do not replace admission, acceptance or readiness decisions.
 
+The `approach-revision-round-cap` case records the supported new shape: a
+failed-review `round-cap` pause, an explicit replacement-Approach command,
+bound authorization and input digest, and preserved extension, Approach,
+settled-review, and corrective-Writer history. Its replay uses the same generic
+candidate-bound operation checks without launching or dispatching the command;
+the public binary tests cover the real extension, revision, retry, and resume
+routes.
+
 Workflow cases document public reconciliation commands whose state lives outside
 an Attempt, such as an already-landed Merge Candidate. Their command and history
 are still checked for safe, machine-independent shape.

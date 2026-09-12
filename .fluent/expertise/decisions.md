@@ -417,3 +417,29 @@ fallback bounded when changing Plan evidence overlays; do not extend it to
 environment, comparison, or live-state policies. See
 [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
 and `plan_evidence_review_is_accepted` in `src/recovery_contracts.rs`.
+
+## Failed-review round-cap Approach revision remains an audited delta
+
+The supported failed-review round-cap path requires the operator to authorize a
+matching bounded extension first. `fluent attempt revise-approach` may then
+accept a replacement Approach even when Architecture passed, but only when the
+audit binds the exact candidate, extension, Architecture-pass and failed-review
+identities, review bytes and digests, prior and replacement Approach, and
+authorization. The extension remains a separate admission record; the revision
+does not silently increase the cap.
+
+Publish the audit, revised planning, Writer completion contract, recovery
+binding, and one corrective Writer through the Work Item aggregate transaction.
+Use the same validator for foreground and queue resume, and make exact retries
+reuse the existing revision and Writer. Interrupted publication must recover
+from the journal without exposing or combining partial authority. Preserve all
+non-Approach requirements, ownership, reports, host evidence, review verdicts,
+and completed Tasks; do not launch execution while recording the revision.
+
+Keep the older `UncertainArchitecture` audit kind and historical replay
+semantics unchanged. Do not integrate the temporary assignment-aware
+coordinator: current readers fence its envelope schema 4 and transaction schema
+5 while recognizing stable envelope schemas 1, 2, and 5 and transaction schemas
+1 through 3 and 6. Pinned stable and assignment-era readers must refuse the new
+authority in both published and pending states, and read-only legacy observation
+must not recover or combine partial state.

@@ -273,6 +273,18 @@ Fluent records the decision and the before/after Approach, preserves a qualifyin
 reviewer launch failure as superseded history, and gives the corrective Writer the
 settled review artifacts for the current candidate.
 
+If a failed review reaches the Writer round cap, first run `fluent attempt extend`
+and confirm that the extension binds the same candidate and exact failed-review
+bytes while leaving an unused Writer round. Then use the same `revise-approach`
+command even when Architecture passed and another review failed. Fluent records
+the round-cap authorization, prior and replacement Approach, and supporting
+review identities, publishes planning and the Writer completion contract in one
+recoverable transaction, and prepares one corrective Writer without launching it.
+Resume through the queue or foreground command above. Exact retries reuse the
+same revision and Writer; changed candidate, review, authorization, cancellation,
+or unsupported format is rejected, and later host, Tester, review, and Learning
+gates remain required.
+
 ### Recover a host-evidence finding
 
 Read [host-evidence recovery](references/host-evidence-recovery.md) for

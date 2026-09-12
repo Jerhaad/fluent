@@ -10005,6 +10005,77 @@ Test: tests/binary.rs (legacy_ownership_survives_approach_recovery)
 Test: tests/binary.rs (explicit_plan_survives_approach_recovery)
 Test: src/planning_approach_recovery.rs (replays_reference_approach_reference_history)
 
+## Failed-review round-cap Approach revision
+
+### B1
+
+WHEN an operator authorizes a replacement Approach for a failed-review
+`round-cap` pause, and a matching round extension leaves an unused Writer round,
+THE SYSTEM SHALL accept the revision even when Architecture review passed,
+subject to the existing recovery safety checks.
+Test: tests/binary.rs (round_cap_approach_revision_accepts_extended_failed_review)
+
+### B2
+
+IF no matching extension provides an unused Writer round,
+THEN THE SYSTEM SHALL reject this revision request without changing planning,
+the Attempt, or its round limit.
+Test: tests/binary.rs (round_cap_approach_revision_requires_extension)
+
+### B3
+
+WHEN Fluent accepts the revision,
+THE SYSTEM SHALL save an immutable audit containing the authorization, old and
+replacement Approach, candidate commit, and exact supporting review identities
+and content digests.
+Test: tests/binary.rs (round_cap_approach_revision_records_audit)
+
+### B4
+
+WHEN Fluent publishes the revision,
+THE SYSTEM SHALL expose the saved Approach and Writer completion requirements
+as one consistent revision, never a partially updated combination.
+Test: tests/binary.rs (round_cap_approach_revision_updates_planning_and_contract_together)
+
+### B5
+
+WHEN Fluent accepts the revision,
+THE SYSTEM SHALL preserve non-Approach requirements, assigned responsibilities,
+original completion reports, accepted host evidence, review verdicts, and
+completed Task history.
+Test: tests/binary.rs (round_cap_approach_revision_preserves_authority_and_history)
+
+### B6
+
+WHEN Fluent accepts the revision,
+THE SYSTEM SHALL prepare exactly one corrective Writer under the revised
+Approach, using one already-authorized round without starting execution.
+Test: tests/binary.rs (round_cap_approach_revision_prepares_one_writer)
+
+### B7
+
+WHEN the identical revision request repeats and its recorded authorization and
+source evidence remain valid,
+THE SYSTEM SHALL return the existing revision and Writer without creating
+another Task or consuming another round.
+Test: tests/binary.rs (round_cap_approach_revision_retry_is_idempotent)
+
+### B8
+
+IF revision publication is interrupted and its bound inputs remain valid,
+THEN THE SYSTEM SHALL allow the same request to complete that revision without
+duplicating its audit or corrective Writer.
+Test: tests/binary.rs (round_cap_approach_revision_recovers_interrupted_publication)
+
+This path applies only to a failed-review round-cap pause. Existing uncertain-
+Architecture recovery and historical replay retain their prior admission rules;
+failed-Tester and unrelated pause types gain no new Approach-revision
+eligibility. Acceptance and resume continue to require a clean exact candidate,
+bound evidence, cancellation precedence, live-owner exclusion, and supported
+stored formats. Recording the revision does not launch a worker, and the
+corrective Writer must still pass host evidence, candidate, review, final
+Tester, and Learning gates.
+
 ## Writer continuation recovery
 
 ### B1

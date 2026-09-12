@@ -23,6 +23,7 @@ use std::path::Path;
 pub const RECOVERY_REPLAY_SCHEMA_VERSION: u32 = 1;
 
 const CORPUS: &str = include_str!("../tests/fixtures/recovery-corpus.json");
+const APPROACH_REVISION_ROUND_CAP_OPERATION_KIND: &str = "approach-revision-round-cap";
 
 /// The scope of a saved incident. Attempt cases exercise the shared recovery
 /// operation record; workflow cases document a public command whose state is
@@ -211,6 +212,7 @@ pub fn validate_corpus(corpus: &RecoveryReplayCorpus) -> Result<(), ReplayCorpus
                 case.id
             )));
         }
+        validate_approach_revision_case(case)?;
 
         match case.scope {
             ReplayScope::Attempt => {
@@ -249,6 +251,43 @@ pub fn validate_corpus(corpus: &RecoveryReplayCorpus) -> Result<(), ReplayCorpus
             }
         }
     }
+    Ok(())
+}
+
+fn validate_approach_revision_case(case: &RecoveryReplayCase) -> Result<(), ReplayCorpusError> {
+    if case.operation_kind != APPROACH_REVISION_ROUND_CAP_OPERATION_KIND {
+        return Ok(());
+    }
+
+    if case.scope != ReplayScope::Attempt
+        || case.pause_kind.as_deref() != Some("round-cap")
+        || !case.public_command.contains("attempt revise-approach")
+        || !case.public_command.contains("--approach-file")
+        || !case.public_command.contains("--resolution")
+        || case.input_digest.as_deref().is_none_or(str::is_empty)
+        || case.authorization.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ReplayCorpusError::new(format!(
+            "recovery corpus case {} does not describe an explicitly authorized round-cap Approach revision",
+            case.id
+        )));
+    }
+
+    for required in [
+        "round-cap-extension",
+        "prior-approach",
+        "replacement-approach",
+        "settled-reviews",
+        "corrective-writer",
+    ] {
+        if !case.preserved_history.iter().any(|entry| entry == required) {
+            return Err(ReplayCorpusError::new(format!(
+                "recovery corpus case {} omits preserved Approach revision history {required:?}",
+                case.id
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -504,6 +543,29 @@ mod tests {
         let mut future = corpus;
         future.schema_version = RECOVERY_REPLAY_SCHEMA_VERSION + 1;
         assert!(validate_corpus(&future).is_err());
+    }
+
+    #[test]
+    fn round_cap_approach_revision_replay_requires_its_bound_history() {
+        let corpus = load_corpus().unwrap();
+        let case = corpus
+            .cases
+            .iter()
+            .find(|case| case.id == "approach-revision-round-cap")
+            .expect("the sanitized Approach revision replay case exists");
+        assert_eq!(case.pause_kind.as_deref(), Some("round-cap"));
+        assert_eq!(case.operation_kind, "approach-revision-round-cap");
+
+        let mut missing_history = corpus;
+        let replay = missing_history
+            .cases
+            .iter_mut()
+            .find(|case| case.id == "approach-revision-round-cap")
+            .unwrap();
+        replay
+            .preserved_history
+            .retain(|entry| entry != "replacement-approach");
+        assert!(validate_corpus(&missing_history).is_err());
     }
 
     #[test]

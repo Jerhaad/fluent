@@ -265,6 +265,18 @@ If a failed review shows that stored behavior `Test:` references name the wrong 
 
 When an uncertain Architecture review identifies a ratified replacement design, save the complete replacement document and run `fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'`. Then run `fluent queue resume <work-item-id> --attempt <attempt-id>`, or `fluent attempt run <work-item-id> <attempt-id>` in the foreground, to execute the corrective Writer. Fluent accepts only the exact current candidate and Architecture-review frontier, records the prior and replacement Approach bytes with the authorization, updates the planning completion contract, and schedules one corrective Writer with that review as input. Fluent reopens an artifact-free terminal launch only with the typed provider-arguments handoff, or with the preserved Review 38/39 legacy form: producer-bound generic handoff, settled execution record, and matching Codex parser diagnostics. Other legacy launch failures remain ineligible. Repeating the exact command reuses its audit and corrective Writer.
 
+For a failed-review `round-cap` pause, first approve the existing bounded
+extension with `fluent attempt extend <work-item-id> <attempt-id> ...`; it must
+bind the exact candidate and failed-review bytes and leave an unused Writer
+round. Then use the same `revise-approach` command, even when Architecture
+passed and another review failed. Fluent records the authorization, prior and
+replacement Approach, and supporting review identities, publishes planning and
+the completion contract together, and prepares one corrective Writer without
+launching it. Resume explicitly through `fluent queue resume` or foreground
+`fluent attempt run`; an exact retry reuses the audit and Writer, while changed,
+stale, canceled, or unsupported state is rejected. This path does not edit the
+Brief, Behaviors, Plan, or live paused repair.
+
 The revised completion matrix remains authoritative for the next corrective
 Writer. Fluent carries its completed planning claims forward and repairs a
 stale pending matrix created by an older Fluent build when the same Writer is

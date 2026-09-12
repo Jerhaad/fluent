@@ -2,6 +2,28 @@
   "schema-version": 1,
   "cases": [
     {
+      "id": "approach-revision-round-cap",
+      "incident": "A failed review reached the Writer round cap after Architecture passed, so an operator approved a replacement Approach for one remaining round.",
+      "scope": "attempt",
+      "work-item-id": "replay-round-cap-approach",
+      "attempt-id": "attempt-1",
+      "pause-kind": "round-cap",
+      "operation-kind": "approach-revision-round-cap",
+      "public-command": "fluent attempt revise-approach replay-round-cap-approach attempt-1 --approach-file <replacement-approach> --resolution \"<decision>\"",
+      "candidate-commit": "1010101010101010101010101010101010101010",
+      "stale-candidate-commit": "2020202020202020202020202020202020202020",
+      "task-id": "attempt-1-review-tests",
+      "input-digest": "sha256:replay-approach-revision",
+      "authorization": "Approve the exact replacement Approach for one remaining Writer round.",
+      "preserved-history": [
+        "round-cap-extension",
+        "prior-approach",
+        "replacement-approach",
+        "settled-reviews",
+        "corrective-writer"
+      ]
+    },
+    {
       "id": "failed-command-recheck-round-cap",
       "incident": "A failed-command recheck at the write-round cap had no eligible recovery command.",
       "scope": "attempt",
