@@ -88,13 +88,15 @@ impl LoggedCommand {
     }
 
     pub fn output(&mut self) -> Result<Output, std::io::Error> {
+        // Keep each CLI fixture in a private process group so a descendant
+        // cannot outlive the captured stdout or stderr pipes.
         self.inner.stdin(Stdio::piped());
         self.inner.stdout(Stdio::piped());
         self.inner.stderr(Stdio::piped());
         let mut child = self.inner.spawn()?;
         let group = child.id();
 
-        let stdin = match (child.stdin.take(), self.stdin.take()) {
+        let stdin = match (child.stdin.take(), self.stdin.clone()) {
             (Some(mut stdin), Some(input)) => {
                 Some(std::thread::spawn(move || stdin.write_all(&input)))
             }
