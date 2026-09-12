@@ -36511,6 +36511,160 @@ fn round_cap_approach_revision_rejects_unsafe_state() {
     );
 }
 
+#[test]
+#[serial]
+fn round_cap_approach_revision_retry_is_idempotent() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+
+    let first = fixture.store.read_work_item("work-1").unwrap();
+    let first_attempt = &first.attempts[0];
+    let first_model = serde_json::to_vec(&first).unwrap();
+    let first_audit = first_attempt
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap()
+        .clone();
+    let first_audit_bytes = fs::read(fixture.main_dir.join(&first_audit.path)).unwrap();
+    let first_writer_ids: Vec<_> = first_attempt
+        .tasks
+        .iter()
+        .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .map(|task| task.id.clone())
+        .collect();
+
+    revise_round_cap_approach(&fixture)
+        .success()
+        .stdout(predicate::str::contains("already applied"));
+
+    let second = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(serde_json::to_vec(&second).unwrap(), first_model);
+    assert_eq!(
+        second.attempts[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .count(),
+        1
+    );
+    assert_eq!(
+        second.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>(),
+        first_writer_ids
+    );
+    assert_eq!(
+        fs::read(fixture.main_dir.join(&first_audit.path)).unwrap(),
+        first_audit_bytes
+    );
+
+    let source_output = second.attempts[0].tasks[0].output.as_ref().unwrap();
+    let candidate_workspace = fixture
+        .main_dir
+        .parent()
+        .unwrap()
+        .join(source_output.workspace_path.trim_start_matches("../"));
+    fs::write(
+        candidate_workspace.join("changed-before-retry.txt"),
+        "changed\n",
+    )
+    .unwrap();
+    let before_rejected_retry = serde_json::to_vec(&second).unwrap();
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("dirty"));
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before_rejected_retry
+    );
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_recovers_interrupted_publication() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let before_root = fs::read(
+        fixture
+            .store
+            .work_item_path("work-1")
+            .expect("work item path"),
+    )
+    .unwrap();
+    revise_round_cap_approach_with_interrupt(&fixture, true).failure();
+
+    let revisions_dir = fixture
+        .main_dir
+        .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions");
+    let revision_dir = fs::read_dir(&revisions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("interrupted revision audit directory");
+    let audit_path = revision_dir.join("revision.json");
+    let audit_bytes = fs::read(&audit_path).unwrap();
+    let transaction_path = fixture
+        .main_dir
+        .join(".fluent/work/transactions/work-1.json");
+    assert!(
+        transaction_path.is_file(),
+        "publication journal must remain"
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .store
+                .work_item_path("work-1")
+                .expect("work item path"),
+        )
+        .unwrap(),
+        before_root
+    );
+    let observed = fixture
+        .store
+        .read_work_item_snapshot("work-1")
+        .expect("read-only observation should retain the old coherent aggregate");
+    assert_eq!(
+        fs::read(fixture.store.work_item_path("work-1").unwrap()).unwrap(),
+        before_root
+    );
+    assert_eq!(
+        observed.attempts[0].tasks.len(),
+        4,
+        "read-only observation must not expose the prepared Writer"
+    );
+
+    revise_round_cap_approach(&fixture)
+        .success()
+        .stdout(predicate::str::contains("already applied"));
+
+    let recovered = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &recovered.attempts[0];
+    assert_eq!(
+        attempt
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .count(),
+        1
+    );
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == fluent::work_model::TaskKind::Write)
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
+    assert!(!transaction_path.exists());
+}
+
 struct RoundCapApproachRevisionFixture {
     _tmp: TempDir,
     main_dir: PathBuf,
@@ -36642,9 +36796,23 @@ fn approve_round_cap_extension(fixture: &RoundCapApproachRevisionFixture) {
 fn revise_round_cap_approach(
     fixture: &RoundCapApproachRevisionFixture,
 ) -> assert_cmd::assert::Assert {
+    revise_round_cap_approach_with_interrupt(fixture, false)
+}
+
+fn revise_round_cap_approach_with_interrupt(
+    fixture: &RoundCapApproachRevisionFixture,
+    interrupt: bool,
+) -> assert_cmd::assert::Assert {
     let approach_file = fixture.main_dir.join("replacement-approach.md");
     fs::write(&approach_file, &fixture.replacement).unwrap();
-    fluent_cmd()
+    let mut command = fluent_cmd();
+    if interrupt {
+        command.env(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-child-publication",
+        );
+    }
+    command
         .current_dir(&fixture.main_dir)
         .args([
             "attempt",

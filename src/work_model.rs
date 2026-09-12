@@ -10859,6 +10859,21 @@ impl WorkModelStore {
             });
         }
 
+        // Integration tests can stop after the journal becomes durable and
+        // before any split child is published. Production builds do not carry
+        // this interruption path; retries exercise the normal journal recovery.
+        #[cfg(feature = "test-support")]
+        if std::env::var("FLUENT_TEST_WORK_MODEL_INTERRUPT")
+            .ok()
+            .as_deref()
+            == Some("before-child-publication")
+        {
+            return Err(WorkModelStorageError::WriteFile {
+                path: self.work_transaction_path(&transaction.id)?,
+                source: io::Error::other("injected Work-model publication interruption"),
+            });
+        }
+
         self.write_attempt_records(&transaction.work_item)?;
         self.write_merge_candidate_records(&transaction.work_item)?;
         let mut record = WorkItemRecord::from(&transaction.work_item);

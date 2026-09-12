@@ -141,6 +141,9 @@ pub fn revise(
             })
             .transpose()?
             .flatten();
+    if round_cap_revision && source_completion.is_none() {
+        bail!("round-cap Approach revision requires source completion evidence");
+    }
     let new_contract = old_contract
         .with_revised_approach(prior_approach, &replacement)
         .map_err(anyhow::Error::msg)?;
@@ -697,6 +700,14 @@ fn existing_revision(
         let audit: RevisionAudit =
             serde_json::from_slice(&fs::read(project_root.join(&artifact.path))?)?;
         if audit.replacement_approach == replacement && audit.resolution == resolution {
+            if audit.revision_kind == ApproachRevisionKind::FailedReviewRoundCap {
+                crate::recovery_contracts::validate_round_cap_approach_revision_retry(
+                    project_root,
+                    attempt,
+                    &audit,
+                    artifact,
+                )?;
+            }
             let writer = attempt
                 .tasks
                 .iter()
