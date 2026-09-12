@@ -746,7 +746,18 @@ fn validate_planning_resume_at(
     allow_settled_cancellation: bool,
 ) -> Result<bool> {
     validate_planning_completion_history(project_root, attempt)?;
-    validate_completed_plan_evidence(project_root, attempt)?;
+    // Completed Plan-host receipts predate this Approach-revision replay
+    // contract. Keep ordinary host-evidence recovery on its existing route;
+    // replay the stricter historical receipt only when this Attempt records a
+    // planning delta that can have changed its completion authority.
+    if attempt.artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.producer_id.as_str(),
+            "planning-reference-recovery" | "planning-approach-recovery"
+        ) && artifact.path.ends_with("/revision.json")
+    }) {
+        validate_completed_plan_evidence(project_root, attempt)?;
+    }
     if attempt.status == AttemptStatus::Complete
         && attempt.review_state == Some(AttemptReviewState::Passed)
         && attempt
