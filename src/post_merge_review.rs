@@ -234,6 +234,15 @@ pub fn spawn_detached_runner(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_clone));
+    // Keep the intentionally detached runner outside the merge command's
+    // process group so callers can clean up their own fixture descendants
+    // without terminating this durable follow-up.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        cmd.process_group(0);
+    }
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn detached {fluent_bin:?} for post-merge review"))?;
