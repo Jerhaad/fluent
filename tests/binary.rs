@@ -268,12 +268,21 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
         ("ownership", 37, true),
         ("verification", 37, false),
         ("verification", 37, true),
+        ("round-cap-approach-revision-stable", 37, false),
+        ("round-cap-approach-revision-stable", 37, true),
+        ("round-cap-approach-revision-assignment", 37, false),
+        ("round-cap-approach-revision-assignment", 37, true),
     ] {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("tester project");
         let fixtures = project.join("tests/fixtures");
         let bin_dir = tmp.path().join("bin");
-        for helper in ["ownership", "verification"] {
+        for helper in [
+            "ownership",
+            "verification",
+            "round-cap-approach-revision-stable",
+            "round-cap-approach-revision-assignment",
+        ] {
             let status = if helper == failed_helper {
                 setup_status
             } else {
@@ -302,7 +311,7 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$FLUENT_TEST_CARGO_CALLS"
-printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
+printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
 case "$1" in
     build) mkdir -p target/debug; touch target/debug/fluent ;;
     nextest) exit 0 ;;
@@ -318,6 +327,8 @@ esac
             .current_dir(&project)
             .env_remove("FLUENT_OWNERSHIP_OLD_BIN")
             .env_remove("FLUENT_VERIFICATION_OLD_BIN")
+            .env_remove("FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN")
+            .env_remove("FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN")
             .env("FLUENT_TEST_CARGO_CALLS", &cargo_calls)
             .env("FLUENT_TEST_READER_PATHS", &reader_paths)
             .env(
@@ -338,9 +349,15 @@ esac
             assert_eq!(
                 fs::read_to_string(reader_paths).unwrap(),
                 format!(
-                    "{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n",
                     bin_dir.join("ownership old reader").display(),
-                    bin_dir.join("verification old reader").display()
+                    bin_dir.join("verification old reader").display(),
+                    bin_dir
+                        .join("round-cap-approach-revision-stable old reader")
+                        .display(),
+                    bin_dir
+                        .join("round-cap-approach-revision-assignment old reader")
+                        .display()
                 )
                 .repeat(3),
                 "every Cargo child must receive the exported reader path"
@@ -36801,6 +36818,102 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
     assert_round_cap_writer_prompt(&queued, &queued_prompt_log, queued_attempt);
 }
 
+#[test]
+#[serial]
+fn round_cap_approach_revision_old_reader_stable_refuses_new_authority() {
+    let binary = round_cap_approach_revision_old_reader(
+        "FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN",
+        "bd59cf35308bf30fa5cbabc05ff5cf69cebfff5a",
+    );
+    assert_old_reader_refuses_round_cap_authority(&binary);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_old_reader_assignment_refuses_new_authority() {
+    let binary = round_cap_approach_revision_old_reader(
+        "FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN",
+        "5c670fdd9eec7eda22e93aee4ea619f1c60f7a70",
+    );
+    assert_old_reader_refuses_round_cap_authority(&binary);
+}
+
+#[test]
+#[serial]
+fn round_cap_approach_revision_rejects_unsupported_assignment_format() {
+    for pending in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let project = setup_git_project(&tmp);
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "work-item",
+                "create",
+                "assignment-format",
+                "--title",
+                "Reject unsupported assignment format",
+            ])
+            .assert()
+            .success();
+        fluent_cmd()
+            .current_dir(&project)
+            .args(["attempt", "create", "assignment-format", "attempt-1"])
+            .assert()
+            .success();
+
+        let work_root = project.join(".fluent/work");
+        if pending {
+            let store = WorkModelStore::new(&project);
+            let item = store.read_work_item("assignment-format").unwrap();
+            let mut work_item = serde_json::to_value(item).unwrap();
+            work_item["title"] = serde_json::json!("Unsupported pending assignment");
+            work_item["attempts"][0]["tasks"][0]["writer_correction_assignment"] =
+                assignment_wire_value();
+            write_json_path(
+                &work_root.join("transactions/assignment-format.json"),
+                &serde_json::json!({
+                    "schema_version": 5,
+                    "id": "assignment-format",
+                    "base_revision": 0,
+                    "target_revision": 1,
+                    "work_item": work_item,
+                }),
+            );
+        } else {
+            let record_path = work_root.join("items/assignment-format.json");
+            let mut record = read_json_path(&record_path);
+            record["schema_version"] = serde_json::json!(6);
+            record["model_writer_version"]["schema_version"] = serde_json::json!(4);
+            write_json_path(&record_path, &record);
+
+            let attempt_path = work_root.join("attempts/assignment-format/attempt-1.json");
+            let mut attempt = read_json_path(&attempt_path);
+            attempt["schema_version"] = serde_json::json!(6);
+            write_json_path(&attempt_path, &attempt);
+
+            let task_path =
+                work_root.join("tasks/assignment-format/attempt-1/attempt-1-write-1.json");
+            let mut task = read_json_path(&task_path);
+            task["writer_correction_assignment"] = assignment_wire_value();
+            write_json_path(&task_path, &task);
+        }
+
+        let before = snapshot_tree(&work_root);
+        fluent_cmd()
+            .current_dir(&project)
+            .args([
+                "work-item",
+                "abandon",
+                "assignment-format",
+                "--reason",
+                "must reject unsupported assignment format",
+            ])
+            .assert()
+            .failure();
+        assert_eq!(snapshot_tree(&work_root), before, "pending={pending}");
+    }
+}
+
 fn round_cap_resume_provider_script(prompt_log: &Path) -> String {
     format!(
         r##"#!/bin/bash
@@ -36869,6 +36982,102 @@ fn assert_round_cap_writer_prompt(
         fs::read_to_string(approach_path).unwrap(),
         fixture.replacement
     );
+}
+
+fn round_cap_approach_revision_old_reader(variable: &str, source_commit: &str) -> PathBuf {
+    let binary = PathBuf::from(
+        std::env::var_os(variable)
+            .unwrap_or_else(|| panic!("build the pinned reader for {variable} first")),
+    );
+    let reader_root = binary
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("pinned reader target directory")
+        .to_path_buf();
+    let identity = read_json_path(&reader_root.join("identity.json"));
+    assert_eq!(identity["source_commit"], source_commit);
+    let source = Command::new("git")
+        .args(["show", &format!("{source_commit}:src/work_model.rs")])
+        .output()
+        .expect("read pinned Work-model source");
+    assert!(source.status.success());
+    assert_eq!(
+        identity["work_model_sha256"],
+        format!("{:x}", Sha256::digest(&source.stdout))
+    );
+    assert_eq!(
+        identity["binary_sha256"],
+        format!("{:x}", Sha256::digest(fs::read(&binary).unwrap()))
+    );
+    binary
+}
+
+fn assert_old_reader_refuses_round_cap_authority(binary: &Path) {
+    for pending in [false, true] {
+        let fixture = setup_round_cap_approach_revision_fixture();
+        approve_round_cap_extension(&fixture);
+        revise_round_cap_approach(&fixture).success();
+        if pending {
+            leave_round_cap_publication_pending(&fixture);
+        }
+
+        let work_root = fixture.main_dir.join(".fluent/work");
+        let before = snapshot_tree(&work_root);
+        let output = Command::new(binary)
+            .current_dir(&fixture.main_dir)
+            .env("FLUENT_NO_UPDATE_CHECK", "1")
+            .args([
+                "work-item",
+                "abandon",
+                "work-1",
+                "--reason",
+                "must refuse new round-cap authority",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "older reader accepted new authority (pending={pending}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(snapshot_tree(&work_root), before, "pending={pending}");
+    }
+}
+
+fn leave_round_cap_publication_pending(fixture: &RoundCapApproachRevisionFixture) {
+    let mut target = fixture.store.read_work_item("work-1").unwrap();
+    target.title = "Interrupted round-cap publication".to_string();
+    unsafe {
+        std::env::set_var(
+            "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+            "before-child-publication",
+        );
+    }
+    let result = fixture.store.write_work_item(&target);
+    unsafe {
+        std::env::remove_var("FLUENT_TEST_WORK_MODEL_INTERRUPT");
+    }
+    assert!(result.is_err(), "fixture must leave a pending transaction");
+    assert!(
+        fixture
+            .main_dir
+            .join(".fluent/work/transactions/work-1.json")
+            .is_file()
+    );
+}
+
+fn assignment_wire_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "work_item_id": "assignment-format",
+        "attempt_id": "attempt-1",
+        "writer_task_id": "attempt-1-write-1",
+        "source_task_id": "attempt-1-write-0",
+        "source_candidate_commit": "candidate",
+        "findings": [],
+        "origin": "captured"
+    })
 }
 
 struct RoundCapApproachRevisionFixture {

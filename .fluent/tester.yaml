@@ -5,6 +5,10 @@ commands:
       export FLUENT_OWNERSHIP_OLD_BIN
       FLUENT_VERIFICATION_OLD_BIN="$(bash tests/fixtures/build-verification-old-reader.sh)"
       export FLUENT_VERIFICATION_OLD_BIN
+      FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN="$(bash tests/fixtures/build-round-cap-approach-revision-stable-old-reader.sh)"
+      export FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN
+      FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN="$(bash tests/fixtures/build-round-cap-approach-revision-assignment-old-reader.sh)"
+      export FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN
       cargo build
       production_bin="$(pwd)/target/debug/fluent-production"
       cp target/debug/fluent "$production_bin"

@@ -9429,7 +9429,14 @@ pub struct WorkModelSnapshot {
 }
 
 const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
-const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 2;
+/// Version 5 fences the assignment-aware coordinator's schema-4 envelope.
+/// Versions 1 and 2 remain readable because stable main models them; versions
+/// 3 and 4 belong to an unsupported intervening format.
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 5;
+
+fn is_supported_writer_envelope_schema(version: u32) -> bool {
+    matches!(version, 1 | 2 | WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION)
+}
 
 /// Fence readers that deserialize the existing writer field as Option<String>.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9454,7 +9461,7 @@ fn deserialize_model_writer_version<'de, D: Deserializer<'de>>(
     }) = &writer
     {
         if format != WORK_MODEL_WRITER_ENVELOPE_FORMAT
-            || !(1..=WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION).contains(schema_version)
+            || !is_supported_writer_envelope_schema(*schema_version)
         {
             return Err(serde::de::Error::custom(
                 "unsupported Work Item writer envelope format/schema",
@@ -9537,7 +9544,14 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    const SCHEMA_VERSION: u32 = 3;
+    /// Version 6 fences the assignment-aware coordinator's schema-5 journal.
+    /// Earlier stable transaction versions remain modeled; versions 4 and 5
+    /// are not admitted by their numeric position alone.
+    const SCHEMA_VERSION: u32 = 6;
+
+    fn is_supported_schema(version: u32) -> bool {
+        matches!(version, 1..=3 | Self::SCHEMA_VERSION)
+    }
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -10793,7 +10807,7 @@ impl WorkModelStore {
             Some(base) => base.checked_add(1),
             None => Some(0),
         };
-        if !(1..=WorkItemTransaction::SCHEMA_VERSION).contains(&transaction.schema_version)
+        if !WorkItemTransaction::is_supported_schema(transaction.schema_version)
             || transaction.id != id
             || transaction.work_item.id != id
             || expected_target != Some(transaction.target_revision)
