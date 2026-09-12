@@ -428,8 +428,9 @@ identities, review bytes and digests, prior and replacement Approach, and
 authorization. The extension remains a separate admission record; the revision
 does not silently increase the cap.
 
-Publish the audit, revised planning, Writer completion contract, recovery
-binding, and one corrective Writer through the Work Item aggregate transaction.
+Journal the audit as a managed file and publish its reference, revised planning,
+Writer completion contract, recovery binding, and one corrective Writer through
+the Work Item aggregate transaction.
 Use the same validator for foreground and queue resume, and make exact retries
 reuse the existing revision and Writer. Interrupted publication must recover
 from the journal without exposing or combining partial authority. Preserve all
@@ -440,6 +441,6 @@ Keep the older `UncertainArchitecture` audit kind and historical replay
 semantics unchanged. Do not integrate the temporary assignment-aware
 coordinator: current readers fence its envelope schema 4 and transaction schema
 5 while recognizing stable envelope schemas 1, 2, and 5 and transaction schemas
-1 through 3 and 6. Pinned stable and assignment-era readers must refuse the new
+1 through 3, 6, and 7. Pinned stable and assignment-era readers must refuse the new
 authority in both published and pending states, and read-only legacy observation
 must not recover or combine partial state.

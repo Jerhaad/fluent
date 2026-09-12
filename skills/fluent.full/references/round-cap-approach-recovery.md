@@ -27,10 +27,14 @@ Save the complete replacement Approach, then run:
 fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'
 ```
 
-Use the matching authorization. Fluent writes an immutable audit sidecar, then
-publishes planning, the completion contract, and one corrective Writer through
-one recoverable Work-model transaction. The audit retains the source candidate,
-exact supporting reviews, failed-review bytes, and extension history.
+Use the matching authorization. Fluent journals the immutable audit bytes as a
+managed file in one recoverable Work-model transaction with planning, the
+completion contract, and one corrective Writer.
+Before that transaction is applied, no audit sidecar exists. A pending
+transaction may expose the managed file while recovery applies it, but the
+aggregate reference and exact bytes together establish authority. The audit
+retains the source candidate, exact supporting reviews, failed-review bytes, and
+extension history.
 
 ## Resume and retry
 

@@ -1099,14 +1099,17 @@ fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path
 The Approach revision additionally binds the authorization, prior and
 replacement Approach, and every supporting review identity and digest.
 Architecture may pass when another settled review failed. The command first
-writes the immutable revision audit sidecar; one Work Item aggregate transaction
-then publishes its reference with the revised planning, completion contract,
-recovery binding, and exactly one corrective Writer. The transaction does not
-launch that Writer. A sidecar without the published reference is not an
-accepted revision: a matching retry can reuse its identical bytes, while an
-unrelated orphan remains inert and conflicting bytes fail closed. Foreground
-and queued resume use the same shared admission checks, while exact retries
-reuse the existing publication and changed or partial authority fails closed.
+journals the immutable revision audit as a managed file in the same Work Item
+aggregate transaction that publishes its reference with the revised planning,
+completion contract, recovery binding, and exactly one corrective Writer. The
+transaction does not launch that Writer. Before transaction application, no
+audit sidecar exists; during interrupted application, a pending transaction may
+expose its managed bytes, but the aggregate reference and exact managed-file
+publication together establish authority. A matching retry reuses those exact
+bytes, while an unrelated file remains inert and conflicting bytes fail closed.
+Foreground and queued resume use the same shared admission checks, while exact
+retries reuse the existing publication and changed or partial authority fails
+closed.
 
 An evidence-targeted `code-change` result supplies one scoped Writer allowance
 because that recovery transition plans the Writer even when the ordinary cap is
@@ -1284,8 +1287,8 @@ as well as the passing targeted Review.
 Work and Attempt record schema 4, the prior writer envelope schema 2, completion
 contract and matrix version 2, and transaction schema 3 fence executables that
 predate explicit verification meaning. Current Fluent writes writer envelope schema 5,
-recognizes only envelope schemas 1, 2, and 5, and writes transaction schema 6,
-recognizing only transaction schemas 1 through 3 and 6. It rejects the
+recognizes only envelope schemas 1, 2, and 5, and writes transaction schema 7,
+recognizing only transaction schemas 1 through 3, 6, and 7. It rejects the
 unmodeled intervening assignment format (envelope schemas 3–4 and transaction
 schemas 4–5) before journal recovery or child publication. Candidate gates use
 schema 5; execution context with a verification assessment uses schema 2.
@@ -4194,15 +4197,17 @@ authorization. Both forms apply their authorized delta to the Attempt's current
 contract, retaining every non-Approach row, including adopted Plan splits and
 earlier Test-reference revisions. The neutral boundary replays both kinds of
 planning revision in order before source selection, exact retry, or corrective
-Writer materialization. The revision command writes the immutable audit sidecar
-before a single aggregate journal publishes its reference with the planning,
-completion contract, recovery binding, and one corrective Writer; the sidecar
-alone never launches execution or establishes authority. An interrupted retry
-can recover identical sidecar bytes, while an unreferenced orphan is ignored as
-an accepted revision and conflicting bytes fail closed. Host evidence keeps its
-original source contract and bytes, while changed Approach rows remain pending
-until the corrective Writer completes them. A changed audit or source digest
-prevents replay without rewriting preserved history.
+Writer materialization. The revision command journals the immutable audit as a
+managed file in that same aggregate transaction before it publishes the file's
+reference with the planning, completion contract, recovery binding, and one
+corrective Writer. Before transaction application, no audit sidecar exists;
+during recoverable application, a pending transaction may expose the managed
+bytes, but the file alone never launches execution or establishes authority. An
+interrupted retry recovers the exact journaled bytes, while an unreferenced file
+is ignored as an accepted revision and conflicting bytes fail closed. Host
+evidence keeps its original source contract and bytes, while changed Approach
+rows remain pending until the corrective Writer completes them. A changed audit
+or source digest prevents replay without rewriting preserved history.
 The shared evidence validator checks an active receipt against its recorded
 Writer and candidate. Once every targeted Plan review passes, Attempt execution
 settles that receipt before advancing a correction; queue admission checks the
