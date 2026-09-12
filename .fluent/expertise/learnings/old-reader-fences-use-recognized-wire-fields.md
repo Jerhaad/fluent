@@ -24,5 +24,12 @@ verify refusal through the older public command, including pending recovery.
 That pattern also preserves separate coverage for a schema check behind an
 earlier envelope refusal.
 
+Treat compatibility as an explicit allowlist rather than a numeric range. A
+temporary writer format can make supported envelope or transaction schemas
+non-contiguous; reject an unsupported intermediate format before journal
+recovery or child publication. Exercise each relevant pinned reader against
+both published and pending state so an older mutator cannot rewrite a newer
+authority through a less-visible path.
+
 Related: [[backward-compatible-serde-fields]],
 [[semantic-validation-tests-reach-target-branch]].

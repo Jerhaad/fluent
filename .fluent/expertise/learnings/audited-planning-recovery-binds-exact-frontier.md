@@ -33,6 +33,13 @@ ordinary Writer matrix, rather than requiring an ownership-adoption artifact.
 An unchanged host obligation may retain accepted evidence only when its exact
 candidate, row, command, source bytes, and targeted review still agree.
 
+Apply each audit variant's own frontier invariant during historical replay as
+well as initial admission and exact retry. A round-cap Approach audit must keep
+proving its extension against the actual pre-extension Writer frontier after
+the corrective Writer completes; comparing historical state only with the
+latest composed contract can accept altered authorization or strand a later
+revision.
+
 Verify recovery composition through public commands, including interleaved
 Approach and Test-reference revisions, both intake and adopted ownership, and
 a successful corrective Writer. Continue through evidence consumption and the
