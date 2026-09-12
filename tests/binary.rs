@@ -20968,6 +20968,36 @@ fn snapshot_tree(root: &Path) -> Vec<SnapshotEntry> {
     entries
 }
 
+fn restore_snapshot_preserving(root: &Path, before: &[SnapshotEntry], preserve: &Path) {
+    let preserve_relative = preserve.strip_prefix(root).unwrap();
+    let current = snapshot_tree(root);
+    for entry in current.iter().rev() {
+        let is_preserved =
+            entry.path == preserve_relative || preserve_relative.starts_with(&entry.path);
+        if is_preserved || before.iter().any(|saved| saved.path == entry.path) {
+            continue;
+        }
+        let path = root.join(&entry.path);
+        match entry.kind {
+            "directory" => fs::remove_dir(&path).unwrap(),
+            "file" | "symlink" => fs::remove_file(&path).unwrap(),
+            kind => panic!("unknown snapshot entry kind {kind:?}"),
+        }
+    }
+    for entry in before {
+        let path = root.join(&entry.path);
+        match entry.kind {
+            "directory" => fs::create_dir_all(&path).unwrap(),
+            "file" => {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, &entry.bytes).unwrap();
+            }
+            "symlink" => panic!("snapshot restoration does not support symlinks"),
+            kind => panic!("unknown snapshot entry kind {kind:?}"),
+        }
+    }
+}
+
 fn persisted_work_snapshot(project_root: &Path, work_item_id: &str) -> Vec<SnapshotEntry> {
     let roots = [
         (
@@ -37377,6 +37407,103 @@ fn round_cap_approach_revision_rejects_conflicting_pending_audit() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_handles_unbound_preexisting_sidecars() {
+    let matching = setup_round_cap_approach_revision_fixture();
+    let (matching_path, matching_bytes) = prepare_unbound_round_cap_sidecar(&matching);
+
+    revise_round_cap_approach(&matching).success();
+    let matching_after = matching.store.read_work_item("work-1").unwrap();
+    assert_eq!(
+        matching_after.attempts[0]
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+            .count(),
+        1
+    );
+    assert_eq!(
+        matching_after.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.role == "approach-revision-correction")
+            .count(),
+        1
+    );
+    assert_eq!(fs::read(&matching_path).unwrap(), matching_bytes);
+    let matching_model = serde_json::to_vec(&matching_after).unwrap();
+    revise_round_cap_approach(&matching)
+        .success()
+        .stdout(predicate::str::contains("already applied"));
+    assert_eq!(
+        serde_json::to_vec(&matching.store.read_work_item("work-1").unwrap()).unwrap(),
+        matching_model
+    );
+    assert_eq!(fs::read(&matching_path).unwrap(), matching_bytes);
+
+    let conflicting = setup_round_cap_approach_revision_fixture();
+    let (conflicting_path, valid_bytes) = prepare_unbound_round_cap_sidecar(&conflicting);
+    let mut conflicting_value: serde_json::Value = serde_json::from_slice(&valid_bytes).unwrap();
+    let conflicting_approach = "# Conflicting prewritten Approach\n";
+    conflicting_value["replacement-approach"] = serde_json::json!(conflicting_approach);
+    conflicting_value["replacement-approach-sha256"] = serde_json::json!(format!(
+        "{:x}",
+        Sha256::digest(conflicting_approach.as_bytes())
+    ));
+    let conflicting_bytes = serde_json::to_vec_pretty(&conflicting_value).unwrap();
+    fs::write(&conflicting_path, &conflicting_bytes).unwrap();
+
+    revise_round_cap_approach(&conflicting).success();
+    let conflicting_after = conflicting.store.read_work_item("work-1").unwrap();
+    let registered_path = conflicting_after.attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .map(|artifact| conflicting.main_dir.join(&artifact.path))
+        .unwrap();
+    assert_ne!(registered_path, conflicting_path);
+    assert_eq!(fs::read(&conflicting_path).unwrap(), conflicting_bytes);
+    let registered_bytes = fs::read(&registered_path).unwrap();
+    let conflicting_model = serde_json::to_vec(&conflicting_after).unwrap();
+    revise_round_cap_approach(&conflicting)
+        .success()
+        .stdout(predicate::str::contains("already applied"));
+    assert_eq!(
+        serde_json::to_vec(&conflicting.store.read_work_item("work-1").unwrap()).unwrap(),
+        conflicting_model
+    );
+    assert_eq!(fs::read(&conflicting_path).unwrap(), conflicting_bytes);
+    assert_eq!(fs::read(&registered_path).unwrap(), registered_bytes);
+
+    let unparseable = setup_round_cap_approach_revision_fixture();
+    let (unparseable_path, _) = prepare_unbound_round_cap_sidecar(&unparseable);
+    let unparseable_bytes = b"not a revision audit\n".to_vec();
+    fs::write(&unparseable_path, &unparseable_bytes).unwrap();
+    let unparseable_before = fs::read(unparseable.store.work_item_path("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach(&unparseable)
+        .failure()
+        .stderr(predicate::str::contains(
+            "already exists with different bytes",
+        ));
+    assert_eq!(
+        fs::read(unparseable.store.work_item_path("work-1").unwrap()).unwrap(),
+        unparseable_before
+    );
+    assert_eq!(fs::read(&unparseable_path).unwrap(), unparseable_bytes);
+    revise_round_cap_approach(&unparseable)
+        .failure()
+        .stderr(predicate::str::contains(
+            "already exists with different bytes",
+        ));
+    assert_eq!(
+        fs::read(unparseable.store.work_item_path("work-1").unwrap()).unwrap(),
+        unparseable_before
+    );
+    assert_eq!(fs::read(&unparseable_path).unwrap(), unparseable_bytes);
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resumes_through_public_routes() {
     let direct = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&direct);
@@ -39287,6 +39414,69 @@ fn revise_round_cap_approach_before_publication(
             "before-work-model-publication",
         )
         .assert()
+}
+
+fn prepare_unbound_round_cap_sidecar(
+    fixture: &RoundCapApproachRevisionFixture,
+) -> (PathBuf, Vec<u8>) {
+    approve_round_cap_extension(fixture);
+    let work_root = fixture.main_dir.join(".fluent/work");
+    let before_work = snapshot_tree(&work_root);
+    let approach_path = fixture
+        .main_dir
+        .join(".fluent/work/items/work-1/approach.md");
+    let before_approach = fixture.prior_approach.as_bytes().to_vec();
+
+    revise_round_cap_approach(fixture).success();
+    let revised = fixture.store.read_work_item("work-1").unwrap();
+    let audit_ref = revised.attempts[0]
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .unwrap();
+    let generated_audit_path = fixture.main_dir.join(&audit_ref.path);
+    let audit_bytes = fs::read(&generated_audit_path).unwrap();
+    let revision_input = format!(
+        "{}\0{}\0{}",
+        fixture.prior_approach, fixture.replacement, fixture.resolution
+    );
+    let legacy_revision_id = format!(
+        "revision-{}",
+        &format!("{:x}", Sha256::digest(revision_input.as_bytes()))[..12]
+    );
+    let audit_path = fixture.main_dir.join(format!(
+        ".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions/{legacy_revision_id}/revision.json"
+    ));
+
+    restore_snapshot_preserving(&work_root, &before_work, &audit_path);
+    fs::create_dir_all(audit_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(approach_path.parent().unwrap()).unwrap();
+    assert_ne!(generated_audit_path, audit_path);
+    let generated_revision_id = generated_audit_path
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let audit_text = String::from_utf8(audit_bytes).unwrap();
+    let audit_bytes = audit_text
+        .replace(
+            &format!("\"revision-id\": \"{generated_revision_id}\""),
+            &format!("\"revision-id\": \"{legacy_revision_id}\""),
+        )
+        .into_bytes();
+    fs::write(&audit_path, &audit_bytes).unwrap();
+    fs::write(&approach_path, before_approach).unwrap();
+    let restored = fixture.store.read_work_item("work-1").unwrap();
+    assert!(
+        restored.attempts[0]
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.producer_id != "planning-approach-recovery")
+    );
+    assert_eq!(fs::read(&audit_path).unwrap(), audit_bytes);
+    (audit_path, audit_bytes)
 }
 
 fn setup_legacy_ownership_fixture(tmp: &TempDir, id: &str) -> (PathBuf, String, PathBuf) {
