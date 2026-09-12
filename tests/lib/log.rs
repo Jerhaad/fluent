@@ -227,7 +227,7 @@ fn logged_command_reaps_descendants_before_returning() {
     let mut command = std::process::Command::new("/bin/sh");
     command.args([
         "-c",
-        "sleep 1 & echo $! > \"$1\"",
+        "sleep 2 & echo $! > \"$1\"",
         "logged-command-process-group",
         pid_path.to_str().unwrap(),
     ]);
@@ -241,11 +241,12 @@ fn logged_command_reaps_descendants_before_returning() {
         .parse()
         .unwrap();
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(500),
+        started.elapsed() < std::time::Duration::from_secs(1),
         "LoggedCommand waited for the descendant instead of sweeping it"
     );
     assert!(
-        unsafe { libc::kill(descendant, 0) } == -1,
+        unsafe { libc::kill(descendant, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
         "LoggedCommand left descendant process {descendant}"
     );
 }
