@@ -891,6 +891,23 @@ Check item {{ITEM_ID}}.
     }
 
     #[test]
+    fn bundled_fluent_skill_points_to_self_contained_round_cap_recovery() {
+        let skill = bundled_skill_content("fluent/SKILL.md")
+            .expect("bundled fluent skill must have SKILL.md");
+        assert!(skill.contains("references/round-cap-approach-recovery.md"));
+
+        let guide = bundled_skill_content("fluent/references/round-cap-approach-recovery.md")
+            .expect("bundled round-cap recovery guide must be present");
+        assert!(guide.contains("## Contents"));
+        assert!(guide.contains("fluent attempt extend <work-item-id> <attempt-id>"));
+        assert!(guide.contains("fluent attempt revise-approach <work-item-id> <attempt-id>"));
+        assert!(guide.contains("fluent queue resume <work-item-id> --attempt <attempt-id>"));
+        assert!(guide.contains("fluent attempt run <work-item-id> <attempt-id>"));
+        assert!(guide.contains("Exact retries reuse the same revision and Writer"));
+        assert!(guide.contains("later host, Tester, review, and Learning gates"));
+    }
+
+    #[test]
     fn living_host_evidence_recovery_docs_require_fail_closed_replay() {
         let architecture = read_living_doc("documentation/architecture.md");
         let guide = read_living_doc("skills/fluent.full/references/host-evidence-recovery.md");

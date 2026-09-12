@@ -271,26 +271,7 @@ fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path
 Then resume with `fluent queue resume <work-item-id> --attempt <attempt-id>` or
 foreground `fluent attempt run <work-item-id> <attempt-id>`.
 
-For a failed-review `round-cap` pause, first run:
-
-```text
-fluent attempt extend <work-item-id> <attempt-id> --additional-write-rounds N --resolution '<authorization>'
-```
-
-The extension must bind the same candidate and exact failed-review bytes while
-leaving an unused Writer round. Then submit the replacement Approach, even when
-Architecture passed and another review failed:
-
-```text
-fluent attempt revise-approach <work-item-id> <attempt-id> --approach-file <path> --resolution '<authorization>'
-```
-
-Fluent writes the immutable audit sidecar, then publishes planning and the Writer
-completion contract with its audit reference in one recoverable transaction. It
-prepares one corrective Writer and retains later host, Tester, review, and
-Learning gates. Exact retries reuse the same revision and Writer; changed
-candidate, review, authorization, cancellation, or unsupported state is
-rejected.
+For a failed-review `round-cap` pause, read [round-cap Approach recovery](references/round-cap-approach-recovery.md) before acting; it covers extension, revision, explicit resume, exact retry, and later gates.
 
 ### Recover a host-evidence finding
 

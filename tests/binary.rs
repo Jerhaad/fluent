@@ -20823,6 +20823,11 @@ fn write_mock_claude(bin_dir: &Path, script: &str) {
     }
 }
 
+fn write_sandboxed_mock_claude(bin_dir: &Path, script: &str) {
+    write_mock_claude(bin_dir, script);
+    write_mock_sandbox_exec(bin_dir);
+}
+
 fn write_executable_hook(project_root: &Path, name: &str, script: &str) {
     let hooks_dir = project_root.join(".fluent/hooks");
     fs::create_dir_all(&hooks_dir).unwrap();
@@ -36525,6 +36530,31 @@ fn round_cap_approach_revision_rejects_changed_extension_candidate() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_rejects_malformed_extension_bounds() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let attempt_path = fixture
+        .main_dir
+        .join(".fluent/work/attempts/work-1/attempt-1.json");
+    let mut attempt = read_json_path(&attempt_path);
+    attempt["round_cap_extensions"][0]["new_cap"] = serde_json::json!(100);
+    write_json_path(&attempt_path, &attempt);
+    let before = snapshot_tree(&fixture.main_dir.join(".fluent/work"));
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains("round-cap extension"));
+
+    assert_eq!(
+        snapshot_tree(&fixture.main_dir.join(".fluent/work")),
+        before,
+        "malformed cap authorization must not publish a revision"
+    );
+    assert_no_round_cap_revision(&fixture);
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_rejects_changed_failed_review_bytes() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
@@ -36662,6 +36692,12 @@ fn round_cap_approach_revision_queue_resume_recovers_cancellation() {
             .count(),
         1
     );
+    let corrective = attempt
+        .tasks
+        .iter()
+        .find(|task| task.role == "approach-revision-correction")
+        .expect("cancellation recovery must retain its corrective Writer");
+    assert_task_settled(&fixture.main_dir, "work-1", corrective);
 }
 
 #[test]
@@ -37254,6 +37290,57 @@ fn round_cap_approach_revision_recovers_prewritten_audit_before_publication() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_rejects_conflicting_prewritten_audit() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    approve_round_cap_extension(&fixture);
+    let before = serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap();
+
+    revise_round_cap_approach_before_publication(&fixture).failure();
+
+    let revisions_dir = fixture
+        .main_dir
+        .join(".fluent/work/artifacts/work-1/attempt-1/planning-approach-revisions");
+    let revision_dir = fs::read_dir(&revisions_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .expect("prewritten revision audit directory");
+    let audit_path = revision_dir.join("revision.json");
+    let conflicting = serde_json::to_vec_pretty(&serde_json::json!({
+        "conflicting": true
+    }))
+    .unwrap();
+    fs::write(&audit_path, &conflicting).unwrap();
+
+    revise_round_cap_approach(&fixture)
+        .failure()
+        .stderr(predicate::str::contains(
+            "already exists with different bytes",
+        ));
+
+    assert_eq!(
+        serde_json::to_vec(&fixture.store.read_work_item("work-1").unwrap()).unwrap(),
+        before,
+        "conflicting audit bytes must not publish aggregate authority"
+    );
+    assert_eq!(fs::read(&audit_path).unwrap(), conflicting);
+    assert!(
+        !fixture
+            .main_dir
+            .join(".fluent/work/transactions/work-1.json")
+            .exists()
+    );
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    assert!(
+        stored.attempts[0]
+            .tasks
+            .iter()
+            .all(|task| task.role != "approach-revision-correction")
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resumes_through_public_routes() {
     let direct = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&direct);
@@ -37277,7 +37364,7 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
     .unwrap();
     let direct_prompt_log = direct._tmp.path().join("direct-provider-prompts.log");
     let direct_bin = direct._tmp.path().join("direct-provider");
-    write_mock_claude(
+    write_sandboxed_mock_claude(
         &direct_bin,
         &round_cap_resume_provider_script(&direct_prompt_log),
     );
@@ -37285,7 +37372,7 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .failure();
     assert_eq!(
@@ -37302,7 +37389,7 @@ fn round_cap_approach_revision_resumes_through_public_routes() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
     let direct_after = direct.store.read_work_item("work-1").unwrap();
@@ -37402,11 +37489,11 @@ fn round_cap_approach_revision_replays_historical_plan_applicability_in_source_w
         ._tmp
         .path()
         .join("historical-applicability-provider");
-    write_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+    write_sandboxed_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
     fluent_cmd()
         .current_dir(&fixture.main_dir)
         .env("PATH", mock_path(&bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
 
@@ -37456,13 +37543,13 @@ fn round_cap_approach_revision_resumes_after_a_second_revision() {
 
     let prompt_log = fixture._tmp.path().join("two-revision-prompts.log");
     let bin = fixture._tmp.path().join("two-revision-provider");
-    write_mock_claude(&bin, &round_cap_two_revision_provider_script(&prompt_log));
+    write_sandboxed_mock_claude(&bin, &round_cap_two_revision_provider_script(&prompt_log));
     revise_round_cap_approach(&fixture).success();
     fluent_cmd()
         .current_dir(&fixture.main_dir)
         .env("PATH", mock_path(&bin))
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
 
@@ -37511,7 +37598,7 @@ fn round_cap_approach_revision_resumes_after_a_second_revision() {
         .current_dir(&fixture.main_dir)
         .env("PATH", mock_path(&bin))
         .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
 
@@ -37555,13 +37642,73 @@ fn round_cap_approach_revision_resumes_after_a_second_revision() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_does_not_deduplicate_a_new_frontier() {
+    let fixture = setup_round_cap_approach_revision_fixture();
+    make_round_cap_behavior_testable(&fixture);
+    approve_round_cap_extension(&fixture);
+
+    let prompt_log = fixture._tmp.path().join("same-input-frontier-prompts.log");
+    let bin = fixture._tmp.path().join("same-input-frontier-provider");
+    write_sandboxed_mock_claude(&bin, &round_cap_two_revision_provider_script(&prompt_log));
+    revise_round_cap_approach(&fixture).success();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+            "--resolution",
+            &fixture.resolution,
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+        .assert()
+        .success();
+    revise_round_cap_approach_with_values(&fixture, &fixture.replacement, &fixture.resolution)
+        .success();
+
+    let stored = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &stored.attempts[0];
+    let audits: Vec<_> = attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.producer_id == "planning-approach-recovery")
+        .collect();
+    assert_eq!(audits.len(), 2, "a new bound frontier needs a new audit");
+    assert_ne!(
+        read_json_path(&fixture.main_dir.join(&audits[0].path))["revision-id"],
+        read_json_path(&fixture.main_dir.join(&audits[1].path))["revision-id"],
+        "same text on a new candidate frontier must not reuse the old identity"
+    );
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.role == "approach-revision-correction")
+            .count(),
+        2
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     let direct = setup_round_cap_approach_revision_fixture_with_downstream_gates();
     approve_round_cap_extension(&direct);
     revise_round_cap_approach(&direct).success();
     let direct_prompt_log = direct._tmp.path().join("direct-gates-provider-prompts.log");
     let direct_bin = direct._tmp.path().join("direct-gates-provider");
-    write_mock_claude(
+    write_sandboxed_mock_claude(
         &direct_bin,
         &round_cap_downstream_provider_script(&direct_prompt_log),
     );
@@ -37569,7 +37716,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
     let direct_after = direct.store.read_work_item("work-1").unwrap();
@@ -37615,7 +37762,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("plan:step-2"));
@@ -37641,7 +37788,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("digest changed"));
@@ -37658,7 +37805,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .success();
     assert_round_cap_downstream_completion(&direct);
@@ -37667,7 +37814,7 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
     fluent_cmd()
         .current_dir(&direct.main_dir)
         .env("PATH", mock_path(&direct_bin))
-        .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+        .args(["attempt", "run", "work-1", "attempt-1"])
         .assert()
         .failure();
     assert_eq!(
@@ -37810,18 +37957,18 @@ fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
                 "candidate-ready",
             );
         } else {
-            write_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
+            write_sandboxed_mock_claude(&bin, &round_cap_downstream_provider_script(&prompt_log));
             fluent_cmd()
                 .current_dir(&fixture.main_dir)
                 .env("PATH", mock_path(&bin))
-                .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                .args(["attempt", "run", "work-1", "attempt-1"])
                 .assert()
                 .success();
             attach_round_cap_host_evidence(&fixture, "foreground-tamper");
             fluent_cmd()
                 .current_dir(&fixture.main_dir)
                 .env("PATH", mock_path(&bin))
-                .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                .args(["attempt", "run", "work-1", "attempt-1"])
                 .assert()
                 .success();
         }
@@ -37858,7 +38005,7 @@ fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
                 fluent_cmd()
                     .current_dir(&fixture.main_dir)
                     .env("PATH", mock_path(&bin))
-                    .args(["attempt", "run", "work-1", "attempt-1", "--no-sandbox"])
+                    .args(["attempt", "run", "work-1", "attempt-1"])
                     .assert()
                     .failure()
                     .stderr(predicate::str::contains(diagnostic));
@@ -38213,6 +38360,8 @@ fn assert_round_cap_downstream_completion(fixture: &RoundCapApproachRevisionFixt
         .iter()
         .rposition(|task| task.kind == fluent::work_model::TaskKind::Write)
         .unwrap();
+    let latest_writer = &attempt.tasks[latest_writer_index];
+    assert_task_settled(&fixture.main_dir, "work-1", latest_writer);
     assert!(attempt.tasks[latest_writer_index + 1..].iter().all(|task| {
         task.kind != fluent::work_model::TaskKind::Review
             || task.status == fluent::work_model::TaskStatus::Complete
@@ -38363,6 +38512,7 @@ fn assert_round_cap_writer_prompt(
         .iter()
         .find(|task| task.role == "approach-revision-correction")
         .unwrap();
+    assert_task_settled(&fixture.main_dir, "work-1", corrective);
     for artifact in &corrective.input_artifacts {
         if artifact.producer_id == "planning-approach-recovery" {
             continue;
@@ -38381,6 +38531,36 @@ fn assert_round_cap_writer_prompt(
         fs::read_to_string(approach_path).unwrap(),
         fixture.replacement
     );
+}
+
+fn assert_task_settled(project_root: &Path, work_item_id: &str, task: &fluent::work_model::Task) {
+    assert_eq!(task.status, fluent::work_model::TaskStatus::Complete);
+    assert!(!fluent::lease::is_leased(&fluent::lease::task_lock_path(
+        project_root,
+        work_item_id,
+        &task.id,
+    )));
+    let area = task
+        .artifact_area
+        .as_ref()
+        .expect("settled Task must retain an artifact area");
+    let execution_path = fluent::execution::record_path_for_artifact(project_root, &area.path);
+    let record: fluent::execution::ExecutionRecord =
+        serde_json::from_slice(&fs::read(&execution_path).unwrap_or_else(|error| {
+            panic!(
+                "settled Task must retain execution record {}: {error}",
+                execution_path.display()
+            )
+        }))
+        .unwrap_or_else(|error| {
+            panic!(
+                "settled Task execution record must be readable {}: {error}",
+                execution_path.display()
+            )
+        });
+    assert_eq!(record.state, fluent::execution::ExecutionState::Settled);
+    assert!(record.settled_at.is_some());
+    assert!(!fluent::execution::execution_is_live(&execution_path).unwrap());
 }
 
 fn round_cap_approach_revision_old_reader(variable: &str, source_commit: &str) -> PathBuf {

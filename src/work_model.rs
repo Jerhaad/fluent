@@ -5344,6 +5344,80 @@ impl RoundCapExtension {
         }
         Ok(())
     }
+
+    fn validate_structure(
+        &self,
+        previous: Option<&RoundCapExtension>,
+        current_evidence_write_rounds: usize,
+    ) -> Result<(), WorkModelError> {
+        if !(MIN_ADDITIONAL_WRITE_ROUNDS..=MAX_ADDITIONAL_WRITE_ROUNDS)
+            .contains(&self.additional_write_rounds)
+        {
+            return Err(WorkModelError::RoundCapExtensionIncrementOutOfRange {
+                requested: self.additional_write_rounds,
+            });
+        }
+        let expected_new_cap = self
+            .old_cap
+            .checked_add(self.additional_write_rounds)
+            .ok_or_else(|| WorkModelError::RoundCapExtensionIneligible {
+                reason: "the approved cap arithmetic overflows".to_string(),
+            })?;
+        if self.new_cap != expected_new_cap {
+            return Err(WorkModelError::RoundCapExtensionIneligible {
+                reason: format!(
+                    "new cap {} does not equal old cap {} plus the approved increment {}",
+                    self.new_cap, self.old_cap, self.additional_write_rounds
+                ),
+            });
+        }
+        if self.id != format!("round-cap-{}-{}", self.old_cap, self.new_cap) {
+            return Err(WorkModelError::RoundCapExtensionIneligible {
+                reason: "the extension identity does not match its cap bounds".to_string(),
+            });
+        }
+        if self.candidate_commit.trim().is_empty() || self.approved_at.trim().is_empty() {
+            return Err(WorkModelError::RoundCapExtensionIneligible {
+                reason: "the extension is missing its candidate or approval timestamp".to_string(),
+            });
+        }
+        if self.evidence_write_rounds > current_evidence_write_rounds {
+            return Err(WorkModelError::RoundCapExtensionIneligible {
+                reason: format!(
+                    "the extension records {} evidence Writer rounds, but only {} exist",
+                    self.evidence_write_rounds, current_evidence_write_rounds
+                ),
+            });
+        }
+        if let Some(previous) = previous {
+            let evidence_delta = current_evidence_write_rounds
+                .checked_sub(previous.evidence_write_rounds)
+                .ok_or_else(|| WorkModelError::RoundCapExtensionIneligible {
+                    reason: "evidence Writer rounds moved backward between extensions".to_string(),
+                })?;
+            let expected_old_cap =
+                previous
+                    .new_cap
+                    .checked_add(evidence_delta)
+                    .ok_or_else(|| WorkModelError::RoundCapExtensionIneligible {
+                        reason: "the extension chain cap arithmetic overflows".to_string(),
+                    })?;
+            if self.old_cap != expected_old_cap {
+                return Err(WorkModelError::RoundCapExtensionIneligible {
+                    reason: format!(
+                        "old cap {} does not continue the preceding cap {} and evidence delta {}",
+                        self.old_cap, previous.new_cap, evidence_delta
+                    ),
+                });
+            }
+        } else if self.old_cap < self.evidence_write_rounds {
+            return Err(WorkModelError::RoundCapExtensionIneligible {
+                reason: "the old cap does not include the recorded evidence Writer rounds"
+                    .to_string(),
+            });
+        }
+        self.validate_human_resolution()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5896,6 +5970,7 @@ impl Attempt {
                         .last()
                         .is_some_and(|extension| extension.new_cap > write_rounds)
                 {
+                    self.validate_round_cap_extensions()?;
                     Ok(())
                 } else {
                     Err(ineligible(
@@ -6021,11 +6096,22 @@ impl Attempt {
             .count()
     }
 
+    pub(crate) fn validate_round_cap_extensions(&self) -> Result<(), WorkModelError> {
+        let current_evidence_write_rounds = self.evidence_write_rounds();
+        let mut previous = None;
+        for extension in &self.round_cap_extensions {
+            extension.validate_structure(previous, current_evidence_write_rounds)?;
+            previous = Some(extension);
+        }
+        Ok(())
+    }
+
     pub fn record_round_cap_extension(
         &mut self,
         base_cap: usize,
         request: RoundCapExtensionRequest,
     ) -> Result<&RoundCapExtension, WorkModelError> {
+        self.validate_round_cap_extensions()?;
         let human_resolution = normalize_round_cap_resolution(&request.human_resolution)?;
         if !(MIN_ADDITIONAL_WRITE_ROUNDS..=MAX_ADDITIONAL_WRITE_ROUNDS)
             .contains(&request.additional_write_rounds)

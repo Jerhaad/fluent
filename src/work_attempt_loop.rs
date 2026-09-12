@@ -2324,6 +2324,7 @@ fn validate_round_cap_frontier(
     attempt: &Attempt,
     extension: &RoundCapExtension,
 ) -> Result<(), WorkModelError> {
+    attempt.validate_round_cap_extensions()?;
     extension.validate_human_resolution()?;
     let failed_reviews = round_cap_failure_frontier(project_root, attempt).map_err(|error| {
         round_cap_ineligible(format!(
@@ -15097,7 +15098,7 @@ mod tests {
                 item.attempts[0]
                     .round_cap_extensions
                     .push(crate::work_model::RoundCapExtension {
-                        id: "fixture-cap-2".to_string(),
+                        id: "round-cap-1-2".to_string(),
                         old_cap: 1,
                         new_cap: 2,
                         additional_write_rounds: 1,

@@ -70,17 +70,26 @@ pub fn revise(
         "revision-{}",
         &digest(format!("{}\0{}\0{}", prior_approach, replacement, resolution).as_bytes())[..12]
     );
-    let audit_artifact = work_artifact_path(
-        work_item_id,
-        attempt_id,
-        &format!("planning-approach-revisions/{revision_id}/revision.json"),
-    );
-    if let Some(existing) =
-        existing_revision(project_root, &item, attempt, &replacement, resolution)?
-    {
+    let current_round_cap_frontier = (attempt.status == AttemptStatus::NeedsUser
+        && attempt.pause_kind == Some(PauseKind::RoundCap)
+        && attempt.review_state == Some(crate::work_model::AttemptReviewState::Failed))
+    .then(|| frontier(project_root, attempt))
+    .transpose()?;
+    if let Some(existing) = existing_revision(
+        project_root,
+        &item,
+        attempt,
+        context,
+        &replacement,
+        resolution,
+        current_round_cap_frontier.as_ref(),
+    )? {
         return Ok(existing);
     }
-    let audited_frontier = frontier(project_root, attempt)?;
+    let audited_frontier = match current_round_cap_frontier {
+        Some(frontier) => frontier,
+        None => frontier(project_root, attempt)?,
+    };
     let legacy_cap_extension = audited_frontier.legacy_reconciliation.is_some();
     let round_cap_revision = audited_frontier.round_cap_extension.is_some();
     if !round_cap_revision
@@ -173,7 +182,7 @@ pub fn revise(
         })
         .transpose()?;
 
-    let audit = RevisionAudit {
+    let mut audit = RevisionAudit {
         schema_version: if round_cap_revision {
             ROUND_CAP_SCHEMA_VERSION
         } else {
@@ -205,6 +214,15 @@ pub fn revise(
         round_cap_extension: audited_frontier.round_cap_extension.clone(),
         supporting_reviews,
     };
+    let (revision_id, audit_artifact) = select_revision_identity(
+        project_root,
+        work_item_id,
+        attempt_id,
+        &revision_id,
+        &audit,
+        round_cap_revision,
+    )?;
+    audit.revision_id = revision_id.clone();
     let audit_bytes = serde_json::to_vec_pretty(&audit)?;
     write_once(&project_root.join(&audit_artifact), &audit_bytes)?;
     #[cfg(feature = "test-support")]
@@ -728,16 +746,33 @@ fn existing_revision(
     project_root: &Path,
     item: &crate::work_model::WorkItem,
     attempt: &Attempt,
+    context: &crate::work_model::PlanningContext,
     replacement: &str,
     resolution: &str,
+    current_round_cap_frontier: Option<&Frontier<'_>>,
 ) -> Result<Option<ApproachRevision>> {
-    for artifact in &attempt.artifacts {
+    for artifact in attempt.artifacts.iter().rev() {
         if artifact.producer_id != PRODUCER || !artifact.path.ends_with("/revision.json") {
             continue;
         }
         let audit: RevisionAudit =
             serde_json::from_slice(&fs::read(project_root.join(&artifact.path))?)?;
         if audit.replacement_approach == replacement && audit.resolution == resolution {
+            if let Some(frontier) = current_round_cap_frontier {
+                let expected = expected_round_cap_revision_audit(
+                    project_root,
+                    attempt,
+                    context,
+                    frontier,
+                    replacement,
+                    resolution,
+                )?;
+                if audit.revision_kind != ApproachRevisionKind::FailedReviewRoundCap
+                    || !audit_identity_matches(&audit, &expected)
+                {
+                    continue;
+                }
+            }
             if audit.revision_kind == ApproachRevisionKind::FailedReviewRoundCap {
                 crate::recovery_contracts::validate_round_cap_approach_revision_retry(
                     project_root,
@@ -767,6 +802,122 @@ fn existing_revision(
         }
     }
     Ok(None)
+}
+
+fn expected_round_cap_revision_audit(
+    project_root: &Path,
+    attempt: &Attempt,
+    context: &crate::work_model::PlanningContext,
+    frontier: &Frontier<'_>,
+    replacement: &str,
+    resolution: &str,
+) -> Result<RevisionAudit> {
+    let old_contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("Attempt has no authoritative completion contract")?;
+    let writer = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write && task.status == TaskStatus::Complete)
+        .context("Attempt has no completed Writer candidate")?;
+    let source_completion = capture_source_completion(project_root, attempt, writer, old_contract)?
+        .context("round-cap Approach revision requires source completion evidence")?;
+    let prior_approach = context
+        .approach
+        .as_deref()
+        .context("Work Item has no approved Approach")?;
+    let extension = frontier
+        .round_cap_extension
+        .clone()
+        .context("round-cap frontier has no approved extension")?;
+
+    Ok(RevisionAudit {
+        schema_version: ROUND_CAP_SCHEMA_VERSION,
+        revision_kind: ApproachRevisionKind::FailedReviewRoundCap,
+        revision_id: String::new(),
+        work_item_id: attempt.work_item_id.clone(),
+        attempt_id: attempt.id.clone(),
+        candidate_commit: frontier.candidate_commit.clone(),
+        source_review_task_id: frontier.source_review.id.clone(),
+        superseded_task_id: frontier.failed_launch.as_ref().map(|task| task.id.clone()),
+        prior_contract: Some(old_contract.clone()),
+        source_completion: Some(source_completion),
+        prior_approach_sha256: digest(prior_approach.as_bytes()),
+        replacement_approach_sha256: digest(replacement.as_bytes()),
+        prior_approach: prior_approach.to_string(),
+        replacement_approach: replacement.to_string(),
+        resolution: resolution.to_string(),
+        resolution_sha256: digest(resolution.as_bytes()),
+        legacy_reconciliation: None,
+        round_cap_extension: Some(extension),
+        supporting_reviews: frontier.supporting_reviews.clone().unwrap_or_default(),
+    })
+}
+
+fn audit_identity_matches(left: &RevisionAudit, right: &RevisionAudit) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.revision_id.clear();
+    right.revision_id.clear();
+    left == right
+}
+
+fn select_revision_identity(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    legacy_revision_id: &str,
+    audit: &RevisionAudit,
+    use_full_frontier_identity: bool,
+) -> Result<(String, String)> {
+    let legacy_artifact = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("planning-approach-revisions/{legacy_revision_id}/revision.json"),
+    );
+    let legacy_path = project_root.join(&legacy_artifact);
+    let existing_bytes = match fs::read(&legacy_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return if use_full_frontier_identity {
+                full_revision_identity(project_root, work_item_id, attempt_id, audit)
+            } else {
+                Ok((legacy_revision_id.to_string(), legacy_artifact))
+            };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(existing) = serde_json::from_slice::<RevisionAudit>(&existing_bytes) else {
+        // Leave an unparseable sidecar at the legacy path so write_once can
+        // fail closed instead of publishing a new audit over conflicting data.
+        return Ok((legacy_revision_id.to_string(), legacy_artifact));
+    };
+    if !use_full_frontier_identity || audit_identity_matches(&existing, audit) {
+        return Ok((legacy_revision_id.to_string(), legacy_artifact));
+    }
+    full_revision_identity(project_root, work_item_id, attempt_id, audit)
+}
+
+fn full_revision_identity(
+    project_root: &Path,
+    work_item_id: &str,
+    attempt_id: &str,
+    audit: &RevisionAudit,
+) -> Result<(String, String)> {
+    let mut identity = audit.clone();
+    identity.revision_id.clear();
+    let full_revision_id = format!(
+        "revision-{}",
+        &digest(&serde_json::to_vec(&identity)?)[..12]
+    );
+    let full_artifact = work_artifact_path(
+        work_item_id,
+        attempt_id,
+        &format!("planning-approach-revisions/{full_revision_id}/revision.json"),
+    );
+    Ok((full_revision_id, full_artifact))
 }
 
 fn digest(bytes: &[u8]) -> String {
