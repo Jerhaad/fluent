@@ -90,7 +90,7 @@ with tempfile.TemporaryDirectory(prefix='fluent-evidence-fence-') as temporary:
             assert interrupted.returncode != 0, interrupted.stdout + interrupted.stderr
             journal = work / 'transactions/evidence-fence.json'
             transaction = json.loads(journal.read_text())
-            assert transaction['schema_version'] == 3
+            assert transaction['schema_version'] == 7
             assert transaction['work_item']['attempts'][0]['evidence_recoveries'] == [recovery]
         for command in [('work-item', 'abandon', 'evidence-fence', '--reason', 'must refuse'), ('work-item', 'upgrade', 'evidence-fence')]:
             before = snapshot(work)
