@@ -766,150 +766,164 @@ pub fn resume_with_tester_no_sandbox(
     // matrices, worktrees, and downstream evidence. Do it before taking the
     // project-wide queue lock. An already-matching active resume is the one
     // idempotent receipt-loss path that intentionally skips this full replay;
-    // its model and cancellation identity are checked again below.
-    let preflight_ledger = read_ledger(project_root, id)?;
-    let already_queued = preflight_ledger
-        .as_ref()
-        .and_then(DispatchLedger::active)
-        .is_some_and(|active| {
+    // its model and cancellation identity are checked again below. Re-read
+    // the ledger under the queue lock and restart admission if it changed
+    // while the lock-free validation ran.
+    let mut preflight_ledger =
+        read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
+    loop {
+        let already_queued = preflight_ledger.active().is_some_and(|active| {
             active.intent == DispatchIntent::ResumeAttempt
                 && active.bound_attempt_id.as_deref() == Some(attempt_id)
         });
-    if already_queued {
-        if let Some(attempt) = item
-            .attempts
-            .iter()
-            .find(|attempt| attempt.id == attempt_id)
-        {
-            crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
-        }
-    } else {
-        ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
-        ensure_resume_eligible(
-            project_root,
-            &item,
-            id,
-            attempt_id,
-            legacy_learner_tester_evidence,
-            reconciled_candidate_ancestry_repair,
-            reconciled_candidate_metadata_repair,
-            pending_code_change_classification,
-        )?;
-    }
-
-    let _lock = lock_queue(project_root)?;
-    let mut ledger = read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
-
-    if let Some(active) = ledger.active_mut() {
-        if active.intent == DispatchIntent::ResumeAttempt
-            && active.bound_attempt_id.as_deref() == Some(attempt_id)
-        {
+        if already_queued {
             if let Some(attempt) = item
                 .attempts
                 .iter()
                 .find(|attempt| attempt.id == attempt_id)
             {
-                if attempt.cancellation_requested()
-                    && active.resume_cancellation_requested_at.as_deref()
-                        != attempt
-                            .cancellation
-                            .as_ref()
-                            .map(|stop| stop.requested_at.as_str())
+                crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
+            }
+        } else {
+            ensure_tester_no_sandbox_eligible(&item, id, attempt_id, tester_no_sandbox)?;
+            ensure_resume_eligible(
+                project_root,
+                &item,
+                id,
+                attempt_id,
+                legacy_learner_tester_evidence,
+                reconciled_candidate_ancestry_repair,
+                reconciled_candidate_metadata_repair,
+                pending_code_change_classification,
+            )?;
+        }
+
+        #[cfg(test)]
+        crate::test_lock_probe::reach("queue-lifecycle", id, "resume", "PREFLIGHT");
+
+        let queue_lock = lock_queue(project_root)?;
+        let mut ledger =
+            read_ledger(project_root, id)?.unwrap_or_else(|| DispatchLedger::empty(id));
+        if preflight_ledger != ledger {
+            drop(queue_lock);
+            preflight_ledger = ledger;
+            continue;
+        }
+        let _lock = queue_lock;
+
+        if let Some(active) = ledger.active_mut() {
+            if active.intent == DispatchIntent::ResumeAttempt
+                && active.bound_attempt_id.as_deref() == Some(attempt_id)
+            {
+                if let Some(attempt) = item
+                    .attempts
+                    .iter()
+                    .find(|attempt| attempt.id == attempt_id)
                 {
+                    if attempt.cancellation_requested()
+                        && active.resume_cancellation_requested_at.as_deref()
+                            != attempt
+                                .cancellation
+                                .as_ref()
+                                .map(|stop| stop.requested_at.as_str())
+                    {
+                        bail!(
+                            "active dispatch was admitted before the current cancellation; wait for it to settle or remove it before authorizing a new resume"
+                        );
+                    }
+                }
+                if active.tester_no_sandbox != tester_no_sandbox {
                     bail!(
-                        "active dispatch was admitted before the current cancellation; wait for it to settle or remove it before authorizing a new resume"
+                        "resume of Attempt {attempt_id:?} is already queued with tester_no_sandbox={}; remove it before changing that approval",
+                        active.tester_no_sandbox
                     );
                 }
+                if let Some(priority) = priority {
+                    active.priority = priority;
+                    write_ledger(project_root, &ledger)?;
+                }
+                return Ok(ResumeDispatchOutcome::ExistingMatching);
             }
-            if active.tester_no_sandbox != tester_no_sandbox {
-                bail!(
-                    "resume of Attempt {attempt_id:?} is already queued with tester_no_sandbox={}; remove it before changing that approval",
-                    active.tester_no_sandbox
-                );
-            }
-            if let Some(priority) = priority {
-                active.priority = priority;
-                write_ledger(project_root, &ledger)?;
-            }
-            return Ok(ResumeDispatchOutcome::ExistingMatching);
+            bail!(
+                "Work Item {id:?} already has active dispatch {:?} ({})",
+                active.dispatch_id,
+                active.status
+            );
         }
-        bail!(
-            "Work Item {id:?} already has active dispatch {:?} ({})",
-            active.dispatch_id,
-            active.status
-        );
+
+        let resume_of_dispatch_id = match ledger.latest() {
+            Some(previous) if previous.status == DispatchStatus::Canceled => {
+                // A canceled dispatch is immutable history, not the suspension this
+                // new command authorizes. The current Work-model frontier above is
+                // the authority, so append a fresh exact resume without linking it
+                // to an older (and possibly differently bound) canceled dispatch.
+                None
+            }
+            Some(previous) => {
+                if previous.status != DispatchStatus::NeedsUser
+                    && !(previous.status == DispatchStatus::Failed
+                        && failed_candidate_gate_correction)
+                    && !(previous.status == DispatchStatus::Failed
+                        && reconciled_candidate_ancestry_repair)
+                    && !(previous.status == DispatchStatus::Failed
+                        && reconciled_candidate_metadata_repair)
+                    && !(previous.status == DispatchStatus::Blocked
+                        && reconciled_candidate_metadata_repair)
+                    && !(previous.status == DispatchStatus::Blocked && learner_retry)
+                    && !(previous.status == DispatchStatus::Blocked
+                        && reconciled_tester_harness_repair)
+                    && !(previous.status == DispatchStatus::Blocked && pending_evidence_review)
+                    && !(pending_code_change_classification
+                        && matches!(
+                            previous.status,
+                            DispatchStatus::Failed | DispatchStatus::Blocked
+                        ))
+                    && !(legacy_learner_tester_evidence
+                        && matches!(
+                            previous.status,
+                            DispatchStatus::CandidateReady | DispatchStatus::Blocked
+                        ))
+                {
+                    bail!(
+                        "Work Item {id:?} latest dispatch {:?} is {}, not a resumable suspension",
+                        previous.dispatch_id,
+                        previous.status
+                    );
+                }
+                if previous
+                    .bound_attempt_id
+                    .as_deref()
+                    .is_some_and(|bound| bound != attempt_id)
+                    && !reconciled_evidence_queue_admission
+                {
+                    bail!(
+                        "Work Item {id:?} latest resumable dispatch is bound to Attempt {:?}, not {attempt_id:?}",
+                        previous.bound_attempt_id.as_deref().unwrap_or_default()
+                    );
+                }
+                Some(previous.dispatch_id.clone())
+            }
+            None => None,
+        };
+
+        let sequence = ledger.next_sequence();
+        ledger.dispatches.push(Dispatch::new_resume(
+            id,
+            attempt_id,
+            priority.unwrap_or(0),
+            resume_of_dispatch_id,
+            tester_no_sandbox,
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.id == attempt_id)
+                .filter(|attempt| attempt.cancellation_requested())
+                .and_then(|attempt| attempt.cancellation.as_ref())
+                .map(|stop| stop.requested_at.clone()),
+            sequence,
+        ));
+        write_ledger(project_root, &ledger)?;
+        return Ok(ResumeDispatchOutcome::Created);
     }
-
-    let resume_of_dispatch_id = match ledger.latest() {
-        Some(previous) if previous.status == DispatchStatus::Canceled => {
-            // A canceled dispatch is immutable history, not the suspension this
-            // new command authorizes. The current Work-model frontier above is
-            // the authority, so append a fresh exact resume without linking it
-            // to an older (and possibly differently bound) canceled dispatch.
-            None
-        }
-        Some(previous) => {
-            if previous.status != DispatchStatus::NeedsUser
-                && !(previous.status == DispatchStatus::Failed && failed_candidate_gate_correction)
-                && !(previous.status == DispatchStatus::Failed
-                    && reconciled_candidate_ancestry_repair)
-                && !(previous.status == DispatchStatus::Failed
-                    && reconciled_candidate_metadata_repair)
-                && !(previous.status == DispatchStatus::Blocked
-                    && reconciled_candidate_metadata_repair)
-                && !(previous.status == DispatchStatus::Blocked && learner_retry)
-                && !(previous.status == DispatchStatus::Blocked && reconciled_tester_harness_repair)
-                && !(previous.status == DispatchStatus::Blocked && pending_evidence_review)
-                && !(pending_code_change_classification
-                    && matches!(
-                        previous.status,
-                        DispatchStatus::Failed | DispatchStatus::Blocked
-                    ))
-                && !(legacy_learner_tester_evidence
-                    && matches!(
-                        previous.status,
-                        DispatchStatus::CandidateReady | DispatchStatus::Blocked
-                    ))
-            {
-                bail!(
-                    "Work Item {id:?} latest dispatch {:?} is {}, not a resumable suspension",
-                    previous.dispatch_id,
-                    previous.status
-                );
-            }
-            if previous
-                .bound_attempt_id
-                .as_deref()
-                .is_some_and(|bound| bound != attempt_id)
-                && !reconciled_evidence_queue_admission
-            {
-                bail!(
-                    "Work Item {id:?} latest resumable dispatch is bound to Attempt {:?}, not {attempt_id:?}",
-                    previous.bound_attempt_id.as_deref().unwrap_or_default()
-                );
-            }
-            Some(previous.dispatch_id.clone())
-        }
-        None => None,
-    };
-
-    let sequence = ledger.next_sequence();
-    ledger.dispatches.push(Dispatch::new_resume(
-        id,
-        attempt_id,
-        priority.unwrap_or(0),
-        resume_of_dispatch_id,
-        tester_no_sandbox,
-        item.attempts
-            .iter()
-            .find(|attempt| attempt.id == attempt_id)
-            .filter(|attempt| attempt.cancellation_requested())
-            .and_then(|attempt| attempt.cancellation.as_ref())
-            .map(|stop| stop.requested_at.clone()),
-        sequence,
-    ));
-    write_ledger(project_root, &ledger)?;
-    Ok(ResumeDispatchOutcome::Created)
 }
 
 /// Read the recovery authority captured by the exact running scheduler dispatch.
@@ -3570,6 +3584,59 @@ mod tests {
         );
         resume_thread.join().unwrap();
         lock_thread.join().unwrap();
+    }
+
+    #[test]
+    fn resume_rechecks_full_admission_when_matching_dispatch_changes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        setup_project(dir.path());
+        write_scheduler_suspension(dir.path(), "wi-resume-race", "attempt-1");
+        assert_eq!(
+            resume(dir.path(), "wi-resume-race", "attempt-1", None).unwrap(),
+            ResumeDispatchOutcome::Created
+        );
+
+        let probe = crate::test_lock_probe::ScopedLockProbe::install(
+            "queue-lifecycle",
+            "wi-resume-race",
+            Some(("resume", "PREFLIGHT")),
+        );
+        let resume_root = dir.path().to_path_buf();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_thread = std::thread::spawn(move || {
+            resume_tx
+                .send(resume_with_tester_no_sandbox(
+                    &resume_root,
+                    "wi-resume-race",
+                    "attempt-1",
+                    None,
+                    true,
+                ))
+                .unwrap();
+        });
+
+        assert!(probe.wait_for("resume", "PREFLIGHT"));
+        remove(dir.path(), "wi-resume-race").unwrap();
+        probe.release();
+
+        let error = resume_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Tester no-sandbox recovery"),
+            "changed resume must rerun the no-sandbox admission check: {error}"
+        );
+        resume_thread.join().unwrap();
+
+        let ledger = read_ledger(dir.path(), "wi-resume-race").unwrap().unwrap();
+        assert_eq!(ledger.dispatches.len(), 2);
+        assert_eq!(ledger.dispatches[0].status, DispatchStatus::NeedsUser);
+        assert_eq!(ledger.latest().unwrap().status, DispatchStatus::Canceled);
     }
 
     #[test]
