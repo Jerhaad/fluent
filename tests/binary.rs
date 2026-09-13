@@ -38260,6 +38260,111 @@ fn round_cap_approach_revision_completed_resume_rejects_unresolved_command() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_completed_resume_accepts_satisfied_verification() {
+    for (label, fixture) in [
+        (
+            "passing",
+            setup_round_cap_approach_revision_fixture_with_downstream_gates(),
+        ),
+        (
+            "accepted-host-proof",
+            setup_round_cap_approach_revision_fixture_with_accepted_host_evidence(),
+        ),
+    ] {
+        let (_tester_results, candidate_workspace, prompt_log) =
+            complete_round_cap_approach_revision(&fixture, label);
+        let before = fixture.store.read_work_item("work-1").unwrap();
+        let prompt_count = fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count();
+
+        fluent_cmd()
+            .current_dir(&fixture.main_dir)
+            .args(["attempt", "run", "work-1", "attempt-1"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Merge Candidate attempt-1-merge-candidate is ready",
+            ));
+
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+        assert_eq!(
+            git_head(&candidate_workspace),
+            before.attempts[0]
+                .tasks
+                .iter()
+                .rev()
+                .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+                .and_then(|task| task.output.as_ref())
+                .map(|output| output.commit.as_str())
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&prompt_log)
+                .unwrap()
+                .matches("--- invocation ---")
+                .count(),
+            prompt_count,
+            "a satisfied completed resume must not restart a Task"
+        );
+    }
+
+    let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    let (tester_results, candidate_workspace, prompt_log) =
+        complete_round_cap_approach_revision(&fixture, "preexisting-baseline");
+    let mut current = read_json_path(&tester_results);
+    let candidate = current["candidate_commit"].as_str().unwrap().to_string();
+    let baseline_path = fixture.main_dir.join(
+        ".fluent/work/artifacts/work-1/attempt-1/attempt-1-baseline-tester/tester-results.json",
+    );
+    current["commands"][0]["exit_code"] = serde_json::json!(1);
+    current["tests"] = serde_json::json!([{
+        "id": "known-baseline-failure",
+        "test_harness": "shell-harness",
+        "status": "fail",
+        "duration_ms": 1,
+        "failure_excerpt": "known baseline failure"
+    }]);
+    current["summary"] = serde_json::json!({
+        "total": 1,
+        "pass": 0,
+        "fail": 1,
+        "skipped": 0
+    });
+    let baseline = current.clone();
+    fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+    write_json_path(&baseline_path, &baseline);
+    write_json_path(&tester_results, &current);
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let prompt_count = fs::read_to_string(&prompt_log)
+        .unwrap()
+        .matches("--- invocation ---")
+        .count();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merge Candidate attempt-1-merge-candidate is ready",
+        ));
+
+    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+    assert_eq!(git_head(&candidate_workspace), candidate);
+    assert_eq!(
+        fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        prompt_count,
+        "baseline-covered verification must not restart a Task"
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
     for queued in [false, true] {
         let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
