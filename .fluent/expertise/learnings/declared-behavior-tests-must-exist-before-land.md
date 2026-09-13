@@ -58,6 +58,14 @@ and all applicable replacements satisfy every requirement. See
 [[tester-failure-routing-requires-proven-cause]] and
 [[required-checks-outlive-individual-results]].
 
+When testing an accepted replacement branch, make the ordinary canonical
+command fail in the fixture and attach proof to that exact canonical occurrence.
+A fixture with a passing command, or proof attached to a different Plan row,
+exercises ordinary success or Plan-evidence replay instead; a blanket rejection
+of nonzero commands could still pass. Drive the public evidence-attachment and
+resume commands, complete the targeted Tests Review, and assert that the
+existing candidate and Task history remain unchanged.
+
 When you declare a `Test:` reference, either land the backing test passing in the
 same candidate, or — if the test is intentionally dropped — remove/replace the
 reference and add an `Untestable:` justification. Do not leave a dangling

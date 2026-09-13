@@ -18,6 +18,14 @@ detail, update the materialized-content tests for the line budget, reference
 paths, and route wording. This keeps progressive disclosure useful without
 letting the compact entry point drift from the procedures it dispatches to.
 
+When splitting an existing procedure into a new reference, preserve the
+operational guarantees for every pre-existing route. A new reference can be
+complete for its trigger while the main entry point silently loses instructions
+for a different recovery family. Compare the old route text with the rendered
+entry point and add content tests for both the new trigger and the retained
+older guarantees; either keep older details in the main file or route them to a
+self-contained reference.
+
 Related: [[mode-specific-prompts-replace-conflicting-base-instructions]],
 [[managed-skill-installation-ownership]],
 [[expertise-testing-patterns-are-copyable-templates]].
