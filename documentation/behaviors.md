@@ -904,6 +904,7 @@ Candidate ready. A satisfied assessment SHALL preserve supported accepted host
 proof and applicable pre-existing baseline treatment without restarting a
 completed Task.
 Test: tests/binary.rs (round_cap_approach_revision_completed_resume_accepts_satisfied_verification)
+Test: tests/binary.rs (round_cap_approach_revision_completed_resume_accepts_failed_command_with_host_proof)
 
 ### B19a
 

@@ -38365,6 +38365,104 @@ fn round_cap_approach_revision_completed_resume_accepts_satisfied_verification()
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_completed_resume_accepts_failed_command_with_host_proof() {
+    let fixture =
+        setup_round_cap_approach_revision_fixture_with_accepted_host_evidence_for_failed_tester();
+    let (tester_results, candidate_workspace, prompt_log) =
+        complete_round_cap_approach_revision_with_accepted_canonical_host_proof(
+            &fixture,
+            "accepted-failed-command",
+        );
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let before_task_ids: Vec<_> = before.attempts[0]
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect();
+    let results = read_json_path(&tester_results);
+    assert_eq!(results["commands"][0]["command"], "false");
+    assert_eq!(results["commands"][0]["exit_code"], 1);
+    assert_eq!(results["error"], serde_json::Value::Null);
+    let recovery = before.attempts[0]
+        .evidence_recoveries
+        .iter()
+        .find(|recovery| recovery.required_check.is_some())
+        .expect("failed canonical command must retain accepted required-check proof");
+    assert_eq!(recovery.required_check.as_ref().unwrap().command, "false");
+    assert_eq!(
+        recovery.state,
+        fluent::work_model::EvidenceRecoveryState::Complete
+    );
+    let target = recovery.targets.first().unwrap();
+    let review_task = before.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| Some(task.id.as_str()) == target.review_task_id.as_deref())
+        .expect("required-check recovery must retain its targeted Tests Review");
+    assert_eq!(review_task.role, "tests");
+    assert_eq!(
+        review::extract_verdict(
+            &fs::read_to_string(
+                fixture
+                    .main_dir
+                    .join(&review_task.artifact_area.as_ref().unwrap().path)
+                    .join("review.md")
+            )
+            .unwrap()
+        ),
+        review::Verdict::Pass
+    );
+    let candidate = before.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+        .unwrap();
+    let candidate_head = git_head(&candidate_workspace);
+    let prompt_count = fs::read_to_string(&prompt_log)
+        .unwrap()
+        .matches("--- invocation ---")
+        .count();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merge Candidate attempt-1-merge-candidate is ready",
+        ));
+
+    let after = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        after.attempts[0]
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>(),
+        before_task_ids,
+        "a satisfied completed resume must not create another Task"
+    );
+    assert_eq!(git_head(&candidate_workspace), candidate_head);
+    assert_eq!(
+        fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        prompt_count,
+        "accepted host proof must not restart a completed Task"
+    );
+    assert_eq!(
+        after.merge_candidates[0].candidate_commit, candidate,
+        "resume must return the existing Merge Candidate"
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
     for queued in [false, true] {
         let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
@@ -38904,6 +39002,140 @@ fn complete_round_cap_approach_revision(
     (results, workspace, prompt_log)
 }
 
+fn complete_round_cap_approach_revision_with_accepted_canonical_host_proof(
+    fixture: &RoundCapApproachRevisionFixture,
+    label: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    approve_round_cap_extension(fixture);
+    revise_round_cap_approach(fixture).success();
+
+    let prompt_log = fixture
+        ._tmp
+        .path()
+        .join(format!("{label}-provider-prompts.log"));
+    let provider = fixture._tmp.path().join(format!("{label}-provider"));
+    write_sandboxed_mock_claude(
+        &provider,
+        &round_cap_downstream_provider_script(&prompt_log),
+    );
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    attach_round_cap_host_evidence(fixture, label);
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let candidate = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+        .unwrap();
+    let tester = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == fluent::work_model::TaskKind::Tester
+                && task.status == fluent::work_model::TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+        })
+        .expect("failed canonical Tester must remain recorded");
+    let tester_results = fixture
+        .main_dir
+        .join(&tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    let results = read_json_path(&tester_results);
+    assert_eq!(results["commands"][0]["exit_code"], 1);
+    assert!(item.merge_candidates.is_empty());
+
+    let config = fs::read(fixture.main_dir.join(".fluent/tester.yaml")).unwrap();
+    let selector = format!("tester:{:x}:0", Sha256::digest(&config));
+    let evidence = fixture
+        ._tmp
+        .path()
+        .join(format!("{label}-canonical-host.json"));
+    fs::write(
+        &evidence,
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "producer": "authorized fixture host",
+            "check": "false",
+            "working_directory": ".",
+            "result": "pass",
+            "run_at": "2026-09-12T00:00:00Z",
+            "output": "host proof accepted the failed canonical command"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            &candidate,
+            "--required-check",
+            &selector,
+            "--evidence-file",
+            evidence.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let attached = fixture.store.read_work_item("work-1").unwrap();
+    let recovery = attached.attempts[0]
+        .evidence_recoveries
+        .iter()
+        .find(|recovery| recovery.required_check.is_some())
+        .expect("public required-check attachment must be recorded");
+    assert_eq!(
+        recovery.state,
+        fluent::work_model::EvidenceRecoveryState::Reviewing
+    );
+    assert_eq!(recovery.required_check.as_ref().unwrap().id, selector);
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merge Candidate attempt-1-merge-candidate is ready",
+        ));
+    assert_round_cap_downstream_completion(fixture);
+
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let writer = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    let workspace = Path::new(&writer.output.as_ref().unwrap().workspace_path);
+    let workspace = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        fixture.main_dir.join(workspace)
+    };
+    (tester_results, workspace, prompt_log)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RoundCapDownstreamTamper {
     Review,
@@ -39253,13 +39485,30 @@ fn make_round_cap_behavior_testable(fixture: &RoundCapApproachRevisionFixture) {
 
 fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
 -> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_accepted_host_evidence_and_tester_command("true")
+}
+
+fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence_for_failed_tester()
+-> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_accepted_host_evidence_and_tester_command(
+        "false",
+    )
+}
+
+fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence_and_tester_command(
+    tester_command: &str,
+) -> RoundCapApproachRevisionFixture {
     use fluent::work_model::{
         AttemptReviewState, AttemptStatus, EvidenceRecoveryState, PauseKind, TaskKind, TaskStatus,
         WriterCompletionRequirementKind, WriterCompletionState, WriterVerificationClaim,
         WriterVerificationResult, set_task_terminal,
     };
 
-    let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    let fixture = setup_round_cap_approach_revision_fixture_with_plan_and_tester_command(
+        "| # | State reached | Behaviors | Verification | Responsibility | Applicability | Req? |\n|---|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | | Yes |\n| 2 | Attach host proof. | | `bash tests/host.sh` | host | {\"comparison_refs\":[\"HEAD\"]} | Yes |\n| 3 | Review the candidate. | | Review candidate | review | | Yes |\n| 4 | Run the final Tester. | | Run final Tester | tester | | Yes |\n| 5 | Capture Learning. | | Capture Learning | learner | | Yes |\n".to_string(),
+        tester_command,
+    );
+    make_round_cap_downstream_behavior_testable(&fixture);
     let initial = fixture.store.read_work_item("work-1").unwrap();
     let writer = &initial.attempts[0].tasks[0];
     let matrix_path = fixture
@@ -39403,6 +39652,13 @@ fn setup_round_cap_approach_revision_fixture_with_accepted_host_evidence()
 fn setup_round_cap_approach_revision_fixture_with_plan(
     plan: String,
 ) -> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_plan_and_tester_command(plan, "true")
+}
+
+fn setup_round_cap_approach_revision_fixture_with_plan_and_tester_command(
+    plan: String,
+    tester_command: &str,
+) -> RoundCapApproachRevisionFixture {
     use fluent::work_model::{
         ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
         EvidenceRecoveryState, EvidenceReviewTarget, PlanningContext, TaskKind, TaskOutput,
@@ -39411,6 +39667,27 @@ fn setup_round_cap_approach_revision_fixture_with_plan(
 
     let tmp = TempDir::new().unwrap();
     let main_dir = setup_git_project(&tmp);
+    if tester_command != "true" {
+        fs::write(
+            main_dir.join(".fluent/tester.yaml"),
+            format!(
+                "commands:\n  - command: \"{tester_command}\"\n    test_harness: shell-harness\n"
+            ),
+        )
+        .unwrap();
+        git::run(
+            &main_dir,
+            &["add", ".fluent/tester.yaml"],
+            "stage failed canonical Tester fixture",
+        )
+        .unwrap();
+        git::run(
+            &main_dir,
+            &["commit", "-m", "Configure failed canonical Tester"],
+            "commit failed canonical Tester fixture",
+        )
+        .unwrap();
+    }
     let prior_approach =
         "# Original Approach\n\nKeep the original implementation boundary.\n".to_string();
     let replacement =
