@@ -898,6 +898,13 @@ to satisfy every outstanding Tester check and retain the other existing gates.
 Test: tests/binary.rs (canonical_tester_recovery_reuses_other_passing_results)
 Test: tests/binary.rs (canonical_tester_recovery_preserves_aggregate_blockers)
 
+WHEN a completed Approach-recovery Attempt resumes, THE SYSTEM SHALL reassess
+the current canonical verification before reporting its existing Merge
+Candidate ready. A satisfied assessment SHALL preserve supported accepted host
+proof and applicable pre-existing baseline treatment without restarting a
+completed Task.
+Test: tests/binary.rs (round_cap_approach_revision_completed_resume_accepts_satisfied_verification)
+
 ### B19a
 
 WHEN an authorized-host run exposes a candidate defect for the exact unchanged
@@ -919,6 +926,13 @@ available to request a correction.
 Test: tests/binary.rs (reviewed_host_result_satisfies_only_bound_check)
 Test: tests/binary.rs (canonical_tester_rejects_diagnostic_command_without_mutation)
 Test: src/work_attempt_loop.rs (passing_related_host_diagnostic_is_rejected_with_exact_command_guidance)
+
+IF a completed Approach-recovery Attempt's current final Tester result has an
+unresolved command failure, THE SYSTEM SHALL reject foreground resume even
+when the result has no structured test failure, a consistent summary, no
+harness error, and the saved candidate gate passed. The rejection SHALL leave
+the candidate, Work history, and evidence unchanged.
+Test: tests/binary.rs (round_cap_approach_revision_completed_resume_rejects_unresolved_command)
 
 ### B21
 

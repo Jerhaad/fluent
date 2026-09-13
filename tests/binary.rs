@@ -38202,6 +38202,64 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_completed_resume_rejects_unresolved_command() {
+    let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    let (tester_results, candidate_workspace, prompt_log) =
+        complete_round_cap_approach_revision(&fixture, "unresolved-command");
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let candidate = before.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .and_then(|task| task.output.as_ref())
+        .map(|output| output.commit.clone())
+        .unwrap();
+    let candidate_head = git_head(&candidate_workspace);
+    let gate_path = before.attempts[0]
+        .artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.path.ends_with("candidate-gate.json"))
+        .map(|artifact| fixture.main_dir.join(&artifact.path))
+        .unwrap();
+    let gate_bytes = fs::read(&gate_path).unwrap();
+    let mut results = read_json_path(&tester_results);
+    assert_eq!(results["candidate_commit"], candidate);
+    assert_eq!(results["error"], serde_json::Value::Null);
+    assert!(results["tests"].as_array().unwrap().is_empty());
+    assert_eq!(results["summary"]["total"], 0);
+    results["commands"][0]["exit_code"] = serde_json::json!(1);
+    write_json_path(&tester_results, &results);
+    let failed_results = fs::read(&tester_results).unwrap();
+    let prompt_count = fs::read_to_string(&prompt_log)
+        .unwrap()
+        .matches("--- invocation ---")
+        .count();
+
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs diagnosis"));
+
+    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+    assert_eq!(git_head(&candidate_workspace), candidate_head);
+    assert_eq!(fs::read(&gate_path).unwrap(), gate_bytes);
+    assert_eq!(fs::read(&tester_results).unwrap(), failed_results);
+    assert_eq!(
+        fs::read_to_string(&prompt_log)
+            .unwrap()
+            .matches("--- invocation ---")
+            .count(),
+        prompt_count,
+        "an unresolved command must not launch another worker"
+    );
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_rechecks_downstream_evidence_on_both_routes() {
     for queued in [false, true] {
         let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
@@ -38678,6 +38736,67 @@ fn assert_round_cap_downstream_completion(fixture: &RoundCapApproachRevisionFixt
             "passed"
         );
     }
+}
+
+fn complete_round_cap_approach_revision(
+    fixture: &RoundCapApproachRevisionFixture,
+    label: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    approve_round_cap_extension(fixture);
+    revise_round_cap_approach(fixture).success();
+
+    let prompt_log = fixture
+        ._tmp
+        .path()
+        .join(format!("{label}-provider-prompts.log"));
+    let provider = fixture._tmp.path().join(format!("{label}-provider"));
+    write_sandboxed_mock_claude(
+        &provider,
+        &round_cap_downstream_provider_script(&prompt_log),
+    );
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    attach_round_cap_host_evidence(fixture, label);
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&provider))
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    assert_round_cap_downstream_completion(fixture);
+
+    let item = fixture.store.read_work_item("work-1").unwrap();
+    let writer = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == fluent::work_model::TaskKind::Write)
+        .unwrap();
+    let workspace = Path::new(&writer.output.as_ref().unwrap().workspace_path);
+    let workspace = if workspace.is_absolute() {
+        workspace.to_path_buf()
+    } else {
+        fixture.main_dir.join(workspace)
+    };
+    let tester = item.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == fluent::work_model::TaskKind::Tester
+                && task.status == fluent::work_model::TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+        })
+        .unwrap();
+    let results = fixture
+        .main_dir
+        .join(&tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    (results, workspace, prompt_log)
 }
 
 #[derive(Debug, Clone, Copy)]

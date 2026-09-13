@@ -918,6 +918,32 @@ pub(crate) fn validate_completed_downstream_evidence(
         tester_results.error.is_none(),
         "final Tester evidence records a harness error"
     );
+    let assessment = assess_canonical_checks(project_root, attempt)
+        .context("completed final Tester verification is unverifiable")?;
+    if !assessment.is_satisfied() {
+        let mut reasons = assessment.blockers.clone();
+        reasons.extend(assessment.diagnoses.iter().cloned());
+        reasons.extend(
+            assessment
+                .defects
+                .iter()
+                .map(|defect| defect.diagnostic.clone()),
+        );
+        reasons.extend(assessment.outstanding.iter().map(|index| {
+            let check = &assessment.checks[*index];
+            format!(
+                "Required check {} remains unresolved: `{}`",
+                check.id, check.command
+            )
+        }));
+        if reasons.is_empty() {
+            reasons.push("canonical verification has no satisfied assessment".into());
+        }
+        anyhow::bail!(
+            "completed final Tester verification remains unresolved: {}",
+            reasons.join("; ")
+        );
+    }
 
     let gate_path = format!(
         "{}/{}/{}",
