@@ -10799,3 +10799,31 @@ saved authority.
 Test: tests/binary.rs (assignment_context_recovery_output_free_reports_next_action)
 Modifies: Corrective assignment context:B7 — identifies the new eligible
 output-free case and its separate retry boundary.
+
+## Combined coordinator recovery
+
+### B1
+
+WHEN an explicitly authorized same-Task retry completes after assignment-context
+repair and current-candidate host proof passes targeted Tests Review,
+THE SYSTEM SHALL deliver that accepted proof to ordinary Tests Review while
+retaining canonical Tester and Learning requirements.
+Test: tests/binary.rs (combined_context_retry_delivers_accepted_proof)
+
+### B2
+
+WHEN an operator authorizes an eligible failed-review round-cap Approach
+revision with its separate bounded extension, THE SYSTEM SHALL preserve the
+completed corrective Writer's assignment and immutable evidence while preparing
+one new corrective Writer. Changed assignment evidence SHALL reject resume
+without changing protected history.
+Test: tests/binary.rs (combined_round_cap_revision_preserves_assignment_authority)
+
+### B3
+
+IF a predecessor cannot retain combined revision and assignment authority,
+THEN THE SYSTEM SHALL prevent it from mutating published records or recovering
+an interrupted revision, including through an otherwise-readable outer envelope.
+The current coordinator SHALL retain supported predecessor records and recover
+the complete current transaction without discarding earlier authority.
+Test: tests/binary.rs (combined_installation_old_readers_preserve_authority)
