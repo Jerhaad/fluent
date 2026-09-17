@@ -26,6 +26,12 @@ commands:
       export FLUENT_COMBINED_EVIDENCE_OLD_BIN
       FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN="$(bash tests/fixtures/build-output-free-context-old-reader.sh)"
       export FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN
+      FLUENT_INSTALLATION_MAIN_OLD_BIN="$(bash tests/fixtures/build-installation-main-old-reader.sh)"
+      export FLUENT_INSTALLATION_MAIN_OLD_BIN
+      FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN="$(bash tests/fixtures/build-installation-output-free-old-reader.sh)"
+      export FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN
+      FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN="$(bash tests/fixtures/build-installation-accepted-proof-old-reader.sh)"
+      export FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN
       cargo build
       production_bin="$(pwd)/target/debug/fluent-production"
       cp target/debug/fluent "$production_bin"

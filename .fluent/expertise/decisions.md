@@ -452,7 +452,13 @@ semantics unchanged. The installation integration supersedes the earlier
 exclusion of assignment-aware formats: this coordinator now models their
 corrective assignments, carried findings, and separately authorized retries
 alongside the failed-review round-cap audit. Retain bounded adapters for those
-modeled records and journals. Pinned predecessor readers must refuse combined
+modeled records and journals. Combined records use schema 10, writer envelopes
+use schema 9, and transactions use schema 10. The output-free predecessor could
+otherwise rewrite the combined aggregate, and neither repair predecessor models
+managed Approach-revision files in pending journals. The current reader models
+envelope schemas 1 through 9 and transaction schemas 1 through 10; each retained
+recovery validator still checks the authority present in those older formats.
+Pinned predecessor readers must refuse combined
 authority in both published and pending states, and read-only legacy observation
 must not recover or combine partial state.
 
@@ -510,8 +516,8 @@ applicability or accepted-proof facts. Status and show never publish this
 assignment. Changed, mixed, contradictory, or live-owned histories remain
 paused with a specific diagnosis.
 
-Work and Attempt record schema 9, writer envelope schema 8, and transaction
-schema 9 preserve carried-finding authority, corrective assignment snapshots,
+Work and Attempt record schema 10, writer envelope schema 9, and transaction
+schema 10 preserve carried-finding authority, corrective assignment snapshots,
 and usage-limit approvals together. The three pinned predecessors share record
 schema 7 but cannot each retain the other branches' authority; the combined
 fence must exceed every predecessor's recognized limits.
@@ -533,7 +539,7 @@ Corrective assignment schema 2 freezes only recognized Work/Attempt progress
 and host handoff inputs at assignment time. Bind each snapshot to its original
 source reference and digest through immutable provenance. Keep source Tasks,
 completion matrices, findings and other evidence unchanged; schema 1 remains
-readable. Writer envelope schema 8 fences executables that predate these
+readable. Writer envelope schema 9 fences executables that predate these
 snapshot semantics. Carried-finding bindings retain their original assignment
 when context recovery freezes it later. Validate the complete operation-bound
 audit chain before accepting that original identity; never rewrite the evidence
@@ -561,14 +567,14 @@ separation preserves request lookup after publication without allowing changed
 audit fields to reuse an operation identity. The store permits only the audited
 substitution and retains all other assignment and lifecycle authority.
 
-New Work/Attempt records use schema 9, writer envelopes 8, and transactions 9
+New Work/Attempt records use schema 10, writer envelopes 9, and transactions 10
 to fence readers that cannot retain the output-free failure audit.
-Context-recovery journals use schema 9 and retain their authorized base aggregate
+Context-recovery journals use schema 10 and retain their authorized base aggregate
 with its children digest. Replay validates the original audited change against
 that base and accepts each stored child only if it matches the base or target.
 This permits interrupted Attempt and Task publication without treating mixed
 records as a fresh authorization. Other mutations also write journal
-schema 9; readers retain schema-6, schema-7, and schema-8 predecessor journals. Status and
+schema 10; readers retain the modeled predecessor journals through schema 9. Status and
 show never reconcile; the exact matching recovery can do so under the storage
 lock. Recovery neither launches work nor supplies resume,
 Review, Tester, host-evidence or merge authority, and replay retains later stops.
@@ -588,8 +594,8 @@ Review bytes and the host-owned audit stay outside the retry's writable roots.
 
 Keep immutable inspection in `usage_limit_contracts` below its queue, lifecycle,
 status, persistence, and executor consumers. Publication belongs to
-`usage_limit_recovery`. Work records now use schema 9, the writer envelope 8, and
-transactions 9 to keep pre-change executables from discarding retry authority.
+`usage_limit_recovery`. Work records now use schema 10, the writer envelope 9, and
+transactions 10 to keep pre-change executables from discarding retry authority.
 The approval supplies no completion, host-evidence, review, Tester, or Learning
 credit. A later cancellation or terminal failure cannot reuse it to restart.
 See the [architecture](../../documentation/architecture.md#recover-a-usage-limit-interrupted-writer)
@@ -671,7 +677,7 @@ authority to admit this case.
 Retain the base aggregate in retry journals and accept only exact base or target
 children, while revalidating the pinned files before replay. The immediate
 combined predecessor at `43022b29fa437ade211fef3fff66798c5d940ef9` must reject
-record-9/envelope-8/transaction-9 state before mutation. Keep all earlier pinned
+record-10/envelope-9/transaction-10 state before mutation. Keep all earlier pinned
 reader preparations in the canonical Tester. The real confinement command is a
 separate host gate; routine profile assertions cannot supply its evidence.
 

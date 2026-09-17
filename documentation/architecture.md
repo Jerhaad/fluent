@@ -1582,7 +1582,7 @@ existing base-child digest. Replay validates the original audited substitution
 and requires each published child record to match its base or target version.
 The matching recovery command can reconcile after any child write under the
 storage lock; status and show continue to withhold partially published state.
-All new journals use transaction schema 9 to fence each predecessor, including
+All new journals use transaction schema 10 to fence each predecessor, including
 ordinary writes of combined authority. Current readers still accept the source
 versions' schema-6 journals and schema-7 context journals with their base proof.
 
@@ -1611,8 +1611,8 @@ audits from that assignment to its recovered snapshot. It revalidates exact
 source, proof, Review and matrix bytes before retaining acceptance. Recovering
 context supplies no new completion credit and does not launch another Task.
 
-Work and Attempt record schema 9, writer envelope schema 8, completion contract
-and matrix version 2, and transaction schema 9 fence executables that predate
+Work and Attempt record schema 10, writer envelope schema 9, completion contract
+and matrix version 2, and transaction schema 10 fence executables that predate
 explicit verification meaning, carried-finding and usage-limit retry authority, and frozen assignment
 context. Writer correction assignments use schema 2 and still read schema 1;
 candidate gates use schema 5; execution context with a verification assessment
@@ -1623,8 +1623,14 @@ authors its own published and interrupted recovery fixtures; the current reader
 must preserve their authority through public upgrade and exact recovery replay.
 All three must refuse combined published records and both kinds of pending
 transaction, with the root envelope lowered only to exercise the inner fences.
-The compatibility tests invoke pinned pre-change executables against both
-published and genuinely pending state and check exact bytes. The pinned-reader
+The installation integration also pins main, output-free retry, and accepted-proof
+source builds. Records use schema 10, writer envelopes use schema 9, and journals
+use schema 10 because a repair predecessor could otherwise rewrite combined
+authority and discard main's managed revision files. The combined regression
+checks each outer and inner fence, preserves predecessor-authored records through
+current upgrade, and recovers a real interrupted revision only with the current
+coordinator. The compatibility tests invoke pinned pre-change executables against
+both published and genuinely pending state and check exact bytes. The pinned-reader
 regression preserves required-check policy, source and reconstruction references,
 accepted Review digests, and corrective Writer assignments through public current
 writes. It makes a Task record directory unwritable to interrupt a real public
@@ -2955,7 +2961,7 @@ prefix, Work Item ID, and Attempt ID so valid hyphenated IDs remain
 globally distinct.
 
 Each Work Item root record stores `model_writer_version` as a validated writer
-envelope: `{"format":"fluent-work-item-writer","schema_version":8,"version":"0.4.0"}`.
+envelope: `{"format":"fluent-work-item-writer","schema_version":9,"version":"0.4.0"}`.
 The public in-memory value remains an optional package-version string. Current
 Fluent also accepts legacy strings without rewriting them during observation.
 The envelope occupies an existing field that older readers deserialize as

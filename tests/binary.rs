@@ -3398,7 +3398,7 @@ fn carried_finding_evidence_compatibility_refuses_public_transaction() {
         let fixture = carried_finding_fixture(&tmp);
         let journal = interrupt_carried_finding_attachment(&fixture);
         let transaction = read_json_path(&journal);
-        assert_eq!(transaction["schema_version"], 9);
+        assert_eq!(transaction["schema_version"], 10);
         let root = fixture.project.join(".fluent/work");
         let path = root.join(format!("items/{}.json", fixture.work));
         let original = read_json_path(&path);
@@ -7746,7 +7746,7 @@ fn assignment_context_recovery_rejects_unmatched_pending_publication() {
             .join(".fluent/work/transactions/work-1.json");
         let journal_bytes = fs::read(&journal_path).unwrap();
         let mut journal = read_json_path(&journal_path);
-        assert_eq!(journal["schema_version"], 9);
+        assert_eq!(journal["schema_version"], 10);
         journal["assignment_context_base"]["attempts"][0]["status"] = "planned".into();
         write_json_path(&journal_path, &journal);
         let changed = snapshot_tree(&fixture.project_root);
@@ -9494,6 +9494,15 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
             "round-cap-approach-revision-assignment",
             "FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN",
         ),
+        ("installation-main", "FLUENT_INSTALLATION_MAIN_OLD_BIN"),
+        (
+            "installation-output-free",
+            "FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN",
+        ),
+        (
+            "installation-accepted-proof",
+            "FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN",
+        ),
     ];
     for (failed_helper, setup_status, prints_path) in [
         ("", 0, true),
@@ -9521,6 +9530,12 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
         ("combined-recovery-evidence", 37, true),
         ("output-free-context", 37, false),
         ("output-free-context", 37, true),
+        ("installation-main", 37, false),
+        ("installation-main", 37, true),
+        ("installation-output-free", 37, false),
+        ("installation-output-free", 37, true),
+        ("installation-accepted-proof", 37, false),
+        ("installation-accepted-proof", 37, true),
     ] {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("tester project");
@@ -9555,7 +9570,7 @@ fn fluent_release_tester_historical_reader_setup_fails_closed() {
             r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$FLUENT_TEST_CARGO_CALLS"
-printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" "${FLUENT_USAGE_LIMIT_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN-unset}" "${FLUENT_CARRIED_FINDING_OLD_BIN-unset}" "${FLUENT_COMBINED_BASE_OLD_BIN-unset}" "${FLUENT_COMBINED_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_COMBINED_EVIDENCE_OLD_BIN-unset}" "${FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
+printf '%s\n' "${FLUENT_OWNERSHIP_OLD_BIN-unset}" "${FLUENT_VERIFICATION_OLD_BIN-unset}" "${FLUENT_USAGE_LIMIT_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_MAIN_OLD_BIN-unset}" "${FLUENT_WRITER_ASSIGNMENT_PAUSED_OLD_BIN-unset}" "${FLUENT_CARRIED_FINDING_OLD_BIN-unset}" "${FLUENT_COMBINED_BASE_OLD_BIN-unset}" "${FLUENT_COMBINED_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_COMBINED_EVIDENCE_OLD_BIN-unset}" "${FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_STABLE_OLD_BIN-unset}" "${FLUENT_ROUND_CAP_APPROACH_ASSIGNMENT_OLD_BIN-unset}" "${FLUENT_INSTALLATION_MAIN_OLD_BIN-unset}" "${FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN-unset}" "${FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN-unset}" >> "$FLUENT_TEST_READER_PATHS"
 case "$1" in
     build) mkdir -p target/debug; touch target/debug/fluent ;;
     nextest) exit 0 ;;
@@ -9581,6 +9596,9 @@ esac
             .env_remove("FLUENT_COMBINED_ASSIGNMENT_OLD_BIN")
             .env_remove("FLUENT_COMBINED_EVIDENCE_OLD_BIN")
             .env_remove("FLUENT_OUTPUT_FREE_CONTEXT_OLD_BIN")
+            .env_remove("FLUENT_INSTALLATION_MAIN_OLD_BIN")
+            .env_remove("FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN")
+            .env_remove("FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN")
             .env("FLUENT_TEST_CARGO_CALLS", &cargo_calls)
             .env("FLUENT_TEST_READER_PATHS", &reader_paths)
             .env(
@@ -54045,7 +54063,7 @@ fn writer_assignment_old_reader_reaches_inner_fences() {
         record["schema_version"] = serde_json::json!(old_record_schema);
         assert_eq!(
             record["model_writer_version"]["schema_version"],
-            serde_json::json!(8),
+            serde_json::json!(9),
             "the published case must retain the newer inner Writer envelope"
         );
         write_json_path(&record_path, &record);
@@ -54082,7 +54100,7 @@ fn writer_assignment_old_reader_reaches_inner_fences() {
             .expect_err("the fixture must leave a real pending aggregate transaction");
         let journal_path = work_root.join("transactions/work-1.json");
         let journal = read_json_path(&journal_path);
-        assert_eq!(journal["schema_version"], serde_json::json!(9));
+        assert_eq!(journal["schema_version"], serde_json::json!(10));
         assert!(old_transaction_schema < journal["schema_version"].as_u64().unwrap() as u32);
         let record_path = work_root.join("items/work-1.json");
         let mut record = read_json_path(&record_path);
@@ -54137,7 +54155,7 @@ fn writer_assignment_old_reader_refuses_published_records() {
             let work_root = project.join(".fluent/work");
             let record_path = work_root.join("items/work-1.json");
             let mut record = read_json_path(&record_path);
-            assert_eq!(record["schema_version"], serde_json::json!(9));
+            assert_eq!(record["schema_version"], serde_json::json!(10));
             if !envelope_is_current {
                 record["model_writer_version"]["schema_version"] =
                     serde_json::json!(old_envelope_schema);
@@ -56488,7 +56506,7 @@ fn usage_limit_writer_compatibility_refuses_public_pending_transaction() {
     let journal = fixture
         .project
         .join(format!(".fluent/work/transactions/{}.json", fixture.work));
-    assert_eq!(read_json_path(&journal)["schema_version"], 9);
+    assert_eq!(read_json_path(&journal)["schema_version"], 10);
     usage_limit_old_mutation_refuses(&binary, &fixture);
     fixture.approve();
     fixture.approve();
@@ -61311,6 +61329,229 @@ fn assert_old_reader_refuses_round_cap_authority(binary: &Path) {
             String::from_utf8_lossy(&output.stdout)
         );
         assert_eq!(snapshot_tree(&work_root), before, "pending={pending}");
+    }
+}
+
+#[test]
+#[serial]
+fn combined_installation_old_readers_preserve_authority() {
+    use fluent::work_model::*;
+    for (variable, source_commit, envelope, record_schema) in [
+        (
+            "FLUENT_INSTALLATION_MAIN_OLD_BIN",
+            "d27e42d2a615a89835aa03da2a809ef93056d4cb",
+            5,
+            4,
+        ),
+        (
+            "FLUENT_INSTALLATION_OUTPUT_FREE_OLD_BIN",
+            "8ab476f75544016bd45b078c8d17627a439914a9",
+            8,
+            9,
+        ),
+        (
+            "FLUENT_INSTALLATION_ACCEPTED_PROOF_OLD_BIN",
+            "d7d1b2da8c8b249aa11c2f6f40cd4a0aafceb0e0",
+            8,
+            9,
+        ),
+    ] {
+        let binary = writer_assignment_old_reader(variable, source_commit);
+        let control = TempDir::new().unwrap();
+        for args in [
+            vec![
+                "work-item",
+                "create",
+                "control",
+                "--title",
+                "Predecessor control",
+            ],
+            vec!["attempt", "create", "control", "attempt-1"],
+            vec![
+                "work-item",
+                "abandon",
+                "control",
+                "--reason",
+                "Positive mutation control",
+            ],
+        ] {
+            let output = Command::new(&binary)
+                .current_dir(control.path())
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{variable}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let control_store = WorkModelStore::new(control.path());
+        let original = control_store.read_work_item_snapshot("control").unwrap();
+        let bytes = snapshot_tree(&control.path().join(".fluent/work"));
+        fluent_cmd()
+            .current_dir(control.path())
+            .args(["work-item", "show", "control"])
+            .assert()
+            .success();
+        assert_eq!(snapshot_tree(&control.path().join(".fluent/work")), bytes);
+        fluent_cmd()
+            .current_dir(control.path())
+            .args(["work-item", "upgrade", "control"])
+            .assert()
+            .success();
+        assert_eq!(
+            control_store.read_work_item_snapshot("control").unwrap(),
+            original
+        );
+        let fixture = setup_round_cap_approach_revision_fixture_with_review(
+            "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n".into(),
+            "true", "Verdict: fail\n\n## Findings\n\n- [ ] Retain the assigned correction.\n",
+        );
+        make_round_cap_behavior_testable(&fixture);
+        approve_round_cap_extension(&fixture);
+        revise_round_cap_approach(&fixture).success();
+        let bin = fixture._tmp.path().join("installation-provider");
+        write_sandboxed_mock_claude(
+            &bin,
+            &round_cap_two_revision_provider_script(&fixture._tmp.path().join("prompts.log")),
+        );
+        fluent_cmd()
+            .current_dir(&fixture.main_dir)
+            .env("PATH", mock_path(&bin))
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+            .args(["attempt", "run", "work-1", "attempt-1"])
+            .assert()
+            .success();
+        let prior = fixture.store.read_work_item_snapshot("work-1").unwrap();
+        let source = prior.attempts[0]
+            .tasks
+            .iter()
+            .rev()
+            .find(|task| task.kind == TaskKind::Write)
+            .unwrap();
+        assert!(
+            !source
+                .writer_correction_assignment
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+        let root = fixture.main_dir.join(".fluent/work");
+        let record_path = root.join("items/work-1.json");
+        let original_record = read_json_path(&record_path);
+        let refuse = |pending: bool| {
+            let before = snapshot_tree(&root);
+            let output = Command::new(&binary)
+                .current_dir(&fixture.main_dir)
+                .env("FLUENT_NO_UPDATE_CHECK", "1")
+                .args([
+                    "work-item",
+                    "abandon",
+                    "work-1",
+                    "--reason",
+                    "must preserve combined authority",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "{variable} rewrote combined authority (pending={pending})"
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("schema") || error.contains("transaction"),
+                "{variable}: {error}"
+            );
+            assert_eq!(
+                snapshot_tree(&root),
+                before,
+                "{variable}, pending={pending}"
+            );
+        };
+        for fence in ["envelope", "root", "attempt"] {
+            let mut record = original_record.clone();
+            if fence != "envelope" {
+                record["model_writer_version"]["schema_version"] = envelope.into();
+            }
+            if fence == "attempt" {
+                record["schema_version"] = record_schema.into();
+            }
+            write_json_path(&record_path, &record);
+            refuse(false);
+        }
+        write_json_path(&record_path, &original_record);
+        fluent_cmd()
+            .current_dir(&fixture.main_dir)
+            .args([
+                "attempt",
+                "extend",
+                "work-1",
+                "attempt-1",
+                "--additional-write-rounds",
+                "1",
+                "--resolution",
+                "Publish the next combined recovery revision",
+            ])
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+            .assert()
+            .success();
+        // Lower only the surrounding envelopes so the predecessor must inspect
+        // a genuine current journal before it can publish any split records.
+        for path in [&record_path, &root.join("attempts/work-1/attempt-1.json")] {
+            let mut record = read_json_path(path);
+            record["schema_version"] = record_schema.into();
+            if record.get("model_writer_version").is_some() {
+                record["model_writer_version"]["schema_version"] = envelope.into();
+            }
+            write_json_path(path, &record);
+        }
+        let replacement =
+            "# Next combined Approach\n\nKeep assignments and revision audits together.\n";
+        let resolution = "Publish the next combined recovery revision";
+        let approach_path = fixture.main_dir.join("next-combined-approach.md");
+        fs::write(&approach_path, replacement).unwrap();
+        fluent_cmd()
+            .current_dir(&fixture.main_dir)
+            .args([
+                "attempt",
+                "revise-approach",
+                "work-1",
+                "attempt-1",
+                "--approach-file",
+                approach_path.to_str().unwrap(),
+                "--resolution",
+                resolution,
+            ])
+            .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+            .env(
+                "FLUENT_TEST_WORK_MODEL_INTERRUPT",
+                "before-child-publication",
+            )
+            .assert()
+            .failure();
+        let journal = root.join("transactions/work-1.json");
+        let pending = read_json_path(&journal);
+        assert!(!pending["managed_files"].as_array().unwrap().is_empty());
+        refuse(true);
+        revise_round_cap_approach_with_values(&fixture, replacement, resolution).success();
+        assert!(!journal.exists());
+        let recovered = fixture.store.read_work_item_snapshot("work-1").unwrap();
+        assert_eq!(
+            &recovered.attempts[0].tasks[..prior.attempts[0].tasks.len()],
+            prior.attempts[0].tasks.as_slice()
+        );
+        assert_eq!(recovered.attempts[0].round_cap_extensions.len(), 2);
+        assert_eq!(
+            recovered.attempts[0]
+                .artifacts
+                .iter()
+                .filter(|a| a.producer_id == "planning-approach-recovery")
+                .count(),
+            2
+        );
     }
 }
 

@@ -641,12 +641,12 @@ fn work_model_store_writes_deterministic_pretty_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 9,
+  "schema_version": 10,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 8,
+    "schema_version": 9,
     "version": "{version}"
   }}
 }}
@@ -695,12 +695,12 @@ fn capture_mode_preserves_minimal_work_item_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 9,
+  "schema_version": 10,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 8,
+    "schema_version": 9,
     "version": "{version}"
   }}
 }}
@@ -1666,7 +1666,7 @@ fn current_record_has_old_reader_wire_fence() {
     assert_eq!(
         record["model_writer_version"],
         serde_json::json!({
-            "format": "fluent-work-item-writer", "schema_version": 8,
+            "format": "fluent-work-item-writer", "schema_version": 9,
             "version": env!("CARGO_PKG_VERSION")
         })
     );

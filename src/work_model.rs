@@ -31,7 +31,7 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// before this marker omit the field and are read as version 0. They remain
 /// readable, but the explicit `work-item upgrade` command rewrites them using
 /// this version after checking every record.
-pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 9;
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 10;
 pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
@@ -9985,7 +9985,9 @@ pub struct WorkModelSnapshot {
 }
 
 const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
-const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 8;
+// Fence both installation source lineages: neither predecessor preserves the
+// union of revision audits, assignments, and separately authorized retries.
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 9;
 
 fn is_supported_writer_envelope_schema(version: u32) -> bool {
     matches!(version, 1..=WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION)
@@ -10111,7 +10113,9 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    const SCHEMA_VERSION: u32 = 9;
+    // Source journals lack either managed revision files or retry authority.
+    // Preserve their modeled formats, but publish the combined format separately.
+    const SCHEMA_VERSION: u32 = 10;
 
     fn is_supported_schema(version: u32) -> bool {
         matches!(version, 1..=Self::SCHEMA_VERSION)
