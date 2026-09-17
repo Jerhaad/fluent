@@ -49865,6 +49865,7 @@ fn attempt_cancel_during_scheduler_startup_blocks_delayed_launch() {
         release: Mutex<mpsc::Receiver<()>>,
         bin: PathBuf,
         diagnostics: PathBuf,
+        writer_started: Option<PathBuf>,
     }
     impl scheduler::AttemptRunner for DelayedRunner {
         fn run(
@@ -49892,7 +49893,26 @@ fn attempt_cancel_during_scheduler_startup_blocks_delayed_launch() {
                 .env("PATH", mock_path(&self.bin))
                 .stdout(std::process::Stdio::null())
                 .stderr(fs::File::create(&self.diagnostics)?);
+            // Keep nested-worker cleanup after the bounded exit observations.
+            // Baseline commands and Writers leave the CLI process group.
+            let _execution_cleanup = VerificationConcurrencyExecution {
+                record_path: project.join(format!(
+                    ".fluent/work/artifacts/{work}/{attempt}/{attempt}-write-1/execution.json"
+                )),
+            };
             let mut child = OwnedFixtureProcess::spawn(&mut command);
+            // Authorized recovery performs baseline checks and worktree setup
+            // before launching the Writer. Bound that work separately from the
+            // stale-dispatch rejection and from the child's eventual exit.
+            if let Some(marker) = &self.writer_started {
+                anyhow::ensure!(
+                    poll_until(Duration::from_secs(30), || marker.exists()
+                        || child.try_wait().unwrap().is_some())
+                        && marker.exists(),
+                    "authorized recovery must launch the Writer: {}",
+                    fs::read_to_string(&self.diagnostics)?
+                );
+            }
             anyhow::ensure!(
                 poll_until(Duration::from_secs(8), || child
                     .try_wait()
@@ -49938,6 +49958,7 @@ fn attempt_cancel_during_scheduler_startup_blocks_delayed_launch() {
         release: Mutex::new(release_rx),
         bin,
         diagnostics: tmp.path().join("delayed-run.log"),
+        writer_started: None,
     };
     std::thread::scope(|scope| {
         let dispatch_thread = scope.spawn(|| scheduler::dispatch_one(&project, &dispatch, &runner));
@@ -50002,6 +50023,10 @@ fn attempt_cancel_during_scheduler_startup_blocks_delayed_launch() {
         .success();
     let recovery = scheduler::pick_next_queued(&project).unwrap().unwrap();
     assert_ne!(recovery.dispatch_id, dispatch.dispatch_id);
+    let runner = DelayedRunner {
+        writer_started: Some(marker.clone()),
+        ..runner
+    };
     std::thread::scope(|scope| {
         let dispatch_thread = scope.spawn(|| scheduler::dispatch_one(&project, &recovery, &runner));
         ready_rx.recv_timeout(Duration::from_secs(8)).unwrap();
