@@ -56509,6 +56509,200 @@ fn ordinary_tests_review_receives_accepted_host_evidence() {
 }
 
 #[test]
+fn combined_context_retry_delivers_accepted_proof() {
+    use fluent::work_model::*;
+    let tmp = TempDir::new().unwrap();
+    let fixture = output_free_context_fixture(&tmp);
+    let carried = &fixture.carried;
+    output_free_context_command(&fixture).assert().success();
+    output_free_retry_command(&fixture).assert().success();
+    let store = WorkModelStore::new(&carried.project);
+    let authorized = store.read_work_item_snapshot(&carried.work).unwrap();
+    let writer = authorized.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.id == "attempt-1-write-5")
+        .unwrap();
+    let area = carried
+        .project
+        .join(&writer.artifact_area.as_ref().unwrap().path);
+    let protected = snapshot_tree(&carried.project.join(".fluent/work/artifacts"));
+    let bin = tmp.path().join("combined-provider");
+    let script = learner_mock_script(r#"{"learning_summary":"combined recovery","follow_ups":[]}"#)
+        .replace(
+            "*/work-6-work-1-attempt-1)",
+            &format!("'{}')", carried.workspace.display()),
+        )
+        .replace(
+            "    printf 'loop output\\n' > loop-output.txt",
+            &format!(
+                r#"    python3 - '{}' <<'PYMATRIX'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / 'writer-completion.json'
+matrix = json.loads(path.read_text())
+for row in matrix['rows']:
+    if row.get('responsibility', 'writer') not in ('writer', None):
+        continue
+    row['state'] = 'complete'
+    row['implementation-evidence'] = ['loop-output.txt: complete the assigned correction']
+    row['verification'] = [{{'command': 'cargo test correction', 'result': 'pass'}}]
+    if row['kind'] == 'finding':
+        row['applicable-constraints'] = ['plan:step-1']
+path.write_text(json.dumps(matrix))
+PYMATRIX
+    printf 'loop output\n' > loop-output.txt"#,
+                area.display()
+            ),
+        );
+    let requesting = script.replace(
+        "    printf 'Verdict: pass\\n\\nLoop review.\\n' > review.md",
+        "    if [[ \"$PWD\" == *-tests && \"$PROMPT\" != *'## Evidence-targeted review'* ]]; then\n      printf 'Verdict: fail\\nDisposition: evidence-needed\\nEvidence-Command: cargo test exact_host_check\\nEvidence-Working-Directory: .\\n\\n## Findings\\n\\n- [ ] Observe the combined host check\\n' > review.md\n    else\n      printf 'Verdict: pass\\n\\nAccepted host proof.\\n' > review.md\n    fi",
+    );
+    write_mock_claude(&bin, &requesting);
+    let run = || {
+        let mut command = fluent_cmd();
+        command
+            .current_dir(&carried.project)
+            .env("PATH", mock_path(&bin))
+            .args(["attempt", "run", &carried.work, "attempt-1", "--no-sandbox"]);
+        command
+    };
+    run().assert().success();
+    let waiting = store.read_work_item_snapshot(&carried.work).unwrap();
+    let completed = waiting.attempts[0]
+        .tasks
+        .iter()
+        .find(|task| task.id == writer.id)
+        .unwrap();
+    assert_eq!(completed.status, TaskStatus::Complete);
+    assert_eq!(
+        completed.writer_correction_assignment,
+        writer.writer_correction_assignment
+    );
+    let candidate = &completed.output.as_ref().unwrap().commit;
+    assert_ne!(candidate, &carried.candidate);
+    let matrix = fs::read(area.join("writer-completion.json")).unwrap();
+    let request = waiting.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.evidence_review_context.is_none()
+        })
+        .unwrap();
+    fluent_cmd()
+        .current_dir(&carried.project)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            &carried.work,
+            "attempt-1",
+            "--candidate",
+            candidate,
+            "--review-artifact",
+            &format!("{}/review.md", request.artifact_area.as_ref().unwrap().path),
+            "--evidence-file",
+            carried.evidence.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let informed = script.replace(
+        "    printf 'Verdict: pass\\n\\nLoop review.\\n' > review.md",
+        r####"    if [[ "$PWD" == *-tests && "$PROMPT" != *'## Evidence-targeted review'* ]]; then
+      python3 - <<'PYREVIEW'
+import hashlib, json
+from pathlib import Path
+context = json.loads(Path('execution-context.json').read_text())
+proofs = json.loads(Path(context['passing-evidence'][0]['path']).read_text())
+assert len(proofs) == 1
+assert proofs[0]['candidate-commit'] == context['candidate-commit']
+for binding in proofs[0]['bindings']:
+    paths = [Path(p) for p in context['historical-artifacts'] if p.endswith('/' + binding['path'])]
+    assert len(paths) == 1
+    assert 'sha256:' + hashlib.sha256(paths[0].read_bytes()).hexdigest() == binding['digest']
+Path('review.md').write_text('Verdict: pass\n\nInspected accepted proof after the same-Task retry.\n')
+PYREVIEW
+    else
+      printf 'Verdict: pass\n\nAccepted host proof.\n' > review.md
+    fi"####,
+    );
+    write_mock_claude(&bin, &informed);
+    run().assert().success();
+    let result = store.read_work_item_snapshot(&carried.work).unwrap();
+    let attempt = &result.attempts[0];
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        authorized.attempts[0]
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count()
+    );
+    assert_eq!(
+        attempt.evidence_recoveries.len(),
+        authorized.attempts[0].evidence_recoveries.len() + 1
+    );
+    assert_eq!(
+        attempt.evidence_recoveries.last().unwrap().state,
+        EvidenceRecoveryState::Complete
+    );
+    assert_eq!(
+        &attempt.evidence_recoveries[..authorized.attempts[0].evidence_recoveries.len()],
+        authorized.attempts[0].evidence_recoveries.as_slice()
+    );
+    let ordinary = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.evidence_review_context.is_none()
+        })
+        .unwrap();
+    let review = fs::read_to_string(
+        carried
+            .project
+            .join(&ordinary.artifact_area.as_ref().unwrap().path)
+            .join("review.md"),
+    )
+    .unwrap();
+    assert!(
+        review.contains("Inspected accepted proof after the same-Task retry"),
+        "{review}"
+    );
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester)
+        .unwrap();
+    assert_eq!(tester.status, TaskStatus::Complete);
+    assert!(tester.started_at.as_ref().unwrap() >= ordinary.completed_at.as_ref().unwrap());
+    assert!(attempt.learning.as_ref().unwrap().is_succeeded());
+    assert!(result.merge_candidates[0].ready_at.is_some());
+    assert_eq!(
+        fs::read(area.join("writer-completion.json")).unwrap(),
+        matrix
+    );
+    let after = snapshot_tree(&carried.project.join(".fluent/work/artifacts"));
+    for entry in protected {
+        assert!(
+            after.contains(&entry),
+            "changed retained recovery artifact: {entry:?}"
+        );
+    }
+}
+
+#[test]
 fn ordinary_tests_review_distinguishes_host_and_writer_evidence() {
     ordinary_accepted_proof_sequence(true, |_, _| {});
 }
