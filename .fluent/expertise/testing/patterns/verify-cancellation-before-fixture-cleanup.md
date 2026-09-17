@@ -60,6 +60,16 @@ confirm the dispatch is running and owns its lease, cancel, and observe a settle
 stop with all Tasks still planned. Release the channel and require the exact stop
 to remain, no worker launch marker, and a `needs-user` dispatch. Follow with a new
 public queue resume and require its worker marker as a positive control.
+Bound authorized recovery setup separately: worktree preparation and baseline
+extraction precede that marker and do not measure cancellation latency. Keep the
+stale dispatch's original exit deadline; give only the explicitly resumed
+dispatch a bounded marker wait, reject an early child exit without the marker,
+and require child exit within the original deadline after the marker. Poll
+`try_wait` before dropping either the CLI or nested-execution cleanup guard.
+A controlled slow baseline must pass this positive control, while a missing
+Writer marker, unauthorized stale launch, or non-exiting child must still fail.
+Retain the diagnostic patches and native before/after output, then remove the
+injected delays and instrumentation before committing.
 
 To verify the shared Attempt stop during parallel setup, reserve two reviewers
 through the real Task reservation boundary and retain both Task leases. Start A
