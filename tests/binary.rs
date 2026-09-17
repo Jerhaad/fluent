@@ -58168,6 +58168,116 @@ fn round_cap_approach_revision_accepts_extended_failed_review() {
 
 #[test]
 #[serial]
+fn combined_round_cap_revision_preserves_assignment_authority() {
+    use fluent::work_model::*;
+    let fixture = setup_round_cap_approach_revision_fixture_with_review(
+        "| # | State reached | Behaviors | Verification | Responsibility | Req? |\n|---|---|---|---|---|---|\n| 1 | Preserve the contract. | B1 | `cargo test` | writer | Yes |\n".into(),
+        "true",
+        "Verdict: fail\n\n## Findings\n\n- [ ] Preserve the assigned recovery boundary.\n",
+    );
+    make_round_cap_behavior_testable(&fixture);
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+    let bin = fixture._tmp.path().join("combined-round-cap-provider");
+    let prompt_log = fixture._tmp.path().join("combined-round-cap-prompts.log");
+    write_sandboxed_mock_claude(&bin, &round_cap_two_revision_provider_script(&prompt_log));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .env("PATH", mock_path(&bin))
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "1")
+        .args(["attempt", "run", "work-1", "attempt-1"])
+        .assert()
+        .success();
+    let prior = fixture.store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(prior.attempts[0].pause_kind, Some(PauseKind::RoundCap));
+    let source = prior.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Write)
+        .unwrap();
+    assert_eq!(source.status, TaskStatus::Complete);
+    let assignment = source
+        .writer_correction_assignment
+        .as_ref()
+        .expect("the native Writer must capture its corrective assignment");
+    assert!(!assignment.findings.is_empty());
+    let protected = snapshot_tree(&fixture.main_dir.join(".fluent/work/artifacts"));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "extend",
+            "work-1",
+            "attempt-1",
+            "--additional-write-rounds",
+            "1",
+            "--resolution",
+            "Preserve the assignment while revising the next correction",
+        ])
+        .env("FLUENT_MAX_TOTAL_WRITE_ROUNDS", "2")
+        .assert()
+        .success();
+    let replacement = "# Combined revised Approach\n\nPreserve both recovery contracts.\n";
+    let resolution = "Preserve the assignment while revising the next correction";
+    revise_round_cap_approach_with_values(&fixture, replacement, resolution).success();
+    let revised = fixture.store.read_work_item_snapshot("work-1").unwrap();
+    assert_eq!(
+        &revised.attempts[0].tasks[..prior.attempts[0].tasks.len()],
+        prior.attempts[0].tasks.as_slice()
+    );
+    assert_eq!(revised.attempts[0].round_cap_extensions.len(), 2);
+    assert_eq!(
+        revised.attempts[0]
+            .round_cap_extensions
+            .last()
+            .unwrap()
+            .new_cap,
+        3
+    );
+    assert_eq!(
+        revised.attempts[0].tasks.last().unwrap().status,
+        TaskStatus::Planned
+    );
+    assert_eq!(
+        revised.attempts[0].tasks.last().unwrap().role,
+        "approach-revision-correction"
+    );
+    revise_round_cap_approach_with_values(&fixture, replacement, resolution).success();
+    assert_eq!(
+        fixture.store.read_work_item_snapshot("work-1").unwrap(),
+        revised
+    );
+    let after = snapshot_tree(&fixture.main_dir.join(".fluent/work/artifacts"));
+    for entry in protected {
+        assert!(
+            after.contains(&entry),
+            "Approach revision changed historical proof: {entry:?}"
+        );
+    }
+    let evidence = fixture.main_dir.join(&assignment.evidence[0].artifact.path);
+    let original = fs::read(&evidence).unwrap();
+    fs::write(&evidence, "changed assigned review").unwrap();
+    let before_rejection = snapshot_tree(&fixture.main_dir.join(".fluent/work"));
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .failure();
+    assert_eq!(
+        snapshot_tree(&fixture.main_dir.join(".fluent/work")),
+        before_rejection
+    );
+    fs::write(evidence, original).unwrap();
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+        .assert()
+        .success();
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_records_audit() {
     let fixture = setup_round_cap_approach_revision_fixture();
     approve_round_cap_extension(&fixture);
@@ -60465,7 +60575,7 @@ fn round_cap_approach_revision_rejects_unsupported_assignment_format() {
             write_json_path(
                 &work_root.join("transactions/assignment-format.json"),
                 &serde_json::json!({
-                    "schema_version": 5,
+                    "schema_version": 999,
                     "id": "assignment-format",
                     "base_revision": 0,
                     "target_revision": 1,
@@ -60476,7 +60586,7 @@ fn round_cap_approach_revision_rejects_unsupported_assignment_format() {
             let record_path = work_root.join("items/assignment-format.json");
             let mut record = read_json_path(&record_path);
             record["schema_version"] = serde_json::json!(6);
-            record["model_writer_version"]["schema_version"] = serde_json::json!(4);
+            record["model_writer_version"]["schema_version"] = serde_json::json!(999);
             write_json_path(&record_path, &record);
 
             let attempt_path = work_root.join("attempts/assignment-format/attempt-1.json");
@@ -60633,6 +60743,8 @@ for row in data["rows"]:
         row["state"] = "complete"
         row["implementation-evidence"] = ["README.md: apply the revised Approach"]
         row["verification"] = [{{"command": "true", "result": "pass"}}]
+        if row["kind"] == "finding":
+            row["applicable-constraints"] = ["plan:step-1"]
 path.write_text(json.dumps(data, indent=2) + "\n")
 PYCODE
     fi
@@ -61500,6 +61612,18 @@ fn setup_round_cap_approach_revision_fixture_with_plan_and_tester_command(
     plan: String,
     tester_command: &str,
 ) -> RoundCapApproachRevisionFixture {
+    setup_round_cap_approach_revision_fixture_with_review(
+        plan,
+        tester_command,
+        "Verdict: fail\n\nTests review found a corrective issue.\n",
+    )
+}
+
+fn setup_round_cap_approach_revision_fixture_with_review(
+    plan: String,
+    tester_command: &str,
+    tests_review: &str,
+) -> RoundCapApproachRevisionFixture {
     use fluent::work_model::{
         ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
         EvidenceRecoveryState, EvidenceReviewTarget, PlanningContext, TaskKind, TaskOutput,
@@ -61594,7 +61718,7 @@ fn setup_round_cap_approach_revision_fixture_with_plan_and_tester_command(
         let verdict = if task.role == "architecture" {
             "Verdict: pass\n\nArchitecture review passed.\n"
         } else if task.role == "tests" {
-            "Verdict: fail\n\nTests review found a corrective issue.\n"
+            tests_review
         } else {
             "Verdict: pass\n\nDocumentation review passed.\n"
         };
