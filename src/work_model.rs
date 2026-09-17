@@ -31,12 +31,16 @@ pub const WORK_MODEL_WRITER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// before this marker omit the field and are read as version 0. They remain
 /// readable, but the explicit `work-item upgrade` command rewrites them using
 /// this version after checking every record.
-pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 4;
+pub const WORK_MODEL_RECORD_SCHEMA_VERSION: u32 = 9;
 pub const WORK_MODEL_UPGRADE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_ADDITIONAL_WRITE_ROUNDS: usize = 1;
 pub const MAX_ADDITIONAL_WRITE_ROUNDS: usize = 3;
 pub const MAX_ROUND_CAP_RESOLUTION_BYTES: usize = 4_096;
 pub const RECOVERY_OPERATION_SCHEMA_VERSION: u32 = 1;
+/// Version of the immutable assignment captured for a corrective Writer.
+pub const WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION: u32 = 2;
+pub const MAX_WRITER_CORRECTION_ASSIGNMENT_INPUTS: usize = 512;
+pub const MAX_WRITER_CORRECTION_ASSIGNMENT_FINDINGS: usize = 512;
 pub const FAILED_COMMAND_RECHECK_ROLE: &str = "failed-command-recheck";
 pub const TESTER_HARNESS_REPAIR_ROLE: &str = "tester-harness-repair";
 pub const CANDIDATE_ANCESTRY_REPAIR_ROLE: &str = "candidate-ancestry-repair";
@@ -1030,6 +1034,7 @@ impl WorkItem {
                     path: artifact_path,
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts,
@@ -1148,6 +1153,7 @@ impl WorkItem {
                     candidate_commit: source_commit.clone(),
                     base_commit: None,
                 }),
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: preserved_inputs.clone(),
@@ -1229,6 +1235,7 @@ impl WorkItem {
                 candidate_commit: source_commit.clone(),
                 base_commit: base_commit.clone(),
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -1270,6 +1277,7 @@ impl WorkItem {
                     candidate_commit: source_commit.clone(),
                     base_commit: base_commit.clone(),
                 }),
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: {
@@ -1508,6 +1516,7 @@ impl WorkItem {
                     candidate_commit: write_output.commit.clone(),
                     base_commit: None,
                 }),
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: task_input_artifacts,
@@ -1604,6 +1613,7 @@ impl WorkItem {
                 candidate_commit: write_output.commit,
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -1690,6 +1700,7 @@ impl WorkItem {
                 candidate_commit: write_output.commit,
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: vec![source_results.clone()],
@@ -1774,6 +1785,7 @@ impl WorkItem {
                 path: work_artifact_path(&self.id, attempt_id, &task_id),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts,
@@ -1851,6 +1863,7 @@ impl WorkItem {
                 path: work_artifact_path(&self.id, attempt_id, &task_id),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: preserved_recovery,
@@ -3981,12 +3994,166 @@ fn parse_plan_completion_requirements(source: &str) -> Vec<WriterCompletionRequi
 }
 
 /// One open review finding added to a corrective Writer's task-specific matrix.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriterCompletionFinding {
     pub id: String,
     pub role: String,
     pub source: String,
     pub requirement: String,
+}
+
+/// Provenance for one immutable input used to justify a corrective Writer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterCorrectionAssignmentInput {
+    pub artifact: ArtifactRef,
+    pub digest: String,
+}
+
+/// Whether the host captured this assignment during normal execution or while
+/// explicitly reconstructing a legacy saved Writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterCorrectionAssignmentOrigin {
+    #[default]
+    Captured,
+    LegacyReconstructed,
+}
+
+/// Host-owned findings and provenance that a corrective Writer must preserve.
+/// The field lives on the Task record, outside all Writer-writable artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterCorrectionAssignment {
+    pub schema_version: u32,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub writer_task_id: String,
+    pub source_task_id: String,
+    pub source_candidate_commit: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_task_inputs: Vec<WriterCorrectionAssignmentInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<WriterCorrectionAssignmentInput>,
+    pub findings: Vec<WriterCompletionFinding>,
+    #[serde(default, skip_serializing_if = "is_captured_assignment")]
+    pub origin: WriterCorrectionAssignmentOrigin,
+}
+
+/// Preserve the exact assignment before and after an explicit context recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssignmentContextRecoveryAudit {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub attempt_digest: String,
+    pub before: WriterCorrectionAssignment,
+    pub after: WriterCorrectionAssignment,
+    pub original: WriterCorrectionAssignmentInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_free: Option<OutputFreeAssignmentContext>,
+}
+
+/// Retain the native failure and exact reservation alongside context proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OutputFreeAssignmentContext {
+    pub task: Task,
+    pub later_tasks: Vec<Task>,
+    pub files: BTreeMap<String, String>,
+}
+
+fn is_captured_assignment(origin: &WriterCorrectionAssignmentOrigin) -> bool {
+    *origin == WriterCorrectionAssignmentOrigin::Captured
+}
+
+impl WriterCorrectionAssignment {
+    pub fn validate_for_task(&self, task: &Task) -> Result<(), String> {
+        if !(1..=WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION).contains(&self.schema_version) {
+            return Err(format!(
+                "unsupported Writer correction assignment schema version {}",
+                self.schema_version
+            ));
+        }
+        for (name, value) in [
+            ("Work Item", &self.work_item_id),
+            ("Attempt", &self.attempt_id),
+            ("Writer Task", &self.writer_task_id),
+            ("source Task", &self.source_task_id),
+            ("source candidate commit", &self.source_candidate_commit),
+        ] {
+            if value.trim().is_empty() || value.len() > 512 {
+                return Err(format!("{name} binding is empty or too large"));
+            }
+        }
+        if self.work_item_id != task.work_item_id {
+            return Err("assignment Work Item does not match its Task".into());
+        }
+        if self.attempt_id != task.attempt_id.as_deref().unwrap_or("") {
+            return Err("assignment Attempt does not match its Task".into());
+        }
+        if self.writer_task_id != task.id {
+            return Err("assignment Writer Task does not match its Task".into());
+        }
+        if self.source_task_id == task.id {
+            return Err("assignment source Task must precede its Writer Task".into());
+        }
+        if self.source_task_inputs.len() > MAX_WRITER_CORRECTION_ASSIGNMENT_INPUTS
+            || self.evidence.len() > MAX_WRITER_CORRECTION_ASSIGNMENT_INPUTS
+            || self.findings.len() > MAX_WRITER_CORRECTION_ASSIGNMENT_FINDINGS
+        {
+            return Err("assignment exceeds its bounded input or finding limit".into());
+        }
+        validate_assignment_inputs("source Task", &self.source_task_inputs)?;
+        validate_assignment_inputs("evidence", &self.evidence)?;
+        if !self.findings.is_empty() && self.evidence.is_empty() {
+            return Err("assignment findings require bound evidence".into());
+        }
+        let mut finding_ids = HashSet::new();
+        for finding in &self.findings {
+            if finding.id.trim().is_empty()
+                || finding.role.trim().is_empty()
+                || finding.source.trim().is_empty()
+                || finding.requirement.trim().is_empty()
+                || finding.id.len() > 512
+                || finding.role.len() > 128
+                || finding.source.len() > 1024
+                || finding.requirement.len() > 16 * 1024
+                || !finding_ids.insert(finding.id.as_str())
+            {
+                return Err("assignment findings must be bounded, complete, and unique".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_assignment_inputs(
+    label: &str,
+    inputs: &[WriterCorrectionAssignmentInput],
+) -> Result<(), String> {
+    let mut refs = HashSet::new();
+    for input in inputs {
+        if input.artifact.producer_id.trim().is_empty()
+            || input.artifact.path.trim().is_empty()
+            || input.artifact.producer_id.len() > 512
+            || input.artifact.path.len() > 1024
+            || !valid_sha256_digest(&input.digest)
+            || !refs.insert((&input.artifact.producer_id, &input.artifact.path))
+        {
+            return Err(format!(
+                "{label} assignment inputs must have unique bounded artifact references and SHA-256 digests"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -4124,6 +4291,18 @@ impl WriterCompletionMatrixStatus {
 }
 
 impl WriterCompletionMatrix {
+    /// Keep the exact unfinished Writer obligations when presenting current work.
+    pub(crate) fn pending_writer_rows(&self) -> Vec<WriterCompletionRow> {
+        self.rows
+            .iter()
+            .filter(|row| {
+                writer_responsibility(row.responsibility)
+                    && row.state == WriterCompletionState::Pending
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Compare stable obligations and completed identities across continuations.
     /// Finding paths may change when the same finding is reported again; evidence
     /// wording and commit counts do not themselves establish additional work.
@@ -6738,6 +6917,14 @@ impl Attempt {
     }
 
     pub fn validate(&self, work_item_id: &str) -> Result<(), WorkModelError> {
+        for recovery in &self.evidence_recoveries {
+            recovery.validate_carried_finding(self).map_err(|reason| {
+                WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: self.id.clone(),
+                    reason,
+                }
+            })?;
+        }
         if let Some(contract) = &self.writer_completion_contract {
             contract
                 .validate()
@@ -6816,6 +7003,48 @@ impl Attempt {
                     attempt_id: self.id.clone(),
                     task_id: task.id.clone(),
                     task_status: task.status.clone(),
+                });
+            }
+        }
+        for (task_index, task) in self.tasks.iter().enumerate() {
+            let Some(assignment) = task.writer_correction_assignment.as_ref() else {
+                continue;
+            };
+            if task.kind != TaskKind::Write {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "assignment belongs only on a Writer Task".into(),
+                });
+            }
+            let Some(source) = self.tasks[..task_index]
+                .iter()
+                .find(|source| source.id == assignment.source_task_id)
+            else {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "assignment source Task is missing or follows the Writer".into(),
+                });
+            };
+            let Some(output) = source.output.as_ref() else {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "assignment source Task has no completed candidate output".into(),
+                });
+            };
+            if source.kind != TaskKind::Write
+                || source.status != TaskStatus::Complete
+                || output.commit != assignment.source_candidate_commit
+            {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "assignment source Task does not own the bound candidate".into(),
+                });
+            }
+            if !crate::recovery_contracts::assignment_source_inputs_match(task, source, assignment)
+            {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "assignment source Task inputs changed".into(),
                 });
             }
         }
@@ -7480,7 +7709,7 @@ impl RecoveryOperationRecord {
         }
     }
 
-    fn matches_request(&self, request: &RecoveryOperationRequest) -> bool {
+    pub(crate) fn matches_request(&self, request: &RecoveryOperationRequest) -> bool {
         self.schema_version == RECOVERY_OPERATION_SCHEMA_VERSION
             && self.operation_id == request.operation_id()
             && self.operation_kind == request.operation_kind
@@ -7656,6 +7885,10 @@ pub struct Task {
     pub evidence_review_context: Option<EvidenceReviewContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_context: Option<VerificationContext>,
+    /// Host-owned assignment captured before a corrective Writer launches.
+    /// Writer-writable completion artifacts never replace this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_correction_assignment: Option<WriterCorrectionAssignment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifacts: Vec<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7719,6 +7952,14 @@ impl Task {
 
     pub fn validate(&self) -> Result<(), WorkModelError> {
         self.workspace_access.validate()?;
+        if let Some(assignment) = &self.writer_correction_assignment {
+            assignment.validate_for_task(self).map_err(|reason| {
+                WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: self.id.clone(),
+                    reason,
+                }
+            })?;
+        }
         if self.status == TaskStatus::Complete {
             if self.kind == TaskKind::Write && self.output.is_none() {
                 return Err(WorkModelError::CompleteWriteTaskMissingOutput {
@@ -8296,6 +8537,8 @@ impl RequiredCheckSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceRecovery {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_finding: Option<CarriedFindingEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_check: Option<RequiredCheck>,
     pub id: String,
     pub candidate_commit: String,
@@ -8306,6 +8549,35 @@ pub struct EvidenceRecovery {
     /// One operator-authorized source correction for a failed evidence review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_change_classification: Option<HostEvidenceClassification>,
+}
+
+/// Bind an explicitly selected historical finding to current-candidate proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarriedFindingBinding {
+    pub schema_version: u32,
+    pub work_item_id: String,
+    pub attempt_id: String,
+    pub writer_task_id: String,
+    pub candidate_commit: String,
+    pub finding: WriterCompletionFinding,
+    pub assignment: WriterCorrectionAssignment,
+    pub assignment_digest: String,
+    pub contract_digest: String,
+    pub source_review: WriterCorrectionAssignmentInput,
+    pub source_matrix: BoundRecheckArtifact,
+    pub command: String,
+    pub working_directory: String,
+    pub applicability: ResolvedCheckApplicability,
+    pub evidence: BoundRecheckArtifact,
+}
+
+/// Retain the typed contract and the immutable bytes supplied to Tests Review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CarriedFindingEvidence {
+    pub binding: CarriedFindingBinding,
+    pub artifact: BoundRecheckArtifact,
 }
 
 /// Durable result of classifying candidate-bound host evidence as a source
@@ -8348,6 +8620,56 @@ impl HostEvidenceClassification {
 }
 
 impl EvidenceRecovery {
+    fn validate_carried_finding(&self, attempt: &Attempt) -> Result<(), String> {
+        let Some(saved) = &self.carried_finding else {
+            return Ok(());
+        };
+        let binding = &saved.binding;
+        if binding.schema_version != 1
+            || self.required_check.is_some()
+            || binding.work_item_id != attempt.work_item_id
+            || binding.attempt_id != attempt.id
+            || binding.candidate_commit != self.candidate_commit
+            || binding.writer_task_id != binding.assignment.writer_task_id
+            || binding.finding.role != "tests"
+            || !binding.assignment.findings.contains(&binding.finding)
+            || !binding.assignment.evidence.contains(&binding.source_review)
+            || binding.finding.source != binding.source_review.artifact.path
+            || binding.evidence.path != self.attachment.snapshot_path
+            || binding.evidence.digest != self.attachment.digest
+            || !valid_sha256_digest(&saved.artifact.digest)
+            || !valid_sha256_digest(&binding.source_matrix.digest)
+            || !valid_sha256_digest(&binding.contract_digest)
+        {
+            return Err("carried finding has an invalid schema or contradictory binding".into());
+        }
+        let bytes = serde_json::to_vec_pretty(binding).map_err(|e| e.to_string())?;
+        let assignment = serde_json::to_vec(&binding.assignment).map_err(|e| e.to_string())?;
+        if format!("sha256:{:x}", Sha256::digest(&bytes)) != saved.artifact.digest
+            || format!("sha256:{:x}", Sha256::digest(&assignment)) != binding.assignment_digest
+            || self.id != format!("carried-finding-{}", &saved.artifact.digest[7..])
+            || saved.artifact.path
+                != work_artifact_path(
+                    &attempt.work_item_id,
+                    &attempt.id,
+                    &format!(
+                        "carried-finding-evidence/{}.json",
+                        &saved.artifact.digest[7..]
+                    ),
+                )
+            || self.targets.len() != 1
+            || self.targets[0].role != "tests"
+            || self.targets[0].prior_review_artifact != saved.artifact.path
+            || (self.state == EvidenceRecoveryState::Complete
+                && self.targets[0].review_digest.is_none())
+        {
+            return Err(
+                "carried finding has an invalid artifact, assignment, or Review identity".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn is_active(&self) -> bool {
         self.state == EvidenceRecoveryState::Reviewing
     }
@@ -8933,6 +9255,13 @@ pub enum WorkModelError {
     InvalidTaskNoChangeOutput {
         task_id: String,
     },
+    InvalidWriterCorrectionAssignment {
+        task_id: String,
+        reason: String,
+    },
+    WriterCorrectionAssignmentModified {
+        task_id: String,
+    },
     InvalidFailedCommandRecheckTask {
         task_id: String,
     },
@@ -9247,6 +9576,14 @@ impl fmt::Display for WorkModelError {
             Self::InvalidTaskNoChangeOutput { task_id } => {
                 write!(f, "task {task_id} has invalid no-change output")
             }
+            Self::InvalidWriterCorrectionAssignment { task_id, reason } => write!(
+                f,
+                "task {task_id} has invalid Writer correction assignment: {reason}"
+            ),
+            Self::WriterCorrectionAssignmentModified { task_id } => write!(
+                f,
+                "task {task_id} has a host-owned Writer correction assignment that was removed or modified"
+            ),
             Self::InvalidFailedCommandRecheckTask { task_id } => {
                 write!(
                     f,
@@ -9648,13 +9985,10 @@ pub struct WorkModelSnapshot {
 }
 
 const WORK_MODEL_WRITER_ENVELOPE_FORMAT: &str = "fluent-work-item-writer";
-/// Version 5 fences the assignment-aware coordinator's schema-4 envelope.
-/// Versions 1 and 2 remain readable because stable main models them; versions
-/// 3 and 4 belong to an unsupported intervening format.
-const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 5;
+const WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION: u32 = 8;
 
 fn is_supported_writer_envelope_schema(version: u32) -> bool {
-    matches!(version, 1 | 2 | WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION)
+    matches!(version, 1..=WORK_MODEL_WRITER_ENVELOPE_SCHEMA_VERSION)
 }
 
 /// Fence readers that deserialize the existing writer field as Option<String>.
@@ -9758,6 +10092,16 @@ struct WorkItemTransaction {
     /// published. Legacy journals omit this field and remain recoverable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     managed_files: Vec<ManagedWorkItemFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usage_limit_publications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    context_retry_publications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_retry_base: Option<WorkItem>,
+    /// Retain the authorized base only for a context-recovery publication. Its
+    /// digest lets replay validate children that already contain target records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment_context_base: Option<WorkItem>,
     work_item: WorkItem,
 }
 
@@ -9767,13 +10111,48 @@ struct StoredRecordVersions {
 }
 
 impl WorkItemTransaction {
-    /// Version 7 journals managed sidecars with the aggregate publication.
-    /// Earlier stable transaction versions remain modeled; versions 4 and 5
-    /// are not admitted by their numeric position alone.
-    const SCHEMA_VERSION: u32 = 7;
+    const SCHEMA_VERSION: u32 = 9;
 
     fn is_supported_schema(version: u32) -> bool {
-        matches!(version, 1..=3 | 6 | Self::SCHEMA_VERSION)
+        matches!(version, 1..=Self::SCHEMA_VERSION)
+    }
+
+    /// Keep the base and operation list mandatory when retry authority exists.
+    /// Defaults read predecessor journals; they must not erase present proof.
+    fn validate_context_retry(&self) -> Result<(), WorkModelError> {
+        let check = || -> anyhow::Result<()> {
+            use crate::recovery_contracts::context_retry::pending_publications;
+            if pending_publications(&self.work_item, None).is_empty() {
+                anyhow::ensure!(
+                    self.context_retry_base.is_none() && self.context_retry_publications.is_empty(),
+                    "unexpected retry journal metadata"
+                );
+                return Ok(());
+            }
+            let base = self
+                .context_retry_base
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("retry journal lost its authorized base"))?;
+            anyhow::ensure!(
+                self.schema_version >= 9
+                    && base.id == self.id
+                    && self.base_children_digest.as_deref()
+                        == Some(work_item_children_digest(base)?.as_str()),
+                "retry journal base changed"
+            );
+            base.ensure_mutation_compatible()?;
+            base.validate()?;
+            anyhow::ensure!(
+                self.context_retry_publications
+                    == pending_publications(&self.work_item, Some(base)),
+                "retry journal publication list changed"
+            );
+            Ok(())
+        };
+        check().map_err(|error| WorkModelError::InvalidRecoveryOperation {
+            attempt_id: self.id.clone(),
+            reason: format!("invalid context retry journal: {error:#}"),
+        })
     }
 }
 
@@ -10049,11 +10428,110 @@ fn reject_canceled_attempt_launches(
     Ok(())
 }
 
+fn reject_writer_correction_assignment_change(
+    project_root: &Path,
+    prior: &WorkItem,
+    target: &WorkItem,
+    path: &Path,
+) -> Result<(), WorkModelStorageError> {
+    for prior_attempt in &prior.attempts {
+        let Some(target_attempt) = target
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == prior_attempt.id)
+        else {
+            if prior_attempt
+                .tasks
+                .iter()
+                .any(|task| task.writer_correction_assignment.is_some())
+            {
+                let task_id = prior_attempt
+                    .tasks
+                    .iter()
+                    .find(|task| task.writer_correction_assignment.is_some())
+                    .map(|task| task.id.clone())
+                    .unwrap_or_else(|| prior_attempt.id.clone());
+                return Err(WorkModelStorageError::InvalidModel {
+                    path: path.to_path_buf(),
+                    source: WorkModelError::WriterCorrectionAssignmentModified { task_id },
+                });
+            }
+            continue;
+        };
+        let prior_recoveries = prior_attempt
+            .recovery_operations
+            .iter()
+            .filter(|r| {
+                r.operation_kind.starts_with("usage-limit-writer-")
+                    || r.operation_kind == "assignment-context-recovery"
+                    || r.operation_kind.starts_with("writer-completion-context-")
+            })
+            .collect::<Vec<_>>();
+        let target_recoveries = target_attempt
+            .recovery_operations
+            .iter()
+            .filter(|r| {
+                r.operation_kind.starts_with("usage-limit-writer-")
+                    || r.operation_kind == "assignment-context-recovery"
+                    || r.operation_kind.starts_with("writer-completion-context-")
+            })
+            .collect::<Vec<_>>();
+        if !target_recoveries.starts_with(&prior_recoveries) {
+            return Err(WorkModelStorageError::InvalidModel {
+                path: path.to_path_buf(),
+                source: WorkModelError::InvalidRecoveryOperation {
+                    attempt_id: prior_attempt.id.clone(),
+                    reason: "usage-limit recovery operations are append-only".into(),
+                },
+            });
+        }
+        for prior_task in &prior_attempt.tasks {
+            let Some(prior_assignment) = prior_task.writer_correction_assignment.as_ref() else {
+                continue;
+            };
+            let Some(target_task) = target_attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == prior_task.id)
+            else {
+                return Err(WorkModelStorageError::InvalidModel {
+                    path: path.to_path_buf(),
+                    source: WorkModelError::WriterCorrectionAssignmentModified {
+                        task_id: prior_task.id.clone(),
+                    },
+                });
+            };
+            if target_task.writer_correction_assignment.as_ref() != Some(prior_assignment)
+                && !crate::recovery_contracts::audited_assignment_context_change(
+                    project_root,
+                    prior_attempt,
+                    target_attempt,
+                    prior_task,
+                    target_task,
+                )
+                .unwrap_or(false)
+            {
+                return Err(WorkModelStorageError::InvalidModel {
+                    path: path.to_path_buf(),
+                    source: WorkModelError::WriterCorrectionAssignmentModified {
+                        task_id: prior_task.id.clone(),
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl WorkModelStore {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: project_root.into(),
         }
+    }
+
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project_root
     }
 
     pub fn work_dir(&self) -> PathBuf {
@@ -10181,6 +10659,16 @@ impl WorkModelStore {
     /// Read one published aggregate without performing host-owned maintenance.
     pub fn read_work_item_snapshot(&self, id: &str) -> Result<WorkItem, WorkModelStorageError> {
         self.read_work_item_snapshot_file(&self.work_item_path(id)?)
+    }
+
+    /// Inspect a valid interrupted target without publishing any of its records.
+    pub(crate) fn read_work_item_recovery_target(
+        &self,
+        id: &str,
+    ) -> Result<Option<WorkItem>, WorkModelStorageError> {
+        Ok(self
+            .read_work_item_transaction(id)?
+            .map(|transaction| transaction.work_item))
     }
 
     fn read_work_item_snapshot_file(&self, path: &Path) -> Result<WorkItem, WorkModelStorageError> {
@@ -10667,6 +11155,28 @@ impl WorkModelStore {
         )
     }
 
+    /// Validate an interrupted external operation before recovering its publication.
+    pub(crate) fn mutate_work_item_from_external_with_recovery_check<T>(
+        &self,
+        id: &str,
+        reason: impl Into<String>,
+        evidence_ref: Option<String>,
+        check: impl FnOnce(&WorkItem) -> Result<(), WorkModelError>,
+        reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+    ) -> Result<T, WorkModelStorageError> {
+        self.mutate_work_item_with_recovery_check(
+            id,
+            &DurableTransitionMetadata {
+                origin: DurableTransitionOrigin::External,
+                reason: Some(reason.into()),
+                evidence_ref,
+            },
+            &[],
+            check,
+            reducer,
+        )
+    }
+
     /// Atomically mutate a Work Item under its per-Work-Item model lock.
     ///
     /// Acquires the stable model lock once, recovers any pending transaction,
@@ -10708,8 +11218,25 @@ impl WorkModelStore {
         managed_files: &[ManagedWorkItemFile],
         reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
     ) -> Result<T, WorkModelStorageError> {
+        self.mutate_work_item_with_recovery_check(id, metadata, managed_files, |_| Ok(()), reducer)
+    }
+
+    fn mutate_work_item_with_recovery_check<T>(
+        &self,
+        id: &str,
+        metadata: &DurableTransitionMetadata,
+        managed_files: &[ManagedWorkItemFile],
+        check: impl FnOnce(&WorkItem) -> Result<(), WorkModelError>,
+        reducer: impl FnOnce(&mut WorkItem) -> Result<T, WorkModelError>,
+    ) -> Result<T, WorkModelStorageError> {
         let path = self.work_item_path(id)?;
         let _lock = self.lock_work_item_model(id)?;
+        if let Some(target) = self.read_work_item_recovery_target(id)? {
+            check(&target).map_err(|source| WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source,
+            })?;
+        }
         let mut work_item = self.read_work_item_under_model_lock(id)?;
         work_item.ensure_mutation_compatible().map_err(|source| {
             WorkModelStorageError::InvalidModel {
@@ -10781,6 +11308,7 @@ impl WorkModelStore {
         if let Some(prior) = prior.as_ref() {
             preserve_transition_history(prior, &mut target, &path)?;
             reject_canceled_attempt_launches(prior, &target, &path)?;
+            reject_writer_correction_assignment_change(&self.project_root, prior, &target, &path)?;
             if recovered_transaction
                 && target == *prior
                 && let Some(revision) = prior.storage_revision.get()
@@ -10902,7 +11430,13 @@ impl WorkModelStore {
         }
 
         let expected_revision = work_item.storage_revision.get();
+        let mut usage_limit_publications =
+            crate::usage_limit_contracts::pending_publication_ids(work_item, None);
+        let mut context_retry_publications =
+            crate::recovery_contracts::context_retry::pending_publications(work_item, None);
         let mut base_children_digest = None;
+        let mut assignment_context_base = None;
+        let mut context_retry_base = None;
         let base_revision = if path.exists() {
             let current: WorkItemRecord = read_json_file(&path)?;
             ensure_supported_record_schema(&path, "Work Item", current.schema_version)?;
@@ -10921,6 +11455,22 @@ impl WorkModelStore {
                 });
             }
             if let Ok(current_item) = self.read_work_item_file_unlocked(&path, false) {
+                context_retry_publications =
+                    crate::recovery_contracts::context_retry::pending_publications(
+                        work_item,
+                        Some(&current_item),
+                    );
+                usage_limit_publications = crate::usage_limit_contracts::pending_publication_ids(
+                    work_item,
+                    Some(&current_item),
+                );
+                if !crate::recovery_contracts::context_retry::pending_publications(work_item, None)
+                    .is_empty()
+                {
+                    // Retain the base even for later ordinary writes so a
+                    // stripped publication list cannot hide a new approval.
+                    context_retry_base = Some(current_item.clone());
+                }
                 if managed_files.is_empty()
                     && !force_persist
                     && aggregate_snapshot_matches(&current_item, work_item)?
@@ -10944,6 +11494,22 @@ impl WorkModelStore {
                         source,
                     },
                 )?;
+                reject_writer_correction_assignment_change(
+                    &self.project_root,
+                    &current_item,
+                    work_item,
+                    &path,
+                )?;
+                if work_item.attempts.iter().any(|attempt| {
+                    attempt.recovery_operations.iter().any(|operation| {
+                        operation.operation_kind == "assignment-context-recovery"
+                            && !current_item.attempts.iter().any(|prior| {
+                                prior.recovery_operation(&operation.operation_id).is_some()
+                            })
+                    })
+                }) {
+                    assignment_context_base = Some(current_item);
+                }
             }
             Some(current.storage_revision)
         } else {
@@ -10966,6 +11532,10 @@ impl WorkModelStore {
             target_revision,
             base_children_digest,
             managed_files: managed_files.to_vec(),
+            usage_limit_publications,
+            context_retry_publications,
+            context_retry_base,
+            assignment_context_base,
             work_item: work_item.clone(),
         };
         let transaction_path = self.work_transaction_path(&work_item.id)?;
@@ -10982,6 +11552,27 @@ impl WorkModelStore {
             });
         }
         write_json_file(&transaction_path, &transaction)?;
+        crate::usage_limit_contracts::test_interrupt_journal(work_item);
+        if work_item.attempts.iter().any(|a| {
+            a.recovery_operations
+                .iter()
+                .any(|r| r.operation_kind == "assignment-context-recovery")
+        }) {
+            crate::assignment_context_recovery::test_interrupt("journal");
+        }
+        if !transaction.context_retry_publications.is_empty() {
+            if work_item.attempts.iter().any(|a| {
+                a.recovery_operations.iter().any(|r| {
+                    r.operation_kind == crate::recovery_contracts::context_retry::START
+                        && transaction
+                            .context_retry_publications
+                            .contains(&r.operation_id)
+                })
+            }) {
+                crate::recovery_contracts::context_retry::test_interrupt("start-journal");
+            }
+            crate::recovery_contracts::context_retry::test_interrupt("journal");
+        }
         self.apply_work_item_transaction(&transaction)?;
         work_item.storage_revision.set(target_revision);
         Ok(())
@@ -11246,6 +11837,12 @@ impl WorkModelStore {
             });
         }
         self.validate_managed_files(&transaction.managed_files)?;
+        transaction.validate_context_retry().map_err(|source| {
+            WorkModelStorageError::InvalidModel {
+                path: path.clone(),
+                source,
+            }
+        })?;
         transaction
             .work_item
             .validate()
@@ -11259,6 +11856,162 @@ impl WorkModelStore {
     fn recover_work_item_transaction(&self, id: &str) -> Result<(), WorkModelStorageError> {
         if let Some(transaction) = self.read_work_item_transaction(id)? {
             self.apply_work_item_transaction(&transaction)?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile only the journal bound to this explicit recovery request. A
+    /// rejected request must not perform unrelated pending maintenance.
+    pub(crate) fn reconcile_assignment_context_transaction(
+        &self,
+        operation: &RecoveryOperationRequest,
+        audit: &AssignmentContextRecoveryAudit,
+    ) -> anyhow::Result<bool> {
+        let _lock = self.lock_work_item_model(&operation.work_item_id)?;
+        let Some(transaction) = self.read_work_item_transaction(&operation.work_item_id)? else {
+            return Ok(false);
+        };
+        let Some(base) = &transaction.assignment_context_base else {
+            return Ok(false);
+        };
+        let (_, task) = crate::recovery_contracts::assignment_context_recovery_target(
+            &self.project_root,
+            &transaction.work_item,
+            &operation.attempt_id,
+            operation.task_id.as_deref().unwrap_or_default(),
+            operation.candidate_commit.as_deref().unwrap_or_default(),
+        )?;
+        anyhow::ensure!(
+            transaction
+                .work_item
+                .validate_recovery_operation(&self.project_root, operation)?
+                .is_some()
+                && task.writer_correction_assignment.as_ref() == Some(&audit.after)
+                && base.attempts.iter().any(|attempt| {
+                    attempt.id == operation.attempt_id
+                        && crate::recovery_contracts::assignment_attempt_digest(attempt)
+                            .is_ok_and(|digest| digest == audit.attempt_digest)
+                }),
+            "pending context recovery does not match this request"
+        );
+        self.apply_work_item_transaction(&transaction)?;
+        Ok(true)
+    }
+
+    /// Validate the original authorization and every partially published child
+    /// before replaying this journal. The journal base is never an observation.
+    fn validate_assignment_context_publication(
+        &self,
+        transaction: &WorkItemTransaction,
+        current: &WorkItem,
+        base: &WorkItem,
+    ) -> anyhow::Result<()> {
+        use crate::recovery_contracts as contracts;
+        let target = &transaction.work_item;
+        anyhow::ensure!(
+            transaction.schema_version >= 7
+                && base.id == target.id
+                && transaction.base_children_digest.as_deref()
+                    == Some(work_item_children_digest(base)?.as_str()),
+            "context recovery journal lost its authorized base"
+        );
+        base.ensure_mutation_compatible()?;
+        base.validate()?;
+        reject_writer_correction_assignment_change(
+            &self.project_root,
+            base,
+            target,
+            &self.work_item_path(&target.id)?,
+        )?;
+        let mut publications = 0;
+        for attempt in &target.attempts {
+            for operation in &attempt.recovery_operations {
+                if operation.operation_kind != "assignment-context-recovery"
+                    || base
+                        .attempts
+                        .iter()
+                        .any(|prior| prior.recovery_operation(&operation.operation_id).is_some())
+                {
+                    continue;
+                }
+                publications += 1;
+                let (_, task) = contracts::assignment_context_recovery_target(
+                    &self.project_root,
+                    target,
+                    &attempt.id,
+                    operation.task_id.as_deref().unwrap_or_default(),
+                    operation.candidate_commit.as_deref().unwrap_or_default(),
+                )?;
+                contracts::validate_assignment_context_recovery_inputs(
+                    &self.project_root,
+                    task,
+                    task.writer_correction_assignment
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("recovery has no assignment"))?,
+                )?;
+            }
+        }
+        anyhow::ensure!(
+            publications == 1,
+            "context recovery journal must bind one publication"
+        );
+        self.validate_recovery_children(current, base, target)
+    }
+
+    /// Each partially published child must still match the authorized base or target.
+    fn validate_recovery_children(
+        &self,
+        current: &WorkItem,
+        base: &WorkItem,
+        target: &WorkItem,
+    ) -> anyhow::Result<()> {
+        let mut current_root = current.clone();
+        current_root.attempts.clear();
+        current_root.merge_candidates.clear();
+        let mut base_root = base.clone();
+        base_root.attempts.clear();
+        base_root.merge_candidates.clear();
+        let mut target_root = target.clone();
+        target_root.attempts.clear();
+        target_root.merge_candidates.clear();
+        anyhow::ensure!(
+            aggregate_snapshot_matches(&current_root, &base_root)?
+                || aggregate_snapshot_matches(&current_root, &target_root)?,
+            "Work changed during context recovery publication"
+        );
+        anyhow::ensure!(
+            current.merge_candidates == base.merge_candidates
+                && target.merge_candidates == base.merge_candidates
+                && current.attempts.len() == base.attempts.len()
+                && target.attempts.len() == base.attempts.len(),
+            "Work children changed during context recovery publication"
+        );
+        for ((current, before), after) in current
+            .attempts
+            .iter()
+            .zip(&base.attempts)
+            .zip(&target.attempts)
+        {
+            let mut current_record = current.clone();
+            current_record.tasks.clear();
+            let mut before_record = before.clone();
+            before_record.tasks.clear();
+            let mut after_record = after.clone();
+            after_record.tasks.clear();
+            anyhow::ensure!(
+                (current_record == before_record || current_record == after_record)
+                    && current.tasks.len() == before.tasks.len()
+                    && after.tasks.len() == before.tasks.len(),
+                "Attempt changed during context recovery publication"
+            );
+            for ((current, before), after) in
+                current.tasks.iter().zip(&before.tasks).zip(&after.tasks)
+            {
+                anyhow::ensure!(
+                    current == before || current == after,
+                    "Task changed during context recovery publication"
+                );
+            }
         }
         Ok(())
     }
@@ -11280,6 +12033,36 @@ impl WorkModelStore {
         &self,
         transaction: &WorkItemTransaction,
     ) -> Result<(), WorkModelStorageError> {
+        transaction.validate_context_retry().map_err(|source| {
+            WorkModelStorageError::InvalidModel {
+                path: self.work_dir(),
+                source,
+            }
+        })?;
+        crate::recovery_contracts::context_retry::validate_publication(
+            &self.project_root,
+            &transaction.work_item,
+            &transaction.context_retry_publications,
+        )
+        .map_err(|error| WorkModelStorageError::InvalidModel {
+            path: self.work_dir(),
+            source: WorkModelError::InvalidRecoveryOperation {
+                attempt_id: transaction.id.clone(),
+                reason: format!("pending context retry is unverifiable: {error:#}"),
+            },
+        })?;
+        crate::usage_limit_contracts::validate_publication(
+            &self.project_root,
+            &transaction.work_item,
+            &transaction.usage_limit_publications,
+        )
+        .map_err(|error| WorkModelStorageError::InvalidModel {
+            path: self.work_dir(),
+            source: WorkModelError::InvalidRecoveryOperation {
+                attempt_id: transaction.id.clone(),
+                reason: format!("pending usage-limit authority is unverifiable: {error:#}"),
+            },
+        })?;
         let path = self.work_item_path(&transaction.id)?;
         let current_revision = if path.exists() {
             let current = read_json_file::<WorkItemRecord>(&path)?;
@@ -11297,6 +12080,39 @@ impl WorkModelStore {
                 expected_revision: transaction.base_revision,
                 actual_revision: current_revision.unwrap_or(0),
             });
+        }
+
+        if path.exists() {
+            let current = self.read_work_item_file_unlocked(&path, false)?;
+            if let Some(base) = &transaction.context_retry_base
+                && !transaction.context_retry_publications.is_empty()
+            {
+                self.validate_recovery_children(&current, base, &transaction.work_item)
+                    .map_err(|error| WorkModelStorageError::InvalidModel {
+                        path: path.clone(),
+                        source: WorkModelError::InvalidRecoveryOperation {
+                            attempt_id: transaction.id.clone(),
+                            reason: format!("pending context retry children changed: {error:#}"),
+                        },
+                    })?;
+            }
+            if let Some(base) = &transaction.assignment_context_base {
+                self.validate_assignment_context_publication(transaction, &current, base)
+                    .map_err(|error| WorkModelStorageError::InvalidModel {
+                        path: path.clone(),
+                        source: WorkModelError::InvalidRecoveryOperation {
+                            attempt_id: transaction.id.clone(),
+                            reason: format!("pending context authority is unverifiable: {error:#}"),
+                        },
+                    })?;
+            } else {
+                reject_writer_correction_assignment_change(
+                    &self.project_root,
+                    &current,
+                    &transaction.work_item,
+                    &path,
+                )?;
+            }
         }
 
         self.publish_managed_files(&transaction.managed_files)?;
@@ -11318,6 +12134,35 @@ impl WorkModelStore {
 
         self.write_attempt_records(&transaction.work_item)?;
         self.write_merge_candidate_records(&transaction.work_item)?;
+        if !transaction.context_retry_publications.is_empty() {
+            crate::recovery_contracts::context_retry::test_interrupt("children");
+        }
+        if transaction.work_item.attempts.iter().any(|a| {
+            a.recovery_operations
+                .iter()
+                .any(|r| r.operation_kind == "assignment-context-recovery")
+        }) {
+            crate::assignment_context_recovery::test_interrupt("children");
+        }
+        // Exercise the real public split-record boundary with a fixture-specific
+        // interruption. Production executables contain no environment override.
+        #[cfg(feature = "test-support")]
+        if std::env::var("FLUENT_TEST_INTERRUPT_CARRIED_FINDING_PUBLICATION")
+            .ok()
+            .as_deref()
+            == Some(transaction.id.as_str())
+            && transaction.work_item.attempts.iter().any(|a| {
+                a.evidence_recoveries
+                    .iter()
+                    .any(|r| r.carried_finding.is_some())
+            })
+        {
+            return Err(WorkModelStorageError::WriteFile {
+                path: self.work_transaction_path(&transaction.id)?,
+                source: io::Error::other("interrupted carried finding publication"),
+            });
+        }
+
         let mut record = WorkItemRecord::from(&transaction.work_item);
         record.storage_revision = transaction.target_revision;
         let json = to_json_pretty(&record).map_err(|source| WorkModelStorageError::ParseFile {
@@ -11382,6 +12227,20 @@ impl WorkModelStore {
             let attempt_path = self.work_attempt_path(&work_item.id, &attempt.id)?;
             let record = AttemptRecord::from_attempt(attempt, order);
             write_json_file(&attempt_path, &record)?;
+            if attempt
+                .recovery_operations
+                .last()
+                .is_some_and(|r| r.operation_kind == "assignment-context-recovery")
+            {
+                crate::assignment_context_recovery::test_interrupt("attempt");
+            }
+            if attempt
+                .recovery_operations
+                .last()
+                .is_some_and(|r| r.operation_kind.starts_with("writer-completion-context-"))
+            {
+                crate::recovery_contracts::context_retry::test_interrupt("attempt");
+            }
             attempt_files.insert(attempt_path);
 
             let task_dir = tasks_item_dir.join(object_dir_name(&attempt.id)?);
@@ -11397,6 +12256,18 @@ impl WorkModelStore {
                 let task_path = self.work_task_path(&work_item.id, &attempt.id, &task.id)?;
                 let record = TaskRecord::from_task(task, order);
                 write_json_file(&task_path, &record)?;
+                if attempt.recovery_operations.last().is_some_and(|r| {
+                    r.operation_kind == "assignment-context-recovery"
+                        && r.task_id.as_deref() == Some(task.id.as_str())
+                }) {
+                    crate::assignment_context_recovery::test_interrupt("task");
+                }
+                if attempt.recovery_operations.last().is_some_and(|r| {
+                    r.operation_kind.starts_with("writer-completion-context-")
+                        && r.task_id.as_deref() == Some(task.id.as_str())
+                }) {
+                    crate::recovery_contracts::context_retry::test_interrupt("task");
+                }
                 task_files.insert(task_path);
             }
             prune_json_files(&task_dir, &task_files)?;
@@ -13956,6 +14827,7 @@ random banner prose that must be ignored
                 path: ".fluent/tasks/task-1".to_string(),
             }),
             review_context,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -13974,6 +14846,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let recovery = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-123".to_string(),
             candidate_commit: "abc123".to_string(),
@@ -14128,6 +15001,7 @@ random banner prose that must be ignored
             sha2::Sha256::digest(targeted_content.as_bytes())
         );
         let recovery = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: recovery_id,
             candidate_commit: candidate.clone(),
@@ -14225,6 +15099,7 @@ random banner prose that must be ignored
         fs::create_dir_all(root.join(&later_path).parent().unwrap()).unwrap();
         fs::write(root.join(&later_path), later_content).unwrap();
         let later_recovery = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: later_recovery_id.clone(),
             candidate_commit: candidate.clone(),
@@ -14303,6 +15178,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let prior = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-123".to_string(),
             candidate_commit: "abc123".to_string(),
@@ -14319,6 +15195,7 @@ random banner prose that must be ignored
         };
         attempt.attach_evidence_recovery(prior).unwrap();
         let later = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-123-recheck".to_string(),
             candidate_commit: "abc123".to_string(),
@@ -14349,6 +15226,7 @@ random banner prose that must be ignored
             digest: "sha256:proof".to_string(),
         };
         let recovery = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-proof".to_string(),
             candidate_commit: "candidate".to_string(),
@@ -14442,6 +15320,7 @@ random banner prose that must be ignored
             ..Attempt::default()
         };
         let mut prior = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-prior".to_string(),
             candidate_commit: "abc123".to_string(),
@@ -14460,6 +15339,7 @@ random banner prose that must be ignored
         attempt.evidence_recoveries[0] = prior;
 
         let next = EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: "host-evidence-next".to_string(),
             candidate_commit: "abc123".to_string(),
@@ -14828,6 +15708,7 @@ random banner prose that must be ignored
                 candidate_commit: "abc123".to_string(),
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -14860,6 +15741,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -15302,6 +16184,7 @@ random banner prose that must be ignored
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
                     verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: Vec::new(),
@@ -16073,6 +16956,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        writer_correction_assignment: None,
                         verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
@@ -16102,6 +16986,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        writer_correction_assignment: None,
                         verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
@@ -17051,6 +17936,7 @@ random banner prose that must be ignored
                             candidate_commit: "commit-initial".to_string(),
                             base_commit: None,
                         }),
+                        writer_correction_assignment: None,
                         verification_context: None,
                         evidence_review_context: None,
                         input_artifacts: Vec::new(),
@@ -17112,6 +17998,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -17159,6 +18046,275 @@ random banner prose that must be ignored
             merge_candidates: Vec::new(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn writer_correction_assignment_round_trips_and_is_immutable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = WorkModelStore::new(tmp.path());
+        let evidence_path = work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        let evidence_file = tmp.path().join(&evidence_path);
+        fs::create_dir_all(evidence_file.parent().unwrap()).unwrap();
+        fs::write(&evidence_file, "- [ ] Preserve the assignment\n").unwrap();
+
+        let mut item = work_item_with_completed_write("work-1");
+        let task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "review-tests".into(),
+                    path: evidence_path.clone(),
+                }],
+            )
+            .unwrap();
+        item.attempts[0].tasks[1].writer_correction_assignment = Some(WriterCorrectionAssignment {
+            schema_version: WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+            writer_task_id: task_id.clone(),
+            source_task_id: "attempt-1-write-1".into(),
+            source_candidate_commit: "commit-initial".into(),
+            source_task_inputs: Vec::new(),
+            evidence: vec![WriterCorrectionAssignmentInput {
+                artifact: ArtifactRef {
+                    producer_id: "review-tests".into(),
+                    path: evidence_path,
+                },
+                digest: format!("sha256:{}", "0".repeat(64)),
+            }],
+            findings: vec![WriterCompletionFinding {
+                id: "finding:tests:preserve-assignment".into(),
+                role: "tests".into(),
+                source: evidence_file
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                requirement: "Preserve the assignment".into(),
+            }],
+            origin: WriterCorrectionAssignmentOrigin::Captured,
+        });
+        // Keep the finding source equal to the managed relative path used by
+        // the evidence binding; the assignment intentionally stores no absolute
+        // filesystem paths.
+        let source = work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        item.attempts[0].tasks[1]
+            .writer_correction_assignment
+            .as_mut()
+            .unwrap()
+            .findings[0]
+            .source = source;
+        item.validate().unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        assert_eq!(
+            stored.attempts[0].tasks[1]
+                .writer_correction_assignment
+                .as_ref()
+                .unwrap()
+                .findings[0]
+                .id,
+            "finding:tests:preserve-assignment"
+        );
+
+        let mut tampered = stored;
+        tampered.attempts[0].tasks[1].writer_correction_assignment = None;
+        let error = store.write_work_item(&tampered).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host-owned Writer correction assignment")
+        );
+    }
+
+    fn persisted_writer_assignment_fixture(root: &Path) -> (WorkModelStore, WorkItem) {
+        let store = WorkModelStore::new(root);
+        let evidence_path = work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        let mut item = work_item_with_completed_write("work-1");
+        let writer_task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "review-tests".into(),
+                    path: evidence_path.clone(),
+                }],
+            )
+            .unwrap();
+        item.attempts[0].tasks[1].writer_correction_assignment = Some(WriterCorrectionAssignment {
+            schema_version: WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+            writer_task_id,
+            source_task_id: "attempt-1-write-1".into(),
+            source_candidate_commit: "commit-initial".into(),
+            source_task_inputs: Vec::new(),
+            evidence: vec![WriterCorrectionAssignmentInput {
+                artifact: ArtifactRef {
+                    producer_id: "review-tests".into(),
+                    path: evidence_path.clone(),
+                },
+                digest: format!("sha256:{}", "1".repeat(64)),
+            }],
+            findings: vec![WriterCompletionFinding {
+                id: "finding:tests:assigned".into(),
+                role: "tests".into(),
+                source: evidence_path.clone(),
+                requirement: "Preserve the assigned finding".into(),
+            }],
+            origin: WriterCorrectionAssignmentOrigin::Captured,
+        });
+        item.validate().unwrap();
+        store.create_work_item(&item).unwrap();
+        let stored = store.read_work_item("work-1").unwrap();
+        (store, stored)
+    }
+
+    #[test]
+    fn writer_assignment_safety_rejects_replacement_and_removal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, stored) = persisted_writer_assignment_fixture(tmp.path());
+        let original = stored.attempts[0].tasks[1]
+            .writer_correction_assignment
+            .clone()
+            .unwrap();
+
+        for replacement in [None, Some("commit-replaced")] {
+            let mut tampered = stored.clone();
+            if let Some(commit) = replacement {
+                tampered.attempts[0].tasks[1]
+                    .writer_correction_assignment
+                    .as_mut()
+                    .unwrap()
+                    .source_candidate_commit = commit.into();
+            } else {
+                tampered.attempts[0].tasks[1].writer_correction_assignment = None;
+            }
+            let before = snapshot_dir(tmp.path());
+            let error = store
+                .write_work_item(&tampered)
+                .expect_err("a published assignment cannot be removed or replaced");
+            assert!(
+                error
+                    .to_string()
+                    .contains("host-owned Writer correction assignment"),
+                "immutable assignment rejection should identify its owner: {error}"
+            );
+            assert_eq!(
+                snapshot_dir(tmp.path()),
+                before,
+                "a rejected assignment mutation must not change any persisted bytes"
+            );
+            assert_eq!(
+                store.read_work_item("work-1").unwrap().attempts[0].tasks[1]
+                    .writer_correction_assignment
+                    .as_ref(),
+                Some(&original)
+            );
+        }
+    }
+
+    #[test]
+    fn writer_assignment_safety_rejects_unknown_schema_and_bounds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (_store, stored) = persisted_writer_assignment_fixture(tmp.path());
+        let task = &stored.attempts[0].tasks[1];
+        let original = task.writer_correction_assignment.as_ref().unwrap();
+
+        let mut unknown = original.clone();
+        unknown.schema_version = WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION + 1;
+        let error = unknown
+            .validate_for_task(task)
+            .expect_err("unknown assignment schemas must fail closed");
+        assert!(error.contains("unsupported Writer correction assignment schema"));
+
+        let mut oversized_inputs = original.clone();
+        oversized_inputs.source_task_inputs = (0..=MAX_WRITER_CORRECTION_ASSIGNMENT_INPUTS)
+            .map(|index| WriterCorrectionAssignmentInput {
+                artifact: ArtifactRef {
+                    producer_id: format!("source-{index}"),
+                    path: format!(".fluent/work/artifacts/source-{index}.json"),
+                },
+                digest: format!("sha256:{}", "2".repeat(64)),
+            })
+            .collect();
+        let error = oversized_inputs
+            .validate_for_task(task)
+            .expect_err("assignment inputs must stay bounded");
+        assert!(error.contains("bounded input or finding limit"));
+
+        let mut oversized_findings = original.clone();
+        oversized_findings.findings = (0..=MAX_WRITER_CORRECTION_ASSIGNMENT_FINDINGS)
+            .map(|index| WriterCompletionFinding {
+                id: format!("finding:tests:{index}"),
+                role: "tests".into(),
+                source: original.evidence[0].artifact.path.clone(),
+                requirement: "Preserve the assigned finding".into(),
+            })
+            .collect();
+        let error = oversized_findings
+            .validate_for_task(task)
+            .expect_err("assignment findings must stay bounded");
+        assert!(error.contains("bounded input or finding limit"));
+    }
+
+    #[test]
+    fn writer_assignment_safety_retries_interrupted_publication() {
+        for publication_point in ["before-root", "after-root"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (store, stored) = persisted_writer_assignment_fixture(tmp.path());
+            let assignment = stored.attempts[0].tasks[1]
+                .writer_correction_assignment
+                .clone()
+                .unwrap();
+            let mut updated = stored.clone();
+            updated.title = format!("Retry {publication_point}");
+
+            let _fault = if publication_point == "before-root" {
+                PersistFaultGuard::Split(persist_fault::arm_split_write("work-1"))
+            } else {
+                PersistFaultGuard::AfterRoot(persist_fault::arm_creation_after_publish("work-1"))
+            };
+            assert!(
+                store.write_work_item(&updated).is_err(),
+                "the fixture must interrupt {publication_point} publication"
+            );
+            let journal_path = store.work_transaction_path("work-1").unwrap();
+            assert!(
+                journal_path.exists(),
+                "the interrupted transaction is durable"
+            );
+            let journal = read_json_file::<WorkItemTransaction>(&journal_path).unwrap();
+            assert_eq!(
+                journal.work_item.attempts[0].tasks[1]
+                    .writer_correction_assignment
+                    .as_ref(),
+                Some(&assignment),
+                "the transaction journal must carry the protected assignment"
+            );
+            drop(_fault);
+
+            store
+                .write_work_item(&updated)
+                .expect("a retry should recover and publish the same assignment");
+            assert!(
+                !journal_path.exists(),
+                "a successful retry cleans the journal"
+            );
+            let recovered = store.read_work_item("work-1").unwrap();
+            assert_eq!(
+                recovered.attempts[0].tasks[1]
+                    .writer_correction_assignment
+                    .as_ref(),
+                Some(&assignment)
+            );
+            assert_eq!(recovered.title, updated.title);
+        }
+    }
+
+    enum PersistFaultGuard {
+        Split(persist_fault::SplitWriteFaultGuard),
+        AfterRoot(persist_fault::CreationAfterPublishFaultGuard),
     }
 
     fn candidate_for_completed_write() -> MergeCandidate {
@@ -17673,6 +18829,10 @@ random banner prose that must be ignored
                 target_revision: 1,
                 base_children_digest: Some(work_item_children_digest(&target).unwrap()),
                 managed_files: Vec::new(),
+                usage_limit_publications: Vec::new(),
+                context_retry_publications: Vec::new(),
+                context_retry_base: None,
+                assignment_context_base: None,
                 work_item: target,
             },
         )
@@ -18077,6 +19237,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18108,6 +19269,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18258,6 +19420,7 @@ random banner prose that must be ignored
                 path: ".fluent/work/artifacts/work-1/attempt-1/attempt-1-write-2".to_string(),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18658,6 +19821,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18689,6 +19853,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18722,6 +19887,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -18883,6 +20049,7 @@ random banner prose that must be ignored
             },
             artifact_area: None,
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -20693,6 +21860,7 @@ random banner prose that must be ignored
                 candidate_commit: "commit-initial".to_string(),
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -20941,6 +22109,7 @@ random banner prose that must be ignored
                 candidate_commit: "commit-initial".to_string(),
                 base_commit: None,
             }),
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -21424,6 +22593,7 @@ random banner prose that must be ignored
     #[test]
     fn evidence_code_changes_advance_the_effective_write_cap() {
         let recovery = |id: &str, state: EvidenceRecoveryState| EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: id.to_string(),
             candidate_commit: format!("candidate-{id}"),
@@ -21495,6 +22665,7 @@ random banner prose that must be ignored
     #[test]
     fn round_cap_extension_chain_uses_recorded_evidence_counts() {
         let recovery = |id: &str| EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: id.to_string(),
             candidate_commit: format!("candidate-{id}"),

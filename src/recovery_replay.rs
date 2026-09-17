@@ -379,6 +379,7 @@ fn replay_attempt_case(
                 ),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -521,7 +522,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_in_corpus_is_valid_and_replayable() {
+    fn recovery_corpus_is_valid_and_replayable() {
         let corpus = load_corpus().expect("the checked-in recovery corpus is valid");
         assert!(corpus.cases.len() >= 8);
         let results = replay_corpus().expect("every recovery case replays offline");
@@ -534,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn corpus_rejects_duplicate_ids_and_future_schema() {
+    fn recovery_corpus_rejects_duplicate_ids_and_future_schema() {
         let corpus = load_corpus().unwrap();
         let mut duplicate = corpus.clone();
         duplicate.cases.push(duplicate.cases[0].clone());
@@ -569,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_scope_names_are_stable_for_serialized_fixtures() {
+    fn recovery_corpus_scope_names_are_stable_for_serialized_fixtures() {
         assert_eq!(ReplayScope::Attempt.as_str(), "attempt");
         assert_eq!(ReplayScope::Workflow.as_str(), "workflow");
         assert_eq!(

@@ -23,10 +23,16 @@ use crate::work_model::{
     work_artifact_path,
 };
 
-const SCHEMA_VERSION: u32 = 1;
-const PRODUCER: &str = "writer-completion-recovery";
-const MAX_RESOLUTION_BYTES: usize = 4_096;
-const INSTRUCTIONS_MARKER: &str = "Fluent writer-completion recovery";
+mod context_retry;
+pub(crate) use crate::recovery_contracts::writer_completion::validated_writer_context;
+use crate::recovery_contracts::writer_completion::{
+    PRODUCER, RecoveryAuthority, SCHEMA_VERSION, corrective_writer_instructions,
+    normalize_resolution, recovery_instructions,
+};
+pub(crate) use context_retry::{
+    before_spawn as before_context_retry_spawn, record_start as record_context_retry_start,
+    resume as resume_context_retry,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterCompletionRecovery {
@@ -36,22 +42,6 @@ pub struct WriterCompletionRecovery {
     pub superseded_task_ids: Vec<String>,
     pub reconciled_task_ids: Vec<String>,
     pub already_applied: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct RecoveryAuthority {
-    schema_version: u32,
-    work_item_id: String,
-    attempt_id: String,
-    task_id: String,
-    source_writer_task_id: String,
-    candidate_commit: String,
-    protected_base_commit: Option<String>,
-    superseded_task_ids: Vec<String>,
-    resolution: String,
-    resolution_sha256: String,
-    created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +98,11 @@ pub fn repair(
     let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
         .context("acquire Writer-completion recovery lock")?;
     let resolution = normalize_resolution(resolution)?;
+    if let Some(retry) =
+        context_retry::repair(project_root, store, work_item_id, attempt_id, &resolution)?
+    {
+        return Ok(retry);
+    }
     let item = store.read_work_item(work_item_id)?;
     item.ensure_mutation_compatible()?;
     let attempt = item
@@ -1111,7 +1106,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
             bail!("paused Writer artifact area is missing");
         }
         if !area_path
-            .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE)
+            .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
             .is_file()
         {
             bail!("paused Writer has no completion matrix to review");
@@ -1124,7 +1119,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
             .ok_or_else(|| anyhow::anyhow!("completed no-change Writer has no artifact area"))?;
         if !project_root
             .join(&area.path)
-            .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE)
+            .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE)
             .is_file()
         {
             bail!("completed no-change Writer has no completion matrix to review");
@@ -1202,7 +1197,7 @@ fn writer_matrix_has_pending_finding(
         .ok_or_else(|| anyhow::anyhow!("Writer has no artifact area"))?;
     let path = project_root
         .join(&area.path)
-        .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
+        .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE);
     let source = fs::read_to_string(&path)
         .with_context(|| format!("read Writer completion matrix {}", path.display()))?;
     let matrix: crate::work_model::WriterCompletionMatrix = serde_json::from_str(&source)
@@ -1249,29 +1244,6 @@ fn write_reconciliation_once(path: &Path, authority: &RecoveryReconciliation) ->
         }
         Err(error) => Err(error.into()),
     }
-}
-
-fn normalize_resolution(resolution: &str) -> Result<String> {
-    let value = resolution.trim();
-    if value.is_empty() {
-        bail!("provide a non-empty --resolution for Writer-completion recovery");
-    }
-    if value.len() > MAX_RESOLUTION_BYTES {
-        bail!("the Writer-completion recovery resolution is too long");
-    }
-    Ok(value.to_string())
-}
-
-fn recovery_instructions(resolution: &str, audit_artifact: &str) -> String {
-    format!(
-        "{INSTRUCTIONS_MARKER}. Retry this exact Writer Task after the prior run omitted its required no-change declaration. Preserve the candidate and existing history. If no source change is justified, write the required no-change.json with fresh focused verification. Operator authorization: {resolution}. Authority: {audit_artifact}"
-    )
-}
-
-fn corrective_writer_instructions(resolution: &str, audit_artifact: &str) -> String {
-    format!(
-        "{INSTRUCTIONS_MARKER}. A prior no-change Writer left a review finding pending in its completion matrix. Address that finding with the smallest safe source or metadata correction, preserve the candidate's existing history, and write a complete matrix for this new corrective Writer. Operator authorization: {resolution}. Authority: {audit_artifact}"
-    )
 }
 
 #[cfg(test)]
@@ -1380,6 +1352,7 @@ mod tests {
                 path: work_artifact_path("work-1", "attempt-1", &paused_id),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -1404,7 +1377,7 @@ mod tests {
         let area = project.join(paused.artifact_area.as_ref().unwrap().path.clone());
         fs::create_dir_all(&area).unwrap();
         fs::write(
-            area.join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE),
+            area.join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
             b"{}\n",
         )
         .unwrap();
@@ -1429,6 +1402,7 @@ mod tests {
                 path: work_artifact_path("work-1", "attempt-1", "attempt-1-write-3"),
             }),
             review_context: None,
+            writer_correction_assignment: None,
             verification_context: None,
             evidence_review_context: None,
             input_artifacts: Vec::new(),
@@ -1629,7 +1603,7 @@ mod tests {
             fixture
                 .project
                 .join(&area)
-                .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE),
+                .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE),
             serde_json::json!({
                 "schema-version": 1,
                 "task-id": task_id,
@@ -1661,7 +1635,7 @@ mod tests {
                     producer_id: task_id.to_string(),
                     path: format!(
                         "{area}/{}",
-                        crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE
+                        crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE
                     ),
                 });
                 Ok(())

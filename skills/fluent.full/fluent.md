@@ -188,11 +188,10 @@ stops at a Learner failure, or pauses at `needs-user`. Each round:
 4. Once Writer-owned progress and matrix rows, applicable findings, required host
    evidence with targeted Tests Review, and the deterministic gate are satisfied,
    domain reviewers evaluate the candidate in parallel using the matrix, gate
-   artifact, and Writer's focused verification as advisory evidence. After a
-   reviewed correction, Fluent reruns failed reviewers plus reviewers whose
-   project-owned path domains changed since the immediately preceding reviewed
-   Writer commit. Unknown or unverifiable deltas rerun every reviewer, and every
-   required review must name the exact new candidate commit before advancement.
+   artifact, and Writer's focused verification as advisory evidence. All ordinary
+   domains must pass; targeted evidence review supplies no ordinary coverage.
+   Corrections rerun failed, changed, or missing roles. Carry-forward requires
+   known unchanged domains across every intervening Writer delta and valid context.
 5. After the reviewers pass, one final Tester Task runs the project's complete
    declared test commands against the exact reviewed commit.
 6. After the final Tester passes, the Learner runs in the Work Item's Learner mode:
@@ -426,8 +425,9 @@ When `.fluent/` does not exist:
 7. After success, show the saved coder, model, and effort for both roles. Explain
    that new Attempts store them unless the user supplies explicit overrides.
 
-`execute` authorizes and queues trusted corrective Work but does not start it.
-A human must run `fluent scheduler run`; a ready candidate still needs inspection and landing.
+`execute` authorizes and queues trusted corrective Work without starting it; a human runs `fluent scheduler run`, inspects the ready candidate, and lands it.
+
+Read [usage-limit Writer recovery](references/host-evidence-recovery.md#recover-a-usage-limit-interrupted-writer) before approving a supported interrupted Writer; approval leaves it paused and requires a separate explicit resume.
 
 ## Writer testing contract
 
@@ -497,4 +497,4 @@ Don't pause for:
 
 Use `fluent --help` for the top-level surface and `fluent <command> --help` for a specific command's flags. Run `fluent cleanup` after terminal Work Items land or fail; `--apply` removes the terminal state.
 
-During interactive stages, follow the stage references directly rather than calling these commands ad hoc. `references/plan-execution.md` is the one exception — it ends by running `fluent work-item create` as documented in its procedure.
+During interactive stages, follow the stage references directly rather than calling these commands ad hoc. `references/plan-execution.md` is the one exception — it ends by running `fluent work-item create` as documented in its procedure. Read [mutable assignment context recovery](references/host-evidence-recovery.md#recover-mutable-writer-assignment-context) when permitted progress edits invalidate an older completed Writer’s or output-free completion retry’s saved input binding. Context recovery and retry authorization are separate actions; follow the next eligible command reported by status.

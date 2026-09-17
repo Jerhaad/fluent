@@ -10,7 +10,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crate::content::ContentResolver;
-use crate::plan_command::extract_plan_command_candidates;
+pub(crate) use crate::plan_command::validate_focused_command;
+use crate::plan_command::{
+    plan_command_binding_matches, resolve_plan_row_command, resolve_plan_row_command_with_source,
+};
 use crate::recovery_contracts::parse_evidence_document;
 pub use crate::recovery_contracts::{EvidenceDocument, EvidenceResult};
 use crate::review::{self, Verdict};
@@ -18,9 +21,11 @@ use crate::work_model::{
     self, ArtifactRef, BoundRecheckArtifact, EvidenceAttachment, EvidenceRecovery,
     EvidenceRecoveryState, EvidenceReviewContext, EvidenceReviewTarget, HostEvidenceClassification,
     PlanHostEvidenceBinding, Task, TaskKind, TaskStatus, WorkModelError, WorkModelStore,
-    WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionRow,
-    WriterCompletionState, WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
+    WriterCompletionMatrix, WriterCompletionRequirementKind, WriterCompletionState,
+    WriterVerificationClaim, WriterVerificationResult, work_artifact_path,
 };
+#[cfg(test)]
+use crate::{plan_command::ResolvedPlanCommand, work_model::WriterCompletionRow};
 
 const MAX_FOCUSED_COMMAND_BYTES: usize = 4096;
 const MAX_FOCUSED_TIMEOUT_SECONDS: u64 = 3600;
@@ -68,12 +73,6 @@ pub(crate) struct PlanHostEvidenceAction {
     pub working_directory: String,
     pub candidate_commit: String,
     pub matrix_artifact: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedPlanCommand {
-    command: String,
-    source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,6 +858,7 @@ pub fn run_focused(
             }),
             review_context: source.review_context.clone(),
             evidence_review_context: None,
+            writer_correction_assignment: None,
             verification_context: Some(context.clone()),
             input_artifacts: vec![ArtifactRef {
                 producer_id: source.id.clone(),
@@ -1120,107 +1120,7 @@ pub(crate) fn required_host_verification_pending(
     .transpose()
 }
 
-/// Resolve one exact executable command from a Plan row without changing the
-/// approved planning text. New Attempts carry a structured command captured at
-/// planning time. Older matrices have no such field, so the compatibility path
-/// accepts one unambiguous command-shaped candidate across their text fields.
-fn resolve_plan_row_command(row: &WriterCompletionRow) -> Option<String> {
-    resolve_plan_row_command_with_source(row).map(|resolved| resolved.command)
-}
-
-fn resolve_plan_row_command_with_source(row: &WriterCompletionRow) -> Option<ResolvedPlanCommand> {
-    if let Some(command) = row.command.as_ref() {
-        if command.source_row != row.id {
-            return None;
-        }
-        validate_focused_command(&command.command).ok()?;
-        return Some(ResolvedPlanCommand {
-            command: command.command.clone(),
-            source: format!("structured:{}", command.source_row),
-        });
-    }
-    let mut candidates = row
-        .verification_refs
-        .iter()
-        .flat_map(|text| {
-            extract_plan_command_candidates(text)
-                .into_iter()
-                .map(|command| (command, "legacy:verification".to_string()))
-                .collect::<Vec<_>>()
-        })
-        .chain(
-            extract_plan_command_candidates(&row.requirement)
-                .into_iter()
-                .map(|command| (command, "legacy:requirement".to_string())),
-        )
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    let command = candidates.first().map(|(command, _)| command.clone())?;
-    if candidates.iter().any(|candidate| candidate.0 != command) {
-        return None;
-    }
-    let mut sources = candidates
-        .into_iter()
-        .map(|(_, source)| source)
-        .collect::<Vec<_>>();
-    sources.sort();
-    sources.dedup();
-    Some(ResolvedPlanCommand {
-        command,
-        source: sources.join("+"),
-    })
-}
-
-fn plan_command_binding_matches(
-    row: &WriterCompletionRow,
-    command: &str,
-    source: Option<&str>,
-) -> bool {
-    let Some(resolved) = resolve_plan_row_command_with_source(row) else {
-        return false;
-    };
-    resolved.command == command && source.is_none_or(|source| source == resolved.source)
-}
-
-/// Select the newest admitted result for each Plan obligation, including
-/// unresolved failures. A malformed indexed binding cannot revive older proof.
-fn latest_plan_host_binding_paths(
-    project_root: &Path,
-    attempt: &work_model::Attempt,
-    candidate: &str,
-) -> Option<std::collections::BTreeMap<String, String>> {
-    let mut latest = std::collections::BTreeMap::new();
-    for recovery in &attempt.evidence_recoveries {
-        if recovery.candidate_commit != candidate {
-            continue;
-        }
-        for target in &recovery.targets {
-            if !attempt.artifacts.iter().any(|artifact| {
-                artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
-                    && artifact.path == target.prior_review_artifact
-                    && artifact.path.ends_with("/binding.json")
-            }) {
-                continue;
-            }
-            let (_, bytes) = crate::recovery_contracts::bound_recovery_artifact(
-                project_root,
-                &target.prior_review_artifact,
-            )
-            .ok()?;
-            let binding: PlanHostEvidenceBinding = serde_json::from_slice(&bytes).ok()?;
-            if binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
-                || binding.work_item_id != attempt.work_item_id
-                || binding.attempt_id != attempt.id
-                || binding.candidate_commit != candidate
-            {
-                return None;
-            }
-            latest.insert(binding.plan_row, target.prior_review_artifact.clone());
-        }
-    }
-    Some(latest)
-}
+use crate::recovery_contracts::latest_plan_host_binding_paths;
 
 /// Return a host-materialized completion matrix only after the evidence review
 /// that accepted it has passed. Before that review, the artifact remains an
@@ -1351,171 +1251,7 @@ pub(crate) fn completed_plan_host_matrix_ref(
     })
 }
 
-/// Overlay accepted plan-host evidence onto the source Writer matrix. The
-/// overlay is only an in-memory view; the immutable Writer artifact is never
-/// rewritten. A later Writer-completion gate can therefore recognize the same
-/// host-owned completion without inventing a source commit.
-pub(crate) fn apply_completed_plan_host_evidence(
-    project_root: &Path,
-    attempt: &work_model::Attempt,
-    writer: &Task,
-    source_matrix: &ArtifactRef,
-    matrix: &mut WriterCompletionMatrix,
-) -> bool {
-    let Some(output) = writer.output.as_ref() else {
-        return false;
-    };
-    if writer_completion_matrix_ref(project_root, attempt, writer).as_ref() != Some(source_matrix) {
-        return false;
-    }
-    let Some(latest) = latest_plan_host_binding_paths(project_root, attempt, &output.commit) else {
-        return false;
-    };
-    let mut changed = false;
-    for artifact in attempt.artifacts.iter().filter(|artifact| {
-        artifact.producer_id == PLAN_HOST_EVIDENCE_PRODUCER
-            && artifact.path.ends_with("/binding.json")
-    }) {
-        let Ok(binding_bytes) = fs::read(project_root.join(&artifact.path)) else {
-            continue;
-        };
-        let Ok(binding) = serde_json::from_slice::<PlanHostEvidenceBinding>(&binding_bytes) else {
-            continue;
-        };
-        if latest.get(&binding.plan_row) != Some(&artifact.path)
-            || binding.schema_version != PLAN_HOST_EVIDENCE_SCHEMA_VERSION
-            || binding.work_item_id != attempt.work_item_id
-            || binding.attempt_id != attempt.id
-            || binding.candidate_commit != output.commit
-            || binding.result != EvidenceResult::Pass
-        {
-            continue;
-        }
-        let Some(original_writer) = attempt.tasks.iter().find(|task| {
-            task.id == binding.writer_task_id
-                && task.kind == TaskKind::Write
-                && task.status == TaskStatus::Complete
-                && task
-                    .output
-                    .as_ref()
-                    .is_some_and(|original| original.commit == output.commit)
-        }) else {
-            continue;
-        };
-        let Some(original_source) =
-            writer_completion_matrix_ref(project_root, attempt, original_writer)
-        else {
-            continue;
-        };
-        let source_matrix_value = match crate::recovery_contracts::plan_host_source_matrix(
-            project_root,
-            attempt,
-            original_writer,
-            &original_source,
-            &binding.source_matrix,
-            &binding.plan_row,
-        ) {
-            Ok(source) => source,
-            Err(_) => continue,
-        };
-        let Some(source_row) = source_matrix_value
-            .rows
-            .iter()
-            .find(|row| row.id == binding.plan_row)
-        else {
-            continue;
-        };
-        if source_row.kind != WriterCompletionRequirementKind::Plan
-            || source_row.state != WriterCompletionState::Pending
-            || source_row.requirement != binding.requirement
-            || !plan_command_binding_matches(
-                source_row,
-                &binding.command,
-                binding.command_source.as_deref(),
-            )
-        {
-            continue;
-        }
-        let evidence_bytes = match fs::read(project_root.join(&binding.evidence.path)) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
-        if format!("sha256:{:x}", Sha256::digest(&evidence_bytes)) != binding.evidence.digest {
-            continue;
-        }
-        let Ok(evidence) = parse_evidence_document(&evidence_bytes) else {
-            continue;
-        };
-        if evidence.result != EvidenceResult::Pass
-            || evidence.check != binding.command
-            || evidence.working_directory != binding.working_directory
-            || source_row
-                .command
-                .as_ref()
-                .map(|command| &command.applicability)
-                .cloned()
-                .unwrap_or_default()
-                != binding.applicability.definition
-            || crate::recovery_contracts::validate_check_applicability(
-                &project_root.join(&output.workspace_path),
-                &binding.applicability,
-                &evidence,
-            )
-            .is_err()
-        {
-            continue;
-        }
-        let Some(recovery) = attempt.evidence_recoveries.iter().find(|recovery| {
-            recovery.candidate_commit == binding.candidate_commit
-                && recovery.attachment.snapshot_path == binding.evidence.path
-                && recovery.attachment.digest == binding.evidence.digest
-                && recovery.state == EvidenceRecoveryState::Complete
-                && recovery.targets.iter().any(|target| {
-                    target.role == "tests"
-                        && target.prior_review_artifact == artifact.path
-                        && crate::recovery_contracts::plan_evidence_review_is_accepted(
-                            project_root,
-                            attempt,
-                            recovery,
-                            target,
-                            &binding,
-                        )
-                })
-        }) else {
-            continue;
-        };
-        let _ = recovery;
-        let Some(row) = matrix.rows.iter_mut().find(|row| {
-            row.id == binding.plan_row && row.kind == WriterCompletionRequirementKind::Plan
-        }) else {
-            continue;
-        };
-        if resolve_plan_row_command(row).as_deref() != Some(binding.command.as_str())
-            || row.requirement != binding.requirement
-            || row.command != source_row.command
-            || row.verification_refs != source_row.verification_refs
-        {
-            continue;
-        }
-        if row.state != WriterCompletionState::Complete
-            || row.implementation_evidence != vec![artifact.path.clone()]
-            || row.verification
-                != vec![WriterVerificationClaim {
-                    command: binding.command.clone(),
-                    result: WriterVerificationResult::Pass,
-                }]
-        {
-            row.state = WriterCompletionState::Complete;
-            row.implementation_evidence = vec![artifact.path.clone()];
-            row.verification = vec![WriterVerificationClaim {
-                command: binding.command.clone(),
-                result: WriterVerificationResult::Pass,
-            }];
-            changed = true;
-        }
-    }
-    changed
-}
+pub(crate) use crate::recovery_contracts::apply_completed_plan_host_evidence;
 
 pub(crate) use crate::recovery_contracts::writer_completion_matrix_ref;
 
@@ -1534,65 +1270,6 @@ fn resolve_requested_value(
             "failed review has no valid Evidence-Command and Evidence-Working-Directory; supply the missing focused evidence {name} explicitly"
         ),
     }
-}
-
-pub(crate) fn validate_focused_command(command: &str) -> Result<()> {
-    anyhow::ensure!(
-        !command.trim().is_empty() && command.len() <= MAX_FOCUSED_COMMAND_BYTES,
-        "focused evidence command must be between 1 and {MAX_FOCUSED_COMMAND_BYTES} bytes"
-    );
-    anyhow::ensure!(
-        !command.contains(['\n', '\r', '\0']),
-        "focused evidence command must occupy one line"
-    );
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Quote {
-        Unquoted,
-        Single,
-        Double,
-    }
-    let mut quote = Quote::Unquoted;
-    let mut escaped = false;
-    let mut chars = command.char_indices().peekable();
-    while let Some((_, character)) = chars.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote != Quote::Single {
-            escaped = true;
-            continue;
-        }
-        match (quote, character) {
-            (Quote::Unquoted, '\'') => quote = Quote::Single,
-            (Quote::Unquoted, '"') => quote = Quote::Double,
-            (Quote::Single, '\'') => quote = Quote::Unquoted,
-            (Quote::Double, '"') => quote = Quote::Unquoted,
-            (Quote::Unquoted, ';' | '&' | '|' | '(' | ')' | '>' | '<') => {
-                bail!(
-                    "focused evidence command must name one direct harness invocation; shell control token {character:?} is not allowed"
-                )
-            }
-            (Quote::Unquoted | Quote::Double, '`') => {
-                bail!(
-                    "focused evidence command must name one direct harness invocation; shell control token \"`\" is not allowed"
-                )
-            }
-            (Quote::Unquoted | Quote::Double, '$')
-                if chars.peek().is_some_and(|(_, next)| *next == '(') =>
-            {
-                bail!(
-                    "focused evidence command must name one direct harness invocation; shell control token \"$(\" is not allowed"
-                )
-            }
-            _ => {}
-        }
-    }
-    anyhow::ensure!(
-        quote == Quote::Unquoted && !escaped,
-        "focused evidence command contains an unterminated quote or escape"
-    );
-    Ok(())
 }
 
 fn canonical_candidate_workspace(path: &Path) -> Result<PathBuf> {
@@ -2285,6 +1962,7 @@ pub(crate) fn attach_with_cancellation_policy(
             .map(|task| task.role.clone())
             .collect::<Vec<_>>();
         let recovery = attempt.attach_evidence_recovery(EvidenceRecovery {
+            carried_finding: None,
             required_check,
             id: format!("host-evidence-{recovery_token}"),
             candidate_commit: candidate_commit.to_string(),
@@ -2378,6 +2056,7 @@ pub(crate) fn attach_with_cancellation_policy(
                         path: work_model::work_artifact_path(work_item_id, attempt_id, &task_id),
                     }),
                     review_context: prior.review_context.clone(),
+                    writer_correction_assignment: None,
                     verification_context: None,
                     evidence_review_context: Some(EvidenceReviewContext {
                         recovery_id: recovery.id.clone(),
@@ -2819,6 +2498,7 @@ pub fn attach_plan_row(
             };
 
             let recovery = EvidenceRecovery {
+                carried_finding: None,
                 required_check: None,
                 id: recovery_id,
                 candidate_commit: candidate_commit.to_string(),
@@ -2929,6 +2609,230 @@ pub fn attach_plan_row(
         },
     )?;
     Ok(recovery)
+}
+
+/// Attach existing proof for an explicitly selected, assigned Tests finding.
+/// This operation reserves review; it never executes the requested host check.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_finding(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+    candidate_commit: &str,
+    finding_id: &str,
+    evidence_file: &Path,
+) -> Result<EvidenceRecovery> {
+    anyhow::ensure!(
+        fs::symlink_metadata(evidence_file)?.is_file(),
+        "evidence must be a regular file, not a symlink"
+    );
+    let bytes = fs::read(evidence_file)?;
+    let document = parse_evidence_document(&bytes)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let snapshot_path = snapshot_path(work_item_id, attempt_id, &digest)?;
+    let operation = work_model::RecoveryOperationRequest::new(
+        "host-evidence-carried-finding-attachment",
+        work_item_id,
+        attempt_id,
+        Some(candidate_commit.into()),
+        None,
+        Some(digest.clone()),
+        None,
+        Some(format!("Select carried finding {finding_id}")),
+        None,
+    );
+    let check_recovery = |item: &work_model::WorkItem| {
+        let reject = |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+            attempt_id: attempt_id.into(),
+            reason,
+        };
+        let (_, existing) = crate::recovery_contracts::inspect_carried_finding_attachment(
+            project_root,
+            item,
+            attempt_id,
+            candidate_commit,
+            finding_id,
+            BoundRecheckArtifact {
+                path: snapshot_path.clone(),
+                digest: digest.clone(),
+            },
+            &document,
+        )
+        .map_err(|e| reject(format!("{e:#}")))?;
+        if existing.is_none()
+            || item
+                .validate_recovery_operation(project_root, &operation)?
+                .is_none()
+        {
+            return Err(reject(
+                "interrupted attachment must replay the exact saved operation".into(),
+            ));
+        }
+        Ok(())
+    };
+    let observed = if let Some(target) = store.read_work_item_recovery_target(work_item_id)? {
+        check_recovery(&target)?;
+        target
+    } else {
+        store.read_work_item_snapshot(work_item_id)?
+    };
+    crate::recovery_contracts::inspect_carried_finding_attachment(
+        project_root,
+        &observed,
+        attempt_id,
+        candidate_commit,
+        finding_id,
+        BoundRecheckArtifact {
+            path: snapshot_path.clone(),
+            digest: digest.clone(),
+        },
+        &document,
+    )?;
+    observed.validate_recovery_operation(project_root, &operation)?;
+    anyhow::ensure!(
+        !crate::land_lock::is_locked(&crate::land_lock::lock_path(project_root)),
+        "finding handoff has a live landing owner"
+    );
+    let _land_lock = crate::land_lock::acquire(&crate::land_lock::lock_path(project_root))
+        .context("acquire land lock before attaching finding evidence")?;
+    store
+        .mutate_work_item_from_external_with_recovery_check(
+            work_item_id,
+            format!("attach host evidence for carried finding {finding_id}"),
+            Some(snapshot_path.clone()),
+            check_recovery,
+            |item| {
+                let reject = |reason: String| WorkModelError::HostEvidenceRecoveryIneligible {
+                    attempt_id: attempt_id.into(),
+                    reason,
+                };
+                let (binding, existing) =
+                    crate::recovery_contracts::inspect_carried_finding_attachment(
+                        project_root,
+                        item,
+                        attempt_id,
+                        candidate_commit,
+                        finding_id,
+                        BoundRecheckArtifact {
+                            path: snapshot_path.clone(),
+                            digest: digest.clone(),
+                        },
+                        &document,
+                    )
+                    .map_err(|e| reject(format!("{e:#}")))?;
+                item.validate_recovery_operation(project_root, &operation)?;
+                if let Some(existing) = existing {
+                    return Ok(existing);
+                }
+                let attempt = item.attempts.last_mut().expect("validated Attempt");
+                retire_expired_pending_evidence(
+                    project_root,
+                    attempt,
+                    candidate_commit,
+                    &crate::recovery_contracts::EvidenceSelector::Finding(finding_id.into()),
+                    &document,
+                )?;
+                attempt.resume_cancellation()?;
+                let binding_bytes =
+                    serde_json::to_vec_pretty(&binding).map_err(|e| reject(e.to_string()))?;
+                let binding_digest = format!("sha256:{:x}", Sha256::digest(&binding_bytes));
+                let binding_path = work_artifact_path(
+                    work_item_id,
+                    attempt_id,
+                    &format!("carried-finding-evidence/{}.json", &binding_digest[7..]),
+                );
+                publish_snapshot(project_root, &snapshot_path, &bytes)
+                    .map_err(|e| reject(format!("{e:#}")))?;
+                publish_snapshot(project_root, &binding_path, &binding_bytes)
+                    .map_err(|e| reject(format!("{e:#}")))?;
+                let recovery = EvidenceRecovery {
+                    carried_finding: Some(work_model::CarriedFindingEvidence {
+                        binding: binding.clone(),
+                        artifact: BoundRecheckArtifact {
+                            path: binding_path.clone(),
+                            digest: binding_digest.clone(),
+                        },
+                    }),
+                    required_check: None,
+                    id: format!("carried-finding-{}", &binding_digest[7..]),
+                    candidate_commit: candidate_commit.into(),
+                    attachment: EvidenceAttachment {
+                        snapshot_path: snapshot_path.clone(),
+                        digest: digest.clone(),
+                    },
+                    targets: vec![EvidenceReviewTarget {
+                        role: "tests".into(),
+                        prior_review_artifact: binding_path.clone(),
+                        review_task_id: None,
+                        review_digest: None,
+                    }],
+                    state: EvidenceRecoveryState::Reviewing,
+                    created_at: work_model::now_iso8601(),
+                    code_change_classification: None,
+                };
+                let attempt = item.attempts.last_mut().expect("validated Attempt");
+                let recovery = attempt.attach_evidence_recovery(recovery)?;
+                let ids = item.add_next_review_tasks(attempt_id, &["tests"])?;
+                let task_id = ids
+                    .first()
+                    .ok_or_else(|| {
+                        reject("finding attachment did not reserve a Tests Review".into())
+                    })?
+                    .clone();
+                let attempt = item.attempts.last_mut().expect("validated Attempt");
+                let inputs = [
+                    ArtifactRef {
+                        producer_id: "carried-finding-evidence".into(),
+                        path: binding_path.clone(),
+                    },
+                    ArtifactRef {
+                        producer_id: "host-evidence".into(),
+                        path: snapshot_path.clone(),
+                    },
+                    binding.source_review.artifact.clone(),
+                    ArtifactRef {
+                        producer_id: binding.writer_task_id.clone(),
+                        path: binding.source_matrix.path.clone(),
+                    },
+                ];
+                let review = attempt
+                    .tasks
+                    .iter_mut()
+                    .find(|t| t.id == task_id)
+                    .expect("reserved Review");
+                for input in &inputs {
+                    if !review.input_artifacts.contains(input) {
+                        review.input_artifacts.push(input.clone());
+                    }
+                }
+                review.evidence_review_context = Some(EvidenceReviewContext {
+                    recovery_id: recovery.id.clone(),
+                    candidate_commit: candidate_commit.into(),
+                    attachment: recovery.attachment.clone(),
+                    prior_review_artifact: binding_path,
+                });
+                for input in inputs {
+                    if !attempt.artifacts.contains(&input) {
+                        attempt.artifacts.push(input);
+                    }
+                }
+                let saved = attempt
+                    .evidence_recoveries
+                    .last_mut()
+                    .expect("attached recovery");
+                saved.targets[0].review_task_id = Some(task_id);
+                let result = saved.clone();
+                attempt.pause_kind = None;
+                attempt.completed_at = None;
+                attempt.record_recovery_operation(
+                    &operation,
+                    Some(format!("fluent attempt run {work_item_id} {attempt_id}")),
+                )?;
+                Ok(result)
+            },
+        )
+        .map_err(Into::into)
 }
 
 fn plan_row_slug(row: &str) -> String {
@@ -5787,6 +5691,7 @@ pub fn attach_required_check(
             }
             attempt.resume_cancellation()?;
             attempt.attach_evidence_recovery(EvidenceRecovery {
+                carried_finding: None,
                 required_check: Some(check),
                 id: recovery_id.clone(),
                 candidate_commit: candidate_commit.into(),

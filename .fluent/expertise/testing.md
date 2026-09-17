@@ -64,7 +64,20 @@ confinement assertion only when that probe reports the parent-sandbox
 `Operation not permitted` condition. Keep route tests on the synthetic seam and
 real profile-enforcement tests on the explicit host probe.
 
+A successful test exit after this skip does not satisfy a Work Item that requires
+observed confinement. Keep that obligation pending and retain the diagnostic;
+neither rendered grants nor synthetic provider runs prove kernel enforcement.
+For `declared_sandbox_input_reads_exact_writer_recovery`, acceptance requires
+the real provider to read the exact audit bytes and fail to read the unrelated
+sibling, with no confinement-unavailable early return.
+
+Retain the Tests Review's exact evidence request against the current candidate
+for an authorized environment that can apply the production profile. A Writer
+must not launch host evidence work or disable worker sandboxing to obtain it.
+
 ## Patterns
+
+- [diagnose-inherited-test-pipes](testing/patterns/diagnose-inherited-test-pipes.md) — read when concurrent nextest runs report LEAK despite settled application workers
 
 - [dispatch-recovery-through-public-cli](testing/patterns/dispatch-recovery-through-public-cli.md) — read when queue recovery must use real claim and Attempt execution without requiring nested Seatbelt.
 

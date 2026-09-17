@@ -483,7 +483,7 @@ fn cmd_work_item(project_root: &Path, command: WorkItemCommands) -> Result<()> {
                 }
             }
         }
-        WorkItemCommands::Show { id } => match store.read_work_item(&id) {
+        WorkItemCommands::Show { id } => match store.read_work_item_snapshot(&id) {
             Ok(item) => {
                 let output = work_status::work_item_show_value(&item, project_root)?;
                 print!("{}", to_json_pretty(&output)?);
@@ -711,8 +711,25 @@ fn cmd_attempt(
                     recheck_artifact,
                     plan_row,
                     required_check,
+                    finding,
                 },
         } => {
+            if let Some(finding) = finding {
+                let recovery = fluent::host_evidence::attach_finding(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    &candidate,
+                    &finding,
+                    Path::new(&evidence_file),
+                )?;
+                println!(
+                    "Attached host evidence {} for finding {}; targeted review: tests",
+                    recovery.attachment.digest, finding
+                );
+                return Ok(());
+            }
             if let Some(required_check) = required_check {
                 let recovery = fluent::host_evidence::attach_required_check(
                     project_root,
@@ -845,7 +862,7 @@ fn cmd_attempt(
             work_item_id,
             attempt_id,
         } => {
-            let item = match store.read_work_item(&work_item_id) {
+            let item = match store.read_work_item_snapshot(&work_item_id) {
                 Ok(item) => item,
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
@@ -917,7 +934,33 @@ fn cmd_attempt(
             work_item_id,
             attempt_id,
             resolution,
+            restore_interrupted,
+            rejected_candidate,
         } => {
+            if restore_interrupted {
+                let restored = fluent::candidate_ancestry_recovery::restore_interrupted(
+                    project_root,
+                    &store,
+                    &work_item_id,
+                    &attempt_id,
+                    rejected_candidate
+                        .as_deref()
+                        .context("--rejected-candidate is required")?,
+                    &resolution,
+                )?;
+                println!(
+                    "Restored interrupted Writer {}: {} -> {} (operation {})",
+                    restored.task_id,
+                    restored.rejected_candidate,
+                    restored.recorded_candidate,
+                    restored.operation_id
+                );
+                println!("Audit: {}", restored.audit_artifact);
+                println!(
+                    "Cancellation remains active. Resume separately: fluent attempt run {work_item_id} {attempt_id}"
+                );
+                return Ok(());
+            }
             let repair = fluent::candidate_ancestry_recovery::repair(
                 project_root,
                 &store,
@@ -968,6 +1011,58 @@ fn cmd_attempt(
             }
             println!("Audit: {}", repair.audit_artifact);
             println!("Next: fluent queue resume {work_item_id} --attempt {attempt_id}");
+        }
+        AttemptCommands::RecoverUsageLimit {
+            work_item_id,
+            attempt_id,
+            resolution,
+        } => {
+            let approval = fluent::usage_limit_recovery::approve(
+                project_root,
+                &store,
+                &work_item_id,
+                &attempt_id,
+                &resolution,
+            )?;
+            println!(
+                "Recorded usage-limit approval {} for Writer {} at partial candidate {}",
+                approval.operation_id, approval.task_id, approval.partial_commit
+            );
+            println!("Audit: {}", approval.audit_artifact);
+            println!("Next: fluent attempt run {work_item_id} {attempt_id}");
+        }
+        AttemptCommands::RecoverAssignmentContext {
+            work_item_id,
+            attempt_id,
+            task,
+            candidate,
+            assignment_digest,
+            input,
+            original_file,
+            resolution,
+        } => {
+            let operation = fluent::assignment_context_recovery::recover(
+                project_root,
+                &store,
+                &fluent::assignment_context_recovery::RecoveryRequest {
+                    work: &work_item_id,
+                    attempt: &attempt_id,
+                    task: &task,
+                    candidate: &candidate,
+                    assignment_digest: &assignment_digest,
+                    input: &input,
+                    original_file: &original_file,
+                    resolution: &resolution,
+                },
+            )?;
+            println!("Recorded assignment context recovery {operation}; no Tasks were launched");
+            let item = store.read_work_item_snapshot(&work_item_id)?;
+            let attempt = item.attempts.iter().find(|a| a.id == attempt_id);
+            if let Some(action) =
+                fluent::work_status::attempt_recovery_next_action(attempt, Some(project_root))
+            {
+                println!("Next: {action}");
+            }
         }
         AttemptCommands::RepairWriterCompletion {
             work_item_id,
@@ -1655,7 +1750,7 @@ fn cmd_task(
             attempt_id,
             task_id,
         } => {
-            let item = match store.read_work_item(&work_item_id) {
+            let item = match store.read_work_item_snapshot(&work_item_id) {
                 Ok(item) => item,
                 Err(WorkModelStorageError::ReadFile { source, .. })
                     if source.kind() == ErrorKind::NotFound =>
@@ -1954,6 +2049,12 @@ fn cmd_review(
                 Err(error) => return Err(error.into()),
             };
             let task_ids = item.add_review_tasks(&attempt_id, review::REVIEWERS)?;
+            work_task_executor::prepare_ordinary_review_evidence(
+                &project_root,
+                &mut item,
+                &attempt_id,
+                &task_ids,
+            )?;
             store.write_work_item(&item)?;
             println!(
                 "Planned {} review Tasks for Attempt {attempt_id}",
@@ -3084,6 +3185,7 @@ mod tests {
                 },
                 artifact_area: None,
                 review_context: None,
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),

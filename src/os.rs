@@ -272,6 +272,14 @@ pub fn preflight_codex_launcher(
     profile: &SandboxProfile,
     worker: &crate::codex_worker::CodexWorkerEnvironment,
 ) -> Result<()> {
+    // Exercise this later gate independently of the coordinator's host probe.
+    #[cfg(feature = "test-support")]
+    if env::var("FLUENT_TEST_CODEX_SANDBOX_PREFLIGHT").as_deref() == Ok("fail") {
+        return Err(HostSandboxPreflightError {
+            message: "test private Codex sandbox preflight failure".into(),
+        }
+        .into());
+    }
     #[cfg(feature = "test-support")]
     if let Some(result) = test_preflight_result() {
         return result;
@@ -313,9 +321,9 @@ fn codex_preflight_command(profile_path: &Path, launcher: &Path, worker_home: &P
         .arg(launcher)
         .args(["login", "status"])
         // The production profile does not grant the caller's arbitrary current
-        // directory. Run this read-only authentication probe from the system
-        // temp tree, which every autonomous Codex profile already permits.
-        .current_dir(env::temp_dir())
+        // directory. The staged private home is an explicit capability even
+        // when a strict profile denies the shared system temporary directory.
+        .current_dir(worker_home)
         .env("CODEX_HOME", worker_home);
     command
 }
@@ -486,11 +494,15 @@ pub fn render_profile_for_scoped_codex_provider(
     readable_roots: &[PathBuf],
     codex_home: &Path,
 ) -> Result<SandboxProfile> {
+    // Include the overlay's private home in root rendering so realpath can
+    // traverse its ancestors without reading unrelated temporary contents.
+    let mut readable = readable_roots.to_vec();
+    readable.push(codex_home.to_path_buf());
     let profile = render_profile_for_access(
         resolver,
         &private_home.to_string_lossy(),
         writable_roots,
-        readable_roots,
+        &readable,
         &[],
         Some(CoderKind::Codex),
         Some(codex_home),
@@ -511,6 +523,42 @@ pub fn render_profile_for_scoped_codex_provider(
             broad_grant,
             "; scoped providers do not receive shared filesystem access",
         );
+    }
+    std::fs::write(&profile.path, content)?;
+    Ok(profile)
+}
+
+/// Admit installed tools read-only while allowing compiled workspace programs.
+/// Keep these grants separate from the provider's private mutable home.
+pub(crate) fn render_profile_for_scoped_codex_provider_with_tools(
+    resolver: &ContentResolver,
+    private_home: &Path,
+    writable_roots: &[PathBuf],
+    readable_roots: &[PathBuf],
+    codex_home: &Path,
+    installed_tools: &[PathBuf],
+) -> Result<SandboxProfile> {
+    let mut readable = readable_roots.to_vec();
+    readable.extend_from_slice(installed_tools);
+    let profile = render_profile_for_scoped_codex_provider(
+        resolver,
+        private_home,
+        writable_roots,
+        &readable,
+        codex_home,
+    )?;
+    let mut content = std::fs::read_to_string(&profile.path)?;
+    for root in writable_roots.iter().chain(installed_tools) {
+        content.push_str(&format!(
+            "\n(allow file-map-executable (subpath {}))",
+            sbpl_string(root)
+        ));
+    }
+    for root in installed_tools {
+        content.push_str(&format!(
+            "\n(deny file-write* (subpath {}))",
+            sbpl_string(root)
+        ));
     }
     std::fs::write(&profile.path, content)?;
     Ok(profile)
@@ -859,6 +907,37 @@ fn is_executable(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scoped_writer_tools_allow_mapping_and_deny_installed_writes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let private = tmp.path().join("private");
+        let installed = tmp.path().join("installed");
+        let workspace = tmp.path().join("workspace");
+        let profile = render_profile_for_scoped_codex_provider_with_tools(
+            &ContentResolver::new(None),
+            &private,
+            &[workspace.clone()],
+            &[],
+            &private,
+            &[installed.clone()],
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(profile.path).unwrap();
+        assert!(text.contains(&format!(
+            "(allow file-map-executable (subpath {}))",
+            sbpl_string(&installed)
+        )));
+        assert!(text.contains(&format!(
+            "(deny file-write* (subpath {}))",
+            sbpl_string(&installed)
+        )));
+        assert!(text.contains(&format!(
+            "(allow file-map-executable (subpath {}))",
+            sbpl_string(&workspace)
+        )));
+        assert!(!text.contains("(allow file-write* (subpath \"/private/tmp\"))"));
+    }
     use super::*;
 
     #[test]
@@ -1028,14 +1107,56 @@ mod tests {
     }
 
     #[test]
-    fn codex_launcher_preflight_uses_a_profile_readable_working_directory() {
+    fn codex_preflight_uses_the_explicit_private_home() {
         let profile = PathBuf::from("/tmp/profile.sb");
         let launcher = PathBuf::from("/opt/codex/bin/codex");
         let worker_home = PathBuf::from("/tmp/fluent-codex-worker");
 
         let command = codex_preflight_command(&profile, &launcher, &worker_home);
 
-        assert_eq!(command.get_current_dir(), Some(env::temp_dir().as_path()));
+        assert_eq!(command.get_current_dir(), Some(worker_home.as_path()));
+    }
+
+    #[test]
+    fn codex_preflight_grants_private_home_ancestor_metadata_only() {
+        let home = PathBuf::from("/private/var/folders/isolated/T/worker/codex");
+        let profile = render_profile_for_scoped_codex_provider(
+            &ContentResolver::new(None),
+            &home,
+            &[PathBuf::from("/Users/test/project")],
+            &[],
+            &home,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(profile.path).unwrap();
+        for ancestor in home.ancestors().skip(1).filter(|p| p.parent().is_some()) {
+            assert!(
+                content.contains(&format!(
+                    "(allow file-read-metadata (literal {}))",
+                    sbpl_string(ancestor)
+                )),
+                "missing traversal for {}",
+                ancestor.display()
+            );
+            for operation in ["file-read*", "file-write*"] {
+                assert!(
+                    !content.contains(&format!(
+                        "(allow {operation} (subpath {}))",
+                        sbpl_string(ancestor)
+                    )),
+                    "broad access to {}",
+                    ancestor.display()
+                );
+                assert!(
+                    !content.contains(&format!(
+                        "(allow {operation}  (subpath {}))",
+                        sbpl_string(ancestor)
+                    )),
+                    "broad access to {}",
+                    ancestor.display()
+                );
+            }
+        }
     }
 
     #[test]

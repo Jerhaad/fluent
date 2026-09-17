@@ -42,6 +42,7 @@ fn documented_work_item() -> WorkItem {
                     path: ".fluent/work/artifacts/write-review".to_string(),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: None,
                 input_artifacts: Vec::new(),
@@ -208,12 +209,12 @@ fn reviewer_storage_writes_documented_deterministic_json() {
         fs::read_to_string(path).unwrap(),
         format!(
             r#"{{
-  "schema_version": 4,
+  "schema_version": 9,
   "id": "work-review",
   "title": "Review durable storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 5,
+    "schema_version": 8,
     "version": "{version}"
   }}
 }}

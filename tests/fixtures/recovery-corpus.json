@@ -37,7 +37,11 @@
       "task-id": "attempt-1-write-1",
       "input-digest": "sha256:replay-round-cap",
       "authorization": "Approve one corrective Writer round for the saved failed recheck.",
-      "preserved-history": ["failed-command-recheck", "no-change-writer", "needs-user-handoff"]
+      "preserved-history": [
+        "failed-command-recheck",
+        "no-change-writer",
+        "needs-user-handoff"
+      ]
     },
     {
       "id": "tester-harness-repair",
@@ -53,7 +57,11 @@
       "task-id": "attempt-1-tester-1",
       "input-digest": "sha256:replay-tester-harness",
       "authorization": "Approve the tracked project Tester repair and retry.",
-      "preserved-history": ["failed-tester-harness", "repair-authority", "candidate-gate"]
+      "preserved-history": [
+        "failed-tester-harness",
+        "repair-authority",
+        "candidate-gate"
+      ]
     },
     {
       "id": "stale-host-sandbox-landing",
@@ -64,7 +72,11 @@
       "public-command": "fluent merge-candidate land replay-stale-landing replay-merge-candidate",
       "candidate-commit": "5555555555555555555555555555555555555555",
       "stale-candidate-commit": "6666666666666666666666666666666666666666",
-      "preserved-history": ["host-sandbox-failure", "approved-landing-retry", "merged-candidate"]
+      "preserved-history": [
+        "host-sandbox-failure",
+        "approved-landing-retry",
+        "merged-candidate"
+      ]
     },
     {
       "id": "command-shaped-plan-reference",
@@ -81,7 +93,11 @@
       "evidence-digest": "sha256:replay-plan-evidence",
       "input-digest": "sha256:replay-plan-command",
       "authorization": "Attach the exact authorized-host result to Plan row plan:step-6.",
-      "preserved-history": ["approved-plan-row", "host-run", "evidence-binding"]
+      "preserved-history": [
+        "approved-plan-row",
+        "host-run",
+        "evidence-binding"
+      ]
     },
     {
       "id": "parallel-review-settlement",
@@ -97,7 +113,11 @@
       "task-id": "attempt-1-review-behaviors",
       "input-digest": "sha256:replay-review-settlement",
       "authorization": "Reconcile the review round after every parallel reviewer settled.",
-      "preserved-history": ["behaviors-review", "tests-review", "remaining-write-rounds"]
+      "preserved-history": [
+        "behaviors-review",
+        "tests-review",
+        "remaining-write-rounds"
+      ]
     },
     {
       "id": "metadata-only-rewrite",
@@ -113,7 +133,11 @@
       "task-id": "attempt-1-write-4",
       "input-digest": "sha256:replay-metadata-rewrite",
       "authorization": "Approve the exact tree-identical commit-message rewrite.",
-      "preserved-history": ["rejected-candidate", "rewrite-authorization", "candidate-gate"]
+      "preserved-history": [
+        "rejected-candidate",
+        "rewrite-authorization",
+        "candidate-gate"
+      ]
     },
     {
       "id": "candidate-ancestry-rewrite",
@@ -129,7 +153,11 @@
       "task-id": "attempt-1-write-5",
       "input-digest": "sha256:replay-candidate-ancestry",
       "authorization": "Preserve the protected base and replay only post-base corrections.",
-      "preserved-history": ["protected-base", "malformed-rewrite", "ancestry-gate"]
+      "preserved-history": [
+        "protected-base",
+        "malformed-rewrite",
+        "ancestry-gate"
+      ]
     },
     {
       "id": "writer-completion-recovery",
@@ -145,7 +173,11 @@
       "task-id": "attempt-1-write-2",
       "input-digest": "sha256:replay-writer-completion",
       "authorization": "Retry the Writer while preserving its incomplete result.",
-      "preserved-history": ["incomplete-writer", "missing-no-change", "writer-retry"]
+      "preserved-history": [
+        "incomplete-writer",
+        "missing-no-change",
+        "writer-retry"
+      ]
     },
     {
       "id": "combined-plan-and-canonical-evidence",
@@ -170,6 +202,119 @@
         "no-failed-command-recheck",
         "interrupted-targeted-review",
         "same-attempt-readiness"
+      ]
+    },
+    {
+      "id": "writer-assignment-mismatch",
+      "incident": "A corrected Writer changed the candidate while its saved assignment still named the original findings.",
+      "scope": "attempt",
+      "work-item-id": "replay-writer-assignment",
+      "attempt-id": "attempt-1",
+      "pause-kind": "writer-completion",
+      "operation-kind": "writer-assignment-recovery",
+      "public-command": "fluent attempt run replay-writer-assignment attempt-1",
+      "candidate-commit": "1515151515151515151515151515151515151515",
+      "stale-candidate-commit": "1616161616161616161616161616161616161616",
+      "task-id": "attempt-1-write-2",
+      "authorization": "Reevaluate the saved Writer assignment without rerunning its completed work.",
+      "preserved-history": [
+        "source-candidate",
+        "assigned-findings",
+        "completed-writer",
+        "same-attempt-recovery"
+      ]
+    },
+    {
+      "id": "usage-limit-interrupted-writer",
+      "incident": "A corrective Writer retained partial source work after its final native Codex stream reported a usage limit.",
+      "scope": "attempt",
+      "work-item-id": "replay-usage-limit-writer",
+      "attempt-id": "attempt-1",
+      "pause-kind": "round-cap",
+      "operation-kind": "usage-limit-writer-approval",
+      "public-command": "fluent attempt recover-usage-limit replay-usage-limit-writer attempt-1 --resolution \"<decision>\"",
+      "candidate-commit": "4444444444444444444444444444444444444444",
+      "stale-candidate-commit": "5555555555555555555555555555555555555555",
+      "task-id": "attempt-1-write-2",
+      "input-digest": "sha256:replay-usage-limit-partial-state",
+      "authorization": "Approve one retry bound to the surviving final native failure, preserved assignment, and exact partial source state.",
+      "preserved-history": [
+        "completed-source-writer",
+        "failed-corrective-writer",
+        "source-review",
+        "original-assignment",
+        "later-partial-head-and-dirty-source",
+        "final-native-quota-stream",
+        "settled-execution",
+        "approval-without-launch"
+      ]
+    },
+    {
+      "id": "usage-limit-preflight-pause",
+      "incident": "An approved corrective Writer paused during private Codex sandbox readiness before reservation; a later resume must prove the unlaunched host transition.",
+      "scope": "attempt",
+      "work-item-id": "replay-quota-preflight",
+      "attempt-id": "attempt-1",
+      "pause-kind": "host-sandbox",
+      "operation-kind": "usage-limit-writer-retry",
+      "public-command": "fluent attempt run replay-quota-preflight attempt-1",
+      "candidate-commit": "6666666666666666666666666666666666666666",
+      "stale-candidate-commit": "7777777777777777777777777777777777777777",
+      "task-id": "attempt-1-write-2",
+      "input-digest": "sha256:replay-approved-preflight-state",
+      "authorization": "Resume the same approved Writer only after proving an unlaunched native preflight pause and unchanged inputs.",
+      "preserved-history": [
+        "failed-writer-and-original-assignment",
+        "partial-head-index-and-working-source",
+        "existing-approval-and-preparation",
+        "native-preflight-task-and-attempt-transitions",
+        "no-start-or-launch",
+        "same-writer-and-round"
+      ]
+    },
+    {
+      "id": "mutable-writer-assignment-context",
+      "incident": "A completed corrective Writer was rejected after permitted progress edits changed a live source input.",
+      "scope": "attempt",
+      "work-item-id": "replay-assignment-context",
+      "attempt-id": "attempt-1",
+      "pause-kind": "writer-completion",
+      "operation-kind": "assignment-context-recovery",
+      "public-command": "fluent attempt recover-assignment-context replay-assignment-context attempt-1 --task attempt-1-write-2 --candidate 7777777777777777777777777777777777777777 --assignment-digest <saved-digest> --input <assigned-context-path> --original-file <original-bytes-file> --resolution \"<decision>\"",
+      "candidate-commit": "7777777777777777777777777777777777777777",
+      "stale-candidate-commit": "8888888888888888888888888888888888888888",
+      "task-id": "attempt-1-write-2",
+      "input-digest": "sha256:replay-exact-original-assignment-context",
+      "authorization": "Preserve only original bytes matching the recorded assignment digest; resume separately.",
+      "preserved-history": [
+        "original-assignment",
+        "immutable-findings",
+        "current-progress",
+        "completed-writer",
+        "source-candidate",
+        "outstanding-host-review-tester-learning"
+      ]
+    },
+    {
+      "id": "carried-tests-finding-host-handoff",
+      "incident": "Source corrections completed on candidate B while the immutable assignment retained a host-check finding from a Tests Review of candidate A.",
+      "scope": "attempt",
+      "work-item-id": "replay-carried-finding",
+      "attempt-id": "attempt-1",
+      "pause-kind": "writer-completion",
+      "operation-kind": "host-evidence-carried-finding-attachment",
+      "public-command": "fluent attempt evidence attach replay-carried-finding attempt-1 --candidate eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee --finding <assigned-finding-id> --evidence-file <path>",
+      "candidate-commit": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "stale-candidate-commit": "dddddddddddddddddddddddddddddddddddddddd",
+      "evidence-digest": "sha256:replay-carried-host-proof",
+      "authorization": "Select the assigned carried Tests finding for current-candidate host proof.",
+      "preserved-history": [
+        "original-tests-review-candidate-a",
+        "immutable-corrective-assignment",
+        "historical-writer-completion",
+        "current-candidate-b",
+        "failed-or-expired-proof",
+        "targeted-tests-review"
       ]
     }
   ]

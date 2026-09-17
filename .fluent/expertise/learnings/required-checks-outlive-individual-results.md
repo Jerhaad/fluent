@@ -1,6 +1,6 @@
 ---
 name: required-checks-outlive-individual-results
-description: Retain required check identities independently of reusable results and Task ordering
+description: Retain independent check obligations after proof changes or finding acceptance, regardless of Task ordering
 metadata:
   type: architecture
 ---
@@ -27,6 +27,15 @@ structured failure is covered only by its exact command-index, command, and
 harness attribution. Missing command results, unrelated structured failures,
 extractor errors, and unresolved process leaks remain blockers. Evaluate the
 original complete run plus applicable replacements without rewriting its bytes.
+
+Revalidate accepted carried-finding proof without returning overall recovery
+success. Its acceptance satisfies only that finding; the shared recovery
+assessment must continue to later active recoveries, expired proof, canonical
+integrity blockers, and outstanding Tester checks. Invalid accepted proof still
+returns an error. Otherwise an early success can hide the next attachment command
+and give status and queue admission an incorrect view of the remaining work.
+Exercise acceptance followed by an unrelated canonical host requirement through
+status, foreground resume, queue admission, fresh attachment, and final readiness.
 
 Regression tests must invalidate proof after targeted acceptance while another
 requirement remains outstanding, then try to finish that other requirement.

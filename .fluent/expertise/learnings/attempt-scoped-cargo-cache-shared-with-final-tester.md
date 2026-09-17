@@ -12,8 +12,11 @@ and Cargo build output remains in the candidate workspace so the existing
 warm-output path is preserved.
 
 Seed only the admitted dependency stores, such as Cargo `registry/` and `git/`,
-from the canonical operator Cargo home. Never copy or grant the operator's
-credentials, configuration, binaries, or other Cargo-home entries. Set the
+from the canonical operator Cargo home. Do not copy credentials, configuration,
+binaries, or other Cargo-home entries into that cache. Cache preparation grants
+only private cache access; scoped retries resolve installed tools through the
+separate read-only boundary in
+[[scoped-writers-separate-tools-from-mutable-state]]. Set the
 private `CARGO_HOME` for both the Tester commands and its result extractor,
 and grant the private Attempt cache at the rendered sandbox boundary. Task
 launches hold the project cache lock while reclaiming stale caches and preparing

@@ -26,7 +26,7 @@ Progress file: {{progress_md_path}}
 
 {{unresolved_progress}}
 
-Implement the unresolved work test-first. Use the test harness's native selectors to run focused checks for the correction; do not rerun the complete configured suite merely to duplicate Fluent's final Tester gate. Make at least one candidate commit.
+Implement the unresolved work test-first. Use the test harness's native selectors to run focused checks for the correction; do not rerun the complete configured suite merely to duplicate Fluent's final Tester gate. Commit source changes. An unchanged candidate requires fresh no-change evidence under the completion contract; an incomplete Writer run still requires a new candidate commit.
 {{#if has_writer_completion_matrix}}
 Record completion and concrete evidence in the Writer completion matrix; do not edit the host-owned `## Required completion` projection in progress.md.
 {{else}}
@@ -34,9 +34,17 @@ Update only genuinely completed required-progress entries with concrete evidence
 {{/if}}
 Do not start or simulate Tester, reviewer, Learner, landing, or Fluent orchestration work.
 
-If the candidate-gate evidence reports only commit-metadata defects, repair those
-commit messages without changing the candidate tree. Do not append a commit to
-hide the rejected commits; Fluent rechecks the complete candidate range.
+{{#if correction_lineage_append_only}}
+Preserve candidate {{prior_candidate_commit}} and all of its ancestors. Append
+new commits for source changes. Historical gate reports and literal backslash-n
+text do not authorize rewriting this history.
+{{/if}}
+{{#if correction_lineage_metadata_rewrite}}
+The host validated a tree-identical metadata rewrite for candidate
+{{prior_candidate_commit}}. Preserve protected base {{protected_base_commit}}
+and all of its ancestors. Repair only the authorized range without changing the
+candidate tree. Fluent rechecks this exact authority and the complete range.
+{{/if}}
 
 {{#if has_writer_completion_matrix}}
 Update the Writer completion matrix as you work. Preserve every host-owned row field exactly. Mark a Writer-owned row or applicable finding complete only with concrete implementation evidence and at least one passing focused command. Keep `implementation-evidence`, `verification`, and `applicable-constraints` as JSON arrays, even when one value exists. A review-finding row must also name an applicable Behavior, Approach, or required Plan row ID, or `["none: <specific reason>"]` when no approved constraint applies. These are the exact allowed IDs for this Attempt:

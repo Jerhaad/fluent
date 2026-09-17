@@ -1,0 +1,212 @@
+//! Validate recorded Writer-completion authority without lifecycle mutation.
+use crate::{
+    follow_up::content_digest,
+    work_model::{ArtifactRef, TaskKind, TaskStatus, work_artifact_path},
+};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path};
+
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const PRODUCER: &str = "writer-completion-recovery";
+const MAX_RESOLUTION_BYTES: usize = 4_096;
+const INSTRUCTIONS_MARKER: &str = "Fluent writer-completion recovery";
+
+/// Instructions and exact files admitted by the recovery owner. Callers must
+/// not turn a filename or a Task instruction into recovery authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriterRecoveryContext {
+    pub instructions: String,
+    pub artifacts: Vec<ArtifactRef>,
+    pub source_task_id: String,
+    pub candidate_commit: String,
+}
+
+pub(crate) fn validated_writer_context(
+    project_root: &Path,
+    item: &crate::work_model::WorkItem,
+    task: &crate::work_model::Task,
+) -> Result<Option<WriterRecoveryContext>> {
+    let references = task
+        .input_artifacts
+        .iter()
+        .filter(|reference| {
+            reference.producer_id == PRODUCER
+                || Path::new(&reference.path)
+                    .components()
+                    .any(|part| part.as_os_str() == "writer-completion-recoveries")
+        })
+        .collect::<Vec<_>>();
+    let instructions = task.instructions.as_deref().unwrap_or_default();
+    if references.is_empty() {
+        anyhow::ensure!(
+            !instructions.contains(INSTRUCTIONS_MARKER),
+            "Writer-completion recovery instructions have no declared authority"
+        );
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        task.kind == TaskKind::Write,
+        "completion recovery requires a Writer Task"
+    );
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+        .context("Writer-completion recovery Attempt is missing")?;
+    let original_instructions =
+        crate::usage_limit_contracts::instructions_before_retries(project_root, attempt, task)?;
+    let original_instructions = original_instructions.as_deref().unwrap_or_default();
+    let mut artifacts = Vec::new();
+    let mut instruction_binding = None;
+    for reference in references {
+        anyhow::ensure!(
+            reference.producer_id == PRODUCER && attempt.artifacts.contains(reference),
+            "Writer-completion recovery authority has an invalid producer or is not attached to the Attempt"
+        );
+        let path =
+            crate::recovery_contracts::resolve_input_artifact_path(project_root, &reference.path)?;
+        let canonical = fs::canonicalize(&path).with_context(|| {
+            format!(
+                "read Writer-completion recovery authority {}",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            canonical.starts_with(fs::canonicalize(project_root)?) && canonical.is_file(),
+            "Writer-completion recovery authority must resolve to an exact file in the project"
+        );
+        anyhow::ensure!(
+            fs::metadata(&canonical)?.len() <= 64 * 1024,
+            "Writer-completion recovery authority exceeds 65536 bytes"
+        );
+        let bytes = fs::read(&canonical)?;
+        let authority: RecoveryAuthority =
+            serde_json::from_slice(&bytes).context("parse Writer-completion recovery authority")?;
+        anyhow::ensure!(
+            bytes == serde_json::to_vec_pretty(&authority)?,
+            "Writer-completion recovery authority bytes changed from the recorded format"
+        );
+        anyhow::ensure!(
+            authority.schema_version == SCHEMA_VERSION
+                && authority.work_item_id == item.id
+                && authority.attempt_id == attempt.id
+                && authority.resolution == normalize_resolution(&authority.resolution)?
+                && authority.resolution_sha256 == content_digest(authority.resolution.as_bytes())
+                && reference.path
+                    == work_artifact_path(
+                        &item.id,
+                        &attempt.id,
+                        &format!(
+                            "writer-completion-recoveries/{}/recovery.json",
+                            authority.task_id
+                        )
+                    ),
+            "Writer-completion recovery authority has invalid version, identity, path, or resolution"
+        );
+        let source = attempt
+            .tasks
+            .iter()
+            .find(|source| source.id == authority.source_writer_task_id)
+            .context("Writer-completion recovery source Writer is missing")?;
+        let output = source
+            .output
+            .as_ref()
+            .context("Writer-completion recovery source has no output")?;
+        let authorized = attempt
+            .tasks
+            .iter()
+            .find(|source| source.id == authority.task_id)
+            .context("Writer-completion recovery authorized Task is missing")?;
+        anyhow::ensure!(
+            source.kind == TaskKind::Write
+                && source.status == TaskStatus::Complete
+                && output.commit == authority.candidate_commit
+                && output.base_commit == authority.protected_base_commit
+                && authorized.kind == TaskKind::Write
+                && authorized.input_artifacts.contains(reference)
+                && task.workspace_access.writes == authorized.workspace_access.writes,
+            "Writer-completion recovery source or Task binding changed"
+        );
+        let operation = crate::work_model::RecoveryOperationRequest::new(
+            PRODUCER,
+            &item.id,
+            &attempt.id,
+            Some(authority.candidate_commit.clone()),
+            Some(authority.task_id.clone()),
+            None,
+            Some(output.workspace_path.clone()),
+            Some(authority.resolution.clone()),
+            Some(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&authority)?)
+            )),
+        );
+        anyhow::ensure!(
+            item.validate_recovery_operation(project_root, &operation)?
+                .is_some(),
+            "Writer-completion recovery has no matching recorded operation"
+        );
+        if original_instructions == recovery_instructions(&authority.resolution, &reference.path)
+            || original_instructions
+                == corrective_writer_instructions(&authority.resolution, &reference.path)
+        {
+            anyhow::ensure!(
+                instruction_binding.is_none(),
+                "Writer-completion recovery instructions have ambiguous authority"
+            );
+            instruction_binding =
+                Some((authority.source_writer_task_id, authority.candidate_commit));
+        }
+        artifacts.push(reference.clone());
+    }
+    let (source_task_id, candidate_commit) = instruction_binding.context(
+        "Writer-completion recovery Task instructions do not match the recorded authorization",
+    )?;
+    Ok(Some(WriterRecoveryContext {
+        instructions: instructions.to_string(),
+        artifacts,
+        source_task_id,
+        candidate_commit,
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct RecoveryAuthority {
+    pub(crate) schema_version: u32,
+    pub(crate) work_item_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) task_id: String,
+    pub(crate) source_writer_task_id: String,
+    pub(crate) candidate_commit: String,
+    pub(crate) protected_base_commit: Option<String>,
+    pub(crate) superseded_task_ids: Vec<String>,
+    pub(crate) resolution: String,
+    pub(crate) resolution_sha256: String,
+    pub(crate) created_at: String,
+}
+
+pub(crate) fn normalize_resolution(resolution: &str) -> Result<String> {
+    let value = resolution.trim();
+    if value.is_empty() {
+        bail!("provide a non-empty --resolution for Writer-completion recovery");
+    }
+    if value.len() > MAX_RESOLUTION_BYTES {
+        bail!("the Writer-completion recovery resolution is too long");
+    }
+    Ok(value.to_string())
+}
+
+pub(crate) fn recovery_instructions(resolution: &str, audit_artifact: &str) -> String {
+    format!(
+        "{INSTRUCTIONS_MARKER}. Retry this exact Writer Task after the prior run omitted its required no-change declaration. Preserve the candidate and existing history. If no source change is justified, write the required no-change.json with fresh focused verification. Operator authorization: {resolution}. Authority: {audit_artifact}"
+    )
+}
+
+pub(crate) fn corrective_writer_instructions(resolution: &str, audit_artifact: &str) -> String {
+    format!(
+        "{INSTRUCTIONS_MARKER}. A prior no-change Writer left a review finding pending in its completion matrix. Address that finding with the smallest safe source or metadata correction, preserve the candidate's existing history, and write a complete matrix for this new corrective Writer. Operator authorization: {resolution}. Authority: {audit_artifact}"
+    )
+}

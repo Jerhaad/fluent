@@ -11,7 +11,7 @@
 //! lineage, candidate, or follow-up locks, so the queue can never invert a
 //! lock order and deadlock.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -690,6 +690,20 @@ pub fn resume_with_tester_no_sandbox(
     if !work_item_exists(project_root, id) {
         bail!("Work Item {id:?} not found");
     }
+    let snapshot = WorkModelStore::new(project_root).read_work_item_snapshot(id)?;
+    let context_retry_ready = crate::recovery_contracts::context_retry::resume_ready(
+        project_root,
+        &snapshot,
+        attempt_id,
+    )?;
+    let usage_limit_ready = crate::lifecycle_recovery::usage_limit_writer_resume_ready(
+        project_root,
+        &snapshot,
+        attempt_id,
+    )?;
+    if !context_retry_ready && !usage_limit_ready {
+        ensure_writer_assignment_resume_ready(project_root, &snapshot, attempt_id)?;
+    }
     let _ = reconcile_interrupted_evidence_queue_admissions(project_root, id, attempt_id)?;
     let store = WorkModelStore::new(project_root);
     // Older Fluent versions could persist a direct Codex authentication failure
@@ -718,6 +732,15 @@ pub fn resume_with_tester_no_sandbox(
             reason,
         })
     })?;
+    // An older paused correction may omit the protected assignment. Rebuild it
+    // only after this explicit resume request has reached the lifecycle owner;
+    // the inspector itself remains read-only and repeats under the model lock.
+    let _ = crate::lifecycle_recovery::recover_legacy_writer_correction_assignment(
+        project_root,
+        &store,
+        id,
+        attempt_id,
+    )?;
     let _model_lock = store.lock_work_item_model(id)?;
     let item = store.read_work_item_under_model_lock(id)?;
     // Queue admission and foreground execution recognize the same narrow
@@ -1187,6 +1210,48 @@ fn ensure_lifecycle_eligible(item: &WorkItem, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject stale completed Writer authority before recovery can refresh stored
+/// pause guidance. Queue admission repeats this check under the model lock.
+fn ensure_writer_assignment_resume_ready(
+    project_root: &Path,
+    item: &WorkItem,
+    attempt_id: &str,
+) -> Result<()> {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        return Ok(());
+    };
+    if attempt.pause_kind == Some(crate::work_model::PauseKind::WriterCompletion)
+        && let Some(writer) = attempt.tasks.iter().rev().find(|task| {
+            task.kind == TaskKind::Write
+                && task.status == TaskStatus::Complete
+                && task.output.is_some()
+                && task.writer_correction_assignment.is_some()
+        })
+    {
+        let assignment = writer
+            .writer_correction_assignment
+            .as_ref()
+            .expect("the assignment was checked above");
+        crate::recovery_contracts::validate_writer_correction_assignment(
+            project_root,
+            item,
+            writer,
+            assignment,
+        )
+        .with_context(|| {
+            format!(
+                "Writer correction assignment is unverifiable before resume for Task {}",
+                writer.id
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn ensure_resume_eligible(
     project_root: &Path,
     item: &WorkItem,
@@ -1204,6 +1269,13 @@ fn ensure_resume_eligible(
         .iter()
         .find(|attempt| attempt.id == attempt_id)
         .ok_or_else(|| anyhow::anyhow!("Work Item {id:?} has no Attempt to resume"))?;
+    if crate::recovery_contracts::context_retry::resume_ready(project_root, item, attempt_id)? {
+        return Ok(());
+    }
+    if crate::lifecycle_recovery::usage_limit_writer_resume_ready(project_root, item, attempt_id)? {
+        return Ok(());
+    }
+    ensure_writer_assignment_resume_ready(project_root, item, attempt_id)?;
     crate::host_evidence::ensure_owned_host_resume_ready(project_root, attempt)?;
     #[cfg(test)]
     crate::test_lock_probe::reach("queue-lifecycle", id, "resume", "EVIDENCE");
@@ -1479,6 +1551,21 @@ pub fn claim(
     let store = WorkModelStore::new(project_root);
     let _model_lock = store.lock_work_item_model(work_item_id)?;
     let item = store.read_work_item_under_model_lock(work_item_id)?;
+    // Claim must apply the same narrow legacy recognition as queue admission
+    // and foreground execution before it changes dispatch state. A fresh
+    // dispatch has no Attempt until the claim is durably bound, so there is no
+    // legacy recovery state to inspect in that case.
+    if item
+        .attempts
+        .iter()
+        .any(|attempt| attempt.id == bound_attempt_id)
+    {
+        let _ = crate::recovery_contracts::inspect_legacy_writer_correction_assignment(
+            project_root,
+            &item,
+            bound_attempt_id,
+        )?;
+    }
     #[cfg(test)]
     crate::test_lock_probe::reach("queue-lifecycle", work_item_id, "claim", "ELIGIBLE");
     // The ledger file is atomically replaced, so this read is a safe admission
@@ -1985,6 +2072,7 @@ mod tests {
         attempt.status = AttemptStatus::Reviewing;
         attempt.review_state = Some(AttemptReviewState::NotReviewed);
         attempt.evidence_recoveries.push(EvidenceRecovery {
+            carried_finding: None,
             required_check: None,
             id: recovery_id,
             candidate_commit: candidate,

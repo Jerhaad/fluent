@@ -1,8 +1,7 @@
-//! Resolve executable commands from older Plan-row text.
+//! Resolve exact commands and their provenance from Plan rows.
 //!
-//! New Attempts store the result in [`crate::work_model::PlanCommand`]. These
-//! helpers remain only for the explicit compatibility path used when an older
-//! completion matrix has no structured command field.
+//! Prefer [`crate::work_model::PlanCommand`] in new Attempts. Older matrices
+//! retain the explicit compatibility path that resolves unambiguous row text.
 
 use std::collections::BTreeMap;
 
@@ -276,6 +275,138 @@ fn is_plan_environment_assignment(token: &str) -> bool {
             (index == 0 && (character == '_' || character.is_ascii_alphabetic()))
                 || (index > 0 && (character == '_' || character.is_ascii_alphanumeric()))
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedPlanCommand {
+    pub command: String,
+    pub source: String,
+}
+
+/// Resolve one exact executable command from a Plan row without changing the
+/// approved planning text. New Attempts carry a structured command captured at
+/// planning time. Older matrices have no such field, so the compatibility path
+/// accepts one unambiguous command-shaped candidate across their text fields.
+pub(crate) fn resolve_plan_row_command(
+    row: &crate::work_model::WriterCompletionRow,
+) -> Option<String> {
+    resolve_plan_row_command_with_source(row).map(|resolved| resolved.command)
+}
+
+pub(crate) fn resolve_plan_row_command_with_source(
+    row: &crate::work_model::WriterCompletionRow,
+) -> Option<ResolvedPlanCommand> {
+    if let Some(command) = row.command.as_ref() {
+        if command.source_row != row.id {
+            return None;
+        }
+        validate_focused_command(&command.command).ok()?;
+        return Some(ResolvedPlanCommand {
+            command: command.command.clone(),
+            source: format!("structured:{}", command.source_row),
+        });
+    }
+    let mut candidates = row
+        .verification_refs
+        .iter()
+        .flat_map(|text| {
+            extract_plan_command_candidates(text)
+                .into_iter()
+                .map(|command| (command, "legacy:verification".to_string()))
+                .collect::<Vec<_>>()
+        })
+        .chain(
+            extract_plan_command_candidates(&row.requirement)
+                .into_iter()
+                .map(|command| (command, "legacy:requirement".to_string())),
+        )
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    let command = candidates.first().map(|(command, _)| command.clone())?;
+    if candidates.iter().any(|candidate| candidate.0 != command) {
+        return None;
+    }
+    let mut sources = candidates
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+    Some(ResolvedPlanCommand {
+        command,
+        source: sources.join("+"),
+    })
+}
+
+pub(crate) fn plan_command_binding_matches(
+    row: &crate::work_model::WriterCompletionRow,
+    command: &str,
+    source: Option<&str>,
+) -> bool {
+    let Some(resolved) = resolve_plan_row_command_with_source(row) else {
+        return false;
+    };
+    resolved.command == command && source.is_none_or(|source| source == resolved.source)
+}
+
+pub(crate) fn validate_focused_command(command: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !command.trim().is_empty() && command.len() <= MAX_COMMAND_BYTES,
+        "focused evidence command must be between 1 and {MAX_COMMAND_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        !command.contains(['\n', '\r', '\0']),
+        "focused evidence command must occupy one line"
+    );
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        Unquoted,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::Unquoted;
+    let mut escaped = false;
+    let mut chars = command.char_indices().peekable();
+    while let Some((_, character)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Quote::Single {
+            escaped = true;
+            continue;
+        }
+        match (quote, character) {
+            (Quote::Unquoted, '\'') => quote = Quote::Single,
+            (Quote::Unquoted, '"') => quote = Quote::Double,
+            (Quote::Single, '\'') => quote = Quote::Unquoted,
+            (Quote::Double, '"') => quote = Quote::Unquoted,
+            (Quote::Unquoted, ';' | '&' | '|' | '(' | ')' | '>' | '<') => {
+                anyhow::bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token {character:?} is not allowed"
+                )
+            }
+            (Quote::Unquoted | Quote::Double, '`') => {
+                anyhow::bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token \"`\" is not allowed"
+                )
+            }
+            (Quote::Unquoted | Quote::Double, '$')
+                if chars.peek().is_some_and(|(_, next)| *next == '(') =>
+            {
+                anyhow::bail!(
+                    "focused evidence command must name one direct harness invocation; shell control token \"$(\" is not allowed"
+                )
+            }
+            _ => {}
+        }
+    }
+    anyhow::ensure!(
+        quote == Quote::Unquoted && !escaped,
+        "focused evidence command contains an unterminated quote or escape"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

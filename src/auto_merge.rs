@@ -321,6 +321,7 @@ mod tests {
                     },
                     artifact_area: None,
                     review_context: None,
+                    writer_correction_assignment: None,
                     verification_context: None,
                     evidence_review_context: None,
                     input_artifacts: vec![],

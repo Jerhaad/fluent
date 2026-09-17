@@ -240,10 +240,11 @@ or `NeedsUser` with no output, and `Complete` with output. A `Failed` or
 `classify` is rejected without mutation. For a `Complete` Writer with output,
 replay retains the original source, review, and evidence bindings but validates
 that saved output's workspace as the current clean candidate before returning
-the stored result. For a `Failed` Writer, no public resume transition retries
-it: `fluent queue resume`, `fluent attempt run`, and repeated `classify` are
-rejected, so the operator must inspect the failed Task and escalate for a
-separately validated recovery. For a `Superseded` Writer, continue with its
+the stored result. For a `Failed` Writer, classification grants no retry
+authority. Repeated `classify` still rejects a failed Writer, including after
+usage-limit approval. Only the dedicated `attempt recover-usage-limit` approval
+followed by a separate explicit resume can retry that same Task; unrelated
+failed Writers remain ineligible. For a `Superseded` Writer, continue with its
 replacement and do not repeat the classification.
 
 This fail-closed policy keeps replay and queue admission aligned: a hard-failed
@@ -362,6 +363,15 @@ default candidate-code applicability and the original comparison context.
 See `corrective_writer_views_preserve_current_proof_and_history` and
 `changed_candidate_resumes_through_reviews_and_tester` in `tests/binary.rs`.
 
+## Pin ordinary Review proof without creating acceptance authority
+
+Save the accepted-proof selection in existing Task artifact references so an
+ordinary Tests Review receives stable inputs. The content-addressed summary
+pins those inputs; fresh source validation grants acceptance. Sources added as
+historical proof provenance do not reassign their findings to the Review.
+See [host evidence recovery](../../documentation/architecture.md#host-evidence-recovery)
+and [[accepted-proof-selection-revalidates-original-sources]] for the contract.
+
 ## Canonical check identity includes configuration and position
 
 Use `tester:<tester.yaml-sha256>:<zero-based-command-index>` to select a canonical
@@ -438,9 +448,253 @@ non-Approach requirements, ownership, reports, host evidence, review verdicts,
 and completed Tasks; do not launch execution while recording the revision.
 
 Keep the older `UncertainArchitecture` audit kind and historical replay
-semantics unchanged. Do not integrate the temporary assignment-aware
-coordinator: current readers fence its envelope schema 4 and transaction schema
-5 while recognizing stable envelope schemas 1, 2, and 5 and transaction schemas
-1 through 3, 6, and 7. Pinned stable and assignment-era readers must refuse the new
+semantics unchanged. The installation integration supersedes the earlier
+exclusion of assignment-aware formats: this coordinator now models their
+corrective assignments, carried findings, and separately authorized retries
+alongside the failed-review round-cap audit. Retain bounded adapters for those
+modeled records and journals. Pinned predecessor readers must refuse combined
 authority in both published and pending states, and read-only legacy observation
 must not recover or combine partial state.
+
+---
+
+## Preserve corrective Writer assignments independently of current verification
+
+An operator may select one carried Tests finding with `attempt evidence attach
+--finding` when the latest completed Writer has finished every other Writer row.
+The typed binding on `EvidenceRecovery` preserves the original assignment and
+Review at candidate A while binding new proof and one targeted Tests Review to
+the current clean managed candidate B. The original Review needs one structured
+check request, without an evidence-targeted disposition marker. Selection never
+authorizes host execution or a general change of responsibility.
+
+`recovery_contracts/carried_finding.rs` supplies the shared source validation and
+accepted-finding overlay. Passing proof and a passing Review satisfy that finding
+in memory; historical matrices and outputs retain their original claims. Keep
+this acceptance out of `verification_assessment` command coverage and ordinary
+review-domain credit. The remaining review, Tester, gate, and Learning obligations
+still apply. Exact retries revalidate immutable bytes and the saved operation,
+including under the model lock before interrupted publication recovery. Fresh
+proof preserves expired or failed history; old actions cannot clear a later stop.
+See `carried_finding_evidence_*` in `tests/binary.rs` and the host recovery guide.
+
+A corrective Writer receives a bounded, immutable assignment on its host-owned
+Task record before launch. `WriterCorrectionAssignment` binds the Work Item,
+Attempt, Writer Task, source Writer Task, source candidate, finding identities,
+requirement text, and the source Task and evidence artifacts with their
+digests. `recovery_contracts` validates that record and supplies its findings
+to completion checks; the Writer's matrix and generated context remain claims
+or instructions, not assignment authority.
+
+An incomplete completion frontier creates a pre-review continuation of the same
+Writer session, so that Task carries the source assignment unchanged apart from
+its Task identity and the proven context-freezing exception below. A later Writer
+whose inputs contain new Review or Tester correction evidence starts a new
+corrective round and captures a fresh assignment for that source Task,
+candidate, findings, and evidence.
+
+The corrected candidate still has a separate verification frontier. The source
+candidate's Tester result and the assigned Writer rows do not satisfy fresh
+candidate checks. Once the preserved assignment and other pre-review gates pass,
+the Attempt may plan ordinary reviews before the complete final Tester; review
+admission does not make the candidate verified or ready to land. Setup rollback
+restores only the reservation-owned execution state and retains the published
+assignment, while retries reuse the same record.
+
+Older saved Writers may lack the field. Foreground and queued resume can publish
+a `LegacyReconstructed` assignment only after the read-only inspector verifies
+the exact completed source Writer, candidate, matrix, evidence, clean worktree,
+and settled Task ownership. It does not trust the saved matrix or current
+assessment to invent historical findings, and it does not reconstruct missing
+applicability or accepted-proof facts. Status and show never publish this
+assignment. Changed, mixed, contradictory, or live-owned histories remain
+paused with a specific diagnosis.
+
+Work and Attempt record schema 9, writer envelope schema 8, and transaction
+schema 9 preserve carried-finding authority, corrective assignment snapshots,
+and usage-limit approvals together. The three pinned predecessors share record
+schema 7 but cannot each retain the other branches' authority; the combined
+fence must exceed every predecessor's recognized limits.
+The pinned b5d8bf02 reader rejects the new binding in published records and real
+interrupted public transactions, with independent inner-fence checks. Earlier
+record-6/envelope-4/transaction-5 fences introduced the assignment field. The pinned
+older readers must refuse both published assignment records and genuinely
+pending assignment transactions without changing protected bytes. See
+`corrective_writer_assignment_survives_candidate_change`,
+`saved_writer_assignment_recovers_through_public_resume`, and
+`writer_assignment_old_reader_reaches_inner_fences`,
+`writer_assignment_old_reader_refuses_pending_transactions` in
+`tests/binary.rs`.
+
+
+## Freeze mutable context and recover proven original bytes
+
+Corrective assignment schema 2 freezes only recognized Work/Attempt progress
+and host handoff inputs at assignment time. Bind each snapshot to its original
+source reference and digest through immutable provenance. Keep source Tasks,
+completion matrices, findings and other evidence unchanged; schema 1 remains
+readable. Writer envelope schema 8 fences executables that predate these
+snapshot semantics. Carried-finding bindings retain their original assignment
+when context recovery freezes it later. Validate the complete operation-bound
+audit chain before accepting that original identity; never rewrite the evidence
+binding or infer acceptance from a snapshot alone.
+
+A continuation may freeze a carried legacy context binding without changing its
+original Work, Attempt, source Task, source candidate, findings, or immutable
+evidence. `recovery_contracts` validates the exact snapshot path and original
+digest, provenance path and bytes, and any recorded context-recovery audit.
+Interrupted restoration uses that same proof to validate the predecessor after
+live progress changes. Preserve every historical assignment; this exception
+permits only the recognized context representation change and receiving Task
+identity. It grants no completion credit or permission to resume a canceled
+Attempt.
+
+An explicit context recovery may replace one saved mutable binding only after
+proving the original bytes, exact assignment, clean candidate and settled
+ownership. It also admits an output-free Failed Writer whose saved completion
+authority binds the latest completed source and whose native execution identity
+proves its setup never launched a provider. At most one later unstarted Writer
+reservation may remain, with no materialized artifacts. Context recovery keeps
+both Tasks and all lifecycle statuses unchanged; it grants no retry authority. The deterministic request path locates the before/after
+audit; the recovery operation separately binds the complete audit bytes. This
+separation preserves request lookup after publication without allowing changed
+audit fields to reuse an operation identity. The store permits only the audited
+substitution and retains all other assignment and lifecycle authority.
+
+New Work/Attempt records use schema 9, writer envelopes 8, and transactions 9
+to fence readers that cannot retain the output-free failure audit.
+Context-recovery journals use schema 9 and retain their authorized base aggregate
+with its children digest. Replay validates the original audited change against
+that base and accepts each stored child only if it matches the base or target.
+This permits interrupted Attempt and Task publication without treating mixed
+records as a fresh authorization. Other mutations also write journal
+schema 9; readers retain schema-6, schema-7, and schema-8 predecessor journals. Status and
+show never reconcile; the exact matching recovery can do so under the storage
+lock. Recovery neither launches work nor supplies resume,
+Review, Tester, host-evidence or merge authority, and replay retains later stops.
+
+See [the storage architecture](../../documentation/architecture.md) and
+[the complete-audit publication pattern](persistence/patterns/bind-complete-recovery-audit.md).
+
+## Require separate approval to retry a quota-failed Writer
+
+The source-correction decision still refuses implicit retries of a failed Writer.
+The dedicated `attempt recover-usage-limit` operation is a narrow exception: it
+validates the surviving native Codex terminal stream, preserved correction
+assignment, settled ownership, and exact partial source state before recording
+operator approval. A separate resume retries that same Task once. The source
+Writer output and partial HEAD remain distinct identities. Retained failure and
+Review bytes and the host-owned audit stay outside the retry's writable roots.
+
+Keep immutable inspection in `usage_limit_contracts` below its queue, lifecycle,
+status, persistence, and executor consumers. Publication belongs to
+`usage_limit_recovery`. Work records now use schema 9, the writer envelope 8, and
+transactions 9 to keep pre-change executables from discarding retry authority.
+The approval supplies no completion, host-evidence, review, Tester, or Learning
+credit. A later cancellation or terminal failure cannot reuse it to restart.
+See the [architecture](../../documentation/architecture.md#recover-a-usage-limit-interrupted-writer)
+and the `usage_limit_writer_` public-route and compatibility tests.
+
+When a quota retry retains completion-recovery instructions,
+`usage_limit_contracts` reconstructs the original instructions through recorded
+approvals, requiring each matching artifact area, Task identity, instruction
+string, input list, and preparation operation to agree. The shared completion
+contract validates those original instructions against completion authority
+while delivering the full audited instructions to the Writer. Keep this rule
+with those owners; consumers must not strip prose to infer authorization. See
+[[composed-recovery-instructions-bind-each-preparation]].
+
+## Preserve transition history as preflight recovery proof
+
+Derive eligibility to reopen an approved Writer's pre-reservation host-sandbox
+pause from existing append-only transitions. Keep the external preparation reason
+`prepare approved usage-limit retry`, Task state spellings `failed`, `needsuser`,
+and `planned`, and preparation time at or after this approval's PREPARE operation
+completion time.
+The latest Task transition must come from `TaskExecutor` and move `planned` to
+`needsuser`. Its paired Attempt transition must come from `TaskExecutor`, move
+`planned` or `executing` to `needs-user`, and carry reason `host-sandbox`. The
+Attempt entry must follow preparation and immediately precede the Task entry
+by sequence, with the same timestamp.
+
+These details bind the pause to explicit preparation and one native executor
+mutation. Preserve them when changing transition emission; treating the reason,
+state spelling, ordering, or timestamps as display-only would break recovery
+compatibility. Existing records suffice alongside the unchanged Task and approval
+bindings, absent start/launch and execution evidence, and settled ownership.
+Missing or conflicting proof rejects recovery. Do not add a second durable
+marker or infer authority from the pause label alone.
+
+See the [retry architecture](../../documentation/architecture.md#recover-a-usage-limit-interrupted-writer)
+and [public-route regressions](../../tests/binary.rs):
+`usage_limit_writer_preflight_pause_requires_compatible_history` covers the ledger
+details, `usage_limit_writer_preflight_pause_rejects_unproven_state` rejects missing
+or conflicting proof, and `usage_limit_writer_preflight_pause_resumes_same_task`
+and `usage_limit_writer_preflight_pause_repeats_without_consuming_approval` retain
+valid recovery without a new approval or Writer round.
+
+## Derive ordinary review coverage from scoped Task history
+
+Use completed Task contexts and verdicts to establish every ordinary review
+domain. Targeted evidence acceptance supplies only its declared scope. Retain
+ordinary passes only across unchanged domains at every intervening Writer
+delta, and schedule missing coverage through native review planning before
+final Tester or unfinished Learning. Keep historical Tasks unchanged instead of
+adding a second durable coverage authority. See
+[[ordinary-review-coverage-follows-writer-history]] and
+[the Work model architecture](../../documentation/architecture.md#core-work-model).
+
+## Separate installed tools from private Writer state
+
+Scoped Writer retries resolve installed tools and exact Git configuration reads
+in the executor, render read/executable-map grants and installed-tool write
+denials in `os`, and keep mutable dependencies and scratch in `writer_cache`.
+Let Git evaluate conditional includes in the retained Writer worktree before
+granting their exact files; configuration parent directories receive no grant.
+See [[scoped-writers-separate-tools-from-mutable-state]], the
+[conditional-include pattern](security/patterns/evaluate-conditional-git-includes.md),
+and [the retry architecture](../../documentation/architecture.md#recover-a-usage-limit-interrupted-writer).
+---
+
+## Authorize one retry after recovering failed setup context
+
+A failed completion retry needs two separate authorities: an operation-bound
+schema-2 context audit and a fresh completion-retry audit. The latter retains the
+original failed Task and evidence, and binds an exact prepared version of that
+same Task with a fresh artifact directory. Use a stable per-Task audit path;
+a request-dependent path would permit conflicting approvals after an interrupted
+audit write. Resume, Task reservation, and spawn validate the same neutral
+contract. Record one start and one launch marker while holding the model lock.
+Do not reuse quota, authentication, round-extension, or generic failure recovery
+authority to admit this case.
+
+Retain the base aggregate in retry journals and accept only exact base or target
+children, while revalidating the pinned files before replay. The immediate
+combined predecessor at `43022b29fa437ade211fef3fff66798c5d940ef9` must reject
+record-9/envelope-8/transaction-9 state before mutation. Keep all earlier pinned
+reader preparations in the canonical Tester. The real confinement command is a
+separate host gate; routine profile assertions cannot supply its evidence.
+
+## Hold reference identity through interrupted restoration
+
+Restoration validates an inherited correction assignment against its original
+source and exact continuation chain independently of the latest completed
+Writer's saved candidate. It never rewrites the assignment to match that target.
+The immutable intent records both identities; replay preserves earlier schema-1
+intents only within their original same-source contract.
+
+Hold the worktree's symbolic HEAD in a prepared Git transaction and update the
+candidate through a separate prepared transaction in the common repository.
+Git rejects combining HEAD verification with its referent's update because the
+update also implicitly updates HEAD. The candidate transaction must use
+`no-deref` with expected commit IDs for the source, retained, and candidate refs,
+then verify that all remain direct while their locks are held. Only commit after
+those checks pass. `no-deref` by itself can replace a symbolic ref and therefore
+does not prove that the candidate's identity stayed unchanged.
+
+Close transaction input on failure to abort without modifying substituted refs
+or publishing a recovery operation. EOF also releases Git locks after coordinator
+exit; normal cleanup reaps each child. Preserve the existing native ownership
+locks, immutable intent, exact evidence checks, cancellation, and replay gates.
+See [the prepared Git transaction pattern](persistence/patterns/hold-git-head-during-restoration.md)
+and `candidate_ancestry_recovery::interrupted::PreparedRefs`.

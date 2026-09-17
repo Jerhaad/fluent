@@ -30,6 +30,7 @@ fn task(kind: TaskKind) -> Task {
             path: ".fluent/work/artifacts/write-code".to_string(),
         }),
         review_context: None,
+        writer_correction_assignment: None,
         verification_context: None,
         evidence_review_context: None,
         input_artifacts: Vec::new(),
@@ -640,12 +641,12 @@ fn work_model_store_writes_deterministic_pretty_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 4,
+  "schema_version": 9,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 5,
+    "schema_version": 8,
     "version": "{version}"
   }}
 }}
@@ -694,12 +695,12 @@ fn capture_mode_preserves_minimal_work_item_json() {
         content,
         format!(
             r#"{{
-  "schema_version": 4,
+  "schema_version": 9,
   "id": "work-1",
   "title": "Add durable model storage",
   "model_writer_version": {{
     "format": "fluent-work-item-writer",
-    "schema_version": 5,
+    "schema_version": 8,
     "version": "{version}"
   }}
 }}
@@ -1665,7 +1666,7 @@ fn current_record_has_old_reader_wire_fence() {
     assert_eq!(
         record["model_writer_version"],
         serde_json::json!({
-            "format": "fluent-work-item-writer", "schema_version": 5,
+            "format": "fluent-work-item-writer", "schema_version": 8,
             "version": env!("CARGO_PKG_VERSION")
         })
     );
@@ -1753,9 +1754,13 @@ fn writer_envelope_rejects_unknown_or_malformed_values() {
     store.create_work_item(&work_item()).unwrap();
     let path = store.work_item_path("work-1").unwrap();
     let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let future_schema = record["model_writer_version"]["schema_version"]
+        .as_u64()
+        .unwrap()
+        + 1;
     for envelope in [
         serde_json::json!({"format": "other", "schema_version": 1, "version": "0.3.0"}),
-        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 3, "version": "0.3.0"}),
+        serde_json::json!({"format": "fluent-work-item-writer", "schema_version": future_schema, "version": "0.3.0"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 0, "version": "0.3.0"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1, "version": "invalid"}),
         serde_json::json!({"format": "fluent-work-item-writer", "schema_version": 1}),

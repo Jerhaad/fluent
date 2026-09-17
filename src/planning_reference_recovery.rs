@@ -303,6 +303,16 @@ pub fn revise(
                 Some(project_root),
             );
             attempt.record_recovery_operation(&operation, next_action)?;
+            crate::work_task_executor::prepare_ordinary_review_evidence(
+                project_root,
+                fresh,
+                attempt_id,
+                &task_ids,
+            )
+            .map_err(|error| WorkModelError::HostEvidenceRecoveryIneligible {
+                attempt_id: attempt_id.into(),
+                reason: format!("{error:#}"),
+            })?;
             Ok(task_ids)
         })?;
 

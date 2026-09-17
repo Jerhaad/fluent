@@ -39,7 +39,11 @@ external host remediation could resolve the failure, and emit exactly one
 `Additional-Proof: <evidence to attach after correction>` line. When the exact
 command has already run against this exact candidate and no external
 remediation is named, emit exactly one `Disposition: code-change` line.
+
+{{carried_finding_context}}
 {{/if}}
+
+{{accepted_host_evidence}}
 
 ## Phase 1 — Understand the Work Item
 

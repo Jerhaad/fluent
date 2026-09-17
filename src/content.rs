@@ -862,15 +862,27 @@ Check item {{ITEM_ID}}.
 
         let attachment = guide
             .split_once("## Attach host-only evidence")
-            .and_then(|(_, rest)| {
-                rest.split_once("## Classify a candidate-bound source correction")
-            })
+            .and_then(|(_, rest)| rest.split_once("\n## "))
             .map(|(section, _)| section)
-            .expect("the guide must separate host-only attachment from classification");
+            .expect("the guide must separate host-only attachment from other recovery paths");
         assert!(attachment.contains("candidate does not need a source change"));
         assert!(
             !attachment.contains("malformed") && !attachment.contains("evidence-needed"),
             "malformed-marker rules belong only to classification guidance"
+        );
+        let carried_finding = guide
+            .split_once("## Attach proof for a carried finding")
+            .and_then(|(_, rest)| rest.split_once("\n## "))
+            .map(|(section, _)| section)
+            .expect("the guide must separate carried findings from other recovery paths");
+        let carried_finding = carried_finding
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(carried_finding.contains("Use `--finding` alone"));
+        assert!(carried_finding.contains("After an `evidence-needed` Review"));
+        assert!(
+            carried_finding.contains("it need not contain an evidence-targeted disposition marker")
         );
         let classification = guide
             .split_once("## Classify a candidate-bound source correction")
@@ -905,6 +917,23 @@ Check item {{ITEM_ID}}.
         assert!(guide.contains("fluent attempt run <work-item-id> <attempt-id>"));
         assert!(guide.contains("Exact retries reuse the same revision and Writer"));
         assert!(guide.contains("later host, Tester, review, and Learning gates"));
+    }
+
+    #[test]
+    fn bundled_fluent_skill_describes_assignment_context_recovery() {
+        let guide = bundled_skill_content("fluent/references/host-evidence-recovery.md").unwrap();
+        for text in [
+            "## Recover mutable Writer assignment context",
+            "recover-assignment-context",
+            "--assignment-digest",
+            "--original-file",
+            "matching the recorded digest",
+            "does not resume",
+            "current progress",
+            "ordinary reviews",
+        ] {
+            assert!(guide.contains(text), "missing recovery guidance: {text}");
+        }
     }
 
     #[test]
@@ -953,10 +982,18 @@ Check item {{ITEM_ID}}.
                     .contains("For a `Complete` Writer with output, replay retains the original"),
                 "{name} must validate the saved completed Writer output during replay"
             );
-            assert!(
-                document.contains("no public resume transition retries it"),
-                "{name} must require escalation after a hard-failed classified Writer"
-            );
+            for requirement in [
+                "classification grants no retry authority",
+                "`classify` still rejects a failed Writer",
+                "`attempt recover-usage-limit`",
+                "separate explicit resume",
+                "unrelated failed Writers remain ineligible",
+            ] {
+                assert!(
+                    document.contains(requirement),
+                    "{name} must retain {requirement}"
+                );
+            }
         }
 
         for (name, document) in [
@@ -969,6 +1006,32 @@ Check item {{ITEM_ID}}.
                 "{name} must qualify duplicate-request replay by Writer lifecycle"
             );
         }
+    }
+
+    #[test]
+    fn quota_recovery_guidance_requires_confined_rust_execution() {
+        for path in [
+            "documentation/architecture.md",
+            "skills/fluent.full/references/host-evidence-recovery.md",
+        ] {
+            let document = read_living_doc(path);
+            for requirement in [
+                "offline Rust test that compiles and runs inside the production retry profile",
+                "installed tools remain read-only",
+                "private dependency cache",
+                "FLUENT_USAGE_LIMIT_REQUIRE_REAL_CONFINEMENT=1",
+                "targeted Tests Review",
+            ] {
+                assert!(
+                    document.contains(requirement),
+                    "{path} must require {requirement}"
+                );
+            }
+        }
+        let architecture = read_living_doc("documentation/architecture.md");
+        assert!(architecture.contains("source symlink leaves"));
+        assert!(architecture.contains("literal target bytes without following their targets"));
+        assert!(!architecture.contains("snapshot rejects symlinks,"));
     }
 
     #[test]

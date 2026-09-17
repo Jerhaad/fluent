@@ -612,6 +612,61 @@ WHEN Fluent reports completed cycle-cost metrics, THE SYSTEM SHALL report active
 Task duration as total Task duration minus known provider wait.
 Test: src/work_status.rs (metrics_are_derived_from_local_work_evidence)
 
+## Carried finding host-evidence handoff
+
+A carried finding is an unresolved Tests finding retained in the current
+Writer's immutable corrective assignment. An eligible handoff has a completed
+latest Writer, a clean managed candidate, a `needs-user/writer-completion`
+pause, settled owners, and no other pending Writer obligation. The assigned
+source Review requests one exact command and candidate-relative working directory.
+
+### B1
+
+WHEN an operator explicitly selects a carried finding in an eligible handoff
+and attaches matching proof, THE SYSTEM SHALL schedule one targeted Tests Review
+against the current candidate for that finding and proof.
+Test: tests/binary.rs (carried_finding_evidence_attachment_plans_current_tests_review)
+Test: tests/binary.rs (carried_finding_evidence_entrypoint_guidance_and_queue)
+Test: tests/binary.rs (carried_finding_evidence_entrypoint_review_inputs)
+
+The original Review continues to name its original candidate. Attachment retains
+its bytes, the assignment, historical matrices and Writer output, and starts no
+host command, Writer, or Tester. Exact retries retain recovery, evidence, Review
+Task, and active dispatch identities, including after interrupted publication.
+A later cancellation requires fresh explicit resume after ownership settles.
+Test: tests/binary.rs (carried_finding_evidence_retry_preserves_identity_and_stop)
+Test: tests/binary.rs (carried_finding_evidence_retry_recovers_interrupted_publication)
+
+### B2
+
+WHEN the targeted Tests Review accepts passing matching proof, THE SYSTEM SHALL
+satisfy only the selected carried finding for the bound current candidate.
+Failed proof or an unsuccessful Review SHALL leave that finding unsatisfied.
+Historical Writer claims, ordinary review domains, canonical Tester commands,
+and Learning SHALL retain their existing meaning and gates.
+Test: tests/binary.rs (carried_finding_evidence_acceptance_satisfies_only_selected_finding)
+Test: tests/binary.rs (carried_finding_evidence_entrypoint_revalidates_accepted_review)
+Test: tests/binary.rs (carried_finding_evidence_entrypoint_preserves_later_required_check)
+Test: tests/binary.rs (carried_finding_evidence_retry_replaces_failed_or_expired_proof)
+Test: tests/binary.rs (carried_finding_evidence_retry_code_change_keeps_source_authority)
+
+### B3
+
+IF the selected finding, assignment, proof, candidate, or execution ownership
+fails eligible-handoff validation, THEN THE SYSTEM SHALL reject the handoff
+without changing Work or candidate state. Foreground resume, queue admission
+and claim, direct Review launch, status, and completion SHALL revalidate the
+same source and acceptance bindings.
+Test: tests/binary.rs (carried_finding_evidence_attachment_rejects_invalid_bindings)
+Test: tests/binary.rs (carried_finding_evidence_entrypoint_rejects_stale_inputs)
+
+Older executables SHALL refuse mutation of finding-bound records and pending
+transactions; current readers SHALL preserve supported legacy meaning without
+inventing finding acceptance from an absent binding.
+Test: tests/binary.rs (carried_finding_evidence_compatibility_refuses_published_records)
+Test: tests/binary.rs (carried_finding_evidence_compatibility_refuses_public_transaction)
+Test: tests/binary.rs (carried_finding_evidence_compatibility_preserves_legacy_meaning)
+
 ## Host evidence recovery
 
 ### B1
@@ -635,6 +690,11 @@ Test: tests/binary.rs (legacy_evidence_requires_historical_comparison_proof)
 WHEN an operator attaches valid host evidence to an eligible Attempt, THE SYSTEM
 SHALL plan the explicitly named failed reviewer roles and no other reviewer roles.
 Test: tests/binary.rs (attempt_evidence_attach_plans_targeted_reviews_without_writer)
+
+For an explicitly selected eligible carried Tests finding, THE SYSTEM SHALL
+plan one targeted Tests Review against the current candidate while retaining
+the source Review at its original candidate.
+Test: tests/binary.rs (carried_finding_evidence_attachment_plans_current_tests_review)
 
 For a bound canonical Tester failure, THE SYSTEM SHALL instead plan one
 targeted Tests Review without a failed ordinary Review artifact.
@@ -693,6 +753,10 @@ Test: tests/binary.rs (expired_pending_evidence_accepts_fresh_proof)
 Test: tests/binary.rs (expired_pending_plan_evidence_accepts_fresh_proof)
 Test: tests/binary.rs (expired_pending_requested_evidence_accepts_fresh_proof)
 Test: tests/binary.rs (canonical_evidence_rejects_changed_comparison_ref)
+
+For a carried finding, THE SYSTEM SHALL validate the assigned source Review
+against its original candidate and matching proof against the current candidate.
+Test: tests/binary.rs (carried_finding_evidence_attachment_rejects_invalid_bindings)
 
 ### B9
 
@@ -826,8 +890,11 @@ Test: src/work_attempt_loop.rs (evidence_targeted_review_pass_preserves_writer_a
 ### B13
 
 WHEN an evidence-targeted reviewer passes, THE SYSTEM SHALL complete that
-recovery frontier.
+recovery frontier. A carried-finding recovery additionally requires passing
+proof and satisfies only its selected finding in current completion assessment.
+It SHALL preserve the historical Writer's claims.
 Test: src/work_attempt_loop.rs (evidence_targeted_review_pass_preserves_writer_and_tester)
+Test: tests/binary.rs (carried_finding_evidence_acceptance_satisfies_only_selected_finding)
 
 ### B14
 
@@ -847,8 +914,9 @@ Test: tests/binary.rs (attempt_evidence_attach_supersedes_interrupted_output_fre
 ### B15
 
 IF a failed Attempt does not end in a no-output Writer whose exact inputs are the
-failed review artifacts named by the attachment, THEN THE SYSTEM SHALL reject
-the attachment without mutation.
+failed review artifacts named by the attachment and does not meet the explicit
+carried-finding handoff requirements, THEN THE SYSTEM SHALL reject the attachment
+without mutation.
 Test: tests/binary.rs (attempt_evidence_attach_rejects_ineligible_failed_attempt)
 
 ### B16
@@ -970,9 +1038,10 @@ Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and
 
 WHEN the authorized-host Plan-row evidence and targeted Tests Review pass, THE
 SYSTEM SHALL credit the host-owned row without rewriting the Writer matrix or
-creating a source commit, and SHALL continue through the ordinary Tester and
-Learner gates. A failing result SHALL remain uncredited for a corrective
-review. Repeating the exact attachment SHALL return the existing recovery;
+creating a source commit, and SHALL require complete ordinary review coverage
+before continuing through the final Tester and Learner gates. Targeted evidence
+review SHALL NOT supply ordinary coverage. A failing result SHALL remain uncredited
+for a corrective review. Repeating the exact attachment SHALL return the existing recovery;
 stale candidates, commands, or rows SHALL be rejected without mutation.
 Test: src/host_evidence.rs (plan_row_host_evidence_binds_unchanged_candidate_and_is_idempotent)
 Test: src/host_evidence.rs (plan_row_host_evidence_rejects_wrong_command_without_mutation)
@@ -1044,11 +1113,25 @@ Test: src/work_model.rs (host_sandbox_pause_round_trips_through_storage)
 Test: src/work_model.rs (tester_harness_pause_round_trips_through_storage)
 Test: src/work_model.rs (unknown_pause_is_readable_but_mutation_fails_closed)
 
-Required-check sources, applicability, reconstruction audit references and
-accepted Review digests SHALL survive current split-record writes and journal
-recovery. The pinned pre-change executable SHALL refuse public mutation of the
-new record or pending journal before changing any model or artifact bytes.
+WHEN current Fluent writes or recovers a split Work Item or pending journal,
+THE SYSTEM SHALL preserve required-check sources, applicability, reconstruction
+audit references, and accepted Review digests.
 Test: tests/behaviors/operations/test-evidence-recovery-old-reader.sh
+
+WHEN current Fluent writes or recovers an assignment-bearing split Work Item or
+pending journal, THE SYSTEM SHALL preserve the host-owned corrective Writer
+assignment.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+Test: tests/binary.rs (work_attempt_run_plans_followup_for_failed_reviews)
+Test: src/work_model.rs (writer_assignment_safety_retries_interrupted_publication)
+
+IF a pinned pre-change executable reads a Work Item record or pending journal
+whose recognized outer or inner schema is newer than it supports, THEN THE
+SYSTEM SHALL refuse public mutation before changing any model or artifact
+bytes.
+Test: tests/binary.rs (writer_assignment_old_reader_refuses_published_records)
+Test: tests/binary.rs (writer_assignment_old_reader_refuses_pending_transactions)
+Test: tests/binary.rs (writer_assignment_old_reader_reaches_inner_fences)
 
 ### B2
 
@@ -4771,10 +4854,32 @@ Test: src/claude_auth.rs (auth_handoff_names_attempt_run_recovery)
 
 WHEN `fluent attempt run` is invoked on an Attempt suspended with a
 pause kind whose resume is not implemented (for example, a `round-cap`
-Attempt without an approved extension or legacy provider migration),
+Attempt without an approved extension, legacy provider migration, or validated
+usage-limit Writer recovery approval),
 THE SYSTEM SHALL report that the pause needs its specific input and
 leave the Attempt suspended.
 Test: src/work_attempt_loop.rs (resume_unimplemented_kind_reports_clearly_and_leaves_suspended)
+
+WHEN `fluent attempt run` or `fluent queue resume` revisits a verified
+assignment-mismatch pause, THE SYSTEM SHALL reevaluate the saved assignment in
+the same Attempt.
+Test: tests/binary.rs (saved_writer_assignment_recovers_through_public_resume)
+
+WHEN assignment-mismatch recovery is admitted, THE SYSTEM SHALL preserve the
+completed Writer, source evidence, corrected candidate, completion matrix, and
+Task history.
+Test: tests/binary.rs (saved_writer_assignment_recovery_preserves_history)
+
+WHEN the same eligible queue resume repeats, THE SYSTEM SHALL reuse the saved
+assignment, existing Tasks, and active dispatch without launching the completed
+Writer again.
+Test: tests/binary.rs (saved_writer_assignment_resume_is_idempotent)
+
+IF the saved assignment, corrected candidate, clean workspace, evidence, or
+execution ownership cannot be verified, THEN THE SYSTEM SHALL leave the pause
+unchanged and report the specific missing or conflicting binding.
+Test: tests/binary.rs (saved_writer_assignment_resume_rejects_unsafe_state)
+Test: tests/binary.rs (corrective_writer_assignment_rejects_invalid_authority)
 
 ### B6a
 
@@ -4810,6 +4915,212 @@ THE SYSTEM SHALL apply the same recovery checks before queueing a resume bound
 to that exact Attempt.
 Test: src/queue.rs (resume_queues_a_valid_uncertain_review_recovery)
 Test: tests/binary.rs (queue_resume_accepts_verified_uncertain_review_pause)
+
+## Usage-limit Writer recovery approval
+
+### B1
+
+WHEN an operator requests recovery and Fluent verifies the usage-limit failure,
+assignment, unchanged partial work, and settled ownership,
+THE SYSTEM SHALL record approval bound to that Writer, evidence, candidate
+commit, and uncommitted changes.
+Test: tests/binary.rs (usage_limit_writer_recovery_records_exact_approval)
+Example: The saved failed Writer has both a committed review correction and an
+unfinished second correction. Neither form of progress makes it ineligible
+solely because model activity occurred before the usage-limit failure.
+
+### B2
+
+WHEN recovery approval is recorded,
+THE SYSTEM SHALL keep the Attempt paused without launching or queueing workers
+until a separate explicit resume.
+Test: tests/binary.rs (usage_limit_writer_recovery_does_not_launch_workers)
+Example: Recording approval does not start the Writer. Returning an existing
+approval later does not reapply this initial pause to a retry already running
+or finished.
+
+### B3
+
+IF required proof is missing or contradictory, partial work has changed, or
+ownership remains unsettled,
+THEN THE SYSTEM SHALL reject recovery without changing the Work records or
+candidate.
+Test: tests/binary.rs (usage_limit_writer_recovery_rejects_unproven_state)
+Example: A usage-limit phrase in model-authored text alone does not prove a
+provider interruption; an unrelated failure remains outside this recovery.
+
+## Usage-limit Writer resume
+
+### B1
+
+WHEN an operator explicitly resumes a still-valid approved recovery,
+THE SYSTEM SHALL retry the same Writer Task in the same Attempt from its
+preserved partial work, using its saved coder settings without consuming another
+Writer round.
+Test: tests/binary.rs (usage_limit_writer_resume_retries_same_task)
+Example: Saved coder settings include the provider, model, and effort. Recovery
+does not reset, stash away, commit, or rewrite the partial work to make it
+eligible; the resumed Writer can continue its authorized implementation work.
+A validated usage-limit recovery approval supplies the specific input required
+by Resumable needs-user attempts:B6. Without that approval, the refusal remains
+applicable.
+
+### B2
+
+WHEN the retry begins,
+THE SYSTEM SHALL retain the original correction assignment and prior failure
+and review artifacts unchanged.
+Test: tests/binary.rs (usage_limit_writer_resume_preserves_assignment_and_history)
+Example: The new execution can produce new evidence, but it cannot overwrite
+the preserved failed execution or replace its assigned review findings.
+
+### B3
+
+IF the approved evidence, assignment, candidate, or uncommitted changes no longer
+match, or execution ownership is live or unverifiable,
+THEN THE SYSTEM SHALL reject resume before launching a worker, without changing
+Work records or the candidate.
+Test: tests/binary.rs (usage_limit_writer_resume_rejects_stale_or_live_state)
+
+## Usage-limit Writer preflight
+
+A prepared retry is the same approved Writer after preparation and before its
+first launch. A preflight-only pause is a host readiness failure before
+reservation, with native evidence that distinguishes it from a later stop or
+Worker failure.
+
+### B1
+
+WHEN an approved Writer retry checks Codex readiness with its private home in
+the host temporary tree and its workspace outside that tree,
+THE SYSTEM SHALL permit the production readiness check inside its restricted
+Worker sandbox.
+Test: tests/binary.rs (usage_limit_writer_recovery_real_confinement)
+Derived: Usage-limit Writer resume:B1 requires this first-launch boundary to work.
+Example: Successful shell launch alone does not prove that Codex can resolve its
+private home and report authentication status from the selected working directory.
+
+### B2
+
+WHILE the readiness check accesses its private home,
+THE SYSTEM SHALL deny access to unrelated temporary and operator-home content
+outside the explicitly admitted roots.
+Test: tests/binary.rs (usage_limit_writer_recovery_real_confinement)
+Derived: Preserve Usage-limit Writer tool access:B2 and the existing restricted
+retry's read boundaries; ancestor metadata does not authorize sibling contents.
+
+### B3
+
+WHEN an operator explicitly resumes a still-valid prepared retry after a
+provable preflight-only host-sandbox pause,
+THE SYSTEM SHALL retry the same Writer Task under its existing approval without
+consuming another Writer round.
+Test: tests/binary.rs (usage_limit_writer_preflight_pause_resumes_same_task)
+Modifies: Usage-limit Writer resume:B1 — explicitly include the native
+pre-reservation host-sandbox pause before the first approved launch.
+
+### B4
+
+IF the preflight-only pause cannot be proved, a later stop or terminal failure
+occurs, the approved inputs change, or ownership is live or unverifiable,
+THEN THE SYSTEM SHALL reject the earlier approval as restart authority before
+launch or Work mutation.
+Test: tests/binary.rs (usage_limit_writer_preflight_pause_rejects_unproven_state)
+Derived: Preserve Usage-limit Writer resume:B3 and Usage-limit recovery repeats
+and later interruptions:B3 across the newly admitted state.
+
+### B5
+
+WHEN public foreground or queued recovery resumes a valid preflight-only pause,
+THE SYSTEM SHALL preserve the original assignment and historical evidence
+through the single approved launch.
+Test: tests/binary.rs (usage_limit_writer_preflight_pause_queue_preserves_history)
+Derived: Usage-limit Writer resume:B2 and Usage-limit recovery repeats and later
+interruptions:B2 apply to this recovery state too.
+
+### B6
+
+WHEN status or Work show observes a prepared retry paused before launch,
+THE SYSTEM SHALL report a current eligible public resume command only while
+the same recovery checks pass.
+Test: tests/binary.rs (usage_limit_writer_preflight_pause_guidance_revalidates)
+Derived: Existing candidate-bound pause guidance must cover this admitted state
+without changing Work during observation.
+
+## Usage-limit Writer tool access
+
+### B1
+
+WHEN an approved usage-limit Writer retry performs focused Rust verification,
+THE SYSTEM SHALL permit the installed toolchain to build and execute the
+verification from the Writer's workspace using its private dependency cache.
+Test: tests/binary.rs (usage_limit_writer_recovery_real_confinement)
+Derived: Usage-limit Writer resume:B1 requires the same Writer to continue its
+authorized implementation work; Writer dependency-cache confinement:B6 already
+permits offline focused verification with admitted dependencies.
+Example: An offline minimal Rust test must compile and run through the actual
+retry profile. Starting a shell or printing a tool version is insufficient proof.
+
+### B2
+
+WHILE an approved usage-limit Writer retry uses installed tools,
+THE SYSTEM SHALL deny writes to the installed toolchain, operator dependency
+cache, retained failure and review artifacts, and host-owned recovery audit.
+Test: tests/binary.rs (usage_limit_writer_recovery_real_confinement)
+Derived: Tool access must preserve the existing recovery confinement and
+historical-evidence boundaries; it grants no new write authority outside the
+Writer's existing workspace and private mutable roots.
+
+## Usage-limit recovery repeats and later interruptions
+
+### B1
+
+WHEN a recovery request repeats, including after interrupted recording, and its
+validated inputs still match,
+THE SYSTEM SHALL complete or reuse the same approval without duplication.
+Test: tests/binary.rs (usage_limit_writer_recovery_replay_is_idempotent)
+Derived: Approval is bound to one specific interruption; retrying the operation
+that records it does not authorize another interruption or duplicate its record.
+Example: An interrupted approval can finish recording after revalidation. An
+already recorded approval is returned unchanged rather than recorded again.
+
+### B2
+
+IF the approved Writer retry is already running or finished,
+THEN THE SYSTEM SHALL NOT launch a second Writer retry under that approval.
+Test: tests/binary.rs (usage_limit_writer_recovery_does_not_duplicate_retry)
+Derived: The approval authorizes one recovery retry, not repeated executions.
+Example: Ordinary continuation to outstanding downstream stages after Writer
+completion does not count as launching a second Writer retry.
+
+### B3
+
+IF a later cancellation or new terminal failure occurs,
+THEN THE SYSTEM SHALL reject the earlier approval as authority for another
+restart.
+Test: tests/binary.rs (usage_limit_writer_recovery_rejects_approval_after_new_stop_or_failure)
+Derived: Authorization for the earlier interruption cannot override a later stop
+or authorize recovery from a different failure.
+Example: A new usage-limit interruption needs its own validated approval;
+cancellation and other pause kinds retain their applicable explicit recovery.
+
+### Retained gates
+
+This recovery requires a dedicated approval. It does not broaden the transcript
+grammar or eligibility of Legacy provider-pause recovery:B1-B3, and it does not
+make unrelated failed Writers automatically retryable.
+
+The existing Pre-review completion gate, Host-action ownership, Complete ordinary
+review coverage, Correction-aware review invalidation, canonical final Tester,
+and Learner readiness requirements remain applicable. Recovery approval supplies
+no completion or verification
+credit. Historical passing checks cannot substitute for checks required against
+the resumed Writer's resulting candidate. The retained unexplained process-leak
+report is not waived.
+
+Worker confinement and the Attempt's approved round budget remain unchanged.
+The existing refusal of implicit failed-Writer retries still applies outside
+this explicitly approved exception.
 
 ## Legacy provider-pause recovery
 
@@ -6822,6 +7133,16 @@ Test: src/work_task_executor.rs (continuation_prompt_contains_only_current_execu
 Test: src/work_task_executor.rs (reviewed_correction_prompt_is_bounded_and_references_full_artifacts_by_path)
 Test: src/work_model.rs (writer_completion_matrix_refuses_unbounded_context)
 
+WHEN Fluent assigns a corrective Writer finding, THE SYSTEM SHALL bind its
+finding identity, requirement text, source candidate, and source evidence to
+the host-owned Writer Task before launch.
+Test: tests/binary.rs (work_attempt_run_plans_followup_for_failed_reviews)
+
+WHEN a corrective Writer produces a later candidate, THE SYSTEM SHALL keep its
+host-owned assignment unchanged while evaluating the later candidate's current
+verification state.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+
 ### B18
 
 WHEN a completed Writer leaves a Writer-owned obligation pending or without
@@ -6836,6 +7157,11 @@ Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix bl
 Test: src/work_attempt_loop.rs (writer_completion_excludes_host_and_later_stage_work)
 Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
 
+WHEN a corrective Writer produces a new candidate, THE SYSTEM SHALL validate
+its completion matrix against the same assigned finding identities and source
+bindings while keeping the new candidate's verification requirements separate.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+
 ### B19
 
 IF a Writer completion matrix is missing, malformed, contradictory, or changes
@@ -6844,6 +7170,11 @@ before any reviewer or final Tester.
 Test: src/work_attempt_loop.rs (missing_writer_completion_matrix_pauses_before_review)
 Test: src/work_attempt_loop.rs (rewritten_writer_completion_matrix_pauses_before_review)
 Test: src/work_model.rs (writer_completion_matrix_reconciles_claims_and_corrective_findings)
+
+IF a corrective Writer assignment cannot be established from trusted host
+records, or its binding evidence is changed or contradictory, THEN THE SYSTEM
+SHALL pause at `needs-user` with a specific diagnosis before downstream work.
+Test: tests/binary.rs (corrective_writer_assignment_rejects_invalid_authority)
 
 ### B20
 
@@ -6857,6 +7188,15 @@ Test: src/work_task_executor.rs (work_review_prompt_renders_role_conditional_blo
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (completion matrix admits review and final Tester)
 Test: src/work_attempt_loop.rs (pending_host_action_pauses_before_another_writer)
 Test: src/host_evidence.rs (pending_host_verification_blocks_readiness)
+
+WHEN Fluent evaluates a corrective Writer's completion, THE SYSTEM SHALL keep
+its assigned findings as part of that completion check.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+
+WHEN a corrective Writer's assigned findings and the other pre-review gates
+pass, THE SYSTEM SHALL admit the corrected candidate to ordinary reviews while
+its complete final Tester remains pending.
+Test: tests/binary.rs (corrected_candidate_reaches_reviews_before_final_tester)
 
 ### B21
 
@@ -7260,6 +7600,12 @@ a passing `my-crate works` alongside a skipped `my-crate::bin/tool works`.
 Evidence from another candidate cannot satisfy the current candidate's requirement.
 Test: src/candidate_gate.rs (rejects_invalid_or_ambiguous_test_evidence)
 
+WHEN a corrective Writer produces a new candidate, THE SYSTEM SHALL require
+fresh verification for that candidate; the source candidate's Tester results
+and the Writer's completed correction rows SHALL NOT satisfy its full declared
+Tester requirements.
+Test: tests/binary.rs (corrected_candidate_requires_fresh_verification)
+
 ### B27a
 
 WHEN the final Tester has completed and ordinary baseline comparison would
@@ -7395,6 +7741,31 @@ THE SYSTEM SHALL retain the gate evidence, roll back to the reviewed Writer
 commit, and keep the Merge Candidate non-ready.
 Test: src/work_attempt_loop.rs (learner_candidate_gate_rejects_and_rolls_back_bad_expertise_commit)
 
+## Complete ordinary review coverage
+
+### B1
+
+WHEN an Attempt is ready to advance from review to final Tester or Learning,
+THE SYSTEM SHALL require each built-in reviewer role to have a passing ordinary
+review for the current candidate or a valid carried-forward ordinary review.
+Test: tests/binary.rs (review_coverage_requires_all_roles_after_host_correction)
+Test: tests/binary.rs (review_coverage_preserves_valid_ordinary_carry_forward)
+Derived: Correction-aware review invalidation:B5 requires fresh affected-role
+reviews; it does not establish missing ordinary coverage for other roles.
+Example: Behaviors and Skills cannot be omitted just because the last host-only
+correction changed no files in their domains.
+
+### B2
+
+WHEN a targeted review passes,
+THE SYSTEM SHALL count its verdict only toward its declared evidence scope,
+without supplying or replacing ordinary review coverage for that role.
+Test: tests/binary.rs (review_coverage_resume_keeps_targeted_and_ordinary_scope_separate)
+Derived: Targeted host acceptance and ordinary domain review are distinct
+requirements in the existing pre-review and host-evidence contracts.
+Example: A passing Plan-step host check does not constitute the ordinary Tests
+Review of the implementation. Resuming a saved Attempt must retain that distinction.
+
 ## Correction-aware review invalidation
 
 ### B1
@@ -7417,10 +7788,12 @@ Test: src/review_invalidation.rs (rename_paths_are_classified_together)
 ### B3
 
 WHEN Fluent plans review after a corrective Writer, THE SYSTEM SHALL schedule the
-ordered union of reviewers that failed the preceding round and reviewers whose
-domains the correction changed.
+ordered union of reviewers that failed the preceding round, reviewers whose
+domains the correction changed, and roles missing ordinary coverage. A pass
+SHALL survive only when every intervening Writer delta leaves its domain
+unchanged.
 Test: src/work_attempt_loop.rs (corrective_review_roles_include_changed_domains_in_default_order)
-Test: src/work_attempt_loop.rs (corrective_writer_invalidates_domains_changed_since_the_reviewed_commit)
+Test: tests/binary.rs (review_coverage_preserves_valid_ordinary_carry_forward)
 Test: tests/behaviors/operations/test-work-attempt-loop.sh (attempt loop plans follow-up with mixed missing review)
 
 ### B4
@@ -7430,19 +7803,23 @@ mismatched, or Git cannot establish the correction delta, THEN THE SYSTEM SHALL
 invalidate every built-in reviewer.
 Test: src/review_invalidation.rs (unknown_or_unsafe_paths_invalidate_every_reviewer)
 Test: src/review_invalidation.rs (changed_paths_fail_closed_when_git_cannot_compare_commits)
-Test: src/work_attempt_loop.rs (corrective_writer_invalidates_domains_changed_since_the_reviewed_commit)
+Test: src/work_attempt_loop.rs (ordinary_review_coverage_rejects_ambiguous_prior_context)
 
 ### B5
 
 BEFORE Fluent interprets the current review round or advances to final Tester or
-Learner, THE SYSTEM SHALL require every affected reviewer to have a completed
-Review Task whose context names the exact latest Writer commit and SHALL reopen
-only missing roles or roles whose latest completed review is mismatched, except
-that an unknown role invalidates all built-in reviewers.
+Learner, THE SYSTEM SHALL require each built-in role to have a completed passing
+ordinary Review Task with the exact current Writer context or valid carry-forward
+from its original candidate. It SHALL reopen missing ordinary roles and roles
+whose latest ordinary review is mismatched; an unknown role SHALL invalidate all
+built-in reviewers. A matching replacement SHALL supersede that role's stale
+review without rewriting completed Tasks.
 Test: src/work_attempt_loop.rs (exact_candidate_review_check_reopens_only_missing_invalidated_roles)
 Test: src/work_attempt_loop.rs (exact_candidate_review_check_reopens_a_mismatched_current_role)
 Test: src/work_attempt_loop.rs (exact_candidate_review_check_accepts_the_latest_replacement_for_a_role)
 Test: src/work_attempt_loop.rs (pre_land_no_expertise_rejects_mismatched_final_review_context)
+Test: src/work_attempt_loop.rs (ordinary_review_coverage_reopens_unknown_review_roles)
+Test: tests/binary.rs (review_coverage_resume_keeps_targeted_and_ordinary_scope_separate)
 
 ### B6
 
@@ -7451,6 +7828,7 @@ pre-Learner review passes valid while enforcing the Learner mutation boundary an
 running the deterministic candidate gate against the canonicalized candidate
 before Learning succeeds.
 Test: src/review_invalidation.rs (learner_owned_expertise_does_not_stale_pre_learner_reviews)
+Test: tests/binary.rs (review_coverage_preserves_completed_learner_expertise)
 Test: src/work_attempt_loop.rs (learner_path_expertise_subtree_is_in_bounds)
 Test: src/work_attempt_loop.rs (learner_path_outside_expertise_is_out_of_bounds)
 Test: src/work_attempt_loop.rs (learner_candidate_gate_rejects_and_rolls_back_bad_expertise_commit)
@@ -7474,6 +7852,17 @@ current finding, unresolved progress entry, and correction-input artifact path
 within the bounded authoritative core.
 Test: src/work_task_executor.rs (execution_context_never_silently_omits_current_findings)
 Test: src/work_task_executor.rs (execution_context_is_bounded_and_preserves_authoritative_core)
+
+WHEN Fluent generates corrective context for a corrective Writer, THE SYSTEM
+SHALL present the assigned findings from the host-owned Task assignment as
+distinct from the current candidate's verification assessment.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+
+WHEN Fluent assesses the current candidate for corrective context, THE SYSTEM
+SHALL use that assessment for fresh verification meaning without erasing or
+replacing the Writer's assigned source obligations.
+Test: tests/binary.rs (corrective_writer_assignment_survives_candidate_change)
+Test: tests/binary.rs (corrected_candidate_requires_fresh_verification)
 
 WHEN the candidate gate, Writer context and requirements, or status report
 verification, THE SYSTEM SHALL use the same current satisfaction, cause, owner,
@@ -10093,6 +10482,68 @@ host-evidence, candidate, Review, final-Tester, and Learning gates. The Writer
 owns only its Writer obligations; those host and later Attempt gates remain
 separate.
 
+## Writer recovery instructions
+
+### B1
+
+WHEN a Writer starts or resumes under a valid recorded completion recovery,
+THE SYSTEM SHALL deliver the complete authorized instructions and exact readable
+evidence references through the selected Writer prompt path, including the
+applicable no-change declaration path and completion contract.
+Test: tests/binary.rs (writer_recovery_context_delivers_recorded_resolution)
+Test: tests/binary.rs (declared_sandbox_input_reads_exact_writer_recovery)
+
+### B2
+
+WHEN Fluent prepares a Writer with pending obligations, THE SYSTEM SHALL expose
+their original identities and assigned findings in current context independently
+of stale progress checkboxes and current-candidate verification, leaving external
+responsibilities pending and uncredited.
+Test: tests/binary.rs (writer_recovery_context_preserves_pending_obligations)
+
+### B3
+
+IF required recovery instructions or evidence are invalid, unreadable, or exceed
+the existing delivery bounds, THEN THE SYSTEM SHALL reject launch with the
+specific missing condition. Historical metadata text alone SHALL NOT authorize
+rewriting the recorded candidate's ancestry.
+Test: tests/binary.rs (writer_recovery_context_rejects_invalid_delivery)
+
+## Interrupted candidate restoration
+
+### B1
+
+WHEN the operator authorizes restoration of an eligible settled interrupted
+Writer, THE SYSTEM SHALL restore the latest completed Writer's exact candidate
+while retaining the rejected history and a candidate-bound recovery audit.
+It SHALL preserve completed Tasks and evidence, pending obligations, the
+unfinished Writer, and active cancellation.
+Test: tests/binary.rs (interrupted_writer_candidate_restore_preserves_history)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_preserves_inherited_assignment)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_preserves_frozen_legacy_context)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_preserves_recovered_context)
+
+### B2
+
+IF the candidate, workspace, source, evidence, authorization, or settled ownership
+does not match the restoration preconditions, THEN THE SYSTEM SHALL reject
+restoration without changing history or Work state.
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_drift)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_aliased_owner)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_broken_assignment_lineage)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_frozen_context_drift)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_context_audit_drift)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_rejects_symbolic_branch_substitution)
+
+### B3
+
+WHEN the identical restoration is retried after interruption or completion,
+THE SYSTEM SHALL reconcile or return the same operation without discarding
+intervening state or duplicating recovery effects. A later explicit resume SHALL
+retry the original unfinished Writer with its valid recorded instructions.
+Test: tests/binary.rs (interrupted_writer_candidate_restore_replays_exactly)
+Test: tests/binary.rs (interrupted_writer_candidate_restore_replays_legacy_intent)
+
 ## Writer continuation recovery
 
 ### B1
@@ -10182,3 +10633,169 @@ failure beyond the applicable accepted baseline,
 THE SYSTEM SHALL continue through the remaining deterministic landing checks and
 fast-forward boundary.
 Test: tests/binary.rs (work_merge_candidate_rebased_tester_pass_continues_to_land)
+
+## Corrective assignment context
+
+### B1
+
+WHEN Fluent captures a corrective Writer assignment that includes mutable
+context, THE SYSTEM SHALL retain the assigned input independently of later
+permitted updates to that context.
+Test: tests/binary.rs (assignment_context_snapshot_survives_progress_updates)
+Derived: Existing corrective assignments must survive ordinary Writer progress
+updates without losing their original source obligations.
+
+### B2
+
+IF an assignment's immutable input or finding evidence changes, THEN THE SYSTEM
+SHALL reject its use before advancement without accepting replacement bytes.
+Test: tests/binary.rs (assignment_context_snapshot_rejects_changed_evidence)
+
+### B3
+
+WHEN an operator explicitly requests recovery of a settled candidate's saved
+assignment that binds a recognized mutable-context path and supplies original
+bytes matching that binding's recorded digest, THE SYSTEM SHALL retain an
+audited immutable binding to those same bytes without changing current context
+or launching work.
+Test: tests/binary.rs (assignment_context_recovery_preserves_original_bytes)
+
+### B4
+
+IF that recovery lacks matching original bytes or has stale candidate or
+assignment identity, active ownership, an unrelated input, or unsafe paths,
+THEN THE SYSTEM SHALL reject it without changing the saved Work or protected
+artifacts.
+Test: tests/binary.rs (assignment_context_recovery_rejects_unsafe_inputs)
+
+### B5
+
+WHEN the same eligible recovery is repeated or resumed after interrupted
+publication, THE SYSTEM SHALL reuse its recorded snapshot and operation
+identity without duplicating work or clearing a later stop.
+Test: tests/binary.rs (assignment_context_recovery_is_idempotent)
+
+### B6
+
+WHEN the operator separately resumes a successfully recovered Attempt, THE
+SYSTEM SHALL continue only its outstanding native requirements while retaining
+its completed Writer, source candidate, assignment findings, and prior evidence.
+Test: tests/binary.rs (assignment_context_recovery_resumes_same_attempt)
+
+### B7
+
+WHEN status or show inspects a saved mutable-context binding, THE SYSTEM SHALL
+report its state without publishing a snapshot, changing a binding, or granting
+recovery authority.
+Test: tests/binary.rs (assignment_context_recovery_inspection_is_read_only)
+
+## Combined recovery state
+
+### B1
+
+WHEN a supported public mutation saves frozen assignment context and
+carried-finding evidence together, THE SYSTEM SHALL preserve both authorities
+and their original identities.
+Test: tests/binary.rs (combined_recovery_preserves_context_and_carried_evidence)
+
+### B2
+
+WHEN an eligible settled Writer has accepted carried evidence and the operator
+proves the exact original bytes of its changed legacy context, THE SYSTEM SHALL
+recover that context without rewriting the carried binding or granting new
+completion credit. Exact retries SHALL preserve the operation and later stops.
+Test: tests/binary.rs (combined_recovery_repairs_context_with_carried_evidence)
+Test: tests/binary.rs (combined_recovery_repairs_interrupted_context_with_carried_evidence)
+
+### B3
+
+IF context recovery receives changed proof or stale authority in combined state,
+THEN THE SYSTEM SHALL reject it without changing protected history.
+Test: tests/binary.rs (combined_recovery_rejects_changed_context_authority)
+
+### B4
+
+WHEN the combined coordinator mutates supported records or recovers pending
+transactions from the preflight, assignment-context, or carried-evidence
+predecessor, THE SYSTEM SHALL preserve the predecessor's recovery authority.
+Test: tests/binary.rs (combined_recovery_preserves_source_version_records)
+
+### B5
+
+IF a predecessor cannot preserve combined recovery authority, THEN THE SYSTEM
+SHALL fence its mutations of published records and pending transactions.
+Test: tests/binary.rs (combined_recovery_older_readers_refuse_mutation)
+
+
+## Output-free assignment context recovery
+
+### B1
+
+WHEN an operator supplies exact original-byte proof for a recognized mutable
+context input assigned to a settled output-free Writer on the unchanged clean
+candidate of its paused Attempt, THE SYSTEM SHALL publish the audited immutable
+substitution without changing Task statuses, current context, or verification
+credit.
+Test: tests/binary.rs (assignment_context_recovery_output_free_preserves_state)
+Modifies: Corrective assignment context:B3 — admits the bounded output-free
+case as well as the existing completed-Writer case.
+
+### B2
+
+IF that request has changed proof, assignment, immutable evidence, candidate,
+ownership, or unsupported later work, THEN THE SYSTEM SHALL reject it without
+changing protected Work or artifacts.
+Test: tests/binary.rs (assignment_context_recovery_output_free_rejects_drift)
+Modifies: Corrective assignment context:B4 — preserves its checks for the
+additional supported Task state.
+
+### B3
+
+WHEN the same eligible output-free context recovery is replayed, including
+after partial publication, THE SYSTEM SHALL reuse its audit and snapshot while
+preserving later stops.
+Test: tests/binary.rs (assignment_context_recovery_output_free_replays_safely)
+Modifies: Corrective assignment context:B5 — applies the same publication
+guarantees to the additional supported Task state.
+
+## Explicit retry after context repair
+
+### B1
+
+WHEN the operator separately authorizes completion recovery for the same
+unchanged output-free Writer after its bound stale-context setup failure has
+been repaired, THE SYSTEM SHALL make that Writer retryable with its original
+obligations and retained failure history.
+Test: tests/binary.rs (writer_completion_context_repaired_retry_keeps_assignment)
+Example: A later unstarted duplicate may be superseded through an audit; it
+cannot replace the failed Writer or consume another Writer round.
+Derived: The actual paused Attempt otherwise remains unusable after its input
+binding is repaired. This is not general permission to retry hard failures.
+
+### B2
+
+IF retry authorization is absent, stale, already consumed by a live or completed
+launch, or invalidated by a later stop or candidate change, THEN THE SYSTEM SHALL
+refuse another launch under that authorization.
+Test: tests/binary.rs (writer_completion_context_repaired_retry_rejects_stale_authority)
+Derived: Context substitution and retry remain separately authorized actions.
+
+### B3
+
+WHEN the authorized same-Task retry launches, THE SYSTEM SHALL retain the
+production confinement boundary for preserved failure evidence, original inputs,
+recovery audits, and unrelated operator state.
+Test: tests/binary.rs (assignment_context_recovery_output_free_retry_real_confinement)
+Derived: Retrying with retained failure history must not make that history
+writable by the new worker.
+
+## Output-free recovery guidance
+
+### B1
+
+WHEN status or show observes this paused shape, THE SYSTEM SHALL report the
+current blocker and exactly eligible public recovery action without changing
+saved authority.
+Test: tests/binary.rs (assignment_context_recovery_output_free_reports_next_action)
+Modifies: Corrective assignment context:B7 — identifies the new eligible
+output-free case and its separate retry boundary.

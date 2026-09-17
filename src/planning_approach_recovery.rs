@@ -1629,7 +1629,17 @@ mod tests {
             })
             .collect::<Vec<_>>();
         roles.sort_unstable();
-        assert_eq!(roles, vec!["architecture", "documentation"]);
+        assert_eq!(
+            roles,
+            vec![
+                "architecture",
+                "behaviors",
+                "documentation",
+                "skills",
+                "tests"
+            ],
+            "recovery must also establish the missing ordinary domains"
+        );
     }
 
     #[test]

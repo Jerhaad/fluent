@@ -27,7 +27,19 @@ use crate::work_model::{
     self, ArtifactRef, AttemptReviewState, AttemptStatus, EvidenceAttachment, EvidenceRecovery,
     EvidenceRecoveryState, EvidenceReviewTarget, HostEvidenceClassification, PauseKind,
     RoundCapExtension, RoundCapReviewArtifact, Task, TaskKind, TaskStatus, WorkModelError,
-    WriterCompletionFinding,
+    WriterCompletionFinding, WriterCorrectionAssignment, WriterCorrectionAssignmentInput,
+    WriterCorrectionAssignmentOrigin,
+};
+
+mod carried_finding;
+mod plan_evidence;
+pub(crate) use plan_evidence::apply_completed_plan_host_evidence;
+pub(crate) mod context_retry;
+pub(crate) mod review_evidence;
+pub(crate) mod writer_completion;
+pub(crate) use carried_finding::{
+    apply_accepted_carried_findings, carried_finding_review_passes,
+    inspect_carried_finding_attachment,
 };
 
 pub(crate) const WRITER_COMPLETION_MATRIX_FILE: &str = "writer-completion.json";
@@ -128,12 +140,40 @@ fn validate_owned_plan_evidence_review_at(
     now: chrono::DateTime<chrono::Utc>,
     settle_history: bool,
 ) -> Result<bool> {
+    if let Some(writer) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|t| t.kind == TaskKind::Write)
+        && attempt.evidence_recoveries.iter().any(|r| {
+            r.carried_finding
+                .as_ref()
+                .is_some_and(|s| s.binding.writer_task_id == writer.id)
+                && r.state == EvidenceRecoveryState::Complete
+        })
+    {
+        let mut matrix = authoritative_writer_completion_matrix(project_root, attempt, writer)?
+            .context("accepted finding source completion matrix is missing")?;
+        apply_accepted_carried_findings(project_root, attempt, writer, &mut matrix)?;
+    }
     let Some(recovery) = attempt
         .active_evidence_recovery()
         .filter(|recovery| recovery.state == EvidenceRecoveryState::Reviewing)
     else {
         return Ok(false);
     };
+    if recovery.carried_finding.is_some() {
+        anyhow::ensure!(
+            !settle_history,
+            "finding evidence cannot settle against a later candidate"
+        );
+        return carried_finding::carried_finding_review_passes_at(
+            project_root,
+            attempt,
+            recovery,
+            now,
+        );
+    }
     if let Some(check) = &recovery.required_check {
         validate_required_check_binding(project_root, attempt, check)?;
         let output = attempt
@@ -203,6 +243,16 @@ fn validate_owned_plan_evidence_review_at(
             "required check reviewer binding changed"
         );
     }
+    validate_plan_evidence_recovery_at(project_root, attempt, recovery, now, settle_history)
+}
+
+fn validate_plan_evidence_recovery_at(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    recovery: &EvidenceRecovery,
+    now: chrono::DateTime<chrono::Utc>,
+    settle_history: bool,
+) -> Result<bool> {
     let mut completed = !recovery.targets.is_empty();
     for target in &recovery.targets {
         if !attempt.artifacts.iter().any(|artifact| {
@@ -427,6 +477,46 @@ pub(crate) fn complete_owned_plan_evidence_review(
     }
     recovery.state = EvidenceRecoveryState::Complete;
     Ok(true)
+}
+
+/// Select the newest admitted result for each Plan obligation, including
+/// unresolved failures. A malformed indexed binding cannot revive older proof.
+pub(crate) fn latest_plan_host_binding_paths(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    candidate: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let mut latest = std::collections::BTreeMap::new();
+    for recovery in &attempt.evidence_recoveries {
+        if recovery.candidate_commit != candidate {
+            continue;
+        }
+        for target in &recovery.targets {
+            if !attempt.artifacts.iter().any(|artifact| {
+                artifact.producer_id == "plan-host-evidence"
+                    && artifact.path == target.prior_review_artifact
+                    && artifact.path.ends_with("/binding.json")
+            }) {
+                continue;
+            }
+            let (_, bytes) = crate::recovery_contracts::bound_recovery_artifact(
+                project_root,
+                &target.prior_review_artifact,
+            )
+            .ok()?;
+            let binding: work_model::PlanHostEvidenceBinding =
+                serde_json::from_slice(&bytes).ok()?;
+            if binding.schema_version != 1
+                || binding.work_item_id != attempt.work_item_id
+                || binding.attempt_id != attempt.id
+                || binding.candidate_commit != candidate
+            {
+                return None;
+            }
+            latest.insert(binding.plan_row, target.prior_review_artifact.clone());
+        }
+    }
+    Some(latest)
 }
 
 /// Validate completed Plan review authority without changing its history.
@@ -1598,9 +1688,51 @@ pub(crate) fn writer_completion_findings(
     project_root: &Path,
     task: &Task,
 ) -> Result<Vec<WriterCompletionFinding>> {
-    let item = work_model::WorkModelStore::new(project_root)
-        .read_work_item_snapshot(&task.work_item_id)
-        .ok();
+    let snapshot = read_settled_work_item_snapshot(project_root, &task.work_item_id);
+    let item = if task.writer_correction_assignment.is_some() {
+        Some(snapshot.with_context(|| {
+            format!("read the host-owned assignment for Writer Task {}", task.id)
+        })?)
+    } else {
+        snapshot.ok()
+    };
+    writer_completion_findings_from_item(project_root, task, item.as_ref())
+}
+
+/// Let a peer's bounded publication settle without recovering its journal.
+pub(crate) fn read_settled_work_item_snapshot(
+    project_root: &Path,
+    work_item_id: &str,
+) -> Result<work_model::WorkItem, work_model::WorkModelStorageError> {
+    let store = work_model::WorkModelStore::new(project_root);
+    let mut snapshot = store.read_work_item_snapshot(work_item_id);
+    for _ in 0..20 {
+        if !matches!(
+            snapshot,
+            Err(work_model::WorkModelStorageError::SnapshotUnavailable { .. })
+        ) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        snapshot = store.read_work_item_snapshot(work_item_id);
+    }
+    snapshot
+}
+
+fn writer_completion_findings_from_item(
+    project_root: &Path,
+    task: &Task,
+    item: Option<&work_model::WorkItem>,
+) -> Result<Vec<WriterCompletionFinding>> {
+    if let Some(assignment) = task.writer_correction_assignment.as_ref() {
+        validate_writer_correction_assignment(
+            project_root,
+            item.context("host-owned Writer assignment has no Work Item")?,
+            task,
+            assignment,
+        )?;
+        return Ok(assignment.findings.clone());
+    }
     let assessment = item
         .as_ref()
         .and_then(|item| {
@@ -1628,6 +1760,1664 @@ pub(crate) fn writer_completion_findings(
         task.role != work_model::TESTER_HARNESS_REPAIR_ROLE,
         assessment.as_ref(),
     )
+}
+
+/// Classify a Writer Task using the same correction markers that select the
+/// reviewed-correction execution path. A continuation of one Writer session
+/// carries its assignment; a new corrective round captures a new one.
+pub(crate) fn is_corrective_writer_task(task: &Task) -> bool {
+    task.input_artifacts
+        .iter()
+        .any(|artifact| crate::writer_context::is_correction_artifact(Path::new(&artifact.path)))
+}
+
+/// Reconstruct one missing assignment only when a paused, changed candidate
+/// still exposes the complete original source chain. This inspector is read
+/// only; lifecycle callers publish the returned record during an explicit
+/// resume transaction.
+pub(crate) fn inspect_legacy_writer_correction_assignment(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    attempt_id: &str,
+) -> Result<Option<WriterCorrectionAssignment>> {
+    let Some(attempt) = item
+        .attempts
+        .iter()
+        .find(|attempt| attempt.id == attempt_id)
+    else {
+        bail!("Attempt {attempt_id:?} not found");
+    };
+    if item.attempts.last().map(|attempt| attempt.id.as_str()) != Some(attempt_id)
+        || attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::WriterCompletion)
+    {
+        return Ok(None);
+    }
+    attempt.ensure_resume_ready().map_err(anyhow::Error::msg)?;
+
+    let Some(correction_index) = attempt.tasks.len().checked_sub(1) else {
+        return Ok(None);
+    };
+    let correction = &attempt.tasks[correction_index];
+    if correction.kind != TaskKind::Write
+        || correction.status != TaskStatus::Complete
+        || correction.output.is_none()
+        || correction.writer_correction_assignment.is_some()
+    {
+        return Ok(None);
+    }
+    let output = correction
+        .output
+        .as_ref()
+        .expect("completed Writer output checked above");
+    let Some(base_commit) = output.base_commit.as_deref() else {
+        return Ok(None);
+    };
+    if base_commit == output.commit {
+        return Ok(None);
+    }
+
+    let Some((source_index, source)) = attempt.tasks[..correction_index]
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, task)| {
+            task.kind == TaskKind::Write
+                && task.status == TaskStatus::Complete
+                && task.output.is_some()
+        })
+    else {
+        // A first Writer can also stop at WriterCompletion, but it has no
+        // older assignment to reconstruct. Leave that ordinary path to the
+        // existing completion recovery logic.
+        return Ok(None);
+    };
+    let source_output = source
+        .output
+        .as_ref()
+        .expect("completed source Writer output checked above");
+    if source_output.commit != base_commit {
+        bail!(
+            "legacy Writer assignment source candidate {} does not match correction base {}",
+            source_output.commit,
+            base_commit
+        );
+    }
+    if attempt.tasks[..correction_index].iter().any(|task| {
+        matches!(
+            task.status,
+            TaskStatus::Planned | TaskStatus::Executing | TaskStatus::NeedsUser
+        ) || (task.status == TaskStatus::Failed && task.output.is_some())
+    }) {
+        bail!("legacy Writer assignment has an unresolved source Task");
+    }
+    if item
+        .merge_candidates
+        .iter()
+        .any(|candidate| candidate.attempt_id == attempt_id)
+    {
+        bail!("legacy Writer assignment cannot recover after Merge Candidate publication");
+    }
+    for task in &attempt.tasks {
+        anyhow::ensure!(
+            !crate::lease::is_leased(&crate::lease::task_lock_path(
+                project_root,
+                &item.id,
+                &task.id
+            )),
+            "Task {} still has a live owner",
+            task.id
+        );
+        anyhow::ensure!(
+            !legacy_task_execution_is_live(project_root, task)?,
+            "Task {} still owns a live execution",
+            task.id
+        );
+    }
+    anyhow::ensure!(
+        candidate_workspace_is_clean_at_managed(project_root, output, &output.commit),
+        "legacy Writer assignment requires the corrected managed candidate to remain clean and unchanged"
+    );
+
+    let matrix_ref = writer_completion_matrix_ref(project_root, attempt, correction)
+        .context("legacy Writer assignment has no completion matrix")?;
+    let matrix_path = resolve_input_artifact_path(project_root, &matrix_ref.path)?;
+    let matrix_metadata = fs::symlink_metadata(&matrix_path).with_context(|| {
+        format!(
+            "inspect legacy Writer completion matrix {}",
+            matrix_path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        matrix_metadata.is_file() && !matrix_metadata.file_type().is_symlink(),
+        "legacy Writer completion matrix is not a regular file"
+    );
+    anyhow::ensure!(
+        matrix_metadata.len() <= work_model::WRITER_COMPLETION_MATRIX_MAX_BYTES as u64,
+        "legacy Writer completion matrix exceeds its size bound"
+    );
+    let matrix: work_model::WriterCompletionMatrix =
+        serde_json::from_slice(&fs::read(&matrix_path).with_context(|| {
+            format!(
+                "read legacy Writer completion matrix {}",
+                matrix_path.display()
+            )
+        })?)
+        .context("parse legacy Writer completion matrix")?;
+    if !matrix
+        .rows
+        .iter()
+        .any(|row| row.kind == work_model::WriterCompletionRequirementKind::Finding)
+    {
+        return Ok(None);
+    }
+
+    let current_findings =
+        writer_completion_findings_from_item(project_root, correction, Some(item))?;
+    let contract = attempt
+        .writer_completion_contract
+        .as_ref()
+        .context("legacy Writer assignment has no immutable completion contract")?;
+    // A structurally valid matrix for the current candidate is not a legacy
+    // mismatch. Any structural disagreement is only a signal to inspect the
+    // older source evidence below; it is not itself authority for recovery.
+    if matrix
+        .status_against(contract, &correction.id, &current_findings)
+        .is_ok()
+    {
+        return Ok(None);
+    }
+
+    let mut historical_attempt = attempt.clone();
+    historical_attempt.tasks = attempt.tasks[..correction_index].to_vec();
+    historical_attempt.status = work_model::AttemptStatus::Reviewing;
+    historical_attempt.pause_kind = None;
+    historical_attempt.pause_recovery = None;
+    historical_attempt.pause_record = None;
+    historical_attempt.completed_at = None;
+
+    let source_testers = historical_attempt
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.kind == TaskKind::Tester
+                && task.status == TaskStatus::Complete
+                && !task.is_failed_command_recheck()
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| context.candidate_commit == source_output.commit)
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        source_testers.len() <= 1,
+        "legacy Writer assignment has multiple complete source Testers"
+    );
+    let canonical = if source_testers.is_empty() {
+        None
+    } else {
+        Some(assess_canonical_checks(project_root, &historical_attempt)?)
+    };
+    if let Some(canonical) = canonical.as_ref() {
+        anyhow::ensure!(
+            canonical.blockers.is_empty() && !canonical.checks.is_empty(),
+            "legacy source Tester does not provide complete, unblocked canonical evidence"
+        );
+    }
+    let historical_assessment = if canonical.is_some() {
+        Some(crate::verification_assessment::assess_current_verification(
+            project_root,
+            &historical_attempt,
+        )?)
+    } else {
+        None
+    };
+    if let Some(assessment) = historical_assessment.as_ref() {
+        anyhow::ensure!(
+            assessment.candidate_commit == source_output.commit,
+            "legacy source verification assessed a different candidate"
+        );
+    }
+    validate_legacy_assignment_inputs(
+        project_root,
+        item,
+        &historical_attempt,
+        source,
+        correction,
+        canonical.as_ref(),
+    )?;
+    let findings = findings_from_inputs(
+        project_root,
+        &correction.input_artifacts,
+        true,
+        historical_assessment.as_ref(),
+    )?;
+    matrix
+        .status_against(contract, &correction.id, &findings)
+        .map_err(|error| anyhow::anyhow!("legacy Writer completion matrix is not bound to the verified source assignment: {error}"))?;
+    anyhow::ensure!(
+        !findings.is_empty(),
+        "legacy Writer assignment has no verified findings to reconstruct"
+    );
+
+    let source_task_inputs = task_assignment_inputs(project_root, &source.input_artifacts)?;
+    let evidence = legacy_assignment_evidence(
+        project_root,
+        &correction.input_artifacts,
+        &findings,
+        historical_assessment.as_ref(),
+        canonical.as_ref(),
+    )?;
+    let assignment = WriterCorrectionAssignment {
+        schema_version: work_model::WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+        work_item_id: item.id.clone(),
+        attempt_id: attempt.id.clone(),
+        writer_task_id: correction.id.clone(),
+        source_task_id: source.id.clone(),
+        source_candidate_commit: source_output.commit.clone(),
+        source_task_inputs,
+        evidence,
+        findings,
+        origin: WriterCorrectionAssignmentOrigin::LegacyReconstructed,
+    };
+    assignment
+        .validate_for_task(correction)
+        .map_err(|error| anyhow::anyhow!("legacy Writer assignment is invalid: {error}"))?;
+    // Keep the source index live in this function so future changes cannot
+    // accidentally select a source after the correction Task.
+    debug_assert!(source_index < correction_index);
+    Ok(Some(assignment))
+}
+
+fn validate_legacy_assignment_inputs(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    historical_attempt: &work_model::Attempt,
+    source: &Task,
+    correction: &Task,
+    canonical: Option<&crate::verification_assessment::CanonicalCheckAssessment>,
+) -> Result<()> {
+    let canonical_results = canonical
+        .into_iter()
+        .flat_map(|assessment| assessment.checks.iter())
+        .filter_map(|check| match &check.source {
+            work_model::RequiredCheckSource::CanonicalTester {
+                task_id, results, ..
+            } => Some((task_id.as_str(), results.path.as_str())),
+            work_model::RequiredCheckSource::ReviewRequested { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    let canonical_results = if let Some(first) = canonical_results.first().copied() {
+        anyhow::ensure!(
+            canonical_results
+                .iter()
+                .all(|candidate| *candidate == first),
+            "legacy source canonical checks use mixed Tester evidence"
+        );
+        Some(first)
+    } else {
+        None
+    };
+    for artifact in &correction.input_artifacts {
+        let path = Path::new(&artifact.path);
+        let is_review = path.file_name().is_some_and(|name| {
+            name == "review.md" || name.to_string_lossy().starts_with("review-")
+        });
+        if is_review {
+            let task = historical_attempt
+                .tasks
+                .iter()
+                .find(|task| task.id == artifact.producer_id)
+                .context("legacy review evidence producer Task is missing")?;
+            let context = task
+                .review_context
+                .as_ref()
+                .context("legacy review evidence has no candidate context")?;
+            anyhow::ensure!(
+                task.kind == TaskKind::Review
+                    && task.status == TaskStatus::Complete
+                    && review_artifact_path(task).as_deref() == Some(artifact.path.as_str())
+                    && context.candidate_commit == source.output.as_ref().unwrap().commit,
+                "legacy review evidence is not bound to the source candidate"
+            );
+            continue;
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name == "candidate-gate.json")
+        {
+            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            let gate: candidate_gate::CandidateGateEvidence =
+                serde_json::from_slice(&bytes).context("parse legacy candidate-gate evidence")?;
+            anyhow::ensure!(
+                artifact.producer_id == source.id
+                    && gate.candidate_commit == source.output.as_ref().unwrap().commit
+                    && gate.base_commit
+                        == correction
+                            .output
+                            .as_ref()
+                            .and_then(|output| output.base_commit.as_deref())
+                            .unwrap_or_default(),
+                "legacy candidate-gate evidence is not bound to the source candidate"
+            );
+            continue;
+        }
+        if artifact.path.ends_with("/tester-results.json") {
+            let Some((tester_id, results_path)) = canonical_results else {
+                let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+                let results: crate::tester::TesterResults =
+                    serde_json::from_slice(&bytes).context("parse legacy Tester results")?;
+                anyhow::ensure!(
+                    results.error.is_none()
+                        && results
+                            .commands
+                            .iter()
+                            .all(|command| command.exit_code == 0)
+                        && results.tests.iter().all(|test| test.status != "fail"),
+                    "legacy Tester findings lack a verified complete source Tester"
+                );
+                continue;
+            };
+            anyhow::ensure!(
+                artifact.producer_id == tester_id && artifact.path == results_path,
+                "legacy Tester evidence is not bound to the original complete Tester"
+            );
+            let bytes = fs::read(resolve_input_artifact_path(project_root, &artifact.path)?)?;
+            let results: crate::tester::TesterResults =
+                serde_json::from_slice(&bytes).context("parse legacy Tester results")?;
+            anyhow::ensure!(
+                results.candidate_commit.as_deref()
+                    == source.output.as_ref().map(|output| output.commit.as_str()),
+                "legacy Tester result candidate binding changed"
+            );
+        }
+    }
+    anyhow::ensure!(
+        item.id == historical_attempt.work_item_id
+            && correction.work_item_id == item.id
+            && correction.attempt_id.as_deref() == Some(historical_attempt.id.as_str()),
+        "legacy Writer assignment Task identity changed"
+    );
+    Ok(())
+}
+
+fn legacy_task_execution_is_live(project_root: &Path, task: &Task) -> Result<bool> {
+    let Some(area) = task.artifact_area.as_ref() else {
+        return Ok(false);
+    };
+    let path = crate::execution::record_path_for_artifact(project_root, &area.path);
+    if !path.exists() {
+        return Ok(false);
+    }
+    crate::execution::execution_is_live(&path)
+}
+
+fn legacy_assignment_evidence(
+    project_root: &Path,
+    task_inputs: &[ArtifactRef],
+    findings: &[WriterCompletionFinding],
+    assessment: Option<&crate::verification_assessment::VerificationAssessment>,
+    canonical: Option<&crate::verification_assessment::CanonicalCheckAssessment>,
+) -> Result<Vec<WriterCorrectionAssignmentInput>> {
+    let mut refs =
+        assignment_evidence_for_findings(project_root, task_inputs, findings, assessment)?
+            .into_iter()
+            .map(|input| input.artifact)
+            .collect::<Vec<_>>();
+    let mut add_if_present = |artifact: ArtifactRef| -> Result<()> {
+        if refs.iter().any(|existing| existing.path == artifact.path) {
+            return Ok(());
+        }
+        let resolved = resolve_input_artifact_path(project_root, &artifact.path)?;
+        if !resolved.exists() && artifact.path.contains("/evidence-reconstructions/") {
+            // The canonical assessor may have produced an in-memory proof for
+            // an older run without a manifest. The committed config, extractor,
+            // result, and logs remain independently bound below.
+            return Ok(());
+        }
+        assignment_input_digest(project_root, &artifact.path)?;
+        refs.push(artifact);
+        Ok(())
+    };
+    if let Some(canonical) = canonical {
+        if let Some(baseline) = &canonical.baseline {
+            add_if_present(ArtifactRef {
+                producer_id: "verification-assessment".into(),
+                path: baseline.path.clone(),
+            })?;
+        }
+        for check in &canonical.checks {
+            if let work_model::RequiredCheckSource::CanonicalTester {
+                reconstruction,
+                results,
+                manifest,
+                logs,
+                ..
+            } = &check.source
+            {
+                let sources = reconstruction
+                    .iter()
+                    .chain(std::iter::once(results))
+                    .chain(std::iter::once(manifest))
+                    .chain(logs);
+                for source in sources {
+                    add_if_present(ArtifactRef {
+                        producer_id: "verification-assessment".into(),
+                        path: source.path.clone(),
+                    })?;
+                }
+            }
+        }
+        for binding in canonical.review_bindings.values().flatten() {
+            add_if_present(ArtifactRef {
+                producer_id: "verification-assessment".into(),
+                path: binding.path.clone(),
+            })?;
+        }
+    }
+    refs.into_iter()
+        .map(|artifact| {
+            Ok(WriterCorrectionAssignmentInput {
+                digest: assignment_input_digest(project_root, &artifact.path)?,
+                artifact,
+            })
+        })
+        .collect()
+}
+
+/// Revalidate the immutable source bindings before a persisted assignment is
+/// used by a completion gate. This catches changed evidence even when a caller
+/// supplied a stale in-memory Task value.
+pub(crate) fn validate_writer_correction_assignment(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    task: &Task,
+    assignment: &WriterCorrectionAssignment,
+) -> Result<()> {
+    validate_writer_assignment_with_context_proof(project_root, item, task, assignment, &[])
+}
+
+fn validate_writer_assignment_with_context_proof(
+    project_root: &Path,
+    item: &work_model::WorkItem,
+    task: &Task,
+    assignment: &WriterCorrectionAssignment,
+    proven_context: &[WriterCorrectionAssignmentInput],
+) -> Result<()> {
+    assignment
+        .validate_for_task(task)
+        .map_err(anyhow::Error::msg)?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+        .context("assignment Attempt is missing")?;
+    let persisted = attempt
+        .tasks
+        .iter()
+        .find(|candidate| candidate.id == task.id)
+        .context("assigned Writer Task is missing from its Attempt")?;
+    anyhow::ensure!(
+        persisted.writer_correction_assignment.as_ref() == Some(assignment),
+        "host-owned Writer correction assignment changed in storage"
+    );
+    let source_index = attempt
+        .tasks
+        .iter()
+        .position(|candidate| candidate.id == assignment.source_task_id)
+        .context("assignment source Task is missing")?;
+    let writer_index = attempt
+        .tasks
+        .iter()
+        .position(|candidate| candidate.id == task.id)
+        .context("assigned Writer Task is missing")?;
+    anyhow::ensure!(
+        source_index < writer_index,
+        "assignment source Task must precede its Writer Task"
+    );
+    let source = &attempt.tasks[source_index];
+    let output = source
+        .output
+        .as_ref()
+        .context("assignment source Task has no candidate output")?;
+    anyhow::ensure!(
+        source.kind == TaskKind::Write
+            && source.status == TaskStatus::Complete
+            && output.commit == assignment.source_candidate_commit,
+        "assignment source candidate changed"
+    );
+    for input in &assignment.source_task_inputs {
+        if mutable_assignment_context(task, &input.artifact) && proven_context.contains(input) {
+            continue;
+        }
+        anyhow::ensure!(
+            assignment_input_digest(project_root, &input.artifact.path)? == input.digest,
+            "Writer assignment input changed: {}",
+            input.artifact.path
+        );
+    }
+    for input in &assignment.evidence {
+        anyhow::ensure!(
+            assignment_input_digest(project_root, &input.artifact.path)? == input.digest,
+            "Writer assignment input changed: {}",
+            input.artifact.path
+        );
+    }
+    Ok(())
+}
+
+/// Follow preserved assignments back to their original Writer. Only a proven
+/// frozen context reference may replace a historical mutable input; immutable
+/// evidence, findings, and source identities retain exact equality.
+pub(crate) fn validate_writer_continuation_lineage(
+    root: &Path,
+    item: &work_model::WorkItem,
+    task: &Task,
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+        .context("assignment Attempt is missing")?;
+    let mut receiver = task;
+    let mut proven_context = Vec::new();
+    loop {
+        let carried = receiver
+            .writer_correction_assignment
+            .as_ref()
+            .context("Writer continuation source has no preserved assignment")?;
+        validate_writer_assignment_with_context_proof(
+            root,
+            item,
+            receiver,
+            carried,
+            &proven_context,
+        )?;
+        validate_recorded_assignment_context_recoveries(root, item, receiver)?;
+        let index = attempt
+            .tasks
+            .iter()
+            .position(|other| other.id == receiver.id)
+            .context("assigned Writer Task is missing")?;
+        let previous = attempt.tasks[..index]
+            .iter()
+            .rev()
+            .find(|other| {
+                other.kind == TaskKind::Write
+                    && other.status == TaskStatus::Complete
+                    && other.output.is_some()
+            })
+            .context("Writer assignment has no preceding completed Writer")?;
+        if carried.source_task_id == previous.id {
+            anyhow::ensure!(
+                previous.writer_correction_assignment.is_none()
+                    || is_corrective_writer_task(receiver),
+                "Writer continuation changed its original assignment source"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            !is_corrective_writer_task(receiver),
+            "an inherited assignment requires a pre-review continuation"
+        );
+        let mut expected = previous
+            .writer_correction_assignment
+            .clone()
+            .context("Writer continuation source has no preserved assignment")?;
+        expected.writer_task_id = receiver.id.clone();
+        for (index, input) in expected.source_task_inputs.iter_mut().enumerate() {
+            if mutable_assignment_context(receiver, &input.artifact)
+                && carried.source_task_inputs.get(index) != Some(input)
+            {
+                let (snapshot, provenance, provenance_bytes) =
+                    assignment_context_snapshot(receiver, input)?;
+                validate_assignment_context_snapshot(
+                    root,
+                    &snapshot,
+                    &provenance,
+                    &provenance_bytes,
+                )?;
+                proven_context.push(input.clone());
+                *input = snapshot;
+                expected.evidence.push(provenance);
+                expected.schema_version = work_model::WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION;
+            }
+        }
+        anyhow::ensure!(
+            expected == *carried,
+            "Writer continuation assignment differs from its preserved source"
+        );
+        receiver = previous;
+    }
+}
+
+fn validate_recorded_assignment_context_recoveries(
+    root: &Path,
+    item: &work_model::WorkItem,
+    task: &Task,
+) -> Result<()> {
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|attempt| Some(attempt.id.as_str()) == task.attempt_id.as_deref())
+        .context("assignment Attempt is missing")?;
+    let records = attempt
+        .recovery_operations
+        .iter()
+        .filter(|record| {
+            record.operation_kind == "assignment-context-recovery"
+                && record.task_id.as_deref() == Some(task.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let mut validated = Vec::new();
+    for artifact in attempt
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.producer_id == "assignment-context-recovery")
+    {
+        let bytes = assignment_input_bytes(root, &artifact.path)?;
+        let audit: work_model::AssignmentContextRecoveryAudit = serde_json::from_slice(&bytes)?;
+        if audit.before.writer_task_id != task.id && audit.after.writer_task_id != task.id {
+            continue;
+        }
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let record = records
+            .iter()
+            .find(|record| record.input_digest.as_deref() == Some(digest.as_str()))
+            .context("assignment context audit has no matching recovery operation")?;
+        validate_assignment_context_audit(root, task, &artifact.path, &bytes, &audit, record)?;
+        validate_assignment_context_lineage(root, item, task, &audit.before)?;
+        validated.push(record.operation_id.as_str());
+    }
+    anyhow::ensure!(
+        records
+            .iter()
+            .all(|record| validated.contains(&record.operation_id.as_str())),
+        "assignment context recovery lost its bound audit"
+    );
+    Ok(())
+}
+
+/// Publish immutable Writer finding assignments on newly planned corrective
+/// Tasks before the Task can launch. A continuation carries the same source
+/// assignment; a correction captures the findings and evidence named by its
+/// failed review or verification inputs.
+pub(crate) fn prepare_writer_correction_assignments(
+    project_root: &Path,
+    item: &mut work_model::WorkItem,
+) -> Result<()> {
+    let mut plans = Vec::new();
+    for (attempt_index, attempt) in item.attempts.iter().enumerate() {
+        for (task_index, task) in attempt.tasks.iter().enumerate() {
+            if task.kind != TaskKind::Write
+                || task.status != TaskStatus::Planned
+                || task.writer_correction_assignment.is_some()
+            {
+                continue;
+            }
+            let Some(source) = attempt.tasks[..task_index]
+                .iter()
+                .rev()
+                .find(|source| {
+                    source.kind == TaskKind::Write
+                        && source.status == TaskStatus::Complete
+                        && source.output.is_some()
+                })
+                .cloned()
+            else {
+                continue;
+            };
+            plans.push((attempt_index, task_index, task.clone(), source));
+        }
+    }
+
+    for (attempt_index, task_index, task, source) in plans {
+        let mut assignment = if source.writer_correction_assignment.is_some()
+            && !is_corrective_writer_task(&task)
+        {
+            let previous = source
+                .writer_correction_assignment
+                .clone()
+                .expect("the continuation source has an assignment");
+            let mut carried = previous;
+            carried.work_item_id = item.id.clone();
+            carried.attempt_id = task.attempt_id.clone().unwrap_or_default();
+            carried.writer_task_id = task.id.clone();
+            carried.validate_for_task(&task).map_err(|reason| {
+                anyhow::anyhow!(
+                    "carry Writer correction assignment to Task {}: {reason}",
+                    task.id
+                )
+            })?;
+            carried
+        } else {
+            let assessment = crate::verification_assessment::assess_current_verification(
+                project_root,
+                &item.attempts[attempt_index],
+            )?;
+            let findings = findings_from_inputs(
+                project_root,
+                &task.input_artifacts,
+                task.role != work_model::TESTER_HARNESS_REPAIR_ROLE,
+                Some(&assessment),
+            )?;
+            let evidence = assignment_evidence_for_findings(
+                project_root,
+                &task.input_artifacts,
+                &findings,
+                Some(&assessment),
+            )?;
+            let source_task_inputs = task_assignment_inputs(project_root, &source.input_artifacts)?;
+            WriterCorrectionAssignment {
+                schema_version: work_model::WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION,
+                work_item_id: item.id.clone(),
+                attempt_id: task.attempt_id.clone().unwrap_or_default(),
+                writer_task_id: task.id.clone(),
+                source_task_id: source.id,
+                source_candidate_commit: source
+                    .output
+                    .as_ref()
+                    .map(|output| output.commit.clone())
+                    .unwrap_or_default(),
+                source_task_inputs,
+                evidence,
+                findings,
+                origin: WriterCorrectionAssignmentOrigin::Captured,
+            }
+        };
+        for input in &mut assignment.source_task_inputs {
+            if mutable_assignment_context(&task, &input.artifact) {
+                let bytes = assignment_input_bytes(project_root, &input.artifact.path)?;
+                anyhow::ensure!(
+                    format!("sha256:{:x}", Sha256::digest(&bytes)) == input.digest,
+                    "mutable context changed during capture"
+                );
+                let (snapshot, provenance, provenance_bytes) =
+                    assignment_context_snapshot(&task, input)?;
+                work_model::publish_recovery_snapshot(
+                    project_root,
+                    &snapshot.artifact.path,
+                    &bytes,
+                )?;
+                work_model::publish_recovery_snapshot(
+                    project_root,
+                    &provenance.artifact.path,
+                    &provenance_bytes,
+                )?;
+                *input = snapshot;
+                assignment.evidence.push(provenance);
+                assignment.schema_version = work_model::WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION;
+            }
+        }
+        assignment.validate_for_task(&task).map_err(|reason| {
+            anyhow::anyhow!(
+                "validate Writer correction assignment for Task {}: {reason}",
+                task.id
+            )
+        })?;
+        item.attempts[attempt_index].tasks[task_index].writer_correction_assignment =
+            Some(assignment);
+    }
+    Ok(())
+}
+
+fn assignment_evidence_for_findings(
+    project_root: &Path,
+    task_inputs: &[ArtifactRef],
+    findings: &[WriterCompletionFinding],
+    assessment: Option<&crate::verification_assessment::VerificationAssessment>,
+) -> Result<Vec<WriterCorrectionAssignmentInput>> {
+    let mut refs = Vec::new();
+    for finding in findings {
+        let mut candidates = task_inputs
+            .iter()
+            .filter(|artifact| artifact.path == finding.source)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(assessment) = assessment {
+            for row in assessment
+                .references
+                .iter()
+                .chain(&assessment.commands)
+                .filter(|row| {
+                    row.id
+                        == finding
+                            .id
+                            .strip_prefix("finding:verification:")
+                            .unwrap_or("")
+                })
+            {
+                for binding in &row.bindings {
+                    if binding.path == finding.source {
+                        candidates.push(ArtifactRef {
+                            producer_id: "verification-assessment".to_string(),
+                            path: binding.path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        if candidates.is_empty() && finding.role == "verification" {
+            candidates.extend(
+                task_inputs
+                    .iter()
+                    .filter(|artifact| {
+                        Path::new(&artifact.path)
+                            .file_name()
+                            .is_some_and(|name| name == candidate_gate::CANDIDATE_GATE_FILE)
+                    })
+                    .cloned(),
+            );
+        }
+        candidates.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
+        candidates.dedup();
+        let Some(artifact) = candidates.into_iter().next() else {
+            bail!(
+                "Writer finding {} has no task-owned or assessment-bound evidence {}",
+                finding.id,
+                finding.source
+            );
+        };
+        if !refs.contains(&artifact) {
+            refs.push(artifact);
+        }
+    }
+    refs.into_iter()
+        .map(|artifact| {
+            Ok(WriterCorrectionAssignmentInput {
+                digest: assignment_input_digest(project_root, &artifact.path)?,
+                artifact,
+            })
+        })
+        .collect()
+}
+
+fn task_assignment_inputs(
+    project_root: &Path,
+    inputs: &[ArtifactRef],
+) -> Result<Vec<WriterCorrectionAssignmentInput>> {
+    inputs
+        .iter()
+        .map(|artifact| {
+            Ok(WriterCorrectionAssignmentInput {
+                digest: assignment_input_digest(project_root, &artifact.path)?,
+                artifact: artifact.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Only the host's exact Work/Attempt projections may change after assignment.
+pub(crate) fn mutable_assignment_context(task: &Task, artifact: &ArtifactRef) -> bool {
+    let Some(attempt) = task.attempt_id.as_deref() else {
+        return false;
+    };
+    artifact.producer_id == "required-progress"
+        && [
+            format!(
+                ".fluent/work/progress/{}/{attempt}/progress.md",
+                task.work_item_id
+            ),
+            work_model::work_artifact_path(
+                &task.work_item_id,
+                attempt,
+                "required-progress-needs-user.md",
+            ),
+            work_model::work_artifact_path(
+                &task.work_item_id,
+                attempt,
+                "writer-completion-needs-user.md",
+            ),
+        ]
+        .contains(&artifact.path)
+}
+
+pub(crate) fn assignment_source_inputs_match(
+    task: &Task,
+    source: &Task,
+    assignment: &WriterCorrectionAssignment,
+) -> bool {
+    source.input_artifacts.len() == assignment.source_task_inputs.len()
+        && source.input_artifacts.iter().all(|artifact| {
+            assignment.source_task_inputs.iter().any(|input| {
+                if &input.artifact == artifact {
+                    return true;
+                }
+                if assignment.schema_version < 2 {
+                    return false;
+                }
+                let original = WriterCorrectionAssignmentInput {
+                    artifact: artifact.clone(),
+                    digest: input.digest.clone(),
+                };
+                assignment_context_snapshot(task, &original).is_ok_and(
+                    |(snapshot, provenance, _)| {
+                        snapshot == *input && assignment.evidence.contains(&provenance)
+                    },
+                )
+            })
+        })
+}
+
+/// Describe ordinary digest-bound artifacts, preserving the original reference
+/// in separately bound provenance. Older readers validate these same bytes.
+pub(crate) fn assignment_context_snapshot(
+    task: &Task,
+    input: &WriterCorrectionAssignmentInput,
+) -> Result<(
+    WriterCorrectionAssignmentInput,
+    WriterCorrectionAssignmentInput,
+    Vec<u8>,
+)> {
+    anyhow::ensure!(
+        mutable_assignment_context(task, &input.artifact),
+        "input is not recognized mutable assignment context"
+    );
+    let provenance_bytes = serde_json::to_vec_pretty(input)?;
+    let identity = format!("{:x}", Sha256::digest(&provenance_bytes));
+    let base = work_model::work_artifact_path(
+        &task.work_item_id,
+        task.attempt_id
+            .as_deref()
+            .context("assignment Attempt is missing")?,
+        &format!("assignment-context/{identity}"),
+    );
+    Ok((
+        WriterCorrectionAssignmentInput {
+            artifact: ArtifactRef {
+                producer_id: input.artifact.producer_id.clone(),
+                path: format!("{base}/input"),
+            },
+            digest: input.digest.clone(),
+        },
+        WriterCorrectionAssignmentInput {
+            artifact: ArtifactRef {
+                producer_id: "writer-assignment-context".into(),
+                path: format!("{base}/source.json"),
+            },
+            digest: format!("sha256:{:x}", Sha256::digest(&provenance_bytes)),
+        },
+        provenance_bytes,
+    ))
+}
+
+/// Describe a stale mutable binding; this is guidance, never recovery authority.
+pub(crate) fn assignment_context_recovery_action(
+    root: &Path,
+    attempt: &work_model::Attempt,
+) -> Result<Option<String>> {
+    if attempt.status != work_model::AttemptStatus::NeedsUser
+        || attempt.pause_kind != Some(work_model::PauseKind::WriterCompletion)
+        || attempt.cancellation_requested()
+    {
+        return Ok(None);
+    }
+    let Some(task) = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|t| t.kind == TaskKind::Write)
+        .filter(|t| t.status == TaskStatus::Complete)
+    else {
+        return Ok(None);
+    };
+    let candidate = &task
+        .output
+        .as_ref()
+        .context("saved Writer has no candidate")?
+        .commit;
+    stale_assignment_context_action(root, attempt, task, candidate)
+}
+
+pub(crate) fn stale_assignment_context_action(
+    root: &Path,
+    attempt: &work_model::Attempt,
+    task: &Task,
+    candidate: &str,
+) -> Result<Option<String>> {
+    let Some(assignment) = task.writer_correction_assignment.as_ref() else {
+        return Ok(None);
+    };
+    validate_assignment_context_recovery_inputs(root, task, assignment)?;
+    for input in &assignment.source_task_inputs {
+        if mutable_assignment_context(task, &input.artifact)
+            && assignment_input_digest(root, &input.artifact.path)? != input.digest
+        {
+            let quote = |s: &str| format!("'{}'", s.replace('\'', "'\"'\"'"));
+            return Ok(Some(format!(
+                "fluent attempt recover-assignment-context {} {} --task {} --candidate {} --assignment-digest {} --input {} --original-file '<original-bytes-file>' --resolution '<describe the exact-byte recovery>'",
+                quote(&task.work_item_id),
+                quote(&attempt.id),
+                quote(&task.id),
+                quote(candidate),
+                quote(&assignment_digest(assignment)?),
+                quote(&input.artifact.path)
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Read a bounded original-byte file through canonical, nonsymlink paths.
+pub(crate) fn assignment_original_bytes(root: &Path, original_file: &Path) -> Result<Vec<u8>> {
+    let original_path = if original_file.is_absolute() {
+        original_file.to_path_buf()
+    } else {
+        root.join(original_file)
+    };
+    anyhow::ensure!(
+        original_path
+            .components()
+            .collect::<std::path::PathBuf>()
+            .as_os_str()
+            == original_path.as_os_str(),
+        "original file path is not canonical"
+    );
+    let mut path = std::path::PathBuf::new();
+    for component in original_path.components() {
+        anyhow::ensure!(
+            !matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            ),
+            "unsafe original file path"
+        );
+        path.push(component);
+        anyhow::ensure!(
+            !fs::symlink_metadata(&path)?.file_type().is_symlink(),
+            "original file path traverses a symlink"
+        );
+    }
+    let metadata = fs::symlink_metadata(&original_path)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= 16 * 1024 * 1024,
+        "unsupported recovery file: {}",
+        original_path.display()
+    );
+    let bytes = fs::read(&original_path)?;
+    anyhow::ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "original bytes exceed the supported bound"
+    );
+    Ok(bytes)
+}
+
+pub(crate) fn assignment_digest(assignment: &WriterCorrectionAssignment) -> Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(assignment)?)
+    ))
+}
+
+pub(crate) fn assignment_attempt_digest(attempt: &work_model::Attempt) -> Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(attempt)?)
+    ))
+}
+
+/// Check settled ownership and candidate identity without publishing anything.
+pub(crate) fn assignment_context_recovery_target<'a>(
+    root: &Path,
+    item: &'a work_model::WorkItem,
+    attempt_id: &str,
+    task_id: &str,
+    candidate: &str,
+) -> Result<(&'a work_model::Attempt, &'a Task)> {
+    item.ensure_mutation_compatible()?;
+    item.validate()?;
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|a| a.id == attempt_id)
+        .context("Attempt is missing")?;
+    let task = attempt
+        .tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .context("recovery requires the latest completed Writer")?;
+    let output_free =
+        task.kind == TaskKind::Write && task.status == TaskStatus::Failed && task.output.is_none();
+    let output = if output_free {
+        output_free_assignment_source(root, item, attempt, task)?
+            .output
+            .as_ref()
+            .unwrap()
+    } else {
+        anyhow::ensure!(attempt.tasks.iter().rev().find(|t| t.kind == TaskKind::Write)
+            .is_some_and(|latest| latest.id == task_id && latest.status == TaskStatus::Complete),
+            "recovery requires the latest completed Writer");
+        task.output.as_ref().context("Writer has no candidate")?
+    };
+    anyhow::ensure!(
+        !item
+            .merge_candidates
+            .iter()
+            .any(|c| c.attempt_id == attempt_id),
+        "Attempt already has a Merge Candidate"
+    );
+    anyhow::ensure!(
+        output.commit == candidate
+            && attempt.current_candidate_commit() == Some(candidate)
+            && candidate_workspace_is_clean_at_managed(root, output, candidate),
+        "candidate is stale, dirty, or not a managed worktree"
+    );
+    for task in &attempt.tasks {
+        anyhow::ensure!(
+            output_free || matches!(task.status, TaskStatus::Complete | TaskStatus::Superseded),
+            "Attempt has unresolved Tasks"
+        );
+        anyhow::ensure!(
+            !crate::lease::is_leased(&crate::lease::task_lock_path(root, &item.id, &task.id)),
+            "Task has a live owner"
+        );
+        crate::usage_limit_contracts::unlocked(
+            &crate::lease::task_lock_path(root, &item.id, &task.id),
+            false,
+        )?;
+        if let Some(area) = &task.artifact_area {
+            crate::usage_limit_contracts::unlocked(
+                &root.join(&area.path).join("execution-owner.lock"),
+                false,
+            )
+            .context("Task has a live execution owner or invalid ownership lock")?;
+            let record = crate::execution::record_path_for_artifact(root, &area.path);
+            anyhow::ensure!(
+                !crate::execution::execution_is_live(&record)?
+                    && !crate::lease::is_leased(
+                        &root.join(&area.path).join("execution-owner.lock")
+                    ),
+                "Task has a live execution owner"
+            );
+        }
+    }
+    anyhow::ensure!(
+        !crate::lease::is_leased(&crate::lease::learner_lock_path(root, &item.id, attempt_id)),
+        "Learner has a live owner"
+    );
+    crate::usage_limit_contracts::unlocked(
+        &crate::lease::learner_lock_path(root, &item.id, attempt_id),
+        false,
+    )?;
+    Ok((attempt, task))
+}
+
+/// Admit only the historical completion retry that stopped before provider launch.
+/// Native execution identity and settled ownership supply proof; log prose does not.
+pub(crate) fn output_free_assignment_source<'a>(
+    root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &'a work_model::Attempt,
+    task: &Task,
+) -> Result<&'a Task> {
+    let assignment = task
+        .writer_correction_assignment
+        .as_ref()
+        .context("output-free Writer has no assignment")?;
+    anyhow::ensure!(
+        task.kind == TaskKind::Write && task.status == TaskStatus::Failed && task.output.is_none(),
+        "context recovery requires an output-free failed Writer"
+    );
+    let source = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|t| t.kind == TaskKind::Write && t.status == TaskStatus::Complete)
+        .context("output-free Writer has no completed source")?;
+    anyhow::ensure!(
+        source.id == assignment.source_task_id
+            && source
+                .output
+                .as_ref()
+                .is_some_and(|o| o.commit == assignment.source_candidate_commit)
+            && task.workspace_access.writes == source.workspace_access.writes,
+        "output-free Writer source candidate or workspace changed"
+    );
+    let context = writer_completion::validated_writer_context(root, item, task)?
+        .context("output-free Writer has no completion-recovery authority")?;
+    anyhow::ensure!(
+        context.source_task_id == source.id
+            && context.candidate_commit == assignment.source_candidate_commit
+            && context.artifacts.iter().any(|a| a.path
+                == work_model::work_artifact_path(
+                    &item.id,
+                    &attempt.id,
+                    &format!("writer-completion-recoveries/{}/recovery.json", task.id)
+                )),
+        "output-free Writer completion authority changed"
+    );
+    let index = attempt
+        .tasks
+        .iter()
+        .position(|t| t.id == task.id)
+        .context("output-free Writer is missing")?;
+    anyhow::ensure!(
+        attempt.tasks[..index]
+            .iter()
+            .all(|t| matches!(t.status, TaskStatus::Complete | TaskStatus::Superseded)),
+        "Attempt has unresolved Tasks"
+    );
+    let later = &attempt.tasks[index + 1..];
+    anyhow::ensure!(
+        later.len() <= 1
+            && later.iter().all(|t| t.kind == TaskKind::Write
+                && t.status == TaskStatus::Planned
+                && t.started_at.is_none()
+                && t.completed_at.is_none()
+                && t.output.is_none()),
+        "unsupported later work after output-free Writer"
+    );
+    for later in later {
+        if let Some(area) = &later.artifact_area {
+            match fs::symlink_metadata(root.join(&area.path)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+                Ok(_) => bail!("later Writer reservation has materialized artifacts"),
+            }
+        } else {
+            bail!("later Writer reservation has no artifact identity");
+        }
+    }
+    let area = task
+        .artifact_area
+        .as_ref()
+        .context("output-free Writer has no artifact identity")?;
+    let record: crate::execution::ExecutionRecord = serde_json::from_slice(
+        &assignment_input_bytes(root, &format!("{}/execution.json", area.path))?,
+    )?;
+    anyhow::ensure!(
+        record.schema_version == 1
+            && (record.state == crate::execution::ExecutionState::Launching
+                || (record.state == crate::execution::ExecutionState::Canceled
+                    && attempt.cancellation_requested()
+                    && attempt
+                        .recovery_operations
+                        .iter()
+                        .any(|r| r.operation_kind == "assignment-context-recovery"
+                            && r.task_id.as_deref() == Some(task.id.as_str()))))
+            && record.leader_pid == 0
+            && record.process_group_id == 0
+            && (record.settled_at.is_none() || attempt.cancellation_requested())
+            && record.heartbeat_at == record.started_at,
+        "setup cannot be proven unlaunched"
+    );
+    let start = DateTime::parse_from_rfc3339(
+        task.started_at
+            .as_deref()
+            .context("failed Writer has no start")?,
+    )?;
+    let end = DateTime::parse_from_rfc3339(
+        task.completed_at
+            .as_deref()
+            .context("failed Writer has no completion")?,
+    )?;
+    let prepared = DateTime::parse_from_rfc3339(&record.started_at)?;
+    anyhow::ensure!(
+        prepared <= start
+            && start <= end
+            && start.signed_duration_since(prepared).num_seconds() == 0,
+        "execution identity does not bind the failed setup"
+    );
+    let owner = record
+        .attempt_owner
+        .context("failed setup has no Attempt owner")?;
+    anyhow::ensure!(
+        owner.project_root == root.canonicalize()?
+            && owner.work_item_id == item.id
+            && owner.attempt_id == attempt.id,
+        "failed setup belongs to another Attempt"
+    );
+    anyhow::ensure!(
+        record.owner_pid > 0 && record.owner_pid <= i32::MAX as u32,
+        "invalid setup owner"
+    );
+    let result = unsafe { libc::kill(record.owner_pid as i32, 0) };
+    anyhow::ensure!(
+        result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "setup owner is live or unverifiable"
+    );
+    Ok(source)
+}
+
+pub(crate) fn output_free_context_binding(
+    root: &Path,
+    item: &work_model::WorkItem,
+    attempt: &work_model::Attempt,
+    task: &Task,
+) -> Result<Option<work_model::OutputFreeAssignmentContext>> {
+    if task.status == TaskStatus::Complete {
+        return Ok(None);
+    }
+    output_free_assignment_source(root, item, attempt, task)?;
+    let mut files = BTreeMap::new();
+    crate::usage_limit_contracts::bind_directory(
+        root,
+        &task.artifact_area.as_ref().unwrap().path,
+        &mut files,
+    )?;
+    let context = writer_completion::validated_writer_context(root, item, task)?
+        .context("missing completion authority")?;
+    for artifact in context.artifacts {
+        crate::usage_limit_contracts::bind_file(root, &artifact.path, &mut files)?;
+    }
+    let index = attempt.tasks.iter().position(|t| t.id == task.id).unwrap();
+    Ok(Some(work_model::OutputFreeAssignmentContext {
+        task: task.clone(),
+        later_tasks: attempt.tasks[index + 1..].to_vec(),
+        files,
+    }))
+}
+
+pub(crate) fn validate_output_free_context_files(
+    root: &Path,
+    audit: &work_model::AssignmentContextRecoveryAudit,
+) -> Result<()> {
+    if let Some(failure) = &audit.output_free {
+        for (path, digest) in &failure.files {
+            anyhow::ensure!(
+                assignment_input_digest(root, path)? == *digest,
+                "output-free failure evidence changed: {path}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A partial recovery leaves every other mutable binding unresolved. Immutable
+/// source inputs and finding evidence always retain their original digests.
+pub(crate) fn validate_assignment_context_recovery_inputs(
+    root: &Path,
+    task: &Task,
+    assignment: &WriterCorrectionAssignment,
+) -> Result<()> {
+    assignment
+        .validate_for_task(task)
+        .map_err(anyhow::Error::msg)?;
+    for input in &assignment.source_task_inputs {
+        if mutable_assignment_context(task, &input.artifact) {
+            assignment_input_bytes(root, &input.artifact.path)?;
+        } else {
+            anyhow::ensure!(
+                assignment_input_digest(root, &input.artifact.path)? == input.digest,
+                "Writer assignment input changed: {}",
+                input.artifact.path
+            );
+        }
+    }
+    for input in &assignment.evidence {
+        anyhow::ensure!(
+            assignment_input_digest(root, &input.artifact.path)? == input.digest,
+            "Writer assignment input changed: {}",
+            input.artifact.path
+        );
+    }
+    Ok(())
+}
+
+/// Validate the complete immutable audit at publication and when a later
+/// consumer follows the same authorized assignment substitution.
+fn validate_assignment_context_audit(
+    root: &Path,
+    task: &Task,
+    audit_path: &str,
+    audit_bytes: &[u8],
+    audit: &work_model::AssignmentContextRecoveryAudit,
+    record: &work_model::RecoveryOperationRecord,
+) -> Result<()> {
+    anyhow::ensure!(
+        (audit.schema_version == 1 && audit.output_free.is_none())
+            || (audit.schema_version == 2 && audit.output_free.is_some()),
+        "unsupported context recovery audit"
+    );
+    audit
+        .before
+        .validate_for_task(task)
+        .map_err(anyhow::Error::msg)?;
+    audit
+        .after
+        .validate_for_task(task)
+        .map_err(anyhow::Error::msg)?;
+    if let Some(failure) = &audit.output_free {
+        anyhow::ensure!(
+            failure.task.id == task.id
+                && failure.task.status == TaskStatus::Failed
+                && failure.task.output.is_none()
+                && failure.task.writer_correction_assignment.as_ref() == Some(&audit.before),
+            "output-free recovery lost its original failed Task"
+        );
+    }
+    let attempt_id = task
+        .attempt_id
+        .as_deref()
+        .context("assignment Attempt is missing")?;
+    let material = serde_json::to_vec(&(
+        assignment_digest(&audit.before)?,
+        audit.original.artifact.path.as_str(),
+        audit.original.digest.as_str(),
+    ))?;
+    let mut operation = work_model::RecoveryOperationRequest::new(
+        "assignment-context-recovery",
+        &task.work_item_id,
+        attempt_id,
+        if audit.output_free.is_some() {
+            Some(audit.before.source_candidate_commit.clone())
+        } else {
+            task.output.as_ref().map(|o| o.commit.clone())
+        },
+        Some(task.id.clone()),
+        None,
+        None,
+        record.authorization.clone(),
+        Some(format!("sha256:{:x}", Sha256::digest(material))),
+    );
+    anyhow::ensure!(
+        operation.operation_id() == audit.request_id
+            && audit_path
+                == work_model::work_artifact_path(
+                    &task.work_item_id,
+                    attempt_id,
+                    &format!("assignment-context-recoveries/{}.json", audit.request_id)
+                ),
+        "recovery request changed"
+    );
+    operation.input_digest = Some(format!("sha256:{:x}", Sha256::digest(&audit_bytes)));
+    anyhow::ensure!(
+        record.matches_request(&operation),
+        "recovery operation changed"
+    );
+    let (snapshot, provenance, provenance_bytes) =
+        assignment_context_snapshot(task, &audit.original)?;
+    let mut expected = audit.before.clone();
+    expected.schema_version = work_model::WRITER_CORRECTION_ASSIGNMENT_SCHEMA_VERSION;
+    let input = expected
+        .source_task_inputs
+        .iter_mut()
+        .find(|input| **input == audit.original)
+        .context("recovery source input is not assigned")?;
+    *input = snapshot.clone();
+    expected.evidence.push(provenance.clone());
+    anyhow::ensure!(
+        expected == audit.after,
+        "recovery changed unrelated assignment authority"
+    );
+    validate_assignment_context_snapshot(root, &snapshot, &provenance, &provenance_bytes)
+}
+
+fn validate_assignment_context_snapshot(
+    root: &Path,
+    snapshot: &WriterCorrectionAssignmentInput,
+    provenance: &WriterCorrectionAssignmentInput,
+    provenance_bytes: &[u8],
+) -> Result<()> {
+    anyhow::ensure!(
+        assignment_input_digest(root, &snapshot.artifact.path)? == snapshot.digest
+            && assignment_input_bytes(root, &provenance.artifact.path)? == provenance_bytes,
+        "recovered snapshot changed"
+    );
+    Ok(())
+}
+
+/// Preserve a historical evidence binding only through recorded exact-byte
+/// recoveries. This grants no finding acceptance or lifecycle authority.
+fn validate_assignment_context_lineage(
+    root: &Path,
+    item: &work_model::WorkItem,
+    task: &Task,
+    original: &WriterCorrectionAssignment,
+) -> Result<()> {
+    let current = task
+        .writer_correction_assignment
+        .as_ref()
+        .context("Writer has no saved assignment")?;
+    if current == original {
+        return Ok(());
+    }
+    let attempt = item
+        .attempts
+        .iter()
+        .find(|a| Some(a.id.as_str()) == task.attempt_id.as_deref())
+        .context("assignment Attempt is missing")?;
+    let mut retained = original.clone();
+    for artifact in attempt
+        .artifacts
+        .iter()
+        .filter(|a| a.producer_id == "assignment-context-recovery")
+    {
+        let bytes = assignment_input_bytes(root, &artifact.path)?;
+        let audit: work_model::AssignmentContextRecoveryAudit = serde_json::from_slice(&bytes)?;
+        if audit.before != retained {
+            continue;
+        }
+        let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        let record = attempt
+            .recovery_operations
+            .iter()
+            .find(|r| {
+                r.operation_kind == "assignment-context-recovery"
+                    && r.task_id.as_deref() == Some(task.id.as_str())
+                    && r.input_digest.as_deref() == Some(digest.as_str())
+            })
+            .context("assignment context audit has no matching recovery operation")?;
+        validate_assignment_context_audit(root, task, &artifact.path, &bytes, &audit, record)?;
+        retained = audit.after;
+    }
+    anyhow::ensure!(
+        retained == *current,
+        "assignment changed without exact context recovery authority"
+    );
+    Ok(())
+}
+
+/// Allow only the exact context substitution recorded by a public recovery.
+/// Generic aggregate writes still cannot replace findings, digests, or history.
+pub(crate) fn audited_assignment_context_change(
+    root: &Path,
+    prior: &work_model::Attempt,
+    target: &work_model::Attempt,
+    before_task: &Task,
+    after_task: &Task,
+) -> Result<bool> {
+    let Some(before) = before_task.writer_correction_assignment.as_ref() else {
+        return Ok(false);
+    };
+    let Some(after) = after_task.writer_correction_assignment.as_ref() else {
+        return Ok(false);
+    };
+    let Some(record) = target.recovery_operations.last().filter(|r| {
+        r.operation_kind == "assignment-context-recovery"
+            && r.task_id.as_deref() == Some(before_task.id.as_str())
+            && !prior
+                .recovery_operations
+                .iter()
+                .any(|old| old.operation_id == r.operation_id)
+    }) else {
+        return Ok(false);
+    };
+    let audit_path = target
+        .artifacts
+        .last()
+        .filter(|a| a.producer_id == "assignment-context-recovery")
+        .context("recovery has no audit reference")?
+        .path
+        .clone();
+    let audit_bytes = assignment_input_bytes(root, &audit_path)?;
+    let audit: work_model::AssignmentContextRecoveryAudit = serde_json::from_slice(&audit_bytes)?;
+    anyhow::ensure!(
+        matches!(audit.schema_version, 1 | 2)
+            && &audit.before == before
+            && &audit.after == after
+            && audit.attempt_digest == assignment_attempt_digest(prior)?,
+        "assignment recovery audit does not match the saved state"
+    );
+    validate_assignment_context_audit(
+        root,
+        before_task,
+        &audit_path,
+        &audit_bytes,
+        &audit,
+        record,
+    )?;
+    validate_output_free_context_files(root, &audit)?;
+    let mut restored = target.clone();
+    restored.recovery_operations.pop();
+    let audit_ref = ArtifactRef {
+        producer_id: "assignment-context-recovery".into(),
+        path: audit_path,
+    };
+    anyhow::ensure!(
+        restored.artifacts.pop() == Some(audit_ref),
+        "recovery lost its audit reference"
+    );
+    *restored
+        .tasks
+        .iter_mut()
+        .find(|t| t.id == before_task.id)
+        .context("recovery Task missing")? = before_task.clone();
+    restored.pause_record = prior.pause_record.clone(); // The host refreshes diagnostic guidance on save.
+    anyhow::ensure!(
+        restored == *prior,
+        "recovery changed Attempt history or lifecycle state"
+    );
+    let mut expected_task = before_task.clone();
+    expected_task.writer_correction_assignment = Some(after.clone());
+    Ok(expected_task == *after_task)
+}
+
+pub(crate) fn assignment_input_digest(project_root: &Path, path: &str) -> Result<String> {
+    Ok(format!(
+        "sha256:{:x}",
+        Sha256::digest(assignment_input_bytes(project_root, path)?)
+    ))
+}
+
+pub(crate) fn assignment_input_bytes(project_root: &Path, path: &str) -> Result<Vec<u8>> {
+    let resolved = resolve_input_artifact_path(project_root, path)?;
+    let relative = Path::new(path);
+    anyhow::ensure!(
+        relative.components().collect::<PathBuf>().as_os_str() == relative.as_os_str(),
+        "Writer assignment input path is not canonical: {path}"
+    );
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current)?;
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink()
+                && (if current == resolved {
+                    metadata.is_file() && metadata.len() <= 16 * 1024 * 1024
+                } else {
+                    metadata.is_dir()
+                }),
+            "Writer assignment input has an unsafe path or file type: {path}"
+        );
+    }
+    let bytes = fs::read(&resolved)
+        .with_context(|| format!("read Writer assignment input: {}", resolved.display()))?;
+    anyhow::ensure!(
+        bytes.len() <= 16 * 1024 * 1024,
+        "Writer assignment input exceeds the supported bound: {path}"
+    );
+    Ok(bytes)
 }
 
 pub(crate) fn findings_from_inputs(
@@ -3539,8 +5329,125 @@ mod tests {
     use super::{EvidenceResult, parse_evidence_document, validate_failed_evidence_snapshot};
 
     #[test]
+    fn assignment_context_freezes_carried_legacy_binding() {
+        use super::*;
+        use crate::work_model::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = WorkItem::planned("work-1", "Carry context");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let input = ArtifactRef {
+            producer_id: "required-progress".into(),
+            path: ".fluent/work/progress/work-1/attempt-1/progress.md".into(),
+        };
+        let path = tmp.path().join(&input.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original\n").unwrap();
+        let source = &mut item.attempts[0].tasks[0];
+        source.input_artifacts.push(input.clone());
+        source.status = TaskStatus::Complete;
+        let workspace = source.workspace_access.writes[0].clone();
+        source.output = Some(TaskOutput {
+            workspace_id: workspace.id,
+            workspace_path: workspace.path,
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: "source".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        let source_output = source.output.clone();
+        let writer = item.add_next_write_round("attempt-1", vec![]).unwrap();
+        item.attempts[0].tasks[1].writer_correction_assignment = Some(WriterCorrectionAssignment {
+            schema_version: 1,
+            work_item_id: "work-1".into(),
+            attempt_id: "attempt-1".into(),
+            writer_task_id: writer,
+            source_task_id: "attempt-1-write-1".into(),
+            source_candidate_commit: "source".into(),
+            source_task_inputs: vec![WriterCorrectionAssignmentInput {
+                artifact: input.clone(),
+                digest: assignment_input_digest(tmp.path(), &input.path).unwrap(),
+            }],
+            evidence: vec![],
+            findings: vec![],
+            origin: WriterCorrectionAssignmentOrigin::Captured,
+        });
+        item.attempts[0].tasks[1].status = TaskStatus::Complete;
+        item.attempts[0].tasks[1].output = source_output;
+        item.add_next_write_round("attempt-1", vec![]).unwrap();
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+        let task = &item.attempts[0].tasks[2];
+        let assignment = task.writer_correction_assignment.as_ref().unwrap();
+        assert_ne!(assignment.source_task_inputs[0].artifact, input);
+        fs::write(path, b"later context\n").unwrap();
+        validate_writer_correction_assignment(tmp.path(), &item, task, assignment).unwrap();
+    }
+
+    #[test]
+    fn assignment_context_recognizes_only_owned_projections() {
+        use super::*;
+        let mut item = work_model::WorkItem::planned("work-1", "Recognize context");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let task = &item.attempts[0].tasks[0];
+        for (producer, path, expected) in [
+            (
+                "required-progress",
+                ".fluent/work/progress/work-1/attempt-1/progress.md",
+                true,
+            ),
+            (
+                "required-progress",
+                ".fluent/work/artifacts/work-1/attempt-1/required-progress-needs-user.md",
+                true,
+            ),
+            (
+                "operator",
+                ".fluent/work/progress/work-1/attempt-1/progress.md",
+                false,
+            ),
+            (
+                "required-progress",
+                ".fluent/work/progress/work-2/attempt-1/progress.md",
+                false,
+            ),
+            (
+                "required-progress",
+                ".fluent/work/progress/work-1/attempt-2/progress.md",
+                false,
+            ),
+            (
+                "required-progress",
+                ".fluent/work/artifacts/work-1/attempt-1/progress.md",
+                false,
+            ),
+            (
+                "required-progress",
+                ".fluent/work/progress/work-1/attempt-1/./progress.md",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                mutable_assignment_context(
+                    task,
+                    &ArtifactRef {
+                        producer_id: producer.into(),
+                        path: path.into()
+                    }
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn recovery_contracts_remain_independent_of_lifecycle_callers() {
-        let source = include_str!("recovery_contracts.rs");
+        let source = [
+            include_str!("recovery_contracts.rs"),
+            include_str!("recovery_contracts/carried_finding.rs"),
+            include_str!("recovery_contracts/writer_completion.rs"),
+            include_str!("recovery_contracts/context_retry.rs"),
+        ]
+        .join("\n");
         assert!(
             !include_str!("tester.rs").contains("crate::recovery_contracts::"),
             "Tester must resolve applicability below the recovery consumer"
@@ -3575,6 +5482,278 @@ mod tests {
                 "verification assessment must stay below {caller}"
             );
         }
+    }
+
+    #[test]
+    fn corrective_writer_assignment_survives_candidate_change() {
+        use super::*;
+        use crate::work_model::{TaskOutput, TaskStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = work_model::WorkModelStore::new(tmp.path());
+        let mut item = work_model::WorkItem::planned("work-1", "Preserve correction");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let source = &mut item.attempts[0].tasks[0];
+        let workspace = source.workspace_access.writes[0].clone();
+        source.status = TaskStatus::Complete;
+        source.output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: "commit-initial".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = work_model::AttemptStatus::Reviewing;
+
+        let evidence_path =
+            work_model::work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        let evidence_file = tmp.path().join(&evidence_path);
+        std::fs::create_dir_all(evidence_file.parent().unwrap()).unwrap();
+        std::fs::write(&evidence_file, "- [ ] Preserve the assigned finding\n").unwrap();
+        let input = ArtifactRef {
+            producer_id: "review-tests".into(),
+            path: evidence_path.clone(),
+        };
+        let correction_id = item
+            .add_next_write_round("attempt-1", vec![input.clone()])
+            .unwrap();
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+        let assignment = item.attempts[0].tasks[1]
+            .writer_correction_assignment
+            .as_ref()
+            .unwrap();
+        assert_eq!(assignment.writer_task_id, correction_id);
+        assert_eq!(assignment.source_task_id, "attempt-1-write-1");
+        assert_eq!(assignment.findings.len(), 1);
+        assert_eq!(assignment.findings[0].role, "tests");
+        item.validate().unwrap();
+        store.create_work_item(&item).unwrap();
+
+        let first = store.read_work_item("work-1").unwrap();
+        let first_task = first.attempts[0].tasks[1].clone();
+        let assigned_finding_id = first_task
+            .writer_correction_assignment
+            .as_ref()
+            .unwrap()
+            .findings[0]
+            .id
+            .clone();
+        assert_eq!(
+            writer_completion_findings(tmp.path(), &first_task).unwrap()[0].id,
+            assigned_finding_id
+        );
+
+        let mut changed = first;
+        let correction = &mut changed.attempts[0].tasks[1];
+        correction.status = TaskStatus::Complete;
+        correction.output = Some(TaskOutput {
+            workspace_id: workspace.id,
+            workspace_path: workspace.path,
+            source_branch: "main".into(),
+            base_commit: Some("commit-initial".into()),
+            commit: "commit-corrected".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        changed.attempts[0].status = work_model::AttemptStatus::Reviewing;
+        store.write_work_item(&changed).unwrap();
+
+        let stored = store.read_work_item("work-1").unwrap();
+        let corrected = stored.attempts[0].tasks[1].clone();
+        assert_eq!(
+            writer_completion_findings(tmp.path(), &corrected)
+                .unwrap()
+                .into_iter()
+                .map(|finding| finding.id)
+                .collect::<Vec<_>>(),
+            vec![assigned_finding_id]
+        );
+    }
+
+    #[test]
+    fn later_corrective_writer_captures_a_new_assignment() {
+        use super::*;
+        use crate::work_model::{TaskOutput, TaskStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = work_model::WorkItem::planned("work-1", "Preserve correction rounds");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let workspace = item.attempts[0].tasks[0].workspace_access.writes[0].clone();
+        item.attempts[0].tasks[0].status = TaskStatus::Complete;
+        item.attempts[0].tasks[0].output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: "commit-initial".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = work_model::AttemptStatus::Reviewing;
+
+        let first_path =
+            work_model::work_artifact_path("work-1", "attempt-1", "review-tests/round-1/review.md");
+        let first_file = tmp.path().join(&first_path);
+        std::fs::create_dir_all(first_file.parent().unwrap()).unwrap();
+        std::fs::write(&first_file, "- [ ] Resolve the first review finding\n").unwrap();
+        let first_input = ArtifactRef {
+            producer_id: "review-tests".into(),
+            path: first_path,
+        };
+        let first_task_id = item
+            .add_next_write_round("attempt-1", vec![first_input])
+            .unwrap();
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+        let first_assignment = item.attempts[0].tasks[1]
+            .writer_correction_assignment
+            .clone()
+            .unwrap();
+
+        item.attempts[0].tasks[1].status = TaskStatus::Complete;
+        item.attempts[0].tasks[1].output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: Some("commit-initial".into()),
+            commit: "commit-corrected".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        let second_path =
+            work_model::work_artifact_path("work-1", "attempt-1", "review-tests/round-2/review.md");
+        let second_file = tmp.path().join(&second_path);
+        std::fs::create_dir_all(second_file.parent().unwrap()).unwrap();
+        std::fs::write(&second_file, "- [ ] Resolve the second review finding\n").unwrap();
+        let second_input = ArtifactRef {
+            producer_id: "review-tests".into(),
+            path: second_path,
+        };
+        let second_task_id = item
+            .add_next_write_round("attempt-1", vec![second_input])
+            .unwrap();
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+
+        let second_assignment = item.attempts[0].tasks[2]
+            .writer_correction_assignment
+            .clone()
+            .unwrap();
+        assert_eq!(first_assignment.writer_task_id, first_task_id);
+        assert_eq!(second_assignment.writer_task_id, second_task_id);
+        assert_eq!(second_assignment.source_task_id, first_task_id);
+        assert_eq!(
+            second_assignment.source_candidate_commit,
+            "commit-corrected"
+        );
+        assert_ne!(second_assignment.findings, first_assignment.findings);
+        assert_eq!(second_assignment.findings.len(), 1);
+        assert!(
+            second_assignment.findings[0]
+                .requirement
+                .contains("second review finding")
+        );
+        assert_eq!(
+            item.attempts[0].tasks[1]
+                .writer_correction_assignment
+                .as_ref(),
+            Some(&first_assignment)
+        );
+    }
+
+    #[test]
+    fn writer_continuation_carries_assignment_after_review_history() {
+        use super::*;
+        use crate::work_model::{TaskOutput, TaskStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut item = work_model::WorkItem::planned("work-1", "Preserve Writer continuation");
+        item.add_initial_attempt("attempt-1").unwrap();
+        let workspace = item.attempts[0].tasks[0].workspace_access.writes[0].clone();
+        item.attempts[0].tasks[0].status = TaskStatus::Complete;
+        item.attempts[0].tasks[0].output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: None,
+            commit: "commit-initial".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+        item.attempts[0].status = work_model::AttemptStatus::Reviewing;
+
+        let review_path =
+            work_model::work_artifact_path("work-1", "attempt-1", "review-tests/review.md");
+        let review_file = tmp.path().join(&review_path);
+        std::fs::create_dir_all(review_file.parent().unwrap()).unwrap();
+        std::fs::write(&review_file, "- [ ] Resolve the assigned finding\n").unwrap();
+        let first_task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "review-tests".into(),
+                    path: review_path,
+                }],
+            )
+            .unwrap();
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+        let first_assignment = item.attempts[0].tasks[1]
+            .writer_correction_assignment
+            .clone()
+            .unwrap();
+        item.attempts[0].tasks[1].status = TaskStatus::Complete;
+        item.attempts[0].tasks[1].output = Some(TaskOutput {
+            workspace_id: workspace.id.clone(),
+            workspace_path: workspace.path.clone(),
+            source_branch: "main".into(),
+            base_commit: Some("commit-initial".into()),
+            commit: "commit-corrected".into(),
+            no_change: None,
+            learner_canonicalization: None,
+        });
+
+        item.add_review_tasks("attempt-1", &["tests"]).unwrap();
+        let continuation_path = work_model::work_artifact_path(
+            "work-1",
+            "attempt-1",
+            "writer-completion/continuation.json",
+        );
+        let continuation_file = tmp.path().join(&continuation_path);
+        std::fs::create_dir_all(continuation_file.parent().unwrap()).unwrap();
+        std::fs::write(&continuation_file, "{}\n").unwrap();
+        let continuation_task_id = item
+            .add_next_write_round(
+                "attempt-1",
+                vec![ArtifactRef {
+                    producer_id: "writer-completion".into(),
+                    path: continuation_path,
+                }],
+            )
+            .unwrap();
+        let continuation = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == continuation_task_id)
+            .unwrap();
+        assert!(!is_corrective_writer_task(continuation));
+        prepare_writer_correction_assignments(tmp.path(), &mut item).unwrap();
+
+        let carried = item.attempts[0]
+            .tasks
+            .iter()
+            .find(|task| task.id == continuation_task_id)
+            .unwrap()
+            .writer_correction_assignment
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_assignment.source_task_id, "attempt-1-write-1");
+        assert_eq!(first_assignment.writer_task_id, first_task_id);
+        assert_eq!(carried.source_task_id, first_assignment.source_task_id);
+        assert_eq!(carried.source_candidate_commit, "commit-initial");
+        assert_eq!(carried.evidence, first_assignment.evidence);
+        assert_eq!(carried.findings, first_assignment.findings);
+        assert_eq!(carried.origin, first_assignment.origin);
     }
 
     #[test]
@@ -3654,6 +5833,7 @@ mod tests {
         use crate::work_model::*;
         let project = tempfile::tempdir().unwrap();
         let recovery = EvidenceRecovery {
+            carried_finding: None,
             id: "pending".into(),
             candidate_commit: "candidate".into(),
             attachment: EvidenceAttachment {
@@ -3895,6 +6075,27 @@ pub(crate) fn authoritative_writer_completion_matrix(
     Ok(Some(matrix))
 }
 
+/// Read pending work through the same matrix and assignment contract used by
+/// completion. Progress text and current verification cannot retire these rows.
+pub(crate) fn pending_writer_completion_rows(
+    project_root: &Path,
+    attempt: &work_model::Attempt,
+    writer: &Task,
+) -> Result<Vec<work_model::WriterCompletionRow>> {
+    let Some(contract) = attempt.writer_completion_contract.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut matrix = authoritative_writer_completion_matrix(project_root, attempt, writer)?
+        .context("Writer completion matrix is missing from current context")?;
+    let findings = writer_completion_findings(project_root, writer)?;
+    apply_accepted_carried_findings(project_root, attempt, writer, &mut matrix)?;
+    matrix
+        .status_against(contract, &writer.id, &findings)
+        .map_err(anyhow::Error::msg)
+        .context("validate current Writer completion context")?;
+    Ok(matrix.pending_writer_rows())
+}
+
 pub(crate) fn writer_completion_matrix_ref(
     project_root: &Path,
     attempt: &work_model::Attempt,
@@ -3923,6 +6124,7 @@ pub(crate) enum EvidenceSelector {
     RequiredCheck(String),
     ReviewArtifact(String),
     PlanRow(String),
+    Finding(String),
 }
 
 impl EvidenceSelector {
@@ -3931,6 +6133,7 @@ impl EvidenceSelector {
             Self::RequiredCheck(id) => format!("--required-check {id}"),
             Self::ReviewArtifact(path) => format!("--review-artifact {path}"),
             Self::PlanRow(id) => format!("--plan-row {id}"),
+            Self::Finding(id) => format!("--finding {id}"),
         }
     }
 }
@@ -3957,7 +6160,12 @@ pub(crate) fn inspect_expired_pending_evidence(
         return Ok(None);
     }
     let target = &recovery.targets[0];
-    let (selector, applicability) = if let Some(check) = &recovery.required_check {
+    let (selector, applicability) = if let Some(saved) = &recovery.carried_finding {
+        (
+            EvidenceSelector::Finding(saved.binding.finding.id.clone()),
+            saved.binding.applicability.clone(),
+        )
+    } else if let Some(check) = &recovery.required_check {
         let selector = match &check.source {
             work_model::RequiredCheckSource::CanonicalTester { .. } => {
                 EvidenceSelector::RequiredCheck(check.id.clone())
@@ -4113,6 +6321,22 @@ pub(crate) fn required_check_recovery_status(
     project_root: &Path,
     attempt: &work_model::Attempt,
 ) -> Result<Option<RequiredCheckRecoveryStatus>> {
+    if attempt
+        .evidence_recoveries
+        .iter()
+        .any(|r| r.carried_finding.is_some())
+        || (attempt.pause_kind == Some(work_model::PauseKind::WriterCompletion)
+            && attempt
+                .tasks
+                .iter()
+                .any(|t| t.writer_correction_assignment.is_some()))
+    {
+        if let Some(status) =
+            carried_finding::carried_finding_recovery_status(project_root, attempt)?
+        {
+            return Ok(Some(status));
+        }
+    }
     if let Some(expired) = inspect_expired_pending_evidence(project_root, attempt)? {
         let settled =
             validate_pending_evidence_owners(project_root, attempt, &expired.recovery).is_ok();
@@ -4219,6 +6443,30 @@ pub(crate) fn required_check_recovery_status(
             reason: canonical.blockers.join("\n\n"),
             next_action: None,
         }));
+    }
+    // An ordinary round scheduled after evidence review still needs aggregate
+    // interpretation once its workers finish. Let that transition record any
+    // unresolved canonical checks as a pause; this grants no verification credit.
+    // Task completion can already mark the Attempt Complete, but NotReviewed
+    // still requires interpretation. Paused or interpreted Attempts keep the
+    // strict resume checks below.
+    if matches!(
+        attempt.status,
+        work_model::AttemptStatus::Reviewing | work_model::AttemptStatus::Complete
+    ) && attempt.review_state == Some(work_model::AttemptReviewState::NotReviewed)
+        && attempt.pause_kind.is_none()
+        && attempt.tasks.last().is_some_and(|task| {
+            task.kind == TaskKind::Review
+                && task.status == TaskStatus::Complete
+                && task.evidence_review_context.is_none()
+                && crate::review::REVIEWERS.contains(&task.role.as_str())
+                && task
+                    .review_context
+                    .as_ref()
+                    .is_some_and(|context| Some(context.candidate_commit.as_str()) == candidate)
+        })
+    {
+        return Ok(None);
     }
     if attempt.writer_completion_contract.is_some()
         && attempt
@@ -4398,7 +6646,8 @@ pub(crate) mod verification_tests {
             no_change: None,
             learner_canonicalization: None,
         });
-        item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        item.add_next_review_tasks("attempt-1", crate::review::REVIEWERS)
+            .unwrap();
         for task in item.attempts[0]
             .tasks
             .iter_mut()
@@ -4442,6 +6691,42 @@ pub(crate) mod verification_tests {
         (root, item)
     }
 
+    #[test]
+    fn completed_ordinary_review_can_settle_unresolved_checks() {
+        let (root, mut item) = fixture(false);
+        accept_first_check(root.path(), &mut item);
+        item.attempts[0].writer_completion_contract = None;
+        let review_ids = item.add_next_review_tasks("attempt-1", &["tests"]).unwrap();
+        for task in item.attempts[0]
+            .tasks
+            .iter_mut()
+            .filter(|task| review_ids.contains(&task.id))
+        {
+            task.status = TaskStatus::Complete;
+            let area = root.path().join(&task.artifact_area.as_ref().unwrap().path);
+            fs::create_dir_all(&area).unwrap();
+            fs::write(area.join("review.md"), "Verdict: pass\n").unwrap();
+        }
+        for status in [AttemptStatus::Reviewing, AttemptStatus::Complete] {
+            item.attempts[0].status = status;
+            let admission = required_check_recovery_status(root.path(), &item.attempts[0]).unwrap();
+            assert!(
+                admission.as_ref().is_none_or(|status| status.can_resume),
+                "completed ordinary review must reach aggregate interpretation: {admission:?}"
+            );
+        }
+        // Interpreting the round must still leave the unrelated failed command
+        // blocked. The same evidence cannot authorize another resume afterward.
+        item.attempts[0].status = AttemptStatus::NeedsUser;
+        item.attempts[0].pause_kind = Some(PauseKind::HostEvidence);
+        item.attempts[0].review_state = Some(AttemptReviewState::Failed);
+        let blocked = required_check_recovery_status(root.path(), &item.attempts[0])
+            .unwrap()
+            .unwrap();
+        assert!(!blocked.can_resume);
+        assert!(blocked.reason.contains("sh -c false"));
+    }
+
     pub(crate) fn accept_first_check(root: &Path, item: &mut WorkItem) {
         let attempt = &mut item.attempts[0];
         let check = assess_canonical_checks(root, attempt).unwrap().checks[0].clone();
@@ -4459,7 +6744,7 @@ pub(crate) mod verification_tests {
         let mut review = attempt
             .tasks
             .iter()
-            .find(|task| task.kind == TaskKind::Review)
+            .find(|task| task.kind == TaskKind::Review && task.role == "tests")
             .unwrap()
             .clone();
         review.id = "accepted-tests-review".into();
@@ -4477,6 +6762,7 @@ pub(crate) mod verification_tests {
             prior_review_artifact: prior.clone(),
         });
         attempt.evidence_recoveries.push(EvidenceRecovery {
+            carried_finding: None,
             id: "accepted".into(),
             candidate_commit: check.candidate_commit.clone(),
             attachment,

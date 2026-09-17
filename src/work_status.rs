@@ -136,18 +136,7 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
             .find(|candidate| candidate.attempt_id == attempt.id)
     });
 
-    let recovery_blocker =
-        attempt
-            .and_then(|attempt| project_root.map(|root| (root, attempt)))
-            .and_then(|(root, attempt)| {
-                match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
-                    Ok(Some(status)) => Some(status.reason),
-                    Err(error) => Some(format!(
-                        "Required check proof is missing or changed: {error:#}"
-                    )),
-                    Ok(None) => None,
-                }
-            });
+    let recovery = attempt_recovery_guidance(attempt, project_root);
     let verification = attempt.and_then(|attempt| {
         project_root.and_then(|root| {
             crate::verification_assessment::assess_current_verification(root, attempt).ok()
@@ -155,7 +144,7 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
     });
     WorkItemStatus {
         verification,
-        recovery_blocker,
+        recovery_blocker: recovery.blocker,
         id: item.id.clone(),
         title: item.title.clone(),
         attempt: attempt
@@ -191,7 +180,7 @@ pub fn summarize_work_item(item: &WorkItem, project_root: Option<&Path>) -> Work
         }) {
             None
         } else {
-            attempt_recovery_next_action(attempt, project_root)
+            recovery.next_action
         },
         metrics: work_metrics(item, project_root),
         compatibility_warnings: item.compatibility_warnings(),
@@ -412,8 +401,12 @@ pub fn work_item_show_value(
         output["compatibility-warnings"] = serde_json::to_value(warnings)?;
     }
     let attempt = display_attempt(item, Some(project_root));
-    if let Some(next_action) = attempt_recovery_next_action(attempt, Some(project_root)) {
+    let recovery = attempt_recovery_guidance(attempt, Some(project_root));
+    if let Some(next_action) = recovery.next_action {
         output["next-action"] = serde_json::to_value(next_action)?;
+    }
+    if let Some(blocker) = recovery.blocker {
+        output["recovery-blocker"] = serde_json::to_value(blocker)?;
     }
     if let Some(attempt) = attempt {
         match crate::recovery_contracts::required_check_recovery_status(project_root, attempt) {
@@ -946,7 +939,77 @@ pub(crate) fn derive_attempt_recovery_next_action(
     attempt: Option<&Attempt>,
     project_root: Option<&Path>,
 ) -> Option<String> {
-    let attempt = attempt?;
+    derive_attempt_recovery_guidance(attempt, project_root).next_action
+}
+
+#[derive(Default)]
+struct AttemptRecoveryGuidance {
+    next_action: Option<String>,
+    blocker: Option<String>,
+}
+
+fn derive_attempt_recovery_guidance(
+    attempt: Option<&Attempt>,
+    project_root: Option<&Path>,
+) -> AttemptRecoveryGuidance {
+    let Some(attempt) = attempt else {
+        return AttemptRecoveryGuidance::default();
+    };
+    if let Some(root) = project_root {
+        match crate::recovery_contracts::context_retry::status_action(root, attempt) {
+            Ok(Some(next_action)) => {
+                return AttemptRecoveryGuidance {
+                    blocker: next_action
+                        .is_none()
+                        .then(|| "No eligible context recovery action".to_string()),
+                    next_action,
+                };
+            }
+            Err(error) => {
+                // Keep the rejection beside the absent action so display cannot
+                // replace it with generic resume guidance.
+                return AttemptRecoveryGuidance {
+                    next_action: None,
+                    blocker: Some(format!("Context recovery is blocked: {error:#}")),
+                };
+            }
+            Ok(None) => {}
+        }
+    }
+    let blocker =
+        project_root.and_then(
+            |root| match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
+                Ok(Some(status)) => Some(status.reason),
+                Err(error) => Some(format!(
+                    "Required check proof is missing or changed: {error:#}"
+                )),
+                Ok(None) => None,
+            },
+        );
+    AttemptRecoveryGuidance {
+        next_action: derive_other_attempt_recovery_next_action(attempt, project_root),
+        blocker,
+    }
+}
+
+fn derive_other_attempt_recovery_next_action(
+    attempt: &Attempt,
+    project_root: Option<&Path>,
+) -> Option<String> {
+    if let Some(root) = project_root {
+        match crate::recovery_contracts::assignment_context_recovery_action(root, attempt) {
+            Ok(Some(action)) => return Some(action),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
+    }
+    if let Some(root) = project_root {
+        match crate::usage_limit_contracts::status_action(root, attempt) {
+            Ok(Some(action)) => return action,
+            Err(_) => return None,
+            Ok(None) => {}
+        }
+    }
     if let Some(root) = project_root {
         match crate::recovery_contracts::required_check_recovery_status(root, attempt) {
             Ok(Some(status)) => return status.next_action,
@@ -1095,20 +1158,30 @@ pub fn attempt_recovery_next_action(
     attempt: Option<&Attempt>,
     project_root: Option<&Path>,
 ) -> Option<String> {
-    let attempt = attempt?;
-    let derived = derive_attempt_recovery_next_action(Some(attempt), project_root);
+    attempt_recovery_guidance(attempt, project_root).next_action
+}
+
+fn attempt_recovery_guidance(
+    attempt: Option<&Attempt>,
+    project_root: Option<&Path>,
+) -> AttemptRecoveryGuidance {
+    let mut guidance = derive_attempt_recovery_guidance(attempt, project_root);
+    let Some(attempt) = attempt else {
+        return guidance;
+    };
     if let Some(record) = attempt.pause_record.as_ref() {
         if record.matches_attempt(attempt) {
             match (&record.next_operation, &record.no_safe_operation_reason) {
-                (Some(operation), _) if derived.as_deref() == Some(operation.command.as_str()) => {
-                    return Some(operation.command.clone());
+                (Some(operation), _)
+                    if guidance.next_action.as_deref() == Some(operation.command.as_str()) =>
+                {
+                    guidance.next_action = Some(operation.command.clone());
                 }
-                (None, Some(_)) if derived.is_none() => return None,
                 _ => {}
             }
         }
     }
-    derived
+    guidance
 }
 
 /// Render the common pause section appended to operator handoffs.
@@ -1906,6 +1979,7 @@ mod tests {
                     path: ".fluent/work/artifacts/work-1/attempt-1/evidence-review".to_string(),
                 }),
                 review_context: None,
+                writer_correction_assignment: None,
                 verification_context: None,
                 evidence_review_context: Some(crate::work_model::EvidenceReviewContext {
                     recovery_id: recovery_id.to_string(),
@@ -1922,6 +1996,7 @@ mod tests {
                 completed_at: None,
             }],
             evidence_recoveries: vec![crate::work_model::EvidenceRecovery {
+                carried_finding: None,
                 required_check: None,
                 id: recovery_id.to_string(),
                 candidate_commit: candidate_commit.to_string(),
@@ -1955,6 +2030,7 @@ mod tests {
             work_item_id: "work-1".to_string(),
             status: AttemptStatus::NeedsUser,
             evidence_recoveries: vec![crate::work_model::EvidenceRecovery {
+                carried_finding: None,
                 required_check: None,
                 id: "host-evidence-1".to_string(),
                 candidate_commit: "abc123".to_string(),

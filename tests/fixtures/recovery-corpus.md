@@ -52,6 +52,45 @@ candidate-bound operation checks without launching or dispatching the command;
 the public binary tests cover the real extension, revision, retry, and resume
 routes.
 
+`writer-assignment-mismatch` records the saved shape addressed by this repair:
+the completed corrective Writer changed its candidate, while its original
+finding assignment and source evidence remained the obligations to reevaluate.
+The offline replay checks only candidate binding, exact operation replay, stale
+candidate rejection, serialization, and logical history preservation. The
+production paths are covered separately by
+`corrective_writer_assignment_binds_source_evidence`,
+`corrective_writer_assignment_survives_candidate_change`,
+`corrected_candidate_requires_fresh_verification`,
+`corrected_candidate_reaches_reviews_before_final_tester`,
+`corrective_writer_assignment_rejects_invalid_authority`,
+`saved_writer_assignment_recovers_through_public_resume`,
+`saved_writer_assignment_resume_rejects_unsafe_state`,
+`saved_writer_assignment_recovery_preserves_history`, and
+`saved_writer_assignment_resume_is_idempotent` in `tests/binary.rs`; those tests
+exercise assignment publication, fresh verification, and foreground or queued
+resume against isolated repositories. The corpus does not execute its command
+string or replace that production coverage.
+
+`usage-limit-interrupted-writer` records a failed corrective Writer with a
+surviving final native quota stream, saved assignment, and partial committed and
+uncommitted source. `candidate-commit` remains the completed source Writer's
+output; the input digest represents the separate typed approval, including the
+partial HEAD and source state. There is no attached host-evidence digest. The
+shared replay checks operation identity and retained history only. The
+`usage_limit_writer_` tests execute dedicated approval and separate resume,
+rejection, publication interruption, queue/claim, confinement, and old-reader
+compatibility through real public routes. No fixture copies live Work, leases,
+credentials, or provider sessions. Approval grants no later gate credit.
+
+`usage-limit-preflight-pause` preserves the approved retry whose private Codex
+readiness failed before reservation. It names the unchanged source, assignment,
+approval, preparation, and native Task/Attempt transitions without copying live
+operational state. The corpus verifies operation binding and retained logical
+history; it does not prove host confinement or interpret a pause label as launch
+authority. The `usage_limit_writer_preflight_pause_` binary tests exercise native
+preflight failure, foreground and queued resume, scheduler claim, direct Task and
+pre-spawn checks, rejected proof, later stops/failures, and read-only guidance.
+
 Workflow cases document public reconciliation commands whose state lives outside
 an Attempt, such as an already-landed Merge Candidate. Their command and history
 are still checked for safe, machine-independent shape.

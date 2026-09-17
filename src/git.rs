@@ -8,7 +8,7 @@ const LOCK_RETRY_MAX_ATTEMPTS: usize = 8;
 const LOCK_RETRY_BASE_MS: u64 = 20;
 const LOCK_RETRY_CAP_MS: u64 = 320;
 
-fn build_command(cwd: &Path, args: &[&str]) -> Command {
+pub(crate) fn build_command(cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
     cmd.env("GIT_EDITOR", "true");

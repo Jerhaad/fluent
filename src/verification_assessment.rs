@@ -1077,6 +1077,7 @@ fn accepted_review_check_results(
         .filter_map(|recovery| {
             if recovery.state != EvidenceRecoveryState::Complete
                 || recovery.candidate_commit != latest_candidate
+                || recovery.carried_finding.is_some()
             {
                 return None;
             }
@@ -1827,7 +1828,7 @@ pub(crate) fn requested_legacy_host_command(gate: &serde_json::Value) -> Option<
 
 pub(crate) struct AcceptedCommandProof {
     pub command: String,
-    bindings: Vec<work_model::BoundRecheckArtifact>,
+    pub(crate) bindings: Vec<work_model::BoundRecheckArtifact>,
 }
 
 #[derive(Deserialize)]

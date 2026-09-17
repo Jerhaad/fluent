@@ -52,6 +52,43 @@ pub fn classify_provider_unavailable(
     classify_provider_phase(provider, transcript).then_some(ProviderUnavailable { provider })
 }
 
+/// Recognize the supported final native Codex quota stream. Earlier launches
+/// may have made progress; this proves only this captured terminal failure.
+/// Session rollouts and model-authored quota text never enter this grammar.
+pub(crate) fn codex_usage_limit_failure(bytes: &[u8]) -> Option<String> {
+    let events = parse_json_lines(std::str::from_utf8(bytes).ok()?)?;
+    let [thread, turn, error, failed] = events.as_slice() else {
+        return None;
+    };
+    let thread_id = thread["thread_id"].as_str()?.to_string();
+    let message = error["message"].as_str()?;
+    let objects_have_supported_keys = [
+        (thread, &["type", "thread_id"][..]),
+        (turn, &["type"][..]),
+        (error, &["type", "message"][..]),
+        (failed, &["type", "error"][..]),
+        (&failed["error"], &["message"][..]),
+    ]
+    .iter()
+    .all(|(value, keys)| {
+        value.as_object().is_some_and(|object| {
+            object.len() == keys.len() && object.keys().all(|key| keys.contains(&key.as_str()))
+        })
+    });
+    (objects_have_supported_keys
+        && !thread_id.is_empty()
+        && thread_id.len() <= 256
+        && thread["type"] == "thread.started"
+        && turn["type"] == "turn.started"
+        && error["type"] == "error"
+        && failed["type"] == "turn.failed"
+        && message.starts_with("You've hit your usage limit. ")
+        && message.len() <= 4096
+        && !message.contains(['\n', '\r'])
+        && failed["error"]["message"].as_str() == Some(message))
+    .then_some(thread_id)
+}
+
 /// Recognize a Codex launch that exhausted its own reconnect path before the
 /// model produced any message or tool activity.
 ///
@@ -394,6 +431,32 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/provider-transcripts")
             .join(name)
+    }
+
+    #[test]
+    fn usage_limit_requires_matching_native_terminal_events() {
+        let transcript = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"saved-thread\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"error\",\"message\":\"You've hit your usage limit. Try again later.\"}\n",
+            "{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit. Try again later.\"}}\n",
+        );
+        assert_eq!(
+            codex_usage_limit_failure(transcript.as_bytes()).as_deref(),
+            Some("saved-thread")
+        );
+        for invalid in [
+            transcript.replace("turn.failed", "turn.completed"),
+            transcript.replacen("Try again later.", "Connection failed.", 1),
+            transcript.replace("\"error\",\"message\"", "\"agent_message\",\"message\""),
+            format!("{transcript}{{}}\n"),
+            transcript.lines().skip(1).collect::<Vec<_>>().join("\n"),
+        ] {
+            assert!(
+                codex_usage_limit_failure(invalid.as_bytes()).is_none(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

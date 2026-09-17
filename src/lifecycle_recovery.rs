@@ -10,16 +10,76 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::work_model::{
-    ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, LearningFailureKind,
-    MergeCandidateMergeStatus, MergeReviewState, PauseKind, Task, TaskKind, TaskStatus, WorkItem,
+    ArtifactRef, Attempt, AttemptReviewState, AttemptStatus, DurableTransitionMetadata,
+    DurableTransitionOrigin, LearningFailureKind, MergeCandidateMergeStatus, MergeReviewState,
+    PauseKind, Task, TaskKind, TaskStatus, WorkItem, WorkModelError, WorkModelStore,
     resolve_managed_sibling_workspace_path, work_artifact_path,
 };
+
+// Keep foreground and queued resume on the same immutable inspection boundary.
+pub(crate) use crate::usage_limit_contracts::resume_ready as usage_limit_writer_resume_ready;
 
 const LEGACY_LEARNER_GATE_SCHEMA_VERSION: u32 = 2;
 const RETIRED_COMMIT_STYLE_RECLASSIFICATION_PRODUCER: &str = "commit-style-policy";
 const RETIRED_COMMIT_STYLE_RECLASSIFICATION_FILE: &str = "reclassification.json";
 const RETIRED_COMMIT_STYLE_RECLASSIFICATION_SCHEMA_VERSION: u32 = 1;
 const RETIRED_COMMIT_STYLE_RECLASSIFICATION_MAX_BYTES: u64 = 256 * 1024;
+
+/// Publish a verified legacy Writer assignment during an explicit resume.
+/// Recognition and all evidence checks remain read-only in
+/// `recovery_contracts`; this function owns the lifecycle mutation and repeats
+/// the inspection under the aggregate's fresh model lock.
+pub(crate) fn recover_legacy_writer_correction_assignment(
+    project_root: &Path,
+    store: &WorkModelStore,
+    work_item_id: &str,
+    attempt_id: &str,
+) -> Result<bool> {
+    let transition = DurableTransitionMetadata {
+        origin: DurableTransitionOrigin::Fluent,
+        reason: Some("publish verified legacy Writer correction assignment".into()),
+        evidence_ref: None,
+    };
+    Ok(
+        store.mutate_work_item_with_transition(work_item_id, &transition, |item| {
+            let Some(assignment) =
+                crate::recovery_contracts::inspect_legacy_writer_correction_assignment(
+                    project_root,
+                    item,
+                    attempt_id,
+                )
+                .map_err(|error| WorkModelError::AttemptResumeIneligible {
+                    attempt_id: attempt_id.to_string(),
+                    reason: format!("legacy Writer assignment is not safe to recover: {error:#}"),
+                })?
+            else {
+                return Ok(false);
+            };
+            let attempt = item
+                .attempts
+                .iter_mut()
+                .find(|attempt| attempt.id == attempt_id)
+                .ok_or_else(|| WorkModelError::AttemptNotFound {
+                    id: attempt_id.to_string(),
+                })?;
+            let task = attempt
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == assignment.writer_task_id)
+                .ok_or_else(|| WorkModelError::TaskNotFound {
+                    id: assignment.writer_task_id.clone(),
+                })?;
+            if task.writer_correction_assignment.is_some() {
+                return Err(WorkModelError::InvalidWriterCorrectionAssignment {
+                    task_id: task.id.clone(),
+                    reason: "legacy assignment appeared after fresh inspection".into(),
+                });
+            }
+            task.writer_correction_assignment = Some(assignment);
+            Ok(true)
+        })?,
+    )
+}
 
 /// The immutable paused frontier that may reuse a candidate after Factory
 /// retires only the stored commit-message presentation findings.

@@ -337,16 +337,17 @@ test_attempt_loop_plans_followup_with_mixed_failed_and_missing_reviews() {
   run_attempt_loop > "$TEST_DIR/stdout" || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "Planned write Task attempt-1-write-2" || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "Completed Task attempt-1-write-2" || RESULT=1
-  assert_contains "$(cat "$TEST_DIR/stdout")" "Planned 1 review Tasks for Attempt attempt-1" || RESULT=1
+  assert_contains "$(cat "$TEST_DIR/stdout")" "Planned 2 review Tasks for Attempt attempt-1" || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "attempt-1-review-2-documentation" || RESULT=1
   assert_contains "$(cat "$TEST_DIR/stdout")" "Merge Candidate attempt-1-merge-candidate is ready" || RESULT=1
   [ "$(json_value '.attempts[0].status')" = "complete" ] || RESULT=1
   [ "$(json_value '.attempts[0].review_state')" = "passed" ] || RESULT=1
   [ "$(json_value '[.attempts[0].tasks[] | select(.id == "attempt-1-write-2") | .input_artifacts[] | select(.path == ".fluent/work/artifacts/work-1/attempt-1/attempt-1-review-documentation/review.md")] | length')" = "1" ] || RESULT=1
   [ "$(json_value '[.attempts[0].artifacts[] | select(.producer_id == "attempt-1-write-2" and (.path | endswith("/candidate-gate.json")))] | length')" = "1" ] || RESULT=1
-  [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "review" and (.id | startswith("attempt-1-review-2-")))] | length')" = "1" ] || RESULT=1
+  [ "$(json_value '[.attempts[0].tasks[] | select(.kind == "review" and (.id | startswith("attempt-1-review-2-")))] | length')" = "2" ] || RESULT=1
   [ "$(json_value '.attempts[0].tasks[] | select(.id == "attempt-1-review-2-documentation") | .role')" = "documentation" ] || RESULT=1
   [ "$(json_value '[.attempts[0].tasks[] | select(.id == "attempt-1-review-2-documentation") | .input_artifacts[] | select(.producer_id == "attempt-1-write-2" and (.path | endswith("/candidate-gate.json")))] | length')" = "1" ] || RESULT=1
+  [ "$(json_value '.attempts[0].tasks[] | select(.id == "attempt-1-review-2-tests") | .role')" = "tests" ] || RESULT=1
   return $RESULT
 }
 

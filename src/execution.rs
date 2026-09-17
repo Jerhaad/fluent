@@ -301,6 +301,18 @@ pub fn spawn(command: &mut Command, transcript: &Path) -> Result<std::process::C
                 .find(|attempt| attempt.id == owner.attempt_id)
                 .ok_or_else(|| anyhow::anyhow!("execution's owning Attempt is missing"))?;
             attempt.ensure_not_canceled()?;
+            crate::writer_completion_recovery::before_context_retry_spawn(
+                &owner.project_root,
+                &item,
+                &owner.attempt_id,
+                transcript,
+            )?;
+            crate::usage_limit_recovery::before_spawn(
+                &owner.project_root,
+                &item,
+                &owner.attempt_id,
+                transcript,
+            )?;
             Some(lock)
         }
         _ => None,

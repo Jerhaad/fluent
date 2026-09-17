@@ -18,7 +18,11 @@ schedules a Writer on the existing Attempt.
 
 ## Contents
 
+- [Recover mutable Writer assignment context](#recover-mutable-writer-assignment-context)
+- [Recover a usage-limit-interrupted Writer](#recover-a-usage-limit-interrupted-writer)
+- [Diagnose a reported process leak](#diagnose-a-reported-process-leak)
 - [Attach host-only evidence](#attach-host-only-evidence)
+- [Attach proof for a carried finding](#attach-proof-for-a-carried-finding)
 - [Declare when a command result applies](#declare-when-a-command-result-applies)
 - [Run one focused Tests check](#run-one-focused-tests-check)
 - [Classify a candidate-bound source correction](#classify-a-candidate-bound-source-correction)
@@ -110,6 +114,20 @@ Fluent snapshots the exact document, binds it to that candidate, and reruns only
 the named reviewers. Do not edit the candidate or invent a commit. Inspect the
 Work Item again for the next action.
 
+When ordinary Tests Review follows targeted acceptance, Fluent supplies the
+currently applicable proof and targeted decision with their exact source paths.
+Its current-acceptance summary names the candidate and the accepted Plan row,
+requested check, carried finding, or canonical command occurrence. The historical
+Writer matrix remains unchanged, including pending host-owned rows. Reviewers
+should read that matrix as the Writer's claim and use the supplied host sources
+to assess the separate accepted check.
+
+Fluent rechecks selected proof before direct or queued reviewer launch. If a
+source changes, disappears, or expires, inspect the reported binding and current
+handoff before supplying matching evidence through the same public attachment
+route. A passing targeted decision alone does not complete ordinary reviews,
+the final canonical Tester, or Learning.
+
 A command that Fluent could not launch because its declared platform prerequisite
 did not match remains unresolved. Repair that environment or submit exact proof
 from an authorized host. A command that ran and exited nonzero without a proven
@@ -135,6 +153,54 @@ queue resume while its dispatch is active reuses that dispatch. A later stop
 requires explicit resume authority; an earlier queued dispatch cannot clear it.
 Remove an unclaimed stale dispatch with `fluent queue remove <work-item>` before
 issuing the newly authorized `fluent queue resume <work-item> --attempt <attempt>`.
+
+## Attach proof for a carried finding
+
+A carried finding is an unresolved Tests finding retained in the latest Writer's
+immutable corrective assignment. After source corrections, its original Review
+may still name candidate A while the completed Writer names B. When this is the
+only remaining Writer obligation, inspect `fluent work-item show <work-item>` for
+the exact finding ID, current candidate, command, and relative working directory.
+
+After the operator separately authorizes and runs that check against B, attach
+the schema-version-1 result using its exact command and working directory:
+
+```sh
+fluent attempt evidence attach <work-item> <attempt> \
+  --candidate <current-candidate-sha> --finding <assigned-finding-id> \
+  --evidence-file <host-result.json>
+fluent attempt run <work-item> <attempt>
+```
+
+Use `--finding` alone among the attachment selectors. Fluent requires a completed
+latest Writer, `needs-user/writer-completion`, a clean registered managed candidate,
+settled Task and Learner owners, no landing owner or Merge Candidate, and complete
+remaining Writer rows. The original assigned Tests Review must request exactly
+one `Evidence-Command` and one `Evidence-Working-Directory`; it need not contain
+an evidence-targeted disposition marker. Declared applicability still applies.
+Status guidance and attachment do not authorize or execute that host command.
+
+The attachment schedules one Tests Review against B. The original Review remains
+bound to A, and the original assignment, completion matrices, and Writer output
+remain unchanged. Passing proof and a passing targeted Review satisfy only the
+selected finding in current completion. Failed proof, a failed Review, or an
+uncertain Review grants no completion. Ordinary reviews, final Tester, candidate
+gates, and Learning remain required. A targeted source-correction Review creates
+a fresh Writer assignment against B. This exception requires explicit selection;
+it does not automatically reassign findings or ownership based on prose.
+
+Repeat the same attachment to recover an interrupted publication or reuse a
+pending Review. Changed input cannot replace an active recovery. After an
+`evidence-needed` Review or expiry of intact live-state proof, attach fresh proof
+with the same finding and candidate once execution owners settle. Fluent retains
+failed or expired proof and completed Reviews. An old attachment or queued
+dispatch cannot clear a later cancellation; use a fresh explicit resume after
+settlement. All resume and review routes recheck the binding, and changed saved
+proof, source Review, matrix, candidate, or accepted Review bytes block progress.
+
+Older executables reject finding-bound records and transactions. Continue with
+the compatible executable; a record upgrade or an absent binding supplies no
+finding acceptance.
 
 ## Declare when a command result applies
 
@@ -242,8 +308,8 @@ target review digest from the exact bound Review bytes; it never derives the
 supplied evidence digest or permits that argument to be omitted.
 
 Source-correction classification requires an immutable candidate-bound evidence
-snapshot whose `result` is `fail`. A passing snapshot belongs to the host-only
-attachment path above and cannot authorize code change.
+snapshot whose `result` is `fail`. Passing evidence follows the ordinary
+host-only attachment path and cannot authorize a source correction.
 
 Use the failed targeted Tests Review path and evidence digest shown by
 `fluent work-item show`. Fluent accepts this command only for the saved,
@@ -261,10 +327,14 @@ is not replayable. In either state, repeating `classify` is rejected without
 mutation. For a `Complete` Writer with output, replay retains the original
 source, review, and evidence bindings but validates that saved output's
 workspace is the current clean candidate before returning the stored result. For
-a `Failed` Writer, no public resume transition retries it: `fluent queue resume`,
-`fluent attempt run`, and repeated `classify` are rejected, so inspect the
-failed Task and escalate for a separately validated recovery. For a `Superseded`
-Writer, continue with its replacement and do not repeat the classification.
+a `Failed` Writer, classification grants no retry authority. Repeated
+`classify` still rejects a failed Writer, including after usage-limit approval.
+Only the dedicated `attempt recover-usage-limit` approval followed by a separate
+explicit resume can retry that same Task; unrelated failed Writers remain
+ineligible. Inspect the failed Task and follow the
+[usage-limit recovery procedure](#recover-a-usage-limit-interrupted-writer).
+For a `Superseded` Writer, continue with its replacement and do not repeat the
+classification.
 Fluent records the authorization,
 explicit `code-change` disposition, and audit artifact, then schedules one
 corrective Writer with the failed review, immutable evidence snapshot, and
@@ -348,7 +418,8 @@ repeat those checks, including when a queue entry predates the changed evidence.
 If live-state proof expires before Fluent consumes its targeted Review, submit
 fresh proof after execution owners settle. Use the same candidate and original
 selector: `--required-check` for a canonical check, `--plan-row` for a host Plan
-row, or `--review-artifact` for a reviewer-requested check. Status reports that
+row, `--finding` for a carried finding, or `--review-artifact` for a
+reviewer-requested check. Status reports that
 exact attachment command when the original bindings remain valid. This also
 applies when the targeted Review completed before the proof expired.
 
@@ -363,3 +434,248 @@ from the canonical Tester. If completed proof expires before readiness, renew
 it through the original `--review-artifact` selector; a later passing Review
 does not erase the request. Changed source bindings require repair before Fluent
 can accept fresh proof.
+
+
+## Recover a usage-limit-interrupted Writer
+
+Use this dedicated path for a failed corrective Codex Writer paused at
+`round-cap`, with its original assignment, settled ownership, and surviving
+final Fluent-captured quota stream. Inspect the Work Item, failed execution,
+partial HEAD, index, and unfinished source first. With operator authorization:
+
+```sh
+fluent attempt recover-usage-limit <work-item> <attempt> --resolution "<decision>"
+```
+
+Fluent reads evidence through the saved Task; there is no arbitrary transcript
+file override. It requires the supported complete native terminal sequence and
+matching quota errors. A phrase in model text, a provider-session rollout, a
+terminal status without settled leases, or an unrelated failure is insufficient.
+The surviving stream cannot prove every earlier launch or the origin of every
+partial edit. The recorded approval explicitly acknowledges that evidence limit.
+
+Inspect the printed approval ID, partial commit, and immutable audit. Approval
+leaves the Attempt paused and launches or queues nothing. The audit binds both
+the last completed Writer output and actual partial HEAD, index, working-file
+bytes and modes, deleted and untracked source, assignment, saved provider/model/
+effort, prior evidence, and execution identity. Do not reset, stash, commit, or
+otherwise change partial work to make recovery eligible. A change after approval
+invalidates its binding rather than silently broadening permission.
+
+Resume separately:
+
+```sh
+fluent attempt run <work-item> <attempt>
+# Or request the same recovery through the queue:
+fluent queue resume <work-item> --attempt <attempt>
+```
+
+Every entry point revalidates before launch. The retry keeps the same Writer Task
+and Attempt without another round, preserves the original assignment and failed
+execution as history, and writes fresh artifacts. Its sandbox grants no writable
+ancestor of retained failure/Review evidence or host approval. Keep sandboxing
+enabled and do not switch the saved coder settings to work around capacity.
+Provider readiness is a launch prerequisite; it does not promise future capacity.
+
+If the first approved launch pauses at `host-sandbox` before reservation,
+inspect the current Work show or status guidance. After the host readiness
+problem is repaired, use the same explicit Attempt or queue resume command.
+Fluent accepts the existing approval only when its native preparation and
+preflight records prove that no launch occurred and all approved inputs still
+match. It keeps the same Writer and round. A missing proof, later stop, or
+conflicting execution record requires inspection; changing a pause label or
+manually resetting the Task does not establish eligibility.
+
+Repeating matching approval or an interrupted publication reuses the same
+operation. An already running or finished retry does not start again. A lost
+launch acknowledgement or uncertain ownership requires diagnosis; it grants no
+second launch. A later cancellation or terminal failure invalidates earlier
+restart authority. A new supported quota interruption needs its own explicit
+approval; cancellation retains its normal explicit recovery requirements.
+
+Approval provides no verification credit. Complete the Writer's current-candidate
+checks and all five ordinary review domains, required host proof and targeted
+Tests Review, the canonical final Tester with process-leak rejection, and
+Learning. Targeted evidence review supplies no ordinary coverage. A normal
+hermetic route test or unavailable sandbox probe does not establish host
+confinement. Keep the test workspace outside the private worker temporary tree
+and require production Codex `login status` using the prepared launcher and
+private home inside the strict profile. Check denied reads of unrelated temporary
+and operator-home content. Also require an offline Rust test that compiles and
+runs inside the production retry profile using installed Cargo/rustc and the
+production launch environment. Confirm that installed tools remain read-only, `CARGO_HOME` uses
+the private dependency cache, and temporary tool state stays in private scratch.
+Retain positive workspace, fresh-artifact, and Git operations and denied writes
+to installed tools, operator state, shared temporary paths, failed execution
+evidence, prior reviews, and the approval audit. For support Work declaring the
+real-host check, the exact command is:
+
+```sh
+FLUENT_USAGE_LIMIT_REQUIRE_REAL_CONFINEMENT=1 cargo nextest run --features test-support --test binary usage_limit_writer_recovery_real_confinement
+```
+
+The assigned host runs it against the exact candidate and attaches the captured
+result through the Plan-row route above. Failure to run the real probe is a
+failure under this command. A Writer must leave that host row pending.
+
+## Diagnose a reported process leak
+
+Start with the original native report and full stdout/stderr for each affected
+run. Retain its command, harness version, concurrency settings, working directory,
+run time, and affected test identities. Record the candidate commit and any
+dirty-source evidence captured at that time; a later checkout cannot establish
+the earlier working tree. Keep absent provenance explicitly unknown.
+
+Before another Writer continuation, check that its supplied input paths actually
+include those reports and any operator evidence named by the Plan. If they do
+not, ask the coordinator for readable preserved copies and leave the diagnosis
+row pending. A later canonical result with empty process-leak lists cannot
+replace the missing historical report.
+
+For a reproduction, retain the original concurrency and process-leak rejection.
+Use the native focused selector, prepare its required pinned readers, and capture
+complete native output. Check recorded execution owners, leaders, process groups,
+and leases before fixture cleanup. If the report identifies a still-live PID,
+an authorized host can capture its process identity, working directory, and
+standard descriptors with these bounded commands, substituting that observed PID:
+
+```sh
+ps -p <pid> -o pid=,ppid=,pgid=,etime=,stat=,command=
+lsof -a -p <pid> -d cwd,0,1,2 -Fn
+```
+
+Capture the observation time and command failures too. A reused PID or a process
+that has already exited cannot establish the original process's identity; do not
+invent missing PIDs or reconstruct an earlier inventory from a later run. If the
+Writer cannot inspect processes, hand off the exact observed selectors and the
+needed evidence to the host while keeping the diagnosis incomplete.
+
+Close the finding only when retained evidence supports the cause and any source
+defect has a verified correction. A clean rerun proves that run's result only.
+Focused diagnostics do not replace required host proof, ordinary reviews, or the
+complete concurrent final Tester with process-leak rejection enabled.
+
+For the quota-recovery selector, the repository supplies a read-only macOS
+observer at `tests/fixtures/collect-quota-process-evidence.py`. Start it while the
+focused nextest launch is alive. It follows observed descendants across
+reparenting, excludes unrelated processes, and records their process identities
+and open descriptors. It does not start tests, signal processes, or clean up
+fixtures. For example, from the settled candidate checkout on the authorized host:
+
+```sh
+set -eu
+: "${CARGO_HOME:?Use the assigned private dependency cache}"
+mkdir -p tests/output
+quota_evidence=$(mktemp -d "$PWD/tests/output/quota-process-evidence.XXXXXX")
+FLUENT_USAGE_LIMIT_OLD_BIN="$(bash tests/fixtures/build-usage-limit-old-reader.sh)"
+export FLUENT_USAGE_LIMIT_OLD_BIN
+{
+  git rev-parse HEAD
+  git status --porcelain=v1
+  cargo nextest --version
+  rustc --version
+} > "$quota_evidence/context.txt"
+printf '%s\n' 'NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --offline --features test-support --test binary usage_limit_writer_ --no-fail-fast --message-format libtest-json' > "$quota_evidence/command.txt"
+(
+  set +e
+  NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --offline \
+    --features test-support --test binary usage_limit_writer_ \
+    --no-fail-fast --message-format libtest-json \
+    > "$quota_evidence/stdout.jsonl" 2> "$quota_evidence/stderr.log"
+  printf '%s\n' "$?" > "$quota_evidence/nextest-exit-status"
+) &
+quota_run_pid=$!
+printf '%s\n' "$quota_run_pid" > "$quota_evidence/launch-pid"
+python3 tests/fixtures/collect-quota-process-evidence.py \
+  --pid "$quota_run_pid" --seconds 90 --output "$quota_evidence/processes"
+```
+
+Preserve the exact launch command with that directory. The observer stops when
+all observed identities disappear or its deadline expires; each host probe has
+a three-second timeout. It returns 2 for denied or incomplete observations and
+for a deadline with processes still observed. On failure, inspect the retained
+data and the native launch rather than interpreting the observer status as a
+test result. The background launch records its own exit status separately.
+
+An observer exit of 0 describes only its samples: children that exit or reparent
+between samples, PID reuse within the start-time clock's one-second resolution,
+and descriptor changes between probes remain possible gaps. Correlate timestamps
+and pipe identities with the native LEAK event before attributing a cause. The
+collector requests each descriptor's access mode as well as its type and pipe
+peer; older records without an access-mode field do not establish that mode.
+Compare a warned test's stdout/stderr with extra descriptors in sibling test
+leaders in the same sample. A sibling can inherit another test's capture pipe
+during concurrent runner launches, keeping its output open after it exits.
+Before changing Fluent's worker cleanup, test that boundary with a small fixture
+that observes its initial descriptors and launches no children. Preserve the
+fixture, exact runner identity, native failures and positive controls. Such an
+upstream runner diagnosis requires a toolchain repair that preserves concurrent
+execution and leak rejection; closing unknown descriptors in Fluent tests or
+waiving native LEAK results would conceal the faulty launch boundary. Keep
+the entire quota selector concurrent; do not narrow reproduction to only the
+first historically affected tests or change the leak timeout to make it pass.
+The collector's hermetic regression runs with
+`bash tests/behaviors/operations/test-quota-process-evidence.sh`; it does not
+constitute host process evidence.
+
+## Recover mutable Writer assignment context
+
+New corrective assignments retain snapshots of host-owned progress and handoff
+inputs. An older completed Writer, or its output-free completion retry, may still bind the live file. If permitted
+edits make that binding stale, inspect `fluent status` or `fluent work-item show
+<work-item>` for the exact candidate, Task, assignment digest, and input path.
+These inspections do not publish snapshots or authorize recovery.
+
+Supply a regular file containing the original bytes matching the recorded digest,
+using a canonical path with no symlink components. Use the command printed by
+status, replacing only the original-file and resolution placeholders:
+
+```sh
+fluent attempt recover-assignment-context <work-item> <attempt> \
+  --task <assigned-writer> --candidate <exact-commit> \
+  --assignment-digest <saved-assignment-digest> --input <assigned-context-path> \
+  --original-file <original-bytes-file> --resolution "<decision>"
+```
+
+Recovery retains a snapshot and an audited before/after assignment. It preserves
+current progress, the current handoff, completed Tasks, findings, and their
+original evidence. It does not resume the Attempt or grant completion, host
+verification, ordinary reviews, Tester, or Learner credit. Missing original bytes,
+changed immutable evidence, stale identities, unsafe paths, and live ownership
+remain blockers. Context recovery alone cannot retry a Writer or reset its
+completion matrix.
+
+An identical request reuses its operation and snapshot, including after an
+interrupted publication. A later cancellation remains in force. If another
+mutable input is stale, inspect status again and recover that input using its
+newly reported assignment digest. For a completed Writer, separately run `fluent attempt run
+<work-item> <attempt>` or `fluent queue resume <work-item> --attempt <attempt>`.
+The native lifecycle requires any outstanding host evidence before advancement.
+
+For an output-free failed Writer, recovery requires the original saved assignment,
+its completion-recovery authority, the same clean candidate and workspace, and a
+native execution record proving setup stopped before provider launch. Every owner
+must be settled. A later Writer may remain only as an unstarted reservation with
+no artifacts. Log messages, a missing candidate, or a quota pause alone do not
+prove this case.
+
+After recovering its context, inspect status again. Separately authorize one
+retry of that exact Task, then explicitly resume:
+
+```sh
+fluent attempt repair-writer-completion <work-item> <attempt> --resolution "<retry decision>"
+fluent attempt run <work-item> <attempt>
+# Queue dispatch is an alternative to foreground resume:
+fluent queue resume <work-item> --attempt <attempt>
+```
+
+Authorization preserves the original assignment and findings, snapshots the
+failed Task, and selects a fresh execution artifact directory for the same Task.
+It supersedes only an exact unstarted later reservation. Failed Tester evidence,
+accepted carried evidence, and the earlier completion audit remain intact. The
+retry does not extend round limits or authorize any further retry. Cancellation,
+changed evidence, a different candidate, or live ownership invalidates pending
+authority. After a started retry stops, inspect its new failure; repeating the old
+authorization cannot launch it again. Ordinary reviews, the canonical final
+Tester, and Learner still govern completion. The required host confinement check
+must run through the exact production profile; a nested sandbox skip is no proof.

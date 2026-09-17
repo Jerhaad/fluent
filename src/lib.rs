@@ -1,3 +1,4 @@
+pub mod assignment_context_recovery;
 pub mod atomic_write;
 pub mod auto_merge;
 pub(crate) mod baseline_cache;
@@ -79,6 +80,8 @@ pub(crate) mod tester_evidence;
 pub mod tester_harness_recovery;
 pub mod update;
 pub mod usage;
+mod usage_limit_contracts;
+pub mod usage_limit_recovery;
 
 pub mod ownership_recovery;
 

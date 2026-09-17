@@ -1,6 +1,9 @@
 //! Recover one host-verified metadata rewrite that accidentally replaced the
 //! candidate's protected base while preserving the exact candidate tree.
 
+mod interrupted;
+pub use interrupted::{InterruptedWriterRestoration, restore_interrupted};
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -775,7 +778,7 @@ fn inspect_eligible(project_root: &Path, attempt: &Attempt) -> Result<EligibleRe
                     .ends_with(crate::candidate_gate::CANDIDATE_GATE_FILE)
         })
         .ok_or_else(|| anyhow::anyhow!("candidate ancestry source gate is missing"))?;
-    let gate_path = crate::work_task_executor::resolve_managed_artifact_area_path(
+    let gate_path = crate::recovery_contracts::resolve_managed_artifact_area_path(
         project_root,
         &gate_ref.path,
     )?;
@@ -874,7 +877,7 @@ fn authorized_history_rewrite(
         return Ok(None);
     }
     for approved in &extension.failed_reviews {
-        let path = crate::work_task_executor::resolve_managed_artifact_area_path(
+        let path = crate::recovery_contracts::resolve_managed_artifact_area_path(
             project_root,
             &approved.artifact.path,
         )?;
@@ -1203,7 +1206,7 @@ fn verify_gate_provenance(project_root: &Path, eligible: &EligibleRecovery) -> R
         }
         return Ok(());
     }
-    let prior_path = crate::work_task_executor::resolve_managed_artifact_area_path(
+    let prior_path = crate::recovery_contracts::resolve_managed_artifact_area_path(
         project_root,
         &eligible.authorization.prior_gate_path,
     )?;
@@ -1337,7 +1340,7 @@ fn clone_completion_matrix(
     };
     let source_path = project_root
         .join(&area.path)
-        .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
+        .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE);
     if !source_path.is_file() {
         if attempt.writer_completion_contract.is_some() {
             bail!("candidate ancestry source Writer has no completion matrix");
@@ -1353,7 +1356,7 @@ fn clone_completion_matrix(
             &attempt.id,
             target_task_id,
         ))
-        .join(crate::work_task_executor::WRITER_COMPLETION_MATRIX_FILE);
+        .join(crate::recovery_contracts::WRITER_COMPLETION_MATRIX_FILE);
     write_bytes_once(&target, &serde_json::to_vec_pretty(&matrix)?)
 }
 

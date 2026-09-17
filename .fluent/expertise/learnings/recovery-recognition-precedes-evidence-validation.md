@@ -20,6 +20,16 @@ Returning no match at that point lets an outer fallback reopen the stopped Task
 or authorize queued dispatch, silently turning corrupt recovery state into an
 ordinary retry.
 
+Recovery histories can overlap. A retained completion audit does not prove
+that a later output-free failure stopped before provider launch; that Writer
+may have launched and reached a quota limit. Keep family selection in the
+shared contract and defer to quota recovery only after its separate approval
+validates. Recorded context-retry authority still requires its own stale and
+consumed checks. Test overlapping histories through foreground and queued
+resume, with missing and changed approvals as rejection controls. See
+[[composed-recovery-instructions-bind-each-preparation]] for validating the
+instructions retained across those recoveries.
+
 Use the same read-only inspector at foreground and queue admission before any
 Work-model or dispatch-ledger mutation. A regression must drive both public
 routes and remove both the persisted input reference and any discoverable file;

@@ -6,6 +6,8 @@ scope, or filesystem inputs.
 
 ## Patterns
 
+- [evaluate-conditional-git-includes](security/patterns/evaluate-conditional-git-includes.md) — read when granting file access from Git configuration includes
+
 - [require-canonical-relative-path-spelling](security/patterns/require-canonical-relative-path-spelling.md) — read when an untrusted path participates in an authorization or identity decision
 
 ## Declared sandbox input symlinks

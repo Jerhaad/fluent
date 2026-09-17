@@ -494,7 +494,7 @@ pub enum AttemptCommands {
         resolution: String,
     },
 
-    /// Repair a tree-identical metadata rewrite that replaced a protected base
+    /// Repair candidate ancestry or restore a settled interrupted Writer
     RepairCandidateAncestry {
         /// Work Item ID
         work_item_id: String,
@@ -503,6 +503,16 @@ pub enum AttemptCommands {
         /// Operator decision approving the exact ancestry repair
         #[arg(long)]
         resolution: String,
+        /// Restore a settled interrupted Writer to its exact saved candidate
+        #[arg(long)]
+        restore_interrupted: bool,
+        /// Exact rejected HEAD inspected by the operator (never a target commit)
+        #[arg(
+            long,
+            requires = "restore_interrupted",
+            required_if_eq("restore_interrupted", "true")
+        )]
+        rejected_candidate: Option<String>,
     },
 
     /// Authorize a tree-identical commit-metadata rewrite for a rejected candidate
@@ -512,6 +522,33 @@ pub enum AttemptCommands {
         /// Attempt ID
         attempt_id: String,
         /// Operator decision approving the exact metadata-only rewrite
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Approve one retry of a Writer interrupted by a proven provider usage limit
+    RecoverUsageLimit {
+        work_item_id: String,
+        attempt_id: String,
+        /// Operator decision authorizing this exact interrupted Writer
+        #[arg(long)]
+        resolution: String,
+    },
+
+    /// Recover one saved mutable context input from its proven original bytes
+    RecoverAssignmentContext {
+        work_item_id: String,
+        attempt_id: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        candidate: String,
+        #[arg(long)]
+        assignment_digest: String,
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        original_file: std::path::PathBuf,
         #[arg(long)]
         resolution: String,
     },
@@ -749,6 +786,9 @@ pub enum AttemptEvidenceCommands {
         /// Stable canonical check selector printed in evidence recovery guidance
         #[arg(long, value_name = "ID", conflicts_with_all = ["review_artifact", "recheck_artifact", "plan_row"])]
         required_check: Option<String>,
+        /// Pending Tests finding in the current Writer's immutable assignment
+        #[arg(long, value_name = "ID", conflicts_with_all = ["review_artifact", "recheck_artifact", "plan_row", "required_check"])]
+        finding: Option<String>,
     },
 }
 
@@ -1322,6 +1362,8 @@ mod tests {
                     work_item_id,
                     attempt_id,
                     resolution,
+                    restore_interrupted: false,
+                    rejected_candidate: None,
                 }
             }) if work_item_id == "work-1"
                 && attempt_id == "attempt-1"
