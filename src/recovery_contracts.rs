@@ -35,6 +35,7 @@ mod carried_finding;
 mod plan_evidence;
 pub(crate) use plan_evidence::apply_completed_plan_host_evidence;
 pub(crate) mod context_retry;
+pub(crate) mod review_coverage;
 pub(crate) mod review_evidence;
 pub(crate) mod writer_completion;
 pub(crate) use carried_finding::{
@@ -929,40 +930,22 @@ pub(crate) fn validate_completed_downstream_evidence(
         .as_ref()
         .context("completed Approach recovery Writer has no candidate")?;
 
-    let reviews = attempt.tasks[writer_index + 1..]
-        .iter()
-        .filter(|task| task.kind == TaskKind::Review)
-        .collect::<Vec<_>>();
+    // Reuse advancement's effective ordinary coverage, including unchanged
+    // domains carried across Writers and replacement full-domain verdicts.
+    // Earlier failures and targeted Reviews remain immutable history; the
+    // canonical assessment below separately revalidates accepted check proof.
+    let reviews = review_coverage::ordinary_review_tasks(project_root, attempt);
     anyhow::ensure!(
-        !reviews.is_empty(),
-        "completed Approach recovery has no current Review evidence"
+        review::REVIEWERS
+            .iter()
+            .all(|role| reviews.iter().any(|(task, _)| task.role == *role)),
+        "completed Approach recovery lacks current ordinary Review evidence"
     );
-    for review_task in reviews {
-        anyhow::ensure!(
-            review_task.status == TaskStatus::Complete,
-            "completed Review Task {} is not complete",
-            review_task.id
-        );
-        let context = review_task.review_context.as_ref().with_context(|| {
-            format!(
-                "completed Review Task {} has no candidate context",
-                review_task.id
-            )
-        })?;
-        anyhow::ensure!(
-            context.candidate_commit == output.commit,
-            "completed Review Task {} is bound to candidate {}, not {}",
-            review_task.id,
-            context.candidate_commit,
-            output.commit
-        );
+    for (review_task, verdict) in reviews {
         let artifact = review_artifact_path(review_task)
             .with_context(|| format!("completed Review Task {} has no artifact", review_task.id))?;
-        let path = resolve_input_artifact_path(project_root, &artifact)?;
-        let bytes = fs::read(&path)
-            .with_context(|| format!("read completed Review evidence {}", path.display()))?;
         anyhow::ensure!(
-            review::extract_verdict(&String::from_utf8_lossy(&bytes)) == review::Verdict::Pass,
+            verdict == review::Verdict::Pass,
             "completed review {} changed or no longer passes",
             artifact
         );

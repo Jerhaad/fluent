@@ -293,8 +293,13 @@ each host-derived Writer outcome, candidate commit, progress and matrix completi
 counts, provider session identity, and whether the run was initial, pre-review
 continuation, or post-review corrective work.
 
-`ordinary_review_tasks` in `work_attempt_loop` establishes ordinary coverage
-from completed Review Tasks, their candidate contexts, and their saved verdicts.
+`ordinary_review_tasks` in `recovery_contracts::review_coverage` establishes
+ordinary coverage from completed Review Tasks, their candidate contexts, and
+their saved verdicts. Attempt advancement and completed Approach-recovery resume
+share this read-only selection. A later ordinary verdict replaces the earlier
+verdict for its domain while preserving both reports. Completed recovery checks
+all ordinary domains and separately revalidates accepted evidence through the
+Plan and canonical verification contracts.
 Targeted evidence reviews retain their narrow scope and supply no ordinary
 coverage. Before final Tester or Learner, all five built-in domains need passing
 ordinary coverage. A missing role is scheduled even when the only preceding

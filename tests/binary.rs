@@ -60171,6 +60171,225 @@ fn round_cap_approach_revision_resume_preserves_downstream_gates() {
 
 #[test]
 #[serial]
+fn round_cap_approach_revision_completed_resume_uses_effective_reviews() {
+    use fluent::work_model::{
+        AttemptStatus, EvidenceRecoveryState, LearningStatus, TaskKind, now_iso8601,
+    };
+
+    let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
+    approve_round_cap_extension(&fixture);
+    revise_round_cap_approach(&fixture).success();
+    let prompt_log = fixture._tmp.path().join("effective-reviews-prompts.log");
+    let provider = fixture._tmp.path().join("effective-reviews-provider");
+    let passing = round_cap_downstream_provider_script(&prompt_log);
+    let requesting = passing.replace(
+        "    printf 'Verdict: pass\\n\\nDownstream route review.\\n' > review.md",
+        r#"    if [[ "$PWD" == *-tests && "$PROMPT" != *'## Evidence-targeted review'* ]]; then
+      printf 'Verdict: fail\nDisposition: evidence-needed\nEvidence-Command: cargo test exact_host_check\nEvidence-Working-Directory: .\n\n## Findings\n\n- [ ] Observe the host check\n' > review.md
+    else
+      printf 'Verdict: pass\n\nAccepted the attached check.\n' > review.md
+    fi"#,
+    );
+    assert_ne!(requesting, passing);
+    write_sandboxed_mock_claude(&provider, &requesting);
+    let run = || {
+        let mut command = fluent_cmd();
+        command
+            .current_dir(&fixture.main_dir)
+            .env("PATH", mock_path(&provider))
+            .args(["attempt", "run", "work-1", "attempt-1"]);
+        command
+    };
+    run().assert().success();
+    attach_round_cap_host_evidence(&fixture, "effective-reviews");
+    run().assert().success();
+    let requested = fixture.store.read_work_item("work-1").unwrap();
+    assert_eq!(requested.attempts[0].status, AttemptStatus::NeedsUser);
+    let request = requested.attempts[0]
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.evidence_review_context.is_none()
+        })
+        .unwrap();
+    let review_ref = format!("{}/review.md", request.artifact_area.as_ref().unwrap().path);
+    let request_bytes = fs::read(fixture.main_dir.join(&review_ref)).unwrap();
+    assert_eq!(
+        review::extract_verdict(std::str::from_utf8(&request_bytes).unwrap()),
+        review::Verdict::Fail
+    );
+    let candidate = &request.review_context.as_ref().unwrap().candidate_commit;
+    let proof = fixture._tmp.path().join("requested-host-check.json");
+    write_json_path(
+        &proof,
+        &serde_json::json!({
+            "schema_version": 1, "producer": "fixture host",
+            "check": "cargo test exact_host_check", "working_directory": ".",
+            "result": "pass", "run_at": now_iso8601(), "output": "passed"
+        }),
+    );
+    fluent_cmd()
+        .current_dir(&fixture.main_dir)
+        .args([
+            "attempt",
+            "evidence",
+            "attach",
+            "work-1",
+            "attempt-1",
+            "--candidate",
+            candidate,
+            "--review-artifact",
+            &review_ref,
+            "--evidence-file",
+            proof.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    write_sandboxed_mock_claude(&provider, &passing);
+    run().assert().success().stdout(predicate::str::contains(
+        "Merge Candidate attempt-1-merge-candidate is ready",
+    ));
+
+    let before = fixture.store.read_work_item("work-1").unwrap();
+    let attempt = &before.attempts[0];
+    assert_eq!(attempt.status, AttemptStatus::Complete);
+    assert_eq!(
+        attempt.learning.as_ref().unwrap().status,
+        LearningStatus::Succeeded
+    );
+    let writer_index = attempt
+        .tasks
+        .iter()
+        .rposition(|task| task.kind == TaskKind::Write)
+        .unwrap();
+    let writer = &attempt.tasks[writer_index];
+    assert_eq!(writer.role, "approach-revision-correction");
+    assert_eq!(
+        attempt
+            .tasks
+            .iter()
+            .filter(|task| task.kind == TaskKind::Write)
+            .count(),
+        2
+    );
+    let ordinary: Vec<_> = attempt.tasks[writer_index + 1..]
+        .iter()
+        .filter(|task| {
+            task.kind == TaskKind::Review
+                && task.role == "tests"
+                && task.evidence_review_context.is_none()
+        })
+        .collect();
+    assert_eq!(ordinary.len(), 2);
+    assert_eq!(ordinary[0].id, request.id);
+    let effective_path = fixture
+        .main_dir
+        .join(&ordinary[1].artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    assert_eq!(
+        review::extract_verdict(&fs::read_to_string(&effective_path).unwrap()),
+        review::Verdict::Pass
+    );
+    let recovery = attempt
+        .evidence_recoveries
+        .iter()
+        .find(|recovery| {
+            recovery
+                .required_check
+                .as_ref()
+                .is_some_and(|check| check.command == "cargo test exact_host_check")
+        })
+        .unwrap();
+    assert_eq!(recovery.state, EvidenceRecoveryState::Complete);
+    let targeted = attempt
+        .tasks
+        .iter()
+        .find(|task| Some(task.id.as_str()) == recovery.targets[0].review_task_id.as_deref())
+        .unwrap();
+    assert!(targeted.evidence_review_context.is_some());
+    assert_ne!(targeted.id, ordinary[1].id);
+    let targeted_path = fixture
+        .main_dir
+        .join(&targeted.artifact_area.as_ref().unwrap().path)
+        .join("review.md");
+    let tester = attempt
+        .tasks
+        .iter()
+        .rev()
+        .find(|task| task.kind == TaskKind::Tester && !task.is_failed_command_recheck())
+        .unwrap();
+    let tester_path = fixture
+        .main_dir
+        .join(&tester.artifact_area.as_ref().unwrap().path)
+        .join("tester-results.json");
+    let mut failed_results = read_json_path(&tester_path);
+    failed_results["commands"][0]["exit_code"] = serde_json::json!(1);
+    let workspace = fixture
+        .main_dir
+        .join(&writer.output.as_ref().unwrap().workspace_path);
+    let candidate_head = git_head(&workspace);
+    let prompts = fs::read(&prompt_log).unwrap();
+
+    // Readiness and completed resume must agree about the preserved failed Review.
+    run().assert().success().stdout(predicate::str::contains(
+        "Merge Candidate attempt-1-merge-candidate is ready",
+    ));
+    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+    assert_eq!(fs::read(&prompt_log).unwrap(), prompts);
+    assert_eq!(
+        fs::read(fixture.main_dir.join(&review_ref)).unwrap(),
+        request_bytes
+    );
+
+    for (path, replacement, diagnostic) in [
+        (
+            effective_path,
+            b"Verdict: fail\n\nCurrent domain evidence changed.\n".to_vec(),
+            "no longer passes",
+        ),
+        (
+            targeted_path,
+            b"Verdict: fail\n\nTargeted acceptance changed.\n".to_vec(),
+            "unresolved",
+        ),
+        (
+            tester_path,
+            serde_json::to_vec_pretty(&failed_results).unwrap(),
+            "needs diagnosis",
+        ),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, &replacement).unwrap();
+        run()
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(diagnostic));
+        fluent_cmd()
+            .current_dir(&fixture.main_dir)
+            .args(["queue", "resume", "work-1", "--attempt", "attempt-1"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(diagnostic));
+        assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+        assert!(
+            fluent::queue::read_ledger(&fixture.main_dir, "work-1")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(git_head(&workspace), candidate_head);
+        assert_eq!(fs::read(&prompt_log).unwrap(), prompts);
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        fs::write(path, original).unwrap();
+    }
+    run().assert().success();
+    assert_eq!(fixture.store.read_work_item("work-1").unwrap(), before);
+}
+
+#[test]
+#[serial]
 fn round_cap_approach_revision_completed_resume_rejects_unresolved_command() {
     let fixture = setup_round_cap_approach_revision_fixture_with_downstream_gates();
     let (tester_results, candidate_workspace, prompt_log) =
