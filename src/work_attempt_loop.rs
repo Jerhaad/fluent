@@ -63,6 +63,9 @@ pub struct WriterHandoffReport {
 #[derive(Debug, Clone)]
 struct WriterGateAssessment {
     evidence: crate::candidate_gate::CandidateGateEvidence,
+    // The gate records the effective base, which may predate the base of a
+    // correction Writer's output. Keep the supplied base for exact handoff.
+    requested_base_commit: String,
     logs: Vec<(usize, Vec<u8>)>,
 }
 
@@ -717,6 +720,7 @@ fn assess_writer_handoff_candidate(
                 .collect::<Result<Vec<_>>>()?;
             gate_assessment = Some(WriterGateAssessment {
                 evidence: evidence.clone(),
+                requested_base_commit: base.to_string(),
                 logs,
             });
         }
@@ -8181,7 +8185,8 @@ fn gate_candidate_after_writer(
     let evidence = if let Some(assessed) = assessed {
         let mut evidence = assessed.evidence.clone();
         anyhow::ensure!(
-            evidence.candidate_commit == output.commit && evidence.base_commit == base_commit,
+            evidence.candidate_commit == output.commit
+                && assessed.requested_base_commit == base_commit,
             "Final Writer gate assessment does not match the completed Writer output"
         );
         let path = project_root.join(&artifact.path);
@@ -22211,6 +22216,7 @@ print(json.dumps([json.loads(line) for line in (pathlib.Path(sys.argv[1])/'comma
         assert_eq!(evidence.disposition, CandidateGateDisposition::Passed);
         assert_eq!(fs::read(&marker).unwrap(), b"x");
         let assessed = WriterGateAssessment {
+            requested_base_commit: output.base_commit.as_deref().unwrap().to_string(),
             logs: evidence
                 .checks
                 .iter()
